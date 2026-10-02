@@ -1,0 +1,41 @@
+{
+  "name": "@opencara/agent-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.32.1",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "dev": "vite --config apps/web/vite.config.ts",
+    "dev:worker": "wrangler dev --config apps/worker/wrangler.jsonc",
+    "dev:runner": "node --env-file-if-exists=apps/runner/.env --import tsx apps/runner/src/index.ts",
+    "build": "vite build --config apps/web/vite.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:integration": "node --import tsx tests/integration.ts",
+    "deploy": "pnpm build && wrangler deploy --config apps/worker/wrangler.jsonc",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local --config apps/worker/wrangler.jsonc",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote --config apps/worker/wrangler.jsonc"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
+    "@hono/node-server": "1.19.11",
+    "hono": "4.12.8",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261002.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "wrangler": "4.147.0"
+  }
+}

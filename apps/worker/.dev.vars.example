@@ -1,0 +1,13 @@
+APP_ORIGIN=http://localhost:8787
+RUNNER_URL=http://127.0.0.1:8788
+RUNNER_EVENT_TRANSPORT=proxy
+SESSION_SECRET=
+RUNNER_SHARED_SECRET=
+# A base64url-encoded, cryptographically random 32-byte encryption key.
+VAULT_KEY=
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+# Loopback development and faux fixtures require all three explicit test settings.
+TEST_AUTH_ENABLED=false
+TEST_AUTH_SECRET=
+TEST_AUTH_EXPIRES_AT=
