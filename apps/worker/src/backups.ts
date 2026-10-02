@@ -1,20 +1,11 @@
 import type { Hono } from 'hono';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
-import type { RunnerBinding } from '../../../packages/shared/src/types.js';
+import { bindingForSession } from './sessions.js';
 import type { WorkerEnv } from './types.js';
 import { auditStatement, requireSession } from './db.js';
 import { fail, id, identifier, now } from './http.js';
-import { boundedResponseText, runnerRequest } from './runner.js';
-
-interface BackupRow { id: string; session_id: string; owner_id: string; object_key: string; sha256: string; size: number; created_at: string }
-interface RunnerBackup {
-  format: 'pi-runner-backup-v1';
-  binding: RunnerBinding;
-  manifest: unknown;
-  sqlite: string;
-  files: { path: string; data: string; mode: number }[];
-  createdAt: string;
-}
+import { runnerRequest } from './runner.js';
+import { boundedSnapshotText, loadBackupSnapshot, validateSnapshot, type BackupRow } from './restore-snapshot.js';
 function backupInfo(row: BackupRow) {
   return { id: row.id, sessionId: row.session_id, size: row.size, sha256: row.sha256, createdAt: row.created_at };
 }
@@ -29,15 +20,8 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
       fail(502, 'invalid_backup', 'The runner returned an invalid backup format.');
     }
     // A bounded snapshot avoids exhausting the Worker heap. The execution authority checkpoints it first.
-    const bytes = await boundedResponseText(response, 24 * 1024 * 1024);
-    let snapshot: RunnerBackup;
-    try { snapshot = JSON.parse(bytes) as RunnerBackup; } catch { fail(502, 'invalid_backup', 'The runner returned an unreadable backup.'); }
-    if (snapshot?.format !== 'pi-runner-backup-v1' || snapshot.binding?.session?.id !== row.id ||
-        snapshot.binding?.session?.ownerId !== row.owner_id || snapshot.binding?.owner?.id !== row.owner_id ||
-        snapshot.binding?.session?.agentVersionId !== row.agent_version_id || typeof snapshot.sqlite !== 'string' ||
-        !snapshot.sqlite || !Array.isArray(snapshot.files) || !snapshot.manifest) {
-      fail(502, 'invalid_backup', 'The backup does not match the immutable session binding.');
-    }
+    const bytes = await boundedSnapshotText(response);
+    validateSnapshot(bytes, await bindingForSession(c, row));
     await requireSession(c, row.id, 'manage');
     const backupId = id();
     const record: BackupRow = { id: backupId, session_id: row.id, owner_id: row.owner_id,
@@ -72,12 +56,12 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
     const record = await c.env.DB.prepare('SELECT * FROM backups WHERE id = ? AND session_id = ? AND owner_id = ?')
       .bind(identifier(c.req.param('backupId'), 'backupId'), row.id, row.owner_id).first<BackupRow>();
     if (!record) fail(404, 'not_found', 'Backup not found.');
-    const object = await c.env.BUCKET.get(record.object_key);
-    if (!object) fail(404, 'not_found', 'Backup object is unavailable.');
+    const bytes = await loadBackupSnapshot(c.env, record, await bindingForSession(c, row));
+    await requireSession(c, row.id, 'manage');
     await auditStatement(c.env, c.get('auth').userId, 'backup.downloaded', row.workspace_id, row.id, { backupId: record.id }).run();
-    return new Response(object.body, { headers: {
+    return new Response(bytes, { headers: {
       'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="session-${row.id}-${record.id}.json"`,
-      'Content-Length': String(object.size), 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
+      'Content-Length': String(record.size), 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
       'X-Backup-SHA256': record.sha256,
     } });
   });

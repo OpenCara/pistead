@@ -1702,3 +1702,97 @@
     }
   }
 }
+
+@layer components {
+  .connection-card {
+    min-width: 0;
+    padding-block: 1.5rem;
+    border-bottom: 1px solid var(--rule);
+    overflow-wrap: anywhere;
+  }
+
+  .connection-card > :is(p, form, h4, .connection-models) {
+    margin-top: 0.85rem;
+  }
+
+  .connection-models ul,
+  .connection-shares,
+  .queue-list {
+    margin: 0.75rem 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .connection-models li,
+  .queue-list li {
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .connection-shares li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem;
+    padding-block: 0.5rem;
+  }
+
+  .pairing-panel,
+  .host-trust,
+  .session-host,
+  .submission-queue {
+    min-width: 0;
+    margin-block: 1.5rem;
+    padding: clamp(0.8rem, 2vw, 1.25rem);
+    border: 1px solid var(--rule-strong);
+    background: var(--paper-light);
+    overflow-wrap: anywhere;
+  }
+
+  .pairing-panel > *,
+  .host-trust > *,
+  .session-host > *,
+  .submission-queue > * {
+    margin-block: 0.65rem;
+  }
+
+  .pairing-panel ol {
+    padding-left: 1.2rem;
+  }
+
+  .pairing-panel li + li {
+    margin-top: 1rem;
+  }
+
+  .pairing-panel pre {
+    max-width: 100%;
+    padding: 0.75rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--paper-deep);
+    font-size: 0.8rem;
+  }
+
+  .pairing-code {
+    padding: 0.65rem;
+    border: 1px dashed var(--accent);
+    background: var(--accent-soft);
+    font-size: 1.2rem;
+    user-select: all;
+  }
+
+  .trust-acknowledgement {
+    padding: 0.85rem;
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+  }
+
+  .revoke-connection {
+    margin-top: 1.25rem;
+  }
+
+  .session-host h2 {
+    font-size: 1.6rem;
+  }
+}

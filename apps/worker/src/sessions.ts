@@ -9,8 +9,11 @@ import { agentVersion, auditStatement, getUser, modelDefinition, requireMember, 
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import { parseOperation } from './operations.js';
+import { requireConnectorSession } from './connectors.js';
+import { presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
+import { issueRunAdmission } from './run-admissions.js';
 
-async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
+export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
   const [owner, agent] = await Promise.all([
     getUser(c.env, row.owner_id),
     c.env.DB.prepare('SELECT * FROM agent_versions WHERE id = ?').bind(row.agent_version_id).first<AgentRow>(),
@@ -18,6 +21,10 @@ async function bindingForSession(c: AppContext, row: SessionRow): Promise<Runner
   if (!owner || !agent) fail(409, 'invalid_binding', 'Session binding is incomplete.');
   const model = await c.env.DB.prepare('SELECT * FROM models WHERE id = ? AND workspace_id = ?').bind(agent.model_id, row.workspace_id).first<ModelRow>();
   if (!model) fail(409, 'invalid_binding', 'The session model is not available.');
+  if ((model.connector_id ?? null) !== (row.connector_id ?? null) || (model.connector_owner_id ?? null) !== (row.connector_owner_id ?? null)) {
+    fail(409, 'invalid_binding', 'Session connector binding is inconsistent.');
+  }
+  if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
   if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are available only in the explicitly enabled test environment.');
   const profile = userProfile(owner);
   // Published definitions never contribute the author's identity or environment.
@@ -35,9 +42,11 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
     c.req.raw.signal.addEventListener('abort', abort, { once: true });
     // Independent of fetch, D1, and write backpressure; never abort an underlying agent run.
     const deadline = setTimeout(abort, 8000);
+    // Connected snapshots perform additional host/generation checks; keep the invocation below Free-plan D1 limits.
+    const snapshots = row.connector_id ? 2 : 4;
     try {
       if (c.req.raw.signal.aborted) abort();
-      for (let snapshot = 0; snapshot < 4 && !stream.aborted; snapshot++) {
+      for (let snapshot = 0; snapshot < snapshots && !stream.aborted; snapshot++) {
         const result = await Promise.race([
           runnerRequest(c, row, 'view').then(response => runnerJSON<{ view: SessionView }>(response)),
           stopped,
@@ -47,11 +56,14 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
           abort();
           break;
         }
+        result.view.approvals = await presentApprovals(c, row, result.view.approvals);
         // Never emit a snapshot fetched before a grant was revoked without a fresh policy check.
         const access = await Promise.race([requireSession(c, row.id, 'read'), stopped]);
         if (!access || stream.aborted) break;
+        if (access.row.connector_id) await requireConnectorSession(c.env, access.row.connector_id, access.row);
+        if (stream.aborted) break;
         await Promise.race([stream.writeSSE({ event: 'view', data: JSON.stringify(result) }), stopped]);
-        if (snapshot < 3 && !stream.aborted) {
+        if (snapshot < snapshots - 1 && !stream.aborted) {
           await Promise.race([new Promise<void>(resolve => {
             const timer = setTimeout(resolve, 1000);
             cancelPause = () => clearTimeout(timer);
@@ -103,11 +115,17 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const model = await c.env.DB.prepare('SELECT * FROM models WHERE id = ? AND workspace_id = ?').bind(agent.model_id, workspaceId).first<ModelRow>();
     if (!model) fail(400, 'model_workspace_mismatch', 'The agent model must belong to the session workspace.');
     if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are disabled.');
+    if (!model.connector_id && !testMode(c.env)) fail(400, 'connector_required', 'New sessions require a connected model.');
+    if (model.connector_id && model.connector_owner_id !== ownerId && input.trustedConnectorId !== model.connector_id) {
+      fail(400, 'connector_trust_required', 'Explicitly acknowledge that this host can access this session before continuing.');
+    }
     const row: SessionRow = { id: id(), workspace_id: workspaceId, owner_id: ownerId, agent_version_id: versionId,
-      title, policy_version: 1, status: 'provisioning', created_at: now() };
+      title, policy_version: 1, status: 'provisioning', created_at: now(),
+      connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
+    if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
     await c.env.DB.batch([
-      c.env.DB.prepare('INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at),
+      c.env.DB.prepare('INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at, row.connector_id ?? null, row.connector_owner_id ?? null),
       auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }),
     ]);
     try {
@@ -132,27 +150,26 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
     const result = await runnerJSON<{ view: SessionView }>(await runnerRequest(c, row, 'view'));
     if (!result?.view || result.view.sessionId !== row.id || result.view.owner?.id !== row.owner_id) fail(502, 'invalid_runner_response', 'The runner returned an inconsistent session binding.');
+    result.view.approvals = await presentApprovals(c, row, result.view.approvals);
+    const fresh = await requireSession(c, row.id, 'read');
+    if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
     return c.json(result);
   });
   app.get('/api/sessions/:id/events', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
-    if (c.env.RUNNER_EVENT_TRANSPORT === 'poll') return pollingEvents(c, row);
-    const response = await runnerRequest(c, row, 'events');
-    if (!response.headers.get('content-type')?.includes('text/event-stream')) {
-      await response.body?.cancel();
-      fail(502, 'invalid_runner_response', 'The runner did not return an event stream.');
-    }
-    // The runner refreshes live policy periodically and owns run lifetime independently of this stream.
-    return new Response(response.body, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store, no-transform', 'X-Accel-Buffering': 'no' } });
+    // Review commitments must be persisted before any approval reaches a browser, including legacy sessions.
+    return pollingEvents(c, row);
   });
 
   for (const mode of ['submit', 'ask'] as const) {
     app.post(`/api/sessions/:id/${mode}`, async c => {
       const { row } = await requireSession(c, identifier(c.req.param('id')), mode === 'ask' ? 'ask' : 'write');
       const input = await jsonObject(c);
+      if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
       const content = text(input.content, 'content', 60000);
       const requestId = text(input.requestId, 'requestId', 128);
-      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId }));
+      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId) : undefined;
+      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}) }));
       if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
       await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId }).run();
       return c.json(result, 202);
@@ -162,9 +179,13 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/operations', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
     const operation = parseOperation(await jsonObject(c));
+    await requireOperationTool(c.env, row, operation);
     const result = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'operations', '', { operation }));
     if (!result?.approval || result.approval.sessionId !== row.id || result.approval.requestedBy !== c.get('auth').userId) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval request.');
+    [result.approval] = await presentApprovals(c, row, [result.approval], { operation, requestedBy: c.get('auth').userId });
     await auditStatement(c.env, c.get('auth').userId, 'approval.requested', row.workspace_id, row.id, { approvalId: result.approval.id, kind: operation.kind }).run();
+    const fresh = await requireSession(c, row.id, 'write');
+    if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
     return c.json(result, 201);
   });
 
@@ -173,30 +194,36 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const approvalId = identifier(c.req.param('approvalId'), 'approvalId');
     const input = await jsonObject(c);
     if (input.decision !== 'approve' && input.decision !== 'deny') fail(400, 'invalid_decision', 'Expected approve or deny.');
-    // Resolve the operation from the execution authority, never from browser-supplied arguments.
+    // The browser echoes its displayed commitment. A later runtime view can only confirm it, never replace it.
+    const review = await reviewedApproval(c, row, approvalId, input.reviewHash);
     const result = await runnerJSON<{ view: SessionView }>(await runnerRequest(c, row, 'view'));
     if (!result?.view || result.view.sessionId !== row.id || result.view.owner?.id !== row.owner_id || !Array.isArray(result.view.approvals)) fail(502, 'invalid_runner_response', 'The runner returned an inconsistent session view.');
-    const approval = result.view.approvals.find(item => item.id === approvalId && item.sessionId === row.id);
+    const candidate = result.view.approvals.find(item => item.id === approvalId && item.sessionId === row.id);
+    const approval = candidate ? (await presentApprovals(c, row, [candidate]))[0] : undefined;
     if (!approval) fail(404, 'not_found', 'Approval request not found.');
     if (approval.status !== 'pending') fail(409, 'approval_already_decided', 'This approval request is no longer pending.');
-    const operation = parseOperation(approval.operation);
+    const operation = review.operation;
     let brokerCapability: string | undefined;
     if (input.decision === 'approve') {
-      const writer = await sessionAccess(c.env, row.id, approval.requestedBy);
+      const writer = await sessionAccess(c.env, row.id, review.requested_by);
       if (!writer || !hasPermission(writer.permissions, 'write')) fail(403, 'requester_revoked', 'The operation requester no longer has write permission.');
+      await reviewedApproval(c, row, approvalId, input.reviewHash);
+      const fresh = await requireSession(c, row.id, 'approve');
+      if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
       if (operation.kind === 'github.comment') {
         const existing = await c.env.DB.prepare('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');
         brokerCapability = randomToken();
         await c.env.DB.prepare(`INSERT INTO broker_capabilities (token_hash, session_id, approval_id, actor_id, requested_by, operation_hash, expires_at, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(await sha256(brokerCapability), row.id, approvalId, c.get('auth').userId,
-          approval.requestedBy, await sha256(JSON.stringify(operation)), Math.floor(Date.now() / 1000) + 90, now()).run();
+          review.requested_by, await sha256(JSON.stringify(operation)), Math.floor(Date.now() / 1000) + 90, now()).run();
       }
     }
     const decided = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'approve', approvalId, {
       approvalId, decision: input.decision, operation, ...(brokerCapability ? { brokerCapability } : {}),
     }));
     if (!decided?.approval || decided.approval.id !== approvalId || decided.approval.sessionId !== row.id) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval result.');
+    [decided.approval] = await presentApprovals(c, row, [decided.approval]);
     await auditStatement(c.env, c.get('auth').userId, `approval.${input.decision}`, row.workspace_id, row.id, { approvalId, kind: operation.kind, status: decided.approval.status }).run();
     return c.json(decided);
   });

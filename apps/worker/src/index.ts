@@ -8,6 +8,8 @@ import { registerBackups } from './backups.js';
 import { registerInternal } from './internal.js';
 import { assertVaultConfigured } from './vault.js';
 import { fail, testMode } from './http.js';
+import { registerConnectorCredentials, registerConnectors } from './connectors.js';
+import { registerRestoreRoutes } from './restore-routes.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -36,14 +38,18 @@ app.get('/api/health', async c => {
     githubConfigured: !!c.env.GITHUB_CLIENT_ID && !!c.env.GITHUB_CLIENT_SECRET && vaultReady,
     runnerConfigured: !!c.env.RUNNER_URL && !!c.env.RUNNER_SHARED_SECRET && c.env.RUNNER_SHARED_SECRET.length >= 32,
     databaseConfigured: !!c.env.DB, backupsConfigured: !!c.env.BUCKET, testMode: testMode(c.env),
+    connectorsConfigured: !!c.env.CONNECTOR_HUB,
   });
 });
 registerAuth(app);
 registerInternal(app);
+registerConnectorCredentials(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
+registerConnectors(app);
 registerSessions(app);
 registerBackups(app);
+registerRestoreRoutes(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));
 app.all('*', c => {
   if (!c.env.ASSETS || !['GET', 'HEAD'].includes(c.req.method)) return c.json({ error: 'Not found.', code: 'not_found' }, 404);

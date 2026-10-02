@@ -1,16 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
+import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { signToken, sha256 } from "../packages/shared/src/crypto.js";
 import type { RunnerBinding, RunnerTicket, RunnerAction, Permission, AuthorizationRequest } from "../packages/shared/src/types.js";
+import type { RestoreDescriptor, RestoreInput } from "../packages/shared/src/connector.js";
 import { assertId, requestKey, stableJson, validateBinding, validateOperation, verifyRunnerTicket } from "../apps/runner/src/protocol.js";
 import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
 import { RunnerSession } from "../apps/runner/src/session.js";
 import { acquireRunnerLease } from "../apps/runner/src/lease.js";
+import { runnerModels } from "../apps/runner/src/provider.js";
 
 const SECRET = "runner-test-secret-not-a-production-secret-123456";
 const allowTestOperation = async (): Promise<void> => {};
@@ -69,6 +76,14 @@ test("path IDs, exact operations and composite dedup keys cannot collide", async
   assert.throws(() => validateOperation({ kind: "github.comment", repository: "../escape/repo", issue: 1, body: "x" }));
   assert.throws(() => validateBinding({ ...binding("a"), owner: { ...binding("a").owner, env: { APP_TOKEN: "no" } } }, "a"));
   assert.equal(stableJson({ b: 2, a: 1 }), stableJson({ a: 1, b: 2 }));
+  const native = binding("native");
+  native.model.provider = "local-provider";
+  native.session.connectorId = native.model.connectorId = "connector-a";
+  native.session.connectorOwnerId = native.model.connectorOwnerId = "test:host";
+  assert.throws(() => validateBinding(native, "native"));
+  assert.equal(validateBinding(native, "native", true).model.provider, "local-provider");
+  assert.throws(() => validateBinding({ ...native, model: { ...native.model, connectorId: "other" } }, "native", true));
+  assert.throws(() => validateBinding({ ...native, model: { ...native.model, provider: "../provider" } }, "native", true));
 });
 
 test("unsigned HTTP session calls fail closed before opening a harness", async t => {
@@ -127,7 +142,7 @@ test("writer cannot self-approve without approve permission; exact authorized op
   assert.equal(result.status, "executed");
   assert.equal(result.requestedBy, "test:bob");
   assert.equal(result.decidedBy, "test:alice");
-  const log = await session.sandbox.execute({ kind: "bash", command: "git log -1 --format='%an <%ae> / %cn <%ce>'" }, true, allowTestOperation);
+  const log = await session.sandbox.execute({ kind: "bash", command: "git log -1 --format='%an <%ae> / %cn <%ce>'" }, true, allowTestOperation, { allowTestShell: true });
   assert.match(log, /Alice <alice@example.test> \/ Alice <alice@example.test>/);
   await assert.rejects(session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation }));
   grants["test:bob"] = ["read"];
@@ -163,6 +178,82 @@ test("checkpointed backup carries SQLite binding/branches and recovers in a fres
   } finally { await restored.close(); }
 });
 
+test("owner restore publishes a new idle session, drops old authority and leaves source untouched", { skip: process.platform !== "linux" }, async t => {
+  const { service, directory } = await fixture(t);
+  const source = await service.provision(binding("restore-source"), await ticket("restore-source", "create"));
+  await source.submit(await ticket("restore-source", "submit"), { requestId: "source-write", content: "TEST_WRITE evidence.txt\noriginal" }, "write");
+  await idle(source);
+  const approval = await source.createApproval("test:alice", { kind: "git.commit", message: "must not replay" });
+  const oldTicket = await ticket("restore-source", "operations");
+  await source.consumeTicket(oldTicket);
+  const backup = await source.backup(await ticket("restore-source", "backup"));
+  const text = JSON.stringify(backup);
+  const bytes = new TextEncoder().encode(text);
+  const descriptor: RestoreDescriptor = { id: "restore-job", sourceSessionId: "restore-source", backupId: "backup-id", sha256: await sha256(text), size: bytes.byteLength, downloadToken: "opaque-scoped-test-capability" };
+  const target = binding("restore-target");
+  target.owner.gitName = "Alice Current";
+  target.owner.env.APP_COLOR = "new-owner-profile";
+  let pulls = 0;
+  let policyVersion = 1;
+  const restoredService = new RunnerService({ ...service.config,
+    authorize: async request => ({ allowed: request.actorId === target.owner.id, ownerId: target.owner.id, policyVersion }),
+    readBackup: async (requested, id) => {
+    assert.deepEqual(requested, descriptor);
+    assert.equal(id, target.session.id);
+    pulls++;
+    return bytes;
+  } });
+  await restoredService.initialize();
+  t.after(() => restoredService.close());
+  const sourceBytes = await readFile(join(directory, "sessions", source.binding.session.id, "session.sqlite"));
+  const input: RestoreInput = { binding: target, restore: descriptor };
+  await assert.rejects(restoredService.restore(input, await ticket(target.session.id, "restore", "test:bob")), /Only the immutable owner/);
+  assert.equal(pulls, 0);
+  const body = JSON.stringify(input);
+  const claims = await ticket(target.session.id, "restore", "test:alice", body);
+  const response = await createRunnerApp(restoredService).request(`/v1/sessions/${target.session.id}/restore`, {
+    method: "POST", headers: { authorization: `Bearer ${await signToken(claims, SECRET)}`, "content-type": "application/json" }, body,
+  });
+  assert.equal(response.status, 201, await response.clone().text());
+  assert.deepEqual((await response.json() as { restore: unknown }).restore, { id: descriptor.id, sha256: descriptor.sha256, targetSessionId: target.session.id });
+  policyVersion = 2;
+  const retryTicket = { ...await ticket(target.session.id, "restore"), policyVersion };
+  await restoredService.restore(input, retryTicket);
+  assert.equal(input.binding.session.policyVersion, 1, "publication binding stays historic while retry authorization uses current policy");
+  assert.equal(pulls, 1, "durable matching marker reconciles an ambiguous response without downloading or overwriting");
+  await assert.rejects(restoredService.restore({ ...input, restore: { ...descriptor, id: "another-job" } }, retryTicket), /receipt|conflict/i);
+  assert.deepEqual(await readFile(join(directory, "sessions", source.binding.session.id, "session.sqlite")), sourceBytes);
+  const restored = await restoredService.get(target.session.id);
+  const view = await restored.view();
+  assert.equal(view.busy, false);
+  assert.equal(view.approvals.find(item => item.id === approval.id)?.status, "interrupted");
+  assert.equal((await source.view()).approvals.find(item => item.id === approval.id)?.status, "pending");
+  assert.equal(await restored.sandbox.readFile("evidence.txt", allowTestOperation), "original");
+  assert.match(await readFile(join(directory, "sessions", target.session.id, "sandbox", "owner.gitconfig"), "utf8"), /Alice Current/);
+  await restored.consumeTicket({ ...oldTicket, sessionId: target.session.id });
+  await restored.submit({ ...await ticket(target.session.id, "submit"), policyVersion }, { requestId: "target-write", content: "TEST_WRITE evidence.txt\nnew session" }, "write");
+  await idle(restored);
+  assert.equal(await source.sandbox.readFile("evidence.txt", allowTestOperation), "original");
+  await restoredService.close();
+});
+
+test("restore checks actual paused pi tasks, not only a manifest claiming idle", { skip: process.platform !== "linux" }, async t => {
+  const { service, directory } = await fixture(t);
+  const source = binding("hidden-task-source");
+  const rootDir = join(directory, "hidden-task-stage");
+  await mkdir(rootDir, { mode: 0o700 });
+  const storage = await openNodeSqliteStorage(join(rootDir, "session.sqlite"));
+  const harness = await Harness.open(storage, { models: runnerModels(source.model, true), registry: createRegistry() }, context);
+  const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: source.model.modelId } } });
+  const manifest = { binding: source, branches: [{ id: root.id, mode: "write" as const }], runs: {}, approvals: {}, toolActors: {} };
+  const state = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
+  await root.commit(async tx => { (await tx.doc(state)).json = JSON.stringify(manifest); }, context);
+  await root.submit({ type: "input", content: "TEST_HOLD 5000", requestId: "hidden-live-task" }, context);
+  await harness.close(context);
+  const target = new RunnerSession(binding("hidden-task-target"), rootDir, service.config);
+  await assert.rejects(target.prepareRestore(manifest), /incomplete durable tasks/);
+});
+
 test("queued sandbox effects recheck authority after admission and fail closed on revocation", { skip: process.platform !== "linux" }, async t => {
   const { service } = await fixture(t);
   const session = await service.provision(binding("queue-session"), await ticket("queue-session", "create"));
@@ -196,6 +287,66 @@ test("generic shell requires both explicit test flags and a faux binding", { ski
   await assert.rejects(real.createApproval("test:alice", operation), /quota-backed/);
   const noFaux = new RunnerSession(binding("shell-no-faux"), join(directory, "shell-no-faux"), { ...service.config, allowFaux: false });
   await assert.rejects(noFaux.createApproval("test:alice", operation), /quota-backed/);
+});
+
+test("connected writes durably bind Worker admission to every model approval without exposing it to the model", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const connectorId = "proof-connector";
+  const target = binding("proof-session");
+  target.session.connectorId = target.model.connectorId = connectorId;
+  target.session.connectorOwnerId = target.model.connectorOwnerId = "test:host";
+  const connected = new RunnerService({ ...service.config, connectorId, resolveModels: async model => {
+    const models = createModels();
+    const faux = fauxProvider({ models: [{ id: model.modelId }] });
+    faux.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("git_commit", { message: "Review this commit" }),
+        fauxToolCall("bash", { command: "true" }),
+        fauxToolCall("github_comment", { repository: "example/repo", issue: 1, body: "Review this comment" }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Approval requests recorded."),
+    ]);
+    models.setProvider(faux.provider);
+    return { models, provider: model.provider, modelId: model.modelId };
+  } });
+  await connected.initialize();
+  t.after(() => connected.close());
+  const session = await connected.provision(target, { ...await ticket(target.session.id, "create"), connectorId });
+  const writer = { ...await ticket(target.session.id, "submit", "test:bob"), connectorId };
+  const admissionId = await sha256("opaque Worker-issued write admission");
+  const input = { content: "Request the three reviews.", requestId: "proof-request", admissionId };
+  await assert.rejects(session.submit(writer, { content: input.content, requestId: input.requestId }, "write"), /Worker write admission/);
+  await assert.rejects(session.submit(writer, { ...input, admissionId: "malformed" }, "write"), /Worker write admission/);
+  await assert.rejects(session.submit({ ...writer, action: "ask" }, input, "ask"), /Worker write admission/);
+  const receipt = await session.submit(writer, input, "write");
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.approvals.length, 3);
+  assert.ok(view.approvals.every(approval => approval.requestedBy === "test:bob" && approval.admissionId === admissionId));
+  assert.deepEqual(view.approvals.map(approval => approval.operation.kind).sort(), ["bash", "git.commit", "github.comment"]);
+  assert.ok(view.entries.every(entry => !entry.text.includes(admissionId)), "proof must not appear in user, tool-result, or model transcript content");
+  const explicit = await session.createApproval("test:bob", { kind: "github.comment", repository: "example/repo", issue: 2, body: "Explicit operation" });
+  assert.equal(explicit.admissionId, undefined, "explicit operations use the Worker's authenticated-request pin instead");
+  await session.restart();
+  assert.equal((await session.submit(writer, input, "write")).submissionId, receipt.submissionId);
+  await assert.rejects(session.submit(writer, { ...input, admissionId: await sha256("replacement proof") }, "write"), /different Worker admission/);
+  const backup = await session.backup({ ...await ticket(target.session.id, "backup"), connectorId });
+  assert.equal(backup.manifest.runs[receipt.submissionId]!.admissionId, admissionId);
+  assert.ok((await session.view()).approvals.filter(approval => approval.id !== explicit.id).every(approval => approval.admissionId === admissionId));
+  await connected.close();
+  const snapshot = JSON.stringify(backup);
+  const restoredBinding = structuredClone(target);
+  restoredBinding.session.id = "proof-restored";
+  const restore: RestoreDescriptor = { id: "proof-restore", sourceSessionId: target.session.id, backupId: "proof-backup", size: Buffer.byteLength(snapshot), sha256: await sha256(snapshot), downloadToken: "scoped-proof-restore-capability" };
+  const recoveredService = new RunnerService({ ...connected.config, readBackup: async () => new TextEncoder().encode(snapshot) });
+  await recoveredService.initialize();
+  t.after(() => recoveredService.close());
+  await recoveredService.restore({ binding: restoredBinding, restore }, { ...await ticket(restoredBinding.session.id, "restore"), connectorId });
+  const recovered = await recoveredService.get(restoredBinding.session.id);
+  assert.ok((await recovered.view()).approvals.every(approval => approval.status === "interrupted" && approval.admissionId === undefined));
+  const restoredBackup = await recovered.backup({ ...await ticket(restoredBinding.session.id, "backup"), connectorId });
+  assert.equal(restoredBackup.manifest.runs[receipt.submissionId]!.admissionId, undefined, "restoring history never transfers source admission authority");
+  await recoveredService.close();
 });
 
 test("kernel runner lease admits one owner and releases without deleting stale files", { skip: process.platform !== "linux" }, async t => {

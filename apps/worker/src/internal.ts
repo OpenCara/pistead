@@ -3,11 +3,14 @@ import type { AuthorizationResult, Permission } from '../../../packages/shared/s
 import { permissions } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
-import type { WorkerEnv } from './types.js';
+import type { AppContext, SessionRow, WorkerEnv } from './types.js';
 import { auditStatement, getUser, sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, now, text, userIdentifier } from './http.js';
 import { parseOperation } from './operations.js';
 import { decryptToken } from './vault.js';
+import { authenticateConnector, requireConnectorSession } from './connectors.js';
+import { legacyRestoreDownload } from './restore-routes.js';
+import { requireBrokerReview } from './approval-reviews.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   const configured = c.env.RUNNER_SHARED_SECRET;
@@ -21,19 +24,33 @@ const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => 
 
 export function registerInternal(app: Hono<WorkerEnv>): void {
   app.use('/api/internal/*', internalAuthentication);
-  app.post('/api/internal/authorize', async c => {
+  app.post('/api/internal/authorize', c => authorizeSession(c, null));
+  app.post('/api/internal/github/comment', c => githubComment(c, null));
+  app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
+}
+
+async function callbackScope(c: AppContext, row: SessionRow, connectorId: string | null): Promise<void> {
+  if (connectorId) {
+    const connector = await authenticateConnector(c);
+    if (connector.id !== connectorId) fail(403, 'connector_binding_mismatch', 'Connector scope changed.');
+    await requireConnectorSession(c.env, connectorId, row, connector.connection_hash!);
+  } else if (row.connector_id) fail(403, 'connector_scope_required', 'Use the connector-scoped callback.');
+}
+
+export async function authorizeSession(c: AppContext, connectorId: string | null): Promise<Response> {
     const input = await jsonObject(c, 4096);
     const sessionId = identifier(input.sessionId, 'sessionId');
     const actorId = userIdentifier(input.actorId, 'actorId');
     const ownerId = userIdentifier(input.ownerId, 'ownerId');
     if (!permissions.includes(input.permission as Permission)) fail(400, 'invalid_permission', 'Invalid permission.');
     const access = await sessionAccess(c.env, sessionId, actorId);
+    if (access) await callbackScope(c, access.row, connectorId);
     const allowed = !!access && access.row.owner_id === ownerId && access.row.status !== 'archived' && hasPermission(access.permissions, input.permission as Permission);
     const result: AuthorizationResult = { allowed, policyVersion: access?.row.policy_version ?? 0, ownerId: access?.row.owner_id ?? '' };
     return c.json(result);
-  });
+}
 
-  app.post('/api/internal/github/comment', async c => {
+export async function githubComment(c: AppContext, connectorId: string | null): Promise<Response> {
     const input = await jsonObject(c);
     const sessionId = identifier(input.sessionId, 'sessionId');
     const actorId = userIdentifier(input.actorId, 'actorId');
@@ -59,11 +76,17 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
         approver.row.status === 'archived' || !hasPermission(approver.permissions, 'approve') || !hasPermission(writer.permissions, 'write')) {
       fail(403, 'permission_revoked', 'The operation requester or approver is no longer authorized.');
     }
+    await callbackScope(c, approver.row, connectorId);
+    await requireBrokerReview(c.env, approver.row, approvalId, stored.requested_by, operation);
+    if (await c.env.DB.prepare("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
+      fail(409, 'restore_pending', 'Session restoration is not complete.');
+    }
     const owner = await getUser(c.env, approver.row.owner_id);
     if (!owner || owner.auth_kind !== 'github' || !owner.github_id) fail(409, 'github_not_connected', 'The session owner has no real GitHub connection.');
     const vault = await c.env.DB.prepare('SELECT ciphertext FROM github_tokens WHERE user_id = ?').bind(owner.id).first<{ ciphertext: string }>();
     if (!vault) fail(409, 'github_not_connected', 'The session owner has no GitHub connection.');
     const accessToken = await decryptToken(c.env, owner.id, vault.ciphertext);
+    await callbackScope(c, approver.row, connectorId);
     // Consume before the network effect. A timeout is ambiguous, not permission to replay a comment.
     const consumed = await c.env.DB.prepare(`UPDATE broker_capabilities SET consumed_at = ?
       WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?
@@ -71,6 +94,18 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
       RETURNING token_hash`).bind(now(), tokenHash, Math.floor(Date.now() / 1000), sessionId, owner.id, approver.row.policy_version, 'archived').first();
     if (!consumed) fail(409, 'capability_consumed', 'This capability was consumed, expired, or revoked. Do not retry the external effect.');
     await auditStatement(c.env, actorId, 'github.comment.attempted', approver.row.workspace_id, sessionId, { approvalId, requestedBy: stored.requested_by, actingAs: owner.id }).run();
+    // An audit write is an await boundary too: refresh both human and host authority before the effect.
+    const [freshApprover, freshWriter] = await Promise.all([
+      sessionAccess(c.env, sessionId, actorId), sessionAccess(c.env, sessionId, stored.requested_by),
+    ]);
+    if (!freshApprover || !freshWriter || freshApprover.row.status === 'archived' ||
+        freshApprover.row.policy_version !== approver.row.policy_version ||
+        freshWriter.row.policy_version !== approver.row.policy_version ||
+        !hasPermission(freshApprover.permissions, 'approve') || !hasPermission(freshWriter.permissions, 'write')) {
+      fail(403, 'permission_revoked', 'Operation authority changed. The capability remains consumed.');
+    }
+    await callbackScope(c, freshApprover.row, connectorId);
+    await requireBrokerReview(c.env, freshApprover.row, approvalId, stored.requested_by, operation);
     const [repositoryOwner, repositoryName] = operation.repository.split('/');
     const url = new URL(`https://api.github.com/repos/${encodeURIComponent(repositoryOwner)}/${encodeURIComponent(repositoryName)}/issues/${operation.issue}/comments`);
     let response: Response;
@@ -99,5 +134,4 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
     await auditStatement(c.env, actorId, 'github.comment.completed', approver.row.workspace_id, sessionId, { approvalId, commentId: result.id, actingAs: owner.id }).run();
     // Never return the upstream body, headers, vault ciphertext, or plaintext credentials.
     return c.json({ id: result.id, url: resultURL.href });
-  });
 }

@@ -9,10 +9,12 @@
     "dev": "vite --config apps/web/vite.config.ts",
     "dev:worker": "wrangler dev --config apps/worker/wrangler.jsonc",
     "dev:runner": "node --env-file-if-exists=apps/runner/.env --import tsx apps/runner/src/index.ts",
+    "connect": "node --import tsx apps/runner/src/connect-cli.ts",
     "build": "vite build --config apps/web/vite.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:integration": "node --import tsx tests/integration.ts",
+    "test:connected": "node --import tsx tests/run-connected-integration.ts",
     "deploy": "pnpm build && wrangler deploy --config apps/worker/wrangler.jsonc",
     "db:migrate:local": "wrangler d1 migrations apply DB --local --config apps/worker/wrangler.jsonc",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote --config apps/worker/wrangler.jsonc"
@@ -20,6 +22,7 @@
   "dependencies": {
     "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@earendil-works/pi-durable": "1.0.0",
     "@hono/node-server": "1.19.11",
     "hono": "4.12.8",

@@ -21,7 +21,7 @@ export function permissionFor(action: RunnerAction): Permission {
   if (action === "submit" || action === "operations" || action === "create") return "write";
   if (action === "ask") return "ask";
   if (action === "approve") return "approve";
-  if (action === "restart" || action === "backup") return "manage";
+  if (action === "restart" || action === "backup" || action === "restore") return "manage";
   return "read";
 }
 export async function verifyRunnerTicket(token: string, secret: string, action: RunnerAction, sessionId: string, body: string, now = Date.now()): Promise<RunnerTicket> {
@@ -33,15 +33,21 @@ export async function verifyRunnerTicket(token: string, secret: string, action: 
     || typeof ticket.jti !== "string" || !ticket.jti) throw new RunnerError(401, "Ticket scope or expiry mismatch");
   return ticket;
 }
-export function validateBinding(value: unknown, id: string): RunnerBinding {
+export function validateBinding(value: unknown, id: string, allowNativeModels = false): RunnerBinding {
   const b = value as RunnerBinding;
   if (!b || b.session?.id !== id || b.session.ownerId !== b.owner?.id || b.session.agentVersionId !== b.agent?.id || b.agent.modelId !== b.model?.id
     || !Number.isSafeInteger(b.agent.version) || b.agent.version < 1 || !Number.isSafeInteger(b.session.policyVersion)
-    || !["faux", "openai", "anthropic"].includes(b.model?.provider) || typeof b.model.modelId !== "string" || !b.model.modelId
+    || typeof b.model?.provider !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(b.model.provider)
+    || (!["faux", "openai", "anthropic"].includes(b.model.provider) && !(allowNativeModels && b.session.connectorId))
+    || typeof b.model.modelId !== "string" || !b.model.modelId || b.model.modelId.length > 200 || /[\0\r\n]/.test(b.model.modelId)
     || !Array.isArray(b.agent.tools) || typeof b.agent.instructions !== "string"
     || typeof b.owner.gitName !== "string" || typeof b.owner.gitEmail !== "string" || /[\r\n\0]/.test(b.owner.gitName + b.owner.gitEmail)
     || !b.owner.gitName || !b.owner.gitEmail) throw new RunnerError(400, "Invalid immutable runner binding");
   if (!b.owner.id || b.owner.id.length > 200) throw new RunnerError(400, "Invalid owner");
+  if (b.session.workspaceId !== b.model.workspaceId || (b.agent.workspaceId !== null && b.agent.workspaceId !== b.session.workspaceId)
+    || b.session.connectorId !== b.model.connectorId || b.session.connectorOwnerId !== b.model.connectorOwnerId)
+    throw new RunnerError(400, "Invalid runner workspace or connector binding");
+  if (b.session.connectorId !== undefined) assertId(b.session.connectorId);
   b.owner.env = validateUserEnv(b.owner.env ?? {});
   return JSON.parse(JSON.stringify(b));
 }

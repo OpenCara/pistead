@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { sha256 } from "../packages/shared/src/crypto.js";
 import type { AgentVersion, ApprovalRecord, ModelDefinition, SessionRecord, SessionView, SubmitResult, UserProfile, Workspace } from "../packages/shared/src/types.js";
+import type { ConnectorInfo, ConnectorPairing } from "../packages/shared/src/connector.js";
+import { createConnector } from "../apps/runner/src/connector.js";
+import { createFauxLocalModels } from "../apps/runner/src/local-pi.js";
 
 const base = (process.env.APP_URL ?? "http://localhost:8787").replace(/\/$/, "");
+const connectedRuntime = process.env.CONNECTED_RUNTIME === "true";
 const testSecret = process.env.TEST_AUTH_SECRET;
 if (!testSecret) throw new Error("TEST_AUTH_SECRET is required; test authentication must be explicitly enabled with an expiry");
 const run = `e2e-${Date.now().toString(36)}`;
@@ -77,6 +84,61 @@ let aliceSession: SessionRecord;
 let bobSession: SessionRecord;
 let requestId = "";
 let firstSubmission: SubmitResult;
+type ConnectorFixture = { id: string; token: string; connectionToken: string; stop: () => Promise<void> };
+const connectorFixtures: ConnectorFixture[] = [];
+let aliceConnector: ConnectorFixture | undefined;
+let bobConnector: ConnectorFixture | undefined;
+let bobLocalSession: SessionRecord | undefined;
+
+async function connectFixture(client: Client): Promise<ConnectorFixture> {
+  const pairing: ConnectorPairing = (await client.request("POST", "/api/connectors/pairings", { name: `${client.name} Pi ${run}` })).pairing;
+  const dataDir = await mkdtemp(join(tmpdir(), "opencara-connector-e2e-"));
+  const fixture: ConnectorFixture = { id: "", token: "", connectionToken: "", stop: async () => {} };
+  const observeFetch: typeof fetch = async (input, init) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    const generationToken = headers.get("x-connection-token");
+    if (generationToken) fixture.connectionToken = generationToken;
+    const response = await fetch(input, init);
+    if (url.endsWith(`/api/connectors/pairings/${pairing.id}/claim`) && response.ok) {
+      const { credentials } = await response.clone().json() as { credentials: { connectorId: string; token: string } };
+      fixture.id = credentials.connectorId;
+      fixture.token = credentials.token;
+    }
+    return response;
+  };
+  const connector = createConnector({
+    server: base, dataDir, pairing: { id: pairing.id, code: pairing.code },
+    localModels: createFauxLocalModels("faux-1"), allowFaux: true, allowTestShell: true,
+    allowInsecureLoopback: base.startsWith("http://"), fetch: observeFetch,
+  });
+  fixture.stop = async () => { await connector.stop(); await rm(dataDir, { recursive: true, force: true }); };
+  connectorFixtures.push(fixture);
+  await connector.start();
+  assert.ok(fixture.id && fixture.token && fixture.connectionToken);
+  const owned = await client.request("GET", "/api/connectors");
+  const info: ConnectorInfo = owned.connectors.find((item: ConnectorInfo) => item.id === fixture.id);
+  assert.equal(info.ownerId, client.user.id);
+  assert.equal(info.online, true);
+  assert.ok(!JSON.stringify(owned).includes(fixture.token), "connector credentials must never enter public metadata");
+  const replay = await fetch(`${base}/api/connectors/pairings/${pairing.id}/claim`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code: pairing.code, models: [{ provider: "faux", modelId: "faux-1", name: "Fixture" }],
+      capabilities: { platform: process.platform, sandbox: true, productionShell: false } }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  assert.ok([400, 401, 403, 409].includes(replay.status), "pairing code must be single-use");
+  await replay.body?.cancel();
+  const impersonation = await fetch(`${base}/api/me`, { headers: { authorization: `Bearer ${fixture.token}` } });
+  assert.equal(impersonation.status, 401, "connector bearer cannot authenticate as a user");
+  await impersonation.body?.cancel();
+  const global = await fetch(`${base}/api/internal/authorize`, {
+    method: "POST", headers: { authorization: `Bearer ${fixture.token}`, "content-type": "application/json" }, body: "{}",
+  });
+  assert.ok([401, 503].includes(global.status), "connector bearer cannot enter the global internal API");
+  await global.body?.cancel();
+  return fixture;
+}
 
 await check("unauthenticated APIs fail closed; test accounts are explicit and isolated", async () => {
   await new Client("anonymous").request("GET", "/api/sessions", undefined, [401]);
@@ -88,11 +150,32 @@ await check("unauthenticated APIs fail closed; test accounts are explicit and is
   await alice.request("PATCH", "/api/me", { env: { APP_API_KEY: "not-a-real-key" } }, [400]);
 });
 
+if (connectedRuntime) {
+  await check("user-owned Pi connections pair once and never receive global or user authority", async () => {
+    aliceConnector = await connectFixture(alice);
+    bobConnector = await connectFixture(bob);
+    assert.notEqual(aliceConnector.id, bobConnector.id);
+    const owned = (await bob.request("GET", "/api/connectors")).connectors as ConnectorInfo[];
+    assert.ok(!owned.some(connection => connection.id === aliceConnector!.id));
+  });
+}
+
 await check("workspace membership and model administration are enforced", async () => {
   workspace = (await alice.request("POST", "/api/workspaces", { name: `Integration ${run}` })).workspace;
   await bob.request("GET", `/api/workspaces/${workspace.id}/agents`, undefined, [403, 404]);
   await alice.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: "member" });
-  model = (await alice.request("POST", `/api/workspaces/${workspace.id}/models`, { name: "Deterministic integration fixture", provider: "faux", modelId: "faux-1" })).model;
+  if (connectedRuntime) {
+    assert.equal((await bob.request("GET", `/api/workspaces/${workspace.id}/connectors`)).connectors.length, 0);
+    await bob.request("PUT", `/api/connectors/${aliceConnector!.id}/shares/${workspace.id}`, {}, [403, 404]);
+    await alice.request("PUT", `/api/connectors/${aliceConnector!.id}/shares/${workspace.id}`, {});
+    await bob.request("PUT", `/api/connectors/${bobConnector!.id}/shares/${workspace.id}`, {});
+    const models: ModelDefinition[] = (await alice.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
+    model = models.find(item => item.connectorId === aliceConnector!.id && item.modelId === "faux-1")!;
+    assert.ok(model, "shared local model must be discovered without cloud provider configuration");
+    await eve.request("GET", `/api/workspaces/${workspace.id}/connectors`, undefined, [403, 404]);
+  } else {
+    model = (await alice.request("POST", `/api/workspaces/${workspace.id}/models`, { name: "Deterministic integration fixture", provider: "faux", modelId: "faux-1" })).model;
+  }
   await bob.request("POST", `/api/workspaces/${workspace.id}/models`, { name: "Forbidden", provider: "faux", modelId: "faux-1" }, [403]);
   await eve.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: eve.user.id, role: "admin" }, [403, 404]);
 });
@@ -111,7 +194,17 @@ await check("private agents remain private; publishing exposes definition, not a
 
 await check("the same published agent starts distinct owner-bound sessions", async () => {
   aliceSession = (await alice.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Alice's session" })).session;
-  bobSession = (await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Bob's session" })).session;
+  if (connectedRuntime) {
+    await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Missing host trust" }, [400, 403]);
+  }
+  bobSession = (await bob.request("POST", "/api/sessions", {
+    workspaceId: workspace.id, agentVersionId: published.id, title: "Bob's session",
+    ...(connectedRuntime ? { trustedConnectorId: aliceConnector!.id } : {}),
+  })).session;
+  if (connectedRuntime) {
+    assert.equal(bobSession.connectorId, aliceConnector!.id);
+    assert.equal(bobSession.connectorOwnerId, alice.user.id);
+  }
   assert.equal(aliceSession.ownerId, alice.user.id);
   assert.equal(bobSession.ownerId, bob.user.id);
   assert.equal(aliceSession.agentVersionId, bobSession.agentVersionId);
@@ -128,6 +221,22 @@ await check("the same published agent starts distinct owner-bound sessions", asy
   const visible: SessionRecord[] = (await alice.request("GET", "/api/sessions")).sessions;
   assert.ok(!visible.some((session) => session.id === bobSession.id));
 });
+
+if (connectedRuntime) {
+  await check("concurrent views and submissions keep the shared connector generation stable", async () => {
+    const generation = aliceConnector!.connectionToken;
+    const [aliceView, bobView] = await Promise.all([
+      alice.view(aliceSession.id),
+      bob.view(bobSession.id),
+      alice.submit(aliceSession.id, "TEST_IDENTITY"),
+      bob.submit(bobSession.id, "TEST_IDENTITY"),
+    ]);
+    assert.equal(aliceView.owner.id, alice.user.id);
+    assert.equal(bobView.owner.id, bob.user.id);
+    await Promise.all([alice.settled(aliceSession.id), bob.settled(bobSession.id)]);
+    assert.ok(generation === aliceConnector!.connectionToken, "Ordinary concurrent requests must not replace the connector generation");
+  });
+}
 
 await check("publishing an update cannot silently change existing sessions or grant author access", async () => {
   await bob.request("POST", `/api/agents/${published.agentId}/versions`, { name: "Hijack", description: "", instructions: "Replace another author's agent", tools: ["identity"], modelId: model.id }, [403, 404]);
@@ -181,11 +290,12 @@ await check("collaborative writes execute as owner; another user's worktree stay
 await check("write access does not grant approval; approved git commits use owner identity", async () => {
   const approval: ApprovalRecord = (await bob.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "git.commit", message: `Integration ${run}` })).approval;
   assert.equal(approval.status, "pending");
-  await bob.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve" }, [403]);
-  const decided: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve" })).approval;
+  assert.ok(approval.reviewHash, "the Worker must commit to the displayed operation and requester");
+  await bob.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve", reviewHash: approval.reviewHash }, [403]);
+  const decided: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve", reviewHash: approval.reviewHash })).approval;
   assert.ok(["approved", "executing", "executed"].includes(decided.status));
   const query: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "bash", command: "git log -1 --format='%an <%ae>|%cn <%ce>'" })).approval;
-  const inspected: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${query.id}`, { decision: "approve" })).approval;
+  const inspected: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${query.id}`, { decision: "approve", reviewHash: query.reviewHash })).approval;
   assert.ok(inspected.result?.includes("Alice Integration <alice@example.invalid>"), "git commit author and committer must use owner identity");
 });
 
@@ -201,6 +311,39 @@ await check("durable request deduplication and restart preserve transcript and o
   await alice.submit(aliceSession.id, "TEST_READ evidence.txt");
   const view = await alice.settled(aliceSession.id, "owned-by-alice");
   assert.equal(view.owner.id, alice.user.id);
+});
+
+await check("durable FIFO submissions retain stable receipts and survive restart", async () => {
+  await alice.submit(aliceSession.id, "TEST_HOLD 5000");
+  const firstKey = `queue-first-${run}`;
+  const lastKey = `queue-last-${run}`;
+  const first = await bob.submit(aliceSession.id, "TEST_WRITE queue.txt\nfifo-first", "submit", firstKey);
+  const last = await alice.submit(aliceSession.id, "TEST_WRITE queue.txt\nfifo-last", "submit", lastKey);
+  assert.equal(first.status, "queued");
+  assert.equal(last.status, "queued");
+  const replay = await bob.submit(aliceSession.id, "TEST_WRITE queue.txt\nfifo-first", "submit", firstKey);
+  assert.equal(replay.submissionId, first.submissionId);
+  await alice.request("POST", `/api/sessions/${aliceSession.id}/restart`, {});
+  await alice.settled(aliceSession.id);
+  const completed = await bob.submit(aliceSession.id, "TEST_WRITE queue.txt\nfifo-first", "submit", firstKey);
+  assert.equal(completed.submissionId, first.submissionId);
+  await alice.submit(aliceSession.id, "TEST_READ queue.txt");
+  const view = await alice.settled(aliceSession.id, "fifo-last");
+  const results = view.entries.filter(entry => entry.conversationId === first.conversationId && (entry.role === "tool" || entry.kind === "pi.tool-result"));
+  assert.ok(results.at(-1)?.text.includes("fifo-last"), "later FIFO write must win");
+});
+
+await check("queued work is reauthorized and revoked writers cannot delay later owner work", async () => {
+  await alice.submit(aliceSession.id, "TEST_HOLD 5000");
+  const revoked = await bob.submit(aliceSession.id, "TEST_WRITE revoked-queue.txt\nmust-not-run", "submit", `revoked-queue-${run}`);
+  assert.equal(revoked.status, "queued");
+  await alice.request("POST", `/api/sessions/${aliceSession.id}/grants`, { userId: bob.user.id, permissions: ["read"] });
+  await alice.submit(aliceSession.id, "TEST_WRITE after-revocation.txt\nowner-queue-continued");
+  await alice.settled(aliceSession.id, "owner-queue-continued");
+  const read = await alice.submit(aliceSession.id, "TEST_READ revoked-queue.txt");
+  const view = await alice.settled(aliceSession.id);
+  const results = view.entries.filter(entry => entry.conversationId === read.conversationId && (entry.role === "tool" || entry.kind === "pi.tool-result"));
+  assert.ok(!results.some(entry => entry.text.includes("must-not-run")));
 });
 
 await check("revocation closes existing streams and blocks subsequent requests", async () => {
@@ -249,6 +392,38 @@ if (!health.backupsConfigured && process.env.ALLOW_MISSING_BACKUPS === "true") {
     assert.equal(snapshot.binding.owner.id, alice.user.id);
     assert.equal(Buffer.from(snapshot.sqlite, "base64").subarray(0, 15).toString(), "SQLite format 3");
   });
+  await check("backup restoration creates an owner-only independent session with an idempotent receipt", async () => {
+    const { backups } = await alice.request("GET", `/api/sessions/${aliceSession.id}/backups`);
+    const backup = backups[0];
+    assert.ok(backup?.id);
+    await alice.request("POST", `/api/sessions/${aliceSession.id}/grants`, { userId: bob.user.id, permissions: ["manage"] });
+    const restorePath = `/api/sessions/${aliceSession.id}/backups/${backup.id}/restore`;
+    const input = { requestId: `restore-${run}`, title: "Restored owner session" };
+    await bob.request("POST", restorePath, input, [403]);
+    await bob.request("GET", `/api/sessions/${aliceSession.id}/backups/${backup.id}/download`, undefined, [403]);
+    const sourceBefore = await alice.view(aliceSession.id);
+    await alice.request("PATCH", "/api/me", { gitName: "Alice Restored" });
+    const restored: SessionRecord = (await alice.request("POST", restorePath, input)).session;
+    assert.notEqual(restored.id, aliceSession.id);
+    assert.equal(restored.ownerId, alice.user.id);
+    assert.equal(restored.agentVersionId, aliceSession.agentVersionId);
+    assert.equal(restored.connectorId, aliceSession.connectorId);
+    const retry = await alice.request("POST", restorePath, input);
+    assert.equal(retry.session.id, restored.id);
+    await alice.request("POST", restorePath, { ...input, title: "Conflicting retry" }, [409]);
+    await bob.request("GET", `/api/sessions/${restored.id}/view`, undefined, [403, 404]);
+    await alice.submit(restored.id, "TEST_READ evidence.txt");
+    const restoredView = await alice.settled(restored.id, "owned-by-alice");
+    assert.equal(restoredView.owner.gitName, "Alice Restored");
+    assert.ok(restoredView.approvals.every(approval => !["pending", "approved", "executing"].includes(approval.status)));
+    await alice.submit(restored.id, "TEST_WRITE evidence.txt\nrestored-is-independent");
+    await alice.settled(restored.id);
+    await alice.submit(aliceSession.id, "TEST_READ evidence.txt");
+    const sourceAfter = await alice.settled(aliceSession.id, "owned-by-alice");
+    assert.equal(sourceAfter.owner.gitName, sourceBefore.owner.gitName);
+    assert.ok(!sourceAfter.entries.some(entry => entry.text.includes("restored-is-independent")));
+    await alice.request("DELETE", `/api/sessions/${aliceSession.id}/grants/${encodeURIComponent(bob.user.id)}`);
+  });
 }
 
 await check("audit history is visible only to authorized session participants", async () => {
@@ -257,4 +432,51 @@ await check("audit history is visible only to authorized session participants", 
   await eve.request("GET", `/api/sessions/${aliceSession.id}/audit`, undefined, [403, 404]);
 });
 
-console.log(JSON.stringify({ target: base, mode: "deterministic-pi-faux", status: report.every(item => item.status === "passed") ? "passed" : "partial", assertions, checks: report, fixtures: { workspaceId: workspace!.id, aliceSessionId: aliceSession!.id, bobSessionId: bobSession!.id }, limitations: ["No real LLM calls billed", "GitHub OAuth and remote writes need a configured OAuth application and real user consent"] }, null, 2));
+if (connectedRuntime) {
+  await check("connector callbacks cannot authorize another host's sessions or fabricate GitHub approvals", async () => {
+    const models: ModelDefinition[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
+    const localModel = models.find(item => item.connectorId === bobConnector!.id)!;
+    assert.ok(localModel);
+    const privateAgent: AgentVersion = (await bob.request("POST", "/api/agents", {
+      name: "Bob local fixture", description: "", instructions: "Use the owner's identity.", tools: ["identity"], modelId: localModel.id,
+    })).agent;
+    const shared: AgentVersion = (await bob.request("POST", `/api/agents/${privateAgent.agentId}/publish`, { workspaceId: workspace.id })).agent;
+    bobLocalSession = (await bob.request("POST", "/api/sessions", {
+      workspaceId: workspace.id, agentVersionId: shared.id, title: "Bob's separate host",
+    })).session;
+    assert.ok(bobLocalSession);
+    const headers = { authorization: `Bearer ${aliceConnector!.token}`, "x-connection-token": aliceConnector!.connectionToken, "content-type": "application/json" };
+    const crossHost = await fetch(`${base}/api/connectors/self/authorize`, {
+      method: "POST", headers, body: JSON.stringify({ sessionId: bobLocalSession.id, actorId: bob.user.id, ownerId: bob.user.id, permission: "read" }),
+    });
+    if (crossHost.ok) assert.equal((await crossHost.json() as { allowed: boolean }).allowed, false);
+    else { assert.ok([403, 404].includes(crossHost.status)); await crossHost.body?.cancel(); }
+    const fabricated = await fetch(`${base}/api/connectors/self/github/comment`, {
+      method: "POST", headers, body: JSON.stringify({
+        sessionId: aliceSession.id, actorId: alice.user.id, approvalId: crypto.randomUUID(), capability: "not-a-real-capability-with-sufficient-length",
+        repository: "fixture/repository", issue: 1, body: "Must never reach GitHub",
+      }),
+    });
+    assert.equal(fabricated.status, 403);
+    await fabricated.body?.cancel();
+  });
+  await check("unsharing and revoking a connection remove its runtime access without affecting other hosts", async () => {
+    await alice.request("DELETE", `/api/connectors/${aliceConnector!.id}/shares/${workspace.id}`, undefined, [204]);
+    await bob.request("GET", `/api/sessions/${bobSession.id}/view`, undefined, [403, 404, 503]);
+    const shared: ConnectorInfo[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/connectors`)).connectors;
+    assert.ok(!shared.some(connection => connection.id === aliceConnector!.id));
+    assert.ok(shared.some(connection => connection.id === bobConnector!.id));
+    await alice.request("DELETE", `/api/connectors/${aliceConnector!.id}`, undefined, [204]);
+    const revoked = await fetch(`${base}/api/connectors/self/authorize`, {
+      method: "POST", headers: { authorization: `Bearer ${aliceConnector!.token}`, "x-connection-token": aliceConnector!.connectionToken, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: aliceSession.id, actorId: alice.user.id, ownerId: alice.user.id, permission: "read" }),
+    });
+    assert.ok([401, 403].includes(revoked.status));
+    await revoked.body?.cancel();
+    await bob.submit(bobLocalSession!.id, "TEST_IDENTITY");
+    await bob.settled(bobLocalSession!.id, "bob-test");
+  });
+}
+await Promise.all(connectorFixtures.map(connector => connector.stop()));
+
+console.log(JSON.stringify({ target: base, mode: connectedRuntime ? "connected-pi-faux" : "deterministic-pi-faux", status: report.every(item => item.status === "passed") ? "passed" : "partial", assertions, checks: report, fixtures: { workspaceId: workspace!.id, aliceSessionId: aliceSession!.id, bobSessionId: bobSession!.id }, limitations: ["No real LLM calls billed", "GitHub OAuth and remote writes need a configured OAuth application and real user consent"] }, null, 2));

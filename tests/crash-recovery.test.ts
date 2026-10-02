@@ -330,7 +330,7 @@ test("SIGKILL runner reopens pi SQLite, resumes pending generation, and preserve
 
     const holdInput = { requestId: randomUUID(), content: "TEST_HOLD 5000" };
     const holdReceipt = await submit(holdInput);
-    assert.equal(holdReceipt.status, "running");
+    assert.ok(["queued", "running"].includes(holdReceipt.status), "The durable receipt may precede model activation");
     const pending = await waitForView("Hold was not placed in the persisted pi transcript", value =>
       value.busy && value.entries.some(entry => entry.role === "user" && entry.text === holdInput.content), 3000);
     assert.equal(pending.entries.some(entry => entry.role === "assistant" && entry.text === heldText), false);

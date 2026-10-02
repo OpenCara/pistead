@@ -12,7 +12,8 @@ export function userProfile(row: UserRow): UserProfile {
     gitName: row.git_name, gitEmail: row.git_email, env: JSON.parse(row.env_json), githubConnected: row.auth_kind === 'github' && !!row.github_connected };
 }
 export function modelDefinition(row: ModelRow): ModelDefinition {
-  return { id: row.id, workspaceId: row.workspace_id, name: row.name, provider: row.provider, modelId: row.model_id };
+  return { id: row.id, workspaceId: row.workspace_id, name: row.name, provider: row.provider, modelId: row.model_id,
+    ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}) };
 }
 export function agentVersion(row: AgentRow): AgentVersion {
   return { id: row.id, agentId: row.agent_id, authorId: row.author_id, workspaceId: row.workspace_id, version: row.version,
@@ -21,6 +22,7 @@ export function agentVersion(row: AgentRow): AgentVersion {
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
+    ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}) };
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {
@@ -53,6 +55,9 @@ export async function requireSession(c: AppContext, sessionId: string, permissio
   if (!access) fail(404, 'not_found', 'Session not found.');
   if (!hasPermission(access.permissions, permission)) fail(403, 'forbidden', `Session ${permission} permission is required.`);
   if (access.row.status === 'archived' && permission !== 'read') fail(409, 'session_archived', 'Session is archived.');
+  if (permission !== 'read' && await c.env.DB.prepare("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
+    fail(409, 'restore_pending', 'Session restoration is not complete.');
+  }
   return access;
 }
 export function auditStatement(env: Env, actorId: string | null, action: string, workspaceId: string | null = null, sessionId: string | null = null, detail: Record<string, unknown> = {}): D1PreparedStatement {

@@ -4,10 +4,11 @@ import { hasPermission } from '../../../packages/shared/src/policy.js';
 import { sessionAccess } from './db.js';
 import type { AppContext, SessionRow } from './types.js';
 import { fail, id, testMode } from './http.js';
+import { connectorRequest } from './connector-transport.js';
 
 const actionPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
-  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage',
+  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write',
 };
 
 export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
@@ -17,7 +18,11 @@ export async function runnerRequest(c: AppContext, row: SessionRow, action: Runn
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && action !== 'view' && action !== 'events') fail(409, 'session_archived', 'Session is archived.');
-  if ((action === 'create' || action === 'restart') && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
+  if ((action === 'create' || action === 'restart' || action === 'restore') && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
+  if (action !== 'restore' && await c.env.DB.prepare("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
+    fail(409, 'restore_pending', 'Session restoration is not complete.');
+  }
+  if (access.row.connector_id) return connectorRequest(c, access.row, action, suffix, body);
   const secret = c.env.RUNNER_SHARED_SECRET;
   if (!secret || secret.length < 32 || !c.env.RUNNER_URL) fail(503, 'runner_unavailable', 'The external runner is not configured.');
   let base: URL;
@@ -30,6 +35,7 @@ export async function runnerRequest(c: AppContext, row: SessionRow, action: Runn
     create: '/v1/sessions', view: `/v1/sessions/${row.id}/view`, events: `/v1/sessions/${row.id}/events`,
     submit: `/v1/sessions/${row.id}/submit`, ask: `/v1/sessions/${row.id}/ask`, operations: `/v1/sessions/${row.id}/operations`,
     approve: `/v1/sessions/${row.id}/approvals/${encodeURIComponent(suffix)}`, backup: `/v1/sessions/${row.id}/backup`, restart: `/v1/sessions/${row.id}/restart`,
+    restore: `/v1/sessions/${row.id}/restore`,
   };
   const serialized = body === undefined ? '' : JSON.stringify(body);
   const issuedAt = Math.floor(Date.now() / 1000);
@@ -44,7 +50,7 @@ export async function runnerRequest(c: AppContext, row: SessionRow, action: Runn
       headers: { Authorization: `Bearer ${authorization}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
       body: body === undefined ? undefined : serialized,
       redirect: 'manual',
-      ...(action === 'events' ? {} : { signal: AbortSignal.timeout(action === 'backup' ? 90000 : 30000) }),
+      ...(action === 'events' ? {} : { signal: AbortSignal.timeout(action === 'backup' || action === 'restore' ? 90000 : 30000) }),
     });
   } catch {
     fail(503, 'runner_unavailable', 'The external runner is unavailable. An accepted operation may still be running; inspect the session before retrying.');

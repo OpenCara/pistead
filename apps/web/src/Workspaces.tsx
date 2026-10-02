@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
-import type { ModelDefinition, UserProfile, Workspace, WorkspaceRole } from "../../../packages/shared/src/types";
+import type { UserProfile, Workspace, WorkspaceRole } from "../../../packages/shared/src/types";
+import { WorkspaceConnections } from "./Connections";
 import { api, segment } from "./api";
 import { Empty, Feedback, PageHeading, ResourceState, useAction, useResource } from "./ui";
 
@@ -29,7 +30,7 @@ export function Workspaces({ user, workspaces, workspace, refresh, select }: { u
 
 function WorkspaceSettings({ user, workspace }: { user: UserProfile; workspace: Workspace }) {
   const admin = workspace.ownerId === user.id || workspace.role === "admin" || workspace.role === "owner";
-  return <div className="split-layout"><Members workspace={workspace} admin={admin} /><Models workspace={workspace} admin={admin} /></div>;
+  return <div className="split-layout"><Members workspace={workspace} admin={admin} /><WorkspaceConnections workspace={workspace} user={user} /></div>;
 }
 
 function Members({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
@@ -49,27 +50,6 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
   return <section className="section"><div className="section-heading"><span className="section-number">02</span><h2>People in {workspace.name}</h2></div><p className="muted">Membership gives access to published agents, not other people's sessions.</p>
     <ResourceState {...resource} retry={resource.refresh}>{resource.data?.members.length === 0 && <Empty title="No members to display">Workspace membership is managed by the owner and admins.</Empty>}<div className="row-list">{resource.data?.members.map(member => <div className="list-row" key={member.userId}><div className="row-main"><h3>{member.displayName || member.githubLogin || member.userId}</h3><p className="metadata">{member.role} / {member.userId}</p></div>{admin && member.userId !== workspace.ownerId && <button className="button danger small" disabled={action.busy} onClick={() => { if (window.confirm(`Remove ${member.displayName || member.userId} from this workspace?`)) void action.run(async () => { await api(`${path}/${segment(member.userId)}`, { method: "DELETE" }); resource.refresh(); }, "Membership removed."); }}>Remove</button>}</div>)}</div></ResourceState>
     {admin ? <form onSubmit={save}><h3>Add or update a member</h3><div className="inline-fields"><label className="field">User ID<input required value={userId} onChange={event => setUserId(event.target.value)} placeholder="Copy from their Profile" /></label><label className="field">Role<select value={role} onChange={event => setRole(event.target.value as "member" | "admin")}><option value="member">Member</option><option value="admin">Admin</option></select></label></div><button className="button secondary" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save membership"}</button></form> : <p className="muted">Only workspace owners and admins can manage membership.</p>}
-    <Feedback {...action} />
-  </section>;
-}
-
-function Models({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
-  const path = `/api/workspaces/${segment(workspace.id)}/models`;
-  const resource = useResource<{ models: ModelDefinition[] }>(path);
-  const [name, setName] = useState("");
-  const [provider, setProvider] = useState<ModelDefinition["provider"]>("openai");
-  const [modelId, setModelId] = useState("");
-  const action = useAction();
-  function create(event: FormEvent) {
-    event.preventDefault();
-    void action.run(async () => {
-      await api(path, { method: "POST", body: { name: name.trim(), provider, modelId: modelId.trim() } });
-      setName(""); setModelId(""); resource.refresh();
-    }, "Model added to the catalog.");
-  }
-  return <section className="section"><div className="section-heading"><span className="section-number">03</span><h2>Model catalog</h2></div><p className="muted">Shared model references, never shared credentials. Provider keys are configured on the runner.</p>
-    <ResourceState {...resource} retry={resource.refresh}>{resource.data?.models.length === 0 && <Empty title="A blank catalog">An admin can add a model before anyone authors an agent.</Empty>}<div className="row-list">{resource.data?.models.map(model => <div className="list-row" key={model.id}><div className="row-main"><h3>{model.name}</h3><p className="metadata">{model.provider} / {model.modelId}</p></div>{model.provider === "faux" && <span className="badge warning">Test model</span>}</div>)}</div></ResourceState>
-    {admin && <form onSubmit={create}><h3>Add a model</h3><label className="field">Catalog name<input required maxLength={120} value={name} onChange={event => setName(event.target.value)} placeholder="Studio reasoning model" /></label><div className="inline-fields"><label className="field">Provider<select value={provider} onChange={event => setProvider(event.target.value as ModelDefinition["provider"])}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="faux">Faux (test environments only)</option></select></label><label className="field">Provider model ID<input required value={modelId} onChange={event => setModelId(event.target.value)} placeholder="Provider's exact model identifier" /></label></div><button className="button secondary" disabled={action.busy || !name.trim() || !modelId.trim()}>{action.busy ? "Adding..." : "Add model"}</button></form>}
     <Feedback {...action} />
   </section>;
 }

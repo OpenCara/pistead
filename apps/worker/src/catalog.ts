@@ -86,7 +86,12 @@ async function requireMemberManagement(
 async function requireModel(env: Env, modelId: string, actorId: string): Promise<ModelRow> {
   const model = await env.DB.prepare(`SELECT m.* FROM models m
     INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
-    WHERE m.id = ?`).bind(actorId, modelId).first<ModelRow>();
+    WHERE m.id = ? AND m.available = 1 AND (m.connector_id IS NULL OR EXISTS (
+      SELECT 1 FROM connectors c JOIN connector_shares s ON s.connector_id = c.id AND s.workspace_id = m.workspace_id
+      JOIN workspace_members host ON host.workspace_id = s.workspace_id AND host.user_id = c.owner_id
+      JOIN users host_user ON host_user.id = c.owner_id
+      WHERE c.id = m.connector_id AND c.revoked_at IS NULL AND (? = 1 OR host_user.auth_kind <> 'test')
+    ))`).bind(actorId, modelId, testMode(env) ? 1 : 0).first<ModelRow>();
   if (!model) fail(404, 'not_found', 'Model not found.');
   return model;
 }
@@ -247,7 +252,12 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     await requireMember(c.env, workspaceId, actorId);
     const result = await c.env.DB.prepare(`SELECT m.* FROM models m
       INNER JOIN workspace_members actor ON actor.workspace_id = m.workspace_id AND actor.user_id = ?
-      WHERE m.workspace_id = ? ORDER BY m.created_at, m.id`).bind(actorId, workspaceId).all<ModelRow>();
+      WHERE m.workspace_id = ? AND m.available = 1 AND (m.connector_id IS NULL OR EXISTS (
+        SELECT 1 FROM connectors c JOIN connector_shares s ON s.connector_id = c.id AND s.workspace_id = m.workspace_id
+        JOIN workspace_members host ON host.workspace_id = s.workspace_id AND host.user_id = c.owner_id
+        JOIN users host_user ON host_user.id = c.owner_id
+        WHERE c.id = m.connector_id AND c.revoked_at IS NULL AND (? = 1 OR host_user.auth_kind <> 'test')
+      )) ORDER BY m.created_at, m.id LIMIT 1000`).bind(actorId, workspaceId, testMode(c.env) ? 1 : 0).all<ModelRow>();
     return c.json({ models: result.results.map(modelDefinition) });
   });
 

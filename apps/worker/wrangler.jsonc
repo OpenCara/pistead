@@ -1,7 +1,7 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "opencara-agent-workspace-dev",
-  "main": "src/index.ts",
+  "main": "src/worker-entry.ts",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
@@ -22,6 +22,10 @@
     "binding": "BUCKET",
     "bucket_name": "opencara-agent-workspace-dev"
   }],
+  "durable_objects": {
+    "bindings": [{ "name": "CONNECTOR_HUB", "class_name": "ConnectorHub" }]
+  },
+  "migrations": [{ "tag": "v1-connectors", "new_sqlite_classes": ["ConnectorHub"] }],
   "vars": {
     "APP_ORIGIN": "https://opencara-agent-workspace-dev.opencara.workers.dev",
     "RUNNER_URL": "",

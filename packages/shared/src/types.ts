@@ -23,8 +23,10 @@ export interface ModelDefinition {
   id: string;
   workspaceId: string;
   name: string;
-  provider: "faux" | "openai" | "anthropic";
+  provider: string;
   modelId: string;
+  connectorId?: string;
+  connectorOwnerId?: string;
 }
 export interface AgentVersion {
   id: string;
@@ -49,6 +51,8 @@ export interface SessionRecord {
   status: "provisioning" | "ready" | "error" | "archived";
   createdAt: string;
   permissions?: Permission[];
+  connectorId?: string;
+  connectorOwnerId?: string;
 }
 export interface SessionGrant {
   userId: string;
@@ -60,7 +64,7 @@ export interface RunnerBinding {
   agent: AgentVersion;
   model: ModelDefinition;
 }
-export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart";
+export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore";
 export interface RunnerTicket {
   aud: "runner";
   sessionId: string;
@@ -72,6 +76,7 @@ export interface RunnerTicket {
   exp: number;
   jti: string;
   bodyHash: string;
+  connectorId?: string;
 }
 export interface AuthorizationRequest {
   sessionId: string;
@@ -97,6 +102,8 @@ export interface ApprovalRecord {
   decidedBy?: string;
   result?: string;
   createdAt: string;
+  admissionId?: string;
+  reviewHash?: string;
 }
 export interface EntryView {
   id: string;
@@ -113,13 +120,16 @@ export interface SessionView {
   approvals: ApprovalRecord[];
   conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
   busy: boolean;
+  queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
 }
 export interface SubmitInput {
   content: string;
   requestId: string;
+  admissionId?: string;
 }
 export interface SubmitResult {
   submissionId: string;
   conversationId: string;
   status: string;
+  queuePosition?: number;
 }

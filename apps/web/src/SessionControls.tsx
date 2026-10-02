@@ -1,10 +1,16 @@
 import { useState, type FormEvent } from "react";
 import { permissions, type ApprovalRecord, type Operation, type Permission, type SessionGrant, type SessionRecord, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
+import { BackupRestore, type Backup } from "./BackupRestore";
 import { Feedback, ResourceState, Timestamp, useAction, useResource } from "./ui";
 
-type Props = { session: SessionRecord; user: UserProfile; onChange: () => void };
-type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string };
+type Props = {
+  session: SessionRecord;
+  user: UserProfile;
+  onChange: () => void;
+  busy?: boolean;
+  openSession?: (id: string) => void;
+};
 type AuditEvent = { id: string; actorId: string; action: string; detail: unknown; createdAt: string };
 
 function detailText(detail: unknown): string {
@@ -15,12 +21,12 @@ function detailText(detail: unknown): string {
   return JSON.stringify(detail, null, 2) ?? "";
 }
 
-export function SessionControls({ session, user, onChange }: Props) {
+export function SessionControls({ session, user, onChange, busy, openSession }: Props) {
   // Reset drafts and results when the session, identity, or explicit grants change.
-  return <Controls key={JSON.stringify([session.id, session.ownerId, user.id, session.permissions])} session={session} user={user} onChange={onChange} />;
+  return <Controls key={JSON.stringify([session.id, session.ownerId, user.id, session.permissions])} session={session} user={user} onChange={onChange} busy={busy} openSession={openSession} />;
 }
 
-function Controls({ session, user, onChange }: Props) {
+function Controls({ session, user, onChange, busy = false, openSession }: Props) {
   const ownPermissions = session.permissions ?? [];
   const grantable = permissions.filter(permission => ownPermissions.includes(permission) || (permission === "read" && ownPermissions.length > 0));
   const canManage = ownPermissions.includes("manage");
@@ -81,7 +87,7 @@ function Controls({ session, user, onChange }: Props) {
   }
 
   function createBackup() {
-    if (!canManage || action.busy) return;
+    if (!canManage || busy || action.busy) return;
     setBackup(null);
     void action.run(async () => {
       const result = await api<{ backup: Backup }>(`${base}/backup`, { method: "POST" });
@@ -152,8 +158,9 @@ function Controls({ session, user, onChange }: Props) {
       </section>
       <section className="section">
         <h2>Backup</h2>
-        <button type="button" className="button secondary" disabled={action.busy} onClick={createBackup}>Create backup</button>
-        <p className="metadata">Only the session owner can download backups; the server checks access.</p>
+        <button type="button" className="button secondary" disabled={busy || action.busy} onClick={createBackup}>Create backup</button>
+        {busy && <p role="status">Backup creation is unavailable while session work is queued or running, or live state cannot be confirmed.</p>}
+        <p className="metadata">Only the session owner can download or restore backups; the server checks access and whether the session is idle.</p>
         {backup && <div role="status" style={{ overflowWrap: "anywhere" }}>
           <p>Backup created: <span className="mono">{backup.id}</span></p>
           <p>Session: {backup.sessionId}</p><p>Size: {backup.size} bytes</p>
@@ -163,6 +170,7 @@ function Controls({ session, user, onChange }: Props) {
         </div>}
       </section>
     </>}
+    {user.id === session.ownerId && <BackupRestore sourceId={session.id} ownerId={user.id} latestBackup={backup} openSession={openSession} />}
       <section className="section">
         <h2>Audit</h2>
         <button type="button" className="button secondary small" disabled={audit.loading} onClick={audit.refresh}>Refresh audit</button>

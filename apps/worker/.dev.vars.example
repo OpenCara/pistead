@@ -1,7 +1,9 @@
 APP_ORIGIN=http://localhost:8787
-RUNNER_URL=http://127.0.0.1:8788
+# Leave empty for user-connected Pi agents. Legacy development only: http://127.0.0.1:8788
+RUNNER_URL=
 RUNNER_EVENT_TRANSPORT=proxy
 SESSION_SECRET=
+# Required only for an explicitly configured legacy runner; never sent to connectors.
 RUNNER_SHARED_SECRET=
 # A base64url-encoded, cryptographically random 32-byte encryption key.
 VAULT_KEY=

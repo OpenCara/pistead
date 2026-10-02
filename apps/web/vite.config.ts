@@ -10,6 +10,6 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    proxy: { "/api": { target: "http://localhost:8787", changeOrigin: false } },
+    proxy: { "/api": { target: "http://localhost:8787", changeOrigin: false, ws: true } },
   },
 });

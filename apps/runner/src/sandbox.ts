@@ -5,6 +5,7 @@ import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
+import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 
 const TIMEOUT_MS = 30_000;
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -14,6 +15,11 @@ const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O
 const sessionQueues = new Map<string, Promise<void>>();
 
 export type SandboxAuthorize = () => Promise<void>;
+
+export interface SandboxExecutionOptions {
+  /** Trusted harness only: caller must separately require faux + allowTestShell. */
+  allowTestShell?: boolean;
+}
 
 export interface SnapshotFile {
   /** Relative to the constructor's sandbox root; data is base64, including binary files. */
@@ -76,6 +82,7 @@ for fd_name in os.listdir('/proc/self/fd'):
         except OSError:
             pass
 os.umask(0o077)
+# These remain defense in depth for fixed helpers/test fixtures, NOT session quotas.
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 resource.setrlimit(resource.RLIMIT_CPU, (25, 25))
 resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
@@ -412,11 +419,15 @@ export class Sandbox {
   readonly #root: string;
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;
+  readonly #resources: Readonly<ResourceConfig> | undefined;
+  readonly #sessionKey: string;
+  readonly #testProvider: boolean;
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
   #closed = false;
+  #cancelActive: (() => void) | undefined;
 
-  constructor(binding: RunnerBinding, root: string) {
+  constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig) {
     if (process.platform !== "linux" || !isAbsolute(root) || resolve(root) === sep) {
       throw new Error("Sandbox requires Linux and an absolute, non-root private storage path");
     }
@@ -432,6 +443,9 @@ export class Sandbox {
     const githubLogin = binding.owner.githubLogin === null ? null : text(binding.owner.githubLogin, "GitHub login", 256);
     const env = Object.freeze({ ...validateUserEnv(binding.owner.env) });
     const key = createHash("sha256").update(JSON.stringify([ownerId, sessionId])).digest("hex");
+    this.#sessionKey = key;
+    this.#resources = resources ? validateResourceConfig(resources) : undefined;
+    this.#testProvider = binding.model.provider === "faux";
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
@@ -545,7 +559,7 @@ export class Sandbox {
     return this.#initialization;
   }
 
-  async #operation(request: Request, readOnly: boolean, authorize: SandboxAuthorize, gitWritable = false): Promise<string> {
+  async #operation(request: Request, readOnly: boolean, authorize: SandboxAuthorize, gitWritable = false, requireResources = false): Promise<string> {
     if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
     await this.initialize();
     return this.#exclusive(async () => {
@@ -553,7 +567,7 @@ export class Sandbox {
       // Admission-time permission may have been revoked while this operation waited.
       await authorize();
       if (this.#closed) throw new Error("Sandbox is closed");
-      return this.#run(request, readOnly, gitWritable);
+      return this.#run(request, readOnly, gitWritable, requireResources);
     });
   }
 
@@ -576,13 +590,17 @@ export class Sandbox {
     return this.#operation({ kind: "status" }, true, authorize);
   }
 
-  async execute(operation: Operation, readOnly: boolean, authorize: SandboxAuthorize): Promise<string> {
+  async execute(operation: Operation, readOnly: boolean, authorize: SandboxAuthorize, options: SandboxExecutionOptions = {}): Promise<string> {
     switch (operation.kind) {
       case "git.commit":
         if (readOnly) throw new Error("Read-only sandbox cannot commit");
         return this.#operation({ kind: "commit", message: text(operation.message, "commit message", 16 * 1024, true) }, false, authorize, true);
       case "bash":
-        return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize);
+        if (options.allowTestShell === true && !this.#testProvider) throw new Error("Test shell bypass is restricted to the explicit faux provider");
+        if (options.allowTestShell !== true && !this.#resources) {
+          throw new Error("Production bash unavailable: explicitly provisioned cgroup and bounded filesystem resources are required");
+        }
+        return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize, false, options.allowTestShell !== true);
       case "github.comment":
         throw new Error("GitHub operations require the control-plane credential broker, not the sandbox");
       default:
@@ -597,6 +615,7 @@ export class Sandbox {
   /** Release pinned descriptors when the owning runner session closes. */
   async close(): Promise<void> {
     this.#closed = true;
+    this.#cancelActive?.();
     await this.#initialization?.catch(() => undefined);
     await this.#exclusive(async () => {
       const mounts = this.#mounts;
@@ -605,10 +624,11 @@ export class Sandbox {
     });
   }
 
-  #run(request: Request, readOnly: boolean, gitWritable: boolean): Promise<string> {
+  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false): Promise<string> {
     const mounts = this.#mounts;
     if (!mounts) return Promise.reject(new Error("Sandbox is not initialized"));
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
+    if (requireResources && !this.#resources) return Promise.reject(new Error("Production bash resources are unavailable"));
     const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
     const args = [
       "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
@@ -622,20 +642,25 @@ export class Sandbox {
       mount, "4", this.worktree,
       gitWritable ? "--bind-fd" : "--ro-bind-fd", "5", `${this.worktree}/.git`,
       "--ro-bind-fd", "6", `${this.home}/.gitconfig`,
-      "--remount-ro", "/proc", "--remount-ro", "/",
+      "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
+    const launch = requireResources
+      ? resourceLaunch(this.#resources!, this.#sessionKey, args)
+      : { command: "/usr/bin/bwrap", args };
     return new Promise<string>((resolveResult, reject) => {
-      // Only these session descriptors are inherited, never the trusted root or
-      // SQLite/binding files. Bubblewrap consumes them before executing the helper.
-      const child = spawn("/usr/bin/bwrap", args, {
+      // Resource supervisor alone receives root fd 8 and liveness pipe 7. It closes
+      // both before bwrap exec; neither is exposed to the untrusted namespace.
+      const child = spawn(launch.command, launch.args, {
         cwd: "/",
         env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
         detached: true,
-        stdio: ["pipe", "pipe", "pipe", mounts.home.fd, mounts.worktree.fd, mounts.git.fd, mounts.config.fd],
+        stdio: requireResources
+          ? ["pipe", "pipe", "pipe", mounts.home.fd, mounts.worktree.fd, mounts.git.fd, mounts.config.fd, "pipe", mounts.root.fd]
+          : ["pipe", "pipe", "pipe", mounts.home.fd, mounts.worktree.fd, mounts.git.fd, mounts.config.fd],
       });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
@@ -644,12 +669,23 @@ export class Sandbox {
       let spawnFailure: Error | undefined;
       const kill = () => {
         if (!child.pid) return;
+        if (requireResources) {
+          // Never SIGKILL the supervisor: it must retain its lock until the entire
+          // cgroup is killed and empty. It also watches parent EOF + its own deadline.
+          child.kill("SIGTERM");
+          return;
+        }
         try {
           process.kill(-child.pid, "SIGKILL");
         } catch (error) {
           if (errorCode(error) !== "ESRCH") child.kill("SIGKILL");
         }
       };
+      const cancel = () => {
+        failure ??= "Sandbox closed";
+        kill();
+      };
+      this.#cancelActive = cancel;
       const timer = setTimeout(() => {
         failure ??= `Sandbox exceeded ${TIMEOUT_MS}ms time limit`;
         kill();
@@ -673,7 +709,7 @@ export class Sandbox {
       }
       child.once("error", (error) => {
         spawnFailure = error;
-        failure ??= "Bubblewrap is unavailable; refusing unsandboxed execution";
+        failure ??= "Sandbox launcher is unavailable; refusing unsandboxed execution";
         kill();
       });
       child.stdin!.on("error", (error: NodeJS.ErrnoException) => {
@@ -685,6 +721,8 @@ export class Sandbox {
       });
       child.once("close", (code, signal) => {
         clearTimeout(timer);
+        if (this.#cancelActive === cancel) this.#cancelActive = undefined;
+        child.stdio.at(7)?.destroy();
         const out = Buffer.concat(stdout).toString("utf8");
         const err = Buffer.concat(stderr).toString("utf8");
         if (failure || code !== 0 || signal) {

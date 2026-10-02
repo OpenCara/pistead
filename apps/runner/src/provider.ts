@@ -10,7 +10,7 @@ export function runnerModels(model: ModelDefinition, allowFaux: boolean) {
   const models = createModels();
   if (model.provider === "openai") models.setProvider(openaiProvider());
   else if (model.provider === "anthropic") models.setProvider(anthropicProvider());
-  else {
+  else if (model.provider === "faux") {
     if (!allowFaux) throw new RunnerError(403, "The deterministic faux test provider is disabled");
     const faux = fauxProvider({ models: [{ id: model.modelId, name: "Deterministic test provider (not an LLM)" }] });
     const respond: FauxResponseFactory = async (context) => {
@@ -51,5 +51,6 @@ export function runnerModels(model: ModelDefinition, allowFaux: boolean) {
     faux.setResponses([respond]);
     models.setProvider(faux.provider);
   }
+  else throw new RunnerError(400, "Unsupported legacy model provider; use a configured local Pi connector");
   return models;
 }

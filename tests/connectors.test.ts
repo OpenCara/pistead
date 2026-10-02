@@ -1,0 +1,1155 @@
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import test, { type TestContext } from 'node:test';
+import { app } from '../apps/worker/src/index.js';
+import type { ConnectorRelayEnvelope } from '../apps/worker/src/connector-transport.js';
+import type { Env } from '../apps/worker/src/types.js';
+import { encryptToken } from '../apps/worker/src/vault.js';
+import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
+import type { AgentVersion, ApprovalRecord, ModelDefinition, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import { sha256 } from '../packages/shared/src/crypto.js';
+
+const origin = 'http://localhost:8787';
+const testSecret = 'connectors-test-secret-not-for-deployment';
+const internalSecret = 'connectors-internal-secret-not-for-deployment';
+const githubToken = 'github-vault-secret-never-in-connector-metadata';
+const manifest = {
+  models: [{ provider: 'local-native', modelId: 'local/model-v1', name: 'Local model' }],
+  capabilities: { platform: 'linux', sandbox: true, productionShell: false },
+};
+const token = () => Buffer.from(randomBytes(32)).toString('base64url');
+const changedToken = (value: string) => `${value[0] === 'A' ? 'B' : 'A'}${value.slice(1)}`;
+
+type ApiRequest = (method: string, path: string, body?: unknown, headers?: Record<string, string>) => Response | Promise<Response>;
+interface Client {
+  user: { id: string };
+  cookie: string;
+  csrf: string;
+  request: ApiRequest;
+}
+interface Fixture {
+  sqlite: DatabaseSync;
+  env: Env;
+  request: ApiRequest;
+  client(name: string): Promise<Client>;
+  githubClient(): Promise<Client>;
+  queryCount(): number;
+}
+type Connected = ConnectorCredentials & { connectionToken: string; pairing: ConnectorPairing };
+
+async function json<T>(response: Response, status = 200): Promise<T> {
+  const body = await response.json();
+  assert.equal(response.status, status, JSON.stringify(body));
+  return body as T;
+}
+
+async function denied(response: Response, status: number, code: string) {
+  const body = await json<{ code: string }>(response, status);
+  assert.equal(body.code, code);
+}
+
+function fixture(t: TestContext): Fixture {
+  const sqlite = new DatabaseSync(':memory:');
+  t.after(() => sqlite.close());
+  sqlite.exec('PRAGMA foreign_keys = ON');
+  const directory = new URL('../apps/worker/migrations/', import.meta.url);
+  for (const file of readdirSync(directory).filter(name => name.endsWith('.sql')).sort()) {
+    sqlite.exec('BEGIN');
+    try {
+      sqlite.exec(readFileSync(new URL(file, directory), 'utf8'));
+      sqlite.exec('COMMIT');
+    } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
+  }
+  let queryCount = 0;
+  class Prepared {
+    values: (string | number | null | Uint8Array)[] = [];
+    constructor(readonly sql: string) {}
+    bind(...values: (string | number | null | Uint8Array)[]) { this.values = values; return this; }
+    execute() {
+      queryCount++;
+      const results = sqlite.prepare(this.sql).all(...this.values);
+      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
+      return { success: true, results, meta: { changes, duration: 0, last_row_id: 0, changed_db: changes > 0,
+        size_after: 0, rows_read: results.length, rows_written: changes } };
+    }
+    async all() { return this.execute(); }
+    async run() { return this.execute(); }
+    async first(column?: string) {
+      const row = this.execute().results[0];
+      return row ? column ? row[column] : row : null;
+    }
+  }
+  const database = {
+    prepare(sql: string) { return new Prepared(sql); },
+    async batch(statements: Prepared[]) {
+      sqlite.exec('BEGIN');
+      try {
+        const result = statements.map(statement => statement.execute());
+        sqlite.exec('COMMIT');
+        return result;
+      } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
+    },
+  };
+  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
+    TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
+    RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url') };
+  function request(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
+    return app.request(path, { method, headers: { Origin: origin,
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body) }, env);
+  }
+  async function browser(user: { id: string }, cookie: string): Promise<Client> {
+    const { csrfToken } = await json<{ csrfToken: string }>(await request('GET', '/api/auth/csrf', undefined, { Cookie: cookie }));
+    return { user, cookie, csrf: csrfToken,
+      request(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
+        return request(method, path, body, { Cookie: cookie, 'X-CSRF-Token': csrfToken, ...headers });
+      } };
+  }
+  async function client(name: string) {
+    const response = await request('POST', '/api/auth/test', { id: name, displayName: name, gitName: name,
+      gitEmail: `${name}@example.test` }, { Authorization: `Bearer ${testSecret}` });
+    const { user } = await json<{ user: { id: string } }>(response);
+    return browser(user, response.headers.get('set-cookie')!.split(';')[0]);
+  }
+  async function githubClient() {
+    // Seed a real account and cookie without mocking OAuth or weakening broker checks.
+    const id = 'github:7'; const createdAt = new Date().toISOString(); const cookieToken = token();
+    sqlite.prepare('INSERT INTO users (id,github_id,github_login,display_name,git_name,git_email,auth_kind,created_at) VALUES (?,?,?,?,?,?,?,?)')
+      .run(id, '7', 'creator', 'Creator', 'Creator', 'creator@example.test', 'github', createdAt);
+    sqlite.prepare('INSERT INTO auth_sessions (token_hash,user_id,csrf_token,expires_at,created_at) VALUES (?,?,?,?,?)')
+      .run(await sha256(cookieToken), id, token(), Date.now() + 3600000, createdAt);
+    sqlite.prepare('INSERT INTO github_tokens (user_id,ciphertext,updated_at) VALUES (?,?,?)')
+      .run(id, await encryptToken(env, id, githubToken), createdAt);
+    return browser({ id }, `test-auth=${cookieToken}`);
+  }
+  return { sqlite, env, request, client, githubClient, queryCount: () => queryCount };
+}
+
+async function pairing(owner: Client, name = 'Local Pi') {
+  return (await json<{ pairing: ConnectorPairing }>(await owner.request('POST', '/api/connectors/pairings', { name }), 201)).pairing;
+}
+
+function claim(f: Fixture, pending: ConnectorPairing, body: unknown = { code: pending.code, ...manifest }, headers: Record<string, string> = {}) {
+  return f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, body, headers);
+}
+
+async function connect(f: Fixture, owner: Client): Promise<Connected> {
+  const pending = await pairing(owner);
+  const { credentials } = await json<{ credentials: ConnectorCredentials }>(await claim(f, pending), 201);
+  const connectionToken = token();
+  // The socket hub normally installs this generation. These tests exercise HTTP routes, not WebSockets.
+  f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connectionToken), credentials.connectorId);
+  return { ...credentials, connectionToken, pairing: pending };
+}
+
+function self(f: Fixture, connector: Connected, path: string, body: unknown, connection: string | null = connector.connectionToken) {
+  return f.request('POST', `/api/connectors/self/${path}`, body, { Authorization: `Bearer ${connector.token}`,
+    ...(connection === null ? {} : { 'X-Connection-Token': connection }) });
+}
+
+async function workspace(owner: Client) {
+  return (await json<{ workspace: { id: string } }>(await owner.request('POST', '/api/workspaces', { name: 'Team' }), 201)).workspace;
+}
+
+async function addMember(admin: Client, workspaceId: string, member: Client) {
+  await json(await admin.request('POST', `/api/workspaces/${workspaceId}/members`, { userId: member.user.id, role: 'member' }));
+}
+
+function provisionHub(f: Fixture) {
+  const requests: ConnectorRelayEnvelope[] = [];
+  const unexpected: string[] = [];
+  f.env.CONNECTOR_HUB = {
+    idFromName(name: string) { return name; },
+    get(connectorId: string) {
+      return { async fetch(input: RequestInfo | URL, init?: RequestInit) {
+        const request = new Request(input, init);
+        if (request.url === 'https://connector.internal/status' && request.method === 'GET') return Response.json({ online: true });
+        if (request.url === 'https://connector.internal/rpc' && request.method === 'POST') {
+          const envelope = await request.json() as ConnectorRelayEnvelope;
+          requests.push(envelope);
+          if (envelope.connectorId === connectorId && envelope.request.ticket.action === 'create') return Response.json({ ok: true }, { status: 201 });
+        }
+        unexpected.push(`${request.method} ${request.url}`);
+        return Response.json({ error: 'Unsupported test relay request' }, { status: 503 });
+      } };
+    },
+  } as unknown as DurableObjectNamespace;
+  return { requests, unexpected };
+}
+
+function rpcHub(f: Fixture, connector: Connected, respond: (envelope: ConnectorRelayEnvelope) => Response | Promise<Response>) {
+  const requests: ConnectorRelayEnvelope[] = [];
+  f.env.CONNECTOR_HUB = {
+    idFromName(name: string) { return name; },
+    get(connectorId: string) {
+      return { async fetch(input: RequestInfo | URL, init?: RequestInit) {
+        const request = new Request(input, init);
+        assert.equal(request.url, 'https://connector.internal/rpc');
+        assert.equal(request.method, 'POST');
+        assert.equal(connectorId, connector.connectorId);
+        const envelope = await request.json() as ConnectorRelayEnvelope;
+        requests.push(envelope);
+        assert.equal(envelope.connectorId, connector.connectorId);
+        assert.equal(envelope.connectionHash, await sha256(connector.connectionToken));
+        return respond(envelope);
+      } };
+    },
+  } as unknown as DurableObjectNamespace;
+  return requests;
+}
+
+async function sharedAgent(f: Fixture, tools: AgentVersion['tools'] = ['identity', 'github_comment']) {
+  const admin = await f.client('admin'); const host = await f.client('host'); const creator = await f.githubClient();
+  const team = await workspace(admin);
+  await addMember(admin, team.id, host); await addMember(admin, team.id, creator);
+  const connector = await connect(f, host);
+  await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
+  const { models } = await json<{ models: ModelDefinition[] }>(await creator.request('GET', `/api/workspaces/${team.id}/models`));
+  assert.equal(models.length, 1);
+  const model = models[0];
+  const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
+    name: 'Published local agent', description: '', instructions: '', tools, modelId: model.id,
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: team.id }), 201);
+  const hub = provisionHub(f);
+  const input = { workspaceId: team.id, agentVersionId: agent.id, title: 'Creator session' };
+  return { admin, host, creator, team, connector, model, agent, hub, input };
+}
+
+async function sharedSession(f: Fixture, tools?: AgentVersion['tools']) {
+  const setup = await sharedAgent(f, tools);
+  const { session } = await json<{ session: SessionRecord }>(await setup.creator.request('POST', '/api/sessions', {
+    ...setup.input, trustedConnectorId: setup.connector.connectorId,
+  }), 201);
+  assert.equal(session.status, 'ready');
+  assert.equal(setup.hub.requests.length, 1);
+  assert.deepEqual(setup.hub.unexpected, []);
+  return { ...setup, session };
+}
+
+function authorization(session: SessionRecord, actorId = session.ownerId) {
+  return { sessionId: session.id, actorId, ownerId: session.ownerId, permission: 'write' };
+}
+
+async function brokerPayload(f: Fixture, session: SessionRecord, actorId = session.ownerId, requestedBy = session.ownerId) {
+  const capability = token(); const approvalId = Buffer.from(randomBytes(16)).toString('hex');
+  const operation = { kind: 'github.comment', repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+  const reviewHash = await sha256(JSON.stringify({ sessionId: session.id, approvalId, requestedBy, operation }));
+  f.sqlite.prepare(`INSERT INTO approval_reviews
+    (session_id,approval_id,requested_by,source,admission_id,operation_json,review_hash,created_at) VALUES (?,?,?,?,?,?,?,?)`)
+    .run(session.id, approvalId, requestedBy, 'explicit', null, JSON.stringify(operation), reviewHash, new Date().toISOString());
+  f.sqlite.prepare('INSERT INTO broker_capabilities (token_hash,session_id,approval_id,actor_id,requested_by,operation_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(await sha256(capability), session.id, approvalId, actorId, requestedBy, await sha256(JSON.stringify(operation)),
+      Math.floor(Date.now() / 1000) + 600, new Date().toISOString());
+  return { sessionId: session.id, actorId, approvalId, capability, repository: operation.repository, issue: operation.issue, body: operation.body };
+}
+
+function githubFetch(t: TestContext) {
+  return t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(input), 'https://api.github.com/repos/owner/repo/issues/3/comments');
+    assert.equal(init?.method, 'POST');
+    assert.equal(init?.redirect, 'manual');
+    assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${githubToken}`);
+    assert.deepEqual(JSON.parse(String(init?.body)), { body: 'Exactly approved text' });
+    return Response.json({ id: 99, html_url: 'https://github.com/owner/repo/issues/3#issuecomment-99', secret: githubToken });
+  });
+}
+
+test('pairings require a CSRF-protected cookie, retain its owner, are single-use, and hash secrets at rest', async t => {
+  const f = fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Pi' }), 401, 'unauthorized');
+  await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Pi' }, { Cookie: alice.cookie }), 403, 'invalid_csrf');
+  await denied(await alice.request('POST', '/api/connectors/pairings', { name: 'Pi' }, { Origin: 'https://hostile.invalid' }), 403, 'invalid_origin');
+  await denied(await alice.request('POST', '/api/connectors/pairings', { name: 'Pi', ownerId: bob.user.id }), 400, 'invalid_metadata');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_pairings').get()!.n, 0);
+  const pending = await pairing(alice);
+  const row = f.sqlite.prepare('SELECT * FROM connector_pairings WHERE id = ?').get(pending.id)!;
+  assert.equal(row.owner_id, alice.user.id);
+  assert.equal(row.code_hash, await sha256(pending.code));
+  assert.equal(row.claimed_at, null);
+  assert.equal(row.expires_at, Date.parse(pending.expiresAt) / 1000);
+  assert.ok(Date.parse(pending.expiresAt) > Date.now());
+  assert.ok(Date.parse(pending.expiresAt) <= Date.now() + 600000);
+  assert.ok(!JSON.stringify(row).includes(pending.code));
+  await denied(await claim(f, pending, { code: changedToken(pending.code), ...manifest }), 403, 'invalid_pairing');
+  await denied(await claim(f, { ...pending, id: 'unknown-pairing' }), 403, 'invalid_pairing');
+  await denied(await claim(f, pending, undefined, { Origin: 'https://hostile.invalid' }), 403, 'invalid_origin');
+  assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
+  // A claimant's ambient cookie cannot replace the owner of the cookie-issued pairing.
+  const { credentials } = await json<{ credentials: ConnectorCredentials }>(await claim(f, pending, undefined, { Cookie: bob.cookie }), 201);
+  assert.match(credentials.token, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(credentials.controlPlaneUrl, origin);
+  const connector = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(credentials.connectorId)!;
+  assert.equal(connector.owner_id, alice.user.id);
+  assert.equal(connector.credential_hash, await sha256(credentials.token));
+  assert.ok(!JSON.stringify(connector).includes(credentials.token));
+  assert.ok(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at);
+  await denied(await claim(f, pending), 403, 'invalid_pairing');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+  const listed = await json<{ connectors: ConnectorInfo[] }>(await alice.request('GET', '/api/connectors'));
+  assert.equal(listed.connectors[0].ownerId, alice.user.id);
+  assert.ok(!JSON.stringify(listed).includes(credentials.token));
+  assert.ok(!JSON.stringify(listed).includes(String(connector.credential_hash)));
+  assert.deepEqual(await json(await bob.request('GET', '/api/connectors')), { connectors: [] });
+});
+
+test('pairing expiry is enforced at claim time and the ten-minute per-owner bound includes claimed pairings', async t => {
+  const f = fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  const pending: ConnectorPairing[] = [];
+  for (let i = 0; i < 5; i++) pending.push(await pairing(alice));
+  await denied(await alice.request('POST', '/api/connectors/pairings', { name: 'Sixth' }), 429, 'pairing_limit');
+  await pairing(bob);
+  // No sleeps or timer races: make the persisted expiry unambiguously expired.
+  f.sqlite.prepare('UPDATE connector_pairings SET expires_at = ? WHERE id = ?')
+    .run(Math.floor(Date.now() / 1000) - 1, pending[0].id);
+  await denied(await claim(f, pending[0]), 403, 'invalid_pairing');
+  assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending[0].id)!.claimed_at, null);
+  await pairing(alice);
+  assert.equal(f.sqlite.prepare('SELECT id FROM connector_pairings WHERE id = ?').get(pending[0].id), undefined);
+  await json(await claim(f, pending[1]), 201);
+  await denied(await alice.request('POST', '/api/connectors/pairings', { name: 'Claimed still counts' }), 429, 'pairing_limit');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_pairings WHERE owner_id = ?').get(alice.user.id)!.n, 5);
+  f.sqlite.prepare('UPDATE connector_pairings SET expires_at = ? WHERE id = ?')
+    .run(Math.floor(Date.now() / 1000) - 1, pending[1].id);
+  await pairing(alice);
+  assert.equal(f.sqlite.prepare('SELECT id FROM connector_pairings WHERE id = ?').get(pending[1].id), undefined);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_pairings WHERE owner_id = ?').get(alice.user.id)!.n, 5);
+});
+
+test('the active connector bound is checked again at claim and revocation releases capacity', async t => {
+  const f = fixture(t); const owner = await f.client('owner');
+  const insert = f.sqlite.prepare('INSERT INTO connectors (id,owner_id,name,credential_hash,created_at) VALUES (?,?,?,?,?)');
+  for (let i = 0; i < 19; i++) insert.run(`existing-${i}`, owner.user.id, 'Existing', await sha256(token()), new Date().toISOString());
+  const first = await pairing(owner); const second = await pairing(owner);
+  const { credentials } = await json<{ credentials: ConnectorCredentials }>(await claim(f, first), 201);
+  await denied(await claim(f, second), 403, 'invalid_pairing');
+  assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(second.id)!.claimed_at, null);
+  await denied(await owner.request('POST', '/api/connectors/pairings', { name: 'Over limit' }), 429, 'pairing_limit');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors WHERE revoked_at IS NULL').get()!.n, 20);
+  assert.equal((await owner.request('DELETE', `/api/connectors/${credentials.connectorId}`)).status, 204);
+  await json(await claim(f, second), 201);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors WHERE revoked_at IS NULL').get()!.n, 20);
+});
+
+test('claim and manifest updates reject malformed metadata and secret-bearing fields without storing them', async t => {
+  const f = fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const pending = await pairing(owner); const secret = 'provider-credential-must-never-be-persisted';
+  const invalid: { name: string; value: object; code: string }[] = [
+    ...['apiKey', 'token', 'env', 'auth'].map(field => ({ name: `top-level ${field}`, value: { ...manifest, [field]: secret }, code: 'invalid_metadata' })),
+    ...['apiKey', 'headers', 'baseUrl', 'credentials'].map(field => ({ name: `model ${field}`,
+      value: { ...manifest, models: [{ ...manifest.models[0], [field]: secret }] }, code: 'invalid_metadata' })),
+    ...['env', 'token'].map(field => ({ name: `capability ${field}`,
+      value: { ...manifest, capabilities: { ...manifest.capabilities, [field]: secret } }, code: 'invalid_metadata' })),
+    { name: 'duplicate models', value: { ...manifest, models: [manifest.models[0], manifest.models[0]] }, code: 'invalid_manifest' },
+    { name: 'too many models', value: { ...manifest, models: Array.from({ length: 201 }, (_, i) => ({ ...manifest.models[0], modelId: `model-${i}` })) }, code: 'invalid_manifest' },
+    { name: 'non-array models', value: { ...manifest, models: {} }, code: 'invalid_manifest' },
+    { name: 'null model', value: { ...manifest, models: [null] }, code: 'invalid_manifest' },
+    { name: 'provider syntax', value: { ...manifest, models: [{ ...manifest.models[0], provider: 'https://provider.invalid' }] }, code: 'invalid_manifest' },
+    { name: 'control characters', value: { ...manifest, models: [{ ...manifest.models[0], name: 'model\nsecret' }] }, code: 'invalid_manifest' },
+    { name: 'missing capabilities', value: { models: manifest.models }, code: 'invalid_manifest' },
+    { name: 'platform syntax', value: { ...manifest, capabilities: { ...manifest.capabilities, platform: 'linux/secret' } }, code: 'invalid_manifest' },
+    { name: 'non-boolean capability', value: { ...manifest, capabilities: { ...manifest.capabilities, sandbox: 'true' } }, code: 'invalid_manifest' },
+    { name: 'unsandboxed production shell', value: { ...manifest, capabilities: { ...manifest.capabilities, sandbox: false, productionShell: true } }, code: 'invalid_manifest' },
+  ];
+  const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
+  for (const entry of invalid) {
+    await t.test(entry.name, async () => {
+      await denied(await claim(f, pending, { code: pending.code, ...entry.value }), 400, entry.code);
+      await denied(await self(f, connector, 'manifest', entry.value), 400, entry.code);
+      assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
+      assert.deepEqual(f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId), before);
+      assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+    });
+  }
+  await json(await claim(f, pending), 201);
+  await json(await self(f, connector, 'manifest', manifest));
+  for (const table of ['connectors', 'connector_pairings', 'models', 'audit']) {
+    assert.ok(!JSON.stringify(f.sqlite.prepare(`SELECT * FROM ${table}`).all()).includes(secret));
+  }
+});
+
+test('connector bearer credentials cannot authenticate browser or internal APIs, and self routes require the current connection', async t => {
+  const f = fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
+  await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
+  await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
+  for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/restores/unknown/download']) {
+    await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
+  }
+  for (const path of ['manifest', 'authorize', 'github/comment', 'restores/unknown/download']) {
+    await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
+    await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
+    await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
+    await denied(await self(f, connector, path, {}, changedToken(connector.connectionToken)), 401, 'stale_connection');
+    await denied(await f.request('POST', `/api/connectors/self/${path}`, {}, { ...headers, Authorization: `Bearer ${internalSecret}` }), 401, 'connector_authentication_required');
+  }
+  await json(await self(f, connector, 'manifest', manifest));
+  const oldConnection = connector.connectionToken;
+  connector.connectionToken = token();
+  f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
+  for (const path of ['manifest', 'authorize', 'github/comment', 'restores/unknown/download']) {
+    await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
+  }
+  await json(await self(f, connector, 'manifest', manifest));
+  const stored = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId)!;
+  assert.equal(stored.connection_hash, await sha256(connector.connectionToken));
+  assert.ok(!JSON.stringify(stored).includes(connector.connectionToken));
+});
+
+test('sharing is connector-owner-only with live workspace membership and imports only safe catalog metadata', async t => {
+  const f = fixture(t); const admin = await f.client('admin'); const host = await f.client('host'); const outsider = await f.client('outsider');
+  const team = await workspace(admin); const connector = await connect(f, host);
+  const path = `/api/connectors/${connector.connectorId}/shares/${team.id}`;
+  await denied(await admin.request('PUT', path), 404, 'not_found');
+  await denied(await admin.request('DELETE', path), 404, 'not_found');
+  await denied(await admin.request('DELETE', `/api/connectors/${connector.connectorId}`), 404, 'not_found');
+  await denied(await host.request('PUT', path), 404, 'not_found');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares').get()!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM models').get()!.n, 0);
+  await addMember(admin, team.id, host);
+  const shared = await json<{ connector: ConnectorInfo }>(await host.request('PUT', path));
+  assert.deepEqual(Object.keys(shared.connector).sort(), ['id', 'ownerId', 'ownerName', 'name', 'createdAt', 'revokedAt', 'online', 'models', 'workspaceIds', 'capabilities'].sort());
+  assert.deepEqual(shared.connector.models, manifest.models);
+  assert.deepEqual(shared.connector.capabilities, manifest.capabilities);
+  assert.deepEqual(shared.connector.workspaceIds, [team.id]);
+  await json(await host.request('PUT', path));
+  const catalog = await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`));
+  assert.equal(catalog.models.length, 1);
+  const model = catalog.models[0];
+  assert.deepEqual(model, { id: model.id, workspaceId: team.id, ...manifest.models[0], connectorId: connector.connectorId, connectorOwnerId: host.user.id });
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM models').get()!.n, 1);
+  await denied(await outsider.request('GET', `/api/workspaces/${team.id}/connectors`), 404, 'not_found');
+  await denied(await outsider.request('GET', `/api/workspaces/${team.id}/models`), 404, 'not_found');
+  await denied(await admin.request('POST', `/api/workspaces/${team.id}/models`, {
+    name: 'Forged', provider: 'openai', modelId: 'model', connectorId: connector.connectorId, connectorOwnerId: host.user.id,
+  }), 400, 'invalid_input');
+  const listed = await json<{ connectors: ConnectorInfo[] }>(await admin.request('GET', `/api/workspaces/${team.id}/connectors`));
+  assert.deepEqual(listed.connectors, [shared.connector]);
+  const visible = JSON.stringify({ shared, catalog, listed });
+  for (const secret of [connector.token, connector.connectionToken, connector.pairing.code, await sha256(connector.token), await sha256(connector.connectionToken)]) {
+    assert.ok(!visible.includes(secret));
+  }
+  await json(await self(f, connector, 'manifest', { ...manifest, models: [] }));
+  assert.deepEqual(await json(await admin.request('GET', `/api/workspaces/${team.id}/models`)), { models: [] });
+  assert.equal(f.sqlite.prepare('SELECT available FROM models WHERE id = ?').get(model.id)!.available, 0);
+  await json(await self(f, connector, 'manifest', { ...manifest, models: [{ ...manifest.models[0], name: 'Renamed' }] }));
+  const refreshed = await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`));
+  assert.deepEqual(refreshed.models, [{ ...model, name: 'Renamed' }]);
+  assert.equal((await admin.request('DELETE', `/api/workspaces/${team.id}/members/${encodeURIComponent(host.user.id)}`)).status, 204);
+  await denied(await host.request('PUT', path), 404, 'not_found');
+  assert.deepEqual(await json(await admin.request('GET', `/api/workspaces/${team.id}/connectors`)), { connectors: [] });
+  assert.deepEqual(await json(await admin.request('GET', `/api/workspaces/${team.id}/models`)), { models: [] });
+});
+
+test('foreign-host sessions require exact trust and retain the creator identity in storage and the provisioning envelope', async t => {
+  const f = fixture(t); const s = await sharedAgent(f);
+  for (const trustedConnectorId of [undefined, 'another-connector', s.host.user.id]) {
+    await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId }), 400, 'connector_trust_required');
+  }
+  await denied(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, trustedConnectorId: s.connector.connectorId, ownerId: s.host.user.id,
+  }), 400, 'server_owned_identity');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  assert.equal(s.hub.requests.length, 0);
+  const { session } = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, trustedConnectorId: s.connector.connectorId,
+  }), 201);
+  assert.equal(session.status, 'ready');
+  assert.equal(session.ownerId, s.creator.user.id);
+  assert.equal(session.connectorId, s.connector.connectorId);
+  assert.equal(session.connectorOwnerId, s.host.user.id);
+  const stored = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(session.id)!;
+  assert.equal(stored.owner_id, s.creator.user.id);
+  assert.equal(stored.agent_version_id, s.agent.id);
+  assert.equal(stored.connector_id, s.connector.connectorId);
+  assert.equal(stored.connector_owner_id, s.host.user.id);
+  assert.equal(s.hub.requests.length, 1);
+  const envelope = s.hub.requests[0]; const request = envelope.request;
+  assert.equal(envelope.connectorId, s.connector.connectorId);
+  assert.equal(envelope.credentialHash, await sha256(s.connector.token));
+  assert.equal(envelope.connectionHash, await sha256(s.connector.connectionToken));
+  assert.equal(request.type, 'request');
+  assert.equal(request.method, 'POST');
+  assert.equal(request.path, '/v1/sessions');
+  assert.equal(request.id, request.ticket.jti);
+  assert.equal(request.ticket.action, 'create');
+  assert.equal(request.ticket.actorId, s.creator.user.id);
+  assert.equal(request.ticket.ownerId, s.creator.user.id);
+  assert.equal(request.ticket.connectorId, s.connector.connectorId);
+  assert.equal(request.ticket.sessionId, session.id);
+  assert.equal(request.ticket.policyVersion, session.policyVersion);
+  assert.equal(request.ticket.bodyHash, await sha256(request.body));
+  const binding = JSON.parse(request.body) as RunnerBinding;
+  assert.equal(binding.owner.id, s.creator.user.id);
+  assert.equal(binding.owner.gitEmail, 'creator@example.test');
+  assert.equal(binding.session.ownerId, s.creator.user.id);
+  assert.equal(binding.agent.authorId, s.host.user.id);
+  assert.equal(binding.agent.id, s.agent.id);
+  assert.deepEqual(binding.model, s.model);
+  for (const secret of [s.connector.token, s.connector.connectionToken, s.connector.pairing.code, githubToken]) assert.ok(!JSON.stringify(envelope).includes(secret));
+  await denied(await s.host.request('GET', `/api/sessions/${session.id}`), 404, 'not_found');
+  assert.equal((await s.creator.request('GET', `/api/sessions/${session.id}`)).status, 200);
+  const own = await json<{ session: SessionRecord }>(await s.host.request('POST', '/api/sessions', s.input), 201);
+  assert.equal(own.session.ownerId, s.host.user.id);
+  assert.equal(own.session.connectorOwnerId, s.host.user.id);
+  assert.deepEqual(s.hub.unexpected, []);
+});
+
+test('API-created model and session routing bindings cannot be rewritten through the database', async t => {
+  const f = fixture(t); const s = await sharedSession(f); const other = await connect(f, s.host);
+  const modelBefore = f.sqlite.prepare('SELECT * FROM models WHERE id = ?').get(s.model.id);
+  for (const [column, value] of [
+    ['workspace_id', 'different-workspace'], ['provider', 'different-provider'], ['model_id', 'different-model'],
+    ['connector_id', other.connectorId], ['connector_owner_id', s.creator.user.id], ['connector_id', null], ['connector_owner_id', null],
+  ] as const) {
+    assert.throws(() => f.sqlite.prepare(`UPDATE models SET ${column} = ? WHERE id = ?`).run(value, s.model.id), /model identity is immutable/);
+  }
+  assert.deepEqual(f.sqlite.prepare('SELECT * FROM models WHERE id = ?').get(s.model.id), modelBefore);
+  const sessionBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id);
+  for (const [column, value] of [
+    ['owner_id', s.host.user.id], ['workspace_id', 'different-workspace'], ['agent_version_id', 'different-version'],
+    ['connector_id', other.connectorId], ['connector_owner_id', s.creator.user.id], ['connector_id', null], ['connector_owner_id', null],
+  ] as const) {
+    assert.throws(() => f.sqlite.prepare(`UPDATE sessions SET ${column} = ? WHERE id = ?`).run(value, s.session.id), /immutable/);
+  }
+  assert.deepEqual(f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id), sessionBefore);
+  assert.throws(() => f.sqlite.prepare('UPDATE agent_versions SET model_id = ? WHERE id = ?').run('another-model', s.agent.id), /immutable/);
+  assert.deepEqual(f.sqlite.prepare('PRAGMA foreign_key_check').all(), []);
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
+});
+
+test('callbacks are scoped to the exact session connector, not merely its owner or a shared workspace', async t => {
+  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const sameHost = await connect(f, s.host); const otherHost = await connect(f, s.admin);
+  const payload = await brokerPayload(f, s.session);
+  for (const [connector, owner] of [[sameHost, s.host], [otherHost, s.admin]] as const) {
+    await json(await owner.request('PUT', `/api/connectors/${connector.connectorId}/shares/${s.team.id}`));
+    await denied(await self(f, connector, 'authorize', authorization(s.session)), 403, 'connector_binding_mismatch');
+    await denied(await self(f, connector, 'github/comment', payload), 403, 'connector_binding_mismatch');
+  }
+  for (const [path, body] of [['authorize', authorization(s.session)], ['github/comment', payload]] as const) {
+    await denied(await f.request('POST', `/api/internal/${path}`, body, { Authorization: `Bearer ${internalSecret}` }), 403, 'connector_scope_required');
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', { ...authorization(s.session), ownerId: s.host.user.id }))).allowed, false);
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session, s.host.user.id)))).allowed, false);
+  assert.equal((await self(f, s.connector, 'github/comment', payload)).status, 200);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.deepEqual(s.hub.unexpected, []);
+});
+
+for (const mutation of ['revoke', 'unshare', 'remove-host', 'remove-owner', 'remove-approver', 'remove-requester'] as const) {
+  test(`${mutation} immediately denies existing connector callbacks and unconsumed broker capabilities`, async t => {
+    const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+    const collaborator = await f.client('collaborator');
+    await addMember(s.admin, s.team.id, collaborator);
+    await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: collaborator.user.id, permissions: ['write', 'approve'] }));
+    const actorId = mutation === 'remove-approver' ? collaborator.user.id : s.creator.user.id;
+    const requestedBy = mutation === 'remove-requester' ? collaborator.user.id : s.creator.user.id;
+    const auth = authorization(s.session, mutation === 'remove-requester' ? collaborator.user.id : actorId);
+    assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', auth))).allowed, true);
+    const first = await brokerPayload(f, s.session, actorId, requestedBy);
+    assert.equal((await self(f, s.connector, 'github/comment', first)).status, 200);
+    assert.equal(fetch.mock.callCount(), 1);
+    const pending = await brokerPayload(f, s.session, actorId, requestedBy);
+    const versionBefore = Number(f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id)!.policy_version);
+    // Authorization must fail from live D1 state even without a hub available to close the socket.
+    delete f.env.CONNECTOR_HUB;
+    if (mutation === 'revoke') {
+      assert.equal((await s.host.request('DELETE', `/api/connectors/${s.connector.connectorId}`)).status, 204);
+      const row = f.sqlite.prepare('SELECT revoked_at,connection_hash FROM connectors WHERE id = ?').get(s.connector.connectorId)!;
+      assert.ok(row.revoked_at); assert.equal(row.connection_hash, null);
+    } else if (mutation === 'unshare') {
+      assert.equal((await s.host.request('DELETE', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`)).status, 204);
+    } else {
+      const removed = mutation === 'remove-host' ? s.host : mutation === 'remove-owner' ? s.creator : collaborator;
+      assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/members/${encodeURIComponent(removed.user.id)}`)).status, 204);
+    }
+    const stored = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
+    assert.equal(stored.owner_id, s.creator.user.id);
+    assert.equal(stored.connector_id, s.connector.connectorId);
+    assert.equal(stored.connector_owner_id, s.host.user.id);
+    assert.equal(stored.policy_version, versionBefore + 1);
+    if (mutation === 'revoke') {
+      await denied(await self(f, s.connector, 'authorize', auth), 401, 'connector_authentication_required');
+      await denied(await self(f, s.connector, 'github/comment', pending), 401, 'connector_authentication_required');
+      await denied(await self(f, s.connector, 'manifest', manifest), 401, 'connector_authentication_required');
+    } else if (mutation === 'unshare' || mutation === 'remove-host') {
+      await denied(await self(f, s.connector, 'authorize', auth), 403, 'connector_unavailable');
+      await denied(await self(f, s.connector, 'github/comment', pending), 403, 'connector_unavailable');
+    } else {
+      assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', auth))).allowed, false);
+      await denied(await self(f, s.connector, 'github/comment', pending), 403, 'permission_revoked');
+    }
+    assert.equal(fetch.mock.callCount(), 1, 'Denied callbacks must not perform another external effect');
+    assert.equal(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(pending.capability))!.consumed_at, null);
+    if (mutation === 'revoke' || mutation === 'unshare' || mutation === 'remove-host') {
+      assert.deepEqual(await json(await s.admin.request('GET', `/api/workspaces/${s.team.id}/connectors`)), { connectors: [] });
+      assert.deepEqual(await json(await s.admin.request('GET', `/api/workspaces/${s.team.id}/models`)), { models: [] });
+    }
+    assert.deepEqual(s.hub.unexpected, []);
+  });
+}
+
+test('broker authentication and approval capabilities require exact tokens and payloads before any fetch', async t => {
+  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const payload = await brokerPayload(f, s.session);
+  for (const secret of [internalSecret.slice(1), `${internalSecret}-suffix`, changedToken(internalSecret)]) {
+    await denied(await f.request('POST', '/api/internal/github/comment', payload, { Authorization: `Bearer ${secret}` }), 401, 'unauthorized');
+  }
+  for (const capability of [payload.capability.slice(1), `${payload.capability}-suffix`, changedToken(payload.capability), await sha256(payload.capability)]) {
+    await denied(await self(f, s.connector, 'github/comment', { ...payload, capability }), 403, 'invalid_capability');
+  }
+  for (const mismatch of [
+    { sessionId: 'another-session' }, { approvalId: 'another-approval' }, { actorId: s.host.user.id },
+    { repository: 'owner/other-repo' }, { issue: payload.issue + 1 }, { body: `${payload.body} ` },
+  ]) {
+    await denied(await self(f, s.connector, 'github/comment', { ...payload, ...mismatch }), 403, 'invalid_capability');
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+  const hash = await sha256(payload.capability);
+  assert.equal(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(hash)!.consumed_at, null);
+  const result = await json(await self(f, s.connector, 'github/comment', payload));
+  assert.deepEqual(result, { id: 99, url: 'https://github.com/owner/repo/issues/3#issuecomment-99' });
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.ok(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(hash)!.consumed_at);
+  await denied(await self(f, s.connector, 'github/comment', payload), 409, 'capability_consumed');
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('connector shares are bounded at fifty, idempotent at the limit, and unsharing releases a slot', async t => {
+  const f = fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const createdAt = new Date().toISOString();
+  // Seed the existing population; exercise both sides of the boundary through the API.
+  for (let i = 0; i < 51; i++) {
+    const workspaceId = `workspace-${i}`;
+    f.sqlite.prepare('INSERT INTO workspaces (id,name,owner_id,created_at) VALUES (?,?,?,?)')
+      .run(workspaceId, 'Team', owner.user.id, createdAt);
+    f.sqlite.prepare('INSERT INTO workspace_members (workspace_id,user_id,role,created_at) VALUES (?,?,?,?)')
+      .run(workspaceId, owner.user.id, 'owner', createdAt);
+    if (i < 49) f.sqlite.prepare('INSERT INTO connector_shares (connector_id,workspace_id,created_at) VALUES (?,?,?)')
+      .run(connector.connectorId, workspaceId, createdAt);
+  }
+  const base = `/api/connectors/${connector.connectorId}/shares`;
+  await json(await owner.request('PUT', `${base}/workspace-49`));
+  await json(await owner.request('PUT', `${base}/workspace-49`));
+  await denied(await owner.request('PUT', `${base}/workspace-50`), 429, 'share_limit');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE connector_id = ?').get(connector.connectorId)!.n, 50);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM models WHERE workspace_id = ?').get('workspace-50')!.n, 0);
+  assert.equal((await owner.request('DELETE', `${base}/workspace-0`)).status, 204);
+  await json(await owner.request('PUT', `${base}/workspace-50`));
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE connector_id = ?').get(connector.connectorId)!.n, 50);
+  const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', '/api/workspaces/workspace-50/models'));
+  assert.equal(models.length, 1);
+  assert.equal(models[0].connectorId, connector.connectorId);
+});
+
+test('callbacks require both an available imported model and its exact provider/model in the live manifest', async t => {
+  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const payload = await brokerPayload(f, s.session);
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, models: [] }));
+  assert.equal(f.sqlite.prepare('SELECT available FROM models WHERE id = ?').get(s.model.id)!.available, 0);
+  await denied(await self(f, s.connector, 'authorize', authorization(s.session)), 403, 'connector_unavailable');
+  await denied(await self(f, s.connector, 'github/comment', payload), 403, 'connector_unavailable');
+  // A stale imported row cannot authorize a model no longer advertised by this host.
+  for (const models of [[], [{ ...manifest.models[0], provider: 'other-provider' }], [{ ...manifest.models[0], modelId: 'other-model' }]]) {
+    f.sqlite.prepare('UPDATE connectors SET models_json = ? WHERE id = ?').run(JSON.stringify(models), s.connector.connectorId);
+    f.sqlite.prepare('UPDATE models SET available = 1 WHERE id = ?').run(s.model.id);
+    await denied(await self(f, s.connector, 'authorize', authorization(s.session)), 403, 'connector_unavailable');
+    await denied(await self(f, s.connector, 'github/comment', payload), 403, 'connector_unavailable');
+  }
+  f.sqlite.prepare('UPDATE connectors SET models_json = ? WHERE id = ?').run(JSON.stringify(manifest.models), s.connector.connectorId);
+  f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run(s.model.id);
+  await denied(await self(f, s.connector, 'authorize', authorization(s.session)), 403, 'connector_unavailable');
+  await denied(await self(f, s.connector, 'github/comment', payload), 403, 'connector_unavailable');
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(payload.capability))!.consumed_at, null);
+  await json(await self(f, s.connector, 'manifest', manifest));
+  const restored = await json<{ models: ModelDefinition[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/models`));
+  assert.deepEqual(restored.models, [s.model], 'Reimport must retain the model identity pinned by the existing session');
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
+  assert.equal((await self(f, s.connector, 'github/comment', payload)).status, 200);
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('claim, socket, and self routes require TLS except for explicitly enabled loopback tests', async t => {
+  const f = fixture(t); const owner = await f.githubClient(); const connector = await connect(f, owner);
+  const pending = await pairing(owner);
+  const claimBody = { code: pending.code, ...manifest };
+  const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
+  const routes = [
+    { method: 'POST', path: `/api/connectors/pairings/${pending.id}/claim`, body: claimBody },
+    { method: 'GET', path: '/api/connectors/socket', body: undefined },
+    { method: 'POST', path: '/api/connectors/self/manifest', body: manifest },
+  ];
+  for (const route of routes) {
+    await denied(await f.request(route.method, `http://remote.invalid${route.path}`, route.body, headers), 400, 'secure_transport_required');
+  }
+  await json(await self(f, connector, 'manifest', manifest));
+  f.env.TEST_AUTH_ENABLED = 'false';
+  f.env.APP_ORIGIN = 'https://workspace.example.test';
+  for (const route of routes) {
+    await denied(await f.request(route.method, `${origin}${route.path}`, route.body, headers), 400, 'secure_transport_required');
+  }
+  const secureHeaders = { ...headers, Origin: f.env.APP_ORIGIN };
+  await json(await f.request('POST', `${f.env.APP_ORIGIN}/api/connectors/pairings/${pending.id}/claim`, claimBody, secureHeaders), 201);
+  await json(await f.request('POST', `${f.env.APP_ORIGIN}/api/connectors/self/manifest`, manifest, secureHeaders));
+});
+
+test('production session creation rejects a legacy non-connector model even for an authenticated GitHub owner', async t => {
+  const f = fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
+  const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
+    name: 'Legacy model', provider: 'openai', modelId: 'legacy-model',
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
+    name: 'Legacy agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
+  }), 201);
+  assert.equal(f.sqlite.prepare('SELECT connector_id FROM models WHERE id = ?').get(model.id)!.connector_id, null);
+  f.env.TEST_AUTH_ENABLED = 'false';
+  f.env.APP_ORIGIN = 'https://workspace.example.test';
+  const headers = { Cookie: owner.cookie.replace(/^test-auth=/, '__Host-auth='), Origin: f.env.APP_ORIGIN, 'X-CSRF-Token': owner.csrf };
+  const profile = await json<{ user: { id: string } }>(await f.request('GET', `${f.env.APP_ORIGIN}/api/me`, undefined, headers));
+  assert.equal(profile.user.id, owner.user.id);
+  await denied(await f.request('POST', `${f.env.APP_ORIGIN}/api/sessions`, {
+    workspaceId: team.id, agentVersionId: agent.id, title: 'No legacy provisioning in production',
+  }, headers), 400, 'connector_required');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+});
+
+test('connected SSE emits only two authoritative snapshots within the fifty-query budget', async t => {
+  const f = fixture(t); const s = await sharedSession(f);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read'] }));
+  const view: SessionView = {
+    sessionId: s.session.id,
+    owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+    entries: [], approvals: [], conversations: [], busy: false,
+  };
+  const requests = rpcHub(f, s.connector, envelope => {
+    assert.equal(envelope.request.ticket.action, 'view');
+    assert.equal(envelope.request.ticket.actorId, s.admin.user.id);
+    assert.equal(envelope.request.method, 'GET');
+    assert.equal(envelope.request.path, `/v1/sessions/${s.session.id}/view`);
+    return Response.json({ view });
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const before = f.queryCount();
+  const response = await s.admin.request('GET', `/api/sessions/${s.session.id}/events`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type') ?? '', /text\/event-stream/);
+  assert.equal(response.headers.get('x-accel-buffering'), 'no');
+  const reader = response.body!.getReader();
+  t.after(() => reader.cancel());
+  let body = '';
+  for (let snapshot = 0; snapshot < 2; snapshot++) {
+    const chunk = await reader.read();
+    assert.equal(chunk.done, false);
+    body += new TextDecoder().decode(chunk.value);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    t.mock.timers.tick(1000);
+  }
+  assert.equal((await reader.read()).done, true);
+  assert.equal(requests.length, 2);
+  assert.equal((body.match(/event: view/g) ?? []).length, 2);
+  const data = body.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
+  assert.deepEqual(data, [{ view }, { view }]);
+  const queries = f.queryCount() - before;
+  assert.ok(queries > 0, 'Count the real Worker authorization queries, not only relay calls');
+  assert.ok(queries + requests.length <= 50, `Connected polling used ${queries} D1 queries plus ${requests.length} relay calls`);
+});
+
+for (const mutation of ['operation', 'requester'] as const) {
+  test(`a reviewed explicit approval rejects a host ${mutation} swap before capability minting`, async t => {
+    const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+    await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
+      userId: s.admin.user.id, permissions: ['write'],
+    }));
+    const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+    const original: ApprovalRecord = {
+      id: 'reviewed-approval', sessionId: s.session.id, requestedBy: s.creator.user.id, operation,
+      status: 'pending', createdAt: new Date().toISOString(), reviewHash: 'untrusted-host-review-hash',
+    };
+    let advertised = original;
+    const requests = rpcHub(f, s.connector, envelope => {
+      const action = envelope.request.ticket.action;
+      if (action === 'view') return Response.json({ view: {
+        sessionId: s.session.id,
+        owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [], approvals: [advertised], conversations: [], busy: false,
+      } });
+      if (action === 'operations') {
+        assert.deepEqual(JSON.parse(envelope.request.body), { operation });
+        return Response.json({ approval: advertised }, { status: 201 });
+      }
+      // A vulnerable Worker would mint a capability and reach this success response.
+      assert.equal(action, 'approve');
+      return Response.json({ approval: { ...advertised, status: 'approved' } });
+    });
+    const path = `/api/sessions/${s.session.id}`;
+    const created = await json<{ approval: ApprovalRecord }>(await s.creator.request('POST', `${path}/operations`, operation), 201);
+    const presented = (await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`))).view.approvals[0];
+    const reviewHash = presented.reviewHash;
+    assert.ok(reviewHash);
+    assert.match(reviewHash, /^[A-Za-z0-9_-]{43}$/);
+    assert.notEqual(reviewHash, original.reviewHash, 'Only the Worker commitment may be returned to the browser');
+    assert.equal(created.approval.reviewHash, reviewHash);
+    assert.deepEqual(presented.operation, operation);
+    assert.equal(presented.requestedBy, s.creator.user.id);
+    const pinned = f.sqlite.prepare('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?')
+      .get(s.session.id, original.id)!;
+    assert.equal(pinned.review_hash, reviewHash);
+    assert.equal(pinned.requested_by, s.creator.user.id);
+    assert.equal(pinned.source, 'explicit');
+    assert.equal(pinned.admission_id, null);
+    assert.deepEqual(JSON.parse(String(pinned.operation_json)), operation);
+    for (const invalidHash of [undefined, 'malformed', changedToken(reviewHash)]) {
+      await denied(await s.creator.request('POST', `${path}/approvals/${original.id}`, {
+        decision: 'approve', reviewHash: invalidHash,
+      }), 409, 'approval_review_required');
+    }
+    // Both requesters are authorized writers, so this must fail on the reviewed binding, not permissions.
+    advertised = mutation === 'operation'
+      ? { ...original, operation: { ...operation, body: 'Host substituted an unreviewed external effect' } }
+      : { ...original, requestedBy: s.admin.user.id };
+    await denied(await s.creator.request('POST', `${path}/approvals/${original.id}`, {
+      decision: 'approve', reviewHash,
+    }), 502, 'approval_changed');
+    assert.equal(requests[0].request.ticket.action, 'operations');
+    assert.equal(requests[1].request.ticket.action, 'view');
+    assert.equal(requests.at(-1)!.request.ticket.action, 'view', 'The denial must compare the newly fetched host approval');
+    assert.equal(requests.filter(envelope => envelope.request.ticket.action === 'approve').length, 0);
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM broker_capabilities').get()!.n, 0);
+    assert.equal(fetch.mock.callCount(), 0);
+    assert.deepEqual(f.sqlite.prepare('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?')
+      .get(s.session.id, original.id), pinned, 'A conflicting host reread must not overwrite the reviewed operation or requester');
+    assert.throws(() => f.sqlite.prepare('UPDATE approval_reviews SET requested_by = ? WHERE session_id = ? AND approval_id = ?')
+      .run(s.admin.user.id, s.session.id, original.id), /immutable/);
+    assert.throws(() => f.sqlite.prepare('DELETE FROM approval_reviews WHERE session_id = ? AND approval_id = ?')
+      .run(s.session.id, original.id), /immutable|must be retained/);
+  });
+}
+
+test('a read-only approver cannot turn an unadmitted host candidate into a reviewed operation or broker capability', async t => {
+  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
+    userId: s.admin.user.id, permissions: ['read', 'approve'],
+  }));
+  const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+  const forged: ApprovalRecord = {
+    id: 'unadmitted-approval', sessionId: s.session.id, requestedBy: s.creator.user.id,
+    operation, status: 'pending', createdAt: new Date().toISOString(),
+  };
+  const forgedHash = await sha256(JSON.stringify({
+    sessionId: s.session.id, approvalId: forged.id, requestedBy: s.creator.user.id, operation,
+  }));
+  let advertised: ApprovalRecord = { ...forged, reviewHash: forgedHash };
+  const requests = rpcHub(f, s.connector, envelope => {
+    assert.equal(envelope.request.ticket.action, 'view');
+    return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals: [advertised], conversations: [], busy: false,
+    } });
+  });
+  const path = `/api/sessions/${s.session.id}`;
+  await denied(await s.admin.request('POST', `${path}/submit`, { content: 'Create an external effect', requestId: 'forged-write' }), 403, 'forbidden');
+  await denied(await s.admin.request('POST', `${path}/operations`, operation), 403, 'forbidden');
+  assert.equal(requests.length, 0);
+  for (const admissionId of [undefined, token()]) {
+    advertised = { ...forged, admissionId, reviewHash: forgedHash };
+    const { view } = await json<{ view: SessionView }>(await s.admin.request('GET', `${path}/view`));
+    assert.equal(view.approvals.length, 1);
+    assert.equal(view.approvals[0].id, forged.id);
+    assert.equal(view.approvals[0].status, 'interrupted');
+    assert.equal(Object.hasOwn(view.approvals[0], 'reviewHash'), false, 'A host-supplied commitment is not proof of a human write admission');
+    await denied(await s.admin.request('POST', `${path}/approvals/${forged.id}`, {
+      decision: 'approve', reviewHash: forgedHash,
+    }), 409, 'approval_review_required');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions').get()!.n, 0);
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM approval_reviews').get()!.n, 0);
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM broker_capabilities').get()!.n, 0);
+  }
+  assert.equal(requests.length, 2, 'Only display reads may reach the host; no approval or write may be relayed');
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('only a Worker-issued write admission produces an approvable model review and the exact broker effect', async t => {
+  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
+    userId: s.admin.user.id, permissions: ['read', 'approve'],
+  }));
+  const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+  const candidate: ApprovalRecord = {
+    id: 'model-approval', sessionId: s.session.id, requestedBy: s.creator.user.id,
+    operation, status: 'pending', createdAt: new Date().toISOString(),
+  };
+  const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
+  let capability = '';
+  const requests = rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const input = JSON.parse(envelope.request.body) as { content: string; requestId: string; admissionId: string };
+      assert.equal(input.content, 'Please draft the approved comment');
+      assert.equal(input.requestId, 'human-write');
+      assert.match(input.admissionId, /^[A-Za-z0-9_-]{43}$/);
+      candidate.admissionId = input.admissionId;
+      return Response.json(receipt, { status: 202 });
+    }
+    if (action === 'ask') {
+      assert.deepEqual(JSON.parse(envelope.request.body), { content: 'Read-only question', requestId: 'human-ask' });
+      return Response.json(receipt, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals: [candidate], conversations: [], busy: false,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string; decision: string; operation: unknown; brokerCapability: string };
+    assert.equal(input.approvalId, candidate.id);
+    assert.equal(input.decision, 'approve');
+    assert.deepEqual(input.operation, operation);
+    assert.match(input.brokerCapability, /^[A-Za-z0-9_-]{43}$/);
+    capability = input.brokerCapability;
+    return Response.json({ approval: { ...candidate, status: 'approved' } });
+  });
+  const path = `/api/sessions/${s.session.id}`;
+  for (const mode of ['submit', 'ask']) {
+    await denied(await s.creator.request('POST', `${path}/${mode}`, {
+      content: 'Forged admission', requestId: `forged-${mode}`, admissionId: token(),
+    }), 400, 'server_owned_admission');
+  }
+  assert.equal(requests.length, 0);
+  assert.deepEqual(await json(await s.creator.request('POST', `${path}/ask`, {
+    content: 'Read-only question', requestId: 'human-ask',
+  }), 202), receipt);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions').get()!.n, 0);
+  const submitted = await json(await s.creator.request('POST', `${path}/submit`, {
+    content: 'Please draft the approved comment', requestId: 'human-write',
+  }), 202);
+  assert.deepEqual(submitted, receipt);
+  const admissionId = candidate.admissionId;
+  assert.ok(admissionId);
+  assert.ok(!JSON.stringify(submitted).includes(admissionId));
+  const admission = f.sqlite.prepare('SELECT * FROM run_admissions WHERE id = ?').get(admissionId)!;
+  assert.equal(admission.session_id, s.session.id);
+  assert.equal(admission.actor_id, s.creator.user.id);
+  assert.equal(admission.mode, 'write');
+  assert.equal(admission.request_id, 'human-write');
+  assert.equal(admission.content_hash, await sha256('Please draft the approved comment'));
+  assert.ok(Number(admission.expires_at) > Math.floor(Date.now() / 1000));
+  assert.ok(!JSON.stringify(admission).includes('Please draft the approved comment'));
+  const { view } = await json<{ view: SessionView }>(await s.admin.request('GET', `${path}/view`));
+  const reviewHash = view.approvals[0].reviewHash;
+  assert.equal(reviewHash, await sha256(JSON.stringify({
+    sessionId: s.session.id, approvalId: candidate.id, requestedBy: s.creator.user.id, operation,
+  })));
+  assert.equal(view.approvals[0].status, 'pending');
+  assert.equal(Object.hasOwn(view.approvals[0], 'admissionId'), false);
+  const review = f.sqlite.prepare('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?').get(s.session.id, candidate.id)!;
+  assert.equal(review.source, 'model');
+  assert.equal(review.admission_id, admissionId);
+  assert.equal(review.requested_by, s.creator.user.id);
+  const approved = await json<{ approval: ApprovalRecord }>(await s.admin.request('POST', `${path}/approvals/${candidate.id}`, {
+    decision: 'approve', reviewHash,
+  }));
+  assert.equal(approved.approval.status, 'approved');
+  assert.equal(approved.approval.reviewHash, reviewHash);
+  assert.equal(Object.hasOwn(approved.approval, 'admissionId'), false);
+  assert.ok(!JSON.stringify(approved).includes(capability));
+  assert.equal(fetch.mock.callCount(), 0, 'Human approval only mints the exact capability; the host callback performs the effect');
+  const broker = f.sqlite.prepare('SELECT * FROM broker_capabilities WHERE token_hash = ?').get(await sha256(capability))!;
+  assert.equal(broker.actor_id, s.admin.user.id);
+  assert.equal(broker.requested_by, s.creator.user.id);
+  assert.equal(broker.operation_hash, await sha256(JSON.stringify(operation)));
+  await json(await self(f, s.connector, 'github/comment', {
+    sessionId: s.session.id, actorId: s.admin.user.id, approvalId: candidate.id, capability,
+    repository: operation.repository, issue: operation.issue, body: operation.body,
+  }));
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+for (const invalid of ['ask', 'expired', 'foreign-session', 'foreign-actor'] as const) {
+  test(`${invalid} admission cannot authorize a model review while history remains readable`, async t => {
+    const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+    await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
+      userId: s.admin.user.id, permissions: ['write'],
+    }));
+    let admissionSessionId = s.session.id;
+    if (invalid === 'foreign-session') {
+      const other = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+        ...s.input, trustedConnectorId: s.connector.connectorId,
+      }), 201);
+      admissionSessionId = other.session.id;
+    }
+    const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+    const admissionId = token();
+    const approval: ApprovalRecord = {
+      id: 'invalid-admission-approval', sessionId: s.session.id, requestedBy: s.creator.user.id,
+      operation, admissionId, status: 'pending', createdAt: new Date().toISOString(),
+    };
+    const reviewHash = await sha256(JSON.stringify({
+      sessionId: s.session.id, approvalId: approval.id, requestedBy: s.creator.user.id, operation,
+    }));
+    f.sqlite.prepare(`INSERT INTO run_admissions
+      (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(admissionId, admissionSessionId, invalid === 'foreign-actor' ? s.admin.user.id : s.creator.user.id,
+        invalid === 'ask' ? 'ask' : 'write', 'prior-request', await sha256('Prior request'),
+        Math.floor(Date.now() / 1000) + (invalid === 'expired' ? -1 : 600), new Date().toISOString());
+    if (invalid === 'expired') {
+      // Preserve an already-reviewed historical operation after its immutable admission expires.
+      f.sqlite.prepare(`INSERT INTO approval_reviews
+        (session_id,approval_id,requested_by,source,admission_id,operation_json,review_hash,created_at) VALUES (?,?,?,?,?,?,?,?)`)
+        .run(s.session.id, approval.id, s.creator.user.id, 'model', admissionId, JSON.stringify(operation), reviewHash, new Date().toISOString());
+    }
+    const requests = rpcHub(f, s.connector, envelope => {
+      assert.equal(envelope.request.ticket.action, 'view');
+      return Response.json({ view: {
+        sessionId: s.session.id,
+        owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [{ id: 'history', kind: 'message', role: 'assistant', text: 'Prior conversation remains readable' }],
+        approvals: [approval], conversations: [], busy: false,
+      } });
+    });
+    const path = `/api/sessions/${s.session.id}`;
+    const { view } = await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`));
+    assert.equal(view.entries[0].text, 'Prior conversation remains readable');
+    assert.equal(view.approvals[0].status, 'interrupted');
+    assert.equal(Object.hasOwn(view.approvals[0], 'reviewHash'), false);
+    assert.equal(Object.hasOwn(view.approvals[0], 'admissionId'), false);
+    await denied(await s.creator.request('POST', `${path}/approvals/${approval.id}`, {
+      decision: 'approve', reviewHash,
+    }), 409, invalid === 'expired' ? 'approval_admission_expired' : 'approval_review_required');
+    assert.equal(requests.length, 1);
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM approval_reviews').get()!.n, invalid === 'expired' ? 1 : 0);
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM broker_capabilities').get()!.n, 0);
+    assert.equal(fetch.mock.callCount(), 0);
+  });
+}
+
+test('broker callbacks require github_comment in the immutable pinned agent even with a matching review and capability', async t => {
+  const f = fixture(t); const s = await sharedSession(f, ['identity']); const fetch = githubFetch(t);
+  assert.deepEqual(s.agent.tools, ['identity']);
+  assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
+  const payload = await brokerPayload(f, s.session);
+  await denied(await self(f, s.connector, 'github/comment', payload), 403, 'tool_not_allowed');
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(payload.capability))!.consumed_at, null);
+});
+
+test('write admission quota follows an actor across sessions without blocking another owner or losing ambiguous receipts', async t => {
+  const f = fixture(t); const s = await sharedSession(f);
+  const cloneSession = f.sqlite.prepare(`INSERT INTO sessions
+    (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
+    SELECT ?,workspace_id,?,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id
+    FROM sessions WHERE id = ?`);
+  const sessionIds = [s.session.id];
+  for (let index = 1; index < 10; index++) {
+    const sessionId = `actor-budget-session-${index}`;
+    cloneSession.run(sessionId, s.creator.user.id, s.session.id);
+    sessionIds.push(sessionId);
+  }
+  cloneSession.run('unrelated-owner-session', s.admin.user.id, s.session.id);
+  const content = 'Quota-bound write';
+  const contentHash = await sha256(content);
+  const createdAt = new Date().toISOString();
+  const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+  const seed = f.sqlite.prepare(`INSERT INTO run_admissions
+    (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at) VALUES (?,?,?,'write',?,?,?,?)`);
+  for (let index = 0; index < 999; index++) {
+    seed.run(`actor-budget-${index}`.padEnd(43, '_'), sessionIds[index % sessionIds.length], s.creator.user.id,
+      `seed-${index}`, contentHash, expiresAt, createdAt);
+  }
+  let failDispatch = true;
+  const requests = rpcHub(f, s.connector, envelope => {
+    assert.equal(envelope.request.ticket.action, 'submit');
+    if (failDispatch) return Response.json({ error: 'Ambiguous dispatch' }, { status: 503 });
+    return Response.json({ submissionId: 'quota-submission', conversationId: 'quota-conversation', status: 'queued' }, { status: 202 });
+  });
+  const path = `/api/sessions/${s.session.id}/submit`;
+  const input = { content, requestId: 'last-actor-slot' };
+  await denied(await s.creator.request('POST', path, input), 503, 'runner_error');
+  const stored = f.sqlite.prepare('SELECT * FROM run_admissions WHERE session_id = ? AND actor_id = ? AND request_id = ?')
+    .get(s.session.id, s.creator.user.id, input.requestId)!;
+  assert.ok(stored, 'An ambiguous dispatch must retain its admission');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions WHERE actor_id = ?').get(s.creator.user.id)!.n, 1000);
+  await denied(await s.creator.request('POST', `/api/sessions/${sessionIds[1]}/submit`, {
+    content, requestId: 'cannot-escape-through-another-session',
+  }), 409, 'admission_unavailable');
+  assert.equal(requests.length, 1, 'Quota denial must happen before relay dispatch');
+  failDispatch = false;
+  await json(await s.creator.request('POST', path, input), 202);
+  assert.equal(JSON.parse(requests[1].request.body).admissionId, stored.id, 'A full quota must not replace an existing receipt');
+  assert.deepEqual(f.sqlite.prepare('SELECT * FROM run_admissions WHERE id = ?').get(stored.id as string), stored);
+  await denied(await s.creator.request('POST', path, { ...input, content: 'Changed retry' }), 409, 'admission_conflict');
+  assert.equal(requests.length, 2);
+  await json(await s.admin.request('POST', '/api/sessions/unrelated-owner-session/submit', {
+    content, requestId: 'unrelated-owner-write',
+  }), 202);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions').get()!.n, 1001);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions WHERE actor_id = ?').get(s.admin.user.id)!.n, 1);
+});
+
+test('owner admission budgets aggregate collaborators but do not impose a cross-tenant global gate', async t => {
+  const f = fixture(t); const s = await sharedSession(f);
+  const createdAt = new Date().toISOString();
+  const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+  const content = 'Owner-budget write';
+  const contentHash = await sha256(content);
+  const cloneSession = f.sqlite.prepare(`INSERT INTO sessions
+    (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
+    SELECT ?,workspace_id,?,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id
+    FROM sessions WHERE id = ?`);
+  const seed = f.sqlite.prepare(`INSERT INTO run_admissions
+    (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at) VALUES (?,?,?,'write',?,?,?,?)`);
+  const grant = f.sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)');
+  const tenants: { owner: Client; sessionIds: string[]; actors: Client[] }[] = [];
+  for (const [tenant, owner] of [s.creator, s.admin].entries()) {
+    const sessionIds: string[] = [];
+    const actors: Client[] = [];
+    for (let index = 0; index < 10; index++) {
+      const sessionId = `owner-budget-${tenant}-${index}`;
+      cloneSession.run(sessionId, owner.user.id, s.session.id);
+      sessionIds.push(sessionId);
+    }
+    for (let index = 0; index < 5; index++) {
+      const actor = await f.client(`quota-writer-${tenant}-${index}`);
+      await addMember(s.admin, s.team.id, actor);
+      actors.push(actor);
+      for (const sessionId of sessionIds) grant.run(sessionId, actor.user.id, '["write"]', createdAt);
+    }
+    tenants.push({ owner, sessionIds, actors });
+    const count = tenant === 0 ? 4999 : 5000;
+    for (let index = 0; index < count; index++) {
+      seed.run(`owner-budget-${tenant}-${index}`.padEnd(43, '_'), sessionIds[index % sessionIds.length],
+        actors[index % actors.length].user.id, `seed-${index}`, contentHash, expiresAt, createdAt);
+    }
+  }
+  const requests = rpcHub(f, s.connector, envelope => {
+    assert.equal(envelope.request.ticket.action, 'submit');
+    return Response.json({ submissionId: 'owner-quota-submission', conversationId: 'owner-quota-conversation', status: 'queued' }, { status: 202 });
+  });
+  const target = tenants[0].sessionIds[0];
+  const path = `/api/sessions/${target}/submit`;
+  const input = { content, requestId: 'last-owner-slot' };
+  await json(await s.creator.request('POST', path, input), 202);
+  const admitted = f.sqlite.prepare('SELECT * FROM run_admissions WHERE session_id = ? AND actor_id = ? AND request_id = ?')
+    .get(target, s.creator.user.id, input.requestId)!;
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions').get()!.n, 10000);
+  await denied(await s.creator.request('POST', `/api/sessions/${tenants[0].sessionIds[1]}/submit`, {
+    content, requestId: 'cannot-escape-owner-budget',
+  }), 409, 'admission_unavailable');
+  assert.equal(requests.length, 1);
+  await json(await s.creator.request('POST', path, input), 202);
+  assert.equal(JSON.parse(requests[1].request.body).admissionId, admitted.id);
+  assert.deepEqual(f.sqlite.prepare('SELECT * FROM run_admissions WHERE id = ?').get(admitted.id as string), admitted);
+  cloneSession.run('third-owner-session', s.host.user.id, s.session.id);
+  await json(await s.host.request('POST', '/api/sessions/third-owner-session/submit', {
+    content, requestId: 'third-owner-is-independent',
+  }), 202);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions').get()!.n, 10001);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions WHERE actor_id = ?').get(s.host.user.id)!.n, 1);
+});

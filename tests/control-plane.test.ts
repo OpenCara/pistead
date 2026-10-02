@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { app } from '../apps/worker/src/index.js';
@@ -12,10 +12,26 @@ import { sha256 } from '../packages/shared/src/crypto.js';
 const origin = 'http://localhost:8787';
 const testSecret = 'control-plane-test-secret-not-for-deployment';
 const internalSecret = 'control-plane-internal-secret-not-for-deployment';
+const migrationsDirectory = new URL('../apps/worker/migrations/', import.meta.url);
+const migrationFiles = readdirSync(migrationsDirectory).filter(name => name.endsWith('.sql')).sort();
+
+function migrate(sqlite: DatabaseSync, files = migrationFiles) {
+  sqlite.exec('PRAGMA foreign_keys = ON');
+  for (const file of files) {
+    sqlite.exec('BEGIN');
+    try {
+      sqlite.exec(readFileSync(new URL(file, migrationsDirectory), 'utf8'));
+      sqlite.exec('COMMIT');
+    } catch (error) {
+      sqlite.exec('ROLLBACK');
+      throw error;
+    }
+  }
+}
 
 function fixture() {
   const sqlite = new DatabaseSync(':memory:');
-  sqlite.exec(readFileSync(new URL('../apps/worker/migrations/0001_control_plane.sql', import.meta.url), 'utf8'));
+  migrate(sqlite);
   let queryCount = 0;
   class Prepared {
     values: (string | number | null | Uint8Array)[] = [];
@@ -63,6 +79,133 @@ function fixture() {
   }
   return { sqlite, env, client, queryCount: () => queryCount };
 }
+
+function seedLegacySchema(sqlite: DatabaseSync) {
+  sqlite.exec(`
+    INSERT INTO users (id, display_name, git_name, git_email, auth_kind, created_at)
+      VALUES ('schema-owner', 'Owner', 'Owner', 'owner@example.test', 'test', '2026-01-01'),
+             ('schema-host', 'Host', 'Host', 'host@example.test', 'test', '2026-01-01');
+    INSERT INTO workspaces (id, name, owner_id, created_at)
+      VALUES ('schema-workspace', 'Workspace', 'schema-owner', '2026-01-01'),
+             ('schema-other-workspace', 'Other workspace', 'schema-owner', '2026-01-01');
+    INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+      VALUES ('schema-workspace', 'schema-owner', 'owner', '2026-01-01');
+    INSERT INTO models (id, workspace_id, name, provider, model_id, created_at)
+      VALUES ('schema-faux', 'schema-workspace', 'Faux', 'faux', 'faux-1', '2026-01-01'),
+             ('schema-openai', 'schema-workspace', 'OpenAI', 'openai', 'gpt-4', '2026-01-01'),
+             ('schema-anthropic', 'schema-workspace', 'Anthropic', 'anthropic', 'claude', '2026-01-01');
+    INSERT INTO agents (id, author_id, created_at) VALUES ('schema-agent', 'schema-owner', '2026-01-01');
+    INSERT INTO agent_versions (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at)
+      SELECT 'version-' || id, 'schema-agent', 'schema-owner', workspace_id,
+             CASE provider WHEN 'faux' THEN 1 WHEN 'openai' THEN 2 ELSE 3 END,
+             name, '', '', '[]', id, created_at FROM models;
+    INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, status, created_at)
+      VALUES ('schema-session', 'schema-workspace', 'schema-owner', 'version-schema-faux', 'Original', 'ready', '2026-01-01');
+    INSERT INTO session_grants (session_id, user_id, permissions_json, created_at)
+      VALUES ('schema-session', 'schema-host', '["read"]', '2026-01-01');
+    INSERT INTO backups (id, session_id, owner_id, object_key, sha256, size, created_at)
+      VALUES ('schema-backup', 'schema-session', 'schema-owner', 'schema-object', 'schema-digest', 1, '2026-01-01');
+    INSERT INTO broker_capabilities (token_hash, session_id, approval_id, actor_id, requested_by, operation_hash, expires_at, created_at)
+      VALUES ('schema-token', 'schema-session', 'schema-approval', 'schema-owner', 'schema-owner', 'schema-operation', 1, '2026-01-01');
+    INSERT INTO audit (id, workspace_id, session_id, actor_id, action, created_at)
+      VALUES ('schema-audit', 'schema-workspace', 'schema-session', 'schema-owner', 'created', '2026-01-01');
+  `);
+}
+
+test('connector migration preserves populated legacy rows, foreign keys, and immutable bindings', t => {
+  const sqlite = new DatabaseSync(':memory:'); t.after(() => sqlite.close());
+  assert.equal(migrationFiles[0], '0001_control_plane.sql');
+  migrate(sqlite, migrationFiles.slice(0, 1));
+  seedLegacySchema(sqlite);
+  const tables = ['users', 'workspaces', 'workspace_members', 'models', 'agents', 'agent_versions', 'sessions', 'session_grants', 'backups', 'broker_capabilities', 'audit'];
+  const original = tables.map(table => ({ table, rows: sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all() }));
+  migrate(sqlite, migrationFiles.slice(1));
+  for (const { table, rows } of original) {
+    const columns = Object.keys(rows[0]!).join(', ');
+    assert.deepEqual(sqlite.prepare(`SELECT ${columns} FROM ${table} ORDER BY rowid`).all(), rows, table);
+  }
+  assert.deepEqual(sqlite.prepare('PRAGMA foreign_key_check').all(), []);
+  assert.equal(sqlite.prepare('PRAGMA foreign_keys').get()!.foreign_keys, 1);
+  assert.ok(sqlite.prepare('PRAGMA foreign_key_list(agent_versions)').all().some(row => row.table === 'models' && row.from === 'model_id'));
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM models WHERE connector_id IS NULL AND connector_owner_id IS NULL AND available = 1').get()!.count, 3);
+  assert.equal(sqlite.prepare("SELECT connector_id FROM sessions WHERE id = 'schema-session'").get()!.connector_id, null);
+  assert.equal(sqlite.prepare("SELECT connector_owner_id FROM sessions WHERE id = 'schema-session'").get()!.connector_owner_id, null);
+  assert.throws(() => sqlite.exec("DELETE FROM models WHERE id = 'schema-faux'"), /FOREIGN KEY/);
+  assert.throws(() => sqlite.exec("INSERT INTO agent_versions SELECT 'bad-version', agent_id, author_id, workspace_id, 4, name, description, instructions, tools_json, 'missing-model', created_at FROM agent_versions LIMIT 1"), /FOREIGN KEY/);
+  assert.throws(() => sqlite.exec("UPDATE agent_versions SET name = 'changed'"), /immutable/);
+  assert.throws(() => sqlite.exec('DELETE FROM agent_versions'), /immutable/);
+  for (const column of ['workspace_id', 'owner_id', 'agent_version_id']) {
+    assert.throws(() => sqlite.exec(`UPDATE sessions SET ${column} = ${column}`), /immutable/);
+  }
+});
+
+test('connector schema enforces credentials, shares, catalog identity, and paired immutable session routing', t => {
+  const f = fixture(); t.after(() => f.sqlite.close());
+  const sqlite = f.sqlite;
+  seedLegacySchema(sqlite);
+  const insertConnector = sqlite.prepare('INSERT INTO connectors (id, owner_id, name, credential_hash, created_at) VALUES (?, ?, ?, ?, ?)');
+  insertConnector.run('schema-connector', 'schema-host', 'Local Pi', 'credential-one', '2026-01-01');
+  insertConnector.run('schema-other-connector', 'schema-host', 'Other Pi', 'credential-two', '2026-01-01');
+  assert.throws(() => insertConnector.run('duplicate', 'schema-host', 'Duplicate', 'credential-one', '2026-01-01'), /UNIQUE/);
+  assert.throws(() => insertConnector.run('missing-owner', 'missing', 'Missing', 'credential-three', '2026-01-01'), /FOREIGN KEY/);
+  const connector = sqlite.prepare("SELECT * FROM connectors WHERE id = 'schema-connector'").get()!;
+  assert.equal(connector.models_json, '[]');
+  assert.equal(connector.capabilities_json, '{}');
+  for (const column of ['revoked_at', 'last_seen_at', 'connection_hash']) assert.equal(connector[column], null);
+  sqlite.prepare('INSERT INTO connector_pairings (id, owner_id, name, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('schema-pairing', 'schema-host', 'Local Pi', 'pairing-hash', 1234567890, '2026-01-01');
+  const pairing = sqlite.prepare("SELECT *, typeof(expires_at) AS expiry_type FROM connector_pairings WHERE id = 'schema-pairing'").get()!;
+  assert.equal(pairing.expiry_type, 'integer');
+  assert.equal(pairing.expires_at, 1234567890);
+  assert.equal(pairing.claimed_at, null);
+  const insertShare = sqlite.prepare("INSERT INTO connector_shares (connector_id, workspace_id, created_at) VALUES (?, ?, '2026-01-01')");
+  insertShare.run('schema-connector', 'schema-workspace');
+  assert.throws(() => insertShare.run('schema-connector', 'schema-workspace'), /UNIQUE/);
+  assert.throws(() => insertShare.run('missing', 'schema-workspace'), /FOREIGN KEY/);
+  assert.throws(() => insertShare.run('schema-connector', 'missing'), /FOREIGN KEY/);
+
+  const insertModel = sqlite.prepare(`INSERT INTO models (id, workspace_id, name, provider, model_id, connector_id, connector_owner_id, created_at)
+    VALUES (?, ?, 'Local model', ?, ?, ?, ?, '2026-01-01')`);
+  insertModel.run('connected-model', 'schema-workspace', 'local-native-provider', 'local-model', 'schema-connector', 'schema-host');
+  assert.throws(() => insertModel.run('duplicate-model', 'schema-workspace', 'local-native-provider', 'local-model', 'schema-connector', 'schema-host'), /UNIQUE/);
+  insertModel.run('other-connector-model', 'schema-workspace', 'local-native-provider', 'local-model', 'schema-other-connector', 'schema-host');
+  insertModel.run('other-workspace-model', 'schema-other-workspace', 'local-native-provider', 'local-model', 'schema-connector', 'schema-host');
+  insertModel.run('other-provider-model', 'schema-workspace', 'another-provider', 'local-model', 'schema-connector', 'schema-host');
+  insertModel.run('other-local-model', 'schema-workspace', 'local-native-provider', 'other-model', 'schema-connector', 'schema-host');
+  insertModel.run('legacy-duplicate', 'schema-workspace', 'faux', 'faux-1', null, null);
+  for (const [connectorId, ownerId] of [['schema-connector', null], [null, 'schema-host']] as const) {
+    assert.throws(() => insertModel.run('unpaired', 'schema-workspace', 'provider', 'model', connectorId, ownerId), /CHECK/);
+  }
+  assert.throws(() => insertModel.run('missing-connector', 'schema-workspace', 'provider', 'model', 'missing', 'schema-host'), /FOREIGN KEY/);
+  assert.throws(() => insertModel.run('missing-host', 'schema-workspace', 'provider', 'model', 'schema-connector', 'missing'), /FOREIGN KEY/);
+  assert.equal(sqlite.prepare("SELECT available FROM models WHERE id = 'connected-model'").get()!.available, 1);
+  for (const column of ['workspace_id', 'provider', 'model_id', 'connector_id', 'connector_owner_id']) {
+    assert.throws(() => sqlite.exec(`UPDATE models SET ${column} = ${column} WHERE id = 'connected-model'`), /immutable/);
+  }
+  assert.throws(() => sqlite.exec("UPDATE models SET connector_id = 'schema-connector', connector_owner_id = 'schema-host' WHERE id = 'schema-faux'"), /immutable/);
+  sqlite.exec("UPDATE models SET name = 'Renamed', available = 0 WHERE id = 'connected-model'");
+  assert.equal(sqlite.prepare("SELECT available FROM models WHERE id = 'connected-model'").get()!.available, 0);
+  assert.throws(() => sqlite.exec("UPDATE models SET available = 2 WHERE id = 'connected-model'"), /CHECK/);
+
+  const insertSession = sqlite.prepare(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, status, connector_id, connector_owner_id, created_at)
+    VALUES (?, 'schema-workspace', 'schema-owner', 'version-schema-faux', 'Connected', 'ready', ?, ?, '2026-01-01')`);
+  insertSession.run('connected-session', 'schema-connector', 'schema-host');
+  for (const [connectorId, ownerId] of [['schema-connector', null], [null, 'schema-host']] as const) {
+    assert.throws(() => insertSession.run('unpaired-session', connectorId, ownerId), /must be paired/);
+  }
+  assert.throws(() => insertSession.run('missing-connector-session', 'missing', 'schema-host'), /FOREIGN KEY/);
+  assert.throws(() => insertSession.run('missing-host-session', 'schema-connector', 'missing'), /FOREIGN KEY/);
+  for (const column of ['connector_id', 'connector_owner_id']) {
+    assert.throws(() => sqlite.exec(`UPDATE sessions SET ${column} = NULL WHERE id = 'connected-session'`), /immutable/);
+  }
+  assert.throws(() => sqlite.exec("UPDATE sessions SET connector_id = 'schema-connector', connector_owner_id = 'schema-host' WHERE id = 'schema-session'"), /immutable/);
+  sqlite.exec("UPDATE sessions SET title = 'Renamed', status = 'archived' WHERE id = 'connected-session'");
+  sqlite.exec("UPDATE connectors SET revoked_at = '2026-01-02', connection_hash = NULL WHERE id = 'schema-connector'");
+  sqlite.exec("DELETE FROM connector_shares WHERE connector_id = 'schema-connector'");
+  assert.equal(sqlite.prepare("SELECT connector_id FROM sessions WHERE id = 'connected-session'").get()!.connector_id, 'schema-connector');
+  assert.equal(sqlite.prepare("SELECT connector_id FROM models WHERE id = 'connected-model'").get()!.connector_id, 'schema-connector');
+  assert.deepEqual(sqlite.prepare('PRAGMA foreign_key_check').all(), []);
+});
 
 test('test auth is disabled by default, secret gated, isolated, and expires existing cookies', async t => {
   const f = fixture(); t.after(() => f.sqlite.close());
@@ -166,6 +309,9 @@ test('internal broker rejects wrong operations and consumes exact approval capab
   const capability = 'one-time-capability';
   f.sqlite.prepare('INSERT INTO broker_capabilities (token_hash,session_id,approval_id,actor_id,requested_by,operation_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)')
     .run(await sha256(capability), 'session', 'approval', ownerId, ownerId, await sha256(JSON.stringify(operation)), Math.floor(Date.now() / 1000) + 60, createdAt);
+  f.sqlite.prepare(`INSERT INTO approval_reviews (session_id,approval_id,requested_by,operation_json,source,admission_id,review_hash,created_at)
+    VALUES (?,?,?,?, 'explicit', NULL,?,?)`).run('session', 'approval', ownerId, JSON.stringify(operation),
+      await sha256(JSON.stringify({ sessionId: 'session', approvalId: 'approval', requestedBy: ownerId, operation })), createdAt);
   const request = (body: unknown, authorization = `Bearer ${internalSecret}`) => app.request('/api/internal/github/comment', {
     method: 'POST', headers: { Authorization: authorization, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   }, f.env);
@@ -252,7 +398,7 @@ test('poll SSE emits at most four authoritative views within the subrequest budg
   assert.equal((await reader.read()).done, true);
   assert.equal(polls, 4);
   assert.equal((body.match(/event: view/g) ?? []).length, 4);
-  assert.ok(f.queryCount() - before + polls <= 23, 'Four snapshots must fit the Free-plan subrequest budget');
+  assert.ok(f.queryCount() - before + polls <= 27, 'Four snapshots including restore-state checks must fit the Free-plan subrequest budget');
 });
 
 test('poll SSE rechecks live grants after fetching and before emitting each snapshot', async t => {
