@@ -16,6 +16,14 @@ jobs:
           cache: pnpm
       - name: Install Linux sandbox prerequisites
         run: sudo apt-get update && sudo apt-get install -y bubblewrap python3 git util-linux
+      - name: Enable sandbox namespaces in the disposable CI VM
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --unshare-user --disable-userns --die-with-parent --new-session \
+            --cap-drop ALL --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+            --symlink usr/bin /bin --proc /proc --dev /dev -- /usr/bin/true
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
