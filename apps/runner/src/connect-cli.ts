@@ -7,12 +7,8 @@ import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createConnector, controlPlaneOrigin, readConnectorState } from "./connector.js";
 import { createFauxLocalModels, loadLocalPiModels } from "./local-pi.js";
+import { ConnectorSetupError } from "./protocol.js";
 import type { ResourceConfig } from "./resources.js";
-
-/** Connector-authored setup failures; safe to print, unlike SDK or HTTP error text. */
-export class ConnectorPreflightError extends Error {
-  override name = "ConnectorPreflightError";
-}
 
 const HELP = `Usage: pistead connect [options]
 
@@ -139,7 +135,7 @@ async function confirmUnsandboxed(): Promise<void> {
   prompt.on("SIGINT", () => prompt.close());
   try {
     const answer = await prompt.question('Type "unsandboxed" to continue: ').catch(() => "");
-    if (answer.trim() !== "unsandboxed") throw new ConnectorPreflightError("Unsandboxed mode was not confirmed; nothing was started.");
+    if (answer.trim() !== "unsandboxed") throw new ConnectorSetupError("Unsandboxed mode was not confirmed; nothing was started.");
   } finally {
     prompt.close();
   }
@@ -154,17 +150,23 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   const unsandboxed = values["unsafe-no-sandbox"] === true;
-  if (Number(process.versions.node.split(".")[0]) < 24) throw new ConnectorPreflightError(`Node.js 24 or newer is required (found ${process.versions.node}).`);
+  if (Number(process.versions.node.split(".")[0]) < 24) throw new ConnectorSetupError(`Node.js 24 or newer is required (found ${process.versions.node}).`);
   if (process.platform === "darwin" && !unsandboxed) {
-    throw new ConnectorPreflightError("macOS has no isolated sandbox: it needs Linux or WSL2 with bubblewrap. To run agent work directly on this Mac, re-run with --unsafe-no-sandbox and read its warning.");
+    throw new ConnectorSetupError("macOS has no isolated sandbox: it needs Linux or WSL2 with bubblewrap. To run agent work directly on this Mac, re-run with --unsafe-no-sandbox and read its warning.");
   }
-  if (process.platform !== "linux" && process.platform !== "darwin") throw new ConnectorPreflightError(`Unsupported platform "${process.platform}": use Linux, WSL2 or macOS.`);
-  if (unsandboxed && values.resources) throw new ConnectorPreflightError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
-  if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorPreflightError("--allow-test-shell requires --allow-faux.");
-  if (values["pairing-id"] && !values.server) throw new ConnectorPreflightError("First pairing requires --server, e.g. --server https://pistead.com.");
+  if (process.platform !== "linux" && process.platform !== "darwin") throw new ConnectorSetupError(`Unsupported platform "${process.platform}": use Linux, WSL2 or macOS.`);
+  if (unsandboxed && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
+  if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorSetupError("--allow-test-shell requires --allow-faux.");
+  const pairingId = values["pairing-id"];
+  if (pairingId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pairingId)) {
+    throw new ConnectorSetupError(/^[A-Za-z0-9_-]{43}$/.test(pairingId)
+      ? "That --pairing-id value looks like the single-use pairing code, not the pairing ID. Copy the command shown in Pistead (its --pairing-id looks like 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed) and type the code only at the hidden prompt. Create a new code: this one is no longer private."
+      : "--pairing-id must be the pairing ID shown in Pistead, e.g. 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed.");
+  }
+  if (pairingId && !values.server) throw new ConnectorSetupError("First pairing requires --server, e.g. --server https://pistead.com.");
   if (values.server) {
     try { controlPlaneOrigin(values.server, values["allow-insecure-loopback"]); }
-    catch { throw new ConnectorPreflightError("--server must be an HTTPS origin such as https://pistead.com."); }
+    catch { throw new ConnectorSetupError("--server must be an HTTPS origin such as https://pistead.com."); }
   }
   const required: Record<string, string> = unsandboxed
     ? process.platform === "linux" ? { "/usr/bin/flock": "flock (util-linux)" } : { "/usr/bin/lockf": "lockf" }
@@ -178,23 +180,25 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   if (missing.length) {
     const hint = process.platform === "darwin" ? " Install Git, e.g. xcode-select --install or brew install git."
       : unsandboxed ? "" : " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first.";
-    throw new ConnectorPreflightError(`Missing prerequisites: ${missing.join(", ")}.${hint}`);
+    throw new ConnectorSetupError(`Missing prerequisites: ${missing.join(", ")}.${hint}`);
   }
   const models = values.model?.map(reference => {
     const slash = reference.indexOf("/");
-    if (slash < 1 || slash === reference.length - 1) throw new ConnectorPreflightError("--model expects PROVIDER/MODEL.");
+    if (slash < 1 || slash === reference.length - 1) throw new ConnectorSetupError("--model expects PROVIDER/MODEL.");
     return { provider: reference.slice(0, slash), modelId: reference.slice(slash + 1) };
   });
-  if (values["allow-faux"] && (values["pi-agent-dir"] || models)) throw new ConnectorPreflightError("Fixture mode cannot select personal Pi models.");
+  if (values["allow-faux"] && (values["pi-agent-dir"] || models)) throw new ConnectorSetupError("Fixture mode cannot select personal Pi models.");
   const localModels = values["allow-faux"] ? createFauxLocalModels() : await loadLocalPiModels({ agentDir: values["pi-agent-dir"], models });
-  if (!(await localModels.manifest()).length) throw new ConnectorPreflightError("No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
+  if (!(await localModels.manifest()).length) throw new ConnectorSetupError("No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
   const resources = values.resources ? await resourceConfig(values.resources) : undefined;
   const dataDir = values["state-dir"] ?? join(homedir(), ".local", "share", "opencara", "connector");
   if (!values["pairing-id"] && !await readConnectorState(dataDir, undefined, values["allow-insecure-loopback"])) {
-    throw new ConnectorPreflightError("This machine is not paired yet. In Pistead, open Connections, create a pairing code, then run:\n  npx pistead@latest connect --server https://pistead.com --pairing-id <PAIRING_ID>");
+    throw new ConnectorSetupError("This machine is not paired yet. In Pistead, open Connections, create a pairing code, then run:\n  npx pistead@latest connect --server https://pistead.com --pairing-id <PAIRING_ID>");
   }
   if (unsandboxed) await confirmUnsandboxed();
-  const pairing = values["pairing-id"] ? { id: values["pairing-id"], code: await promptPairingCode() } : undefined;
+  const code = pairingId ? await promptPairingCode() : "";
+  if (pairingId && !code) throw new ConnectorSetupError("No pairing code was entered. Paste the single-use code shown in Pistead at the hidden prompt.");
+  const pairing = pairingId ? { id: pairingId, code } : undefined;
   const connector = createConnector({
     dataDir,
     server: values.server, pairing, localModels, resources, unsandboxed,

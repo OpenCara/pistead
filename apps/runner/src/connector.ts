@@ -14,7 +14,7 @@ import type { AuthorizationRequest, AuthorizationResult, RunnerAction, RunnerBin
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
-import { assertId, verifyRunnerTicket } from "./protocol.js";
+import { assertId, ConnectorSetupError, verifyRunnerTicket } from "./protocol.js";
 import { recoverResourceOrphans } from "./resources.js";
 import { RunnerService, createRunnerApp } from "./server.js";
 import type { RunnerConfig } from "./session.js";
@@ -59,7 +59,7 @@ export function controlPlaneOrigin(value: string, allowInsecureLoopback = false)
 function credentials(value: unknown, origin?: string, allowInsecureLoopback = false): ConnectorCredentials {
   const c = credentialsSchema.parse(value);
   const controlPlaneUrl = controlPlaneOrigin(c.controlPlaneUrl, allowInsecureLoopback);
-  if (origin && controlPlaneUrl !== origin) throw new Error("Connector state is bound to a different control-plane origin");
+  if (origin && controlPlaneUrl !== origin) throw new ConnectorSetupError("Connector state is bound to a different control-plane origin; use its saved server or a separate --state-dir");
   return { connectorId: c.connectorId, token: c.token, controlPlaneUrl };
 }
 
@@ -69,7 +69,7 @@ async function privateDirectory(directory: string): Promise<string> {
   const stat = await lstat(path);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700
     || (process.getuid && stat.uid !== process.getuid()) || await realpath(path) !== path) {
-    throw new Error("Connector state directory must be an owned, non-symlink mode0700 directory");
+    throw new ConnectorSetupError("Connector state directory must be an owned, non-symlink mode0700 directory");
   }
   return path;
 }
@@ -180,7 +180,7 @@ export async function claimConnectorPairing(options: {
     body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: capabilities(options.capabilities, options.unsandboxed) }),
     signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]),
   });
-  if (!response.ok) { await response.body?.cancel(); throw new Error("Pairing rejected or unavailable; create a new pairing if its outcome is unknown"); }
+  if (!response.ok) { await response.body?.cancel(); throw new ConnectorSetupError("Pairing rejected or unavailable: the code may be wrong, expired (codes last 10 minutes) or already used. Create a new pairing code and try again."); }
   const bytes = await boundedBody(response, CALLBACK_LIMIT, AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]));
   const value = z.object({ credentials: credentialsSchema }).strict().parse(decodeJson(bytes));
   return credentials(value.credentials, origin, options.allowInsecureLoopback);
@@ -295,11 +295,14 @@ export class LocalConnector {
 
   start(): Promise<void> {
     if (this.lifetime.signal.aborted) return Promise.reject(new Error("Connector has stopped"));
-    this.starting ??= this.initialize().catch(async () => {
-      this.readiness.reject(new Error("Connector initialization failed; verify private state, pairing, local models and Linux lease prerequisites"));
+    this.starting ??= this.initialize().catch(async (error: unknown) => {
+      // Setup errors carry fixed connector text; anything else may contain SDK or HTTP detail.
+      const failure = error instanceof ConnectorSetupError ? error
+        : new Error("Connector initialization failed; verify private state, pairing, local models and lease prerequisites");
+      this.readiness.reject(failure);
       await this.releaseLease?.();
       this.releaseLease = undefined;
-      throw new Error("Connector initialization failed; verify private state, pairing, local models and Linux lease prerequisites");
+      throw failure;
     });
     return this.starting.then(() => this.ready);
   }
@@ -319,9 +322,9 @@ export class LocalConnector {
     }
     const origin = this.options.server === undefined ? undefined : controlPlaneOrigin(this.options.server, this.options.allowInsecureLoopback);
     this.state = await readConnectorState(this.directory, origin, this.options.allowInsecureLoopback);
-    if (this.state && this.options.pairing) throw new Error("Connector is already paired; do not overwrite existing credentials");
+    if (this.state && this.options.pairing) throw new ConnectorSetupError("This machine is already paired; run without --pairing-id, or use a separate --state-dir for another connection");
     if (!this.state) {
-      if (!origin || !this.options.pairing) throw new Error("First connection requires a server origin and private pairing code");
+      if (!origin || !this.options.pairing) throw new ConnectorSetupError("First connection requires --server and --pairing-id");
       this.state = await claimConnectorPairing({ ...this.options, server: origin, pairing: this.options.pairing, signal: this.lifetime.signal });
       await writeConnectorState(this.directory, this.state, this.options.allowInsecureLoopback);
     }

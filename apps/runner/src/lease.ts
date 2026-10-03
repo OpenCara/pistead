@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { ConnectorSetupError } from "./protocol.js";
 
 // The guardian reports LOCKED, then holds the kernel lock until its stdin reaches EOF.
 const GUARDIAN = ["/bin/sh", "-c", "echo LOCKED; exec /bin/cat >/dev/null"];
@@ -30,7 +31,7 @@ export async function acquireRunnerLease(directory: string, onLost: () => void):
   child.once("error", () => ready.reject(new Error("Cannot start mandatory flock guardian")));
   child.once("close", () => {
     exited.resolve();
-    if (!acquired) ready.reject(new Error("Another runner owns DATA_DIR or mandatory flock is unavailable"));
+    if (!acquired) ready.reject(new ConnectorSetupError("Another connector or runner is already using this state directory (or flock/lockf is unavailable)"));
     else if (!releasing) onLost();
   });
   const timeout = setTimeout(() => {

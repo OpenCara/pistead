@@ -1,4 +1,5 @@
-import { ConnectorPreflightError, connectMain } from "../../../apps/runner/src/connect-cli.js";
+import { connectMain } from "../../../apps/runner/src/connect-cli.js";
+import { ConnectorSetupError } from "../../../apps/runner/src/protocol.js";
 import packageJson from "../package.json" with { type: "json" };
 
 const USAGE = `Usage: pistead <command> [options]
@@ -17,7 +18,7 @@ const [command, ...args] = process.argv.slice(2);
 if (command === "connect") {
   connectMain(args).catch((error: unknown) => {
     // Only connector-authored preflight text is printed: SDK/HTTP errors can contain auth/config detail.
-    process.stderr.write(error instanceof ConnectorPreflightError
+    process.stderr.write(error instanceof ConnectorSetupError
       ? `${error.message}\n`
       : "Connector failed. Check --help, private state permissions, pairing, local Pi configuration and sandbox prerequisites.\n");
     process.exitCode = 1;

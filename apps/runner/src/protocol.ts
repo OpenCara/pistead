@@ -6,6 +6,10 @@ import { repositoryLimits, type SessionRepository } from "../../../packages/shar
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
 }
+/** Connector-authored setup failures with fixed text, safe to show the operator unlike SDK or HTTP errors. */
+export class ConnectorSetupError extends Error {
+  override name = "ConnectorSetupError";
+}
 export function assertId(id: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) throw new RunnerError(400, "Invalid identifier");
   return id;
