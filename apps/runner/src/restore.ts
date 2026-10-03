@@ -99,6 +99,8 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
     || source.session.connectorOwnerId !== target.session.connectorOwnerId
     || stableJson(source.agent) !== stableJson(target.agent)
     || stableJson(source.model) !== stableJson(target.model)) invalid("Backup source, owner, agent, model, or connector mismatch");
+  if (stableJson(source.session.repositories ?? []) !== stableJson(target.session.repositories ?? []))
+    invalid("Backup immutable repository pins mismatch");
   const manifest = value.manifest;
   if (!record(manifest) || stableJson(manifest.binding) !== stableJson(value.binding)
     || !Array.isArray(manifest.branches) || !manifest.branches.length
@@ -370,7 +372,11 @@ export async function restoreSession(config: RestoreConfig, input: RunnerBinding
     await prepare(stage, backup.manifest);
     if (stableJson(JSON.parse(await readPrivate(join(stage, "binding.json"), MAX_BYTES))) !== stableJson(binding)) throw new RunnerError(409, "Preparation changed the target binding");
     const sandbox = new Sandbox(binding, join(stage, "sandbox"));
-    try { await sandbox.initialize(); } finally { await sandbox.close(); }
+    try {
+      await sandbox.initialize();
+      if (binding.session.repositories?.length && !await sandbox.repositoryCachesReady(binding.session.repositories, async () => {}))
+        throw new RunnerError(409, "Restored repository cache is not ready");
+    } finally { await sandbox.close(); }
     await writePrivate(join(stage, MARKER), JSON.stringify(receipt));
     await syncTree(stage, await mountIdentity(parent));
     await parent.sync();

@@ -1,6 +1,7 @@
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
+import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -33,6 +34,27 @@ export async function verifyRunnerTicket(token: string, secret: string, action: 
     || typeof ticket.jti !== "string" || !ticket.jti) throw new RunnerError(401, "Ticket scope or expiry mismatch");
   return ticket;
 }
+export function validateRepositories(value: unknown): SessionRepository[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > repositoryLimits.repositories) throw new RunnerError(400, "Invalid immutable repository bindings");
+  const ids = new Set<number>(), bindings = new Set<string>(), names = new Set<string>();
+  return Array.from(value, repository => {
+    if (!repository || typeof repository !== "object" || Array.isArray(repository)
+      || Object.keys(repository).sort().join(",") !== "bindingId,commit,fullName,path,ref,repositoryId"
+      || typeof repository.bindingId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(repository.bindingId)
+      || !Number.isSafeInteger(repository.repositoryId) || repository.repositoryId < 1
+      || typeof repository.fullName !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]{1,100}$/.test(repository.fullName)
+      || [".", "..", ".git"].includes(repository.fullName.split("/")[1]!.toLowerCase())
+      || repository.path !== repository.fullName
+      || typeof repository.commit !== "string" || !/^[a-f0-9]{40}$/.test(repository.commit)
+      || typeof repository.ref !== "string" || !repository.ref.trim() || repository.ref.length > 255 || /[\x00-\x20\x7f\\]/.test(repository.ref))
+      throw new RunnerError(400, "Invalid immutable repository binding");
+    const name = repository.fullName.toLowerCase();
+    if (ids.has(repository.repositoryId) || bindings.has(repository.bindingId) || names.has(name)) throw new RunnerError(400, "Duplicate immutable repository binding");
+    ids.add(repository.repositoryId); bindings.add(repository.bindingId); names.add(name);
+    return { ...repository } as SessionRepository;
+  });
+}
 export function validateBinding(value: unknown, id: string, allowNativeModels = false): RunnerBinding {
   const b = value as RunnerBinding;
   if (!b || b.session?.id !== id || b.session.ownerId !== b.owner?.id || b.session.agentVersionId !== b.agent?.id || b.agent.modelId !== b.model?.id
@@ -48,6 +70,7 @@ export function validateBinding(value: unknown, id: string, allowNativeModels = 
     || b.session.connectorId !== b.model.connectorId || b.session.connectorOwnerId !== b.model.connectorOwnerId)
     throw new RunnerError(400, "Invalid runner workspace or connector binding");
   if (b.session.connectorId !== undefined) assertId(b.session.connectorId);
+  validateRepositories(b.session.repositories);
   b.owner.env = validateUserEnv(b.owner.env ?? {});
   return JSON.parse(JSON.stringify(b));
 }

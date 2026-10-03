@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { chmod, link, lstat, mkdtemp, readFile, realpath, rm, symlink, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +8,8 @@ import test from 'node:test';
 import type { TestContext } from 'node:test';
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, LocalModelSummary } from '../packages/shared/src/connector.js';
 import type { AuthorizationRequest, ModelDefinition, RunnerAction, RunnerBinding } from '../packages/shared/src/types.js';
+import type { SessionRepository } from '../packages/shared/src/repositories.js';
+import { repositoryLimits } from '../packages/shared/src/repositories.js';
 import type { ConnectorRuntime, ConnectorSocket, LocalConnector } from '../apps/runner/src/connector.js';
 import type { LocalModels } from '../apps/runner/src/local-pi.js';
 import type { RunnerConfig } from '../apps/runner/src/session.js';
@@ -26,6 +29,20 @@ const summary: LocalModelSummary = { provider: 'native.fixture', modelId: 'regio
 const model: ModelDefinition = { ...summary, id: 'model', workspaceId: 'workspace', connectorId: credentials.connectorId };
 const publicCapabilities: ConnectorCapabilities = { platform: 'linux', sandbox: true, productionShell: false };
 const authorizationRequest: AuthorizationRequest = { sessionId: 'session', actorId: 'owner', ownerId: 'owner', permission: 'write' };
+const repository: SessionRepository = {
+  bindingId: 'repository-binding', repositoryId: 123, fullName: 'fixture/repository',
+  ref: 'main', commit: 'a'.repeat(40), path: 'fixture/repository',
+};
+const repositoryBytes = Uint8Array.from([0x1f, 0x8b, 0x00, 0xff, 0x80, 0x01]);
+
+function repositoryResponse(bytes = repositoryBytes): Response {
+  return new Response(bytes, {
+    headers: {
+      'x-repository-commit': repository.commit,
+      'x-archive-sha256': createHash('sha256').update(bytes).digest('base64url'),
+    },
+  });
+}
 
 function localModels(entries: LocalModelSummary[] = [summary]): LocalModels {
   return {
@@ -333,6 +350,7 @@ type RuntimeRecord = { config: RunnerConfig; requests: Request[]; closed: boolea
 type FixtureOptions = {
   manifest?: (generation: number) => Response | Promise<Response>;
   authorize?: () => Response | Promise<Response>;
+  repository?: (request: Request) => Response | Promise<Response>;
   execute?: (request: Request, generation: number) => Response | Promise<Response>;
   unblock?: () => void;
 };
@@ -386,6 +404,9 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
       }
       if (request.url === `${origin}/api/connectors/self/authorize`) {
         return options.authorize?.() ?? Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' });
+      }
+      if (request.url === `${origin}/api/connectors/self/repositories/${repository.bindingId}/download`) {
+        return options.repository?.(request) ?? repositoryResponse();
       }
       assert.fail(`Unexpected fixture Worker request: ${request.url}`);
     },
@@ -722,13 +743,13 @@ for (const duplicate of ['request ID', 'ticket ID'] as const) {
 test('reconnect drains an ambiguous in-flight effect without retry and rejects old callbacks and replay', { timeout: 15000 }, async t => {
   const effectStarted = Promise.withResolvers<Request>();
   const effectFinished = Promise.withResolvers<Response>();
-  const authorizeFinished = Promise.withResolvers<Response>();
+  const authorizeFinished = Promise.withResolvers<void>();
   const fixture = await connectorFixture(t, {
     execute: request => { effectStarted.resolve(request); return effectFinished.promise; },
-    authorize: () => authorizeFinished.promise,
+    authorize: async () => { await authorizeFinished.promise; return Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' }); },
     unblock: () => {
       effectFinished.resolve(Response.json({ effect: 'already-applied' }));
-      authorizeFinished.resolve(Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' }));
+      authorizeFinished.resolve();
     },
   });
   const starting = fixture.connector.start();
@@ -769,7 +790,7 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
   assert.equal(oldRuntime.closed, false, 'ambiguous local work must drain before runtime retirement');
   assert.equal(fixture.allSockets.length, 1, 'a replacement must not race the old runtime');
   assert.equal(oldRuntime.requests.length, 1);
-  authorizeFinished.resolve(Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' }));
+  authorizeFinished.resolve();
   await oldAuthorization;
   effectFinished.resolve(Response.json({ effect: 'already-applied' }));
 
@@ -805,6 +826,8 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
     id: 'restore', sourceSessionId: 'source', backupId: 'backup', size: 1,
     sha256: await sha256('x'), downloadToken: 'fixture_download_token_0123456789abcdef',
   }, 'session'), /generation is no longer authorized/);
+  assert.ok(oldConfig.readRepository);
+  await assert.rejects(oldConfig.readRepository(repository, 'session'), /generation is no longer authorized/);
   assert.equal(fixture.allCalls.length, count, 'retired callbacks must fail before Worker fetch');
 
   first.receive(await rpc('submit', '{}', 'late-old-message'));
@@ -845,4 +868,230 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
   await fixture.connector.stop();
   assert.equal(fixture.runtimes.reduce((count, runtime) => count + runtime.requests.length, 0), 1);
   assert.deepEqual(fixture.leases, { acquired: 1, released: 1 });
+});
+
+test('repository downloads return verified binary bytes through only the fixed scoped callback', { timeout: 10000 }, async t => {
+  const fixture = await connectorFixture(t);
+  const socket = await startFixture(fixture);
+  const config = fixture.runtimes[0]!.config;
+  assert.ok(config.readRepository);
+  const installationToken = 'fixture-github-installation-token-never-on-wire';
+  const input = {
+    ...repository, url: 'https://attacker.invalid/archive', downloadUrl: 'https://attacker.invalid/download',
+    token: installationToken, credentials: { apiKey: providerSecret },
+  };
+  const bytes = await config.readRepository(input, 'session');
+  assert.ok(bytes instanceof Uint8Array);
+  assert.deepEqual(bytes, repositoryBytes, 'archive bytes must not be UTF-8 decoded');
+  const call = await fixture.workerCalls.next();
+  assert.equal(call.request.url, `${origin}/api/connectors/self/repositories/${repository.bindingId}/download`);
+  assert.deepEqual(JSON.parse(call.body), { sessionId: 'session', commit: repository.commit });
+  assert.equal(call.request.headers.get('content-type'), 'application/json');
+  assert.equal(call.request.headers.get('x-connection-token'), connectionToken);
+  assert.deepEqual(socket.sent, [], 'download bytes never travel over relay frames');
+  assertWorkerBoundary(fixture.allCalls, fixture.allSockets, [config.sharedSecret, installationToken]);
+});
+
+test('repository downloads accept exactly the shared 8 MiB archive limit', { timeout: 10000 }, async t => {
+  assert.equal(repositoryLimits.archiveBytes, 8 * 1024 * 1024);
+  const expected = new Uint8Array(repositoryLimits.archiveBytes).fill(0xff);
+  const fixture = await connectorFixture(t, { repository: () => repositoryResponse(expected) });
+  await startFixture(fixture);
+  const bytes = await fixture.runtimes[0]!.config.readRepository!(repository, 'session');
+  assert.deepEqual(bytes, expected);
+});
+
+test('repository downloads reject missing, malformed and mismatched integrity headers', { timeout: 10000 }, async t => {
+  const cases = [
+    { name: 'missing commit', header: 'x-repository-commit', value: null },
+    { name: 'wrong commit', header: 'x-repository-commit', value: 'b'.repeat(40) },
+    { name: 'missing checksum', header: 'x-archive-sha256', value: null },
+    { name: 'malformed checksum', header: 'x-archive-sha256', value: '!'.repeat(43) },
+    { name: 'hex checksum', header: 'x-archive-sha256', value: createHash('sha256').update(repositoryBytes).digest('hex') },
+    { name: 'wrong checksum', header: 'x-archive-sha256', value: createHash('sha256').update('different archive').digest('base64url') },
+    { name: 'noncanonical base64url', header: 'x-archive-sha256', value: `${'A'.repeat(42)}B` },
+    { name: 'truncated body', header: 'content-length', value: String(repositoryBytes.byteLength + 1) },
+    { name: 'incorrect declared size', header: 'content-length', value: String(repositoryBytes.byteLength - 1) },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async t => {
+      const fixture = await connectorFixture(t, {
+        repository: () => {
+          const response = repositoryResponse();
+          if (entry.value === null) response.headers.delete(entry.header);
+          else response.headers.set(entry.header, entry.value);
+          return response;
+        },
+      });
+      await startFixture(fixture);
+      await assert.rejects(fixture.runtimes[0]!.config.readRepository!(repository, 'session'), /Repository integrity mismatch/);
+      assert.deepEqual(fixture.allSockets[0]!.sent, []);
+    });
+  }
+});
+
+test('repository downloads reject an empty archive even with its correct checksum', { timeout: 10000 }, async t => {
+  const fixture = await connectorFixture(t, { repository: () => repositoryResponse(new Uint8Array()) });
+  await startFixture(fixture);
+  await assert.rejects(fixture.runtimes[0]!.config.readRepository!(repository, 'session'), /Repository integrity mismatch/);
+});
+
+test('repository downloads bound both declared and streamed size and cancel rejected bodies', { timeout: 10000 }, async t => {
+  for (const kind of ['declared', 'streamed', 'invalid length'] as const) {
+    await t.test(kind, async t => {
+      let canceled = false;
+      let chunk = 0;
+      const fixture = await connectorFixture(t, {
+        repository: () => {
+          const headers = repositoryResponse().headers;
+          if (kind === 'declared') headers.set('content-length', String(repositoryLimits.archiveBytes + 1));
+          if (kind === 'invalid length') headers.set('content-length', '-1');
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              controller.enqueue(new Uint8Array(chunk++ === 0 ? repositoryLimits.archiveBytes : 1));
+            },
+            cancel() { canceled = true; },
+          }), { headers });
+        },
+      });
+      await startFixture(fixture);
+      await assert.rejects(fixture.runtimes[0]!.config.readRepository!(repository, 'session'), /Response exceeds connector limit/);
+      assert.equal(canceled, true);
+    });
+  }
+});
+
+test('repository downloads reject malformed identifiers and commits before fetching', { timeout: 10000 }, async t => {
+  const fixture = await connectorFixture(t);
+  await startFixture(fixture);
+  const readRepository = fixture.runtimes[0]!.config.readRepository!;
+  const calls = fixture.allCalls.length;
+  for (const bindingId of ['', '../other', 'binding?token=secret', 'https://attacker.invalid', 'binding/download']) {
+    await assert.rejects(readRepository({ ...repository, bindingId }, 'session'), /Invalid repository descriptor/);
+  }
+  for (const commit of ['', 'main', 'a'.repeat(39), 'a'.repeat(41), 'A'.repeat(40)]) {
+    await assert.rejects(readRepository({ ...repository, commit }, 'session'), /Invalid repository descriptor/);
+  }
+  await assert.rejects(readRepository(repository, '../session'), /Invalid repository descriptor/);
+  assert.equal(fixture.allCalls.length, calls);
+});
+
+test('repository downloads reject denied responses without consuming archive bytes', { timeout: 10000 }, async t => {
+  let canceled = false;
+  const fixture = await connectorFixture(t, {
+    repository: () => new Response(new ReadableStream({ cancel() { canceled = true; } }), { status: 403 }),
+  });
+  await startFixture(fixture);
+  await assert.rejects(fixture.runtimes[0]!.config.readRepository!(repository, 'session'), /Scoped connector callback denied/);
+  assert.equal(canceled, true);
+});
+
+test('repository downloads reject late responses and stalled bodies from retired generations', { timeout: 10000 }, async t => {
+  for (const phase of ['headers', 'body'] as const) {
+    await t.test(phase, async t => {
+      const response = Promise.withResolvers<Response>();
+      const reading = Promise.withResolvers<void>();
+      let canceled = false;
+      const stale = new Response(new ReadableStream<Uint8Array>({
+        pull() { reading.resolve(); },
+        cancel() { canceled = true; },
+      }, { highWaterMark: 0 }), { headers: repositoryResponse().headers });
+      const fixture = await connectorFixture(t, {
+        repository: () => phase === 'headers' ? response.promise : stale,
+        unblock: () => response.resolve(stale),
+      });
+      const first = await startFixture(fixture);
+      const old = fixture.runtimes[0]!.config;
+      const rejected = assert.rejects(old.readRepository!(repository, 'session'), /generation is no longer authorized|aborted/i);
+      const call = await fixture.workerCalls.next();
+      if (phase === 'body') await reading.promise;
+      first.close();
+      assert.equal(call.request.signal.aborted, true);
+      const second = await fixture.sockets.next();
+      second.open();
+      const secondToken = 'fixture_second_connection_token_0123456789abcdef';
+      second.welcome(secondToken);
+      await fixture.connected.next();
+      await fixture.workerCalls.next();
+      response.resolve(stale);
+      await rejected;
+      assert.equal(canceled, true, 'retired downloads must cancel their body');
+      const count = fixture.allCalls.length;
+      await assert.rejects(old.readRepository!(repository, 'session'), /generation is no longer authorized/);
+      assert.equal(fixture.allCalls.length, count, 'old callback cannot use a new generation token');
+      assert.deepEqual(first.sent, []);
+      assert.deepEqual(second.sent, []);
+    });
+  }
+});
+
+test('repository download deadline aborts both fetch and stalled body without restarting', { timeout: 10000 }, async t => {
+  for (const phase of ['headers', 'body'] as const) {
+    await t.test(phase, async t => {
+      const reading = Promise.withResolvers<void>();
+      let canceled = false;
+      const fixture = await connectorFixture(t, {
+        repository: request => {
+          if (phase === 'headers') {
+            return new Promise<Response>((_resolve, reject) => {
+              request.signal.addEventListener('abort', () => { canceled = true; reject(request.signal.reason); }, { once: true });
+              reading.resolve();
+            });
+          }
+          return new Response(new ReadableStream<Uint8Array>({
+            pull() { reading.resolve(); },
+            cancel() { canceled = true; },
+          }, { highWaterMark: 0 }), { headers: repositoryResponse().headers });
+        },
+      });
+      const socket = await startFixture(fixture);
+      const deadline = new AbortController();
+      const timeout = t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
+        assert.equal(milliseconds, 15_000);
+        return deadline.signal;
+      });
+      const rejected = assert.rejects(fixture.runtimes[0]!.config.readRepository!(repository, 'session'), /deadline expired/);
+      const call = await fixture.workerCalls.next();
+      await reading.promise;
+      deadline.abort(new Error('deadline expired'));
+      await rejected;
+      assert.equal(call.request.signal.aborted, true);
+      assert.equal(canceled, true);
+      assert.equal(timeout.mock.callCount(), 1, 'fetch and body share one deadline');
+      assert.equal(socket.readyState, 1);
+    });
+  }
+});
+
+test('repository downloads keep relay effects and responses FIFO without archive frames', { timeout: 10000 }, async t => {
+  const download = Promise.withResolvers<void>();
+  const fixture = await connectorFixture(t, {
+    repository: async () => { await download.promise; return repositoryResponse(); },
+    execute: async () => {
+      const config = fixture.runtimes[0]!.config;
+      assert.deepEqual(await config.readRepository!(repository, 'session'), repositoryBytes);
+      return Response.json({ installed: true });
+    },
+    unblock: () => download.resolve(),
+  });
+  const socket = await startFixture(fixture);
+  const first = await rpc('submit', '{"text":"first"}', 'repository-first');
+  const second = await rpc('submit', '{"text":"second"}', 'repository-second');
+  socket.receive(first);
+  await fixture.workerCalls.next();
+  socket.receive(second);
+  await nextTurn();
+  assert.equal(fixture.runtimes[0]!.requests.length, 1, 'queued effect cannot overtake a download');
+  assert.deepEqual(socket.sent, []);
+  download.resolve();
+  const firstResult = JSON.parse(await socket.messages.next());
+  assert.equal(firstResult.id, first.id);
+  const secondResult = JSON.parse(await socket.messages.next());
+  assert.equal(secondResult.id, second.id);
+  await fixture.workerCalls.next();
+  assert.equal(fixture.runtimes[0]!.requests.length, 2);
+  assert.equal(firstResult.body, '{"installed":true}');
+  assert.equal(secondResult.body, '{"installed":true}');
+  assert.deepEqual(socket.sent.map(frame => JSON.parse(frame)), [firstResult, secondResult]);
+  assertWorkerBoundary(fixture.allCalls, fixture.allSockets, [fixture.runtimes[0]!.config.sharedSecret]);
 });

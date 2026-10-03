@@ -12,6 +12,7 @@ import { parseOperation } from './operations.js';
 import { requireConnectorSession } from './connectors.js';
 import { presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
+import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 
 export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
   const [owner, agent] = await Promise.all([
@@ -103,7 +104,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.post('/api/sessions', async c => {
     const input = await jsonObject(c);
-    if ('ownerId' in input || 'permissions' in input || 'githubId' in input) fail(400, 'server_owned_identity', 'Session identity and permissions are assigned by the server.');
+    if (['ownerId', 'permissions', 'githubId', 'repositories', 'repositories_json', 'pins'].some(key => key in input)) fail(400, 'server_owned_identity', 'Session identity, repository pins, and permissions are assigned by the server.');
     const workspaceId = identifier(input.workspaceId, 'workspaceId');
     const versionId = identifier(input.agentVersionId, 'agentVersionId');
     const title = text(input.title ?? 'Untitled session', 'title', 200);
@@ -115,7 +116,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const model = await c.env.DB.prepare('SELECT * FROM models WHERE id = ? AND workspace_id = ?').bind(agent.model_id, workspaceId).first<ModelRow>();
     if (!model) fail(400, 'model_workspace_mismatch', 'The agent model must belong to the session workspace.');
     if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are disabled.');
-    if (!model.connector_id && !testMode(c.env)) fail(400, 'connector_required', 'New sessions require a connected model.');
+    const syntheticLegacy = model.provider === 'faux' && await legacyRepositoryFixture(c.env, ownerId);
+    if (!model.connector_id && !syntheticLegacy) fail(400, 'connector_required', 'New sessions require a connected model.');
     if (model.connector_id && model.connector_owner_id !== ownerId && input.trustedConnectorId !== model.connector_id) {
       fail(400, 'connector_trust_required', 'Explicitly acknowledge that this host can access this session before continuing.');
     }
@@ -123,11 +125,30 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       title, policy_version: 1, status: 'provisioning', created_at: now(),
       connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
-    await c.env.DB.batch([
-      c.env.DB.prepare('INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at, row.connector_id ?? null, row.connector_owner_id ?? null),
-      auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }),
-    ]);
+    const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId);
+    row.repositories_json = JSON.stringify(resolved.repositories);
+    await requireMember(c.env, workspaceId, ownerId);
+    if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
+    const inserted = await c.env.DB.prepare(`INSERT INTO sessions
+      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?
+      WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
+      AND (SELECT json_group_array(id) FROM (SELECT id FROM workspace_repositories WHERE workspace_id = ? ORDER BY id)) = ?
+      AND (? IS NULL OR EXISTS (
+        SELECT 1 FROM connectors host JOIN connector_shares share ON share.connector_id = host.id
+        JOIN workspace_members member ON member.workspace_id = share.workspace_id AND member.user_id = host.owner_id
+        JOIN models m ON m.id = ?
+        WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND share.workspace_id = ?
+          AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id
+          AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
+            WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
+      )) RETURNING id`)
+      .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
+        row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json,
+        workspaceId, ownerId, workspaceId, resolved.bindingIds, row.connector_id ?? null,
+        model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId).first();
+    if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, membership, or connector authority changed. Try again.');
+    await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }).run();
     try {
       const binding = await bindingForSession(c, row);
       const response = await runnerRequest(c, row, 'create', '', binding);

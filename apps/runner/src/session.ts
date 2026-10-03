@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
@@ -7,8 +7,9 @@ import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxD
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ModelDefinition, Operation, Permission, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
+import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
-import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
+import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { Sandbox } from "./sandbox.js";
 import type { ResourceConfig } from "./resources.js";
@@ -32,6 +33,7 @@ export type RunnerConfig = {
   githubComment?: (request: { sessionId: string; actorId: string; approvalId: string; capability: string; repository: string; issue: number; body: string }) => Promise<{ id: number; url: string }>;
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
+  readRepository?: (repository: SessionRepository, sessionId: string) => Promise<Uint8Array>;
   resources?: ResourceConfig;
 };
 
@@ -81,6 +83,7 @@ export class RunnerSession {
   }
 
   async prepareRestore(manifest: RestoreManifest): Promise<void> {
+    await this.initializeRepositories(true);
     const resolved = this.config.resolveModels ? await this.config.resolveModels(this.binding.model)
       : { models: runnerModels(this.binding.model, this.config.allowFaux) };
     const storage = await openNodeSqliteStorage(this.sqlitePath);
@@ -127,8 +130,89 @@ export class RunnerSession {
     } finally { await harness.close(context); }
   }
 
-  async open(): Promise<void> {
+  private async pullRepository(repository: SessionRepository): Promise<Uint8Array> {
+    if (this.config.readRepository) return this.config.readRepository({ ...repository }, this.binding.session.id);
+    if (this.config.connectorId) throw new RunnerError(503, "Connected repository download requires its scoped callback");
+    const origin = new URL(this.config.controlPlaneUrl);
+    if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/"
+      || (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))))
+      throw new RunnerError(503, "Invalid repository control-plane origin");
+    const signal = AbortSignal.timeout(30_000);
+    const response = await (this.config.fetch ?? fetch)(`${origin.origin}/api/internal/repositories/${assertId(repository.bindingId)}/download`, {
+      method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: this.binding.session.id, commit: repository.commit }), signal, redirect: "error",
+    });
+    const checksum = response.headers.get("x-archive-sha256");
+    const length = response.headers.get("content-length");
+    if (!response.ok || response.headers.get("x-repository-commit") !== repository.commit || !checksum
+      || !/^[A-Za-z0-9_-]{43}$/.test(checksum) || Buffer.from(checksum, "base64url").toString("base64url") !== checksum
+      || (length !== null && (!/^[0-9]+$/.test(length) || Number(length) > repositoryLimits.archiveBytes)) || !response.body) {
+      await response.body?.cancel();
+      throw new RunnerError(403, "Repository download denied or metadata mismatch");
+    }
+    const reader = response.body.getReader();
+    const cancel = () => { void reader.cancel().catch(() => {}); };
+    signal.addEventListener("abort", cancel, { once: true });
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const chunk = await reader.read();
+        signal.throwIfAborted();
+        if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > repositoryLimits.archiveBytes) throw new RunnerError(413, "Repository archive exceeds its bound");
+        chunks.push(chunk.value);
+      }
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    const bytes = Buffer.concat(chunks, size);
+    if (!size || (length !== null && Number(length) !== size)
+      || createHash("sha256").update(bytes).digest("base64url") !== checksum) throw new RunnerError(400, "Repository archive checksum or size mismatch");
+    return bytes;
+  }
+
+  private async initializeRepositories(restoring = false): Promise<void> {
+    const repositories = validateRepositories(this.binding.session.repositories);
+    const authorize = async () => { await this.authorize(this.binding.owner.id, restoring ? "manage" : "write"); };
+    if (repositories.length) await authorize();
     await this.sandbox.initialize();
+    if (!repositories.length) return;
+    if (await this.sandbox.repositoryCachesReady(repositories, authorize)) return;
+    // A restored cache is authoritative: never replace its files with a fresh download.
+    if (restoring) throw new RunnerError(409, "Restored repository cache is not ready");
+    const archives: Uint8Array[] = [];
+    for (const repository of repositories) {
+      await authorize();
+      const bytes = await this.pullRepository(repository);
+      await authorize();
+      if (!(bytes instanceof Uint8Array) || !bytes.byteLength || bytes.byteLength > repositoryLimits.archiveBytes)
+        throw new RunnerError(413, "Repository archive exceeds its bound");
+      archives.push(bytes);
+    }
+    await this.sandbox.materializeRepositories(repositories, archives, authorize);
+    if (!await this.sandbox.repositoryCachesReady(repositories, authorize)) throw new RunnerError(409, "Repository cache initialization did not complete");
+  }
+
+  private agentInstructions(mode: "write" | "ask"): string {
+    let instructions = this.binding.agent.instructions;
+    const repositories = this.binding.session.repositories ?? [];
+    if (repositories.length) {
+      instructions += "\n\nTrusted runtime repository context:\n"
+        + "The execution root is the isolated session worktree. File-tool paths are relative to that worktree, not to a repository root.\n"
+        + repositories.map(repository => `- Source snapshot: worktree/${repository.path}; file-tool path prefix: ${repository.path}/; pinned commit: ${repository.commit}.`).join("\n")
+        + "\nOperate only on isolated session files. These are pinned source snapshots, not full upstream Git histories.";
+    }
+    if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
+    return instructions;
+  }
+
+  async open(): Promise<void> {
+    await this.initializeRepositories();
     const registry = createRegistry();
     this.tools = this.buildTools();
     const extension = defineExtension({ name: "workspace-tools", tools: this.tools });
@@ -142,7 +226,7 @@ export class RunnerSession {
     catch (error) { await storage.close(context); throw error; }
     this.root = await this.harness.root(context, { agent: {
       model: this.modelRef, extensions: [extension],
-      tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never)), instructions: this.binding.agent.instructions,
+      tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never)), instructions: this.agentInstructions("write"),
     } });
     await this.root.commit(async tx => {
       const doc = await tx.doc(RunnerState);
@@ -291,8 +375,11 @@ export class RunnerSession {
       if (mode === "ask") {
         const transcript = await this.root.context(context);
         const head = transcript.entries.at(-1);
-        const options = { ownership: { kind: "ownerless" as const }, agent: { model: this.modelRef, tools: this.tools.filter(tool => ["identity", "read_file", "list_files", "git_status"].includes(tool.name) && this.binding.agent.tools.includes(tool.name as never)) } };
-        conversation = head ? await this.root.fork(head.id, options, context) : await this.harness.createConversation({ ...options, agent: { ...options.agent, instructions: this.binding.agent.instructions } }, context);
+        const options = { ownership: { kind: "ownerless" as const }, agent: {
+          model: this.modelRef, instructions: this.agentInstructions("ask"),
+          tools: this.tools.filter(tool => ["identity", "read_file", "list_files", "git_status"].includes(tool.name) && this.binding.agent.tools.includes(tool.name as never)),
+        } };
+        conversation = head ? await this.root.fork(head.id, options, context) : await this.harness.createConversation(options, context);
       }
       const transcript = await conversation.context(context);
       const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0 };

@@ -1,0 +1,774 @@
+import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import test, { type TestContext } from 'node:test';
+import { gzipSync } from 'node:zlib';
+import { HTTPException } from 'hono/http-exception';
+import { app } from '../apps/worker/src/index.js';
+import type { ConnectorRelayEnvelope } from '../apps/worker/src/connector-transport.js';
+import { archiveRedirect, boundedRepositoryBody } from '../apps/worker/src/repositories.js';
+import type { Env } from '../apps/worker/src/types.js';
+import { encryptToken } from '../apps/worker/src/vault.js';
+import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
+import { sha256 } from '../packages/shared/src/crypto.js';
+import { repositoryLimits, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
+import type { AgentVersion, ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
+
+const origin = 'http://localhost:8787';
+const testSecret = 'repositories-test-secret-not-for-deployment';
+const internalSecret = 'repositories-internal-secret-not-for-deployment';
+const commitA = 'a'.repeat(40);
+const commitB = 'b'.repeat(40);
+const metadata = { id: 1701, full_name: 'acme/private-repo', default_branch: 'main', private: true };
+const repositoryInput = { repositoryId: metadata.id, fullName: metadata.full_name, ref: 'release/stable' };
+const manifest = {
+  models: [{ provider: 'local-native', modelId: 'local/model-v1', name: 'Local model' }],
+  capabilities: { platform: 'linux', sandbox: true, productionShell: false },
+};
+// A small, valid gzip of an empty tar, not a multi-megabyte archive fixture.
+const archiveBytes = new Uint8Array(gzipSync(Buffer.alloc(1024)));
+const token = () => randomBytes(32).toString('base64url');
+type ApiRequest = (method: string, path: string, body?: unknown, headers?: Record<string, string>) => Promise<Response>;
+interface Client { user: { id: string }; cookie: string; csrf: string; githubToken: string; request: ApiRequest }
+interface Fixture {
+  sqlite: DatabaseSync;
+  env: Env;
+  request: ApiRequest;
+  client(name: string, production?: boolean): Promise<Client>;
+}
+type Connected = ConnectorCredentials & { connectionToken: string };
+
+async function json<T>(response: Response, status = 200): Promise<T> {
+  const body = await response.json();
+  assert.equal(response.status, status, JSON.stringify(body));
+  return body as T;
+}
+async function denied(response: Response, status: number, code: string) {
+  assert.equal((await json<{ code: string }>(response, status)).code, code);
+}
+
+async function repositoryFailure(operation: Promise<unknown>, code: string) {
+  let response: Response | undefined;
+  await assert.rejects(operation, (error: unknown) => {
+    assert.ok(error instanceof HTTPException);
+    response = error.getResponse();
+    return true;
+  });
+  assert.ok(response);
+  await denied(response, 502, code);
+}
+
+function fixture(t: TestContext) {
+  const sqlite = new DatabaseSync(':memory:');
+  t.after(() => sqlite.close());
+  sqlite.exec('PRAGMA foreign_keys = ON');
+  const directory = new URL('../apps/worker/migrations/', import.meta.url);
+  for (const file of readdirSync(directory).filter(name => name.endsWith('.sql')).sort()) {
+    sqlite.exec('BEGIN');
+    try { sqlite.exec(readFileSync(new URL(file, directory), 'utf8')); sqlite.exec('COMMIT'); }
+    catch (error) { sqlite.exec('ROLLBACK'); throw error; }
+  }
+  class Prepared {
+    values: (string | number | null | Uint8Array)[] = [];
+    constructor(readonly sql: string) {}
+    bind(...values: (string | number | null | Uint8Array)[]) { this.values = values; return this; }
+    execute() {
+      const results = sqlite.prepare(this.sql).all(...this.values);
+      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
+      return { success: true, results, meta: { changes, duration: 0, last_row_id: 0, changed_db: changes > 0,
+        size_after: 0, rows_read: results.length, rows_written: changes } };
+    }
+    async all() { return this.execute(); }
+    async run() { return this.execute(); }
+    async first(column?: string) {
+      const row = this.execute().results[0];
+      return row ? column ? row[column] : row : null;
+    }
+  }
+  const database = {
+    prepare(sql: string) { return new Prepared(sql); },
+    async batch(statements: Prepared[]) {
+      sqlite.exec('BEGIN');
+      try { const results = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return results; }
+      catch (error) { sqlite.exec('ROLLBACK'); throw error; }
+    },
+  };
+  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
+    TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
+    RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url') };
+  const request: ApiRequest = async (method, path, body, headers = {}) => app.request(`${origin}${path}`, {
+    method, headers: { Origin: origin, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }, env);
+  let nextGithubId = 100;
+  async function client(name: string, production = true): Promise<Client> {
+    const response = await request('POST', '/api/auth/test', { id: name, displayName: name, gitName: name,
+      gitEmail: `${name}@example.test` }, { Authorization: `Bearer ${testSecret}` });
+    const { user } = await json<{ user: { id: string } }>(response);
+    const cookie = response.headers.get('set-cookie')!.split(';')[0];
+    const githubToken = `github-secret-for-${name}`;
+    if (production) {
+      const githubId = String(nextGithubId++); const userId = `github:${githubId}`;
+      // Keep the login-issued cookie/CSRF, but use the production identity namespace and vault path.
+      sqlite.exec('BEGIN; PRAGMA defer_foreign_keys = ON');
+      try {
+        sqlite.prepare("UPDATE users SET id = ?, auth_kind = 'github', github_id = ? WHERE id = ?").run(userId, githubId, user.id);
+        sqlite.prepare('UPDATE auth_sessions SET user_id = ? WHERE user_id = ?').run(userId, user.id);
+        sqlite.exec('COMMIT');
+      } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
+      user.id = userId;
+      sqlite.prepare('INSERT INTO github_tokens (user_id,ciphertext,updated_at) VALUES (?,?,?)')
+        .run(user.id, await encryptToken(env, user.id, githubToken), new Date().toISOString());
+    }
+    const { csrfToken } = await json<{ csrfToken: string }>(await request('GET', '/api/auth/csrf', undefined, { Cookie: cookie }));
+    return { user, cookie, csrf: csrfToken, githubToken,
+      request(method, path, body, headers = {}) { return request(method, path, body, { Cookie: cookie, 'X-CSRF-Token': csrfToken, ...headers }); } };
+  }
+  return { sqlite, env, request, client };
+}
+
+async function workspace(owner: Client) {
+  return (await json<{ workspace: { id: string } }>(await owner.request('POST', '/api/workspaces', { name: 'Repositories' }), 201)).workspace;
+}
+async function member(owner: Client, workspaceId: string, client: Client, role = 'member') {
+  await json(await owner.request('POST', `/api/workspaces/${workspaceId}/members`, { userId: client.user.id, role }));
+}
+async function bindRepository(actor: Client, workspaceId: string, input = repositoryInput) {
+  return (await json<{ repository: WorkspaceRepository }>(await actor.request('POST', `/api/workspaces/${workspaceId}/repositories`, input), 201)).repository;
+}
+async function pair(host: Client, workspaceId: string) {
+  return (await json<{ pairing: ConnectorPairing }>(await host.request('POST', '/api/connectors/pairings', { name: 'Repository host', workspaceId }), 201)).pairing;
+}
+async function connect(f: Fixture, host: Client, workspaceId: string): Promise<Connected> {
+  const pending = await pair(host, workspaceId);
+  const { credentials } = await json<{ credentials: ConnectorCredentials }>(await f.request('POST',
+    `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 201);
+  const connectionToken = token();
+  // Only the WebSocket generation is seeded; pairing, sharing and catalog import use real routes.
+  f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connectionToken), credentials.connectorId);
+  return { ...credentials, connectionToken };
+}
+function provisionHub(f: Fixture) {
+  const requests: ConnectorRelayEnvelope[] = [];
+  f.env.CONNECTOR_HUB = {
+    idFromName(name: string) { return name; },
+    get(connectorId: string) {
+      return { async fetch(input: RequestInfo | URL, init?: RequestInit) {
+        const request = new Request(input, init);
+        if (request.url === 'https://connector.internal/status' && request.method === 'GET') return Response.json({ online: true });
+        assert.equal(request.url, 'https://connector.internal/rpc');
+        assert.equal(request.method, 'POST');
+        const envelope = await request.json() as ConnectorRelayEnvelope;
+        assert.equal(envelope.connectorId, connectorId);
+        assert.equal(envelope.request.ticket.action, 'create');
+        requests.push(envelope);
+        return Response.json({ ok: true }, { status: 201 });
+      } };
+    },
+  } as unknown as DurableObjectNamespace;
+  return requests;
+}
+
+function github(t: TestContext) {
+  const calls: { url: string; authorization: string | null; redirect: RequestRedirect | undefined }[] = [];
+  const unexpected: string[] = [];
+  const state = {
+    commit: commitA,
+    ref: repositoryInput.ref,
+    metadata: async (): Promise<Response> => Response.json(metadata),
+    resolve: async (): Promise<Response> => Response.json({ sha: state.commit }),
+    picker: async (): Promise<Response> => Response.json([metadata]),
+    redirect: (): Response => new Response(null, { status: 302,
+      headers: { Location: `https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/${state.commit}` } }),
+    archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
+  };
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, authorization: new Headers(init?.headers).get('authorization'), redirect: init?.redirect });
+    if (url === `https://api.github.com/repos/${metadata.full_name}`) return state.metadata();
+    if (url === `https://api.github.com/repos/${metadata.full_name}/commits/${encodeURIComponent(state.ref)}` ||
+        url === `https://api.github.com/repos/${metadata.full_name}/commits/main`) return state.resolve();
+    if (/^https:\/\/api\.github\.com\/user\/repos\?per_page=30&page=\d+&sort=full_name&direction=asc$/.test(url)) return state.picker();
+    if (url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitA}` ||
+        url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitB}`) return state.redirect();
+    if (url.startsWith(`https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/`)) return state.archive();
+    unexpected.push(url);
+    throw new Error('Unexpected outbound repository request');
+  });
+  t.after(() => {
+    assert.deepEqual(unexpected, []);
+    for (const call of calls) {
+      assert.equal(call.redirect, 'manual');
+      if (new URL(call.url).origin !== 'https://api.github.com') assert.equal(call.authorization, null, 'Never forward OAuth across origins');
+    }
+  });
+  return { state, calls };
+}
+
+async function connectedSetup(t: TestContext) {
+  const f = fixture(t); const remote = github(t);
+  const admin = await f.client('admin'); const host = await f.client('host'); const owner = await f.client('owner');
+  const team = await workspace(admin);
+  await member(admin, team.id, host); await member(admin, team.id, owner);
+  const repository = await bindRepository(admin, team.id);
+  const connector = await connect(f, host, team.id);
+  const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
+  assert.equal(models.length, 1);
+  const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
+    name: 'Repository agent', description: '', instructions: '', tools: ['identity'], modelId: models[0].id,
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: team.id }), 201);
+  const provisions = provisionHub(f);
+  const input = { workspaceId: team.id, agentVersionId: agent.id, trustedConnectorId: connector.connectorId, title: 'Pinned repositories' };
+  const start = async () => (await json<{ session: SessionRecord }>(await owner.request('POST', '/api/sessions', input), 201)).session;
+  remote.calls.length = 0;
+  return { f, remote, admin, host, owner, team, repository, connector, agent, provisions, input, start };
+}
+function download(f: Fixture, session: SessionRecord, pin: SessionRepository, connector?: Connected, body: unknown = { sessionId: session.id, commit: pin.commit }) {
+  return f.request('POST', connector ? `/api/connectors/self/repositories/${pin.bindingId}/download` : `/api/internal/repositories/${pin.bindingId}/download`,
+    body, connector ? { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken } : { Authorization: `Bearer ${internalSecret}` });
+}
+
+// Existing legacy rows must remain downloadable, but new production sessions cannot create them.
+async function legacySetup(t: TestContext) {
+  const f = fixture(t); const remote = github(t); const owner = await f.client('legacy-owner');
+  const team = await workspace(owner); const repository = await bindRepository(owner, team.id);
+  const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
+    name: 'Legacy model', provider: 'openai', modelId: 'legacy-model',
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
+    name: 'Legacy agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
+  }), 201);
+  const pin: SessionRepository = { bindingId: repository.id, repositoryId: metadata.id, fullName: metadata.full_name,
+    ref: repository.ref, commit: commitA, path: metadata.full_name };
+  const session: SessionRecord = { id: 'legacy-session', workspaceId: team.id, ownerId: owner.user.id, agentVersionId: agent.id,
+    title: 'Existing session', policyVersion: 1, status: 'ready', createdAt: new Date().toISOString(), repositories: [pin] };
+  f.sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,repositories_json)
+    VALUES (?,?,?,?,?,?,?,?,?)`).run(session.id, team.id, owner.user.id, agent.id, session.title, 1, 'ready', session.createdAt, JSON.stringify([pin]));
+  remote.calls.length = 0;
+  return { f, remote, owner, team, repository, session, pin };
+}
+
+test('repository API separates cookie/CSRF authentication, administrator writes, and member reads', async t => {
+  const f = fixture(t); const remote = github(t);
+  const owner = await f.client('owner'); const admin = await f.client('admin'); const reader = await f.client('reader'); const outsider = await f.client('outsider');
+  const team = await workspace(owner); const path = `/api/workspaces/${team.id}/repositories`;
+  await member(owner, team.id, admin, 'admin'); await member(owner, team.id, reader);
+  for (const path of ['/api/github/repositories', `/api/workspaces/${team.id}/repositories`]) {
+    await denied(await f.request('GET', path), 401, 'unauthorized');
+    await denied(await f.request('GET', path, undefined, { Authorization: `Bearer ${internalSecret}` }), 401, 'unauthorized');
+  }
+  await denied(await outsider.request('GET', path), 404, 'not_found');
+  await denied(await outsider.request('POST', path, repositoryInput), 404, 'not_found');
+  await denied(await reader.request('POST', path, repositoryInput), 403, 'forbidden');
+  await denied(await owner.request('POST', path, repositoryInput, { 'X-CSRF-Token': '' }), 403, 'invalid_csrf');
+  assert.equal((await owner.request('POST', path, repositoryInput, { Origin: 'https://evil.example' })).status, 403);
+  assert.equal(remote.calls.length, 0);
+  const binding = await bindRepository(admin, team.id);
+  assert.equal(remote.calls[0].authorization, `Bearer ${admin.githubToken}`);
+  assert.deepEqual((await json<{ repositories: WorkspaceRepository[] }>(await reader.request('GET', path))).repositories, [binding]);
+  const remove = `${path}/${binding.id}`;
+  await denied(await reader.request('DELETE', remove), 403, 'forbidden');
+  await denied(await outsider.request('DELETE', remove), 404, 'not_found');
+  await denied(await admin.request('DELETE', remove, undefined, { 'X-CSRF-Token': '' }), 403, 'invalid_csrf');
+  assert.equal((await admin.request('DELETE', remove, undefined, { Origin: 'https://evil.example' })).status, 403);
+  const other = await workspace(owner);
+  assert.equal((await owner.request('DELETE', `/api/workspaces/${other.id}/repositories/${binding.id}`)).status, 204);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 1);
+  assert.equal((await admin.request('DELETE', remove)).status, 204);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
+  assert.equal(remote.calls.length, 1);
+});
+
+test('picker uses the acting GitHub token, projects safe metadata and bounds pagination', async t => {
+  const f = fixture(t); const remote = github(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  remote.state.picker = async () => Response.json([{ ...metadata, token: alice.githubToken, clone_url: 'credential-bearing upstream field' }]);
+  for (const actor of [alice, bob]) {
+    const result = await json(await actor.request('GET', '/api/github/repositories?page=2'));
+    assert.deepEqual(result, { repositories: [{ id: metadata.id, fullName: metadata.full_name, defaultBranch: 'main', private: true }], page: 2, hasMore: false });
+    assert.equal(remote.calls.at(-1)!.authorization, `Bearer ${actor.githubToken}`);
+  }
+  for (const page of ['0', '-1', '01', '1.5', '1001', '1e2']) await denied(await alice.request('GET', `/api/github/repositories?page=${page}`), 400, 'invalid_page');
+  assert.equal(remote.calls.length, 2);
+  remote.state.picker = async () => Response.json(Array.from({ length: 30 }, (_, index) => ({ ...metadata, id: index + 1, full_name: `acme/repo-${index}` })));
+  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', '/api/github/repositories'))).hasMore, true);
+  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', '/api/github/repositories?page=1000'))).hasMore, false);
+  remote.state.picker = async () => Response.json(Array.from({ length: 31 }, () => metadata));
+  await denied(await alice.request('GET', '/api/github/repositories'), 502, 'invalid_github_response');
+});
+
+test('shared repository configuration never lends another member a GitHub token', async t => {
+  const f = fixture(t); const remote = github(t); const owner = await f.client('owner'); const admin = await f.client('admin');
+  const synthetic = await f.client('synthetic', false); const team = await workspace(owner);
+  await member(owner, team.id, admin, 'admin'); await member(owner, team.id, synthetic, 'admin');
+  await bindRepository(owner, team.id);
+  f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(admin.user.id);
+  remote.calls.length = 0;
+  for (const [actor, status] of [[admin, 409], [synthetic, 403]] as const) {
+    await denied(await actor.request('GET', '/api/github/repositories'), status, 'github_not_connected');
+    await denied(await actor.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput), status, 'github_not_connected');
+    assert.equal((await actor.request('GET', `/api/workspaces/${team.id}/repositories`)).status, 200);
+  }
+  assert.equal(remote.calls.length, 0);
+});
+
+for (const changed of [{ id: metadata.id + 1 }, { full_name: 'acme/renamed' }, { full_name: 'Acme/private-repo' }]) {
+  test(`binding rejects exact numeric/name identity mismatch: ${JSON.stringify(changed)}`, async t => {
+    const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
+    remote.state.metadata = async () => Response.json({ ...metadata, ...changed });
+    await denied(await actor.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput), 409, 'repository_identity_changed');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
+    assert.equal(remote.calls.length, 1);
+    assert.equal(remote.calls[0].authorization, `Bearer ${actor.githubToken}`);
+  });
+}
+
+test('binding validates numeric IDs and allowed fields before fetching, defaults the ref, and rejects duplicates', async t => {
+  const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
+  const path = `/api/workspaces/${team.id}/repositories`;
+  for (const repositoryId of ['1701', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, null]) {
+    await denied(await actor.request('POST', path, { ...repositoryInput, repositoryId }), 400, 'invalid_repository');
+  }
+  for (const extra of [{ token: actor.githubToken }, { path: '../escape' }, { commit: commitA }]) {
+    await denied(await actor.request('POST', path, { ...repositoryInput, ...extra }), 400, 'invalid_repository');
+  }
+  assert.equal(remote.calls.length, 0);
+  const { repository } = await json<{ repository: WorkspaceRepository }>(await actor.request('POST', path, {
+    repositoryId: metadata.id, fullName: metadata.full_name,
+  }), 201);
+  assert.equal(repository.ref, 'main');
+  assert.equal(repository.private, true);
+  await denied(await actor.request('POST', path, repositoryInput), 409, 'repository_binding_conflict');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 1);
+});
+
+for (const route of ['picker', 'binding'] as const) {
+  test(`${route} rechecks the acting token after asynchronous metadata`, async t => {
+    const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
+    const revoke = async () => {
+      f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(actor.user.id);
+      return Response.json(route === 'picker' ? [metadata] : metadata);
+    };
+    if (route === 'picker') remote.state.picker = revoke; else remote.state.metadata = revoke;
+    const response = route === 'picker' ? await actor.request('GET', '/api/github/repositories') :
+      await actor.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput);
+    await denied(response, 403, 'github_access_changed');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
+  });
+}
+
+test('session resolution pins encoded refs with the SESSION OWNER token, never the connector host token', async t => {
+  const s = await connectedSetup(t); const session = await s.start();
+  const expected: SessionRepository = { bindingId: s.repository.id, repositoryId: metadata.id, fullName: metadata.full_name,
+    ref: repositoryInput.ref, commit: commitA, path: metadata.full_name };
+  assert.equal(session.status, 'ready');
+  assert.equal(session.ownerId, s.owner.user.id);
+  assert.equal(session.connectorOwnerId, s.host.user.id);
+  assert.deepEqual(session.repositories, [expected]);
+  assert.deepEqual(s.remote.calls.map(call => call.url), [
+    `https://api.github.com/repos/${metadata.full_name}`, `https://api.github.com/repos/${metadata.full_name}/commits/release%2Fstable`,
+    `https://api.github.com/repos/${metadata.full_name}`,
+  ]);
+  for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+  assert.equal(s.provisions.length, 1);
+  const binding = JSON.parse(s.provisions[0].request.body) as RunnerBinding;
+  assert.deepEqual(binding.session.repositories, [expected]);
+  assert.equal(binding.owner.id, s.owner.user.id);
+  const persisted = s.f.sqlite.prepare('SELECT repositories_json FROM sessions WHERE id = ?').get(session.id)!;
+  assert.deepEqual(JSON.parse(String(persisted.repositories_json)), [expected]);
+  for (const secret of [s.owner.githubToken, s.admin.githubToken, s.host.githubToken, s.connector.token, s.connector.connectionToken]) {
+    assert.ok(!JSON.stringify(s.provisions).includes(secret));
+    assert.ok(!JSON.stringify(session).includes(secret));
+  }
+});
+
+test('session pins are server-owned and immutable; reconfiguration and moved refs affect only new sessions', async t => {
+  const s = await connectedSetup(t);
+  for (const field of ['repositories', 'repositories_json', 'pins']) {
+    await denied(await s.owner.request('POST', '/api/sessions', { ...s.input, [field]: [] }), 400, 'server_owned_identity');
+  }
+  assert.equal(s.remote.calls.length, 0);
+  const first = await s.start(); const firstPins = first.repositories!;
+  assert.throws(() => s.f.sqlite.prepare('UPDATE sessions SET repositories_json = ? WHERE id = ?').run('[]', first.id), /immutable/);
+  assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/repositories/${s.repository.id}`)).status, 204);
+  const replacement = await bindRepository(s.admin, s.team.id, { ...repositoryInput, ref: 'main' });
+  assert.notEqual(replacement.id, s.repository.id);
+  s.remote.state.commit = commitB;
+  const second = await s.start();
+  assert.deepEqual(second.repositories, [{ ...firstPins[0], bindingId: replacement.id, ref: 'main', commit: commitB }]);
+  assert.deepEqual(JSON.parse(String(s.f.sqlite.prepare('SELECT repositories_json FROM sessions WHERE id = ?').get(first.id)!.repositories_json)), firstPins);
+  // Downloads are pinned to the old binding and SHA, not today's workspace configuration/ref.
+  s.remote.state.redirect = () => new Response(null, { status: 302,
+    headers: { Location: `https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/${commitA}` } });
+  s.remote.calls.length = 0;
+  const response = await download(s.f, first, firstPins[0], s.connector);
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), archiveBytes);
+  assert.ok(s.remote.calls.some(call => call.url.endsWith(`/tarball/${commitA}`)));
+  assert.ok(s.remote.calls.every(call => !call.url.includes('/commits/')));
+});
+
+test('configuration changes while resolving a ref abort without inserting or provisioning a session', async t => {
+  const s = await connectedSetup(t);
+  s.remote.state.resolve = async () => {
+    assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/repositories/${s.repository.id}`)).status, 204);
+    await bindRepository(s.admin, s.team.id);
+    return Response.json({ sha: commitA });
+  };
+  await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'repository_configuration_changed');
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  assert.equal(s.provisions.length, 0);
+});
+
+for (const replacement of [{ id: metadata.id + 1 }, { full_name: 'acme/replaced-repo' }]) {
+  test(`repository replacement during commit lookup cannot become a session pin: ${JSON.stringify(replacement)}`, async t => {
+    const s = await connectedSetup(t);
+    s.remote.state.resolve = async () => {
+      s.remote.state.metadata = async () => Response.json({ ...metadata, ...replacement });
+      return Response.json({ sha: commitA });
+    };
+    await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'repository_identity_changed');
+    assert.deepEqual(s.remote.calls.map(call => call.url), [
+      `https://api.github.com/repos/${metadata.full_name}`,
+      `https://api.github.com/repos/${metadata.full_name}/commits/release%2Fstable`,
+      `https://api.github.com/repos/${metadata.full_name}`,
+    ]);
+    for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+    assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+    assert.equal(s.provisions.length, 0);
+  });
+}
+
+for (const change of ['identity', 'invalid-commit', 'owner-token'] as const) {
+  test(`session resolution fails closed on ${change}`, async t => {
+    const s = await connectedSetup(t);
+    if (change === 'identity') s.remote.state.metadata = async () => Response.json({ ...metadata, id: metadata.id + 1 });
+    if (change === 'invalid-commit') s.remote.state.resolve = async () => Response.json({ sha: 'main' });
+    if (change === 'owner-token') s.f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(s.owner.user.id);
+    await denied(await s.owner.request('POST', '/api/sessions', s.input), change === 'invalid-commit' ? 502 : 409,
+      change === 'identity' ? 'repository_identity_changed' : change === 'invalid-commit' ? 'invalid_repository_commit' : 'github_not_connected');
+    assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+    assert.equal(s.provisions.length, 0);
+    for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+  });
+}
+
+test('real users still require configured workspaces for pairing, claim, share and session creation in testMode', async t => {
+  const s = await connectedSetup(t); const empty = await workspace(s.owner);
+  const health = await json<{ testMode: boolean }>(await s.f.request('GET', '/api/health'));
+  assert.equal(health.testMode, true);
+  await denied(await s.owner.request('POST', '/api/connectors/pairings', { name: 'Empty workspace', workspaceId: empty.id }), 409, 'workspace_repositories_required');
+  const hostEmpty = await workspace(s.host);
+  await denied(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/shares/${hostEmpty.id}`), 409, 'workspace_repositories_required');
+  const pending = await pair(s.host, s.team.id);
+  assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/repositories/${s.repository.id}`)).status, 204);
+  await denied(await s.f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 409, 'workspace_repositories_required');
+  assert.equal(s.f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
+  await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'workspace_repositories_required');
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  assert.equal(s.provisions.length, 0);
+  assert.equal(s.remote.calls.length, 0);
+});
+
+test('testMode does not let a real user start an unconnected faux-model session', async t => {
+  const f = fixture(t); const owner = await f.client('owner'); const team = await workspace(owner);
+  const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
+    name: 'Faux', provider: 'faux', modelId: 'faux',
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
+    name: 'Faux agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
+  }), 201);
+  await denied(await owner.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id }), 400, 'connector_required');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+});
+
+test('configured pairing claim auto-shares and imports models, but lost membership leaves a pairing unused', async t => {
+  const s = await connectedSetup(t);
+  const shares = s.f.sqlite.prepare('SELECT workspace_id FROM connector_shares WHERE connector_id = ?').all(s.connector.connectorId);
+  assert.deepEqual(shares.map(row => row.workspace_id), [s.team.id]);
+  const models = s.f.sqlite.prepare('SELECT connector_owner_id, provider, model_id FROM models WHERE connector_id = ?').all(s.connector.connectorId);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].connector_owner_id, s.host.user.id);
+  assert.equal(models[0].provider, manifest.models[0].provider);
+  assert.equal(models[0].model_id, manifest.models[0].modelId);
+  const pending = await pair(s.host, s.team.id);
+  assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/members/${s.host.user.id}`)).status, 204);
+  await denied(await s.f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 404, 'not_found');
+  assert.equal(s.f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+});
+
+test('only explicitly enabled synthetic fixtures can claim a legacy workspace-free pairing', async t => {
+  const f = fixture(t); const synthetic = await f.client('synthetic', false); const real = await f.client('real');
+  assert.equal((await real.request('POST', '/api/connectors/pairings', { name: 'No workspace' })).status, 400);
+  const pending = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Legacy fixture' }), 201)).pairing;
+  const other = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Disabled fixture' }), 201)).pairing;
+  await json(await f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 201);
+  f.env.TEST_AUTH_ENABLED = 'false';
+  // HTTPS avoids testing the independent loopback transport exemption instead of the fixture gate.
+  const response = await app.request(`https://workspace.example.test/api/connectors/pairings/${other.id}/claim`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: other.code, ...manifest }),
+  }, f.env);
+  assert.ok(response.status >= 400 && response.status < 500);
+  assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(other.id)!.claimed_at, null);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+});
+
+test('connector archive callbacks require the exact credential, generation, session binding and commit', async t => {
+  const s = await connectedSetup(t); const session = await s.start(); const pin = session.repositories![0];
+  const other = await connect(s.f, s.host, s.team.id);
+  s.remote.calls.length = 0;
+  const path = `/api/connectors/self/repositories/${pin.bindingId}/download`; const body = { sessionId: session.id, commit: pin.commit };
+  await denied(await s.owner.request('POST', path, body), 401, 'connector_authentication_required');
+  await denied(await s.f.request('POST', path, body, { Authorization: `Bearer ${s.connector.token}` }), 401, 'stale_connection');
+  await denied(await download(s.f, session, pin, { ...s.connector, connectionToken: token() }), 401, 'stale_connection');
+  await denied(await download(s.f, session, pin, other), 403, 'connector_binding_mismatch');
+  await denied(await download(s.f, session, pin), 403, 'connector_scope_required');
+  await denied(await download(s.f, session, pin, s.connector, { ...body, commit: commitB }), 403, 'repository_binding_mismatch');
+  await denied(await download(s.f, session, { ...pin, bindingId: 'unbound-repository' }, s.connector), 403, 'repository_binding_mismatch');
+  for (const extra of [{ url: 'https://evil.example/archive' }, { ownerId: s.host.user.id }, { repositoryId: metadata.id }, { ref: 'main' }]) {
+    await denied(await download(s.f, session, pin, s.connector, { ...body, ...extra }), 400, 'invalid_repository_download');
+  }
+  await denied(await s.f.request('GET', '/api/github/repositories', undefined, { Authorization: `Bearer ${s.connector.token}` }), 401, 'unauthorized');
+  assert.equal(s.remote.calls.length, 0);
+});
+
+for (const transport of ['connector', 'legacy'] as const) {
+  test(`${transport} archives return bounded pinned bytes and a native SHA-256, with owner auth only on GitHub API`, async t => {
+    const s = transport === 'connector' ? await connectedSetup(t) : await legacySetup(t);
+    const session = 'start' in s ? await s.start() : s.session;
+    const pin = session.repositories![0]; const connector = 'connector' in s ? s.connector : undefined;
+    s.remote.calls.length = 0;
+    s.remote.state.redirect = () => new Response(null, { status: 302,
+      headers: { Location: `https://codeload.github.com/${pin.fullName}/legacy.tar.gz/${pin.commit}?token=opaque_Signed-123` } });
+    const response = await download(s.f, session, pin, connector);
+    assert.equal(response.status, 200, await (response.ok ? Promise.resolve('') : response.clone().text()));
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), archiveBytes);
+    assert.equal(response.headers.get('content-type'), 'application/gzip');
+    assert.equal(response.headers.get('content-length'), String(archiveBytes.length));
+    assert.equal(response.headers.get('cache-control'), 'private, no-store');
+    assert.equal(response.headers.get('x-repository-commit'), pin.commit);
+    assert.equal(response.headers.get('x-archive-sha256'), createHash('sha256').update(archiveBytes).digest('base64url'));
+    assert.deepEqual(s.remote.calls.map(call => call.url), [
+      `https://api.github.com/repos/${pin.fullName}`,
+      `https://api.github.com/repos/${pin.fullName}/tarball/${pin.commit}`,
+      `https://codeload.github.com/${pin.fullName}/legacy.tar.gz/${pin.commit}?token=opaque_Signed-123`,
+      `https://api.github.com/repos/${pin.fullName}`,
+    ]);
+    for (const call of s.remote.calls.filter(call => new URL(call.url).origin === 'https://api.github.com')) {
+      assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+    }
+    assert.ok(!JSON.stringify([...response.headers]).includes(s.owner.githubToken));
+  });
+}
+
+test('legacy archive callback rejects ambient cookies and connector credentials before any remote fetch', async t => {
+  const s = await legacySetup(t); const path = `/api/internal/repositories/${s.pin.bindingId}/download`;
+  const body = { sessionId: s.session.id, commit: s.pin.commit };
+  await denied(await s.owner.request('POST', path, body), 401, 'unauthorized');
+  await denied(await s.f.request('POST', path, body, { Authorization: `Bearer ${token()}` }), 401, 'unauthorized');
+  assert.equal(s.remote.calls.length, 0);
+});
+
+function pausedArchive() {
+  const started = Promise.withResolvers<void>(); const release = Promise.withResolvers<void>(); let first = true;
+  const response = new Response(new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (first) { first = false; controller.enqueue(archiveBytes.slice(0, 2)); return; }
+      started.resolve();
+      await release.promise;
+      controller.enqueue(archiveBytes.slice(2));
+      controller.close();
+    },
+  }, { highWaterMark: 0 }));
+  return { response, started: started.promise, release: () => release.resolve() };
+}
+
+for (const transport of ['connector', 'legacy'] as const) {
+  const changes = ['token-deleted', 'token-rotated', 'policy', 'archived', 'owner-membership', 'github-access', 'github-identity',
+    ...(transport === 'connector' ? ['generation', 'revoked', 'unshared', 'host-membership'] : [])];
+  for (const change of changes) {
+    test(`${transport} archive withholds bytes when ${change} changes during the body read`, { timeout: 5000 }, async t => {
+      const s = transport === 'connector' ? await connectedSetup(t) : await legacySetup(t);
+      const session = 'start' in s ? await s.start() : s.session;
+      const pin = session.repositories![0]; const connector = 'connector' in s ? s.connector : undefined;
+      const paused = pausedArchive(); s.remote.state.archive = async () => paused.response;
+      s.remote.calls.length = 0;
+      const pending = download(s.f, session, pin, connector);
+      let status = 403; let code = 'repository_authority_changed';
+      try {
+        await Promise.race([paused.started, pending.then(response => {
+          throw new Error(`Archive callback ended before reading bytes: ${response.status}`);
+        })]);
+        if (change === 'token-deleted') {
+          s.f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(s.owner.user.id);
+          code = 'github_access_changed';
+        } else if (change === 'token-rotated') {
+          s.f.sqlite.prepare('UPDATE github_tokens SET ciphertext = ? WHERE user_id = ?')
+            .run(await encryptToken(s.f.env, s.owner.user.id, 'rotated-token'), s.owner.user.id);
+          code = 'github_access_changed';
+        } else if (change === 'policy') {
+          s.f.sqlite.prepare('UPDATE sessions SET policy_version = policy_version + 1 WHERE id = ?').run(session.id);
+        } else if (change === 'archived') {
+          s.f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = ?").run(session.id);
+        } else if (change === 'owner-membership') {
+          s.f.sqlite.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(s.team.id, s.owner.user.id);
+        } else if (change === 'github-access') {
+          s.remote.state.metadata = async () => Response.json({ message: 'Not Found' }, { status: 404 });
+          code = 'github_repository_unavailable';
+        } else if (change === 'github-identity') {
+          s.remote.state.metadata = async () => Response.json({ ...metadata, id: metadata.id + 1 });
+          status = 409; code = 'repository_identity_changed';
+        } else {
+          assert.ok(connector && 'host' in s);
+          if (change === 'generation') {
+            s.f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(token()), connector.connectorId);
+            status = 401; code = 'stale_connection';
+          } else if (change === 'revoked') {
+            s.f.sqlite.prepare('UPDATE connectors SET revoked_at = ? WHERE id = ?').run(new Date().toISOString(), connector.connectorId);
+            status = 401; code = 'connector_authentication_required';
+          } else if (change === 'unshared') {
+            s.f.sqlite.prepare('DELETE FROM connector_shares WHERE connector_id = ? AND workspace_id = ?').run(connector.connectorId, s.team.id);
+            code = 'connector_unavailable';
+          } else {
+            s.f.sqlite.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(s.team.id, s.host.user.id);
+            code = 'connector_unavailable';
+          }
+        }
+      } finally { paused.release(); }
+      const response = await pending;
+      assert.equal(response.headers.get('x-archive-sha256'), null);
+      await denied(response, status, code);
+      const metadataCalls = s.remote.calls.filter(call => call.url === `https://api.github.com/repos/${pin.fullName}`);
+      assert.equal(metadataCalls.length, 2, 'Revalidate GitHub access/identity after the asynchronous bytes');
+      for (const call of metadataCalls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+    });
+  }
+}
+
+const redirectPin: SessionRepository = { bindingId: 'binding', repositoryId: metadata.id, fullName: metadata.full_name,
+  ref: 'main', commit: commitA, path: metadata.full_name };
+const archiveUrl = `https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/${commitA}`;
+
+test('archive redirect accepts only the exact codeload SHA path and at most one bounded opaque token', () => {
+  for (const suffix of ['', '?token=a', '?token=Abc_012-xyz', `?token=${'x'.repeat(1024)}`]) {
+    assert.equal(archiveRedirect(`${archiveUrl}${suffix}`, redirectPin), `${archiveUrl}${suffix}`);
+  }
+  for (const location of [
+    null, '/relative', archiveUrl.replace('https:', 'http:'), archiveUrl.replace('codeload.github.com', 'evil.example'),
+    archiveUrl.replace('codeload.github.com', 'codeload.github.com.evil.example'), archiveUrl.replace('https://', 'https://user:pass@'),
+    archiveUrl.replace('github.com/', 'github.com:443/'), archiveUrl.replace('github.com/', 'github.com:444/'),
+    archiveUrl.replace(commitA, commitB), archiveUrl.replace(metadata.full_name, 'acme/other'), `${archiveUrl}/`,
+    archiveUrl.replace('/legacy.tar.gz/', '/tar.gz/'), archiveUrl.replace('/acme/', '/x/../acme/'),
+    `${archiveUrl}#fragment`, `${archiveUrl}?foo=bar`, `${archiveUrl}?token=`, `${archiveUrl}?token=${'x'.repeat(1025)}`,
+    `${archiveUrl}?token=a&token=b`, `${archiveUrl}?token=a&extra=b`, `${archiveUrl}?token=a%2Fb`,
+    `${archiveUrl}?token=a+b`, `${archiveUrl}?token=a=b`, `${archiveUrl}?token=a#fragment`,
+  ]) assert.throws(() => archiveRedirect(location, redirectPin), String(location));
+});
+
+test('archive redirect violations are rejected by the callback without contacting another origin', async t => {
+  const s = await legacySetup(t);
+  for (const [status, location] of [[301, archiveUrl], [307, archiveUrl], [302, 'https://evil.example/archive'],
+    [302, `${archiveUrl}?token=a&extra=b`], [302, archiveUrl.replace(commitA, commitB)]] as const) {
+    s.remote.calls.length = 0;
+    s.remote.state.redirect = () => new Response(null, { status, headers: { Location: location } });
+    await denied(await download(s.f, s.session, s.pin), 502, 'invalid_archive_redirect');
+    assert.equal(s.remote.calls.length, 2);
+    assert.ok(s.remote.calls.every(call => new URL(call.url).origin === 'https://api.github.com'));
+  }
+  s.remote.state.redirect = () => new Response(null, { status: 302, headers: { Location: archiveUrl } });
+  s.remote.state.archive = async () => new Response(null, { status: 302, headers: { Location: 'https://evil.example/second-hop' } });
+  s.remote.calls.length = 0;
+  await denied(await download(s.f, s.session, s.pin), 502, 'repository_download_failed');
+  assert.equal(s.remote.calls.length, 3, 'Never follow a second redirect');
+});
+
+test('archive callback enforces declared archive size, gzip signature and readable body', async t => {
+  const s = await legacySetup(t); let cancelled = false;
+  s.remote.state.archive = async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
+    headers: { 'Content-Length': String(repositoryLimits.archiveBytes + 1) },
+  });
+  await denied(await download(s.f, s.session, s.pin), 502, 'repository_size_limit');
+  assert.equal(cancelled, true);
+  for (const bytes of [new Uint8Array(), new Uint8Array([0x1f]), new TextEncoder().encode('<html>not a tarball</html>')]) {
+    s.remote.state.archive = async () => new Response(bytes);
+    await denied(await download(s.f, s.session, s.pin), 502, 'invalid_repository_archive');
+  }
+  s.remote.state.archive = async () => new Response(null);
+  await denied(await download(s.f, s.session, s.pin), 502, 'invalid_github_response');
+});
+
+test('repository body bound accepts the exact byte limit and cancels streamed overflow even with a lying length', async () => {
+  const exact = new Uint8Array([1, 2, 3, 4]);
+  assert.deepEqual(await boundedRepositoryBody(new Response(exact, { headers: { 'Content-Length': '4' } }), 4), exact);
+  for (const contentLength of [undefined, '1']) {
+    let cancelled = false; let reads = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) { reads++; controller.enqueue(new Uint8Array(3)); },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 }), { headers: contentLength ? { 'Content-Length': contentLength } : {} });
+    await repositoryFailure(boundedRepositoryBody(response, 4), 'repository_download_failed');
+    assert.equal(cancelled, true);
+    assert.equal(reads, 2);
+    assert.equal(response.body!.locked, false);
+  }
+});
+
+test('repository body bound rejects malformed/oversized Content-Length without reading the stream', async () => {
+  for (const length of ['5', '-1', 'NaN', '1.5', '1e2']) {
+    let cancelled = false; let reads = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull() { reads++; }, cancel() { cancelled = true; },
+    }, { highWaterMark: 0 }), { headers: { 'Content-Length': length } });
+    await repositoryFailure(boundedRepositoryBody(response, 4), 'repository_size_limit');
+    assert.equal(reads, 0); assert.equal(cancelled, true);
+  }
+  await repositoryFailure(boundedRepositoryBody(new Response(null), 4), 'invalid_github_response');
+  const broken = new Response(new ReadableStream({ start(controller) { controller.error(new Error('private upstream error')); } }));
+  await repositoryFailure(boundedRepositoryBody(broken, 4), 'repository_download_failed');
+});
+
+test('repository body deadline cancels a stalled stream without real-time waits', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let cancelled = false;
+  const response = new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } }, { highWaterMark: 0 }));
+  const pending = boundedRepositoryBody(response, 4);
+  const rejection = repositoryFailure(pending, 'repository_download_failed');
+  t.mock.timers.tick(20001);
+  await rejection;
+  assert.equal(cancelled, true);
+  assert.equal(response.body!.locked, false);
+});
+
+test('GitHub metadata has a separate small size bound and rejects malformed JSON/UTF-8', async t => {
+  const f = fixture(t); const remote = github(t); const owner = await f.client('owner'); let cancelled = false;
+  remote.state.picker = async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
+    headers: { 'Content-Length': String(512 * 1024 + 1) },
+  });
+  await denied(await owner.request('GET', '/api/github/repositories'), 502, 'repository_size_limit');
+  assert.equal(cancelled, true);
+  for (const body of [new TextEncoder().encode('{broken'), new Uint8Array([0xff])]) {
+    remote.state.picker = async () => new Response(body);
+    await denied(await owner.request('GET', '/api/github/repositories'), 502, 'invalid_github_response');
+  }
+});
+
+test('picker accepts underscore/Unicode refs and session resolution URL-encodes Unicode and hash characters', async t => {
+  const s = await connectedSetup(t);
+  let bindingId = s.repository.id;
+  for (const ref of ['_prefix', '\u4fee\u590d/#issue']) {
+    s.remote.state.picker = async () => Response.json([{ ...metadata, default_branch: ref }]);
+    const picked = await json<{ repositories: { defaultBranch: string }[] }>(await s.owner.request('GET', '/api/github/repositories'));
+    assert.equal(picked.repositories[0].defaultBranch, ref);
+    assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/repositories/${bindingId}`)).status, 204);
+    bindingId = (await bindRepository(s.admin, s.team.id, { ...repositoryInput, ref })).id;
+    s.remote.state.ref = ref;
+    s.remote.calls.length = 0;
+    const session = await s.start();
+    assert.equal(session.repositories![0].ref, ref);
+    assert.equal(session.repositories![0].commit, commitA);
+    assert.ok(s.remote.calls.some(call => call.url === `https://api.github.com/repos/${metadata.full_name}/commits/${encodeURIComponent(ref)}`));
+    for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+  }
+});

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RestoreDescriptor } from "../packages/shared/src/connector.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
+import type { SessionRepository } from "../packages/shared/src/repositories.js";
 import { sha256 } from "../packages/shared/src/crypto.js";
 import { restoreSession, type RestoreConfig, type RestoreManifest } from "../apps/runner/src/restore.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
@@ -135,6 +136,71 @@ test("restore rejects mismatched source, owner, template, workspace, model, conn
     await assert.rejects(restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, prepare));
   }
   assert.equal(prepare.mock.callCount(), 0);
+});
+
+test("restore requires every immutable repository pin to match before paused preparation", linux, async t => {
+  const f = await fixture(t);
+  const pin: SessionRepository = { bindingId: "binding-1", repositoryId: 123, fullName: "alice/project", path: "alice/project", ref: "main", commit: "a".repeat(40) };
+  f.target.session.repositories = [pin];
+  const prepare = t.mock.fn(async () => {});
+  for (const repositories of [
+    undefined, [],
+    [{ ...pin, commit: "b".repeat(40) }],
+    [{ ...pin, repositoryId: 456 }],
+    [{ ...pin, bindingId: "binding-2" }],
+    [{ ...pin, ref: "other-branch" }],
+    [{ ...pin, fullName: "alice/renamed", path: "alice/renamed" }],
+  ]) {
+    const value = archive();
+    value.binding.session.repositories = repositories;
+    value.manifest.binding = structuredClone(value.binding);
+    const saved = envelope(value);
+    await assert.rejects(restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, prepare), /repository pins mismatch/);
+  }
+  assert.equal(prepare.mock.callCount(), 0);
+  await absent(join(f.directory, "sessions", "target"));
+});
+
+test("restore preserves exact repository pins and requires the restored ready marker before publication", linux, async t => {
+  const f = await fixture(t);
+  const pin: SessionRepository = { bindingId: "binding-1", repositoryId: 123, fullName: "alice/project", path: "alice/project", ref: "main", commit: "a".repeat(40) };
+  f.target.session.repositories = [pin];
+  const value = archive();
+  value.binding.session.repositories = [pin];
+  value.manifest.binding = structuredClone(value.binding);
+  value.files.push({ path: "worktree/alice/project/edited.txt", data: Buffer.from("owner edits, not live branch").toString("base64"), mode: 0o600 });
+  const saved = envelope(value);
+  let stagePath = "";
+  fakeInitializer(t, () => stagePath);
+  let ready = false;
+  const probe = t.mock.method(Sandbox.prototype, "repositoryCachesReady", async (repositories: readonly SessionRepository[], authorize: () => Promise<void>) => {
+    assert.deepEqual(repositories, [pin]);
+    await authorize();
+    return ready;
+  });
+  const prepare = async (stage: string, manifest: RestoreManifest) => {
+    stagePath = stage;
+    assert.deepEqual(manifest.binding.session.repositories, [pin]);
+    assert.equal(await readFile(join(stage, "sandbox", "worktree", pin.path, "edited.txt"), "utf8"), "owner edits, not live branch");
+  };
+  const config = { ...f.config, readBackup: async () => saved.bytes };
+  await assert.rejects(restoreSession(config, f.target, saved.descriptor, prepare), /repository cache is not ready/);
+  await absent(join(f.directory, "sessions", "target"));
+  ready = true;
+  await restoreSession(config, f.target, saved.descriptor, prepare);
+  assert.equal(probe.mock.callCount(), 2);
+  assert.equal(await readFile(join(f.directory, "sessions", "target", "sandbox", "worktree", pin.path, "edited.txt"), "utf8"), "owner edits, not live branch");
+  const persisted = JSON.parse(await readFile(join(f.directory, "sessions", "target", "binding.json"), "utf8")) as RunnerBinding;
+  assert.deepEqual(persisted.session.repositories, [pin]);
+});
+
+test("legacy restore treats omitted and empty repository pins equivalently", linux, async t => {
+  const f = await fixture(t);
+  f.target.session.repositories = [];
+  let staged = "";
+  fakeInitializer(t, () => staged);
+  await restoreSession(f.config, f.target, f.descriptor, async stage => { staged = stage; });
+  assert.deepEqual(JSON.parse(await readFile(join(f.directory, "sessions", "target", "binding.json"), "utf8")).session.repositories, []);
 });
 
 test("restore refuses active metadata before opening pi", linux, async t => {

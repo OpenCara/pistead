@@ -10,6 +10,7 @@ import { assertVaultConfigured } from './vault.js';
 import { fail, testMode } from './http.js';
 import { registerConnectorCredentials, registerConnectors } from './connectors.js';
 import { registerRestoreRoutes } from './restore-routes.js';
+import { registerRepositories } from './repositories.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -46,6 +47,7 @@ registerInternal(app);
 registerConnectorCredentials(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
+registerRepositories(app);
 registerConnectors(app);
 registerSessions(app);
 registerBackups(app);

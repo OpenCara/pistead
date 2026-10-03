@@ -25,7 +25,14 @@ export function useResource<T>(path: string | null) {
   return { data, loading, error, refresh, setData };
 }
 
-export function useAction() {
+export interface ActionState {
+  busy: boolean;
+  error: string;
+  notice: string;
+  run: (action: () => Promise<void>, success?: string) => Promise<void>;
+}
+
+export function useAction(): ActionState {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");

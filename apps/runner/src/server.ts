@@ -60,7 +60,12 @@ export class RunnerService {
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new RunnerError(404, "Session not found"); throw error; }
       if (await realpath(directory) !== directory) throw new RunnerError(403, "Invalid session storage");
       const session = new RunnerSession(immutable(binding), directory, this.config);
-      await session.open();
+      try { await session.open(); }
+      catch (error) {
+        await session.close().catch(() => {});
+        await session.sandbox.close().catch(() => {});
+        throw error;
+      }
       return session;
     })();
     this.sessions.set(id, opening);
@@ -135,7 +140,9 @@ export class RunnerService {
       binding, input.restore, async (stage, manifest) => {
         if (this.closed) throw new RunnerError(503, "Runner service is closed");
         await authority.authorize(ticket.actorId, "manage", ticket.policyVersion);
-        await new RunnerSession(binding, stage, this.config).prepareRestore(manifest);
+        const staged = new RunnerSession(binding, stage, this.config);
+        try { await staged.prepareRestore(manifest); }
+        finally { await staged.sandbox.close(); }
       });
     return binding;
   }

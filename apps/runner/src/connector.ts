@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { constants } from "node:fs";
 import { mkdir, realpath, lstat, open, link, unlink } from "node:fs/promises";
@@ -8,6 +8,8 @@ import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
+import type { SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { repositoryLimits } from "../../../packages/shared/src/repositories.js";
 import type { AuthorizationRequest, AuthorizationResult, RunnerAction, RunnerBinding } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
@@ -403,6 +405,7 @@ export class LocalConnector {
           }).strict().parse(await this.callback(generation, "/api/connectors/self/github/comment", payload));
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
+        readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
@@ -433,15 +436,21 @@ export class LocalConnector {
     if (this.lifetime.signal.aborted || generation.abort.signal.aborted || this.generation !== generation || !generation.connectionToken) throw new Error("Connector generation is no longer authorized");
   }
 
-  private async callbackResponse(generation: Generation, path: string, body: unknown): Promise<Response> {
+  private async callbackResponse(generation: Generation, path: string, body: unknown, signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)])): Promise<Response> {
     this.requireGeneration(generation);
     const response = await (this.options.fetch ?? fetch)(`${this.state!.controlPlaneUrl}${path}`, {
       method: "POST", redirect: "error", credentials: "omit",
       headers: { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken!, "content-type": "application/json" },
-      body: JSON.stringify(body), signal: AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)]),
+      body: JSON.stringify(body), signal,
     });
-    this.requireGeneration(generation);
-    if (!response.ok) { await response.body?.cancel(); throw new Error("Scoped connector callback denied or unavailable"); }
+    try {
+      this.requireGeneration(generation);
+      signal.throwIfAborted();
+      if (!response.ok) throw new Error("Scoped connector callback denied or unavailable");
+    } catch (error) {
+      await response.body?.cancel();
+      throw error;
+    }
     return response;
   }
 
@@ -474,6 +483,29 @@ export class LocalConnector {
     this.requireGeneration(generation);
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     if (bytes.length !== restore.size || response.headers.get("x-backup-sha256") !== restore.sha256 || await sha256(text) !== restore.sha256) throw new Error("Backup integrity mismatch");
+    return bytes;
+  }
+
+  private async readRepository(generation: Generation, repository: SessionRepository, sessionId: string): Promise<Uint8Array> {
+    this.requireGeneration(generation);
+    const { bindingId, commit } = repository;
+    if (typeof bindingId !== "string" || !IDENTIFIER.test(bindingId)
+      || typeof sessionId !== "string" || !IDENTIFIER.test(sessionId)
+      || typeof commit !== "string" || !/^[a-f0-9]{40}$/.test(commit)) throw new Error("Invalid repository descriptor");
+    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)]);
+    const response = await this.callbackResponse(generation, `/api/connectors/self/repositories/${bindingId}/download`, { sessionId, commit }, signal);
+    const checksum = response.headers.get("x-archive-sha256");
+    if (response.headers.get("x-repository-commit") !== commit || !checksum || !/^[A-Za-z0-9_-]{43}$/.test(checksum)) {
+      await response.body?.cancel();
+      throw new Error("Repository integrity mismatch");
+    }
+    const bytes = await boundedBody(response, repositoryLimits.archiveBytes, signal);
+    this.requireGeneration(generation);
+    const declared = response.headers.get("content-length");
+    if (!bytes.byteLength || (declared !== null && Number(declared) !== bytes.byteLength)
+      || createHash("sha256").update(bytes).digest("base64url") !== checksum) throw new Error("Repository integrity mismatch");
+    signal.throwIfAborted();
+    this.requireGeneration(generation);
     return bytes;
   }
 

@@ -11,7 +11,9 @@ import type { ResourceConfig } from "./resources.js";
 const HELP = `Usage: pnpm connect [options]
 
 Connect your local Pi to a workspace control plane using outbound WebSocket only.
-First pair in the web app, then run:
+From the cloned OpenCara/agent-workspace repository root, use Node.js 24 and
+pnpm 10.32.1, then run pnpm install. In the web app, configure authorized GitHub
+repositories for your workspace and pair Pi with that workspace, then run:
   pnpm connect --server https://workspace.example --pairing-id PAIRING_ID
 The pairing code is requested privately on a terminal, never as an argument.
 Subsequent runs use the private saved connector token.
@@ -28,8 +30,11 @@ Options:
   --allow-test-shell       Fixture shell opt-in; requires --allow-faux
   --help                  Show this help without reading Pi configuration
 
-Linux, bubblewrap, Python 3, Git and flock are required. Production bash additionally
-requires verified per-session aggregate cgroups and a bounded private filesystem;
+Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required.
+Native Windows is unsupported; configure Pi and run this command inside WSL2.
+Session repositories are pinned into private session caches, not your current folder.
+Production bash additionally requires verified per-session aggregate cgroups and a
+bounded private filesystem;
 --resources does not provision these. Missing resource limits never enable host shell.
 Pi model/auth configuration is used locally, including Pi's OAuth refresh. Provider
 credentials, private history and personal extensions are not uploaded or shared.

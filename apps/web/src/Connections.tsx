@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { ConnectorInfo, ConnectorPairing } from "../../../packages/shared/src/connector";
 import type { UserProfile, Workspace } from "../../../packages/shared/src/types";
+import type { WorkspaceRepository } from "../../../packages/shared/src/repositories";
 import { api, errorMessage, segment } from "./api";
-import { Empty, Feedback, PageHeading, ResourceState, Timestamp, useAction } from "./ui";
+import { Empty, Feedback, PageHeading, ResourceState, Timestamp, useAction, useResource, type ActionState } from "./ui";
 
 export function useConnections(path: string | null) {
   const [data, setData] = useState<{ connectors: ConnectorInfo[] } | null>(null);
@@ -42,34 +43,52 @@ export function useConnections(path: string | null) {
 }
 
 export function ConnectionStatus({ connector }: { connector: ConnectorInfo }) {
-  const state = connector.revokedAt ? "Revoked" : !connector.online ? "Offline" : !connector.capabilities.sandbox ? "Sandbox unavailable" : "Online";
+  const state = connector.revokedAt ? "Revoked" : !connector.online ? "Offline" : !connector.capabilities.sandbox ? "Sandbox unverified" : "Online";
   return <span className={`badge ${state === "Online" ? "" : "warning"}`}>{state}</span>;
 }
 
 export function HostCapabilities({ connector }: { connector: ConnectorInfo }) {
-  return <p className="metadata">Host-reported platform: {connector.capabilities.platform || "Unknown"}. {!connector.online ? "Host is offline. It must reconnect before work can run. " : ""}{!connector.capabilities.sandbox ? "Host reports that a supported Linux sandbox is unavailable. Non-shell session work may still be available; shell execution fails closed rather than falling back to an unrestricted host shell." : !connector.capabilities.productionShell ? "Production shell is unavailable: verified per-session CPU, memory, process and writable-storage limits are required. No unrestricted shell fallback." : "Host reports sandbox support and production shell resource limits. This is not a security attestation; the runner verifies prerequisites when work runs."}</p>;
+  return <p className="metadata">Host-reported platform: {connector.capabilities.platform || "Unknown"}. {!connector.online ? "Host is offline. It must reconnect before work can run. " : ""}{!connector.capabilities.sandbox ? "Sandbox support is unverified, not necessarily unavailable. The connector reports conservatively; the runner verifies isolation during per-session repository preparation. " : "The host reports sandbox support, but this is not a security attestation. "}{!connector.capabilities.productionShell ? "Production shell resource limits are not confirmed. " : "The host reports production shell resource limits; these must still be verified. "}The runner verifies prerequisites for each session; verification failures stop the affected work. Production shell requires verified CPU, memory, process and writable-storage limits, with no unrestricted host-shell fallback. Native Windows is unsupported; use Linux or WSL2 with Pi configured in that environment.</p>;
 }
 
 function ModelMetadata({ connector }: { connector: ConnectorInfo }) {
   return <div className="connection-models"><h4>Native local models</h4>{connector.models.length ? <ul>{connector.models.map(model => <li key={`${model.provider}:${model.modelId}`}><strong>{model.name}</strong><span className="metadata">{model.provider} / {model.modelId}</span></li>)}</ul> : <p className="muted">No locally configured models advertised yet.</p>}</div>;
 }
 
-export function WorkspaceConnections({ workspace, user }: { workspace: Workspace; user: UserProfile }) {
+export function WorkspaceConnections({ workspace, user, configured }: { workspace: Workspace; user: UserProfile; configured: boolean }) {
   const resource = useConnections(`/api/workspaces/${segment(workspace.id)}/connectors`);
   return <section className="section"><div className="section-heading"><span className="section-number">03</span><h2>Shared connections</h2><button className="button secondary small" disabled={resource.loading} onClick={resource.refresh}>Refresh hosts</button></div>
-    <p>Choose whose machine runs your agent. Sharing a connection makes its advertised models available here, not its owner's private Pi history or old sessions.</p>
-    <p className="muted">Model metadata is read-only. Configure providers and credentials in Pi on the host, never in this workspace.</p>
-    <ResourceState {...resource} retry={resource.refresh}>{!resource.data?.connectors.length ? <Empty title="Bring a local Pi to the table">Connect your Pi, then explicitly share it with this workspace.</Empty> : <div className="row-list">{resource.data.connectors.map(connector => <article className="connection-card" key={connector.id}><div className="section-heading"><h3>{connector.name}</h3><ConnectionStatus connector={connector} /></div><p>Hosted by <strong>{connector.ownerName}</strong>{connector.ownerId === user.id ? " (you)" : ""}</p><p className="metadata">Host owner ID: {connector.ownerId}</p><HostCapabilities connector={connector} /><ModelMetadata connector={connector} /></article>)}</div>}</ResourceState>
-    <a className="button secondary" href="#connections">Manage my connections</a>
+    <p>Choose whose machine runs your agent. Pairing a new Pi automatically shares it with the workspace you choose. Existing connections can be shared deliberately.</p>
+    <p className="muted">Model metadata is read-only. Configure providers and credentials in Pi on the host, never in this workspace. The host operator can see session prompts and repository files, including private source, but receives no GitHub token.</p>
+    <ResourceState {...resource} retry={resource.refresh}>{!resource.data?.connectors.length ? <Empty title="Bring a local Pi to the table">{configured ? "Repository setup is complete. Connect a trusted Pi to this workspace next." : "First, ask an owner or admin to complete repository setup above. Pairing and sharing require at least one configured repository."}</Empty> : <div className="row-list">{resource.data.connectors.map(connector => <article className="connection-card" key={connector.id}><div className="section-heading"><h3>{connector.name}</h3><ConnectionStatus connector={connector} /></div><p>Hosted by <strong>{connector.ownerName}</strong>{connector.ownerId === user.id ? " (you)" : ""}</p><p className="metadata">Host owner ID: {connector.ownerId}</p><HostCapabilities connector={connector} /><ModelMetadata connector={connector} /></article>)}</div>}</ResourceState>
+    {!configured && <p className="notice">Pairing, new sharing and new sessions stay disabled until repository setup is confirmed. Configure or refresh repositories above.</p>}
+    <a className="button secondary" href="#connections">{configured ? "Connect Pi / manage my connections" : "View connection status"}</a>
   </section>;
 }
 
-export function Connections({ user, workspaces }: { user: UserProfile; workspaces: Workspace[] }) {
+export function Connections({ user, workspaces, workspace, selectWorkspace }: { user: UserProfile; workspaces: Workspace[]; workspace: Workspace | null; selectWorkspace: (id: string) => void }) {
   const resource = useConnections("/api/connectors");
+  return <>
+    <PageHeading number="04" title="Your Pi. A shared possibility.">Create a workspace, bind its GitHub repositories, then connect a trusted Pi. Pairing automatically shares the new host with your chosen workspace.</PageHeading>
+    <div className="split-layout"><section className="section"><div className="section-heading"><h2>Your connections</h2><button className="button secondary small" disabled={resource.loading} onClick={resource.refresh}>Refresh connections</button></div>
+      <p className="muted">Status refreshes every 10 seconds while this page is visible. A shared host can see prompts and repository files processed on its machine, including private source. Session ownership and session grants remain separate.</p>
+      <ResourceState {...resource} retry={resource.refresh}>{!resource.data?.connectors.length ? <Empty title="Make the first connection">Choose a configured workspace, create a pairing code, and run the connector from the app repository on your Linux or WSL2 Pi host.</Empty> : <div className="row-list">{resource.data.connectors.map(connector => <OwnedConnection key={connector.id} connector={connector} user={user} workspaces={workspaces} refresh={resource.refresh} selectWorkspace={selectWorkspace} />)}</div>}</ResourceState>
+    </section><aside className="rail"><p className="eyebrow">03 / Connect your local Pi</p><h2>Keep the keys at home.</h2><p>Pairing connects a dedicated app runtime. It does not attach to your private interactive Pi conversations or import old sessions.</p>
+      <label className="field">Workspace to automatically share with<select value={workspace?.id ?? ""} disabled={!workspaces.length} onChange={event => selectWorkspace(event.target.value)}><option value="" disabled>Choose a workspace</option>{workspaces.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+      <PairingSetup key={workspace?.id ?? "none"} workspace={workspace} refreshConnections={resource.refresh} />
+    </aside></div>
+  </>;
+}
+
+function PairingSetup({ workspace, refreshConnections }: { workspace: Workspace | null; refreshConnections: () => void }) {
+  const repositories = useResource<{ repositories: WorkspaceRepository[] }>(workspace ? `/api/workspaces/${segment(workspace.id)}/repositories` : null);
   const [name, setName] = useState("");
   const [pairing, setPairing] = useState<ConnectorPairing | null>(null);
   const [expired, setExpired] = useState(false);
   const action = useAction();
+  const mounted = useRef(true);
+  const configured = Boolean(workspace && !repositories.loading && !repositories.error && repositories.data?.repositories.length);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     if (!pairing) return;
     const delay = Math.max(0, new Date(pairing.expiresAt).getTime() - Date.now());
@@ -78,38 +97,52 @@ export function Connections({ user, workspaces }: { user: UserProfile; workspace
   }, [pairing]);
   function create(event: FormEvent) {
     event.preventDefault();
-    if (action.busy || !name.trim()) return;
+    if (!workspace || !configured || action.busy || !name.trim()) return;
     setPairing(null);
     setExpired(false);
     void action.run(async () => {
-      const result = await api<{ pairing: ConnectorPairing }>("/api/connectors/pairings", { method: "POST", body: { name: name.trim() } });
-      setPairing(result.pairing);
+      const result = await api<{ pairing: ConnectorPairing }>("/api/connectors/pairings", { method: "POST", body: { name: name.trim(), workspaceId: workspace.id } });
+      if (mounted.current) setPairing(result.pairing);
     });
   }
   return <>
-    <PageHeading number="04" title="Your Pi. A shared possibility.">Connect a local runtime, then decide where to share it. Your credentials stay on your machine.</PageHeading>
-    <div className="split-layout"><section className="section"><div className="section-heading"><h2>Your connections</h2><button className="button secondary small" disabled={resource.loading} onClick={resource.refresh}>Refresh connections</button></div>
-      <p className="muted">Status refreshes every 10 seconds while this page is visible. A shared host can see prompts and files processed on its machine. Session ownership and session grants remain separate.</p>
-      <ResourceState {...resource} retry={resource.refresh}>{!resource.data?.connectors.length ? <Empty title="Make the first connection">Create a pairing code and run the connector on the machine where you use Pi.</Empty> : <div className="row-list">{resource.data.connectors.map(connector => <OwnedConnection key={connector.id} connector={connector} user={user} workspaces={workspaces} refresh={resource.refresh} />)}</div>}</ResourceState>
-    </section><aside className="rail"><p className="eyebrow">Connect your local Pi</p><h2>Keep the keys at home.</h2><p>Pairing connects a dedicated app runtime. It does not attach to your private interactive Pi conversations or import old sessions.</p>
-      <form onSubmit={create}><label className="field">Connection name<input required maxLength={120} autoComplete="off" value={name} onChange={event => setName(event.target.value)} placeholder="My Linux workstation" /></label><Feedback {...action} /><button className="button primary" disabled={action.busy || !name.trim()}>{action.busy ? "Creating code..." : pairing ? "Create another pairing code" : "Create pairing code"}</button></form>
-      {expired && <p className="notice" role="status">The pairing code expired and was cleared. Create a new code to try again.</p>}
-      {pairing && <section className="pairing-panel" aria-label="One-time pairing instructions"><h3>Pair on your own machine</h3><p role="status">Your single-use pairing code is ready. Complete these steps before it expires.</p><ol><li>In the installed connector project, run:<pre><code>{`pnpm connect --server ${window.location.origin} --pairing-id ${pairing.id}`}</code></pre></li><li>Enter this single-use code when the CLI privately prompts you:<p className="pairing-code"><code>{pairing.code}</code></p></li><li>Return here, confirm your host is connected, and choose a workspace to share it with.</li></ol><p>Expires <Timestamp value={pairing.expiresAt} />. Treat this code as a secret; do not share it with teammates. It is held only in this page's memory, not browser storage.</p><button className="button secondary small" onClick={() => { setPairing(null); resource.refresh(); }}>Done / hide code</button><p className="metadata">Hiding clears the code from this page; an unused code remains valid until its expiry.</p></section>}
-      <p className="metadata">The local connector needs a supported Linux sandbox with verified resource limits. Unsupported platforms or missing isolation cannot run production shell tools. An offline machine cannot execute new work. No public local listener or inbound tunnel is needed.</p>
-    </aside></div>
+    {!workspace ? <p className="notice"><a href="#workspaces">Create or select a workspace</a>, then ask its owner or admin to bind GitHub repositories before pairing.</p> : <ResourceState {...repositories} retry={repositories.refresh}>{!repositories.data?.repositories.length ? <p className="notice">No repositories are configured for {workspace.name}. <a href="#workspaces">Open repository setup</a>; an owner or admin must bind at least one before you can pair or share a host.</p> : <p className="notice" role="status">{workspace.name} has {repositories.data.repositories.length} configured {repositories.data.repositories.length === 1 ? "repository" : "repositories"}. This new host will automatically be shared with this workspace when the code is claimed.</p>}</ResourceState>}
+    {workspace && <div className="actions"><button type="button" className="button secondary small" disabled={repositories.loading || action.busy} onClick={repositories.refresh}>Refresh repository setup</button><a href="#workspaces">Manage repositories</a></div>}
+    <form onSubmit={create}><label className="field">Connection name<input required maxLength={120} autoComplete="off" value={name} onChange={event => setName(event.target.value)} placeholder="My Linux workstation" /></label><p className="metadata">By creating and claiming this code, you share the host and its advertised models with <strong>{workspace?.name ?? "the workspace you choose"}</strong>. Members can start their own sessions there. Old sessions and personal Pi history are not shared.</p><Feedback {...action} /><button className="button primary" disabled={action.busy || !name.trim() || !configured}>{action.busy ? "Creating code..." : pairing ? "Create another pairing code" : "Create pairing code"}</button></form>
+    <section className="pairing-panel" aria-label="Local Pi installation requirements"><h3>Prepare the app checkout</h3><ol><li>Use Linux or WSL2; native Windows is unsupported. Install Node.js 24 and pnpm 10.32.1 in that environment. Configure Pi locally there, including its providers and models, and ensure the Linux sandbox and resource-limit prerequisites are available.</li><li>As a GitHub user authorized to read the private <code>OpenCara/agent-workspace</code> repository, clone the app and install its dependencies:<pre><code>{"git clone https://github.com/OpenCara/agent-workspace.git\ncd agent-workspace\npnpm install"}</code></pre>If GitHub reports that the repository is missing or access is denied, authenticate Git as an authorized user or ask the repository owner for access. Never paste a token into this page or a command URL.</li><li>Run <code>pnpm connect</code> with the pairing arguments below from that cloned app repository root, where its existing <code>package.json</code> lives. Do not run it in an arbitrary target project folder. Do not create a package file or use <code>pnpm init</code> as a workaround. Session source is downloaded separately into private caches.</li></ol></section>
+    {expired && <p className="notice" role="status">The pairing code expired and was cleared. Create a new code to try again.</p>}
+    {pairing && <section className="pairing-panel" aria-label="One-time pairing instructions"><h3>Pair with {workspace?.name}</h3><p role="status">Your single-use code is ready. Claiming it automatically shares this host with {workspace?.name}. Complete these steps before it expires.</p><ol><li>From the prepared <code>agent-workspace</code> repository root, run:<pre><code>{`pnpm connect --server ${window.location.origin} --pairing-id ${pairing.id}`}</code></pre></li><li>Enter this single-use code when the CLI privately prompts you:<p className="pairing-code"><code>{pairing.code}</code></p></li><li>Return here and refresh connections to confirm that the host is online and shared with {workspace?.name}.</li></ol><p>Expires <Timestamp value={pairing.expiresAt} />. Treat this code as a secret; do not share it with teammates. It is held only in this page's memory, not browser storage.</p><button type="button" className="button secondary small" onClick={() => { setPairing(null); refreshConnections(); }}>Done / hide code</button><p className="metadata">Hiding or switching workspaces clears the displayed code but does not revoke it. An unused code stays tied to its original workspace until expiry.</p></section>}
+    <p className="metadata">The host can see private repository snapshots and prompts, but receives no GitHub OAuth token. Model credentials stay in Pi on the host. An offline machine cannot execute new work. No public local listener or inbound tunnel is needed.</p>
   </>;
 }
 
-function OwnedConnection({ connector, user, workspaces, refresh }: { connector: ConnectorInfo; user: UserProfile; workspaces: Workspace[]; refresh: () => void }) {
+function OwnedConnection({ connector, user, workspaces, refresh, selectWorkspace }: { connector: ConnectorInfo; user: UserProfile; workspaces: Workspace[]; refresh: () => void; selectWorkspace: (id: string) => void }) {
   const action = useAction();
   const [workspaceId, setWorkspaceId] = useState("");
   const own = connector.ownerId === user.id;
   const available = workspaces.filter(workspace => !connector.workspaceIds.includes(workspace.id));
-  const target = available.find(workspace => workspace.id === workspaceId)?.id ?? available[0]?.id ?? "";
+  const target = available.find(workspace => workspace.id === workspaceId) ?? available[0];
   return <article className="connection-card"><div className="section-heading"><h3>{connector.name}</h3><ConnectionStatus connector={connector} /></div><p>Host owner: <strong>{connector.ownerName}</strong>{own ? " (you)" : ""}</p><p className="metadata">Connection ID: {connector.id}</p><HostCapabilities connector={connector} /><ModelMetadata connector={connector} /><Feedback {...action} />
     {own && !connector.revokedAt && <><h4>Shared with</h4>{!connector.workspaceIds.length ? <p className="muted">Not shared with any workspace.</p> : <ul className="connection-shares">{connector.workspaceIds.map(id => <li key={id}><span>{workspaces.find(workspace => workspace.id === id)?.name ?? id}</span><button className="button secondary small" disabled={action.busy} onClick={() => { if (window.confirm("Unshare this connection? New work and callbacks in this workspace will be blocked; existing session records are not deleted.")) void action.run(async () => { await api(`/api/connectors/${segment(connector.id)}/shares/${segment(id)}`, { method: "DELETE" }); refresh(); }, "Connection unshared."); }}>Unshare</button></li>)}</ul>}
-      {available.length > 0 ? <form onSubmit={event => { event.preventDefault(); if (!target || action.busy) return; void action.run(async () => { await api(`/api/connectors/${segment(connector.id)}/shares/${segment(target)}`, { method: "PUT", body: {} }); refresh(); }, "Shared. Existing sessions and personal Pi history remain private."); }}><label className="field">Share with workspace<select value={target} onChange={event => setWorkspaceId(event.target.value)}>{available.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label><p className="metadata">Members may deliberately create new sessions on this host using its local models. This does not grant access to old sessions.</p><button className="button secondary small" disabled={action.busy || !target}>Share connection</button></form> : !workspaces.length && <p>Create or join a workspace before sharing.</p>}
+      {target ? <><label className="field">Share with workspace<select value={target.id} disabled={action.busy} onChange={event => setWorkspaceId(event.target.value)}>{available.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label><ShareConnection key={target.id} connector={connector} workspace={target} action={action} refresh={refresh} selectWorkspace={selectWorkspace} /></> : !workspaces.length && <p><a href="#workspaces">Create or join a workspace</a> and configure its repositories before sharing.</p>}
       <button className="button danger small revoke-connection" disabled={action.busy} onClick={() => { if (window.confirm(`Revoke ${connector.name}? This disconnects its runtime and blocks work in every shared workspace. Pair again to reconnect; existing session records are not deleted.`)) void action.run(async () => { await api(`/api/connectors/${segment(connector.id)}`, { method: "DELETE" }); refresh(); }, "Connection revoked."); }}>Revoke connection</button>
     </>}
   </article>;
+}
+
+function ShareConnection({ connector, workspace, action, refresh, selectWorkspace }: { connector: ConnectorInfo; workspace: Workspace; action: ActionState; refresh: () => void; selectWorkspace: (id: string) => void }) {
+  const repositories = useResource<{ repositories: WorkspaceRepository[] }>(`/api/workspaces/${segment(workspace.id)}/repositories`);
+  const configured = !repositories.loading && !repositories.error && Boolean(repositories.data?.repositories.length);
+  return <form onSubmit={event => {
+    event.preventDefault();
+    if (!configured || action.busy) return;
+    void action.run(async () => {
+      await api(`/api/connectors/${segment(connector.id)}/shares/${segment(workspace.id)}`, { method: "PUT", body: {} });
+      refresh();
+    }, "Shared. Existing sessions and personal Pi history remain private.");
+  }}>
+    <ResourceState {...repositories} retry={repositories.refresh}>{!repositories.data?.repositories.length && <p className="notice">No repositories are configured for {workspace.name}. Ask an owner or admin to bind at least one before sharing.</p>}</ResourceState>
+    <p className="metadata">Sharing with {workspace.name} lets members start new sessions on this host using its local models. Its operator can see their repository snapshots and prompts. This does not grant access to old sessions or teammates' GitHub credentials.</p>
+    <div className="actions"><button className="button secondary small" disabled={action.busy || !configured}>{action.busy ? "Saving..." : "Share connection"}</button><button type="button" className="button secondary small" disabled={repositories.loading || action.busy} onClick={repositories.refresh}>Refresh setup</button><a href="#workspaces" onClick={() => selectWorkspace(workspace.id)}>Open repository setup</a></div>
+  </form>;
 }

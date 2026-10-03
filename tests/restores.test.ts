@@ -6,16 +6,19 @@ import { Hono } from 'hono';
 import type { Env, WorkerEnv } from '../apps/worker/src/types.js';
 import type { RunnerBinding, RunnerTicket } from '../packages/shared/src/types.js';
 import type { RestoreInput } from '../packages/shared/src/connector.js';
+import type { SessionRepository } from '../packages/shared/src/repositories.js';
 import { sha256, verifyToken } from '../packages/shared/src/crypto.js';
 import { registerRestoreRoutes, downloadRestoreSnapshot } from '../apps/worker/src/restore-routes.js';
 import { registerBackups } from '../apps/worker/src/backups.js';
-import { boundedSnapshotText, MAX_BACKUP_BYTES } from '../apps/worker/src/restore-snapshot.js';
+import { boundedSnapshotText, MAX_BACKUP_BYTES, validateSnapshot } from '../apps/worker/src/restore-snapshot.js';
 
 const secret = 'restore-internal-test-secret-not-for-deployment';
 const bearer = 'b'.repeat(43);
 const connection = 'c'.repeat(43);
 const downloadToken = 'd'.repeat(43);
 const restorePath = '/api/sessions/source/backups/backup/restore';
+const repositoryPins: SessionRepository[] = [{ bindingId: 'original-binding', repositoryId: 123,
+  fullName: 'Owner/Project', ref: 'main', commit: 'a'.repeat(40), path: 'Owner/Project' }];
 
 interface SnapshotFixture {
   sqlite: DatabaseSync;
@@ -25,7 +28,7 @@ interface SnapshotFixture {
   replaceSnapshot(change: (snapshot: { binding: RunnerBinding }) => void): Promise<void>;
 }
 
-async function fixture(t: TestContext, connected = false) {
+async function fixture(t: TestContext, connected = false, repositories: SessionRepository[] = []) {
   const sqlite = new DatabaseSync(':memory:');
   t.after(() => sqlite.close());
   sqlite.exec('PRAGMA foreign_keys = ON');
@@ -82,14 +85,15 @@ async function fixture(t: TestContext, connected = false) {
     VALUES ('model','workspace','Model','faux','faux-v1',?,?,'2026-01-01')`).run(connected ? 'connector' : null, connected ? 'test:host' : null);
   sqlite.exec(`INSERT INTO agents VALUES ('agent','test:host','2026-01-01');
     INSERT INTO agent_versions VALUES ('version','agent','test:host','workspace',1,'Agent','Description','Instructions','["read_file"]','model','2026-01-01')`);
-  sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
-    VALUES ('source','workspace','test:owner','version','Original',7,'ready','2026-01-01',?,?)`)
-    .run(connected ? 'connector' : null, connected ? 'test:host' : null);
+  sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id,repositories_json)
+    VALUES ('source','workspace','test:owner','version','Original',7,'ready','2026-01-01',?,?,?)`)
+    .run(connected ? 'connector' : null, connected ? 'test:host' : null, JSON.stringify(repositories));
   sqlite.exec(`INSERT INTO session_grants VALUES ('source','test:manager','["read","manage"]','2026-01-01')`);
   const route = connected ? { connectorId: 'connector', connectorOwnerId: 'test:host' } : {};
   const binding: RunnerBinding = {
     session: { id: 'source', workspaceId: 'workspace', ownerId: 'test:owner', agentVersionId: 'version', title: 'Original',
-      policyVersion: 7, status: 'ready', createdAt: '2026-01-01', ...route },
+      policyVersion: 7, status: 'ready', createdAt: '2026-01-01', ...route,
+      ...(repositories.length ? { repositories: structuredClone(repositories) } : {}) },
     owner: { id: 'test:owner', githubId: null, githubLogin: null, displayName: 'Old Owner', gitName: 'Old Name',
       gitEmail: 'old@example.test', env: { APP_PROJECT: 'old' }, githubConnected: false },
     agent: { id: 'version', agentId: 'agent', authorId: 'test:host', workspaceId: 'workspace', version: 1,
@@ -118,12 +122,12 @@ async function fixture(t: TestContext, connected = false) {
     change(snapshot); raw = JSON.stringify(snapshot); objects.set(key, new TextEncoder().encode(raw));
     sqlite.prepare('UPDATE backups SET sha256 = ?, size = ?').run(await sha256(raw), Buffer.byteLength(raw));
   }
-  async function pending() {
+  async function pending(storedRepositories = repositories) {
     const targetBinding = structuredClone(binding);
     targetBinding.session = { ...binding.session, id: 'target', title: 'Restored', policyVersion: 1, status: 'provisioning' };
-    sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
-      VALUES ('target','workspace','test:owner','version','Restored',1,'provisioning','2026-01-01',?,?)`)
-      .run(connected ? 'connector' : null, connected ? 'test:host' : null);
+    sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id,repositories_json)
+      VALUES ('target','workspace','test:owner','version','Restored',1,'provisioning','2026-01-01',?,?,?)`)
+      .run(connected ? 'connector' : null, connected ? 'test:host' : null, JSON.stringify(storedRepositories));
     sqlite.prepare(`INSERT INTO restore_jobs (id,request_id,owner_id,workspace_id,source_session_id,backup_id,target_session_id,
       sha256,size,binding_json,download_token_hash,download_expires_at,created_at)
       VALUES ('restore','request','test:owner','workspace','source','backup','target',?,?,?,?,?,'2026-01-01')`)
@@ -196,6 +200,82 @@ test('restore pins one new target, uses current owner profile and copies no gran
   assert.equal(job.download_token_hash, null);
   assert.throws(() => f.sqlite.exec("UPDATE restore_jobs SET target_session_id='source'"), /immutable/);
   assert.throws(() => f.sqlite.exec('DELETE FROM restore_jobs'), /retained/);
+});
+
+test('restore copies source repository pins after live workspace bindings are removed or replaced', async t => {
+  const f = await fixture(t, false, repositoryPins);
+  f.sqlite.prepare(`INSERT INTO workspace_repositories (id, workspace_id, repository_id, full_name, ref, private, created_at)
+    VALUES ('original-binding', 'workspace', 123, 'Owner/Project', 'main', 1, '2026-01-01')`).run();
+  f.sqlite.exec(`DELETE FROM workspace_repositories;
+    INSERT INTO workspace_repositories (id, workspace_id, repository_id, full_name, ref, private, created_at)
+    VALUES ('replacement-binding', 'workspace', 456, 'Other/Project', 'new-branch', 0, '2026-01-02')`);
+  let targetId = '';
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as RestoreInput;
+    targetId = body.binding.session.id;
+    assert.deepEqual(body.binding.session.repositories, repositoryPins);
+    const download = await f.request(`/api/internal/restores/${body.restore.id}/download`, {
+      targetSessionId: targetId, sourceSessionId: 'source', backupId: 'backup', downloadToken: body.restore.downloadToken,
+    }, { Authorization: `Bearer ${secret}` });
+    assert.equal(download.status, 200);
+    const snapshot = await download.json() as { binding: RunnerBinding };
+    assert.equal(snapshot.binding.session.id, 'source');
+    assert.deepEqual(snapshot.binding.session.repositories, repositoryPins);
+    return runnerReceipt(body);
+  });
+  const response = await f.request(restorePath, { requestId: 'pinned' });
+  assert.equal(response.status, 201);
+  assert.deepEqual((await response.json() as { session: RunnerBinding['session'] }).session.repositories, repositoryPins);
+  const target = f.sqlite.prepare('SELECT repositories_json FROM sessions WHERE id = ?').get(targetId)!;
+  assert.equal(target.repositories_json, JSON.stringify(repositoryPins));
+  assert.throws(() => f.sqlite.prepare('UPDATE sessions SET repositories_json = ? WHERE id = ?')
+    .run('[]', targetId), /immutable/);
+});
+
+test('snapshot repositories must match every source pin before target creation or owner download', async t => {
+  const changes: ((session: RunnerBinding['session']) => void)[] = [
+    session => { delete session.repositories; },
+    session => { session.repositories = []; },
+    ...Object.entries({ bindingId: 'other-binding', repositoryId: 456, fullName: 'Other/Project',
+      ref: 'other-branch', commit: 'b'.repeat(40), path: '../escape' })
+      .map(([key, value]) => (session: RunnerBinding['session']) => {
+        Object.assign(session.repositories![0], { [key]: value });
+      }),
+    session => { Object.assign(session, { repositories: null }); },
+    session => { Object.assign(session, { repositories: {} }); },
+    session => { Object.assign(session, { repositories: [null] }); },
+  ];
+  for (const change of changes) {
+    const f = await fixture(t, false, repositoryPins);
+    await f.replaceSnapshot(snapshot => change(snapshot.binding.session));
+    assert.equal((await f.request(restorePath, { requestId: 'wrong-pins' })).status, 502);
+    assert.equal((await f.app.request('/api/sessions/source/backups/backup/download', {}, f.env)).status, 502);
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
+  }
+});
+
+test('snapshot pin comparison allows property order and legacy absent pins, but not repository order changes', async t => {
+  const f = await fixture(t);
+  const source = structuredClone(f.binding);
+  source.session.repositories = [];
+  assert.doesNotThrow(() => validateSnapshot(JSON.stringify(f.snapshot), source));
+  const pins = [...repositoryPins, { bindingId: 'second-binding', repositoryId: 456, fullName: 'Other/Project',
+    ref: 'stable', commit: 'b'.repeat(40), path: 'Other/Project' }];
+  source.session.repositories = pins;
+  f.snapshot.binding.session.repositories = pins.map(pin => ({ path: pin.path, commit: pin.commit, ref: pin.ref,
+    fullName: pin.fullName, repositoryId: pin.repositoryId, bindingId: pin.bindingId }));
+  assert.doesNotThrow(() => validateSnapshot(JSON.stringify(f.snapshot), source));
+  f.snapshot.binding.session.repositories.reverse();
+  assert.throws(() => validateSnapshot(JSON.stringify(f.snapshot), source), /immutable session binding/);
+});
+
+test('restore download rejects target rows whose pins differ from the immutable receipt', async t => {
+  const f = await fixture(t, false, repositoryPins);
+  const descriptor = await f.pending([{ ...repositoryPins[0]!, commit: 'b'.repeat(40) }]);
+  const response = await f.request('/api/internal/restores/restore/download', descriptor,
+    { Authorization: `Bearer ${secret}` });
+  assert.equal(response.status, 409);
+  assert.equal(f.reads.length, 0);
 });
 
 test('ambiguous runner failure and invalid receipt retry the same target and immutable binding', async t => {

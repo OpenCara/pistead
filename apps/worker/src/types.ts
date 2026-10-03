@@ -51,6 +51,7 @@ export interface SessionRow {
   id: string; workspace_id: string; owner_id: string; agent_version_id: string; title: string;
   policy_version: number; status: 'provisioning' | 'ready' | 'error' | 'archived'; created_at: string;
   connector_id?: string | null; connector_owner_id?: string | null;
+  repositories_json?: string;
 }
 export interface SessionAccess { row: SessionRow; permissions: Permission[] }
 export type PublicProfile = UserProfile;

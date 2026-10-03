@@ -36,12 +36,26 @@ export async function boundedSnapshotText(response: Response, expectedSize?: num
   catch { fail(502, 'invalid_backup', 'The backup is not valid UTF-8.'); }
 }
 
+export function repositoryIdentity(repositories: RunnerBinding['session']['repositories']): string {
+  if (repositories === undefined) return '[]';
+  if (!Array.isArray(repositories)) fail(409, 'invalid_restore', 'Invalid session repository pins.');
+  return JSON.stringify(repositories.map(repository => {
+    if (!repository || typeof repository.bindingId !== 'string' || typeof repository.repositoryId !== 'number' ||
+        typeof repository.fullName !== 'string' || typeof repository.ref !== 'string' ||
+        typeof repository.commit !== 'string' || typeof repository.path !== 'string') {
+      fail(409, 'invalid_restore', 'Invalid session repository pins.');
+    }
+    return [repository.bindingId, repository.repositoryId, repository.fullName, repository.ref, repository.commit, repository.path];
+  }));
+}
+
 // Ignore mutable display names and owner profile, but never execution routing or identity.
 export function bindingIdentity(binding: RunnerBinding): string {
   const { session: s, agent: a, model: m } = binding;
   return JSON.stringify([s.workspaceId, s.ownerId, s.agentVersionId, s.connectorId ?? null, s.connectorOwnerId ?? null,
     binding.owner.id, a.id, a.agentId, a.authorId, a.workspaceId, a.version, a.instructions, a.tools, a.modelId,
-    m.id, m.workspaceId, m.provider, m.modelId, m.connectorId ?? null, m.connectorOwnerId ?? null]);
+    m.id, m.workspaceId, m.provider, m.modelId, m.connectorId ?? null, m.connectorOwnerId ?? null,
+    repositoryIdentity(s.repositories)]);
 }
 
 export function validateSnapshot(raw: string, source: RunnerBinding): void {

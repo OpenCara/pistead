@@ -4,6 +4,7 @@ import { api, ApiError, errorMessage, segment } from "./api";
 import { Empty, Feedback, PageHeading, Timestamp, useAction } from "./ui";
 import { SessionHost } from "./SessionHost";
 import { SessionControls } from "./SessionControls";
+import { SessionRepositories } from "./SessionRepositories";
 
 function useLiveSession(id: string) {
   const [session, setSession] = useState<SessionRecord | null>(null);
@@ -82,7 +83,7 @@ function useLiveSession(id: string) {
   return { session, view, error, status, refresh, reconnect };
 }
 
-export function SessionDetail({ id, user, goBack, openSession }: { id: string; user: UserProfile; goBack: () => void; openSession: (id: string) => void }) {
+export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }: { id: string; user: UserProfile; goBack: () => void; openSession: (id: string) => void; selectWorkspace: (id: string) => void }) {
   const live = useLiveSession(id);
   const [mode, setMode] = useState<"write" | "ask">("write");
   const [content, setContent] = useState("");
@@ -140,6 +141,7 @@ export function SessionDetail({ id, user, goBack, openSession }: { id: string; u
     {!view && !live.error && <p className="loading" role="status">Loading identity and committed history...</p>}
     {live.session && <SessionHost session={live.session} user={user} />}
     {!view && live.session && <SessionControls session={live.session} user={user} onChange={live.refresh} busy openSession={openSession} />}
+    {live.session && <SessionRepositories session={live.session} refresh={live.refresh} selectWorkspace={selectWorkspace} />}
     {view && live.session && <>
       <section className="owner-banner" aria-label="Session owner identity"><div><p className="eyebrow">Acts as owner</p><h2>{view.owner.displayName}</h2><p>{view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} <span aria-hidden="true">/</span> {view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</p></div><div><span className="badge">{live.session.ownerId === user.id ? "You own this session" : "You are a collaborator"}</span><p className="mono">Your permissions: {permissions.join(" / ") || "none"}</p><p className="metadata">Session ID: {id}</p></div></section>
       <div className="session-layout"><div className="session-main"><section className="section"><div className="section-heading"><h2>Committed conversation</h2><span className={`stream-status ${live.status}`} role="status">{live.status === "online" ? "Live" : live.status === "reconnecting" ? "Reconnecting automatically" : live.status === "offline" ? "Disconnected" : "Connecting"}</span></div>

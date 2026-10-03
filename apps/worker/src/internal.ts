@@ -11,6 +11,7 @@ import { decryptToken } from './vault.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
 import { legacyRestoreDownload } from './restore-routes.js';
 import { requireBrokerReview } from './approval-reviews.js';
+import { repositoryDownload } from './repositories.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   const configured = c.env.RUNNER_SHARED_SECRET;
@@ -27,6 +28,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/authorize', c => authorizeSession(c, null));
   app.post('/api/internal/github/comment', c => githubComment(c, null));
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
+  app.post('/api/internal/repositories/:bindingId/download', c => repositoryDownload(c, null));
 }
 
 async function callbackScope(c: AppContext, row: SessionRow, connectorId: string | null): Promise<void> {

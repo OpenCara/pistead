@@ -1,5 +1,7 @@
 import { useState, type FormEvent } from "react";
 import type { UserProfile, Workspace, WorkspaceRole } from "../../../packages/shared/src/types";
+import type { WorkspaceRepository } from "../../../packages/shared/src/repositories";
+import { WorkspaceRepositories } from "./WorkspaceRepositories";
 import { WorkspaceConnections } from "./Connections";
 import { api, segment } from "./api";
 import { Empty, Feedback, PageHeading, ResourceState, useAction, useResource } from "./ui";
@@ -16,10 +18,11 @@ export function Workspaces({ user, workspaces, workspace, refresh, select }: { u
       setName("");
       select(result.workspace.id);
       refresh();
-    }, "Workspace created.");
+    }, "Workspace created. Next, bind at least one GitHub repository below.");
   }
   return <>
     <PageHeading number="01" title="Room to work.">A place for people, published agents, and a shared model catalog. Session access is always granted separately.</PageHeading>
+    <ol className="setup-steps" aria-label="Workspace setup"><li><strong>01 / Create a workspace</strong><span>Choose the people and place.</span></li><li><strong>02 / Bind repositories</strong><span>An owner or admin chooses GitHub source.</span></li><li><strong>03 / Connect Pi</strong><span>Pair and automatically share a trusted host.</span></li></ol>
     <div className="split-layout"><section className="section">
       <div className="section-heading"><span className="section-number">01</span><h2>Your workspaces</h2><span className="badge">{workspaces.length}</span></div>
       {workspaces.length === 0 ? <Empty title="Start a workshop">Create a workspace to curate models and publish reusable agents.</Empty> : <div className="row-list">{workspaces.map(item => <div className="list-row" key={item.id}><div className="row-main"><h3>{item.name}</h3><p className="metadata">{item.role ?? (item.ownerId === user.id ? "owner" : "member")}</p></div><button className={`button ${workspace?.id === item.id ? "primary" : "secondary"} small`} onClick={() => select(item.id)} aria-pressed={workspace?.id === item.id}>{workspace?.id === item.id ? "Selected" : "Select workspace"}</button></div>)}</div>}
@@ -30,7 +33,9 @@ export function Workspaces({ user, workspaces, workspace, refresh, select }: { u
 
 function WorkspaceSettings({ user, workspace }: { user: UserProfile; workspace: Workspace }) {
   const admin = workspace.ownerId === user.id || workspace.role === "admin" || workspace.role === "owner";
-  return <div className="split-layout"><Members workspace={workspace} admin={admin} /><WorkspaceConnections workspace={workspace} user={user} /></div>;
+  const repositories = useResource<{ repositories: WorkspaceRepository[] }>(`/api/workspaces/${segment(workspace.id)}/repositories`);
+  const configured = !repositories.loading && !repositories.error && Boolean(repositories.data?.repositories.length);
+  return <><WorkspaceRepositories workspace={workspace} user={user} admin={admin} repositories={repositories.data?.repositories ?? null} loading={repositories.loading} error={repositories.error} refresh={repositories.refresh} /><div className="split-layout"><WorkspaceConnections workspace={workspace} user={user} configured={configured} /><Members workspace={workspace} admin={admin} /></div></>;
 }
 
 function Members({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
@@ -47,7 +52,7 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
       resource.refresh();
     }, "Membership saved. This does not grant access to any session.");
   }
-  return <section className="section"><div className="section-heading"><span className="section-number">02</span><h2>People in {workspace.name}</h2></div><p className="muted">Membership gives access to published agents, not other people's sessions.</p>
+  return <section className="section"><div className="section-heading"><h2>People in {workspace.name}</h2></div><p className="muted">Membership gives access to published agents, not other people's sessions or GitHub permissions.</p>
     <ResourceState {...resource} retry={resource.refresh}>{resource.data?.members.length === 0 && <Empty title="No members to display">Workspace membership is managed by the owner and admins.</Empty>}<div className="row-list">{resource.data?.members.map(member => <div className="list-row" key={member.userId}><div className="row-main"><h3>{member.displayName || member.githubLogin || member.userId}</h3><p className="metadata">{member.role} / {member.userId}</p></div>{admin && member.userId !== workspace.ownerId && <button className="button danger small" disabled={action.busy} onClick={() => { if (window.confirm(`Remove ${member.displayName || member.userId} from this workspace?`)) void action.run(async () => { await api(`${path}/${segment(member.userId)}`, { method: "DELETE" }); resource.refresh(); }, "Membership removed."); }}>Remove</button>}</div>)}</div></ResourceState>
     {admin ? <form onSubmit={save}><h3>Add or update a member</h3><div className="inline-fields"><label className="field">User ID<input required value={userId} onChange={event => setUserId(event.target.value)} placeholder="Copy from their Profile" /></label><label className="field">Role<select value={role} onChange={event => setRole(event.target.value as "member" | "admin")}><option value="member">Member</option><option value="admin">Admin</option></select></label></div><button className="button secondary" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save membership"}</button></form> : <p className="muted">Only workspace owners and admins can manage membership.</p>}
     <Feedback {...action} />

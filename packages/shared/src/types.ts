@@ -1,3 +1,5 @@
+import type { SessionRepository } from "./repositories.js";
+
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
@@ -53,6 +55,7 @@ export interface SessionRecord {
   permissions?: Permission[];
   connectorId?: string;
   connectorOwnerId?: string;
+  repositories?: SessionRepository[];
 }
 export interface SessionGrant {
   userId: string;

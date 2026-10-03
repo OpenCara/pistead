@@ -180,6 +180,17 @@ await check("workspace membership and model administration are enforced", async 
   await eve.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: eve.user.id, role: "admin" }, [403, 404]);
 });
 
+await check("repository setup stays workspace-scoped and synthetic sign-in grants no GitHub access", async () => {
+  assert.deepEqual((await alice.request("GET", `/api/workspaces/${workspace.id}/repositories`)).repositories, []);
+  assert.deepEqual((await bob.request("GET", `/api/workspaces/${workspace.id}/repositories`)).repositories, []);
+  await eve.request("GET", `/api/workspaces/${workspace.id}/repositories`, undefined, [403, 404]);
+  const repository = { repositoryId: 1, fullName: "example/private-repository" };
+  await bob.request("POST", `/api/workspaces/${workspace.id}/repositories`, repository, [403]);
+  await alice.request("POST", `/api/workspaces/${workspace.id}/repositories`, repository, [403]);
+  await alice.request("GET", "/api/github/repositories", undefined, [403]);
+  await bob.request("DELETE", `/api/workspaces/${workspace.id}/repositories/00000000-0000-4000-8000-000000000001`, undefined, [403]);
+});
+
 await check("private agents remain private; publishing exposes definition, not author environment", async () => {
   const own: AgentVersion = (await alice.request("POST", "/api/agents", { name: `Reviewer ${run}`, description: "Shared identity-neutral integration fixture", instructions: "Use the connected session owner's identity. Never change identity configuration.", tools: ["identity", "list_files", "read_file", "write_file", "git_status", "git_commit", "bash", "github_comment"], modelId: model.id })).agent;
   await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: own.id, title: "Forbidden private use" }, [403, 404]);
@@ -190,6 +201,16 @@ await check("private agents remain private; publishing exposes definition, not a
   assert.ok(catalog.some((item) => item.id === published.id));
   assert.equal("env" in published, false);
   assert.equal("githubToken" in published, false);
+});
+
+await check("repository pins and cache destinations are assigned by the server, not the session caller", async () => {
+  await alice.request("POST", "/api/sessions", {
+    workspaceId: workspace.id, agentVersionId: published.id, title: "Forbidden repository injection",
+    repositories: [{
+      bindingId: "00000000-0000-4000-8000-000000000001", repositoryId: 1,
+      fullName: "example/private-repository", ref: "main", commit: "a".repeat(40), path: "../../host",
+    }],
+  }, [400]);
 });
 
 await check("the same published agent starts distinct owner-bound sessions", async () => {

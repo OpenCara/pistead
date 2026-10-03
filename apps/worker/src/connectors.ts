@@ -6,6 +6,7 @@ import { requireMember } from './db.js';
 import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
 import { authorizeSession, githubComment } from './internal.js';
 import { connectorRestoreDownload } from './restore-routes.js';
+import { legacyRepositoryFixture, repositoryDownload, requireConfiguredWorkspace } from './repositories.js';
 
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
@@ -122,9 +123,9 @@ async function connectorInfos(env: Env, rows: ConnectorInfoRow[]): Promise<Conne
   return result;
 }
 
-async function syncModels(env: Env, row: ConnectorRow, workspaceId: string | null): Promise<void> {
+function modelStatements(env: Env, row: Pick<ConnectorRow, 'id' | 'models_json'>, workspaceId: string | null): D1PreparedStatement[] {
   // Import with two set-based statements, not one D1 query per model or workspace.
-  await env.DB.batch([
+  return [
     env.DB.prepare(`UPDATE models SET available = 0 WHERE connector_id = ? AND (? IS NULL OR workspace_id = ?)
       AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND models_json = ? AND revoked_at IS NULL)`)
       .bind(row.id, workspaceId, workspaceId, row.id, row.models_json),
@@ -138,7 +139,11 @@ async function syncModels(env: Env, row: ConnectorRow, workspaceId: string | nul
       WHERE c.id = ? AND c.revoked_at IS NULL AND c.models_json = ? AND (? IS NULL OR sh.workspace_id = ?)
       ON CONFLICT (workspace_id, connector_id, provider, model_id) DO UPDATE SET name = excluded.name, available = 1`)
       .bind(now(), row.id, row.models_json, workspaceId, workspaceId),
-  ]);
+  ];
+}
+
+async function syncModels(env: Env, row: ConnectorRow, workspaceId: string | null): Promise<void> {
+  await env.DB.batch(modelStatements(env, row, workspaceId));
 }
 
 export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
@@ -151,18 +156,52 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     const pairingId = identifier(c.req.param('id'));
     const code = text(input.code, 'code', 128);
     const controlPlaneUrl = appOrigin(c.env);
-    const pairing = await c.env.DB.prepare(`UPDATE connector_pairings SET claimed_at = ? WHERE id = ? AND code_hash = ?
-      AND claimed_at IS NULL AND expires_at > ?
-      AND (SELECT COUNT(*) FROM connectors WHERE owner_id = connector_pairings.owner_id AND revoked_at IS NULL) < 20
-      AND EXISTS (SELECT 1 FROM users WHERE id = owner_id AND (? = 1 OR auth_kind <> 'test')) RETURNING owner_id, name`)
-      .bind(now(), pairingId, await sha256(code), Math.floor(Date.now() / 1000), testMode(c.env) ? 1 : 0).first<{ owner_id: string; name: string }>();
+    const codeHash = await sha256(code);
+    const pairing = await c.env.DB.prepare(`SELECT owner_id, name, workspace_id FROM connector_pairings
+      WHERE id = ? AND code_hash = ? AND claimed_at IS NULL AND expires_at > ?`)
+      .bind(pairingId, codeHash, Math.floor(Date.now() / 1000))
+      .first<{ owner_id: string; name: string; workspace_id: string | null }>();
     if (!pairing) fail(403, 'invalid_pairing', 'Pairing is expired, used, or invalid.');
+    const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, pairing.owner_id);
+    if (pairing.workspace_id !== null) {
+      await requireMember(c.env, pairing.workspace_id, pairing.owner_id);
+      await requireConfiguredWorkspace(c.env, pairing.workspace_id, pairing.owner_id);
+    } else if (!legacy) {
+      fail(403, 'invalid_pairing', 'Pairing requires a configured workspace.');
+    }
     const connectorId = id();
     const token = randomToken();
-    const created = await c.env.DB.prepare(`INSERT INTO connectors (id,owner_id,name,credential_hash,created_at,models_json,capabilities_json)
-      SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20 RETURNING id`)
-      .bind(connectorId, pairing.owner_id, pairing.name, await sha256(token), now(), JSON.stringify(manifest.models), JSON.stringify(manifest.capabilities), pairing.owner_id).first();
-    if (!created) fail(429, 'connector_limit', 'Connector limit reached.');
+    const credentialHash = await sha256(token);
+    const createdAt = now();
+    // Consume the code, create the connector and capture its explicit share in one transaction.
+    // INSERT rechecks authority after the asynchronous preflight and token hashing.
+    const results = await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO connectors (id,owner_id,name,credential_hash,created_at,models_json,capabilities_json)
+        SELECT ?, p.owner_id, p.name, ?, ?, ?, ? FROM connector_pairings p
+        JOIN users u ON u.id = p.owner_id
+        WHERE p.id = ? AND p.code_hash = ? AND p.claimed_at IS NULL AND p.expires_at > ?
+        AND p.owner_id = ? AND p.workspace_id IS ?
+        AND (? = 1 OR u.auth_kind <> 'test')
+        AND (SELECT COUNT(*) FROM connectors WHERE owner_id = p.owner_id AND revoked_at IS NULL) < 20
+        AND ((p.workspace_id IS NULL AND ? = 1 AND u.auth_kind = 'test')
+          OR (p.workspace_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = p.workspace_id AND user_id = p.owner_id)
+            AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = p.workspace_id)
+              OR (? = 1 AND u.auth_kind = 'test'))))
+        RETURNING *`)
+        .bind(connectorId, credentialHash, createdAt, JSON.stringify(manifest.models), JSON.stringify(manifest.capabilities),
+          pairingId, codeHash, Math.floor(Date.now() / 1000), pairing.owner_id, pairing.workspace_id,
+          testMode(c.env) ? 1 : 0, legacy ? 1 : 0, legacy ? 1 : 0),
+      c.env.DB.prepare(`UPDATE connector_pairings SET claimed_at = ? WHERE id = ?
+        AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND credential_hash = ?)`)
+        .bind(createdAt, pairingId, connectorId, credentialHash),
+      c.env.DB.prepare(`INSERT INTO connector_shares (connector_id, workspace_id, created_at)
+        SELECT id, ?, ? FROM connectors WHERE id = ? AND ? IS NOT NULL`)
+        .bind(pairing.workspace_id, createdAt, connectorId, pairing.workspace_id),
+      ...modelStatements(c.env, { id: connectorId, models_json: JSON.stringify(manifest.models) }, pairing.workspace_id),
+    ]);
+    const created = results[0].results[0] as ConnectorRow | undefined;
+    if (!created) fail(403, 'invalid_pairing', 'Pairing is expired, used, invalid, or its workspace is no longer available.');
     return c.json({ credentials: { connectorId, token, controlPlaneUrl } }, 201);
   });
   app.get('/api/connectors/socket', async c => {
@@ -195,20 +234,32 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/authorize', async c => authorizeSession(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/comment', async c => githubComment(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/repositories/:bindingId/download', async c => repositoryDownload(c, await authenticateConnector(c)));
 }
 
 export function registerConnectors(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/pairings', async c => {
     const input = await jsonObject(c, 4096);
-    onlyFields(input, ['name']);
+    onlyFields(input, ['name', 'workspaceId']);
     const name = text(input.name, 'name', 120);
     const ownerId = c.get('auth').userId;
+    const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, ownerId);
+    const workspaceId = input.workspaceId === undefined && legacy ? null : identifier(input.workspaceId, 'workspaceId');
+    if (workspaceId !== null) {
+      await requireMember(c.env, workspaceId, ownerId);
+      await requireConfiguredWorkspace(c.env, workspaceId, ownerId);
+    }
     const pairingId = id(); const code = randomToken(); const expires = Math.floor(Date.now() / 1000) + 600;
     await c.env.DB.prepare('DELETE FROM connector_pairings WHERE owner_id = ? AND expires_at <= ?').bind(ownerId, Math.floor(Date.now() / 1000)).run();
-    const created = await c.env.DB.prepare(`INSERT INTO connector_pairings (id,owner_id,name,code_hash,expires_at,created_at)
-      SELECT ?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM connector_pairings WHERE owner_id = ?) < 5
-      AND (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20 RETURNING id`)
-      .bind(pairingId, ownerId, name, await sha256(code), expires, now(), ownerId, ownerId).first();
+    const created = await c.env.DB.prepare(`INSERT INTO connector_pairings (id,owner_id,name,code_hash,expires_at,created_at,workspace_id)
+      SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM connector_pairings WHERE owner_id = ?) < 5
+      AND (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20
+      AND ((? IS NULL AND ? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test'))
+        OR (? IS NOT NULL AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
+          AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = ?)
+            OR (? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test'))))) RETURNING id`)
+      .bind(pairingId, ownerId, name, await sha256(code), expires, now(), workspaceId, ownerId, ownerId,
+        workspaceId, legacy ? 1 : 0, ownerId, workspaceId, workspaceId, ownerId, workspaceId, legacy ? 1 : 0, ownerId).first();
     if (!created) fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
     return c.json({ pairing: { id: pairingId, code, expiresAt: new Date(expires * 1000).toISOString() } }, 201);
   });
@@ -236,10 +287,27 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
     if (row.revoked_at) fail(409, 'connector_revoked', 'Connector is revoked.');
     const workspaceId = identifier(c.req.param('workspaceId'));
     await requireMember(c.env, workspaceId, row.owner_id);
-    await c.env.DB.prepare(`INSERT INTO connector_shares (connector_id,workspace_id,created_at)
-      SELECT ?,?,? WHERE (SELECT COUNT(*) FROM connector_shares WHERE connector_id = ?) < 50
-      ON CONFLICT (connector_id, workspace_id) DO NOTHING`).bind(row.id, workspaceId, now(), row.id).run();
-    if (!await c.env.DB.prepare('SELECT 1 FROM connector_shares WHERE connector_id = ? AND workspace_id = ?').bind(row.id, workspaceId).first()) fail(429, 'share_limit', 'Connector share limit reached.');
+    await requireConfiguredWorkspace(c.env, workspaceId, row.owner_id);
+    const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, row.owner_id);
+    const shared = await c.env.DB.prepare(`INSERT INTO connector_shares (connector_id,workspace_id,created_at)
+      SELECT ?,?,? WHERE ((SELECT COUNT(*) FROM connector_shares WHERE connector_id = ?) < 50
+        OR EXISTS (SELECT 1 FROM connector_shares WHERE connector_id = ? AND workspace_id = ?))
+      AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND owner_id = ? AND revoked_at IS NULL)
+      AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
+      AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = ?)
+        OR (? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test')))
+      ON CONFLICT (connector_id, workspace_id) DO UPDATE SET created_at = connector_shares.created_at
+      RETURNING connector_id`)
+      .bind(row.id, workspaceId, now(), row.id, row.id, workspaceId, row.id, row.owner_id, workspaceId, row.owner_id,
+        workspaceId, legacy ? 1 : 0, row.owner_id).first();
+    if (!shared) {
+      const atLimit = await c.env.DB.prepare(`SELECT 1 WHERE
+        (SELECT COUNT(*) FROM connector_shares WHERE connector_id = ?) >= 50
+        AND NOT EXISTS (SELECT 1 FROM connector_shares WHERE connector_id = ? AND workspace_id = ?)`)
+        .bind(row.id, row.id, workspaceId).first();
+      if (atLimit) fail(429, 'share_limit', 'Connector share limit reached.');
+      fail(409, 'share_unavailable', 'Connector or workspace authority changed.');
+    }
     await syncModels(c.env, row, workspaceId);
     return c.json({ connector: await connectorInfo(c.env, row) });
   });

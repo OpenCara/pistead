@@ -127,16 +127,16 @@ function fixture(t: TestContext): Fixture {
   return { sqlite, env, request, client, githubClient, queryCount: () => queryCount };
 }
 
-async function pairing(owner: Client, name = 'Local Pi') {
-  return (await json<{ pairing: ConnectorPairing }>(await owner.request('POST', '/api/connectors/pairings', { name }), 201)).pairing;
+async function pairing(owner: Client, name = 'Local Pi', workspaceId?: string) {
+  return (await json<{ pairing: ConnectorPairing }>(await owner.request('POST', '/api/connectors/pairings', { name, workspaceId }), 201)).pairing;
 }
 
 function claim(f: Fixture, pending: ConnectorPairing, body: unknown = { code: pending.code, ...manifest }, headers: Record<string, string> = {}) {
   return f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, body, headers);
 }
 
-async function connect(f: Fixture, owner: Client): Promise<Connected> {
-  const pending = await pairing(owner);
+async function connect(f: Fixture, owner: Client, workspaceId?: string): Promise<Connected> {
+  const pending = await pairing(owner, 'Local Pi', workspaceId);
   const { credentials } = await json<{ credentials: ConnectorCredentials }>(await claim(f, pending), 201);
   const connectionToken = token();
   // The socket hub normally installs this generation. These tests exercise HTTP routes, not WebSockets.
@@ -204,6 +204,27 @@ async function sharedAgent(f: Fixture, tools: AgentVersion['tools'] = ['identity
   const admin = await f.client('admin'); const host = await f.client('host'); const creator = await f.githubClient();
   const team = await workspace(admin);
   await addMember(admin, team.id, host); await addMember(admin, team.id, creator);
+  f.sqlite.prepare(`INSERT INTO workspace_repositories
+    (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
+    .run('shared-repository', team.id, 7, 'owner/repo', 'main', 1, new Date().toISOString());
+  const creatorRequest = creator.request;
+  creator.request = async (method, path, body, headers) => {
+    if (method !== 'POST' || path !== '/api/sessions') return creatorRequest(method, path, body, headers);
+    // Scope resolution to session creation so existing broker fetch mocks keep their exact call counts.
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url !== 'https://api.github.com/repos/owner/repo' &&
+          url !== 'https://api.github.com/repos/owner/repo/commits/main') return previousFetch(input, init);
+      assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${githubToken}`);
+      assert.equal(init?.redirect, 'manual');
+      assert.equal(init?.method ?? 'GET', 'GET');
+      return Response.json(url.endsWith('/commits/main') ? { sha: 'a'.repeat(40) } :
+        { id: 7, full_name: 'owner/repo', default_branch: 'main', private: true });
+    };
+    try { return await creatorRequest(method, path, body, headers); }
+    finally { globalThis.fetch = previousFetch; }
+  };
   const connector = await connect(f, host);
   await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
   const { models } = await json<{ models: ModelDefinition[] }>(await creator.request('GET', `/api/workspaces/${team.id}/models`));
@@ -224,6 +245,8 @@ async function sharedSession(f: Fixture, tools?: AgentVersion['tools']) {
     ...setup.input, trustedConnectorId: setup.connector.connectorId,
   }), 201);
   assert.equal(session.status, 'ready');
+  assert.deepEqual(session.repositories, [{ bindingId: 'shared-repository', repositoryId: 7,
+    fullName: 'owner/repo', ref: 'main', commit: 'a'.repeat(40), path: 'owner/repo' }]);
   assert.equal(setup.hub.requests.length, 1);
   assert.deepEqual(setup.hub.unexpected, []);
   return { ...setup, session };
@@ -677,8 +700,12 @@ test('callbacks require both an available imported model and its exact provider/
 });
 
 test('claim, socket, and self routes require TLS except for explicitly enabled loopback tests', async t => {
-  const f = fixture(t); const owner = await f.githubClient(); const connector = await connect(f, owner);
-  const pending = await pairing(owner);
+  const f = fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
+  f.sqlite.prepare(`INSERT INTO workspace_repositories
+    (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
+    .run('tls-repository', team.id, 7, 'owner/repo', 'main', 1, new Date().toISOString());
+  const connector = await connect(f, owner, team.id);
+  const pending = await pairing(owner, 'Local Pi', team.id);
   const claimBody = { code: pending.code, ...manifest };
   const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
   const routes = [

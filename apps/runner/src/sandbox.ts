@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
+import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 
@@ -61,6 +62,8 @@ interface Mounts {
 
 type Request =
   | { kind: "initialize" }
+  | { kind: "repository-ready" }
+  | { kind: "repository-materialize"; archives: string[] }
   | { kind: "read" | "list"; path: string }
   | { kind: "write"; path: string; content: string }
   | { kind: "status" | "snapshot" }
@@ -72,7 +75,7 @@ type Request =
  * with O_NOFOLLOW, so swapping a checked parent for a symlink cannot win a race.
  */
 const HELPER = String.raw`
-import base64, json, os, resource, secrets, stat, subprocess, sys
+import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, stat, subprocess, sys, zlib
 
 for fd_name in os.listdir('/proc/self/fd'):
     fd = int(fd_name)
@@ -96,6 +99,279 @@ MAX_ENTRIES = 10000
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
+REPOSITORY_LIMITS = ${JSON.stringify(repositoryLimits)}
+CACHE_MARKER = 'repository-cache.json'
+CACHE_LOCK = 'repository-cache.lock'
+RESERVED = {'.git'}
+
+
+def archive_parts(value, directory=False):
+    if directory and value.endswith('/'):
+        value = value[:-1]
+    if not value or len(value.encode('utf-8')) > 1024 or value.startswith('/') or '\\' in value:
+        raise ValueError('invalid repository archive path')
+    parts = value.split('/')
+    if len(parts) > 64 or any(p in ('', '.', '..') or len(p.encode('utf-8')) > 255 for p in parts):
+        raise ValueError('repository archive traversal or depth limit')
+    if any(ord(c) < 32 or ord(c) == 127 for c in value) or any(':' in p for p in parts):
+        raise ValueError('invalid repository archive path')
+    if any(p.lower() in RESERVED for p in parts):
+        raise ValueError('repository archive contains reserved Git or identity files')
+    return parts
+
+
+def expand_archive(encoded, budget):
+    try:
+        packed = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        raise ValueError('invalid repository archive encoding')
+    if not packed or len(packed) > REPOSITORY_LIMITS['archiveBytes']:
+        raise ValueError('repository archive exceeds compressed size limit')
+    # No tar parser sees a byte until the complete gzip stream (metadata included)
+    # has passed the aggregate expansion bound. Concatenated streams are refused.
+    inflater = zlib.decompressobj(31)
+    expanded = inflater.decompress(packed, budget + 1)
+    if len(expanded) > budget or inflater.unconsumed_tail:
+        raise ValueError('repository archives exceed expanded size limit')
+    if not inflater.eof or inflater.unused_data:
+        raise ValueError('incomplete or concatenated repository gzip archive')
+    return expanded
+
+
+def tar_number(raw):
+    value = raw.rstrip(b'\x00 ').lstrip(b' ')
+    if not value:
+        return 0
+    if not re.fullmatch(b'[0-7]+', value):
+        raise ValueError('unsupported repository tar numeric field')
+    return int(value, 8)
+
+
+def tar_text(raw):
+    value, separator, padding = raw.partition(b'\x00')
+    if separator and any(padding):
+        raise ValueError('invalid repository tar name padding')
+    return value.decode('utf-8')
+
+
+def pax_fields(data, global_header):
+    result, offset = {}, 0
+    while offset < len(data):
+        space = data.find(b' ', offset, min(len(data), offset + 12))
+        if space < 0 or not re.fullmatch(b'[1-9][0-9]*', data[offset:space]):
+            raise ValueError('invalid repository PAX length')
+        length = int(data[offset:space])
+        end = offset + length
+        if end > len(data) or end <= space + 2 or data[end - 1:end] != b'\n':
+            raise ValueError('incomplete repository PAX record')
+        key, separator, value = data[space + 1:end - 1].partition(b'=')
+        key, value = key.decode('utf-8'), value.decode('utf-8')
+        if not separator or key in result:
+            raise ValueError('duplicate or invalid repository PAX key')
+        # GitHub emits a global commit comment and may use POSIX path metadata.
+        # Size overrides, sparse maps, linkpaths and vendor extensions are unsafe.
+        if key not in ('comment', 'mtime', 'atime', 'ctime', 'uid', 'gid', 'uname', 'gname', 'path'):
+            raise ValueError('unsupported repository PAX metadata')
+        if key == 'path':
+            if global_header:
+                raise ValueError('global repository PAX path is not supported')
+            archive_parts(value, True)
+        result[key] = value
+        offset = end
+    return result
+
+
+def parse_archive(data, budget, destination):
+    if len(data) % 512:
+        raise ValueError('incomplete repository tar archive')
+    offset, entries, prefix, pending, ended = 0, 0, None, None, False
+    explicit, nodes, files = set(), {}, []
+    while offset < len(data):
+        header = data[offset:offset + 512]
+        offset += 512
+        if not any(header):
+            if pending is not None or offset + 512 > len(data) or any(data[offset:]):
+                raise ValueError('incomplete repository tar terminator')
+            ended = True
+            break
+        entries += 1
+        if entries > budget:
+            raise ValueError('repository archives have too many entries')
+        if tar_number(header[148:156]) != sum(header[:148]) + 8 * 32 + sum(header[156:]):
+            raise ValueError('invalid repository tar checksum')
+        if header[257:263] not in (b'ustar\x00', b'ustar '):
+            raise ValueError('unsupported repository tar format')
+        name = tar_text(header[:100])
+        if header[257:263] == b'ustar\x00':
+            parent = tar_text(header[345:500])
+            if parent:
+                name = parent + '/' + name
+        kind, size = header[156:157], tar_number(header[124:136])
+        if offset + ((size + 511) // 512) * 512 > len(data):
+            raise ValueError('incomplete repository tar entry')
+        body = data[offset:offset + size]
+        offset += ((size + 511) // 512) * 512
+        archive_parts(name, kind == b'5')
+        if kind in (b'x', b'g'):
+            if pending is not None:
+                raise ValueError('conflicting repository PAX headers')
+            metadata = pax_fields(body, kind == b'g')
+            if kind == b'x':
+                pending = metadata
+            continue
+        if kind not in (b'0', b'\x00', b'5') or any(header[157:257]):
+            raise ValueError('repository archive links and special files are forbidden')
+        if pending is not None:
+            name = pending.get('path', name)
+            pending = None
+        parts = archive_parts(name, kind == b'5')
+        if prefix is None:
+            prefix = parts[0]
+        if parts[0] != prefix:
+            raise ValueError('repository archive must have one top-level directory')
+        path = tuple(parts[1:])
+        if len(path) + 2 > 64 or len('/'.join([destination] + list(path)).encode('utf-8')) > 1024:
+            raise ValueError('repository destination exceeds path or depth limit')
+        if not path and kind != b'5':
+            raise ValueError('repository archive root must be a directory')
+        if path in explicit:
+            raise ValueError('duplicate repository archive entry')
+        explicit.add(path)
+        for depth in range(1, len(path)):
+            parent = path[:depth]
+            if nodes.get(parent) == 'file':
+                raise ValueError('conflicting repository archive paths')
+            nodes[parent] = 'directory'
+        if kind == b'5':
+            if size or nodes.get(path) == 'file':
+                raise ValueError('conflicting repository directory entry')
+            nodes[path] = 'directory'
+        else:
+            if size > REPOSITORY_LIMITS['fileBytes']:
+                raise ValueError('repository file exceeds size limit')
+            if path in nodes:
+                raise ValueError('conflicting repository archive paths')
+            nodes[path] = 'file'
+            mode = 0o700 if tar_number(header[100:108]) & 0o111 else 0o600
+            files.append((path, body, mode))
+        if len(nodes) > REPOSITORY_LIMITS['entries']:
+            raise ValueError('repository archive has too many filesystem entries')
+    if not ended or prefix is None:
+        raise ValueError('incomplete or empty repository tar archive')
+    return files, nodes, max(entries, len(nodes))
+
+
+def git_capture(arguments, success=True):
+    result = subprocess.run(GIT + arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
+    if success and result.returncode:
+        raise ValueError('repository Git baseline validation failed')
+    return result
+
+
+def cache_ready(work, git, repositories):
+    try:
+        raw, _ = read_at(git, CACHE_MARKER, 65536)
+    except FileNotFoundError:
+        if not repositories:
+            return True
+        if os.listdir(work) != ['.git'] or git_capture(['rev-parse', '--verify', 'HEAD'], False).returncode == 0:
+            raise ValueError('repository cache is unmarked and nonempty; refusing to overwrite')
+        if git_capture(['ls-files', '--stage']).stdout:
+            raise ValueError('repository cache has an existing Git index')
+        return False
+    marker = json.loads(raw)
+    if (not isinstance(marker, dict) or type(marker.get('version')) is not int or marker['version'] != 1
+            or json.dumps(marker.get('repositories'), sort_keys=True) != json.dumps(repositories, sort_keys=True)):
+        raise ValueError('repository cache binding does not match immutable pins')
+    if marker.get('status') != 'ready':
+        raise ValueError('repository cache preparation is incomplete; refusing to overwrite')
+    baseline = marker.get('baseline')
+    if not isinstance(baseline, str) or not re.fullmatch('[0-9a-f]{40}', baseline):
+        raise ValueError('invalid repository cache baseline')
+    if git_capture(['cat-file', '-t', baseline]).stdout.strip() != b'commit':
+        raise ValueError('repository cache baseline is missing')
+    git_capture(['merge-base', '--is-ancestor', baseline, 'HEAD'])
+    return True
+
+
+def cache_marker(git, repositories, status, baseline=None):
+    value = {'version': 1, 'repositories': repositories, 'status': status}
+    if baseline is not None:
+        value['baseline'] = baseline
+    write_at(git, [CACHE_MARKER], json.dumps(value, ensure_ascii=True))
+
+
+def rename_new(source, destination, name):
+    renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    encoded = os.fsencode(name)
+    if renameat2(source, encoded, destination, encoded, 1) != 0:  # RENAME_NOREPLACE
+        raise OSError(ctypes.get_errno(), 'repository destination cannot be promoted')
+
+
+def sync_cache(fd):
+    syncfs = ctypes.CDLL(None, use_errno=True).syncfs
+    syncfs.argtypes = (ctypes.c_int,)
+    syncfs.restype = ctypes.c_int
+    if syncfs(fd) != 0:
+        raise OSError(ctypes.get_errno(), 'repository cache could not be persisted')
+
+
+def materialize_repositories(work, git, repositories, archives):
+    if cache_ready(work, git, repositories):
+        return
+    if len(archives) != len(repositories):
+        raise ValueError('repository archives do not match pins')
+    prepared, expanded, entries = [], 0, 0
+    for repository, encoded in zip(repositories, archives):
+        data = expand_archive(encoded, REPOSITORY_LIMITS['expandedBytes'] - expanded)
+        expanded += len(data)
+        files, nodes, count = parse_archive(data, REPOSITORY_LIMITS['entries'] - entries, repository['path'])
+        entries += count
+        if entries > REPOSITORY_LIMITS['entries']:
+            raise ValueError('repository archives have too many entries')
+        prepared.append((repository['path'].split('/'), files, nodes))
+    # Validate every archive before the first filesystem change. Thereafter a
+    # durable preparing marker makes interruption fail closed, never reset edits.
+    cache_marker(git, repositories, 'preparing')
+    stage_name = '.repository-stage-' + secrets.token_hex(16)
+    os.mkdir(stage_name, 0o700, dir_fd=work)
+    stage = os.open(stage_name, DIR_FLAGS, dir_fd=work)
+    try:
+        for destination, files, nodes in prepared:
+            root = walk(stage, destination, True)
+            try:
+                directories = sorted((path for path in nodes if nodes[path] == 'directory'), key=lambda p: (len(p), p))
+                for path in directories:
+                    os.close(walk(root, path, True))
+                for path, body, mode in files:
+                    parent = walk(root, path[:-1], True)
+                    try:
+                        fd = os.open(path[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                     mode, dir_fd=parent)
+                        with os.fdopen(fd, 'wb') as stream:
+                            stream.write(body)
+                    finally:
+                        os.close(parent)
+            finally:
+                os.close(root)
+        for owner in os.listdir(stage):
+            # Atomic no-replace promotion, including against concurrent insertion.
+            rename_new(stage, work, owner)
+        os.rmdir(stage_name, dir_fd=work)
+        git_capture(['add', '--force', '--all', '--', '.'])
+        git_capture(['commit', '--quiet', '--allow-empty', '--no-verify', '--no-gpg-sign',
+                     '-m', 'Initialize pinned repository snapshots'])
+        baseline = git_capture(['rev-parse', '--verify', 'HEAD']).stdout.decode('ascii').strip()
+        # Batch data/metadata durability instead of thousands of per-file device
+        # flushes; the bounded helper must also work on slower session storage.
+        sync_cache(work)
+        sync_cache(git)
+        cache_marker(git, repositories, 'ready', baseline)
+    finally:
+        os.close(stage)
 
 def parts_for(value, writing=False):
     if not isinstance(value, str) or not value or len(value) > 1024:
@@ -205,6 +481,7 @@ GIT = ['/usr/bin/git', '--no-pager',
        '-c', 'credential.helper=', '-c', 'commit.gpgSign=false',
        '-c', 'tag.gpgSign=false', '-c', 'protocol.allow=never',
        '-c', 'core.pager=cat', '-c', 'core.editor=/usr/bin/false',
+       '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
        '-c', 'core.worktree=' + WORK, '-c', 'safe.directory=' + WORK,
        '-c', 'user.name=' + os.environ['GIT_AUTHOR_NAME'],
        '-c', 'user.email=' + os.environ['GIT_AUTHOR_EMAIL']]
@@ -269,15 +546,46 @@ def snapshot():
 def main():
     request = json.load(sys.stdin)
     kind = request['kind']
-    if kind == 'bash':
-        run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
-        return
+    repositories = request['expectedRepositories']
     if kind == 'initialize':
         try:
             os.stat(os.path.join(WORK, '.git', 'HEAD'), follow_symlinks=False)
         except FileNotFoundError:
+            if repositories:
+                try:
+                    os.stat(os.path.join(WORK, '.git', CACHE_MARKER), follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError('repository cache Git HEAD is missing; refusing to reinitialize')
             run(GIT + ['init', '--quiet', '--template=', '--initial-branch=main', WORK])
         run(GIT + ['rev-parse', '--is-inside-work-tree'])
+        return
+    work = os.open(WORK, DIR_FLAGS)
+    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    lock = None
+    try:
+        if kind == 'repository-materialize':
+            lock = os.open(CACHE_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                           0o600, dir_fd=git)
+            regular(os.fstat(lock))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            materialize_repositories(work, git, repositories, request['archives'])
+            return
+        if kind == 'repository-ready' or repositories:
+            ready = cache_ready(work, git, repositories)
+            if kind == 'repository-ready':
+                print(json.dumps(ready))
+                return
+            if not ready:
+                raise ValueError('repository cache is not prepared')
+    finally:
+        if lock is not None:
+            os.close(lock)
+        os.close(git)
+        os.close(work)
+    if kind == 'bash':
+        run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
         return
     if kind == 'status':
         run(GIT + ['status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=all'])
@@ -320,7 +628,7 @@ def main():
 
 try:
     main()
-except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
+except (OSError, ValueError, KeyError, TypeError, UnicodeError, zlib.error) as error:
     print('sandbox: ' + str(error), file=sys.stderr)
     sys.exit(1)
 `;
@@ -334,6 +642,32 @@ function text(value: unknown, label: string, limit: number, multiline = false): 
     throw new Error(`Invalid ${label}`);
   }
   return value;
+}
+
+function repositoryPins(repositories: readonly SessionRepository[]): SessionRepository[] {
+  if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) throw new Error("Invalid repository pin set");
+  const names = new Set<string>();
+  const ids = new Set<number>();
+  const bindings = new Set<string>();
+  return repositories.map((repository) => {
+    if (!repository || typeof repository !== "object") throw new Error("Invalid repository pin");
+    const { bindingId, repositoryId, fullName, ref, commit, path } = repository;
+    text(bindingId, "repository binding id", 256);
+    text(ref, "repository ref", 1024);
+    if (typeof fullName !== "string" || !/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d_.-]{1,100}$/i.test(fullName)) {
+      throw new Error("Invalid repository name");
+    }
+    if (fullName.split("/").some((part) => [".", "..", ".git"].includes(part.toLowerCase()))
+      || path !== fullName || typeof commit !== "string" || !/^[a-f\d]{40}$/.test(commit)
+      || !Number.isSafeInteger(repositoryId) || repositoryId <= 0
+      || names.has(fullName.toLowerCase()) || ids.has(repositoryId) || bindings.has(bindingId)) {
+      throw new Error("Invalid or duplicate repository pin");
+    }
+    names.add(fullName.toLowerCase());
+    ids.add(repositoryId);
+    bindings.add(bindingId);
+    return { bindingId, repositoryId, fullName, ref, commit, path };
+  }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 }
 
 function fdPath(directory: FileHandle, name: string): string {
@@ -422,6 +756,7 @@ export class Sandbox {
   readonly #resources: Readonly<ResourceConfig> | undefined;
   readonly #sessionKey: string;
   readonly #testProvider: boolean;
+  readonly #repositories: readonly SessionRepository[];
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
   #closed = false;
@@ -446,6 +781,7 @@ export class Sandbox {
     this.#sessionKey = key;
     this.#resources = resources ? validateResourceConfig(resources) : undefined;
     this.#testProvider = binding.model.provider === "faux";
+    this.#repositories = repositoryPins(binding.session.repositories ?? []);
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
@@ -612,6 +948,36 @@ export class Sandbox {
     return JSON.parse(await this.#operation({ kind: "snapshot" }, true, authorize)) as SnapshotFile[];
   }
 
+  #assertRepositories(repositories: readonly SessionRepository[]): void {
+    if (JSON.stringify(repositoryPins(repositories)) !== JSON.stringify(this.#repositories)) {
+      throw new Error("Repository pins do not match the immutable sandbox binding");
+    }
+  }
+
+  /** False only for pristine storage; mismatched or interrupted caches fail closed. */
+  async repositoryCachesReady(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<boolean> {
+    this.#assertRepositories(repositories);
+    return JSON.parse(await this.#operation({ kind: "repository-ready" }, true, authorize)) as boolean;
+  }
+
+  /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
+  async materializeRepositories(
+    repositories: readonly SessionRepository[],
+    archives: readonly Uint8Array[],
+    authorize: SandboxAuthorize,
+  ): Promise<void> {
+    this.#assertRepositories(repositories);
+    if (!Array.isArray(archives) || archives.length !== repositories.length
+      || archives.some((archive) => !(archive instanceof Uint8Array) || !archive.byteLength || archive.byteLength > repositoryLimits.archiveBytes)) {
+      throw new Error("Repository archives exceed size limits or do not match pins");
+    }
+    const encoded = new Map(repositories.map((repository, index) => [repository.path, Buffer.from(archives[index]!).toString("base64")]));
+    await this.#operation({
+      kind: "repository-materialize",
+      archives: this.#repositories.map((repository) => encoded.get(repository.path)!),
+    }, false, authorize, true);
+  }
+
   /** Release pinned descriptors when the owning runner session closes. */
   async close(): Promise<void> {
     this.#closed = true;
@@ -736,7 +1102,7 @@ export class Sandbox {
           resolveResult(request.kind === "bash" || request.kind === "commit" || request.kind === "status" ? out + err : out);
         }
       });
-      child.stdin!.end(JSON.stringify(request));
+      child.stdin!.end(JSON.stringify({ ...request, expectedRepositories: this.#repositories }));
     });
   }
 }
