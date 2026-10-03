@@ -66,6 +66,8 @@ try {
   config.d1_databases = config.d1_databases.map((database: Record<string, unknown>) => ({
     ...database, migrations_dir: resolve(dirname(workerConfigPath), String(database.migrations_dir)),
   }));
+  // Production custom-domain routes make wrangler dev rewrite Origin to that host.
+  delete config.routes;
   config.vars = { ...config.vars, APP_ORIGIN: origin, RUNNER_URL: "", RUNNER_EVENT_TRANSPORT: "poll",
     TEST_AUTH_ENABLED: "true", TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 20 * 60_000).toISOString() };
   await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });

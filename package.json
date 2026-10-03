@@ -7,7 +7,7 @@
   "engines": { "node": ">=24.0.0" },
   "scripts": {
     "dev": "vite --config apps/web/vite.config.ts",
-    "dev:worker": "wrangler dev --config apps/worker/wrangler.jsonc",
+    "dev:worker": "wrangler dev --config apps/worker/wrangler.jsonc --local-upstream localhost:8787",
     "dev:runner": "node --env-file-if-exists=apps/runner/.env --import tsx apps/runner/src/index.ts",
     "connect": "node --import tsx packages/cli/src/pistead.ts connect",
     "build": "vite build --config apps/web/vite.config.ts",
