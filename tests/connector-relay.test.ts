@@ -75,12 +75,13 @@ async function fixture(t: TestContext) {
   db.prepare('INSERT INTO connectors (id, owner_id, name, credential_hash, created_at, models_json, capabilities_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run('connector', 'host', 'Local host', credentialHash, created, JSON.stringify([{ provider: 'openai', modelId: 'local-model', name: 'Local model' }]), JSON.stringify({ platform: 'linux', sandbox: true, productionShell: false }));
   db.prepare('INSERT INTO connector_shares VALUES (?, ?, ?)').run('connector', 'workspace', created);
+  db.prepare('INSERT INTO connector_workspaces VALUES (?, ?, ?)').run('connector', 'workspace', created);
   db.prepare('INSERT INTO models (id, workspace_id, name, provider, model_id, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run('model', 'workspace', 'Model', 'openai', 'local-model', created, 'connector', 'host');
   db.prepare('INSERT INTO agents VALUES (?, ?, ?)').run('agent', 'owner', created);
   db.prepare('INSERT INTO agent_versions (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run('version', 'agent', 'owner', 'workspace', 1, 'Agent', '', '', '[]', 'model', created);
-  db.prepare('INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+  db.prepare("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private')")
     .run('session', 'workspace', 'owner', 'version', 'Session', 1, 'ready', created, 'connector', 'host');
   db.prepare('INSERT INTO session_grants VALUES (?, ?, ?, ?)').run('session', 'guest', '["read","manage"]', created);
   let beforeQuery: ((sql: string) => Promise<void>) | undefined;
@@ -217,6 +218,7 @@ test('RPC validation rejects path confusion, body tampering, ticket mismatch, SS
 });
 
 const revocations: Record<string, string> = {
+  association: 'DELETE FROM connector_workspaces',
   share: 'DELETE FROM connector_shares',
   hostMembership: "DELETE FROM workspace_members WHERE user_id = 'host'",
   ownerMembership: "DELETE FROM workspace_members WHERE user_id = 'owner'",
@@ -250,9 +252,9 @@ for (const [name, mutation] of Object.entries(revocations)) {
   }
 }
 
-test('manage grant cannot restore or restart another creator session', async t => {
+test('manage grant cannot back up, restore or restart another creator session', async t => {
   const f = await fixture(t);
-  for (const action of ['restore', 'restart', 'create'] as const) {
+  for (const action of ['backup', 'restore', 'restart', 'create'] as const) {
     const value = await f.envelope(action, '{}', 'guest');
     assert.equal((await f.rpc(value)).status, 403);
   }
@@ -282,7 +284,7 @@ test('socket replacement during a pending D1 admission fences dispatch', async t
   const { promise: entered, resolve: signal } = Promise.withResolvers<void>();
   let held = false;
   f.setBeforeQuery(async sql => {
-    if (!held && sql.includes('SELECT s.* FROM sessions')) { held = true; signal(); await gate; }
+    if (!held && sql.includes('FROM sessions s')) { held = true; signal(); await gate; }
   });
   const pending = f.rpc(await f.envelope());
   await entered;
@@ -449,7 +451,7 @@ test('replacement during response policy lookup discards the old response', asyn
   const { promise: entered, resolve: signal } = Promise.withResolvers<void>();
   let held = false;
   f.setBeforeQuery(async sql => {
-    if (!held && sql.includes('SELECT s.* FROM sessions')) { held = true; signal(); await gate; }
+    if (!held && sql.includes('FROM sessions s')) { held = true; signal(); await gate; }
   });
   const oldReply = f.reply(f.initial.socket, wire, '{"private":"old-response"}');
   await entered;
@@ -461,3 +463,90 @@ test('replacement during response policy lookup discards the old response', asyn
   assert.ok(!(await response.text()).includes('old-response'));
   assert.equal(f.db.prepare('SELECT connection_hash FROM connectors').get()!.connection_hash, await sha256(replacement.welcome.connectionToken));
 });
+
+test('workspace visibility authorizes relay reads without granting any mutation or backup action', async t => {
+  const f = await fixture(t);
+  f.db.exec("DELETE FROM session_grants; UPDATE sessions SET visibility = 'workspace'");
+  const value = await f.envelope('view', '', 'guest');
+  const pending = f.rpc(value);
+  const wire = await f.initial.socket.nextRequest();
+  assert.equal(wire.ticket.actorId, 'guest');
+  assert.equal(wire.ticket.ownerId, 'owner');
+  await f.reply(f.initial.socket, wire, '{"view":"workspace-readable"}');
+  assert.deepEqual(await (await pending).json(), { view: 'workspace-readable' });
+  for (const action of ['ask', 'submit', 'operations', 'approve', 'backup', 'restore', 'restart', 'create'] as const) {
+    assert.equal((await f.rpc(await f.envelope(action, '{}', 'guest'))).status, 403, action);
+  }
+  assert.equal(f.initial.socket.requests.length, 0);
+});
+
+for (const mutation of ['privacy', 'membership'] as const) {
+  for (const stage of ['dispatch', 'response'] as const) {
+    test(`workspace ${mutation} is rechecked by the relay before ${stage} without an explicit grant`, async t => {
+      const f = await fixture(t);
+      f.db.exec("DELETE FROM session_grants; UPDATE sessions SET visibility = 'workspace'");
+      const value = await f.envelope('view', '', 'guest');
+      const sql = mutation === 'privacy' ? "UPDATE sessions SET visibility = 'private'"
+        : "DELETE FROM workspace_members WHERE user_id = 'guest'";
+      // Do not bump policy_version: live access must be sufficient even with an unchanged ticket.
+      if (stage === 'dispatch') {
+        f.db.exec(sql);
+        assert.equal((await f.rpc(value)).status, 403);
+        assert.equal(f.initial.socket.requests.length, 0);
+      } else {
+        const pending = f.rpc(value);
+        const wire = await f.initial.socket.nextRequest();
+        f.db.exec(sql);
+        await f.reply(f.initial.socket, wire, '{"private":"workspace-revoked-must-not-leak"}');
+        const response = await pending;
+        assert.equal(response.status, 403);
+        assert.ok(!(await response.text()).includes('workspace-revoked-must-not-leak'));
+      }
+    });
+  }
+}
+
+const isolatedRevocations: Record<string, string> = {
+  share: "DELETE FROM connector_shares; UPDATE sessions SET policy_version = policy_version + 1 WHERE owner_id <> 'host'",
+  privacy: "UPDATE sessions SET visibility = 'private', policy_version = policy_version + 1 WHERE id = 'session'",
+  membership: "DELETE FROM workspace_members WHERE user_id = 'guest'",
+};
+for (const name of ['share', 'privacy', 'membership', 'revocation', 'credential', 'generation']) {
+  test(`${name} response denial isolates session policy but preserves host-generation fencing`, async t => {
+    const f = await fixture(t);
+    f.db.exec(`DELETE FROM session_grants;
+      UPDATE sessions SET visibility = 'workspace';
+      INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status,
+        created_at, connector_id, connector_owner_id, visibility)
+      SELECT 'host-session', workspace_id, 'host', agent_version_id, 'Host session', 1, 'ready',
+        created_at, connector_id, connector_owner_id, 'workspace' FROM sessions WHERE id = 'session'`);
+    const viewer = f.rpc(await f.envelope('view', '', 'guest'));
+    const viewerWire = await f.initial.socket.nextRequest();
+    const ownerEnvelope = await f.envelope('view', '', 'host');
+    ownerEnvelope.request.path = connectorPath('view', 'host-session', '');
+    ownerEnvelope.request.ticket.sessionId = 'host-session';
+    ownerEnvelope.request.ticket.ownerId = 'host';
+    const owner = f.rpc(ownerEnvelope);
+    const ownerWire = await f.initial.socket.nextRequest();
+    const generation = f.db.prepare("SELECT connection_hash FROM connectors WHERE id = 'connector'").get()!.connection_hash;
+    const isolated = name in isolatedRevocations;
+    f.db.exec(isolatedRevocations[name] ?? revocations[name]!);
+    await f.reply(f.initial.socket, viewerWire, '{"private":"revoked-content-must-not-leak"}');
+    const denied = await viewer;
+    assert.equal(denied.status, 403);
+    assert.ok(!(await denied.text()).includes('revoked-content-must-not-leak'));
+    if (!isolated) {
+      assert.equal((await owner).status, 403);
+      assert.equal(f.initial.socket.readyState, 3, 'host revocation still closes the entire generation');
+      return;
+    }
+    assert.equal(f.initial.socket.readyState, 1, 'session revocation must not disconnect the host');
+    assert.equal(f.db.prepare("SELECT connection_hash FROM connectors WHERE id = 'connector'").get()!.connection_hash, generation);
+    await f.reply(f.initial.socket, ownerWire, '{"owner":"uninterrupted"}');
+    assert.deepEqual(await (await owner).json(), { owner: 'uninterrupted' });
+    const continued = f.rpc(ownerEnvelope);
+    const continuedWire = await f.initial.socket.nextRequest();
+    await f.reply(f.initial.socket, continuedWire, '{"owner":"still-connected"}');
+    assert.deepEqual(await (await continued).json(), { owner: 'still-connected' });
+  });
+}

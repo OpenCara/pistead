@@ -83,15 +83,30 @@ async function requireMemberManagement(
   return authority.targetRole;
 }
 
+// Keep discovery and atomic version writes on the same live model authorization.
+// The two bindings are the test-mode flag (provider, then connector owner).
+function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id'): string {
+  return `m.available = 1 AND (? = 1 OR m.provider <> 'faux')
+    AND (m.connector_id IS NULL OR EXISTS (
+      SELECT 1 FROM connectors c
+      JOIN connector_workspaces cw ON cw.connector_id = c.id AND cw.workspace_id = m.workspace_id
+      JOIN workspace_members host ON host.workspace_id = cw.workspace_id AND host.user_id = c.owner_id
+      JOIN users host_user ON host_user.id = c.owner_id
+      WHERE c.id = m.connector_id AND c.owner_id = m.connector_owner_id AND c.revoked_at IS NULL
+        AND (? = 1 OR host_user.auth_kind <> 'test')
+        AND (c.owner_id = ${actor} OR EXISTS (SELECT 1 FROM connector_shares sh
+          WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
+        AND EXISTS (SELECT 1 FROM json_each(c.models_json) local_model
+          WHERE json_extract(local_model.value, '$.provider') = m.provider
+            AND json_extract(local_model.value, '$.modelId') = m.model_id)
+    ))`;
+}
+
 async function requireModel(env: Env, modelId: string, actorId: string): Promise<ModelRow> {
   const model = await env.DB.prepare(`SELECT m.* FROM models m
     INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
-    WHERE m.id = ? AND m.available = 1 AND (m.connector_id IS NULL OR EXISTS (
-      SELECT 1 FROM connectors c JOIN connector_shares s ON s.connector_id = c.id AND s.workspace_id = m.workspace_id
-      JOIN workspace_members host ON host.workspace_id = s.workspace_id AND host.user_id = c.owner_id
-      JOIN users host_user ON host_user.id = c.owner_id
-      WHERE c.id = m.connector_id AND c.revoked_at IS NULL AND (? = 1 OR host_user.auth_kind <> 'test')
-    ))`).bind(actorId, modelId, testMode(env) ? 1 : 0).first<ModelRow>();
+    WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
+    .bind(actorId, modelId, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0).first<ModelRow>();
   if (!model) fail(404, 'not_found', 'Model not found.');
   return model;
 }
@@ -125,8 +140,9 @@ function privateVersionStatement(
     INNER JOIN models m ON m.id = ?
     INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = a.author_id
     WHERE a.id = ? AND a.author_id = ?
+      AND ${modelAccessSQL('a.author_id')}
     RETURNING *`).bind(versionId, input.name, input.description, input.instructions, input.toolsJson,
-      createdAt, input.modelId, agentId, actorId);
+      createdAt, input.modelId, agentId, actorId, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0);
 }
 
 function versionConflict(error: unknown): boolean {
@@ -252,12 +268,9 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     await requireMember(c.env, workspaceId, actorId);
     const result = await c.env.DB.prepare(`SELECT m.* FROM models m
       INNER JOIN workspace_members actor ON actor.workspace_id = m.workspace_id AND actor.user_id = ?
-      WHERE m.workspace_id = ? AND m.available = 1 AND (m.connector_id IS NULL OR EXISTS (
-        SELECT 1 FROM connectors c JOIN connector_shares s ON s.connector_id = c.id AND s.workspace_id = m.workspace_id
-        JOIN workspace_members host ON host.workspace_id = s.workspace_id AND host.user_id = c.owner_id
-        JOIN users host_user ON host_user.id = c.owner_id
-        WHERE c.id = m.connector_id AND c.revoked_at IS NULL AND (? = 1 OR host_user.auth_kind <> 'test')
-      )) ORDER BY m.created_at, m.id LIMIT 1000`).bind(actorId, workspaceId, testMode(c.env) ? 1 : 0).all<ModelRow>();
+      WHERE m.workspace_id = ? AND ${modelAccessSQL('actor.user_id')}
+      ORDER BY m.created_at, m.id LIMIT 1000`)
+      .bind(actorId, workspaceId, testMode(c.env) ? 1 : 0, testMode(c.env) ? 1 : 0).all<ModelRow>();
     return c.json({ models: result.results.map(modelDefinition) });
   });
 
@@ -318,7 +331,8 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
       c.env.DB.prepare(`INSERT INTO agents (id, author_id, created_at)
         SELECT ?, ?, ? FROM models m
         INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
-        WHERE m.id = ?`).bind(agentId, actorId, createdAt, actorId, input.modelId),
+        WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
+        .bind(agentId, actorId, createdAt, actorId, input.modelId, testMode(c.env) ? 1 : 0, testMode(c.env) ? 1 : 0),
       privateVersionStatement(c.env, actorId, agentId, versionId, input, createdAt),
       auditAfterChange(c.env, actorId, 'agent.create', null, { agentId, agentVersionId: versionId }),
     ], 1);
@@ -370,9 +384,11 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         INNER JOIN workspace_members target ON target.workspace_id = ? AND target.user_id = a.author_id
         WHERE a.id = ? AND a.author_id = ? AND source.id = ? AND source.workspace_id IS NULL
           AND m.workspace_id = target.workspace_id
+          AND ${modelAccessSQL('a.author_id')}
           AND source.id = (SELECT id FROM agent_versions WHERE agent_id = a.id AND workspace_id IS NULL
             ORDER BY version DESC LIMIT 1)
-        RETURNING *`).bind(versionId, now(), workspaceId, agentId, actorId, source.id),
+        RETURNING *`).bind(versionId, now(), workspaceId, agentId, actorId, source.id,
+          testMode(c.env) ? 1 : 0, testMode(c.env) ? 1 : 0),
       auditAfterChange(c.env, actorId, 'agent.publish', workspaceId,
         { agentId, agentVersionId: versionId, sourceVersionId: source.id }),
     ], 0);

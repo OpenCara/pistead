@@ -248,7 +248,7 @@ test('published definitions are immutable and do not grant authors access to ano
   assert.equal((await bob.request('POST', '/api/sessions', { workspaceId: workspace.id, agentVersionId: privateVersion.id })).status, 404);
   const published = (await (await alice.request('POST', `/api/agents/${privateVersion.agentId}/publish`, { workspaceId: workspace.id })).json() as { agent: { id: string } }).agent;
   assert.throws(() => f.sqlite.prepare('UPDATE agent_versions SET name = ? WHERE id = ?').run('changed', published.id), /immutable/);
-  f.sqlite.prepare('INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+  f.sqlite.prepare("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'private')")
     .run('bob-session', workspace.id, bob.user.id, published.id, 'private session', 1, 'ready', new Date().toISOString());
   assert.equal((await alice.request('GET', '/api/sessions/bob-session')).status, 404);
   assert.equal((await eve.request('GET', '/api/sessions/bob-session')).status, 404);
@@ -361,7 +361,7 @@ async function pollingFixture() {
   await owner.request('POST', `/api/workspaces/${workspace.id}/members`, { userId: reader.user.id, role: 'member' });
   const model = (await (await owner.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'polling', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
   const agent = (await (await owner.request('POST', '/api/agents', { name: 'polling', description: '', instructions: '', tools: ['identity'], modelId: model.id })).json() as { agent: { id: string } }).agent;
-  f.sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at) VALUES (?,?,?,?,?,?,?)')
+  f.sqlite.prepare("INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,visibility) VALUES (?,?,?,?,?,?,?,'private')")
     .run('poll-session', workspace.id, owner.user.id, agent.id, 'polling', 'ready', new Date().toISOString());
   await owner.request('POST', '/api/sessions/poll-session/grants', { userId: reader.user.id, permissions: ['read'] });
   f.env.RUNNER_URL = 'https://runner.example.test';

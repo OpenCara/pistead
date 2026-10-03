@@ -76,6 +76,8 @@ type Request =
  */
 const HELPER = String.raw`
 import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, stat, subprocess, sys, zlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 for fd_name in os.listdir('/proc/self/fd'):
     fd = int(fd_name)
@@ -311,12 +313,73 @@ def rename_new(source, destination, name):
         raise OSError(ctypes.get_errno(), 'repository destination cannot be promoted')
 
 
-def sync_cache(fd):
-    syncfs = ctypes.CDLL(None, use_errno=True).syncfs
-    syncfs.argtypes = (ctypes.c_int,)
-    syncfs.restype = ctypes.c_int
-    if syncfs(fd) != 0:
-        raise OSError(ctypes.get_errno(), 'repository cache could not be persisted')
+def sync_cache(root, entry_limit, byte_limit):
+    # Only pinned descendants are flushed, never the shared host filesystem.
+    # Bound both traversal and outstanding descriptors; concurrent fsync calls
+    # let storage coalesce flushes without weakening the ready-marker barrier.
+    pending = deque()
+    entries, size = 0, 0
+
+    def mount_id(fd):
+        # Overlay files and directories can legitimately have different st_dev.
+        # Kernel fdinfo identifies the actual mount of the pinned descriptor.
+        with open('/proc/self/fdinfo/' + str(fd), 'r', encoding='ascii') as stream:
+            match = re.search(r'^mnt_id:\s*([0-9]+)$', stream.read(4096), re.MULTILINE)
+        if match is None:
+            raise ValueError('repository durability mount identity is unavailable')
+        return match.group(1)
+
+    mount = mount_id(root)
+
+    def persist(fd):
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        def enqueue(fd):
+            try:
+                if len(pending) >= 16:
+                    pending.popleft().result()
+                future = pool.submit(persist, fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            pending.append(future)
+
+        def visit(directory, depth, path_bytes):
+            nonlocal entries, size
+            with os.scandir(directory) as children:
+                for child in children:
+                    entries += 1
+                    length = path_bytes + len(os.fsencode(child.name)) + (1 if depth else 0)
+                    if entries > entry_limit or depth >= 64 or length > 1024:
+                        raise ValueError('repository durability traversal limit exceeded')
+                    before = child.stat(follow_symlinks=False)
+                    is_directory = stat.S_ISDIR(before.st_mode)
+                    if not is_directory:
+                        regular(before)
+                    fd = os.open(child.name, DIR_FLAGS if is_directory else FILE_FLAGS, dir_fd=directory)
+                    try:
+                        info = os.fstat(fd)
+                        if mount_id(fd) != mount or (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
+                            raise ValueError('repository durability entry changed or crosses a mount')
+                        if is_directory:
+                            visit(fd, depth + 1, length)
+                        else:
+                            regular(info)
+                            size += info.st_size
+                            if size > byte_limit:
+                                raise ValueError('repository durability byte limit exceeded')
+                            enqueue(os.dup(fd))
+                    finally:
+                        os.close(fd)
+            enqueue(os.dup(directory))
+
+        visit(root, 0, 0)
+        while pending:
+            pending.popleft().result()
 
 
 def materialize_repositories(work, git, repositories, archives):
@@ -357,18 +420,22 @@ def materialize_repositories(work, git, repositories, archives):
                         os.close(parent)
             finally:
                 os.close(root)
+        sync_cache(stage, REPOSITORY_LIMITS['entries'] + 2 * len(repositories),
+                   REPOSITORY_LIMITS['expandedBytes'])
         for owner in os.listdir(stage):
             # Atomic no-replace promotion, including against concurrent insertion.
             rename_new(stage, work, owner)
         os.rmdir(stage_name, dir_fd=work)
+        os.fsync(work)
         git_capture(['add', '--force', '--all', '--', '.'])
         git_capture(['commit', '--quiet', '--allow-empty', '--no-verify', '--no-gpg-sign',
                      '-m', 'Initialize pinned repository snapshots'])
         baseline = git_capture(['rev-parse', '--verify', 'HEAD']).stdout.decode('ascii').strip()
-        # Batch data/metadata durability instead of thousands of per-file device
-        # flushes; the bounded helper must also work on slower session storage.
-        sync_cache(work)
-        sync_cache(git)
+        # Loose blobs and trees add at most two objects per imported node.
+        # Include bounded overhead for refs, logs, index and Git administrative
+        # directories, independently of the worktree's archive quotas.
+        sync_cache(git, 2 * REPOSITORY_LIMITS['entries'] + 1024,
+                   4 * REPOSITORY_LIMITS['expandedBytes'] + 1024 * REPOSITORY_LIMITS['entries'])
         cache_marker(git, repositories, 'ready', baseline)
     finally:
         os.close(stage)
@@ -482,6 +549,7 @@ GIT = ['/usr/bin/git', '--no-pager',
        '-c', 'tag.gpgSign=false', '-c', 'protocol.allow=never',
        '-c', 'core.pager=cat', '-c', 'core.editor=/usr/bin/false',
        '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
+       '-c', 'core.preloadIndex=false', '-c', 'index.threads=1',
        '-c', 'core.worktree=' + WORK, '-c', 'safe.directory=' + WORK,
        '-c', 'user.name=' + os.environ['GIT_AUTHOR_NAME'],
        '-c', 'user.email=' + os.environ['GIT_AUTHOR_EMAIL']]

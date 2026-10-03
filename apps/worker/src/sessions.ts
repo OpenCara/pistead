@@ -5,7 +5,7 @@ import { permissions } from '../../../packages/shared/src/types.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, getUser, modelDefinition, requireMember, requireSession, sessionAccess, sessionRecord, userProfile } from './db.js';
+import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import { parseOperation } from './operations.js';
@@ -30,7 +30,12 @@ export async function bindingForSession(c: AppContext, row: SessionRow): Promise
   const profile = userProfile(owner);
   // Published definitions never contribute the author's identity or environment.
   profile.env = validateUserEnv(profile.env);
-  return { session: sessionRecord(row), owner: profile, agent: agentVersion(agent), model: modelDefinition(model) };
+  return { session: runnerSessionRecord(row), owner: profile, agent: agentVersion(agent), model: modelDefinition(model) };
+}
+
+function sessionVisibility(value: unknown): 'private' | 'workspace' {
+  if (value !== 'private' && value !== 'workspace') fail(400, 'invalid_visibility', 'Visibility must be private or workspace.');
+  return value;
 }
 
 function pollingEvents(c: AppContext, row: SessionRow): Response {
@@ -89,16 +94,8 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
 export function registerSessions(app: Hono<WorkerEnv>): void {
   app.get('/api/sessions', async c => {
     const actorId = c.get('auth').userId;
-    const result = await c.env.DB.prepare(`SELECT DISTINCT s.id FROM sessions s
-      INNER JOIN workspace_members m ON m.workspace_id = s.workspace_id AND m.user_id = ?
-      LEFT JOIN session_grants g ON g.session_id = s.id AND g.user_id = ?
-      WHERE s.owner_id = ? OR g.user_id IS NOT NULL ORDER BY s.created_at DESC LIMIT 500`)
-      .bind(actorId, actorId, actorId).all<{ id: string }>();
-    const sessions = [];
-    for (const row of result.results) {
-      const access = await sessionAccess(c.env, row.id, actorId);
-      if (access && hasPermission(access.permissions, 'read')) sessions.push(sessionRecord(access.row, access.permissions));
-    }
+    const sessions = (await listSessionAccess(c.env, actorId))
+      .map(access => sessionRecord(access.row, access.permissions));
     return c.json({ sessions });
   });
 
@@ -108,6 +105,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const workspaceId = identifier(input.workspaceId, 'workspaceId');
     const versionId = identifier(input.agentVersionId, 'agentVersionId');
     const title = text(input.title ?? 'Untitled session', 'title', 200);
+    const visibility = sessionVisibility(input.visibility === undefined ? 'workspace' : input.visibility);
     const ownerId = c.get('auth').userId;
     await requireMember(c.env, workspaceId, ownerId);
     const agent = await c.env.DB.prepare('SELECT * FROM agent_versions WHERE id = ? AND (author_id = ? OR workspace_id = ?)')
@@ -122,32 +120,43 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       fail(400, 'connector_trust_required', 'Explicitly acknowledge that this host can access this session before continuing.');
     }
     const row: SessionRow = { id: id(), workspace_id: workspaceId, owner_id: ownerId, agent_version_id: versionId,
-      title, policy_version: 1, status: 'provisioning', created_at: now(),
+      title, visibility, policy_version: 1, status: 'provisioning', created_at: now(),
       connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
     const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId);
     row.repositories_json = JSON.stringify(resolved.repositories);
     await requireMember(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
+    // Admit pins only while the exact owner credential used to resolve them is still current.
     const inserted = await c.env.DB.prepare(`INSERT INTO sessions
-      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?
+      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
       AND (SELECT json_group_array(id) FROM (SELECT id FROM workspace_repositories WHERE workspace_id = ? ORDER BY id)) = ?
+      AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ?
+        AND ((session_owner.auth_kind = 'github' AND session_owner.github_id = ?
+          AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))
+          OR (? = 1 AND session_owner.auth_kind = 'test')))
       AND (? IS NULL OR EXISTS (
-        SELECT 1 FROM connectors host JOIN connector_shares share ON share.connector_id = host.id
-        JOIN workspace_members member ON member.workspace_id = share.workspace_id AND member.user_id = host.owner_id
+        SELECT 1 FROM connectors host JOIN connector_workspaces association ON association.connector_id = host.id
+        JOIN workspace_members member ON member.workspace_id = association.workspace_id AND member.user_id = host.owner_id
+        JOIN users host_user ON host_user.id = host.owner_id
         JOIN models m ON m.id = ?
-        WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND share.workspace_id = ?
+        WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND association.workspace_id = ?
+          AND (host.owner_id = ? OR EXISTS (SELECT 1 FROM connector_shares share
+            WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
           AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id
+          AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
           AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
             WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
       )) RETURNING id`)
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
-        row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json,
-        workspaceId, ownerId, workspaceId, resolved.bindingIds, row.connector_id ?? null,
-        model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId).first();
-    if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, membership, or connector authority changed. Try again.');
+        row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility,
+        workspaceId, ownerId, workspaceId, resolved.bindingIds,
+        ownerId, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
+        resolved.githubAuthority === null && testMode(c.env) ? 1 : 0, row.connector_id ?? null,
+        model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId, testMode(c.env) ? 1 : 0).first();
+    if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, GitHub access, membership, or connector authority changed. Try again.');
     await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }).run();
     try {
       const binding = await bindingForSession(c, row);
@@ -166,6 +175,24 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   app.get('/api/sessions/:id', async c => {
     const access = await requireSession(c, identifier(c.req.param('id')), 'read');
     return c.json({ session: sessionRecord(access.row, access.permissions) });
+  });
+  app.patch('/api/sessions/:id', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    const ownerId = c.get('auth').userId;
+    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change its visibility.');
+    const input = await jsonObject(c, 4096);
+    if (Object.keys(input).some(key => key !== 'visibility')) fail(400, 'invalid_input', 'Only session visibility can be changed.');
+    const visibility = sessionVisibility(input.visibility);
+    const updated = await c.env.DB.prepare(`UPDATE sessions SET visibility = ?, policy_version = policy_version + 1
+      WHERE id = ? AND owner_id = ? AND policy_version = ?
+        AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = sessions.workspace_id AND user_id = ?)
+        AND EXISTS (SELECT 1 FROM users owner JOIN agent_versions a ON a.id = sessions.agent_version_id
+          JOIN models m ON m.id = a.model_id WHERE owner.id = sessions.owner_id
+            AND (? = 1 OR (owner.auth_kind <> 'test' AND m.provider <> 'faux')))
+      RETURNING *`).bind(visibility, row.id, ownerId, row.policy_version, ownerId, testMode(c.env) ? 1 : 0).first<SessionRow>();
+    if (!updated) fail(409, 'policy_changed', 'Session membership or permissions changed; reload and retry.');
+    await auditStatement(c.env, ownerId, 'session.visibility.updated', row.workspace_id, row.id, { visibility }).run();
+    return c.json({ session: sessionRecord(updated, [...permissions]) });
   });
   app.get('/api/sessions/:id/view', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');

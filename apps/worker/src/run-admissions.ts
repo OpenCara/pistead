@@ -40,11 +40,13 @@ const ELIGIBLE_SESSION = `SELECT s.id FROM sessions s
     AND NOT EXISTS (SELECT 1 FROM restore_jobs r WHERE r.target_session_id = s.id AND r.status <> 'completed')
     AND ((s.connector_id IS NULL AND s.connector_owner_id IS NULL) OR EXISTS (
       SELECT 1 FROM connectors connector
-      JOIN connector_shares share ON share.connector_id = connector.id AND share.workspace_id = s.workspace_id
+      JOIN connector_workspaces cw ON cw.connector_id = connector.id AND cw.workspace_id = s.workspace_id
       JOIN workspace_members host ON host.workspace_id = s.workspace_id AND host.user_id = connector.owner_id
       JOIN users host_user ON host_user.id = host.user_id
       WHERE connector.id = s.connector_id AND connector.owner_id = s.connector_owner_id
         AND connector.revoked_at IS NULL AND m.available = 1
+        AND (connector.owner_id = s.owner_id OR EXISTS (SELECT 1 FROM connector_shares share
+          WHERE share.connector_id = connector.id AND share.workspace_id = s.workspace_id))
         AND (? = 1 OR host_user.auth_kind <> 'test')
         AND EXISTS (SELECT 1 FROM json_each(connector.models_json) local_model
           WHERE json_extract(local_model.value, '$.provider') = m.provider

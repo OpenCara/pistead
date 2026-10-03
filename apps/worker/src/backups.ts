@@ -13,6 +13,7 @@ function backupInfo(row: BackupRow) {
 export function registerBackups(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/backup', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can create its backups.');
     if (!c.env.BUCKET) fail(503, 'backup_unavailable', 'Durable R2 backup storage is not configured.');
     const response = await runnerRequest(c, row, 'backup', '', {});
     if (!response.headers.get('content-type')?.includes('application/json')) {
@@ -45,6 +46,7 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
   });
   app.get('/api/sessions/:id/backups', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can list its backups.');
     const result = await c.env.DB.prepare('SELECT * FROM backups WHERE session_id = ? AND owner_id = ? ORDER BY created_at DESC LIMIT 100')
       .bind(row.id, row.owner_id).all<BackupRow>();
     return c.json({ backups: result.results.map(backupInfo) });

@@ -114,11 +114,11 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
 
   return <section className="section" aria-label="Restore a backup">
     <div className="section-heading">
-      <h2>Restore into a new session</h2>
+      <h2>Restore into a new private session</h2>
       <button type="button" className="button secondary small" disabled={backups.loading || pending} onClick={backups.refresh}>Refresh backups</button>
     </div>
-    <p>Only the session owner can restore or download backups. The server authorizes every request.</p>
-    <p>Restore creates a new session without overwriting this source session. It does not replay approvals or execute operations.</p>
+    <p>Only the session owner can list, download, or restore backups. Manage permission and workspace viewing access are not enough. The server authorizes every request.</p>
+    <p>Restore creates a new private session, even if this source session is workspace-visible, without overwriting the source. It does not replay approvals or execute operations. Only the new session's owner can make it workspace-visible.</p>
     <p className="metadata">Stored backups can be listed and downloaded even when the live view is offline; restoring requires the original host and current authority. Backend or backup availability errors are shown here.</p>
     {!openSession && <p>Restore navigation is not available in this view. You can still browse and download backups.</p>}
     <ResourceState {...backups} retry={backups.refresh}>
@@ -142,7 +142,7 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
             </label>
             {attempt && <p className="metadata" style={{ overflowWrap: "anywhere" }}>Restore request: <code>{attempt.requestId}</code>. Retries retain this request ID and title to resolve the same new session, not create another one.</p>}
             <button className="button primary" disabled={!openSession || Boolean(storageError)}>
-              {pending ? "Restoring..." : attempt?.targetSessionId ? "Open restored session" : attempt ? "Retry same restore" : "Restore into new session"}
+              {pending ? "Restoring..." : attempt?.targetSessionId ? "Open restored session" : attempt ? "Retry same restore" : "Restore into new private session"}
             </button>
           </>}
         </fieldset>
@@ -150,7 +150,7 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
     </ResourceState>
     <Feedback error={storageError || error} />
     {error && attempt && !attempt.targetSessionId && <p>The outcome is not confirmed. Retry the same restore request; do not assume that an error means no session was created.</p>}
-    {attempt?.targetSessionId && <p role="status" style={{ overflowWrap: "anywhere" }}>Restored session: <code>{attempt.targetSessionId}</code>.</p>}
+    {attempt?.targetSessionId && <p role="status" style={{ overflowWrap: "anywhere" }}>Restored session: <code>{attempt.targetSessionId}</code>. New sessions are private at restore time; only their owner can change visibility.</p>}
     {pending && <p role="status">Waiting for the server to confirm the new session...</p>}
   </section>;
 }

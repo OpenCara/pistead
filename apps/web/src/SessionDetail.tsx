@@ -96,6 +96,8 @@ export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
   const canApprove = permissions.includes("approve");
+  const isOwner = live.session?.ownerId === user.id;
+  const viewerOnly = !isOwner && !permissions.some(permission => permission !== "read");
   const actualMode = mode === "ask" && !canAsk ? "write" : mode;
   const permitted = actualMode === "write" ? canWrite : canAsk;
   const view = live.view;
@@ -127,7 +129,7 @@ export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }
     });
   }
   function decide(approval: ApprovalRecord, decision: "approve" | "deny") {
-    if (approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
+    if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
     if (decision === "approve" && !window.confirm("Approve this exact operation? It will run as the session owner.")) return;
     void approvalAction.run(async () => {
       await api(`/api/sessions/${segment(id)}/approvals/${segment(approval.id)}`, { method: "POST", body: { decision, reviewHash: approval.reviewHash } });
@@ -139,14 +141,22 @@ export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }
     <Feedback error={live.error} />
     {live.error && <div className="actions"><button className="button secondary" onClick={live.reconnect}>Reconnect and check access</button></div>}
     {!view && !live.error && <p className="loading" role="status">Loading identity and committed history...</p>}
+    {live.session && <section className="notice" aria-label="Session viewing access">
+      <p><strong>{live.session.visibility === "workspace" ? "Workspace-visible" : "Private"}</strong> / {isOwner ? "Session owner" : viewerOnly ? "Viewer-only access" : "Granted collaborator access"}</p>
+      <p>{live.session.visibility === "workspace"
+        ? "All workspace members can view this session's existing and future prompts and output, including tool output, repository content shown in the transcript, and side asks. Workspace viewing does not grant ask, write, approve, or manage permissions."
+        : "Only the owner and workspace members with explicit session grants can view this session's prompts and output."}</p>
+      {viewerOnly && <p>You can follow committed work, but cannot ask questions, submit work, approve operations, manage grants, change visibility, or access backups.</p>}
+      <p className="metadata">Workspace viewing does not grant direct GitHub access or permission to run tools. Only the owner can change visibility. Session visibility is separate from private host sharing and agent publication.</p>
+    </section>}
     {live.session && <SessionHost session={live.session} user={user} />}
     {!view && live.session && <SessionControls session={live.session} user={user} onChange={live.refresh} busy openSession={openSession} />}
     {live.session && <SessionRepositories session={live.session} refresh={live.refresh} selectWorkspace={selectWorkspace} />}
     {view && live.session && <>
-      <section className="owner-banner" aria-label="Session owner identity"><div><p className="eyebrow">Acts as owner</p><h2>{view.owner.displayName}</h2><p>{view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} <span aria-hidden="true">/</span> {view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</p></div><div><span className="badge">{live.session.ownerId === user.id ? "You own this session" : "You are a collaborator"}</span><p className="mono">Your permissions: {permissions.join(" / ") || "none"}</p><p className="metadata">Session ID: {id}</p></div></section>
+      <section className="owner-banner" aria-label="Session owner identity"><div><p className="eyebrow">Acts as owner</p><h2>{view.owner.displayName}</h2><p>{view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} <span aria-hidden="true">/</span> {view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</p></div><div><span className="badge">{isOwner ? "You own this session" : viewerOnly ? "You are a read-only viewer" : "You are a collaborator"}</span><p className="mono">Your permissions: {permissions.join(" / ") || "none"}</p><p className="metadata">Session ID: {id}</p></div></section>
       <div className="session-layout"><div className="session-main"><section className="section"><div className="section-heading"><h2>Committed conversation</h2><span className={`stream-status ${live.status}`} role="status">{live.status === "online" ? "Live" : live.status === "reconnecting" ? "Reconnecting automatically" : live.status === "offline" ? "Disconnected" : "Connecting"}</span></div>
         <div className="mode-tabs" role="group" aria-label="Conversation mode"><button className={actualMode === "write" ? "active" : ""} aria-pressed={actualMode === "write"} onClick={() => setMode("write")}>Shared conversation</button>{canAsk && <button className={actualMode === "ask" ? "active" : ""} aria-pressed={actualMode === "ask"} onClick={() => setMode("ask")}>My side ask</button>}</div>
-        <p className="muted">{actualMode === "ask" ? "A read-only side conversation, not a private channel: authorized session readers may access it. Asking cannot write files or invoke the main session's tools." : canWrite ? "Your submissions continue the shared session using the owner's identity and allowed tools." : "Read-only access. You can follow committed work, but cannot submit to the shared conversation."}</p>
+        <p className="muted">{actualMode === "ask" ? "A read-only side conversation, not a private channel: authorized session readers, including workspace members when workspace-visible, may access its prompts and output. Asking cannot write files or invoke the main session's tools." : canWrite ? "Your submissions continue the shared session using the owner's identity and allowed tools." : "You can follow committed work, but submitting to the shared conversation requires write permission."}</p>
         {actualMode === "write" && !canWrite && canAsk && <div className="notice"><p>You can ask questions in a read-only side conversation.</p><button className="button secondary small" onClick={() => setMode("ask")}>Open my side ask</button></div>}
         {actualMode === "ask" && sideConversations.length > 0 && <label className="field">Side conversation<select value={conversationId} onChange={event => setConversationId(event.target.value)}><option value="">All my side asks</option>{sideConversations.map((conversation, index) => <option value={conversation.id} key={conversation.id}>Side ask {index + 1} / {conversation.id.slice(0, 8)}</option>)}</select></label>}
         <div className="transcript" aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>{!entries.length ? <Empty title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it." : "Committed messages and tool results will appear here."}</Empty> : entries.map(entry => <article className="entry" key={entry.id}><header className="entry-header"><span>{entry.role}</span><span>{entry.kind}</span>{entry.actorId && <span title={entry.actorId}>Initiated by {entry.actorId === user.id ? "you" : entry.actorId}</span>}</header><div className="entry-body">{entry.text}</div></article>)}</div>

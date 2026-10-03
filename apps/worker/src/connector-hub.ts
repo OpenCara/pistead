@@ -1,3 +1,4 @@
+import { HTTPException } from 'hono/http-exception';
 import { connectorLimits, type ConnectorRpcResponse } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import {
@@ -18,6 +19,8 @@ type Pending = {
   responding: boolean;
 };
 const encoder = new TextEncoder();
+
+class SessionAuthorizationError extends HTTPException {}
 
 async function boundedJSON(request: Request, limit: number): Promise<unknown> {
   if (!request.headers.get('content-type')?.startsWith('application/json')) fail(415, 'invalid_rpc', 'Expected JSON.');
@@ -227,7 +230,16 @@ export class ConnectorHub {
         await this.disconnect(connection, 502, 'Unsolicited connector response'); return;
       }
       pending.responding = true;
-      await this.checkAuthority(connection, pending.envelope);
+      try {
+        await this.checkAuthority(connection, pending.envelope);
+      } catch (error) {
+        if (!(error instanceof SessionAuthorizationError)) throw error;
+        // A session policy change does not revoke other sessions on the same host.
+        if (this.current === connection && this.pending.get(reply.id) === pending) {
+          this.finish(reply.id, this.errorResponse(error.status, 'Session authorization changed; inspect the session before retrying'));
+        }
+        return;
+      }
       if (this.current !== connection || this.pending.get(reply.id) !== pending) return;
       const responseBytes = connectorUtf8Bytes(reply.body);
       this.bufferedBytes -= charged - responseBytes;
@@ -288,8 +300,16 @@ export class ConnectorHub {
     const timer = setTimeout(() => reject(new Error('Connector policy lookup timed out')), 10000);
     try {
       await Promise.race([deadline, (async () => {
-        await authorizeConnectorTicket(this.env, envelope.request.ticket, connection.connectionHash);
+        let denied: HTTPException | undefined;
+        try {
+          await authorizeConnectorTicket(this.env, envelope.request.ticket, connection.connectionHash);
+        } catch (error) {
+          if (!(error instanceof HTTPException) || ![403, 404, 409].includes(error.status)) throw error;
+          denied = error;
+        }
+        // Only isolate session denials after confirming the host generation is still valid.
         await requireConnectorGeneration(this.env, connection.connectorId, connection.credentialHash, connection.connectionHash);
+        if (denied) throw new SessionAuthorizationError(denied.status, { res: denied.getResponse() });
       })()]);
     } finally { clearTimeout(timer); }
   }

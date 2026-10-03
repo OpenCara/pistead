@@ -21,7 +21,10 @@ export interface ConnectorInfo {
   revokedAt: string | null;
   online: boolean;
   models: LocalModelSummary[];
+  // Explicit runtime shares, not the owner's private workspace associations.
   workspaceIds: string[];
+  // Private associations are owner-scoped; shared listings expose only their workspace.
+  connectedWorkspaceIds?: string[];
   capabilities: ConnectorCapabilities;
 }
 

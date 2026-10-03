@@ -28,7 +28,7 @@ const manifest = {
 };
 // A small, valid gzip of an empty tar, not a multi-megabyte archive fixture.
 const archiveBytes = new Uint8Array(gzipSync(Buffer.alloc(1024)));
-const token = () => randomBytes(32).toString('base64url');
+const token = () => Buffer.from(randomBytes(32)).toString('base64url');
 type ApiRequest = (method: string, path: string, body?: unknown, headers?: Record<string, string>) => Promise<Response>;
 interface Client { user: { id: string }; cookie: string; csrf: string; githubToken: string; request: ApiRequest }
 interface Fixture {
@@ -128,6 +128,16 @@ function fixture(t: TestContext) {
   return { sqlite, env, request, client };
 }
 
+function beforeStatement(t: TestContext, f: Fixture, pattern: RegExp, change: () => void) {
+  const prepare = f.env.DB.prepare.bind(f.env.DB);
+  let changed = false;
+  t.mock.method(f.env.DB, 'prepare', (sql: string) => {
+    if (!changed && pattern.test(sql)) { changed = true; change(); }
+    return prepare(sql);
+  });
+  t.after(() => assert.ok(changed, 'The test must reach the guarded write'));
+}
+
 async function workspace(owner: Client) {
   return (await json<{ workspace: { id: string } }>(await owner.request('POST', '/api/workspaces', { name: 'Repositories' }), 201)).workspace;
 }
@@ -213,6 +223,8 @@ async function connectedSetup(t: TestContext) {
   await member(admin, team.id, host); await member(admin, team.id, owner);
   const repository = await bindRepository(admin, team.id);
   const connector = await connect(f, host, team.id);
+  // This fixture intentionally runs another member's session on the host.
+  await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
   assert.equal(models.length, 1);
   const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
@@ -409,6 +421,96 @@ test('session pins are server-owned and immutable; reconfiguration and moved ref
   assert.ok(s.remote.calls.every(call => !call.url.includes('/commits/')));
 });
 
+test('a GitHub-connected host runs its unpublished agent privately with pinned repositories and no host trust', async t => {
+  const s = await connectedSetup(t);
+  assert.equal((await s.host.request('DELETE', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`)).status, 204);
+  const { agent } = await json<{ agent: AgentVersion }>(await s.host.request('POST', '/api/agents', {
+    name: 'Private repository agent', description: '', instructions: '', tools: ['identity'], modelId: s.agent.modelId,
+  }), 201);
+  assert.equal(agent.workspaceId, null);
+  const input = { workspaceId: s.team.id, agentVersionId: agent.id, title: 'Host-owned session' };
+  const { session } = await json<{ session: SessionRecord }>(await s.host.request('POST', '/api/sessions', input), 201);
+  assert.equal(session.ownerId, s.host.user.id);
+  assert.equal(session.connectorOwnerId, s.host.user.id);
+  assert.equal(session.visibility, 'workspace');
+  assert.equal(session.repositories?.[0]?.commit, commitA);
+  assert.equal(s.provisions.length, 1);
+  assert.equal(s.remote.calls.length, 3);
+  for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.host.githubToken}`);
+});
+
+for (const change of ['association-removed', 'share-removed', 'revoked', 'model-unavailable'] as const) {
+  test(`session admission atomically rechecks connector ${change} after repository resolution`, async t => {
+    const s = await connectedSetup(t);
+    const actor = change === 'share-removed' ? s.owner : s.host;
+    if (actor === s.host) {
+      assert.equal((await s.host.request('DELETE', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`)).status, 204);
+    }
+    beforeStatement(t, s.f, /^INSERT INTO sessions\b/, () => {
+      if (change === 'association-removed') s.f.sqlite.prepare('DELETE FROM connector_workspaces WHERE connector_id = ?').run(s.connector.connectorId);
+      if (change === 'share-removed') s.f.sqlite.prepare('DELETE FROM connector_shares WHERE connector_id = ?').run(s.connector.connectorId);
+      if (change === 'revoked') s.f.sqlite.prepare("UPDATE connectors SET revoked_at = '2026-01-02' WHERE id = ?").run(s.connector.connectorId);
+      if (change === 'model-unavailable') s.f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run(s.agent.modelId);
+    });
+    await denied(await actor.request('POST', '/api/sessions', s.input), 409, 'session_configuration_changed');
+    assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+    assert.equal(s.provisions.length, 0);
+    assert.equal(s.remote.calls.length, 3);
+    for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${actor.githubToken}`);
+  });
+}
+
+for (const change of ['token-deleted', 'token-rotated', 'github-identity', 'auth-kind'] as const) {
+  test(`session admission rechecks ${change} atomically after repository resolution`, async t => {
+    const s = await connectedSetup(t);
+    const rotated = await encryptToken(s.f.env, s.owner.user.id, 'rotated-owner-token');
+    beforeStatement(t, s.f, /^INSERT INTO sessions\b/, () => {
+      if (change === 'token-deleted') s.f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(s.owner.user.id);
+      if (change === 'token-rotated') s.f.sqlite.prepare('UPDATE github_tokens SET ciphertext = ? WHERE user_id = ?').run(rotated, s.owner.user.id);
+      if (change === 'github-identity') s.f.sqlite.prepare('UPDATE users SET github_id = ? WHERE id = ?').run('999', s.owner.user.id);
+      if (change === 'auth-kind') s.f.sqlite.prepare("UPDATE users SET auth_kind = 'test' WHERE id = ?").run(s.owner.user.id);
+    });
+    await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'session_configuration_changed');
+    assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+    assert.equal(s.provisions.length, 0);
+    assert.equal(s.remote.calls.length, 3, 'Repository resolution completed before the authority change');
+    for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+  });
+
+  test(`repository binding rechecks ${change} in its final write`, async t => {
+    const f = fixture(t); const remote = github(t); const owner = await f.client('owner');
+    const team = await workspace(owner);
+    const rotated = await encryptToken(f.env, owner.user.id, 'rotated-owner-token');
+    beforeStatement(t, f, /^INSERT INTO workspace_repositories\b/, () => {
+      if (change === 'token-deleted') f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(owner.user.id);
+      if (change === 'token-rotated') f.sqlite.prepare('UPDATE github_tokens SET ciphertext = ? WHERE user_id = ?').run(rotated, owner.user.id);
+      if (change === 'github-identity') f.sqlite.prepare('UPDATE users SET github_id = ? WHERE id = ?').run('999', owner.user.id);
+      if (change === 'auth-kind') f.sqlite.prepare("UPDATE users SET auth_kind = 'test' WHERE id = ?").run(owner.user.id);
+    });
+    await denied(await owner.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput), 409, 'repository_binding_conflict');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
+    assert.equal(remote.calls.length, 1);
+  });
+}
+
+for (const change of ['identity', 'test-mode'] as const) {
+  test(`legacy empty repository session admission rechecks fixture ${change}`, async t => {
+    const f = fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
+    const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
+      name: 'Faux', provider: 'faux', modelId: 'faux',
+    }), 201);
+    const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
+      name: 'Faux agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
+    }), 201);
+    beforeStatement(t, f, /^INSERT INTO sessions\b/, () => {
+      if (change === 'identity') f.sqlite.prepare("UPDATE users SET auth_kind = 'github', github_id = '999' WHERE id = ?").run(owner.user.id);
+      else f.env.TEST_AUTH_ENABLED = 'false';
+    });
+    await denied(await owner.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id }), 409, 'session_configuration_changed');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  });
+}
+
 test('configuration changes while resolving a ref abort without inserting or provisioning a session', async t => {
   const s = await connectedSetup(t);
   s.remote.state.resolve = async () => {
@@ -483,15 +585,25 @@ test('testMode does not let a real user start an unconnected faux-model session'
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
 });
 
-test('configured pairing claim auto-shares and imports models, but lost membership leaves a pairing unused', async t => {
-  const s = await connectedSetup(t);
-  const shares = s.f.sqlite.prepare('SELECT workspace_id FROM connector_shares WHERE connector_id = ?').all(s.connector.connectorId);
-  assert.deepEqual(shares.map(row => row.workspace_id), [s.team.id]);
-  const models = s.f.sqlite.prepare('SELECT connector_owner_id, provider, model_id FROM models WHERE connector_id = ?').all(s.connector.connectorId);
+test('configured pairing claims privately associate and import models, but lost membership leaves a pairing unused', async t => {
+  const f = fixture(t); github(t);
+  const admin = await f.client('admin'); const host = await f.client('host');
+  const team = await workspace(admin);
+  await member(admin, team.id, host);
+  await bindRepository(admin, team.id);
+  const connector = await connect(f, host, team.id);
+  const s = { f, admin, host, team, connector };
+  const shares = f.sqlite.prepare('SELECT workspace_id FROM connector_shares WHERE connector_id = ?').all(connector.connectorId);
+  assert.deepEqual(shares, []);
+  const associations = f.sqlite.prepare('SELECT workspace_id FROM connector_workspaces WHERE connector_id = ?').all(connector.connectorId);
+  assert.deepEqual(associations.map(row => row.workspace_id), [team.id]);
+  const models = f.sqlite.prepare('SELECT connector_owner_id, provider, model_id FROM models WHERE connector_id = ?').all(connector.connectorId);
   assert.equal(models.length, 1);
-  assert.equal(models[0].connector_owner_id, s.host.user.id);
+  assert.equal(models[0].connector_owner_id, host.user.id);
   assert.equal(models[0].provider, manifest.models[0].provider);
   assert.equal(models[0].model_id, manifest.models[0].modelId);
+  assert.equal((await json<{ models: ModelDefinition[] }>(await host.request('GET', `/api/workspaces/${team.id}/models`))).models.length, 1);
+  assert.deepEqual((await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`))).models, []);
   const pending = await pair(s.host, s.team.id);
   assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/members/${s.host.user.id}`)).status, 204);
   await denied(await s.f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 404, 'not_found');
@@ -506,13 +618,54 @@ test('only explicitly enabled synthetic fixtures can claim a legacy workspace-fr
   const other = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Disabled fixture' }), 201)).pairing;
   await json(await f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 201);
   f.env.TEST_AUTH_ENABLED = 'false';
+  f.env.APP_ORIGIN = 'https://workspace.example.test';
   // HTTPS avoids testing the independent loopback transport exemption instead of the fixture gate.
   const response = await app.request(`https://workspace.example.test/api/connectors/pairings/${other.id}/claim`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: other.code, ...manifest }),
   }, f.env);
-  assert.ok(response.status >= 400 && response.status < 500);
+  await denied(response, 403, 'invalid_pairing');
   assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(other.id)!.claimed_at, null);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+});
+
+for (const scoped of [false, true]) {
+  test(`legacy ${scoped ? 'workspace-bound' : 'workspace-free'} pairing rechecks test-mode expiry at the write`, async t => {
+    const f = fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
+    beforeStatement(t, f, /^INSERT INTO connector_pairings\b/, () => {
+      f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
+    });
+    await denied(await owner.request('POST', '/api/connectors/pairings', {
+      name: 'Expiring fixture', ...(scoped ? { workspaceId: team.id } : {}),
+    }), 429, 'pairing_limit');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_pairings').get()!.n, 0);
+  });
+}
+
+test('legacy pairing claim rechecks test-mode expiry without consuming its code', async t => {
+  const f = fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
+  const pending = await pair(owner, team.id);
+  beforeStatement(t, f, /^INSERT INTO connectors\b/, () => {
+    f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
+  });
+  await denied(await f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 403, 'invalid_pairing');
+  assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares').get()!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_workspaces').get()!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM models').get()!.n, 0);
+});
+
+test('legacy sharing rechecks test-mode expiry before sharing an unconfigured workspace', async t => {
+  const f = fixture(t); const owner = await f.client('synthetic', false);
+  const existing = await workspace(owner); const target = await workspace(owner);
+  const connector = await connect(f, owner, existing.id);
+  beforeStatement(t, f, /^INSERT INTO connector_shares\b/, () => {
+    f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
+  });
+  await denied(await owner.request('PUT', `/api/connectors/${connector.connectorId}/shares/${target.id}`), 409, 'share_unavailable');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE workspace_id = ?').get(target.id)!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_workspaces WHERE workspace_id = ?').get(target.id)!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM models WHERE workspace_id = ?').get(target.id)!.n, 0);
 });
 
 test('connector archive callbacks require the exact credential, generation, session binding and commit', async t => {
@@ -586,7 +739,7 @@ function pausedArchive() {
 }
 
 for (const transport of ['connector', 'legacy'] as const) {
-  const changes = ['token-deleted', 'token-rotated', 'policy', 'archived', 'owner-membership', 'github-access', 'github-identity',
+  const changes = ['token-deleted', 'token-rotated', 'owner-github-identity', 'policy', 'archived', 'owner-membership', 'github-access', 'github-identity',
     ...(transport === 'connector' ? ['generation', 'revoked', 'unshared', 'host-membership'] : [])];
   for (const change of changes) {
     test(`${transport} archive withholds bytes when ${change} changes during the body read`, { timeout: 5000 }, async t => {
@@ -607,6 +760,9 @@ for (const transport of ['connector', 'legacy'] as const) {
         } else if (change === 'token-rotated') {
           s.f.sqlite.prepare('UPDATE github_tokens SET ciphertext = ? WHERE user_id = ?')
             .run(await encryptToken(s.f.env, s.owner.user.id, 'rotated-token'), s.owner.user.id);
+          code = 'github_access_changed';
+        } else if (change === 'owner-github-identity') {
+          s.f.sqlite.prepare('UPDATE users SET github_id = ? WHERE id = ?').run('999', s.owner.user.id);
           code = 'github_access_changed';
         } else if (change === 'policy') {
           s.f.sqlite.prepare('UPDATE sessions SET policy_version = policy_version + 1 WHERE id = ?').run(session.id);

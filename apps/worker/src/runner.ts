@@ -18,7 +18,7 @@ export async function runnerRequest(c: AppContext, row: SessionRow, action: Runn
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && action !== 'view' && action !== 'events') fail(409, 'session_archived', 'Session is archived.');
-  if ((action === 'create' || action === 'restart' || action === 'restore') && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
+  if (['create', 'restart', 'restore', 'backup'].includes(action) && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
   if (action !== 'restore' && await c.env.DB.prepare("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }

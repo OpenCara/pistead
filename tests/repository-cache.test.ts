@@ -1,5 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -200,7 +201,7 @@ async function hostTree(root: string): Promise<unknown[]> {
     const path = join(root, name);
     const info = await lstat(path);
     const content = info.isSymbolicLink() ? await readlink(path)
-      : info.isDirectory() ? await hostTree(path) : (await readFile(path)).toString("base64");
+      : info.isDirectory() ? await hostTree(path) : Buffer.from(await readFile(path)).toString("base64");
     entries.push({ name, mode: info.mode, ino: info.ino, nlink: info.nlink, content });
   }
   return entries;
@@ -214,6 +215,182 @@ async function writeTrustedSnapshot(root: string, files: readonly SnapshotFile[]
     await writeFile(destination, Buffer.from(file.data, "base64"), { mode: file.mode, flag: "wx" });
   }
 }
+
+// White-box probes run the production Python definitions with real Git/files,
+// but instrument fsync for ordering/failure assertions unavailable through bwrap.
+// Public API confinement and reopen/restore remain covered by the sandbox tests.
+async function durabilityProbe(t: TestContext, script: string): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "repository-durability-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = await readFile(new URL("../apps/runner/src/sandbox.ts", import.meta.url), "utf8");
+  const match = /const HELPER = String.raw`([\s\S]*?)`;/u.exec(source);
+  assert.ok(match, "production helper must be present");
+  const helper = match[1]!.replace("${JSON.stringify(repositoryLimits)}", JSON.stringify(repositoryLimits));
+  assert.doesNotMatch(helper, /\bsyncfs\b|\bos\.sync\s*\(/u, "cache durability must never flush a filesystem");
+  const boundary = helper.lastIndexOf("\ntry:\n    main()");
+  assert.ok(boundary > 0);
+  const result = spawnSync("/usr/bin/python3", ["-I", "-c", helper.slice(0, boundary) + "\n" + script], {
+    encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
+    env: {
+      PATH: "/usr/bin:/bin", HOME: directory, SANDBOX_WORKTREE: join(directory, "worktree"),
+      GIT_AUTHOR_NAME: "Durability Test", GIT_AUTHOR_EMAIL: "durability@example.test",
+      GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+    input: JSON.stringify({ repositories: [alpha], archives: [Buffer.from(validArchives[0]!).toString("base64")] }),
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+const durabilitySetup = String.raw`
+request = json.load(sys.stdin)
+os.mkdir(WORK)
+git_capture(['init', '--quiet', '--template=', '--initial-branch=main', WORK])
+work = os.open(WORK, DIR_FLAGS)
+git = os.open('.git', DIR_FLAGS, dir_fd=work)
+`;
+
+test("scoped cache durability covers all data and baseline metadata before ready", linux, async t => {
+  await durabilityProbe(t, durabilitySetup + String.raw`
+import threading
+synced, events = set(), []
+mutex = threading.Lock()
+real_fsync, real_marker = os.fsync, cache_marker
+def tracked_fsync(fd):
+    path = os.readlink('/proc/self/fd/' + str(fd))
+    assert os.path.commonpath((WORK, path)) == WORK, path
+    info = os.fstat(fd)
+    real_fsync(fd)
+    with mutex:
+        synced.add((info.st_dev, info.st_ino))
+        events.append(path)
+os.fsync = tracked_fsync
+def tracked_marker(git, repositories, status, baseline=None):
+    if status == 'ready':
+        assert events
+        for parent, directories, files in os.walk(WORK):
+            for path in [parent] + [os.path.join(parent, name) for name in files]:
+                info = os.stat(path, follow_symlinks=False)
+                assert (info.st_dev, info.st_ino) in synced, 'not durable before ready: ' + path
+        assert any('/objects/' in path for path in events), events
+        assert any('/refs/heads/' in path for path in events), events
+        assert os.path.join(WORK, '.git', 'index') in events
+        assert os.path.join(WORK, '.git', 'HEAD') in events
+    real_marker(git, repositories, status, baseline)
+cache_marker = tracked_marker
+materialize_repositories(work, git, request['repositories'], request['archives'])
+assert cache_ready(work, git, request['repositories'])
+assert json.loads(read_at(git, CACHE_MARKER, 65536)[0])['status'] == 'ready'
+os.close(git)
+os.close(work)
+`);
+});
+
+test("cache durability failures leave a preparing marker and retries never overwrite", linux, async t => {
+  for (const failure of ["file", "directory", "promotion", "baseline"]) {
+    await t.test(failure, async t => {
+      await durabilityProbe(t, durabilitySetup + `\nfailure = ${JSON.stringify(failure)}\n` + String.raw`
+real_fsync = os.fsync
+failed = []
+def failing_fsync(fd):
+    path = os.readlink('/proc/self/fd/' + str(fd))
+    directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+    stage = '/.repository-stage-' in path
+    if ((failure == 'file' and stage and not directory)
+            or (failure == 'directory' and stage and directory)
+            or (failure == 'promotion' and path == WORK)
+            or (failure == 'baseline' and '/.git/objects/' in path and not directory)):
+        failed.append(path)
+        raise OSError('injected scoped durability failure')
+    real_fsync(fd)
+os.fsync = failing_fsync
+try:
+    materialize_repositories(work, git, request['repositories'], request['archives'])
+    raise AssertionError('durability failure was ignored')
+except OSError as error:
+    assert 'injected scoped durability failure' in str(error), error
+assert failed
+saved = read_at(git, CACHE_MARKER, 65536)[0]
+assert json.loads(saved)['status'] == 'preparing'
+def tree():
+    result = {}
+    for parent, directories, files in os.walk(WORK):
+        for name in files:
+            path = os.path.join(parent, name)
+            with open(path, 'rb') as stream:
+                result[path] = stream.read()
+    return result
+before = tree()
+for operation in (
+        lambda: cache_ready(work, git, request['repositories']),
+        lambda: materialize_repositories(work, git, request['repositories'], request['archives'])):
+    try:
+        operation()
+        raise AssertionError('incomplete cache was accepted')
+    except ValueError as error:
+        assert 'incomplete' in str(error), error
+assert tree() == before
+assert read_at(git, CACHE_MARKER, 65536)[0] == saved
+os.close(git)
+os.close(work)
+`);
+    });
+  }
+});
+
+test("scoped durability rejects links, special files and traversal budgets", linux, async t => {
+  await durabilityProbe(t, String.raw`
+os.mkdir(WORK)
+with open(os.path.join(HOME, 'outside'), 'wb') as stream:
+    stream.write(b'untouched')
+outside = os.stat(os.path.join(HOME, 'outside'))
+real_fsync = os.fsync
+def confined_fsync(fd):
+    info = os.fstat(fd)
+    path = os.readlink('/proc/self/fd/' + str(fd))
+    assert os.path.commonpath((WORK, path)) == WORK, path
+    assert (info.st_dev, info.st_ino) != (outside.st_dev, outside.st_ino)
+    real_fsync(fd)
+os.fsync = confined_fsync
+def refused(name, setup, entries=1000, size=1000):
+    path = os.path.join(WORK, name)
+    os.mkdir(path)
+    setup(path)
+    fd = os.open(path, DIR_FLAGS)
+    descriptors = len(os.listdir('/proc/self/fd'))
+    try:
+        try:
+            sync_cache(fd, entries, size)
+            raise AssertionError('unsafe durability traversal accepted: ' + name)
+        except (OSError, ValueError):
+            pass
+        assert len(os.listdir('/proc/self/fd')) == descriptors, 'durability traversal leaked descriptors'
+    finally:
+        os.close(fd)
+refused('symlink', lambda path: os.symlink(HOME, os.path.join(path, 'escape')))
+refused('hardlink', lambda path: os.link(os.path.join(HOME, 'outside'), os.path.join(path, 'escape')))
+refused('fifo', lambda path: os.mkfifo(os.path.join(path, 'pipe')))
+refused('entries', lambda path: [os.mkdir(os.path.join(path, str(i))) for i in range(3)], entries=2)
+def oversized(path):
+    with open(os.path.join(path, 'file'), 'wb') as stream:
+        stream.write(b'large')
+refused('bytes', oversized, size=1)
+refused('depth', lambda path: os.makedirs(os.path.join(path, *(['d'] * 65))))
+refused('length', lambda path: os.makedirs(os.path.join(path, *(['d' * 200] * 6))))
+real_open = os.open
+def swapped_open(name, flags, *args, **kwargs):
+    if name == 'victim':
+        parent = kwargs['dir_fd']
+        os.rmdir(name, dir_fd=parent)
+        os.symlink(HOME, name, dir_fd=parent)
+    return real_open(name, flags, *args, **kwargs)
+os.open = swapped_open
+try:
+    refused('swap', lambda path: os.mkdir(os.path.join(path, 'victim')))
+finally:
+    os.open = real_open
+`);
+});
 
 test("repository archives create one clean multi-repo Git baseline with the session owner's identity", linux, async t => {
   const f = await fixture(t, [gamma, beta, alpha]);
@@ -785,6 +962,17 @@ test("archive entry counts are bounded across repositories and rejected batches 
   await assert.rejects(f.sandbox.materializeRepositories(f.repositories, [packed, packed], authorize), /too many.*entries/i);
   await pristine(f);
   await recover(f);
+});
+
+test("the full repository entry budget becomes durable within the sandbox deadline", linux, async t => {
+  const f = await fixture(t, [alpha]);
+  const packed = gzipSync(tar(Array.from({ length: repositoryLimits.entries }, (_, index) => ({
+    name: `checkout/file-${index}`, body: `unique baseline content ${index}\n`,
+  }))));
+  await f.sandbox.materializeRepositories(f.repositories, [packed], authorize);
+  assert.equal(await f.sandbox.repositoryCachesReady(f.repositories, authorize), true);
+  assert.equal((await f.sandbox.listFiles(alpha.path, authorize)).length, repositoryLimits.entries);
+  assert.equal(await f.sandbox.gitStatus(authorize), "");
 });
 
 test("imported .gitconfig and owner.gitconfig are ordinary source files, not session Git authority", linux, async t => {

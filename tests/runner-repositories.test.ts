@@ -75,7 +75,7 @@ function archive(files: Record<string, string>): Uint8Array {
     header.fill(0x20, 148, 156);
     header.write(type, 156, 1, "ascii");
     header.write("ustar\0", 257, 6, "ascii"); header.write("00", 263, 2, "ascii");
-    const checksum = header.reduce((sum, byte) => sum + byte, 0);
+    const checksum = header.reduce((sum: number, byte: number) => sum + byte, 0);
     header.write(checksum.toString(8).padStart(6, "0") + "\0 ", 148, 8, "ascii");
     blocks.push(header, contents, Buffer.alloc((512 - contents.length % 512) % 512));
   }

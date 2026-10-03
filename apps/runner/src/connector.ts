@@ -492,7 +492,8 @@ export class LocalConnector {
     if (typeof bindingId !== "string" || !IDENTIFIER.test(bindingId)
       || typeof sessionId !== "string" || !IDENTIFIER.test(sessionId)
       || typeof commit !== "string" || !/^[a-f0-9]{40}$/.test(commit)) throw new Error("Invalid repository descriptor");
-    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)]);
+    // Archive preparation includes upstream GitHub reads; allow the full RPC budget.
+    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(RPC_TIMEOUT)]);
     const response = await this.callbackResponse(generation, `/api/connectors/self/repositories/${bindingId}/download`, { sessionId, commit }, signal);
     const checksum = response.headers.get("x-archive-sha256");
     if (response.headers.get("x-repository-commit") !== commit || !checksum || !/^[A-Za-z0-9_-]{43}$/.test(checksum)) {

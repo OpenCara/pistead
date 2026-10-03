@@ -70,13 +70,15 @@ export async function authenticateConnectorToken(env: Env, token: string, connec
 export async function requireConnectorSession(env: Env, connectorId: string, row: SessionRow, expectedConnectionHash?: string): Promise<void> {
   if (row.connector_id !== connectorId || !row.connector_owner_id) fail(403, 'connector_binding_mismatch', 'Connector does not own this route.');
   const allowed = await env.DB.prepare(`SELECT c.id FROM connectors c
-    JOIN connector_shares sh ON sh.connector_id = c.id AND sh.workspace_id = ?
-    JOIN workspace_members host ON host.workspace_id = sh.workspace_id AND host.user_id = c.owner_id
-    JOIN workspace_members owner ON owner.workspace_id = sh.workspace_id AND owner.user_id = ?
+    JOIN connector_workspaces cw ON cw.connector_id = c.id AND cw.workspace_id = ?
+    JOIN workspace_members host ON host.workspace_id = cw.workspace_id AND host.user_id = c.owner_id
+    JOIN workspace_members owner ON owner.workspace_id = cw.workspace_id AND owner.user_id = ?
     JOIN users u ON u.id = c.owner_id
     JOIN agent_versions a ON a.id = ? JOIN models m ON m.id = a.model_id
     WHERE c.id = ? AND c.owner_id = ? AND c.revoked_at IS NULL
-      AND m.connector_id = c.id AND m.connector_owner_id = c.owner_id AND m.workspace_id = sh.workspace_id
+      AND (c.owner_id = owner.user_id OR EXISTS (SELECT 1 FROM connector_shares sh
+        WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
+      AND m.connector_id = c.id AND m.connector_owner_id = c.owner_id AND m.workspace_id = cw.workspace_id
       AND EXISTS (SELECT 1 FROM json_each(c.models_json) local_model
         WHERE json_extract(local_model.value, '$.provider') = m.provider AND json_extract(local_model.value, '$.modelId') = m.model_id)
       AND m.available = 1 AND (? = 1 OR (u.auth_kind <> 'test' AND m.provider <> 'faux'))
@@ -94,13 +96,17 @@ async function ownedConnector(c: AppContext): Promise<ConnectorRow> {
   return row;
 }
 
-type ConnectorInfoRow = ConnectorRow & { owner_name?: string; workspace_ids?: string };
+type ConnectorInfoRow = ConnectorRow & { owner_name?: string; workspace_ids?: string; connected_workspace_ids?: string };
 async function connectorInfo(env: Env, row: ConnectorInfoRow): Promise<ConnectorInfo> {
   const ownerName = row.owner_name ?? (await env.DB.prepare('SELECT display_name FROM users WHERE id = ?')
     .bind(row.owner_id).first<{ display_name: string }>())?.display_name ?? '';
   const workspaceIds: string[] = row.workspace_ids !== undefined ? JSON.parse(row.workspace_ids) :
     (await env.DB.prepare(`SELECT s.workspace_id FROM connector_shares s JOIN workspace_members m
       ON m.workspace_id = s.workspace_id AND m.user_id = ? WHERE s.connector_id = ? ORDER BY s.workspace_id LIMIT 50`)
+      .bind(row.owner_id, row.id).all<{ workspace_id: string }>()).results.map(item => item.workspace_id);
+  const connectedWorkspaceIds: string[] = row.connected_workspace_ids !== undefined ? JSON.parse(row.connected_workspace_ids) :
+    (await env.DB.prepare(`SELECT cw.workspace_id FROM connector_workspaces cw JOIN workspace_members m
+      ON m.workspace_id = cw.workspace_id AND m.user_id = ? WHERE cw.connector_id = ? ORDER BY cw.workspace_id`)
       .bind(row.owner_id, row.id).all<{ workspace_id: string }>()).results.map(item => item.workspace_id);
   let online = false;
   if (!row.revoked_at && env.CONNECTOR_HUB) {
@@ -112,7 +118,7 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow): Promise<Connector
   }
   return { id: row.id, ownerId: row.owner_id, ownerName, name: row.name,
     createdAt: row.created_at, revokedAt: row.revoked_at, online, models: JSON.parse(row.models_json),
-    workspaceIds, capabilities: JSON.parse(row.capabilities_json) };
+    workspaceIds, connectedWorkspaceIds, capabilities: JSON.parse(row.capabilities_json) };
 }
 
 async function connectorInfos(env: Env, rows: ConnectorInfoRow[]): Promise<ConnectorInfo[]> {
@@ -131,12 +137,12 @@ function modelStatements(env: Env, row: Pick<ConnectorRow, 'id' | 'models_json'>
       .bind(row.id, workspaceId, workspaceId, row.id, row.models_json),
     env.DB.prepare(`INSERT INTO models
       (id, workspace_id, name, provider, model_id, created_at, connector_id, connector_owner_id, available)
-      SELECT lower(hex(randomblob(16))), sh.workspace_id, json_extract(local.value, '$.name'),
+      SELECT lower(hex(randomblob(16))), cw.workspace_id, json_extract(local.value, '$.name'),
         json_extract(local.value, '$.provider'), json_extract(local.value, '$.modelId'), ?, c.id, c.owner_id, 1
-      FROM connectors c JOIN connector_shares sh ON sh.connector_id = c.id
-      JOIN workspace_members m ON m.workspace_id = sh.workspace_id AND m.user_id = c.owner_id
+      FROM connectors c JOIN connector_workspaces cw ON cw.connector_id = c.id
+      JOIN workspace_members m ON m.workspace_id = cw.workspace_id AND m.user_id = c.owner_id
       JOIN json_each(c.models_json) local
-      WHERE c.id = ? AND c.revoked_at IS NULL AND c.models_json = ? AND (? IS NULL OR sh.workspace_id = ?)
+      WHERE c.id = ? AND c.revoked_at IS NULL AND c.models_json = ? AND (? IS NULL OR cw.workspace_id = ?)
       ON CONFLICT (workspace_id, connector_id, provider, model_id) DO UPDATE SET name = excluded.name, available = 1`)
       .bind(now(), row.id, row.models_json, workspaceId, workspaceId),
   ];
@@ -173,7 +179,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     const token = randomToken();
     const credentialHash = await sha256(token);
     const createdAt = now();
-    // Consume the code, create the connector and capture its explicit share in one transaction.
+    // Consume the code, create the connector and its private association in one transaction.
     // INSERT rechecks authority after the asynchronous preflight and token hashing.
     const results = await c.env.DB.batch([
       c.env.DB.prepare(`INSERT INTO connectors (id,owner_id,name,credential_hash,created_at,models_json,capabilities_json)
@@ -191,11 +197,11 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
         RETURNING *`)
         .bind(connectorId, credentialHash, createdAt, JSON.stringify(manifest.models), JSON.stringify(manifest.capabilities),
           pairingId, codeHash, Math.floor(Date.now() / 1000), pairing.owner_id, pairing.workspace_id,
-          testMode(c.env) ? 1 : 0, legacy ? 1 : 0, legacy ? 1 : 0),
+          testMode(c.env) ? 1 : 0, legacy && testMode(c.env) ? 1 : 0, legacy && testMode(c.env) ? 1 : 0),
       c.env.DB.prepare(`UPDATE connector_pairings SET claimed_at = ? WHERE id = ?
         AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND credential_hash = ?)`)
         .bind(createdAt, pairingId, connectorId, credentialHash),
-      c.env.DB.prepare(`INSERT INTO connector_shares (connector_id, workspace_id, created_at)
+      c.env.DB.prepare(`INSERT INTO connector_workspaces (connector_id, workspace_id, created_at)
         SELECT id, ?, ? FROM connectors WHERE id = ? AND ? IS NOT NULL`)
         .bind(pairing.workspace_id, createdAt, connectorId, pairing.workspace_id),
       ...modelStatements(c.env, { id: connectorId, models_json: JSON.stringify(manifest.models) }, pairing.workspace_id),
@@ -259,14 +265,17 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
           AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = ?)
             OR (? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test'))))) RETURNING id`)
       .bind(pairingId, ownerId, name, await sha256(code), expires, now(), workspaceId, ownerId, ownerId,
-        workspaceId, legacy ? 1 : 0, ownerId, workspaceId, workspaceId, ownerId, workspaceId, legacy ? 1 : 0, ownerId).first();
+        workspaceId, legacy && testMode(c.env) ? 1 : 0, ownerId, workspaceId, workspaceId, ownerId,
+        workspaceId, legacy && testMode(c.env) ? 1 : 0, ownerId).first();
     if (!created) fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
     return c.json({ pairing: { id: pairingId, code, expiresAt: new Date(expires * 1000).toISOString() } }, 201);
   });
   app.get('/api/connectors', async c => {
     const rows = await c.env.DB.prepare(`SELECT c.*, u.display_name AS owner_name,
       (SELECT json_group_array(s.workspace_id) FROM connector_shares s JOIN workspace_members m
-        ON m.workspace_id = s.workspace_id AND m.user_id = c.owner_id WHERE s.connector_id = c.id) AS workspace_ids
+        ON m.workspace_id = s.workspace_id AND m.user_id = c.owner_id WHERE s.connector_id = c.id) AS workspace_ids,
+      (SELECT json_group_array(cw.workspace_id) FROM connector_workspaces cw JOIN workspace_members m
+        ON m.workspace_id = cw.workspace_id AND m.user_id = c.owner_id WHERE cw.connector_id = c.id) AS connected_workspace_ids
       FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.owner_id = ? ORDER BY c.created_at DESC LIMIT 100`)
       .bind(c.get('auth').userId).all<ConnectorInfoRow>();
     return c.json({ connectors: await connectorInfos(c.env, rows.results) });
@@ -274,12 +283,18 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/connectors', async c => {
     const workspaceId = identifier(c.req.param('id'));
     await requireMember(c.env, workspaceId, c.get('auth').userId);
-    const rows = await c.env.DB.prepare(`SELECT c.*, u.display_name AS owner_name, json_array(?) AS workspace_ids
-      FROM connectors c JOIN connector_shares s ON s.connector_id = c.id
-      JOIN workspace_members m ON m.workspace_id = s.workspace_id AND m.user_id = c.owner_id
-      JOIN users u ON u.id = c.owner_id WHERE s.workspace_id = ? AND c.revoked_at IS NULL
+    const rows = await c.env.DB.prepare(`SELECT c.*, u.display_name AS owner_name,
+      CASE WHEN EXISTS (SELECT 1 FROM connector_shares sh WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id)
+        THEN json_array(cw.workspace_id) ELSE json_array() END AS workspace_ids,
+      json_array(cw.workspace_id) AS connected_workspace_ids
+      FROM connectors c JOIN connector_workspaces cw ON cw.connector_id = c.id
+      JOIN workspace_members m ON m.workspace_id = cw.workspace_id AND m.user_id = c.owner_id
+      JOIN workspace_members actor ON actor.workspace_id = cw.workspace_id AND actor.user_id = ?
+      JOIN users u ON u.id = c.owner_id WHERE cw.workspace_id = ? AND c.revoked_at IS NULL
+      AND (c.owner_id = actor.user_id OR EXISTS (SELECT 1 FROM connector_shares sh
+        WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
       AND (? = 1 OR u.auth_kind <> 'test') ORDER BY c.created_at DESC LIMIT 30`)
-      .bind(workspaceId, workspaceId, testMode(c.env) ? 1 : 0).all<ConnectorInfoRow>();
+      .bind(c.get('auth').userId, workspaceId, testMode(c.env) ? 1 : 0).all<ConnectorInfoRow>();
     return c.json({ connectors: await connectorInfos(c.env, rows.results) });
   });
   app.put('/api/connectors/:id/shares/:workspaceId', async c => {
@@ -289,7 +304,8 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
     await requireMember(c.env, workspaceId, row.owner_id);
     await requireConfiguredWorkspace(c.env, workspaceId, row.owner_id);
     const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, row.owner_id);
-    const shared = await c.env.DB.prepare(`INSERT INTO connector_shares (connector_id,workspace_id,created_at)
+    const results = await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO connector_shares (connector_id,workspace_id,created_at)
       SELECT ?,?,? WHERE ((SELECT COUNT(*) FROM connector_shares WHERE connector_id = ?) < 50
         OR EXISTS (SELECT 1 FROM connector_shares WHERE connector_id = ? AND workspace_id = ?))
       AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND owner_id = ? AND revoked_at IS NULL)
@@ -299,7 +315,12 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
       ON CONFLICT (connector_id, workspace_id) DO UPDATE SET created_at = connector_shares.created_at
       RETURNING connector_id`)
       .bind(row.id, workspaceId, now(), row.id, row.id, workspaceId, row.id, row.owner_id, workspaceId, row.owner_id,
-        workspaceId, legacy ? 1 : 0, row.owner_id).first();
+        workspaceId, legacy && testMode(c.env) ? 1 : 0, row.owner_id),
+      c.env.DB.prepare(`INSERT INTO connector_workspaces (connector_id,workspace_id,created_at)
+        SELECT ?,?,? WHERE changes() = 1
+        ON CONFLICT (connector_id, workspace_id) DO NOTHING`).bind(row.id, workspaceId, now()),
+    ]);
+    const shared = results[0].results[0];
     if (!shared) {
       const atLimit = await c.env.DB.prepare(`SELECT 1 WHERE
         (SELECT COUNT(*) FROM connector_shares WHERE connector_id = ?) >= 50
@@ -316,7 +337,8 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
     const workspaceId = identifier(c.req.param('workspaceId'));
     await c.env.DB.batch([
       c.env.DB.prepare('DELETE FROM connector_shares WHERE connector_id = ? AND workspace_id = ?').bind(row.id, workspaceId),
-      c.env.DB.prepare('UPDATE sessions SET policy_version = policy_version + 1 WHERE connector_id = ? AND workspace_id = ?').bind(row.id, workspaceId),
+      c.env.DB.prepare(`UPDATE sessions SET policy_version = policy_version + 1
+        WHERE connector_id = ? AND workspace_id = ? AND owner_id <> ?`).bind(row.id, workspaceId, row.owner_id),
     ]);
     return c.body(null, 204);
   });

@@ -1047,7 +1047,7 @@ test('repository download deadline aborts both fetch and stalled body without re
       const socket = await startFixture(fixture);
       const deadline = new AbortController();
       const timeout = t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
-        assert.equal(milliseconds, 15_000);
+        assert.equal(milliseconds, 30_000, 'repository preparation gets the full RPC budget, not the short metadata callback deadline');
         return deadline.signal;
       });
       const rejected = assert.rejects(fixture.runtimes[0]!.config.readRepository!(repository, 'session'), /deadline expired/);

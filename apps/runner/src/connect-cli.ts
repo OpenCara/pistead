@@ -17,6 +17,8 @@ repositories for your workspace and pair Pi with that workspace, then run:
   pnpm connect --server https://workspace.example --pairing-id PAIRING_ID
 The pairing code is requested privately on a terminal, never as an argument.
 Subsequent runs use the private saved connector token.
+Pairing keeps Pi runtime access private to you; sharing it with teammates is opt-in.
+New sessions are workspace-viewable by default, without granting agent control.
 
 Options:
   --server ORIGIN          HTTPS control-plane origin (required for first pairing)

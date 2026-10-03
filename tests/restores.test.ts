@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import type { Env, WorkerEnv } from '../apps/worker/src/types.js';
 import type { RunnerBinding, RunnerTicket } from '../packages/shared/src/types.js';
 import type { RestoreInput } from '../packages/shared/src/connector.js';
@@ -11,6 +12,7 @@ import { sha256, verifyToken } from '../packages/shared/src/crypto.js';
 import { registerRestoreRoutes, downloadRestoreSnapshot } from '../apps/worker/src/restore-routes.js';
 import { registerBackups } from '../apps/worker/src/backups.js';
 import { boundedSnapshotText, MAX_BACKUP_BYTES, validateSnapshot } from '../apps/worker/src/restore-snapshot.js';
+import { sessionAccess } from '../apps/worker/src/db.js';
 
 const secret = 'restore-internal-test-secret-not-for-deployment';
 const bearer = 'b'.repeat(43);
@@ -80,6 +82,7 @@ async function fixture(t: TestContext, connected = false, repositories: SessionR
     sqlite.prepare(`INSERT INTO connectors (id,owner_id,name,credential_hash,connection_hash,models_json,created_at)
       VALUES ('connector','test:host','Local Pi',?,?,'[{"provider":"faux","modelId":"faux-v1","name":"Model"}]','2026-01-01')`).run(await sha256(bearer), await sha256(connection));
     sqlite.exec("INSERT INTO connector_shares VALUES ('connector','workspace','2026-01-01')");
+    sqlite.exec("INSERT INTO connector_workspaces VALUES ('connector','workspace','2026-01-01')");
   }
   sqlite.prepare(`INSERT INTO models (id,workspace_id,name,provider,model_id,connector_id,connector_owner_id,created_at)
     VALUES ('model','workspace','Model','faux','faux-v1',?,?,'2026-01-01')`).run(connected ? 'connector' : null, connected ? 'test:host' : null);
@@ -151,8 +154,25 @@ test('only the original owner may restore, not a manager or template/connector a
   assert.equal(f.reads.length, 0);
 });
 
+test('workspace viewers and explicit managers cannot create, list, download or restore owner backups', async t => {
+  const f = await fixture(t);
+  f.sqlite.exec("UPDATE sessions SET visibility = 'workspace' WHERE id = 'source'");
+  for (const actor of ['test:host', 'test:manager']) {
+    const headers = { 'x-test-user': actor };
+    assert.equal((await f.request('/api/sessions/source/backup', {}, headers)).status, 403);
+    assert.equal((await f.app.request('/api/sessions/source/backups', { headers }, f.env)).status, 403);
+    assert.equal((await f.app.request('/api/sessions/source/backups/backup/download', { headers }, f.env)).status, 403);
+    assert.equal((await f.request(restorePath, { requestId: 'forbidden' }, headers)).status, 403);
+  }
+  assert.equal(f.reads.length, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM restore_jobs').get()!.n, 0);
+  assert.equal((await f.app.request('/api/sessions/source/backups', {}, f.env)).status, 200);
+});
+
 test('restore pins one new target, uses current owner profile and copies no grants; completed replay is inert', async t => {
   const f = await fixture(t);
+  f.sqlite.exec("UPDATE sessions SET visibility = 'workspace' WHERE id = 'source'");
+  assert.deepEqual((await sessionAccess(f.env, 'source', 'test:host'))?.permissions, ['read']);
   const sourceBefore = f.sqlite.prepare("SELECT * FROM sessions WHERE id='source'").get();
   let calls = 0;
   let targetId = '';
@@ -167,6 +187,7 @@ test('restore pins one new target, uses current owner profile and copies no gran
     assert.equal(body.binding.session.ownerId, 'test:owner');
     assert.equal(body.binding.session.policyVersion, 1);
     assert.equal(body.binding.session.permissions, undefined);
+    assert.equal(body.binding.session.visibility, undefined);
     const stored = f.sqlite.prepare('SELECT * FROM restore_jobs').get()!;
     assert.equal(stored.download_token_hash, await sha256(body.restore.downloadToken));
     assert.ok(!JSON.stringify(stored).includes(body.restore.downloadToken));
@@ -183,9 +204,13 @@ test('restore pins one new target, uses current owner profile and copies no gran
   });
   const first = await f.request(restorePath, { requestId: 'request', title: 'Restored title' });
   assert.equal(first.status, 201);
-  const firstBody = await first.json() as { session: { id: string; status: string } };
+  const firstBody = await first.json() as { session: { id: string; status: string; visibility: string } };
   assert.equal(firstBody.session.id, targetId);
   assert.equal(firstBody.session.status, 'ready');
+  assert.equal(firstBody.session.visibility, 'private');
+  assert.equal(f.sqlite.prepare('SELECT visibility FROM sessions WHERE id = ?').get(targetId)!.visibility, 'private');
+  assert.equal(await sessionAccess(f.env, targetId, 'test:host'), null);
+  assert.equal(await sessionAccess(f.env, targetId, 'test:manager'), null);
   assert.deepEqual(f.sqlite.prepare("SELECT * FROM sessions WHERE id='source'").get(), sourceBefore);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_grants WHERE session_id=?').get(targetId)!.n, 0);
   f.objects.clear(); // Completed receipts must not depend on another R2 read or runner RPC.
@@ -266,7 +291,17 @@ test('snapshot pin comparison allows property order and legacy absent pins, but 
     fullName: pin.fullName, repositoryId: pin.repositoryId, bindingId: pin.bindingId }));
   assert.doesNotThrow(() => validateSnapshot(JSON.stringify(f.snapshot), source));
   f.snapshot.binding.session.repositories.reverse();
-  assert.throws(() => validateSnapshot(JSON.stringify(f.snapshot), source), /immutable session binding/);
+  let response: Response | undefined;
+  assert.throws(() => validateSnapshot(JSON.stringify(f.snapshot), source), (error: unknown) => {
+    assert.ok(error instanceof HTTPException);
+    response = error.getResponse();
+    return true;
+  });
+  assert.ok(response);
+  assert.equal(response.status, 502);
+  const body = await response.json() as { code: string; error: string };
+  assert.equal(body.code, 'invalid_backup');
+  assert.match(body.error, /immutable session binding/);
 });
 
 test('restore download rejects target rows whose pins differ from the immutable receipt', async t => {

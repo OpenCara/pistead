@@ -63,7 +63,7 @@ export async function authorizeConnectorTicket(env: Env, ticket: RunnerTicket, c
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && ticket.action !== 'view' && ticket.action !== 'events') fail(409, 'session_archived', 'Session is archived.');
-  if (['create', 'restart', 'restore'].includes(ticket.action) && ticket.actorId !== ticket.ownerId) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
+  if (['create', 'restart', 'restore', 'backup'].includes(ticket.action) && ticket.actorId !== ticket.ownerId) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
   await requireConnectorSession(env, ticket.connectorId, access.row, connectionHash);
   return access.row;
 }

@@ -89,9 +89,10 @@ const connectorFixtures: ConnectorFixture[] = [];
 let aliceConnector: ConnectorFixture | undefined;
 let bobConnector: ConnectorFixture | undefined;
 let bobLocalSession: SessionRecord | undefined;
+let workspaceVisibleSession: SessionRecord | undefined;
 
 async function connectFixture(client: Client): Promise<ConnectorFixture> {
-  const pairing: ConnectorPairing = (await client.request("POST", "/api/connectors/pairings", { name: `${client.name} Pi ${run}` })).pairing;
+  const pairing: ConnectorPairing = (await client.request("POST", "/api/connectors/pairings", { name: `${client.name} Pi ${run}`, workspaceId: workspace.id })).pairing;
   const dataDir = await mkdtemp(join(tmpdir(), "opencara-connector-e2e-"));
   const fixture: ConnectorFixture = { id: "", token: "", connectionToken: "", stop: async () => {} };
   const observeFetch: typeof fetch = async (input, init) => {
@@ -120,6 +121,8 @@ async function connectFixture(client: Client): Promise<ConnectorFixture> {
   const info: ConnectorInfo = owned.connectors.find((item: ConnectorInfo) => item.id === fixture.id);
   assert.equal(info.ownerId, client.user.id);
   assert.equal(info.online, true);
+  assert.deepEqual(info.workspaceIds, [], "pairing must not implicitly share runtime access");
+  assert.ok(info.connectedWorkspaceIds?.includes(workspace.id), "the owner's private connection remains workspace-associated");
   assert.ok(!JSON.stringify(owned).includes(fixture.token), "connector credentials must never enter public metadata");
   const replay = await fetch(`${base}/api/connectors/pairings/${pairing.id}/claim`, {
     method: "POST", headers: { "content-type": "application/json" },
@@ -150,6 +153,12 @@ await check("unauthenticated APIs fail closed; test accounts are explicit and is
   await alice.request("PATCH", "/api/me", { env: { APP_API_KEY: "not-a-real-key" } }, [400]);
 });
 
+await check("workspace membership is required before associating a private Pi", async () => {
+  workspace = (await alice.request("POST", "/api/workspaces", { name: `Integration ${run}` })).workspace;
+  await bob.request("GET", `/api/workspaces/${workspace.id}/agents`, undefined, [403, 404]);
+  await alice.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: "member" });
+});
+
 if (connectedRuntime) {
   await check("user-owned Pi connections pair once and never receive global or user authority", async () => {
     aliceConnector = await connectFixture(alice);
@@ -158,14 +167,86 @@ if (connectedRuntime) {
     const owned = (await bob.request("GET", "/api/connectors")).connectors as ConnectorInfo[];
     assert.ok(!owned.some(connection => connection.id === aliceConnector!.id));
   });
+  await check("private Pi runs an unpublished agent while teammates can only view its default workspace session", async () => {
+    const ownModels: ModelDefinition[] = (await alice.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
+    const ownModel = ownModels.find(item => item.connectorId === aliceConnector!.id)!;
+    assert.ok(ownModel, "owner can select their private Pi model");
+    const peerModels: ModelDefinition[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
+    assert.ok(!peerModels.some(item => item.connectorId === aliceConnector!.id));
+    await bob.request("POST", "/api/agents", {
+      name: "Guessed private model", description: "Unauthorized model selection", instructions: "Use private model", tools: ["identity"], modelId: ownModel.id,
+    }, [403, 404]);
+    const own: AgentVersion = (await alice.request("POST", "/api/agents", {
+      name: "Private local agent", description: "Owner-only local agent", instructions: "Use the session owner's identity.", tools: ["identity"], modelId: ownModel.id,
+    })).agent;
+    assert.equal(own.workspaceId, null);
+    workspaceVisibleSession = (await alice.request("POST", "/api/sessions", {
+      workspaceId: workspace.id, agentVersionId: own.id, title: "Local run, workspace view",
+    })).session;
+    const sessionId = workspaceVisibleSession!.id;
+    assert.equal(workspaceVisibleSession!.visibility, "workspace");
+    assert.equal(workspaceVisibleSession!.connectorId, aliceConnector!.id);
+    const listed: SessionRecord[] = (await bob.request("GET", "/api/sessions")).sessions;
+    assert.deepEqual(listed.find(item => item.id === sessionId)?.permissions, ["read"]);
+    assert.deepEqual((await bob.request("GET", `/api/sessions/${sessionId}`)).session.permissions, ["read"]);
+    await alice.submit(sessionId, "TEST_IDENTITY");
+    await alice.settled(sessionId, "alice-test");
+    const viewed = await bob.view(sessionId);
+    assert.equal(viewed.owner.id, alice.user.id);
+    assert.equal("env" in viewed.owner, false);
+    assert.equal("githubToken" in viewed.owner, false);
+    await eve.request("GET", `/api/sessions/${sessionId}/view`, undefined, [403, 404]);
+    for (const mode of ["submit", "ask"]) {
+      await bob.request("POST", `/api/sessions/${sessionId}/${mode}`, { content: "TEST_IDENTITY", requestId: `viewer-${mode}` }, [403]);
+    }
+    await bob.request("POST", `/api/sessions/${sessionId}/operations`, { kind: "git.commit", message: "forbidden" }, [403]);
+    await bob.request("POST", `/api/sessions/${sessionId}/approvals/${crypto.randomUUID()}`, { decision: "approve" }, [403]);
+    await bob.request("POST", `/api/sessions/${sessionId}/grants`, { userId: bob.user.id, permissions: ["write", "manage"] }, [403]);
+    await bob.request("POST", `/api/sessions/${sessionId}/restart`, {}, [403]);
+    await bob.request("POST", `/api/sessions/${sessionId}/backup`, {}, [403]);
+    await bob.request("GET", `/api/sessions/${sessionId}/backups`, undefined, [403]);
+    await bob.request("PATCH", `/api/sessions/${sessionId}`, { visibility: "private" }, [403]);
+    await bob.request("POST", "/api/sessions", {
+      workspaceId: workspace.id, agentVersionId: own.id, title: "No private agent use", trustedConnectorId: aliceConnector!.id,
+    }, [403, 404]);
+  });
+  await check("workspace viewing follows membership and privacy changes immediately, without granting control", async () => {
+    const sessionId = workspaceVisibleSession!.id;
+    await alice.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: eve.user.id, role: "member" });
+    assert.equal((await eve.view(sessionId)).owner.id, alice.user.id);
+    await alice.request("DELETE", `/api/workspaces/${workspace.id}/members/${encodeURIComponent(eve.user.id)}`, undefined, [200, 204]);
+    await eve.request("GET", `/api/sessions/${sessionId}/view`, undefined, [403, 404]);
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), 12_000);
+    try {
+      const response = await fetch(`${base}/api/sessions/${sessionId}/events`, {
+        headers: { Cookie: [...bob.cookies].map(([key, value]) => `${key}=${value}`).join("; "), Origin: base }, signal: abort.signal,
+      });
+      assert.equal(response.status, 200);
+      assert.ok(response.headers.get("content-type")?.includes("text/event-stream"));
+      const reader = response.body!.getReader();
+      await reader.read();
+      const changed = (await alice.request("PATCH", `/api/sessions/${sessionId}`, { visibility: "private" })).session;
+      assert.equal(changed.visibility, "private");
+      while (!(await reader.read()).done) { /* Privacy changes close an already-open viewer stream. */ }
+      assert.equal(abort.signal.aborted, false);
+    } finally { clearTimeout(timeout); abort.abort(); }
+    await bob.request("GET", `/api/sessions/${sessionId}/view`, undefined, [403, 404]);
+    assert.ok(!(await bob.request("GET", "/api/sessions")).sessions.some((item: SessionRecord) => item.id === sessionId));
+    await alice.request("POST", `/api/sessions/${sessionId}/grants`, { userId: bob.user.id, permissions: ["read"] });
+    assert.equal((await bob.view(sessionId)).owner.id, alice.user.id);
+    await alice.request("DELETE", `/api/sessions/${sessionId}/grants/${encodeURIComponent(bob.user.id)}`);
+    await bob.request("GET", `/api/sessions/${sessionId}/view`, undefined, [403, 404]);
+    workspaceVisibleSession = (await alice.request("PATCH", `/api/sessions/${sessionId}`, { visibility: "workspace" })).session;
+    assert.deepEqual((await bob.request("GET", `/api/sessions/${sessionId}`)).session.permissions, ["read"]);
+  });
 }
 
-await check("workspace membership and model administration are enforced", async () => {
-  workspace = (await alice.request("POST", "/api/workspaces", { name: `Integration ${run}` })).workspace;
-  await bob.request("GET", `/api/workspaces/${workspace.id}/agents`, undefined, [403, 404]);
-  await alice.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: "member" });
+await check("workspace model discovery distinguishes private Pi from explicitly shared Pi", async () => {
   if (connectedRuntime) {
-    assert.equal((await bob.request("GET", `/api/workspaces/${workspace.id}/connectors`)).connectors.length, 0);
+    const visible = (await bob.request("GET", `/api/workspaces/${workspace.id}/connectors`)).connectors as ConnectorInfo[];
+    assert.ok(visible.some(item => item.id === bobConnector!.id), "owner can discover their private Pi");
+    assert.ok(!visible.some(item => item.id === aliceConnector!.id), "teammates cannot discover another user's private Pi");
     await bob.request("PUT", `/api/connectors/${aliceConnector!.id}/shares/${workspace.id}`, {}, [403, 404]);
     await alice.request("PUT", `/api/connectors/${aliceConnector!.id}/shares/${workspace.id}`, {});
     await bob.request("PUT", `/api/connectors/${bobConnector!.id}/shares/${workspace.id}`, {});
@@ -214,12 +295,12 @@ await check("repository pins and cache destinations are assigned by the server, 
 });
 
 await check("the same published agent starts distinct owner-bound sessions", async () => {
-  aliceSession = (await alice.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Alice's session" })).session;
+  aliceSession = (await alice.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Alice's session", visibility: "private" })).session;
   if (connectedRuntime) {
     await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Missing host trust" }, [400, 403]);
   }
   bobSession = (await bob.request("POST", "/api/sessions", {
-    workspaceId: workspace.id, agentVersionId: published.id, title: "Bob's session",
+    workspaceId: workspace.id, agentVersionId: published.id, title: "Bob's session", visibility: "private",
     ...(connectedRuntime ? { trustedConnectorId: aliceConnector!.id } : {}),
   })).session;
   if (connectedRuntime) {
@@ -426,6 +507,7 @@ if (!health.backupsConfigured && process.env.ALLOW_MISSING_BACKUPS === "true") {
     await alice.request("PATCH", "/api/me", { gitName: "Alice Restored" });
     const restored: SessionRecord = (await alice.request("POST", restorePath, input)).session;
     assert.notEqual(restored.id, aliceSession.id);
+    assert.equal(restored.visibility, "private", "restores must not republish historical session content");
     assert.equal(restored.ownerId, alice.user.id);
     assert.equal(restored.agentVersionId, aliceSession.agentVersionId);
     assert.equal(restored.connectorId, aliceSession.connectorId);
@@ -463,7 +545,7 @@ if (connectedRuntime) {
     })).agent;
     const shared: AgentVersion = (await bob.request("POST", `/api/agents/${privateAgent.agentId}/publish`, { workspaceId: workspace.id })).agent;
     bobLocalSession = (await bob.request("POST", "/api/sessions", {
-      workspaceId: workspace.id, agentVersionId: shared.id, title: "Bob's separate host",
+      workspaceId: workspace.id, agentVersionId: shared.id, title: "Bob's separate host", visibility: "private",
     })).session;
     assert.ok(bobLocalSession);
     const headers = { authorization: `Bearer ${aliceConnector!.token}`, "x-connection-token": aliceConnector!.connectionToken, "content-type": "application/json" };
@@ -487,6 +569,8 @@ if (connectedRuntime) {
     const shared: ConnectorInfo[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/connectors`)).connectors;
     assert.ok(!shared.some(connection => connection.id === aliceConnector!.id));
     assert.ok(shared.some(connection => connection.id === bobConnector!.id));
+    assert.equal((await alice.view(aliceSession.id)).owner.id, alice.user.id, "unsharing does not disable the host owner's session");
+    assert.equal((await bob.view(workspaceVisibleSession!.id)).owner.id, alice.user.id, "viewing the owner's workspace session does not require sharing the Pi");
     await alice.request("DELETE", `/api/connectors/${aliceConnector!.id}`, undefined, [204]);
     const revoked = await fetch(`${base}/api/connectors/self/authorize`, {
       method: "POST", headers: { authorization: `Bearer ${aliceConnector!.token}`, "x-connection-token": aliceConnector!.connectionToken, "content-type": "application/json" },

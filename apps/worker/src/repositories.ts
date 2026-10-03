@@ -10,7 +10,12 @@ import { authenticateConnector, requireConnectorSession, type ConnectorRow } fro
 interface RepositoryRow {
   id: string; workspace_id: string; repository_id: number; full_name: string; ref: string; private: number; created_at: string;
 }
-interface GitHubAccess { token: string; ciphertext: string; userId: string }
+interface GitHubAccess { token: string; ciphertext: string; userId: string; githubId: string }
+interface RepositoryResolution {
+  repositories: SessionRepository[];
+  bindingIds: string;
+  githubAuthority: Pick<GitHubAccess, 'ciphertext' | 'githubId'> | null;
+}
 const apiOrigin = 'https://api.github.com';
 const jsonBytes = 512 * 1024;
 const remoteTimeout = 20000;
@@ -57,11 +62,11 @@ async function githubAccess(env: Env, userId: string): Promise<GitHubAccess> {
   if (!user || user.auth_kind !== 'github' || !user.github_id) fail(409, 'github_not_connected', 'The acting user must connect GitHub. Workspace sharing does not grant repository access.');
   const vault = await env.DB.prepare('SELECT ciphertext FROM github_tokens WHERE user_id = ?').bind(userId).first<{ ciphertext: string }>();
   if (!vault) fail(409, 'github_not_connected', 'The acting user must connect GitHub.');
-  return { token: await decryptToken(env, userId, vault.ciphertext), ciphertext: vault.ciphertext, userId };
+  return { token: await decryptToken(env, userId, vault.ciphertext), ciphertext: vault.ciphertext, userId, githubId: user.github_id };
 }
 async function recheckGitHubAccess(env: Env, access: GitHubAccess): Promise<void> {
   const row = await env.DB.prepare(`SELECT t.ciphertext FROM github_tokens t JOIN users u ON u.id = t.user_id
-    WHERE t.user_id = ? AND u.auth_kind = 'github' AND u.github_id IS NOT NULL`).bind(access.userId).first<{ ciphertext: string }>();
+    WHERE t.user_id = ? AND u.auth_kind = 'github' AND u.github_id = ?`).bind(access.userId, access.githubId).first<{ ciphertext: string }>();
   if (row?.ciphertext !== access.ciphertext) fail(403, 'github_access_changed', 'GitHub access changed; retry with the current connection.');
 }
 function headers(access: GitHubAccess): Record<string, string> {
@@ -124,12 +129,12 @@ async function verifyRepository(access: GitHubAccess, expected: { repositoryId: 
   }
   return metadata;
 }
-export async function resolveWorkspaceRepositories(env: Env, workspaceId: string, ownerId: string): Promise<{ repositories: SessionRepository[]; bindingIds: string }> {
+export async function resolveWorkspaceRepositories(env: Env, workspaceId: string, ownerId: string): Promise<RepositoryResolution> {
   await requireMember(env, workspaceId, ownerId);
   const configured = await workspaceRepositories(env, workspaceId);
   const bindingIds = JSON.stringify(configured.map(item => item.id));
   if (!configured.length) {
-    if (await legacyRepositoryFixture(env, ownerId)) return { repositories: [], bindingIds };
+    if (await legacyRepositoryFixture(env, ownerId)) return { repositories: [], bindingIds, githubAuthority: null };
     fail(409, 'workspace_repositories_required', 'Configure at least one GitHub repository before starting a session.');
   }
   if (configured.length > repositoryLimits.repositories) fail(409, 'repository_limit', 'Too many workspace repositories.');
@@ -148,7 +153,7 @@ export async function resolveWorkspaceRepositories(env: Env, workspaceId: string
   if (JSON.stringify((await workspaceRepositories(env, workspaceId)).map(item => item.id)) !== bindingIds) {
     fail(409, 'repository_configuration_changed', 'Workspace repositories changed while resolving references. Try again.');
   }
-  return { repositories, bindingIds };
+  return { repositories, bindingIds, githubAuthority: { ciphertext: access.ciphertext, githubId: access.githubId } };
 }
 
 export function registerRepositories(app: Hono<WorkerEnv>): void {
@@ -181,9 +186,12 @@ export function registerRepositories(app: Hono<WorkerEnv>): void {
       ref, private: metadata.private ? 1 : 0, created_at: now() };
     const inserted = await c.env.DB.prepare(`INSERT INTO workspace_repositories (id,workspace_id,repository_id,full_name,ref,private,created_at)
       SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))
+      AND EXISTS (SELECT 1 FROM github_tokens t JOIN users u ON u.id = t.user_id
+        WHERE t.user_id = ? AND t.ciphertext = ? AND u.auth_kind = 'github' AND u.github_id = ?)
       AND (SELECT COUNT(*) FROM workspace_repositories WHERE workspace_id = ?) < 5
       AND NOT EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = ? AND (repository_id = ? OR full_name = ? COLLATE NOCASE)) RETURNING id`)
-      .bind(row.id, workspaceId, row.repository_id, row.full_name, row.ref, row.private, row.created_at, workspaceId, actor, workspaceId, workspaceId, row.repository_id, row.full_name).first();
+      .bind(row.id, workspaceId, row.repository_id, row.full_name, row.ref, row.private, row.created_at, workspaceId, actor,
+        actor, access.ciphertext, access.githubId, workspaceId, workspaceId, row.repository_id, row.full_name).first();
     if (!inserted) fail(409, 'repository_binding_conflict', 'Repository already configured, limit reached, or workspace authority changed.');
     return c.json({ repository: publicRepository(row) }, 201);
   });

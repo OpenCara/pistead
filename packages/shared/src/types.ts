@@ -56,6 +56,8 @@ export interface SessionRecord {
   connectorId?: string;
   connectorOwnerId?: string;
   repositories?: SessionRepository[];
+  // Control-plane viewing policy; absent on legacy records means private.
+  visibility?: "private" | "workspace";
 }
 export interface SessionGrant {
   userId: string;
