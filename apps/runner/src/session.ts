@@ -199,7 +199,14 @@ export class RunnerSession {
         throw new RunnerError(413, "Repository archive exceeds its bound");
       archives.push(bytes);
     }
-    await this.sandbox.materializeRepositories(repositories, archives, authorize);
+    try {
+      await this.sandbox.materializeRepositories(repositories, archives, authorize);
+    } catch (error) {
+      if (error instanceof RunnerError) throw error;
+      // Helper reasons are fixed "sandbox: ..." phrases; anything carrying paths or other detail stays local.
+      const reason = error instanceof Error ? /sandbox: ([a-z0-9 ,.'()-]{1,160})$/i.exec(error.message.trim())?.[1] : undefined;
+      throw new RunnerError(422, `Repository snapshot could not be prepared${reason ? `: ${reason}` : ""}`);
+    }
     if (!await this.sandbox.repositoryCachesReady(repositories, authorize)) throw new RunnerError(409, "Repository cache initialization did not complete");
   }
 

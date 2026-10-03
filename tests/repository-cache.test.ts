@@ -820,9 +820,12 @@ test("repository archive paths reject traversal, aliases, controls and reserved 
   ]))));
 });
 
-test("repository tar rejects links, devices, FIFO, unsupported types, duplicates and path conflicts", linux, async t => {
+test("repository tar rejects unsafe links, devices, FIFO, unsupported types, duplicates and path conflicts", linux, async t => {
   const cases: [string, TarEntry[]][] = [
-    ["symbolic link", [{ name: "checkout/link", type: "2", linkname: "../../escape" }]],
+    ["escaping symbolic link", [{ name: "checkout/link", type: "2", linkname: "../../escape" }]],
+    ["absolute symbolic link", [{ name: "checkout/link", type: "2", linkname: "/etc/passwd" }]],
+    ["dangling symbolic link", [{ name: "checkout/link", type: "2", linkname: "missing" }]],
+    ["symbolic link to a directory", [{ name: "checkout/dir/", type: "5" }, { name: "checkout/link", type: "2", linkname: "dir" }]],
     ["hard link", [{ name: "checkout/file", body: "source" }, { name: "checkout/link", type: "1", linkname: "checkout/file" }]],
     ["character device", [{ name: "checkout/device", type: "3" }]],
     ["block device", [{ name: "checkout/device", type: "4" }]],
@@ -841,6 +844,22 @@ test("repository tar rejects links, devices, FIFO, unsupported types, duplicates
     ["oversized file", [{ name: "checkout/large", body: Buffer.alloc(repositoryLimits.fileBytes + 1) }]],
   ];
   for (const [name, entries] of cases) await t.test(name, t => rejectArchive(t, gzipSync(tar(entries))));
+});
+
+test("in-repository symbolic links materialize as regular file copies", linux, async t => {
+  const library = Buffer.alloc(3 * 1024 * 1024, 7);
+  const f = await fixture(t, [alpha]);
+  await f.sandbox.materializeRepositories(f.repositories, [gzipSync(tar([
+    { name: "checkout/", type: "5" },
+    { name: "checkout/lib/libfoo.5.dylib", type: "2", linkname: "libfoo.5.0.0.dylib" },
+    { name: "checkout/lib/libfoo.5.0.0.dylib", body: library },
+    { name: "checkout/docs/readme", type: "2", linkname: "../README.md" },
+    { name: "checkout/README.md", body: "pinned" },
+  ]))], authorize);
+  assert.equal(await f.sandbox.repositoryCachesReady(f.repositories, authorize), true);
+  const copy = await lstat(join(f.root, "worktree", alpha.path, "lib/libfoo.5.dylib"));
+  assert.ok(copy.isFile() && !copy.isSymbolicLink() && copy.size === library.length);
+  assert.equal(await f.sandbox.readFile(`${alpha.path}/docs/readme`, authorize), "pinned");
 });
 
 test("PAX paths and unsupported metadata cannot bypass repository archive policy", linux, async t => {

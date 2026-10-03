@@ -29,6 +29,7 @@ export const repositoryLimits = {
   repositories: 5,
   archiveBytes: 8 * 1024 * 1024,
   expandedBytes: 32 * 1024 * 1024,
-  fileBytes: 1024 * 1024,
+  // Real repositories vendor prebuilt binaries (multi-MiB dylibs/tools); the aggregate bounds above still apply.
+  fileBytes: 8 * 1024 * 1024,
   entries: 10000,
 } as const;

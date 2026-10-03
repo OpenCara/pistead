@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -33,15 +33,16 @@ async function hostWorkspace(t: TestContext, repositories: SessionRepository[] =
 }
 
 /** Minimal ustar writer: one header block per entry plus padded body and terminator. */
-function tarGz(entries: { name: string; body?: string; type?: "0" | "5" }[]): Uint8Array {
+function tarGz(entries: { name: string; body?: string | Buffer; type?: "0" | "2" | "5"; link?: string }[]): Uint8Array {
   const blocks: Buffer[] = [];
   for (const entry of entries) {
-    const body = Buffer.from(entry.body ?? "");
+    const body = Buffer.isBuffer(entry.body) ? entry.body : Buffer.from(entry.body ?? "");
     const header = Buffer.alloc(512);
     header.write(entry.name, 0, "utf8");
     header.write("0000644\0", 100);
     header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
     header.write(entry.type ?? "0", 156);
+    if (entry.link) header.write(entry.link, 157, "utf8");
     header.write("ustar\0" + "00", 257, "latin1");
     header.fill(32, 148, 156);
     header.write(`${header.reduce((sum: number, byte: number) => sum + byte, 0).toString(8).padStart(6, "0")}\0 `, 148, "latin1");
@@ -94,13 +95,24 @@ test("unsandboxed repository caches unpack pinned archives once and refuse unsaf
     [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/../escape.txt", body: "x" }],
     [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/.git/config", body: "x" }],
     [{ name: "alpha-main/", type: "5" as const }, { name: "other-root/file.txt", body: "x" }],
+    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/escape", type: "2" as const, link: "../../outside.txt" }],
+    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/abs", type: "2" as const, link: "/etc/hosts" }],
+    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/dangling", type: "2" as const, link: "missing.txt" }],
+    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/lib", type: "5" as const }, { name: "alpha-main/dir-link", type: "2" as const, link: "lib" }],
   ]) {
     await assert.rejects(workspace.materializeRepositories([pin], [tarGz(unsafe)], authorize));
     assert.equal(await workspace.repositoryCachesReady([pin], authorize), false, "a rejected archive changes nothing");
   }
+  // GitHub archives vendor multi-MiB binaries and relative library symlinks (libfoo.5.dylib -> libfoo.5.0.0.dylib).
+  const binary = Buffer.alloc(3 * 1024 * 1024, 7);
   await workspace.materializeRepositories([pin], [tarGz([
     { name: "alpha-main/", type: "5" }, { name: "alpha-main/README.md", body: "pinned" }, { name: "alpha-main/src/index.ts", body: "export {};" },
+    { name: "alpha-main/lib/libfoo.5.dylib", type: "2", link: "libfoo.5.0.0.dylib" }, { name: "alpha-main/lib/libfoo.5.0.0.dylib", body: binary },
+    { name: "alpha-main/docs/readme-link", type: "2", link: "../README.md" },
   ])], authorize);
+  const copy = await lstat(join(workspace.worktree, "acme/alpha/lib/libfoo.5.dylib"));
+  assert.ok(copy.isFile() && !copy.isSymbolicLink() && copy.size === binary.length, "in-repository symlinks become regular file copies");
+  assert.equal(await workspace.readFile("acme/alpha/docs/readme-link", authorize), "pinned");
   assert.equal(await workspace.repositoryCachesReady([pin], authorize), true);
   assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "pinned");
   await workspace.writeFile("acme/alpha/README.md", "edited", authorize);

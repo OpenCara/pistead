@@ -321,6 +321,9 @@ export class HostWorkspace {
       const data = expandArchive(archives[index]!, repositoryLimits.expandedBytes - expanded);
       expanded += data.length;
       const parsed = parseArchive(data, repositoryLimits.entries - entries, repository.path);
+      // Symlink copies occupy disk too; they count against the same aggregate bound.
+      expanded += parsed.copied;
+      if (expanded > repositoryLimits.expandedBytes) throw hostError("repository archives exceed expanded size limit");
       entries += parsed.count;
       if (entries > repositoryLimits.entries) throw hostError("repository archives have too many entries");
       prepared.push({ destination: repository.path.split("/"), files: parsed.files, nodes: parsed.nodes });
@@ -661,7 +664,22 @@ function paxFields(data: Buffer, global: boolean): Map<string, string> {
   return result;
 }
 
-function parseArchive(data: Buffer, budget: number, destination: string): { files: ArchiveFile[]; nodes: Map<string, ArchiveNode>; count: number } {
+/** Symlinks resolve lexically inside their repository; ".." may never climb above its root. */
+function linkTarget(path: readonly string[], link: string): string[] {
+  if (!link || link.startsWith("/") || link.includes("\\") || /[\x00-\x1f\x7f]/.test(link)) throw hostError("repository symlink target must be a relative path");
+  const parts = path.slice(0, -1);
+  for (const part of link.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (!parts.length) throw hostError("repository symlink escapes its repository");
+      parts.pop();
+    } else parts.push(part);
+  }
+  if (!parts.length) throw hostError("repository symlink escapes its repository");
+  return parts;
+}
+
+function parseArchive(data: Buffer, budget: number, destination: string): { files: ArchiveFile[]; nodes: Map<string, ArchiveNode>; count: number; copied: number } {
   if (data.length % 512) throw hostError("incomplete repository tar archive");
   let offset = 0;
   let entries = 0;
@@ -671,6 +689,7 @@ function parseArchive(data: Buffer, budget: number, destination: string): { file
   const explicit = new Set<string>();
   const nodes = new Map<string, ArchiveNode>();
   const files: ArchiveFile[] = [];
+  const links = new Map<string, { path: string[]; link: string }>();
   while (offset < data.length) {
     const header = data.subarray(offset, offset + 512);
     offset += 512;
@@ -703,7 +722,12 @@ function parseArchive(data: Buffer, budget: number, destination: string): { file
       if (kind === "x") pending = metadata;
       continue;
     }
-    if (!["0", "\0", "5"].includes(kind) || header.subarray(157, 257).some((byte) => byte !== 0)) {
+    let link = "";
+    if (kind === "2") {
+      // Symlinks become copies of an in-repository regular file; no link is ever created.
+      if (size) throw hostError("repository symlink entries cannot carry data");
+      link = tarText(header.subarray(157, 257));
+    } else if (!["0", "\0", "5"].includes(kind) || header.subarray(157, 257).some((byte) => byte !== 0)) {
       throw hostError("repository archive links and special files are forbidden");
     }
     if (pending) {
@@ -727,6 +751,10 @@ function parseArchive(data: Buffer, budget: number, destination: string): { file
     if (kind === "5") {
       if (size || nodes.get(key) === "file") throw hostError("conflicting repository directory entry");
       if (path.length) nodes.set(key, "directory");
+    } else if (kind === "2") {
+      if (nodes.has(key)) throw hostError("conflicting repository archive paths");
+      nodes.set(key, "file");
+      links.set(key, { path, link });
     } else {
       if (size > repositoryLimits.fileBytes) throw hostError("repository file exceeds size limit");
       if (nodes.has(key)) throw hostError("conflicting repository archive paths");
@@ -736,5 +764,18 @@ function parseArchive(data: Buffer, budget: number, destination: string): { file
     if (nodes.size > repositoryLimits.entries) throw hostError("repository archive has too many filesystem entries");
   }
   if (!ended || prefix === undefined) throw hostError("incomplete or empty repository tar archive");
-  return { files, nodes, count: Math.max(entries, nodes.size) };
+  const regular = new Map(files.map((file) => [file.path.join("/"), file]));
+  let copied = 0;
+  for (const { path, link } of links.values()) {
+    let target = linkTarget(path, link);
+    for (let hop = 0; hop < 8 && links.has(target.join("/")); hop++) {
+      const next = links.get(target.join("/"))!;
+      target = linkTarget(next.path, next.link);
+    }
+    const file = regular.get(target.join("/"));
+    if (!file) throw hostError("repository symlink must point to a regular file in its repository");
+    copied += file.body.length;
+    files.push({ path, body: file.body, mode: file.mode });
+  }
+  return { files, nodes, count: Math.max(entries, nodes.size), copied };
 }

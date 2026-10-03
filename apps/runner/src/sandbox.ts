@@ -183,11 +183,30 @@ def pax_fields(data, global_header):
     return result
 
 
+def link_target(path, link):
+    # Symlinks resolve lexically inside their repository; '..' may never climb above its root.
+    if not link or link.startswith('/') or '\\' in link or any(ord(c) < 32 or ord(c) == 127 for c in link):
+        raise ValueError('repository symlink target must be a relative path')
+    parts = list(path[:-1])
+    for part in link.split('/'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if not parts:
+                raise ValueError('repository symlink escapes its repository')
+            parts.pop()
+        else:
+            parts.append(part)
+    if not parts:
+        raise ValueError('repository symlink escapes its repository')
+    return tuple(parts)
+
+
 def parse_archive(data, budget, destination):
     if len(data) % 512:
         raise ValueError('incomplete repository tar archive')
     offset, entries, prefix, pending, ended = 0, 0, None, None, False
-    explicit, nodes, files = set(), {}, []
+    explicit, nodes, files, links = set(), {}, [], {}
     while offset < len(data):
         header = data[offset:offset + 512]
         offset += 512
@@ -221,7 +240,12 @@ def parse_archive(data, budget, destination):
             if kind == b'x':
                 pending = metadata
             continue
-        if kind not in (b'0', b'\x00', b'5') or any(header[157:257]):
+        if kind == b'2':
+            # Symlinks become copies of an in-repository regular file; no link is ever created.
+            if size:
+                raise ValueError('repository symlink entries cannot carry data')
+            link = tar_text(header[157:257])
+        elif kind not in (b'0', b'\x00', b'5') or any(header[157:257]):
             raise ValueError('repository archive links and special files are forbidden')
         if pending is not None:
             name = pending.get('path', name)
@@ -248,6 +272,11 @@ def parse_archive(data, budget, destination):
             if size or nodes.get(path) == 'file':
                 raise ValueError('conflicting repository directory entry')
             nodes[path] = 'directory'
+        elif kind == b'2':
+            if path in nodes:
+                raise ValueError('conflicting repository archive paths')
+            nodes[path] = 'file'
+            links[path] = link
         else:
             if size > REPOSITORY_LIMITS['fileBytes']:
                 raise ValueError('repository file exceeds size limit')
@@ -260,7 +289,20 @@ def parse_archive(data, budget, destination):
             raise ValueError('repository archive has too many filesystem entries')
     if not ended or prefix is None:
         raise ValueError('incomplete or empty repository tar archive')
-    return files, nodes, max(entries, len(nodes))
+    regular_files = {path: (body, mode) for path, body, mode in files}
+    copied = 0
+    for path, link in links.items():
+        target = link_target(path, link)
+        for _ in range(8):
+            if target not in links:
+                break
+            target = link_target(target, links[target])
+        if target not in regular_files:
+            raise ValueError('repository symlink must point to a regular file in its repository')
+        body, mode = regular_files[target]
+        copied += len(body)
+        files.append((path, body, mode))
+    return files, nodes, max(entries, len(nodes)), copied
 
 
 def git_capture(arguments, success=True):
@@ -391,7 +433,11 @@ def materialize_repositories(work, git, repositories, archives):
     for repository, encoded in zip(repositories, archives):
         data = expand_archive(encoded, REPOSITORY_LIMITS['expandedBytes'] - expanded)
         expanded += len(data)
-        files, nodes, count = parse_archive(data, REPOSITORY_LIMITS['entries'] - entries, repository['path'])
+        files, nodes, count, copied = parse_archive(data, REPOSITORY_LIMITS['entries'] - entries, repository['path'])
+        # Symlink copies occupy disk too; they count against the same aggregate bound.
+        expanded += copied
+        if expanded > REPOSITORY_LIMITS['expandedBytes']:
+            raise ValueError('repository archives exceed expanded size limit')
         entries += count
         if entries > REPOSITORY_LIMITS['entries']:
             raise ValueError('repository archives have too many entries')

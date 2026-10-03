@@ -116,17 +116,31 @@ export async function connectorRequest(c: AppContext, row: SessionRow, action: R
     fail(503, 'connector_unavailable', 'The connector is unavailable. An accepted operation may still be running; inspect the session before retrying.');
   }
   try {
-    await authorizeConnectorTicket(c.env, ticket, envelope.connectionHash);
+    // A dropped or replaced connection must be reported as such, not as lost session authority.
     await requireConnectorGeneration(c.env, envelope.connectorId, envelope.credentialHash, envelope.connectionHash);
+    await authorizeConnectorTicket(c.env, ticket, envelope.connectionHash);
     if (!response.ok) {
       const status = [400, 403, 404, 409, 413, 422, 429, 503, 504].includes(response.status) ? response.status : 502;
+      // 422 carries a fixed, runner-authored reason (e.g. a repository limit); other runner text is not shown.
+      const reason = response.status === 422 ? await runnerReason(response) : '';
       fail(status as 400 | 403 | 404 | 409 | 413 | 422 | 429 | 502 | 503 | 504, 'runner_error',
-        'The connector could not complete the operation. Inspect the session before retrying.');
+        reason ? `The connector could not complete the operation: ${reason}` : 'The connector could not complete the operation. Inspect the session before retrying.');
     }
     return response;
   } catch (error) {
     await response.body?.cancel();
     throw error;
+  }
+}
+
+/** Reads a runner 422 `{error}` message for display: one short line of plain words, or nothing. */
+async function runnerReason(response: Response): Promise<string> {
+  try {
+    const parsed: unknown = JSON.parse((await response.clone().text()).slice(0, 2048));
+    const message = parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' ? parsed.error : '';
+    return /^[\w .,:'()-]{1,300}$/.test(message) ? message : '';
+  } catch {
+    return '';
   }
 }
 
