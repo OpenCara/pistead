@@ -2,19 +2,17 @@ import { access, constants, readFile } from "node:fs/promises";
 import { Buffer } from "node:buffer";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { createConnector, controlPlaneOrigin } from "./connector.js";
 import { createFauxLocalModels, loadLocalPiModels } from "./local-pi.js";
 import type { ResourceConfig } from "./resources.js";
 
-const HELP = `Usage: pnpm connect [options]
+const HELP = `Usage: pistead connect [options]
 
-Connect your local Pi to a workspace control plane using outbound WebSocket only.
-From the cloned OpenCara/agent-workspace repository root, use Node.js 24 and
-pnpm 10.32.1, then run pnpm install. In the web app, configure authorized GitHub
+Connect your local Pi to a Pistead workspace using outbound WebSocket only.
+Use Node.js 24 on Linux or WSL2. In the web app, configure authorized GitHub
 repositories for your workspace and pair Pi with that workspace, then run:
-  pnpm connect --server https://workspace.example --pairing-id PAIRING_ID
+  npx pistead@latest connect --server https://pistead.com --pairing-id PAIRING_ID
 The pairing code is requested privately on a terminal, never as an argument.
 Subsequent runs use the private saved connector token.
 Pairing keeps Pi runtime access private to you; sharing it with teammates is opt-in.
@@ -151,12 +149,4 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     await connector.stop();
     if (pairing) pairing.code = "";
   }
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  void connectMain().catch(() => {
-    // SDK/HTTP errors can contain auth/config detail. Never log their raw text.
-    process.stderr.write("Connector failed. Check --help, private state permissions, pairing, local Pi configuration and Linux sandbox prerequisites.\n");
-    process.exitCode = 1;
-  });
 }

@@ -25,15 +25,15 @@ export function Profile({ user, onSave }: { user: UserProfile; onSave: (user: Us
     }, "Profile saved. New sessions use your configured identity.");
   }
   return <>
-    <PageHeading number="05" title="Your signature.">The identity behind your work. Sessions you own act with your Git and GitHub identity.</PageHeading>
+    <PageHeading title="Profile">The identity behind your work. Sessions you own act with your Git and GitHub identity.</PageHeading>
     <div className="split-layout"><form className="section" onSubmit={submit}>
-      <div className="section-heading"><span className="section-number">01</span><h2>Identity</h2></div>
+      <div className="section-heading"><h2>Identity</h2></div>
       <div className="form-grid">
         <label className="field field-wide">Display name<input required maxLength={120} value={displayName} onChange={event => setDisplayName(event.target.value)} autoComplete="name" /></label>
         <label className="field">Git author name<input required maxLength={120} value={gitName} onChange={event => setGitName(event.target.value)} /></label>
         <label className="field">Git author email<input required type="email" value={gitEmail} onChange={event => setGitEmail(event.target.value)} autoComplete="email" /></label>
       </div>
-      <div className="section-heading"><span className="section-number">02</span><h2>Application environment</h2></div>
+      <div className="section-heading"><h2>Application environment</h2></div>
       <p className="muted">Only APP_ variables are allowed. Do not put GitHub tokens, provider keys, or other credentials here. Model credentials belong in Pi on your local host, not here. These nonsecret variables are sent to the host of sessions you own.</p>
       {rows.map((row, index) => <div className="env-row" key={row.id}>
         <label className="field">Variable {index + 1}<input required pattern="APP_[A-Z0-9_]+" placeholder="APP_PROJECT" value={row.key} onChange={event => setRows(current => current.map(item => item.id === row.id ? { ...item, key: event.target.value } : item))} autoComplete="off" spellCheck={false} /></label>

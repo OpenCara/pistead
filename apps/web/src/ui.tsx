@@ -62,8 +62,8 @@ export function ResourceState({ loading, error, retry, children }: { loading: bo
   return <>{children}</>;
 }
 
-export function PageHeading({ number, title, children, actions }: { number: string; title: string; children: ReactNode; actions?: ReactNode }) {
-  return <header className="page-heading"><div><p className="eyebrow">{number} / The workshop</p><h1>{title}</h1><p className="lead">{children}</p></div>{actions && <div className="heading-actions">{actions}</div>}</header>;
+export function PageHeading({ eyebrow, title, children, actions }: { eyebrow?: string; title: string; children: ReactNode; actions?: ReactNode }) {
+  return <header className="page-heading"><div>{eyebrow && <p className="eyebrow">{eyebrow}</p>}<h1>{title}</h1><p className="lead">{children}</p></div>{actions && <div className="heading-actions">{actions}</div>}</header>;
 }
 
 export function Empty({ title, children }: { title: string; children: ReactNode }) {

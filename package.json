@@ -1,5 +1,5 @@
 {
-  "name": "@opencara/agent-workspace",
+  "name": "@opencara/pistead",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,8 +9,9 @@
     "dev": "vite --config apps/web/vite.config.ts",
     "dev:worker": "wrangler dev --config apps/worker/wrangler.jsonc",
     "dev:runner": "node --env-file-if-exists=apps/runner/.env --import tsx apps/runner/src/index.ts",
-    "connect": "node --import tsx apps/runner/src/connect-cli.ts",
+    "connect": "node --import tsx packages/cli/src/pistead.ts connect",
     "build": "vite build --config apps/web/vite.config.ts",
+    "build:cli": "pnpm --filter pistead run build",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:integration": "node --import tsx tests/integration.ts",

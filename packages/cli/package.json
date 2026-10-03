@@ -1,0 +1,27 @@
+{
+  "name": "pistead",
+  "version": "0.1.0",
+  "description": "Connect your Linux or WSL2 Pi host to a Pistead workspace.",
+  "license": "MIT",
+  "homepage": "https://pistead.com",
+  "keywords": ["pistead", "pi", "agent", "connector"],
+  "type": "module",
+  "bin": { "pistead": "dist/pistead.js" },
+  "files": ["dist"],
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "build": "esbuild src/pistead.ts --bundle --platform=node --format=esm --target=node24 --packages=external --outfile=dist/pistead.js --banner:js=\"#!/usr/bin/env node\"",
+    "prepublishOnly": "pnpm run build"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
+    "hono": "4.12.8",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

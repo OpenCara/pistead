@@ -235,7 +235,7 @@ async function githubCallback(c: AppContext) {
     fail(502, 'github_error', 'GitHub authentication could not be completed.');
   }
   const headers = { Accept: 'application/vnd.github+json', Authorization: `Bearer ${exchange.access_token}`,
-    'User-Agent': 'agent-workspace', 'X-GitHub-Api-Version': '2022-11-28' };
+    'User-Agent': 'pistead', 'X-GitHub-Api-Version': '2022-11-28' };
   const identity = await githubJson('https://api.github.com/user', { headers });
   const emails = await githubJson('https://api.github.com/user/emails?per_page=100', { headers });
   if (!record(identity) || typeof identity.id !== 'number' || !Number.isSafeInteger(identity.id) || identity.id <= 0 ||
