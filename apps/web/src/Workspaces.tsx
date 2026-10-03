@@ -1,14 +1,27 @@
 import { useState, type FormEvent } from "react";
-import type { UserProfile, Workspace, WorkspaceRole } from "../../../packages/shared/src/types";
+import type { AgentVersion, SessionRecord, UserProfile, Workspace, WorkspaceRole } from "../../../packages/shared/src/types";
 import type { WorkspaceRepository } from "../../../packages/shared/src/repositories";
 import { WorkspaceRepositories } from "./WorkspaceRepositories";
-import { WorkspaceConnections } from "./Connections";
+import { useConnections } from "./Connections";
 import { api, segment } from "./api";
-import { Empty, Feedback, PageHeading, ResourceState, useAction, useResource } from "./ui";
+import { Checklist, Details, Empty, Feedback, PageHeading, ResourceState, useAction, useResource } from "./ui";
 
 interface Member { userId: string; role: WorkspaceRole; displayName?: string; githubLogin?: string | null }
 
 export function Workspaces({ user, workspaces, workspace, refresh, select }: { user: UserProfile; workspaces: Workspace[]; workspace: Workspace | null; refresh: () => void; select: (id: string) => void }) {
+  const [creating, setCreating] = useState(false);
+  if (workspaces.length === 0) return <>
+    <PageHeading title="Workspaces">A shared home for your repositories, people, agents and sessions.</PageHeading>
+    <section className="section"><div className="empty-state"><h3>Create your first workspace</h3><p>Name it, then bind a repository and connect your Pi.</p><CreateWorkspace refresh={refresh} select={select} /></div></section>
+  </>;
+  return <>
+    <PageHeading title={workspace?.name ?? "Workspaces"} actions={!creating && <button type="button" className="button secondary small" onClick={() => setCreating(true)}>New workspace</button>}>Set up repositories and people for this workspace.</PageHeading>
+    {creating && <section className="section" aria-label="New workspace"><div className="section-heading"><h2>New workspace</h2></div><CreateWorkspace refresh={refresh} select={select} close={() => setCreating(false)} /></section>}
+    {workspace ? <WorkspaceHome key={workspace.id} user={user} workspace={workspace} /> : <section className="section"><Empty title="No workspace selected">Choose a workspace from the workspace menu.</Empty></section>}
+  </>;
+}
+
+function CreateWorkspace({ refresh, select, close }: { refresh: () => void; select: (id: string) => void; close?: () => void }) {
   const [name, setName] = useState("");
   const action = useAction();
   function create(event: FormEvent) {
@@ -18,24 +31,34 @@ export function Workspaces({ user, workspaces, workspace, refresh, select }: { u
       setName("");
       select(result.workspace.id);
       refresh();
-    }, "Workspace created. Next, bind at least one GitHub repository below.");
+      close?.();
+    }, "Workspace created. Next, bind a GitHub repository.");
   }
-  return <>
-    <PageHeading title="Workspaces">A place for people, private or published agents, and workspace-visible sessions. Members can follow those sessions read-only; additional session permissions require explicit grants.</PageHeading>
-    <ol className="setup-steps" aria-label="Workspace setup"><li><strong>Create a workspace</strong><span>Choose the people and place.</span></li><li><strong>Bind repositories</strong><span>An owner or admin chooses GitHub source.</span></li><li><strong>Connect Pi</strong><span>Pair your Pi for your own use. Sharing stays optional.</span></li><li><strong>Run a private agent</strong><span>Create an agent using your Pi model and run it without publishing. Keep the default workspace-visible session for members to follow read-only.</span></li></ol>
-    <div className="split-layout"><section className="section">
-      <div className="section-heading"><h2>Your workspaces</h2><span className="badge">{workspaces.length}</span></div>
-      {workspaces.length === 0 ? <Empty title="Start a workshop">Create a workspace, bind repositories, and connect your private Pi. You can run your own agent without publishing or sharing the host.</Empty> : <div className="row-list">{workspaces.map(item => <div className="list-row" key={item.id}><div className="row-main"><h3>{item.name}</h3><p className="metadata">{item.role ?? (item.ownerId === user.id ? "owner" : "member")}</p></div><button className={`button ${workspace?.id === item.id ? "primary" : "secondary"} small`} onClick={() => select(item.id)} aria-pressed={workspace?.id === item.id}>{workspace?.id === item.id ? "Selected" : "Select workspace"}</button></div>)}</div>}
-    </section><aside className="rail"><h2>Create a workspace</h2><form onSubmit={create}><label className="field">Workspace name<input required maxLength={120} value={name} onChange={event => setName(event.target.value)} placeholder="The field studio" /></label><Feedback {...action} /><button className="button primary" disabled={action.busy || !name.trim()}>{action.busy ? "Creating..." : "Create workspace"}</button></form></aside></div>
-    {workspace && <WorkspaceSettings key={workspace.id} user={user} workspace={workspace} />}
-  </>;
+  return <form onSubmit={create}><label className="field">Workspace name<input required maxLength={120} value={name} onChange={event => setName(event.target.value)} placeholder="The field studio" /></label><Feedback {...action} /><div className="actions"><button className="button primary" disabled={action.busy || !name.trim()}>{action.busy ? "Creating..." : "Create workspace"}</button>{close && <button type="button" className="button secondary" disabled={action.busy} onClick={close}>Cancel</button>}</div></form>;
 }
 
-function WorkspaceSettings({ user, workspace }: { user: UserProfile; workspace: Workspace }) {
+function WorkspaceHome({ user, workspace }: { user: UserProfile; workspace: Workspace }) {
   const admin = workspace.ownerId === user.id || workspace.role === "admin" || workspace.role === "owner";
   const repositories = useResource<{ repositories: WorkspaceRepository[] }>(`/api/workspaces/${segment(workspace.id)}/repositories`);
-  const configured = !repositories.loading && !repositories.error && Boolean(repositories.data?.repositories.length);
-  return <><WorkspaceRepositories workspace={workspace} user={user} admin={admin} repositories={repositories.data?.repositories ?? null} loading={repositories.loading} error={repositories.error} refresh={repositories.refresh} /><div className="split-layout"><WorkspaceConnections workspace={workspace} user={user} configured={configured} /><Members workspace={workspace} admin={admin} /></div></>;
+  const connectors = useConnections(`/api/workspaces/${segment(workspace.id)}/connectors`);
+  const agents = useResource<{ agents: AgentVersion[] }>("/api/agents");
+  const sessions = useResource<{ sessions: SessionRecord[] }>("/api/sessions");
+  const steps = [
+    { label: "Bind a GitHub repository", done: Boolean(repositories.data?.repositories.length), detail: admin ? undefined : "An owner or admin does this.", action: <button type="button" className="button secondary small" onClick={() => document.getElementById("workspace-repositories")?.scrollIntoView({ behavior: "smooth" })}>Go to repositories</button> },
+    { label: "Connect a Pi", done: Boolean(connectors.data?.connectors.some(connector => !connector.revokedAt && connector.online && (connector.ownerId === user.id || connector.workspaceIds.includes(workspace.id)))), action: <a className="button secondary small" href="#connections">Connect</a> },
+    { label: "Create an agent", done: Boolean(agents.data?.agents.length), action: <a className="button secondary small" href="#agents">Create</a> },
+    { label: "Start a session", done: Boolean(sessions.data?.sessions.some(session => session.workspaceId === workspace.id)), action: <a className="button secondary small" href="#agents">Start</a> },
+  ];
+  const complete = steps.every(step => step.done);
+  return <>
+    <section className="section" aria-label="Workspace setup">
+      {complete ? <><div className="section-heading"><h2>Ready to work</h2><span className="badge success">Setup complete</span></div><Details summary="Setup"><Checklist items={steps} /></Details></> : <><div className="section-heading"><h2>Get started</h2><span className="badge">{steps.filter(step => step.done).length} / {steps.length}</span></div><Checklist items={steps} /></>}
+    </section>
+    <div className="split-layout">
+      <WorkspaceRepositories workspace={workspace} user={user} admin={admin} repositories={repositories.data?.repositories ?? null} loading={repositories.loading} error={repositories.error} refresh={repositories.refresh} />
+      <Members workspace={workspace} admin={admin} />
+    </div>
+  </>;
 }
 
 function Members({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
@@ -50,11 +73,16 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
       await api(path, { method: "POST", body: { userId: userId.trim(), role } });
       setUserId("");
       resource.refresh();
-    }, "Membership saved. Members can view workspace-visible sessions read-only; further session permissions require explicit grants.");
+    }, "Membership saved.");
   }
-  return <section className="section"><div className="section-heading"><h2>People in {workspace.name}</h2></div><p className="muted">Membership gives access to published agents and read-only access to workspace-visible sessions. Private sessions require explicit grants. Workspace-visible sessions expose prompts, tool output and repository content shown in the transcript, not direct GitHub access or tool execution. Membership alone does not grant ask, write, approve or manage permissions, or use of private Pi hosts.</p>
-    <ResourceState {...resource} retry={resource.refresh}>{resource.data?.members.length === 0 && <Empty title="No members to display">Workspace membership is managed by the owner and admins.</Empty>}<div className="row-list">{resource.data?.members.map(member => <div className="list-row" key={member.userId}><div className="row-main"><h3>{member.displayName || member.githubLogin || member.userId}</h3><p className="metadata">{member.role} / {member.userId}</p></div>{admin && member.userId !== workspace.ownerId && <button className="button danger small" disabled={action.busy} onClick={() => { if (window.confirm(`Remove ${member.displayName || member.userId} from this workspace?`)) void action.run(async () => { await api(`${path}/${segment(member.userId)}`, { method: "DELETE" }); resource.refresh(); }, "Membership removed."); }}>Remove</button>}</div>)}</div></ResourceState>
-    {admin ? <form onSubmit={save}><h3>Add or update a member</h3><div className="inline-fields"><label className="field">User ID<input required value={userId} onChange={event => setUserId(event.target.value)} placeholder="Copy from their Profile" /></label><label className="field">Role<select value={role} onChange={event => setRole(event.target.value as "member" | "admin")}><option value="member">Member</option><option value="admin">Admin</option></select></label></div><button className="button secondary" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save membership"}</button></form> : <p className="muted">Only workspace owners and admins can manage membership.</p>}
+  return <section className="section"><div className="section-heading"><h2>Members</h2>{resource.data && <span className="badge">{resource.data.members.length}</span>}<button type="button" className="button secondary small" disabled={resource.loading} onClick={resource.refresh}>Refresh</button></div>
+    <ResourceState {...resource} retry={resource.refresh}>{resource.data?.members.length === 0 ? <Empty title="No members to display">Owners and admins manage membership.</Empty> : <div className="row-list">{resource.data?.members.map(member => <div className="list-row" key={member.userId}><div className="row-main"><h3>{member.displayName || member.githubLogin || member.userId}</h3><p className="metadata"><span className={`badge${member.role === "member" ? "" : " success"}`}>{member.role}</span></p></div>{admin && member.userId !== workspace.ownerId && <button className="button danger small" disabled={action.busy} onClick={() => { if (window.confirm(`Remove ${member.displayName || member.userId} from this workspace?`)) void action.run(async () => { await api(`${path}/${segment(member.userId)}`, { method: "DELETE" }); resource.refresh(); }, "Membership removed."); }}>Remove</button>}</div>)}</div>}</ResourceState>
     <Feedback {...action} />
+    {admin && <Details summary="Add or update a member"><form onSubmit={save}><div className="inline-fields"><label className="field">User ID<input required value={userId} onChange={event => setUserId(event.target.value)} placeholder="Copy from their Profile" /></label><label className="field">Role<select value={role} onChange={event => setRole(event.target.value as "member" | "admin")}><option value="member">Member</option><option value="admin">Admin</option></select></label></div><button className="button secondary" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save membership"}</button></form></Details>}
+    <Details summary="What membership allows">
+      {!admin && <p>Only workspace owners and admins can manage membership.</p>}
+      <p>Members can use published agents and follow workspace-visible sessions read-only, which shows prompts, tool output and repository content in the transcript. Private sessions, and ask, write, approve or manage permissions, require explicit grants.</p>
+      <p>Membership never grants GitHub access, tool execution, or use of anyone's private Pi host.</p>
+    </Details>
   </section>;
 }

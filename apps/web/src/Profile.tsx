@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import type { UserProfile } from "../../../packages/shared/src/types";
 import { api } from "./api";
-import { Feedback, PageHeading, useAction } from "./ui";
+import { CopyButton, Details, Feedback, PageHeading, useAction } from "./ui";
 
 type EnvRow = { id: string; key: string; value: string };
 
@@ -25,7 +25,7 @@ export function Profile({ user, onSave }: { user: UserProfile; onSave: (user: Us
     }, "Profile saved. New sessions use your configured identity.");
   }
   return <>
-    <PageHeading title="Profile">The identity behind your work. Sessions you own act with your Git and GitHub identity.</PageHeading>
+    <PageHeading title="Profile">Your name, Git identity and session environment.</PageHeading>
     <div className="split-layout"><form className="section" onSubmit={submit}>
       <div className="section-heading"><h2>Identity</h2></div>
       <div className="form-grid">
@@ -34,7 +34,8 @@ export function Profile({ user, onSave }: { user: UserProfile; onSave: (user: Us
         <label className="field">Git author email<input required type="email" value={gitEmail} onChange={event => setGitEmail(event.target.value)} autoComplete="email" /></label>
       </div>
       <div className="section-heading"><h2>Application environment</h2></div>
-      <p className="muted">Only APP_ variables are allowed. Do not put GitHub tokens, provider keys, or other credentials here. Model credentials belong in Pi on your local host, not here. These nonsecret variables are sent to the host of sessions you own.</p>
+      <p className="muted">Nonsecret APP_ variables only. Never put tokens or keys here.</p>
+      <Details summary="Where these variables go"><p>They are sent to the host of every session you own. GitHub tokens, provider keys and other credentials must never go here; model credentials belong in Pi on your local host.</p></Details>
       {rows.map((row, index) => <div className="env-row" key={row.id}>
         <label className="field">Variable {index + 1}<input required pattern="APP_[A-Z0-9_]+" placeholder="APP_PROJECT" value={row.key} onChange={event => setRows(current => current.map(item => item.id === row.id ? { ...item, key: event.target.value } : item))} autoComplete="off" spellCheck={false} /></label>
         <label className="field">Value<input value={row.value} onChange={event => setRows(current => current.map(item => item.id === row.id ? { ...item, value: event.target.value } : item))} autoComplete="off" /></label>
@@ -43,6 +44,8 @@ export function Profile({ user, onSave }: { user: UserProfile; onSave: (user: Us
       <div className="actions"><button type="button" className="button secondary" onClick={() => setRows(current => [...current, { id: crypto.randomUUID(), key: "APP_", value: "" }])}>Add variable</button></div>
       <Feedback {...action} />
       <div className="actions"><button className="button primary" disabled={action.busy}>{action.busy ? "Saving..." : "Save profile"}</button></div>
-    </form><aside className="rail"><p className="eyebrow">Connected identity</p><h2>{user.githubLogin ? `@${user.githubLogin}` : user.displayName}</h2><p><span className={`badge ${user.githubConnected ? "success" : "warning"}`}>{user.githubConnected ? "GitHub connected" : "GitHub not connected"}</span></p>{!user.githubConnected && <a className="button secondary" href="/api/auth/github">Connect GitHub</a>}<p>Your login and user ID are managed by the server. Workspace members can view workspace-visible sessions read-only, including prompts, tool output and repository content shown in the transcript. Viewing grants neither direct GitHub access nor tool execution; further session permissions require explicit grants. Neither viewing a session, sharing a Pi nor publishing an agent replaces the session owner's identity or grants GitHub access.</p><p className="mono">User ID<br />{user.id}</p></aside></div>
+    </form><aside className="rail"><p className="eyebrow">Connected identity</p><h2>{user.githubLogin ? `@${user.githubLogin}` : user.displayName}</h2><p><span className={`badge ${user.githubConnected ? "success" : "warning"}`}>{user.githubConnected ? "GitHub connected" : "GitHub not connected"}</span></p>{!user.githubConnected && <a className="button secondary" href="/api/auth/github">Connect GitHub</a>}<p className="metadata">User ID: <code>{user.id}</code> <CopyButton value={user.id} /></p>
+      <Details summary="How your identity is used"><p>Your login and user ID are managed by the server. Sessions you own act with your Git and GitHub identity. Members can view workspace-visible sessions read-only (prompts, tool output and repository content in the transcript) without direct GitHub access or tool execution; more requires explicit session grants. Viewing a session, sharing a Pi or publishing an agent never replaces the session owner's identity or grants GitHub access.</p></Details>
+    </aside></div>
   </>;
 }

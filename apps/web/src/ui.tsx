@@ -74,3 +74,28 @@ export function Timestamp({ value }: { value: string }) {
   const date = new Date(value);
   return <time dateTime={value} className="mono">{Number.isNaN(date.getTime()) ? value : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</time>;
 }
+
+/** Collapsed secondary content: explanations, policies and advanced controls. */
+export function Details({ summary, children, open = false }: { summary: ReactNode; children: ReactNode; open?: boolean }) {
+  return <details className="details" open={open}><summary>{summary}</summary><div className="details-body">{children}</div></details>;
+}
+
+export function CopyButton({ value, label = "Copy" }: { value: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  return <button type="button" className="button secondary small" onClick={() => void navigator.clipboard.writeText(value).then(() => setCopied(true))}>{copied ? "Copied" : label}</button>;
+}
+
+/** A command or secret with a copy action; text stays selectable for manual copying. */
+export function CopyField({ value, label }: { value: string; label?: string }) {
+  return <div className="copy-field"><code>{value}</code><CopyButton value={value} label={label} /></div>;
+}
+
+/** Progress list for multi-step setup; each item links to where the step is done. */
+export function Checklist({ items }: { items: { label: string; done: boolean; detail?: ReactNode; action?: ReactNode }[] }) {
+  return <ol className="checklist">{items.map(item => <li key={item.label} className={item.done ? "done" : ""}><span className="check" aria-hidden="true">{item.done ? "✓" : ""}</span><div><strong>{item.label}</strong>{item.detail && <span className="metadata">{item.detail}</span>}</div>{!item.done && item.action}<span className="visually-hidden">{item.done ? "Done" : "Not done"}</span></li>)}</ol>;
+}

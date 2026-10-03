@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import type { ApprovalRecord, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
+import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage, segment } from "./api";
-import { Empty, Feedback, PageHeading, Timestamp, useAction } from "./ui";
+import { CopyField, Details, Empty, Feedback, PageHeading, Timestamp, useAction } from "./ui";
 import { SessionHost } from "./SessionHost";
 import { SessionControls } from "./SessionControls";
 import { SessionRepositories } from "./SessionRepositories";
@@ -83,6 +83,19 @@ function useLiveSession(id: string) {
   return { session, view, error, status, refresh, reconnect };
 }
 
+const toolCall = /^([a-z_]+)\(.*\)$/s;
+
+/** User and assistant messages render as chat bubbles; system, tool calls and tool results collapse to one row. */
+function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
+  const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
+  const call = entry.role === "assistant" ? toolCall.exec(entry.text.trim()) : null;
+  if (call || entry.role === "system" || entry.role === "toolResult") {
+    const label = call ? `Tool · ${call[1]}` : entry.role === "toolResult" ? "Tool result" : "System";
+    return <article className="entry" data-role={entry.role}><Details summary={<>{label}{actor && <> · {actor}</>}</>}><pre>{entry.text}</pre></Details></article>;
+  }
+  return <article className="entry" data-role={entry.role}><header className="entry-header"><span title={entry.kind}>{entry.role}</span>{actor && <span title={entry.actorId}>{entry.actorId === userId ? "by you" : `by ${entry.actorId}`}</span>}</header><div className="entry-body">{entry.text}</div></article>;
+}
+
 export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }: { id: string; user: UserProfile; goBack: () => void; openSession: (id: string) => void; selectWorkspace: (id: string) => void }) {
   const live = useLiveSession(id);
   const [mode, setMode] = useState<"write" | "ask">("write");
@@ -106,6 +119,7 @@ export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }
   const conversations = view?.conversations ?? [];
   const sideConversations = conversations.filter(item => item.mode === "ask" && (!item.actorId || item.actorId === user.id));
   const entries = view?.entries.filter(entry => {
+    if (entry.role === "system" && !entry.text.trim()) return false;
     const conversation = conversations.find(item => item.id === entry.conversationId);
     if (actualMode === "ask") return conversation?.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || entry.conversationId === conversationId);
     return conversation?.mode !== "ask";
@@ -138,37 +152,65 @@ export function SessionDetail({ id, user, goBack, openSession, selectWorkspace }
       live.refresh();
     }, decision === "approve" ? "Approval decision recorded." : "Operation denied.");
   }
+  const session = live.session;
+  const pendingApprovals = view?.approvals.filter(approval => approval.status === "pending") ?? [];
+  const decidedApprovals = view?.approvals.filter(approval => approval.status !== "pending") ?? [];
+  const queueStatus = activeQueue.length ? `${activeQueue.length} submission${activeQueue.length === 1 ? "" : "s"} queued or running` : view?.busy ? "Work is running" : "Queue is empty";
+  const unsandboxedWarning = session?.hostUnsandboxed && (canWrite || canApprove) && <p className="notice danger">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</p>;
+  const approvalCard = (approval: ApprovalRecord) => <article className="approval" key={approval.id}><div className="section-heading"><h3>{approval.operation.kind}</h3><span className={`badge ${approval.status === "pending" ? "warning" : ""}`}>{approval.status}</span></div><pre className="operation">{JSON.stringify(approval.operation, null, 2)}</pre><p className="metadata">Requested by {approval.requestedBy} / <Timestamp value={approval.createdAt} /></p>{approval.decidedBy && <p className="metadata">Decision by {approval.decidedBy}</p>}{approval.result && <pre>{approval.result}</pre>}{approval.status === "pending" && (canApprove ? <>{!approval.reviewHash && <div className="notice"><p>This approval has no verified review commitment. Refresh before deciding; the server must bind the displayed operation and requester.</p><button className="button secondary small" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</button></div>}<div className="actions"><button className="button primary small" disabled={approvalAction.busy || !approval.reviewHash} onClick={() => decide(approval, "approve")}>Approve exact operation</button><button className="button danger small" disabled={approvalAction.busy || !approval.reviewHash} onClick={() => decide(approval, "deny")}>Deny</button></div></> : <p className="muted">Waiting for an authorized approver.</p>)}</article>;
+  const sidebar = session && <aside className="session-sidebar">
+    <SessionHost session={session} user={user} />
+    <SessionRepositories session={session} refresh={live.refresh} selectWorkspace={selectWorkspace} />
+    <SessionControls session={session} user={user} onChange={live.refresh} busy={!view || Boolean(live.error) || view.busy || activeQueue.length > 0} openSession={openSession} />
+  </aside>;
   return <>
-    <PageHeading eyebrow="Session" title={live.session?.title ?? "Opening the session."} actions={<button className="button secondary" onClick={goBack}>Back to sessions</button>}>Shared work has a clear owner. Every permission is checked by the server.</PageHeading>
+    <PageHeading eyebrow="Session" title={session?.title ?? "Opening the session."} actions={<button className="button secondary" onClick={goBack}>Back to sessions</button>}>{view ? `Runs as ${view.owner.displayName}${isOwner ? " (you)" : ""}. The server checks every action.` : "The server checks every action."}</PageHeading>
+    {session && <div className="actions" aria-label="Session status">
+      <span className="badge">{isOwner ? "Owner" : viewerOnly ? "Viewer" : "Collaborator"}</span>
+      <span className="badge">{session.visibility === "workspace" ? "Workspace-visible" : "Private"}</span>
+      <span className={`stream-status ${live.status}`} role="status">{live.status === "online" ? "Live" : live.status === "reconnecting" ? "Reconnecting automatically" : live.status === "offline" ? "Disconnected" : "Connecting"}</span>
+    </div>}
     <Feedback error={live.error} />
     {live.error && <div className="actions"><button className="button secondary" onClick={live.reconnect}>Reconnect and check access</button></div>}
     {!view && !live.error && <p className="loading" role="status">Loading identity and committed history...</p>}
-    {live.session && <section className="notice" aria-label="Session viewing access">
-      <p><strong>{live.session.visibility === "workspace" ? "Workspace-visible" : "Private"}</strong> / {isOwner ? "Session owner" : viewerOnly ? "Viewer-only access" : "Granted collaborator access"}</p>
-      <p>{live.session.visibility === "workspace"
-        ? "All workspace members can view this session's existing and future prompts and output, including tool output, repository content shown in the transcript, and side asks. Workspace viewing does not grant ask, write, approve, or manage permissions."
-        : "Only the owner and workspace members with explicit session grants can view this session's prompts and output."}</p>
-      {viewerOnly && <p>You can follow committed work, but cannot ask questions, submit work, approve operations, manage grants, change visibility, or access backups.</p>}
-      <p className="metadata">Workspace viewing does not grant direct GitHub access or permission to run tools. Only the owner can change visibility. Session visibility is separate from private host sharing and agent publication.</p>
-    </section>}
-    {!view && live.session && <SessionHost session={live.session} user={user} />}
-    {!view && live.session && <SessionControls session={live.session} user={user} onChange={live.refresh} busy openSession={openSession} />}
-    {!view && live.session && <SessionRepositories session={live.session} refresh={live.refresh} selectWorkspace={selectWorkspace} />}
-    {view && live.session && <>
-      <section className="owner-banner" aria-label="Session owner identity"><div><p className="eyebrow">Acts as owner</p><h2>{view.owner.displayName}</h2><p>{view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} <span aria-hidden="true">/</span> {view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</p></div><div><span className="badge">{isOwner ? "You own this session" : viewerOnly ? "You are a read-only viewer" : "You are a collaborator"}</span><p className="mono">Your permissions: {permissions.join(" / ") || "none"}</p><p className="metadata">Session ID: {id}</p></div></section>
-      <div className="session-layout"><div className="session-main"><section className="section"><div className="section-heading"><h2>Committed conversation</h2><span className={`stream-status ${live.status}`} role="status">{live.status === "online" ? "Live" : live.status === "reconnecting" ? "Reconnecting automatically" : live.status === "offline" ? "Disconnected" : "Connecting"}</span></div>
-        <div className="mode-tabs" role="group" aria-label="Conversation mode"><button className={actualMode === "write" ? "active" : ""} aria-pressed={actualMode === "write"} onClick={() => setMode("write")}>Shared conversation</button>{canAsk && <button className={actualMode === "ask" ? "active" : ""} aria-pressed={actualMode === "ask"} onClick={() => setMode("ask")}>My side ask</button>}</div>
-        <p className="muted">{actualMode === "ask" ? "A read-only side conversation, not a private channel: authorized session readers, including workspace members when workspace-visible, may access its prompts and output. Asking cannot write files or invoke the main session's tools." : canWrite ? "Your submissions continue the shared session using the owner's identity and allowed tools." : "You can follow committed work, but submitting to the shared conversation requires write permission."}</p>
-        {actualMode === "write" && !canWrite && canAsk && <div className="notice"><p>You can ask questions in a read-only side conversation.</p><button className="button secondary small" onClick={() => setMode("ask")}>Open my side ask</button></div>}
+    {session && <Details summary="Access and identity">
+      {view && <p>Work runs as <strong>{view.owner.displayName}</strong> ({view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "no GitHub login connected"}), committing as {view.owner.gitName} &lt;{view.owner.gitEmail}&gt;.</p>}
+      <p>Your permissions: <strong>{permissions.join(", ") || "none"}</strong>.{viewerOnly ? " You can follow committed work but can't ask, submit, approve, manage grants, change visibility, or use backups." : ""}</p>
+      <p>{session.visibility === "workspace"
+        ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
+        : "Private: only the owner and members with a session grant can view prompts and output."} Viewing doesn't grant ask, write, approve or manage permissions, GitHub access, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>
+      <p className="metadata">Session ID</p>
+      <CopyField value={id} />
+    </Details>}
+    {!view && sidebar}
+    {view && session && <div className="session-layout"><div className="session-main">
+      <Feedback {...approvalAction} />
+      {pendingApprovals.length > 0 && <section className="section" aria-label="Pending approvals">
+        <div className="section-heading"><h2>Waiting for approval</h2><span className="badge warning">{pendingApprovals.length} pending</span></div>
+        <p className="muted">{canApprove ? "Each approval covers one exact operation and its arguments." : "Only collaborators with approve permission can decide."}</p>
+        {unsandboxedWarning}
+        <div className="approval-list">{pendingApprovals.map(approvalCard)}</div>
+      </section>}
+      <section className="section" aria-label="Conversation">
+        <div className="section-heading"><h2>Conversation</h2></div>
+        {canAsk && <div className="mode-tabs" role="group" aria-label="Conversation mode"><button className={actualMode === "write" ? "active" : ""} aria-pressed={actualMode === "write"} onClick={() => setMode("write")}>Shared conversation</button><button className={actualMode === "ask" ? "active" : ""} aria-pressed={actualMode === "ask"} onClick={() => setMode("ask")}>My side ask</button></div>}
+        {actualMode === "ask" && <p className="muted">Read-only: can't change files or run tools. Anyone who can view this session can see side asks.</p>}
+        {actualMode === "write" && !canWrite && (canAsk
+          ? <div className="notice"><p>You can ask questions in a read-only side conversation.</p><button className="button secondary small" onClick={() => setMode("ask")}>Open my side ask</button></div>
+          : <p className="muted">You can follow along; submitting needs write permission.</p>)}
         {actualMode === "ask" && sideConversations.length > 0 && <label className="field">Side conversation<select value={conversationId} onChange={event => setConversationId(event.target.value)}><option value="">All my side asks</option>{sideConversations.map((conversation, index) => <option value={conversation.id} key={conversation.id}>Side ask {index + 1} / {conversation.id.slice(0, 8)}</option>)}</select></label>}
-        <div className="transcript" aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>{!entries.length ? <Empty title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it." : "Committed messages and tool results will appear here."}</Empty> : entries.map(entry => <article className="entry" data-role={entry.role} key={entry.id}><header className="entry-header"><span>{entry.role}</span><span>{entry.kind}</span>{entry.actorId && <span title={entry.actorId}>Initiated by {entry.actorId === user.id ? "you" : entry.actorId}</span>}</header><div className="entry-body">{entry.text}</div></article>)}</div>
-        <section className="submission-queue" aria-label="Live submissions"><div className="section-heading"><h3>Live submissions</h3><button type="button" className="button secondary small" onClick={live.refresh}>Refresh queue</button></div><p className="metadata">Write submissions and read-only side asks share a durable FIFO queue. Permissions are checked again before work runs.</p><p role="status" aria-live="polite">{activeQueue.length ? `${activeQueue.length} submission${activeQueue.length === 1 ? "" : "s"} in the latest queue view.` : view.busy ? "Session work is active; waiting for the next queue update." : "No queued work in the latest view."}</p>{Boolean(activeQueue.length) && <ol className="queue-list">{activeQueue.map((item, index) => <li key={item.submissionId}><div className="section-heading"><strong>{index + 1}. {item.mode === "ask" ? "Read-only side ask" : "Shared submission"}</strong><span className="badge">{item.status}</span></div><p>Submitted by {item.actorId === user.id ? "you" : item.actorId}</p><p className="metadata">Receipt: {item.submissionId}</p></li>)}</ol>}{recentSubmissions.length > 0 && <details><summary>Recent submission outcomes</summary><ul className="queue-list">{recentSubmissions.map(item => <li key={item.submissionId}><strong>{item.status}</strong> / {item.mode === "ask" ? "Side ask" : "Shared submission"}<p className="metadata">By {item.actorId === user.id ? "you" : item.actorId} / Receipt: {item.submissionId}</p></li>)}</ul></details>}{live.error && <p className="notice">This is the last received queue view; live host status is not confirmed.</p>}</section>
-        {view.busy && <p className="notice" role="status">Work is queued or running. You can leave this page; accepted work remains on the host. Progress depends on the host being online and authorized.</p>}
-        {permitted && <form className="composer" onSubmit={submit}><label className="field">{actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}<textarea rows={4} required value={content} onChange={event => setContent(event.target.value)} disabled={submission.busy} placeholder={actualMode === "ask" ? "What would you like to understand?" : "Describe the next step..."} /></label><Feedback {...submission} />{receipt && <p className="notice" role="status">Submission {receipt.status}{receipt.queuePosition !== undefined ? ` / queue position ${receipt.queuePosition}` : ""}. Receipt: <code>{receipt.submissionId}</code>. Committed output appears in the live view.</p>}<div className="actions"><button className="button primary" disabled={submission.busy || !content.trim()}>{submission.busy ? "Submitting..." : actualMode === "ask" ? "Send side ask" : "Submit to session"}</button><span className="metadata">{actualMode === "ask" ? "Read-only branch" : "Runs as session owner"}</span></div></form>}
+        <div className="transcript" aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>{!entries.length ? <Empty title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it." : "Committed messages and tool results will appear here."}</Empty> : entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)}</div>
+        <Details summary={<span role="status" aria-live="polite">{queueStatus}</span>}>
+          <p className="metadata">Submissions and side asks share one queue; permissions are checked again before work runs. You can leave this page: accepted work continues while the host is online and authorized.</p>
+          {live.error && <p className="notice">This is the last received queue view; live host status is not confirmed.</p>}
+          {Boolean(activeQueue.length) && <ol className="queue-list">{activeQueue.map((item, index) => <li key={item.submissionId}><div className="section-heading"><strong>{index + 1}. {item.mode === "ask" ? "Read-only side ask" : "Shared submission"}</strong><span className="badge">{item.status}</span></div><p>Submitted by {item.actorId === user.id ? "you" : item.actorId}</p><p className="metadata">Receipt: {item.submissionId}</p></li>)}</ol>}
+          {recentSubmissions.length > 0 && <><h3>Recent outcomes</h3><ul className="queue-list">{recentSubmissions.map(item => <li key={item.submissionId}><strong>{item.status}</strong> / {item.mode === "ask" ? "Side ask" : "Shared submission"}<p className="metadata">By {item.actorId === user.id ? "you" : item.actorId} / Receipt: {item.submissionId}</p></li>)}</ul></>}
+          <div className="actions"><button type="button" className="button secondary small" onClick={live.refresh}>Refresh queue</button></div>
+        </Details>
+        {actualMode === "write" && canWrite && !pendingApprovals.length && unsandboxedWarning}
+        {permitted && <form className="composer" onSubmit={submit}><label className="field">{actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}<textarea rows={4} required value={content} onChange={event => setContent(event.target.value)} disabled={submission.busy} placeholder={actualMode === "ask" ? "What would you like to understand?" : "Describe the next step..."} /></label><Feedback {...submission} />{receipt && <p className="notice" role="status">Submission {receipt.status}{receipt.queuePosition !== undefined ? ` / queue position ${receipt.queuePosition}` : ""}. Receipt: <code>{receipt.submissionId}</code>.</p>}<div className="actions"><button className="button primary" disabled={submission.busy || !content.trim()}>{submission.busy ? "Submitting..." : actualMode === "ask" ? "Send side ask" : "Submit to session"}</button><span className="metadata">{actualMode === "ask" ? "Read-only branch" : "Runs as session owner"}</span></div></form>}
       </section>
-      <section className="section"><div className="section-heading"><h2>Approval desk</h2><span className="badge">{view.approvals.filter(approval => approval.status === "pending").length} pending</span></div><p className="muted">Approvals bind an exact operation and its arguments. Only collaborators with approve permission can decide.</p>{live.session.hostUnsandboxed && <p className="notice danger">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</p>}<Feedback {...approvalAction} />
-        {!view.approvals.length ? <Empty title="Nothing awaiting a decision">Sensitive operations appear here before execution.</Empty> : <div className="approval-list">{view.approvals.map(approval => <article className="approval" key={approval.id}><div className="section-heading"><h3>{approval.operation.kind}</h3><span className={`badge ${approval.status === "pending" ? "warning" : ""}`}>{approval.status}</span></div><pre className="operation">{JSON.stringify(approval.operation, null, 2)}</pre><p className="metadata">Requested by {approval.requestedBy} / <Timestamp value={approval.createdAt} /></p>{approval.decidedBy && <p className="metadata">Decision by {approval.decidedBy}</p>}{approval.result && <pre>{approval.result}</pre>}{approval.status === "pending" && (canApprove ? <>{!approval.reviewHash && <div className="notice"><p>This approval has no verified review commitment. Refresh before deciding; the server must bind the displayed operation and requester.</p><button className="button secondary small" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</button></div>}<div className="actions"><button className="button primary small" disabled={approvalAction.busy || !approval.reviewHash} onClick={() => decide(approval, "approve")}>Approve exact operation</button><button className="button danger small" disabled={approvalAction.busy || !approval.reviewHash} onClick={() => decide(approval, "deny")}>Deny</button></div></> : <p className="muted">Waiting for an authorized approver.</p>)}</article>)}</div>}
-      </section></div><aside className="session-sidebar"><SessionHost session={live.session} user={user} /><SessionControls session={live.session} user={user} onChange={live.refresh} busy={Boolean(live.error) || view.busy || activeQueue.length > 0} openSession={openSession} /><SessionRepositories session={live.session} refresh={live.refresh} selectWorkspace={selectWorkspace} /></aside></div>
-    </>}
+      {decidedApprovals.length > 0 && <Details summary={`Approval history (${decidedApprovals.length})`}><div className="approval-list">{decidedApprovals.map(approvalCard)}</div></Details>}
+    </div>{sidebar}</div>}
   </>;
 }

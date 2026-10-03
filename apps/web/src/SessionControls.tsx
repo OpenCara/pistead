@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { permissions, type ApprovalRecord, type Operation, type Permission, type SessionGrant, type SessionRecord, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { BackupRestore, type Backup } from "./BackupRestore";
-import { Feedback, ResourceState, Timestamp, useAction, useResource } from "./ui";
+import { Details, Feedback, ResourceState, Timestamp, useAction, useResource } from "./ui";
 
 type Props = {
   session: SessionRecord;
@@ -133,37 +133,25 @@ function Controls({ session, user, onChange, busy = false, openSession }: Props)
   }
 
   return <section aria-label="Session controls">
-    <section className="section">
-      <h2>Session access</h2>
-      <p>Your permissions: {ownPermissions.join(", ") || "None"}.</p>
-      <p className="metadata">Workspace visibility grants read access only. Ask, write, approve, and manage remain separate permissions. The server authorizes every request.</p>
-      {viewerOnly && <p className="notice">Viewer-only access: you can follow prompts and output, but cannot ask, write, approve, manage grants, or change visibility.</p>}
-      <p>Owner: <span className="mono">{session.ownerId}</span> (owner access cannot be changed).</p>
-      {!canManage && <p>Managing explicit grants requires manage permission.</p>}
-      <p>Only the session owner can change visibility or create, list, download, and restore backups, even when another member has manage permission.</p>
-    </section>
-    <section className="section" aria-label="Session visibility">
-      <h2>Visibility: {visibility === "workspace" ? "Workspace-visible" : "Private"}</h2>
+    <Feedback {...action} />
+    {action.busy && <p role="status">Saving request...</p>}
+    <Details summary="People and access">
+      <p>Your permissions: <strong>{ownPermissions.join(", ") || "none"}</strong>{viewerOnly ? " (view only)" : ""}.</p>
+      <h3>Visibility: {visibility === "workspace" ? "Workspace-visible" : "Private"}</h3>
       <p>{visibility === "workspace"
-        ? "All workspace members can view existing and future prompts and output, including tool output, repository content shown in the transcript, and side asks. Viewing alone does not allow asking or controlling this session."
-        : "Only the owner and members with explicit session grants can view prompts and output. Private does not mean owner-only when grants exist."}</p>
-      <p className="metadata">Session visibility does not grant direct GitHub access or permission to run tools. It is separate from private host sharing and agent publication: it does not share the host or publish an agent.</p>
+        ? "All workspace members can view existing and future prompts and output, including tool output and side asks."
+        : "Only the owner and people with a grant can view prompts and output."}</p>
       {isOwner ? <>
-        <p className="notice">{visibility === "workspace"
-          ? "Making this session private removes workspace-wide viewing, but preserves explicit grants. It cannot recall content already viewed or copied."
-          : "Before making this session workspace-visible, review existing prompts and output, including tool output, repository content shown in the transcript, and side asks, for secrets or sensitive information. All workspace members will gain access to existing and future content."}</p>
+        <p className="metadata">{visibility === "workspace"
+          ? "Making it private keeps explicit grants and can't recall content already viewed or copied."
+          : "Before sharing, check existing prompts, tool output and side asks for secrets."}</p>
         <button type="button" className="button secondary" disabled={action.busy} onClick={changeVisibility}>
           {visibility === "workspace" ? "Make private" : "Make workspace-visible"}
         </button>
-      </> : <p>Only the session owner can change visibility. Read access or manage permission does not allow you to change it.</p>}
-    </section>
-    <Feedback {...action} />
-    {canManage && <section className="section">
-        <div className="section-heading"><h2>Session grants</h2><button type="button" className="button secondary small" disabled={grants.loading} onClick={grants.refresh}>Refresh grants</button></div>
-        <p>The user must already be a member of this workspace. Membership grants viewing only when the session is workspace-visible; other permissions require explicit grants.</p>
-        <p className="notice">{visibility === "workspace"
-          ? "Revoking an explicit grant does not stop workspace members from viewing prompts and output. The owner must also make the session private to remove workspace-wide viewing."
-          : "Explicit grants allow access to this private session. If the owner makes it workspace-visible, revoking grants alone will no longer remove member viewing access."}</p>
+      </> : <p className="metadata">Only the session owner can change visibility.</p>}
+      <h3>Grants</h3>
+      {canManage ? <>
+        <div className="actions"><button type="button" className="button secondary small" disabled={grants.loading} onClick={grants.refresh}>Refresh grants</button></div>
         <ResourceState {...grants} retry={grants.refresh}>
           {grants.data && <>
             {!grants.data.grants.length && <p>No explicit member grants.</p>}
@@ -188,46 +176,32 @@ function Controls({ session, user, onChange, busy = false, openSession }: Props)
                     {permission}{!grantable.includes(permission) ? " (not yours to grant)" : ""}
                   </label>)}
                 </fieldset>
-                <p className="metadata">Grant only permissions you hold. Ask, write, approve, and manage each imply read, not one another.</p>
                 {ownerSelected && <p>The owner's grant is immutable.</p>}
-                <button className="button primary" disabled={!grantReady}>Save grant</button>
-                {existing && !ownerSelected && <button type="button" className="button secondary" onClick={revoke}>Revoke grant</button>}
+                <div className="actions">
+                  <button className="button primary" disabled={!grantReady}>Save grant</button>
+                  {existing && !ownerSelected && <button type="button" className="button secondary" onClick={revoke}>Revoke grant</button>}
+                </div>
+                {visibility === "workspace" && <p className="metadata">Revoking a grant doesn't stop workspace members from viewing; make the session private for that.</p>}
               </fieldset>
             </form>
           </>}
         </ResourceState>
-      </section>}
-    {isOwner && <section className="section">
-        <h2>Backup</h2>
-        <button type="button" className="button secondary" disabled={busy || action.busy} onClick={createBackup}>Create backup</button>
-        {busy && <p role="status">Backup creation is unavailable while session work is queued or running, or live state cannot be confirmed.</p>}
-        <p className="metadata">Only the session owner can create, list, download, or restore backups; manage permission is not enough. The server checks access and whether the session is idle.</p>
-        {backup && <div role="status" style={{ overflowWrap: "anywhere" }}>
-          <p>Backup created: <span className="mono">{backup.id}</span></p>
-          <p>Session: {backup.sessionId}</p><p>Size: {backup.size} bytes</p>
-          <p>SHA-256: <code>{backup.sha256}</code></p>
-          <p>Created: <Timestamp value={backup.createdAt} /></p>
-          <a className="button secondary" href={`${base}/backups/${segment(backup.id)}/download`}>Download backup</a>
-        </div>}
-      </section>}
-    {isOwner && <BackupRestore sourceId={session.id} ownerId={session.ownerId} latestBackup={backup} openSession={openSession} />}
-      <section className="section">
-        <h2>Audit</h2>
-        <button type="button" className="button secondary small" disabled={audit.loading} onClick={audit.refresh}>Refresh audit</button>
-        <ResourceState {...audit} retry={audit.refresh}>
-          {!audit.data?.events.length ? <p>No audit events.</p> : <ul className="row-list">
-            {audit.data.events.map(event => <li key={event.id} style={{ overflowWrap: "anywhere" }}>
-              <p><strong>{event.action}</strong> by {event.actorId}</p>
-              <Timestamp value={event.createdAt} />
-              <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{detailText(event.detail)}</pre>
-            </li>)}
-          </ul>}
-        </ResourceState>
-      </section>
-    {canWrite && <section className="section">
-      <h2>Request an operation</h2>
-      <p>Sensitive effects require separate approval. This form only requests an operation; it does not execute it. Approval decisions are handled in the session.</p>
-      <p className="metadata">Do not include passwords, tokens, or other secrets.</p>
+      </> : <p className="metadata">Managing grants requires manage permission.</p>}
+      <p className="metadata">The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p>
+    </Details>
+    {isOwner && <Details summary="Backups">
+      <p className="metadata">Only the session owner can create, download or restore backups. Backups need the session to be idle.</p>
+      <button type="button" className="button secondary" disabled={busy || action.busy} onClick={createBackup}>Create backup</button>
+      {busy && <p role="status">Unavailable while work is queued or running, or the live state can't be confirmed.</p>}
+      {backup && <div className="notice" role="status">
+        <p>Backup created <Timestamp value={backup.createdAt} />: {backup.size} bytes.</p>
+        <p className="metadata">ID <code>{backup.id}</code>; SHA-256 <code>{backup.sha256}</code></p>
+        <a className="button secondary" href={`${base}/backups/${segment(backup.id)}/download`}>Download backup</a>
+      </div>}
+      <BackupRestore sourceId={session.id} ownerId={session.ownerId} latestBackup={backup} openSession={openSession} />
+    </Details>}
+    {canWrite && <Details summary="Request an operation">
+      <p className="metadata">This only requests the operation; it runs after approval in the session. Don't include passwords, tokens or other secrets.</p>
       <form onSubmit={requestOperation}>
         <fieldset disabled={action.busy}>
           <label className="field">Operation
@@ -246,7 +220,18 @@ function Controls({ session, user, onChange, busy = false, openSession }: Props)
         </fieldset>
       </form>
       {approval && <p role="status">Approval {approval.id}: {approval.status}.</p>}
-    </section>}
-    {action.busy && <p role="status">Saving request...</p>}
+    </Details>}
+    <Details summary="Audit log">
+      <div className="actions"><button type="button" className="button secondary small" disabled={audit.loading} onClick={audit.refresh}>Refresh audit</button></div>
+      <ResourceState {...audit} retry={audit.refresh}>
+        {!audit.data?.events.length ? <p>No audit events.</p> : <ul className="queue-list">
+          {audit.data.events.map(event => <li key={event.id}>
+            <p><strong>{event.action}</strong> by {event.actorId}</p>
+            <p className="metadata"><Timestamp value={event.createdAt} /></p>
+            <pre>{detailText(event.detail)}</pre>
+          </li>)}
+        </ul>}
+      </ResourceState>
+    </Details>
   </section>;
 }
