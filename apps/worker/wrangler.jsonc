@@ -31,7 +31,7 @@
     "RUNNER_URL": "",
     "TEST_AUTH_ENABLED": "false",
     "TEST_AUTH_EXPIRES_AT": "",
-    "GITHUB_CLIENT_ID": ""
+    "GITHUB_CLIENT_ID": "Ov23liyoi7u2Ff6853PM"
   },
   "observability": { "enabled": true, "head_sampling_rate": 0.1 }
 }
