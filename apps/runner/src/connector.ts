@@ -156,17 +156,19 @@ export async function connectorManifest(localModels: LocalModels, allowFaux = fa
   return models;
 }
 
-function capabilities(value?: ConnectorCapabilities): ConnectorCapabilities {
+function capabilities(value?: ConnectorCapabilities, unsandboxed = false): ConnectorCapabilities {
   const result = value ?? { platform: process.platform, sandbox: false, productionShell: false };
   if (typeof result.platform !== "string" || !/^[A-Za-z0-9_-]{1,40}$/.test(result.platform)
     || typeof result.sandbox !== "boolean" || typeof result.productionShell !== "boolean"
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
+  // The host mode, not caller-supplied metadata, decides whether isolation is disclosed as absent.
+  if (unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell };
 }
 
 export async function claimConnectorPairing(options: {
   server: string; pairing: { id: string; code: string }; localModels: LocalModels;
-  capabilities?: ConnectorCapabilities; allowFaux?: boolean; allowInsecureLoopback?: boolean; fetch?: typeof fetch; signal?: AbortSignal;
+  capabilities?: ConnectorCapabilities; unsandboxed?: boolean; allowFaux?: boolean; allowInsecureLoopback?: boolean; fetch?: typeof fetch; signal?: AbortSignal;
 }): Promise<ConnectorCredentials> {
   const origin = controlPlaneOrigin(options.server, options.allowInsecureLoopback);
   const { id, code } = options.pairing;
@@ -175,7 +177,7 @@ export async function claimConnectorPairing(options: {
   const response = await (options.fetch ?? fetch)(`${origin}/api/connectors/pairings/${id}/claim`, {
     method: "POST", redirect: "error", credentials: "omit",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: capabilities(options.capabilities) }),
+    body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: capabilities(options.capabilities, options.unsandboxed) }),
     signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]),
   });
   if (!response.ok) { await response.body?.cancel(); throw new Error("Pairing rejected or unavailable; create a new pairing if its outcome is unknown"); }
@@ -243,6 +245,8 @@ export interface ConnectorOptions {
   allowTestShell?: boolean;
   capabilities?: ConnectorCapabilities;
   resources?: RunnerConfig["resources"];
+  /** Run session work directly on the host without isolation; requires explicit owner consent. */
+  unsandboxed?: boolean;
   fetch?: typeof fetch;
   createSocket?: (url: string, protocols: string[]) => ConnectorSocket;
   runtimeFactory?: (config: RunnerConfig) => Promise<ConnectorRuntime>;
@@ -301,7 +305,7 @@ export class LocalConnector {
   }
 
   private async initialize(): Promise<void> {
-    if (process.platform !== "linux" && !this.options.runtimeFactory) throw new Error("Connected runner requires a Linux sandbox and kernel lease; no host-shell fallback");
+    if (process.platform !== "linux" && !this.options.runtimeFactory && !(this.options.unsandboxed && process.platform === "darwin")) throw new Error("Connected runner requires a Linux sandbox and kernel lease; no host-shell fallback");
     this.directory = await privateDirectory(this.options.dataDir);
     this.releaseLease = await (this.options.acquireLease ?? acquireRunnerLease)(this.directory, () => {
       this.lifetime.abort();
@@ -392,7 +396,7 @@ export class LocalConnector {
         dataDir: join(this.directory, "runner"), controlPlaneUrl: state.controlPlaneUrl,
         sharedSecret: this.secret, connectorId: state.connectorId,
         allowFaux: this.options.allowFaux === true, allowTestShell: this.options.allowTestShell === true,
-        resources: this.options.resources,
+        resources: this.options.resources, unsandboxed: this.options.unsandboxed === true,
         resolveModels: model => { this.requireGeneration(generation); return this.options.localModels.resolve(model); },
         authorize: request => this.authorize(generation, request),
         githubComment: async request => {
@@ -409,7 +413,7 @@ export class LocalConnector {
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
-      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: capabilities(this.options.capabilities) });
+      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: capabilities(this.options.capabilities, this.options.unsandboxed) });
       this.requireGeneration(generation);
       generation.runtimeReady.resolve();
       this.options.onStatus?.("connected");

@@ -174,7 +174,13 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.get('/api/sessions/:id', async c => {
     const access = await requireSession(c, identifier(c.req.param('id')), 'read');
-    return c.json({ session: sessionRecord(access.row, access.permissions) });
+    // Readers who cannot see a private host in the catalog still learn that it runs without isolation.
+    const host = access.row.connector_id
+      ? await c.env.DB.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').bind(access.row.connector_id).first<{ capabilities_json: string }>()
+      : null;
+    const capabilities: unknown = host ? JSON.parse(host.capabilities_json) : null;
+    const hostUnsandboxed = typeof capabilities === 'object' && capabilities !== null && 'unsandboxed' in capabilities && capabilities.unsandboxed === true;
+    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}) } });
   });
   app.patch('/api/sessions/:id', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');

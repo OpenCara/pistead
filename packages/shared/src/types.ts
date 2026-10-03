@@ -58,6 +58,8 @@ export interface SessionRecord {
   repositories?: SessionRepository[];
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
+  // Present only on single-session reads: the pinned host explicitly runs without isolation.
+  hostUnsandboxed?: boolean;
 }
 export interface SessionGrant {
   userId: string;

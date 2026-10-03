@@ -760,7 +760,13 @@
     background: var(--warning-soft);
   }
 
-  .badge:is(.success, .warning)::before {
+  .badge.danger {
+    border-color: var(--danger-border);
+    color: var(--danger);
+    background: var(--danger-soft);
+  }
+
+  .badge:is(.success, .warning, .danger)::before {
     width: 0.375rem;
     height: 0.375rem;
     border-radius: 50%;
@@ -842,6 +848,12 @@
     color: var(--danger);
     background: var(--danger-soft);
     font-size: 0.875rem;
+  }
+
+  .notice.danger {
+    border-color: var(--danger-border);
+    box-shadow: inset 3px 0 0 var(--danger);
+    background: var(--danger-soft);
   }
 
   .notice a,
@@ -1227,6 +1239,7 @@
   }
 
   .approval {
+    min-width: 0;
     padding: 1rem;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
@@ -1238,8 +1251,9 @@
     box-shadow: inset 3px 0 0 var(--warning);
   }
 
-  .operation {
+  .approval pre {
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   .host-trust,

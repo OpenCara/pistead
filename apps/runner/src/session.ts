@@ -35,6 +35,8 @@ export type RunnerConfig = {
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
   readRepository?: (repository: SessionRepository, sessionId: string) => Promise<Uint8Array>;
   resources?: ResourceConfig;
+  /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
+  unsandboxed?: boolean;
 };
 
 export class RunnerSession {
@@ -53,7 +55,7 @@ export class RunnerSession {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
       throw new RunnerError(403, "Session connector mismatch");
     this.sqlitePath = join(directory, "session.sqlite");
-    this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources);
+    this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { unsandboxed: config.unsandboxed === true });
   }
 
   private assertTicket(ticket: RunnerTicket): void {
@@ -415,7 +417,7 @@ export class RunnerSession {
   }
 
   private requireShellCapability(operation: Operation): void {
-    if (operation.kind === "bash" && !this.config.resources && !(this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true)) {
+    if (operation.kind === "bash" && !this.config.resources && !this.config.unsandboxed && !(this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true)) {
       throw new RunnerError(403, "Production shell requires a quota-backed runner; bash needs verified resources or explicitly enabled faux test sessions");
     }
   }

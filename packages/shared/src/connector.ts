@@ -10,6 +10,8 @@ export interface ConnectorCapabilities {
   platform: string;
   sandbox: boolean;
   productionShell: boolean;
+  /** Owner explicitly opted out of isolation: approved work runs directly as the host user. Absent means false. */
+  unsandboxed?: boolean;
 }
 
 export interface ConnectorInfo {
