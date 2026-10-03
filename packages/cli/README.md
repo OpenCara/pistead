@@ -35,7 +35,7 @@ The isolated sandbox needs Linux. On macOS, or Linux without bubblewrap, you can
 npx pistead@latest connect --unsafe-no-sandbox
 ```
 
-This needs only Python 3 and Git (on macOS: `xcode-select --install`). The connector prints the risks and asks you to type `unsandboxed` before starting:
+This needs only Git on your `PATH` (on macOS: `xcode-select --install` or `brew install git`). The connector prints the risks and asks you to type `unsandboxed` before starting:
 
 - Approved shell commands and commits run directly as your user, with access to your files, credentials (`~/.ssh`, cloud and Git config, Pi's auth) and network, and no CPU, memory or disk limits.
 - File tools are confined to each session folder by path checks only.

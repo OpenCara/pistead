@@ -1,16 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
+import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 
-const TIMEOUT_MS = 30_000;
-const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+export const TIMEOUT_MS = 30_000;
+export const MAX_FILE_BYTES = 1024 * 1024;
+export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const sessionQueues = new Map<string, Promise<void>>();
@@ -79,29 +79,20 @@ import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, stat, s
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-if os.path.isdir('/proc/self/fd'):
-    for fd_name in os.listdir('/proc/self/fd'):
-        fd = int(fd_name)
-        if fd > 2:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-else:
-    # Unsandboxed macOS hosts have no procfs; close every possible inherited descriptor.
-    os.closerange(3, min(resource.getrlimit(resource.RLIMIT_NOFILE)[0], 65536))
+for fd_name in os.listdir('/proc/self/fd'):
+    fd = int(fd_name)
+    if fd > 2:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 os.umask(0o077)
 # These remain defense in depth for fixed helpers/test fixtures, NOT session quotas.
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 resource.setrlimit(resource.RLIMIT_CPU, (25, 25))
 resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
 resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-try:
-    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
-except (ValueError, OSError):
-    # macOS cannot lower RLIMIT_AS; Linux must keep this defense-in-depth limit.
-    if sys.platform == 'linux':
-        raise
+resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
 HOME = os.environ['HOME']
 WORK = os.environ['SANDBOX_WORKTREE']
 MAX_FILE = 1024 * 1024
@@ -314,15 +305,11 @@ def cache_marker(git, repositories, status, baseline=None):
 
 
 def rename_new(source, destination, name):
-    libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == 'darwin':
-        rename, no_replace = libc.renameatx_np, 0x00000004  # RENAME_EXCL
-    else:
-        rename, no_replace = libc.renameat2, 1  # RENAME_NOREPLACE
-    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
-    rename.restype = ctypes.c_int
+    renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
     encoded = os.fsencode(name)
-    if rename(source, encoded, destination, encoded, no_replace) != 0:
+    if renameat2(source, encoded, destination, encoded, 1) != 0:  # RENAME_NOREPLACE
         raise OSError(ctypes.get_errno(), 'repository destination cannot be promoted')
 
 
@@ -334,9 +321,6 @@ def sync_cache(root, entry_limit, byte_limit):
     entries, size = 0, 0
 
     def mount_id(fd):
-        if sys.platform != 'linux':
-            # Unsandboxed hosts have no overlay mounts; the device identifies the filesystem.
-            return os.fstat(fd).st_dev
         # Overlay files and directories can legitimately have different st_dev.
         # Kernel fdinfo identifies the actual mount of the pinned descriptor.
         with open('/proc/self/fdinfo/' + str(fd), 'r', encoding='ascii') as stream:
@@ -669,8 +653,7 @@ def main():
         os.close(git)
         os.close(work)
     if kind == 'bash':
-        # macOS ships bash at /bin/bash only; Linux sandboxes bind /usr/bin.
-        run(['/bin/bash' if sys.platform == 'darwin' else '/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
+        run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
         return
     if kind == 'status':
         run(GIT + ['status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=all'])
@@ -722,14 +705,14 @@ function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | null)?.code;
 }
 
-function text(value: unknown, label: string, limit: number, multiline = false): string {
+export function text(value: unknown, label: string, limit: number, multiline = false): string {
   if (typeof value !== "string" || !value || Buffer.byteLength(value) > limit || value.includes("\0") || (!multiline && /[\r\n]/.test(value))) {
     throw new Error(`Invalid ${label}`);
   }
   return value;
 }
 
-function repositoryPins(repositories: readonly SessionRepository[]): SessionRepository[] {
+export function repositoryPins(repositories: readonly SessionRepository[]): SessionRepository[] {
   if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) throw new Error("Invalid repository pin set");
   const names = new Set<string>();
   const ids = new Set<number>();
@@ -828,8 +811,46 @@ function quoteGitConfig(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\t/g, "\\t")}"`;
 }
 
+/** Immutable per-session owner Git config, shared with the unsandboxed host workspace. */
+export function ownerGitConfig(identity: Readonly<SandboxIdentity>): string {
+  const { ownerId, githubLogin, gitName, gitEmail, home, worktree } = identity;
+  return `# Immutable session owner: ${JSON.stringify({ ownerId, githubLogin, gitName, gitEmail, home, worktree })}\n[user]\n\tname = ${quoteGitConfig(gitName)}\n\temail = ${quoteGitConfig(gitEmail)}\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n[commit]\n\tgpgSign = false\n[credential]\n\thelper =\n`;
+}
+
+/** The complete process environment for session tools; nothing is inherited from the runner. */
+export function sessionEnvironment(identity: Readonly<SandboxIdentity>, tools: { path: string; gitConfig: string }): Readonly<Record<string, string>> {
+  return Object.freeze({
+    ...identity.env,
+    PATH: tools.path,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    TZ: "UTC",
+    TERM: "dumb",
+    HOME: identity.home,
+    PWD: identity.worktree,
+    TMPDIR: `${identity.home}/.tmp`,
+    XDG_CONFIG_HOME: `${identity.home}/.config`,
+    XDG_CACHE_HOME: `${identity.home}/.cache`,
+    SANDBOX_WORKTREE: identity.worktree,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_GLOBAL: tools.gitConfig,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "/usr/bin/false",
+    SSH_ASKPASS: "/usr/bin/false",
+    GIT_PAGER: "cat",
+    GIT_EDITOR: "/usr/bin/false",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_AUTHOR_NAME: identity.gitName,
+    GIT_AUTHOR_EMAIL: identity.gitEmail,
+    GIT_COMMITTER_NAME: identity.gitName,
+    GIT_COMMITTER_EMAIL: identity.gitEmail,
+  });
+}
+
 /** Creates the read-only owner Git config once, then verifies it is the unchanged private original. */
-async function pinOwnerConfig(path: string, configText: string): Promise<FileHandle> {
+export async function pinOwnerConfig(path: string, configText: string): Promise<FileHandle> {
   try {
     const created = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o400);
     try {
@@ -855,21 +876,11 @@ async function pinOwnerConfig(path: string, configText: string): Promise<FileHan
   }
 }
 
-export interface SandboxOptions {
-  /**
-   * Owner-consented host mode for hosts without bubblewrap (e.g. macOS). Work runs
-   * as the connector user with network access and no resource limits; only path
-   * checks confine file tools, and bash still requires exact per-command approval.
-   */
-  unsandboxed?: boolean;
-}
-
 /**
- * Linux execution boundary. The caller supplies a trusted live-authorization
+ * Linux-only execution boundary. The caller supplies a trusted live-authorization
  * callback, which is awaited after queueing, immediately before execution.
  * execute() takes the exact approved Operation, never a reconstructed shell command.
- * Without the explicit unsandboxed option there is no host-shell, host-Git, or
- * host-filesystem-tool fallback.
+ * No host-shell, host-Git, or host-filesystem-tool fallback exists.
  */
 export class Sandbox {
   readonly #root: string;
@@ -879,23 +890,18 @@ export class Sandbox {
   readonly #sessionKey: string;
   readonly #testProvider: boolean;
   readonly #repositories: readonly SessionRepository[];
-  readonly #unsandboxed: boolean;
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
-  #hostReady = false;
   #closed = false;
   #cancelActive: (() => void) | undefined;
 
-  constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig, options: SandboxOptions = {}) {
-    const unsandboxed = options.unsandboxed === true;
-    const supported = process.platform === "linux" || (unsandboxed && process.platform === "darwin");
-    if (!supported || !isAbsolute(root) || resolve(root) === sep) {
-      throw new Error("Sandbox requires Linux (or explicit unsandboxed macOS) and an absolute, non-root private storage path");
+  constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig) {
+    if (process.platform !== "linux" || !isAbsolute(root) || resolve(root) === sep) {
+      throw new Error("Sandbox requires Linux and an absolute, non-root private storage path");
     }
     if (["/usr", "/lib", "/lib64"].some((runtime) => resolve(root) === runtime || resolve(root).startsWith(`${runtime}/`))) {
       throw new Error("Session storage cannot be located in a shared runtime mount");
     }
-    if (unsandboxed && resources) throw new Error("Resource-limited execution requires the Linux sandbox");
     const ownerId = text(binding.owner.id, "owner id", 256);
     if (binding.session.ownerId !== ownerId) throw new Error("Session owner does not match its binding");
     const sessionId = text(binding.session.id, "session id", 256);
@@ -906,43 +912,13 @@ export class Sandbox {
     const env = Object.freeze({ ...validateUserEnv(binding.owner.env) });
     const key = createHash("sha256").update(JSON.stringify([ownerId, sessionId])).digest("hex");
     this.#sessionKey = key;
-    this.#unsandboxed = unsandboxed;
     this.#resources = resources ? validateResourceConfig(resources) : undefined;
     this.#testProvider = binding.model.provider === "faux";
     this.#repositories = repositoryPins(binding.session.repositories ?? []);
+    const base = `/sessions/${key}`;
     this.#root = resolve(root);
-    // Sandboxed paths are namespace mount points; unsandboxed paths are real host directories.
-    const base = unsandboxed ? this.#root : `/sessions/${key}`;
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
-    this.#environment = Object.freeze({
-      ...env,
-      // Host commands need the owner's tools; connector secrets in its environment are still never inherited.
-      PATH: unsandboxed ? process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin" : "/usr/bin:/bin",
-      LANG: "C.UTF-8",
-      LC_ALL: "C.UTF-8",
-      TZ: "UTC",
-      TERM: "dumb",
-      HOME: this.home,
-      PWD: this.worktree,
-      TMPDIR: `${this.home}/.tmp`,
-      XDG_CONFIG_HOME: `${this.home}/.config`,
-      XDG_CACHE_HOME: `${this.home}/.cache`,
-      SANDBOX_WORKTREE: this.worktree,
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_SYSTEM: "/dev/null",
-      GIT_CONFIG_GLOBAL: unsandboxed ? `${this.#root}/owner.gitconfig` : `${this.home}/.gitconfig`,
-      GIT_ATTR_NOSYSTEM: "1",
-      GIT_TERMINAL_PROMPT: "0",
-      GIT_ASKPASS: "/usr/bin/false",
-      SSH_ASKPASS: "/usr/bin/false",
-      GIT_PAGER: "cat",
-      GIT_EDITOR: "/usr/bin/false",
-      GIT_OPTIONAL_LOCKS: "0",
-      GIT_AUTHOR_NAME: gitName,
-      GIT_AUTHOR_EMAIL: gitEmail,
-      GIT_COMMITTER_NAME: gitName,
-      GIT_COMMITTER_EMAIL: gitEmail,
-    });
+    this.#environment = sessionEnvironment(this.#identity, { path: "/usr/bin:/bin", gitConfig: `${this.home}/.gitconfig` });
   }
 
   get home(): string { return this.#identity.home; }
@@ -973,10 +949,6 @@ export class Sandbox {
   initialize(): Promise<void> {
     if (this.#closed) return Promise.reject(new Error("Sandbox is closed"));
     this.#initialization ??= this.#exclusive(async () => {
-      if (this.#unsandboxed) {
-        await this.#initializeHost();
-        return;
-      }
       const opened: FileHandle[] = [];
       try {
         const root = await openRoot(this.#root);
@@ -997,7 +969,7 @@ export class Sandbox {
         const temporary = await privateDirectory(home, ".tmp", true);
         await temporary.close();
         await placeholder(home, ".gitconfig");
-        const config = await pinOwnerConfig(fdPath(root, "owner.gitconfig"), this.#ownerConfig());
+        const config = await pinOwnerConfig(fdPath(root, "owner.gitconfig"), ownerGitConfig(this.#identity));
         opened.push(config);
         this.#mounts = { root, home, worktree, git, config };
         await this.#run({ kind: "initialize" }, false, true);
@@ -1008,30 +980,6 @@ export class Sandbox {
       }
     });
     return this.#initialization;
-  }
-
-  #ownerConfig(): string {
-    const { ownerId, githubLogin, gitName, gitEmail } = this.#identity;
-    return `# Immutable session owner: ${JSON.stringify({ ownerId, githubLogin, gitName, gitEmail, home: this.home, worktree: this.worktree })}\n[user]\n\tname = ${quoteGitConfig(gitName)}\n\temail = ${quoteGitConfig(gitEmail)}\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n[commit]\n\tgpgSign = false\n[credential]\n\thelper =\n`;
-  }
-
-  /** No mounts exist: Git lives directly in worktree/.git and the owner config is referenced in place. */
-  async #initializeHost(): Promise<void> {
-    for (const directory of [this.#root, this.home, this.worktree, `${this.worktree}/.git`, `${this.worktree}/.git/objects`, `${this.worktree}/.git/refs`, `${this.home}/.tmp`]) {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      const info = await lstat(directory);
-      if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) {
-        throw new Error("Sandbox storage must be private and owned by the runner user");
-      }
-    }
-    await (await pinOwnerConfig(`${this.#root}/owner.gitconfig`, this.#ownerConfig())).close();
-    this.#hostReady = true;
-    try {
-      await this.#run({ kind: "initialize" }, false, true);
-    } catch (error) {
-      this.#hostReady = false;
-      throw error;
-    }
   }
 
   async #operation(request: Request, readOnly: boolean, authorize: SandboxAuthorize, gitWritable = false, requireResources = false): Promise<string> {
@@ -1072,11 +1020,6 @@ export class Sandbox {
         return this.#operation({ kind: "commit", message: text(operation.message, "commit message", 16 * 1024, true) }, false, authorize, true);
       case "bash":
         if (options.allowTestShell === true && !this.#testProvider) throw new Error("Test shell bypass is restricted to the explicit faux provider");
-        if (this.#unsandboxed) {
-          // No read-only mounts exist on the host, so only writable approved commands can run.
-          if (readOnly) throw new Error("Unsandboxed hosts cannot run read-only shell commands");
-          return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, false, authorize);
-        }
         if (options.allowTestShell !== true && !this.#resources) {
           throw new Error("Production bash unavailable: explicitly provisioned cgroup and bounded filesystem resources are required");
         }
@@ -1130,58 +1073,48 @@ export class Sandbox {
     await this.#exclusive(async () => {
       const mounts = this.#mounts;
       this.#mounts = undefined;
-      this.#hostReady = false;
       if (mounts) await Promise.allSettled(Object.values(mounts).map((handle) => handle.close()));
     });
   }
 
   #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false): Promise<string> {
+    const mounts = this.#mounts;
+    if (!mounts) return Promise.reject(new Error("Sandbox is not initialized"));
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
     if (requireResources && !this.#resources) return Promise.reject(new Error("Production bash resources are unavailable"));
+    const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
+    const args = [
+      "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
+      "--cap-drop", "ALL",
+      "--ro-bind", "/usr", "/usr",
+      "--ro-bind", "/lib", "/lib",
+      "--ro-bind", "/lib64", "/lib64",
+      "--symlink", "usr/bin", "/bin",
+      "--proc", "/proc", "--dev", "/dev",
+      mount, "3", this.home,
+      mount, "4", this.worktree,
+      gitWritable ? "--bind-fd" : "--ro-bind-fd", "5", `${this.worktree}/.git`,
+      "--ro-bind-fd", "6", `${this.home}/.gitconfig`,
+      "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
+      "--chdir", this.worktree, "--clearenv",
+    ];
+    for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
+    args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
-    let launch: { command: string; args: string[] };
-    let options: { cwd: string; env: Record<string, string>; stdio: Array<"pipe" | number> };
-    if (this.#unsandboxed) {
-      if (!this.#hostReady) return Promise.reject(new Error("Sandbox is not initialized"));
-      // Owner-consented host mode: the same helper and path checks, without namespace isolation.
-      launch = { command: "/usr/bin/python3", args: ["-I", "-c", HELPER] };
-      options = { cwd: this.worktree, env: { ...this.#environment }, stdio: ["pipe", "pipe", "pipe"] };
-    } else {
-      const mounts = this.#mounts;
-      if (!mounts) return Promise.reject(new Error("Sandbox is not initialized"));
-      const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
-      const args = [
-        "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
-        "--cap-drop", "ALL",
-        "--ro-bind", "/usr", "/usr",
-        "--ro-bind", "/lib", "/lib",
-        "--ro-bind", "/lib64", "/lib64",
-        "--symlink", "usr/bin", "/bin",
-        "--proc", "/proc", "--dev", "/dev",
-        mount, "3", this.home,
-        mount, "4", this.worktree,
-        gitWritable ? "--bind-fd" : "--ro-bind-fd", "5", `${this.worktree}/.git`,
-        "--ro-bind-fd", "6", `${this.home}/.gitconfig`,
-        "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
-        "--chdir", this.worktree, "--clearenv",
-      ];
-      for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
-      args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
-      launch = requireResources
-        ? resourceLaunch(this.#resources!, this.#sessionKey, args)
-        : { command: "/usr/bin/bwrap", args };
-      options = {
+    const launch = requireResources
+      ? resourceLaunch(this.#resources!, this.#sessionKey, args)
+      : { command: "/usr/bin/bwrap", args };
+    return new Promise<string>((resolveResult, reject) => {
+      // Resource supervisor alone receives root fd 8 and liveness pipe 7. It closes
+      // both before bwrap exec; neither is exposed to the untrusted namespace.
+      const child = spawn(launch.command, launch.args, {
         cwd: "/",
         env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
-        // Resource supervisor alone receives root fd 8 and liveness pipe 7. It closes
-        // both before bwrap exec; neither is exposed to the untrusted namespace.
+        detached: true,
         stdio: requireResources
           ? ["pipe", "pipe", "pipe", mounts.home.fd, mounts.worktree.fd, mounts.git.fd, mounts.config.fd, "pipe", mounts.root.fd]
           : ["pipe", "pipe", "pipe", mounts.home.fd, mounts.worktree.fd, mounts.git.fd, mounts.config.fd],
-      };
-    }
-    return new Promise<string>((resolveResult, reject) => {
-      const child = spawn(launch.command, launch.args, { ...options, detached: true });
+      });
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let bytes = 0;

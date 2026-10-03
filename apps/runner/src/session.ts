@@ -11,6 +11,7 @@ import { repositoryLimits, type SessionRepository } from "../../../packages/shar
 import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
+import { HostWorkspace } from "./host-workspace.js";
 import { Sandbox } from "./sandbox.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
@@ -40,7 +41,7 @@ export type RunnerConfig = {
 };
 
 export class RunnerSession {
-  readonly sandbox: Sandbox;
+  readonly sandbox: Sandbox | HostWorkspace;
   readonly sqlitePath: string;
   private harness!: Harness;
   private root!: Conversation;
@@ -55,7 +56,9 @@ export class RunnerSession {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
       throw new RunnerError(403, "Session connector mismatch");
     this.sqlitePath = join(directory, "session.sqlite");
-    this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { unsandboxed: config.unsandboxed === true });
+    this.sandbox = config.unsandboxed
+      ? new HostWorkspace(binding, join(directory, "sandbox"))
+      : new Sandbox(binding, join(directory, "sandbox"), config.resources);
   }
 
   private assertTicket(ticket: RunnerTicket): void {

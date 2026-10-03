@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { homedir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createConnector, controlPlaneOrigin, readConnectorState } from "./connector.js";
 import { createFauxLocalModels, loadLocalPiModels } from "./local-pi.js";
@@ -39,8 +40,8 @@ Options:
 
 Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required for the
 isolated sandbox. Native Windows is unsupported; run this command inside WSL2.
---unsafe-no-sandbox needs only Python 3 and Git, but approved commands then run as
-your user with access to your files, credentials and network, and no resource limits.
+--unsafe-no-sandbox needs only Git on PATH, but approved commands then run as your
+user with access to your files, credentials and network, and no resource limits.
 Session repositories are pinned into private session caches, not your current folder.
 Production bash additionally requires verified per-session aggregate cgroups and a
 bounded private filesystem;
@@ -166,14 +167,18 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     catch { throw new ConnectorPreflightError("--server must be an HTTPS origin such as https://pistead.com."); }
   }
   const required: Record<string, string> = unsandboxed
-    ? { "/usr/bin/python3": "Python 3", "/usr/bin/git": "Git", ...(process.platform === "linux" ? { "/usr/bin/flock": "flock (util-linux)" } : {}) }
+    ? process.platform === "linux" ? { "/usr/bin/flock": "flock (util-linux)" } : { "/usr/bin/lockf": "lockf" }
     : { "/usr/bin/bwrap": "bubblewrap", "/usr/bin/python3": "Python 3", "/usr/bin/git": "Git", "/usr/bin/flock": "flock (util-linux)" };
   const missing: string[] = [];
   for (const [binary, name] of Object.entries(required)) {
     try { await access(binary, constants.X_OK); } catch { missing.push(`${name} (${binary})`); }
   }
+  // Unsandboxed sessions use the owner's Git from PATH, e.g. Xcode tools or Homebrew on macOS.
+  if (unsandboxed && spawnSync("git", ["--version"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "" } }).status !== 0) missing.push("Git on PATH");
   if (missing.length) {
-    throw new ConnectorPreflightError(`Missing prerequisites: ${missing.join(", ")}.${process.platform === "darwin" ? " Install the Xcode Command Line Tools: xcode-select --install." : unsandboxed ? "" : " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first."}`);
+    const hint = process.platform === "darwin" ? " Install Git, e.g. xcode-select --install or brew install git."
+      : unsandboxed ? "" : " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first.";
+    throw new ConnectorPreflightError(`Missing prerequisites: ${missing.join(", ")}.${hint}`);
   }
   const models = values.model?.map(reference => {
     const slash = reference.indexOf("/");

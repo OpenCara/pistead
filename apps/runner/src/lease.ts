@@ -1,36 +1,24 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 
-// macOS has no flock(1); Python's fcntl.flock takes the same BSD advisory lock.
-const PYTHON_FLOCK = `import fcntl, os, sys, time
-fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-deadline = time.monotonic() + 5
-while True:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.monotonic() > deadline:
-            sys.exit(1)
-        time.sleep(0.1)
-print('LOCKED', flush=True)
-sys.stdin.buffer.read()`;
+// The guardian reports LOCKED, then holds the kernel lock until its stdin reaches EOF.
+const GUARDIAN = ["/bin/sh", "-c", "echo LOCKED; exec /bin/cat >/dev/null"];
 
 /** Kernel flock survives stale lock files; pipe EOF releases it even after Node is SIGKILLed. */
 export async function acquireRunnerLease(directory: string, onLost: () => void): Promise<() => Promise<void>> {
-  if (process.platform !== "linux" && process.platform !== "darwin") throw new Error("Runner lease requires Linux or macOS flock; no PID-file fallback");
+  if (process.platform !== "linux" && process.platform !== "darwin") throw new Error("Runner lease requires Linux flock or macOS lockf; no PID-file fallback");
   const ready = Promise.withResolvers<void>();
   const exited = Promise.withResolvers<void>();
   let acquired = false;
   let releasing = false;
   let output = "";
   const lock = join(directory, "runner.lock");
+  // util-linux flock(1) on Linux; macOS lockf(1) takes the same flock(2) lock via O_EXLOCK.
   const child = process.platform === "linux"
-    ? spawn("/usr/bin/flock", ["--exclusive", "--timeout", "5", "--no-fork", lock,
-      "/usr/bin/python3", "-I", "-S", "-c", "import sys\nprint('LOCKED', flush=True)\nsys.stdin.buffer.read()"], {
+    ? spawn("/usr/bin/flock", ["--exclusive", "--timeout", "5", "--no-fork", lock, ...GUARDIAN], {
       env: { PATH: "/usr/bin:/bin", LANG: "C" }, stdio: ["pipe", "pipe", "ignore"],
     })
-    : spawn("/usr/bin/python3", ["-I", "-S", "-c", PYTHON_FLOCK, lock], {
+    : spawn("/usr/bin/lockf", ["-k", "-s", "-t", "5", lock, ...GUARDIAN], {
       env: { PATH: "/usr/bin:/bin", LANG: "C" }, stdio: ["pipe", "pipe", "ignore"],
     });
   child.stdin.on("error", () => { /* Exit handler makes a lost lease fatal. */ });
