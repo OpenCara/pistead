@@ -1,33 +1,10 @@
-import { connectMain } from "../../../apps/runner/src/connect-cli.js";
-import { ConnectorSetupError } from "../../../apps/runner/src/protocol.js";
-import packageJson from "../package.json" with { type: "json" };
-
-const USAGE = `Usage: pistead <command> [options]
-
-Commands:
-  connect     Connect this Linux or WSL2 Pi host to a Pistead workspace
-
-Options:
-  --help      Show this help
-  --version   Show the installed version
-
-Run "pistead connect --help" for connector options.
-`;
-
-const [command, ...args] = process.argv.slice(2);
-if (command === "connect") {
-  connectMain(args).catch((error: unknown) => {
-    // Only connector-authored preflight text is printed: SDK/HTTP errors can contain auth/config detail.
-    process.stderr.write(error instanceof ConnectorSetupError
-      ? `${error.message}\n`
-      : "Connector failed. Check --help, private state permissions, pairing, local Pi configuration and sandbox prerequisites.\n");
-    process.exitCode = 1;
-  });
-} else if (command === "--version" || command === "-v") {
-  process.stdout.write(`${packageJson.version}\n`);
-} else if (command === undefined || command === "--help" || command === "-h" || command === "help") {
-  process.stdout.write(USAGE);
-} else {
-  process.stderr.write(`Unknown command: ${command}\n\n${USAGE}`);
-  process.exitCode = 2;
+// Launcher: compiled without bundling and kept free of imports, so it runs on any Node.js release. The connector
+// bundle (./cli.js) pulls in node:sqlite and other Node 24 APIs at load time; check the runtime before loading it.
+const major = Number(process.versions.node.split(".")[0]);
+if (!(major >= 24)) {
+  process.stderr.write(`pistead needs Node.js 24 or newer; this is Node.js ${process.versions.node}.\n`
+    + "Install Node.js 24 (for example `nvm install 24`, or from https://nodejs.org), then run the command again.\n");
+  process.exit(1);
 }
+await import("./cli.js");
+export {};

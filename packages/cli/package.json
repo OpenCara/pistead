@@ -1,6 +1,6 @@
 {
   "name": "pistead",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Connect your Linux or WSL2 Pi host to a Pistead workspace.",
   "license": "MIT",
   "homepage": "https://pistead.com",
@@ -10,7 +10,7 @@
   "files": ["dist"],
   "engines": { "node": ">=24.0.0" },
   "scripts": {
-    "build": "esbuild src/pistead.ts --bundle --platform=node --format=esm --target=node24 --packages=external --outfile=dist/pistead.js --banner:js=\"#!/usr/bin/env node\"",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node24 --packages=external --outfile=dist/cli.js && esbuild src/pistead.ts --platform=node --format=esm --target=node16 --outfile=dist/pistead.js --banner:js=\"#!/usr/bin/env node\"",
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
