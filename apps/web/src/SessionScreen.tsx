@@ -193,22 +193,29 @@ function SessionPane({ id }: { id: string }) {
     }, decision === "approve" ? "Approval decision recorded" : "Operation denied");
   }
 
+  // A failed start explains itself in the conversation area, where the chat box restarts it.
+  const startFailed = !view && Boolean(session && (session.status === "error" || session.status === "provisioning"));
+  const badge = startFailed ? <StatusBadge tone={session?.status === "error" ? "danger" : "running"} dot>{session?.status === "error" ? "Not started" : "Starting"}</StatusBadge>
+    : !view && live.error ? <StatusBadge tone="warning" dot>Unavailable</StatusBadge>
+    : streamBadge;
   return <div className={panelOpen && session ? "session-screen panel-open" : "session-screen"}>
     <div className="session-pane">
       <ScreenHeader
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
-          {session && <span className="session-badges">{streamBadge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
+          {session && <span className="session-badges">{badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}
       />
-      {(live.error || actions.action.error || actions.action.notice) && <div className="session-alerts">
-        {live.error && <Alert variant="error" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button variant="outline" size="sm" onClick={live.reconnect}>Reconnect and check access</Button>}>{live.error}</Alert>}
+      {((live.error && !startFailed) || actions.action.error || actions.action.notice) && <div className="session-alerts">
+        {live.error && !startFailed && <Alert variant="error" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button variant="outline" size="sm" onClick={live.reconnect}>Reconnect and check access</Button>}>{live.error}</Alert>}
         <Feedback {...actions.action} />
       </div>}
-      {!view ? (live.error ? <div className="session-transcript" /> : <PageLoading />) : session && <Conversation
+      {!view ? (!live.error ? <PageLoading />
+        : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
+        : <div className="session-transcript" />) : session && <Conversation
         id={id} user={user} session={session} view={view} stale={Boolean(live.error)} refresh={live.refresh}
         pinned={<>
           {session.hostUnsandboxed && (canWrite || canApprove) && <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>}
@@ -247,7 +254,6 @@ function Conversation({ id, user, session, view, stale, refresh, pinned }: { id:
   const submission = useAction();
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
-  const textarea = useRef<HTMLTextAreaElement>(null);
   const stick = useRef(true);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
@@ -277,12 +283,6 @@ function Conversation({ id, user, session, view, stale, refresh, pinned }: { id:
     const element = transcript.current;
     if (element) element.scrollTop = element.scrollHeight;
   }, [actualMode, conversationId]);
-  useLayoutEffect(() => {
-    const element = textarea.current;
-    if (!element) return;
-    element.style.height = "auto";
-    element.style.height = `${element.scrollHeight}px`;
-  }, [content]);
 
   function submit(event?: FormEvent) {
     event?.preventDefault();
@@ -302,13 +302,6 @@ function Conversation({ id, user, session, view, stale, refresh, pinned }: { id:
       request.current = null;
       refresh();
     });
-  }
-
-  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-      event.preventDefault();
-      submit();
-    }
   }
 
   const queueLabel = view.busy
@@ -346,37 +339,123 @@ function Conversation({ id, user, session, view, stale, refresh, pinned }: { id:
             <div className="inline"><Button variant="outline" size="sm" icon="refresh" onClick={refresh}>Refresh queue</Button></div>
           </div>
         </details>
-        {permitted ? <form className="composer" onSubmit={submit}>
-          <textarea
-            ref={textarea}
-            rows={1}
-            required
-            value={content}
-            disabled={submission.busy}
-            aria-label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
-            placeholder={actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
-            onChange={event => setContent(event.target.value)}
-            onKeyDown={onKeyDown}
-          />
-          <div className="composer-toolbar">
+        <ComposerInput
+          value={content}
+          onChange={setContent}
+          onSubmit={submit}
+          busy={submission.busy}
+          disabled={!permitted}
+          label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
+          placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
+          sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
+          hint={!permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
+            : actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks"
+            : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}
+          tools={<>
             {canAsk && <SegmentedControl<"write" | "ask"> size="xs" label="Conversation mode" value={actualMode} onChange={setMode} options={[{ value: "write", label: "Shared" }, { value: "ask", label: "Side ask" }]} />}
             {actualMode === "ask" && sideConversations.length > 0 && <Combobox<string> label="Side conversation" side="above" value={conversationId} onChange={setConversationId} options={[
               { value: "", label: "All my side asks" },
               ...sideConversations.map((conversation, index) => ({ value: conversation.id, label: `Side ask ${index + 1}`, hint: conversation.id.slice(0, 8) })),
             ]} />}
-            <span className="composer-hint truncate">{actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks" : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}</span>
-            <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={submission.busy ? "Sending..." : actualMode === "ask" ? "Send side ask" : "Submit to session"} title={actualMode === "ask" ? "Send side ask" : "Submit to session"} disabled={submission.busy || !content.trim()} />
-          </div>
-        </form> : <div className="readonly-bar">
-          {actualMode === "write" && canAsk ? <>
-            <span>You can ask questions in a read-only side conversation</span>
-            <Button variant="outline" size="sm" onClick={() => setMode("ask")}>Open side ask</Button>
-          </> : <>
-            <span>Read-only — you can follow along</span>
-            <span className="muted small">Submitting needs write permission</span>
           </>}
-        </div>}
+        />
         <Feedback error={submission.error} />
+      </div>
+    </div>
+  </>;
+}
+
+/** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. */
+function ComposerInput({ value, onChange, onSubmit, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
+  value: string; onChange: (value: string) => void; onSubmit: () => void; busy: boolean; disabled?: boolean;
+  label: string; placeholder: string; sendLabel: string; hint: ReactNode; tools?: ReactNode;
+}) {
+  const input = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const element = input.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${element.scrollHeight}px`;
+  }, [value]);
+  function submit(event?: FormEvent) {
+    event?.preventDefault();
+    if (!disabled && !busy && value.trim()) onSubmit();
+  }
+  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event);
+  }
+  return <form className="composer" onSubmit={submit}>
+    <textarea ref={input} rows={1} required value={value} disabled={busy || disabled} aria-label={label} placeholder={placeholder}
+      onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} />
+    <div className="composer-toolbar">
+      {tools}
+      <span className="composer-hint truncate">{hint}</span>
+      <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !value.trim()} />
+    </div>
+  </form>;
+}
+
+/**
+ * Shown when the transcript cannot load. A session whose start failed is restarted by its owner's
+ * next message: restart re-provisions on the pinned host, then the message is submitted.
+ */
+function UnavailableConversation({ id, user, session, error, recovered }: { id: string; user: UserProfile; session: SessionRecord; error: string; recovered: () => void }) {
+  const [content, setContent] = useState("");
+  const request = useRef<{ content: string; id: string } | null>(null);
+  const action = useAction();
+  const failed = session.status === "error" || session.status === "provisioning";
+  const canRestart = failed && session.ownerId === user.id && Boolean(session.permissions?.includes("manage"));
+  const canWrite = Boolean(session.permissions?.includes("write"));
+  function send() {
+    const sent = content;
+    // Same text retried after a failure keeps its idempotency key.
+    if (request.current?.content !== sent) request.current = { content: sent, id: crypto.randomUUID() };
+    const requestId = request.current.id;
+    void action.run(async () => {
+      await api(`/api/sessions/${segment(id)}/restart`, { method: "POST" });
+      try {
+        await api<SubmitResult>(`/api/sessions/${segment(id)}/submit`, { method: "POST", body: { content: sent, requestId } });
+      } catch (reason) {
+        // The session is running again; hand the unsent text to the live conversation.
+        try { sessionStorage.setItem(`pistead.draft.${id}`, sent); } catch { /* Storage unavailable: the text is lost. */ }
+        recovered();
+        throw reason;
+      }
+      request.current = null;
+      setContent("");
+      recovered();
+    });
+  }
+  const title = session.status === "error" ? "This session didn't start" : session.status === "provisioning" ? "This session is still starting" : "This session can't be reached";
+  const body = canRestart ? "Send a message to start it again on its host. Your message runs once it's ready."
+    : failed ? "Only the session owner can start it again."
+    : canWrite ? "Messages can be sent once the host is back online."
+    : "The conversation appears once the host is back online.";
+  return <>
+    <div className="session-transcript">
+      <div className="chat-column">
+        <EmptyState title={title}>
+          <span className="stack">
+            <span>{body}</span>
+            {failed && error && <span className="muted small">{error}</span>}
+          </span>
+        </EmptyState>
+      </div>
+    </div>
+    <div className="session-bottom">
+      <div className="chat-column stack">
+        <ComposerInput
+          value={content}
+          onChange={setContent}
+          onSubmit={send}
+          busy={action.busy}
+          disabled={!canRestart}
+          label="Message the agent"
+          placeholder={canRestart ? "Message the agent to start the session again" : "Message the agent"}
+          sendLabel={canRestart ? "Restart and send" : "Sending is unavailable"}
+          hint={action.busy ? "Starting the session and preparing repositories..." : canRestart ? "Restarts the session, then sends" : failed ? "Only the owner can restart this session" : canWrite ? "Waiting for the host" : "Read-only — submitting needs write permission"}
+        />
+        <Feedback error={action.error} />
       </div>
     </div>
   </>;
