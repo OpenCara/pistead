@@ -265,10 +265,11 @@ await check("repository setup stays workspace-scoped and synthetic sign-in grant
   assert.deepEqual((await alice.request("GET", `/api/workspaces/${workspace.id}/repositories`)).repositories, []);
   assert.deepEqual((await bob.request("GET", `/api/workspaces/${workspace.id}/repositories`)).repositories, []);
   await eve.request("GET", `/api/workspaces/${workspace.id}/repositories`, undefined, [403, 404]);
-  const repository = { repositoryId: 1, fullName: "example/private-repository" };
+  const repository = { provider: "github", host: "github.com", repositoryId: "1", fullName: "example/private-repository" };
   await bob.request("POST", `/api/workspaces/${workspace.id}/repositories`, repository, [403]);
   await alice.request("POST", `/api/workspaces/${workspace.id}/repositories`, repository, [403]);
-  await alice.request("GET", "/api/github/repositories", undefined, [403]);
+  await alice.request("GET", "/api/git/accounts/github/repositories", undefined, [403]);
+  assert.deepEqual((await alice.request("GET", "/api/git/accounts")).accounts, []);
   await bob.request("DELETE", `/api/workspaces/${workspace.id}/repositories/00000000-0000-4000-8000-000000000001`, undefined, [403]);
 });
 

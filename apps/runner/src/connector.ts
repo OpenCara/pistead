@@ -163,8 +163,8 @@ function capabilities(value?: ConnectorCapabilities, unsandboxed = false): Conne
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
   // The host mode, not caller-supplied metadata, decides whether isolation is disclosed as absent.
   // Every connector of this version applies per-message model, reasoning and access choices.
-  if (unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true };
+  if (unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true };
 }
 
 export async function claimConnectorPairing(options: {

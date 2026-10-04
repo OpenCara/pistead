@@ -8,7 +8,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { Harness } from "@earendil-works/pi-durable";
 import { sha256 } from "../packages/shared/src/crypto.js";
-import { repositoryLimits, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { repositoryLimits, repositoryPath, type GitHubSessionRepository, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { repositoryPins } from "../apps/runner/src/sandbox.js";
 import type { RestoreDescriptor } from "../packages/shared/src/connector.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
 import { RunnerError, validateBinding, validateRepositories } from "../apps/runner/src/protocol.js";
@@ -23,12 +24,12 @@ const OWNER = "test:alice";
 const allow = async (): Promise<void> => {};
 const MODEL_BOUNDARY = new Error("repository test reached model resolution");
 
-function repository(index = 1): SessionRepository {
+function repository(index = 1): GitHubSessionRepository {
   return { bindingId: `repo-${index}`, repositoryId: index, fullName: `acme/project-${index}`,
     path: `acme/project-${index}`, ref: "refs/heads/main", commit: String(index).repeat(40) };
 }
 
-function binding(id: string, repositories = [repository()]): RunnerBinding {
+function binding(id: string, repositories: SessionRepository[] = [repository()]): RunnerBinding {
   const createdAt = "2026-01-01T00:00:00Z";
   return {
     session: { id, workspaceId: "workspace", ownerId: OWNER, agentVersionId: "version-1", title: "Repository tests", policyVersion: 1, status: "ready", createdAt, repositories },
@@ -594,4 +595,65 @@ test("real repository backup/restore preserves the protected ready marker and ed
   assert.deepEqual(await readFile(join(source.directory, "sandbox", markerPath)), markerBytes);
   assert.equal(backupDownloads, 1);
   assert.equal(repositoryDownloads, 0);
+});
+
+function providerPin(overrides: Record<string, unknown> = {}): SessionRepository {
+  const pin = { bindingId: "gitlab-binding", provider: "gitlab", host: "gitlab.example.com", repositoryId: "4242", fullName: "group/sub/project", ref: "main", commit: "c".repeat(40), ...overrides };
+  return { ...pin, path: repositoryPath(pin as SessionRepository) } as SessionRepository;
+}
+
+test("repository protocol accepts provider pins beside legacy GitHub pins", () => {
+  const pins = [
+    repository(),
+    providerPin(),
+    providerPin({ bindingId: "azure-binding", provider: "azure-devops", host: "dev.azure.com", repositoryId: "6f0c1b2a-0d4e-4c5b-9a7e-1d2c3b4a5f60", fullName: "org/My Project/repo" }),
+    providerPin({ bindingId: "bitbucket-binding", provider: "bitbucket", host: "bitbucket.org", repositoryId: "{3c1f5a2e-7d4b-4e6a-8f9c-0b1a2d3e4f50}", fullName: "team/app" }),
+    providerPin({ bindingId: "gitea-binding", provider: "gitea", host: "git.example.org:3000", repositoryId: "7", fullName: "owner/app" }),
+  ];
+  assert.equal(pins[2]!.path, "dev.azure.com/org/My-Project/repo");
+  assert.equal(pins[4]!.path, "git.example.org-3000/owner/app");
+  const validated = validateRepositories(pins);
+  assert.deepEqual(validated, pins);
+  assert.deepEqual(validateBinding(binding("providers", pins), "providers").session.repositories, pins);
+  assert.deepEqual(Object.keys(repositoryPins([pins[1]!])[0]!).sort(), ["bindingId", "commit", "fullName", "host", "path", "provider", "ref", "repositoryId"]);
+  assert.deepEqual(repositoryPins(pins).map(pin => pin.path), pins.map(pin => pin.path).sort());
+});
+
+test("repository protocol rejects malformed or duplicate provider pins", async t => {
+  const pin = providerPin();
+  const { provider: _provider, host: _host, ...withoutProvider } = pin as SessionRepository & { provider: string; host: string };
+  const invalid: Array<[string, unknown]> = [
+    ["missing host", [{ ...withoutProvider, provider: "gitlab" }]],
+    ["provider shape without provider", [withoutProvider]],
+    ["extra field", [{ ...pin, url: "https://elsewhere.example/archive" }]],
+    ["github provider shape", [{ ...pin, provider: "github", host: "github.com", path: "github.com/group/sub/project" }]],
+    ["unknown provider", [{ ...pin, provider: "sourcehut" }]],
+    ["localhost host", [providerPin({ host: "localhost" })]],
+    ["IP host", [providerPin({ host: "10.0.0.1" })]],
+    ["uppercase host", [{ ...pin, host: "GitLab.example.com" }]],
+    ["internal host", [providerPin({ host: "gitlab.internal" })]],
+    ["overridden fixed host", [providerPin({ provider: "bitbucket", host: "bitbucket.example.com", fullName: "team/app" })]],
+    ["path mismatch", [{ ...pin, path: "group/sub/project" }]],
+    ["traversal path", [{ ...pin, path: "gitlab.example.com/../project" }]],
+    ["traversal name", [providerPin({ fullName: "group/../project" })]],
+    ["numeric id", [{ ...pin, repositoryId: 4242 }]],
+    ["bad id", [providerPin({ repositoryId: "../1" })]],
+    ["azure name without project", [providerPin({ provider: "azure-devops", host: "dev.azure.com", fullName: "org/repo" })]],
+    ["bad commit", [{ ...pin, commit: "main" }]],
+    ["bad ref", [{ ...pin, ref: "main branch" }]],
+  ];
+  for (const [name, value] of invalid) await t.test(name, () => {
+    assert.throws(() => validateRepositories(value), runnerError(400, /immutable repository/));
+    assert.throws(() => repositoryPins(value as SessionRepository[]));
+  });
+  for (const [name, second] of [
+    ["provider repository id", providerPin({ bindingId: "other", fullName: "group/other" })],
+    ["binding id", providerPin({ repositoryId: "5", fullName: "group/other" })],
+    ["case-insensitive path", providerPin({ bindingId: "other", repositoryId: "5", fullName: "GROUP/SUB/PROJECT" })],
+  ] as const) await t.test(`duplicate ${name}`, () => {
+    assert.throws(() => validateRepositories([pin, second]), runnerError(400, /Duplicate/));
+    assert.throws(() => repositoryPins([pin, second]), /duplicate/);
+  });
+  assert.equal(validateRepositories([pin, providerPin({ bindingId: "other", host: "gitlab.com", fullName: "group/other" })]).length, 2, "same id on another host is distinct");
+  assert.equal(validateRepositories([repository(), providerPin({ repositoryId: String(repository().repositoryId) })]).length, 2, "GitHub and provider ids never collide");
 });

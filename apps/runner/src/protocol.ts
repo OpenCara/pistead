@@ -1,7 +1,7 @@
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
-import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validGitHost, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -38,24 +38,45 @@ export async function verifyRunnerTicket(token: string, secret: string, action: 
     || typeof ticket.jti !== "string" || !ticket.jti) throw new RunnerError(401, "Ticket scope or expiry mismatch");
   return ticket;
 }
+const githubPinKeys = "bindingId,commit,fullName,path,ref,repositoryId";
+const providerPinKeys = "bindingId,commit,fullName,host,path,provider,ref,repositoryId";
+/**
+ * Checks one immutable repository pin (legacy GitHub or token-provider shape) and returns its repository identity key,
+ * or null when the pin is malformed. Callers enforce uniqueness of binding ids, lowercase paths and identity keys.
+ */
+export function repositoryPinIdentity(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const pin = value as Record<string, unknown>;
+  const keys = Object.keys(pin).sort().join(",");
+  if (typeof pin.bindingId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(pin.bindingId)
+    || typeof pin.commit !== "string" || !/^[a-f0-9]{40}$/.test(pin.commit)
+    || typeof pin.ref !== "string" || !pin.ref.trim() || pin.ref.length > 255 || /[\x00-\x20\x7f\\]/.test(pin.ref)) return null;
+  if (keys === githubPinKeys) {
+    if (!Number.isSafeInteger(pin.repositoryId) || (pin.repositoryId as number) < 1
+      || !validRepositoryName("github", pin.fullName) || pin.path !== pin.fullName) return null;
+    return `github:${pin.repositoryId}`;
+  }
+  if (keys !== providerPinKeys || typeof pin.provider !== "string" || pin.provider === "github"
+    || !(gitProviders as readonly string[]).includes(pin.provider)) return null;
+  const provider = pin.provider as TokenGitProvider;
+  const fixed = gitProviderHosts[provider].fixed;
+  if (typeof pin.host !== "string" || (fixed ? pin.host !== fixed : !validGitHost(pin.host))
+    || !validRepositoryId(pin.repositoryId) || !validRepositoryName(provider, pin.fullName)
+    || pin.path !== repositoryPath({ provider, host: pin.host, fullName: pin.fullName })) return null;
+  const path = pin.path as string;
+  if (path.length > 512 || path.split("/").some(part => !/^[A-Za-z0-9._-]+$/.test(part) || [".", "..", ".git"].includes(part.toLowerCase()))) return null;
+  return `${provider}:${pin.host}:${pin.repositoryId}`;
+}
 export function validateRepositories(value: unknown): SessionRepository[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > repositoryLimits.repositories) throw new RunnerError(400, "Invalid immutable repository bindings");
-  const ids = new Set<number>(), bindings = new Set<string>(), names = new Set<string>();
+  const ids = new Set<string>(), bindings = new Set<string>(), names = new Set<string>();
   return Array.from(value, repository => {
-    if (!repository || typeof repository !== "object" || Array.isArray(repository)
-      || Object.keys(repository).sort().join(",") !== "bindingId,commit,fullName,path,ref,repositoryId"
-      || typeof repository.bindingId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(repository.bindingId)
-      || !Number.isSafeInteger(repository.repositoryId) || repository.repositoryId < 1
-      || typeof repository.fullName !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]{1,100}$/.test(repository.fullName)
-      || [".", "..", ".git"].includes(repository.fullName.split("/")[1]!.toLowerCase())
-      || repository.path !== repository.fullName
-      || typeof repository.commit !== "string" || !/^[a-f0-9]{40}$/.test(repository.commit)
-      || typeof repository.ref !== "string" || !repository.ref.trim() || repository.ref.length > 255 || /[\x00-\x20\x7f\\]/.test(repository.ref))
-      throw new RunnerError(400, "Invalid immutable repository binding");
-    const name = repository.fullName.toLowerCase();
-    if (ids.has(repository.repositoryId) || bindings.has(repository.bindingId) || names.has(name)) throw new RunnerError(400, "Duplicate immutable repository binding");
-    ids.add(repository.repositoryId); bindings.add(repository.bindingId); names.add(name);
+    const id = repositoryPinIdentity(repository);
+    if (!id) throw new RunnerError(400, "Invalid immutable repository binding");
+    const name = repository.path.toLowerCase();
+    if (ids.has(id) || bindings.has(repository.bindingId) || names.has(name)) throw new RunnerError(400, "Duplicate immutable repository binding");
+    ids.add(id); bindings.add(repository.bindingId); names.add(name);
     return { ...repository } as SessionRepository;
   });
 }

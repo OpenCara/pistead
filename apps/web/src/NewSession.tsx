@@ -192,7 +192,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
           <InfoTip label="Who can see and do what">
             <div className="stack">
               <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Asking the agent, invoking tools, or controlling the session needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
-              <p>You are the session owner; the agent author and host owner are separate roles. Viewing never grants GitHub access, and visibility does not share your Pi host, private agent, or local models.</p>
+              <p>You are the session owner; the agent author and host owner are separate roles. Viewing never grants access to your Git accounts, and visibility does not share your Pi host, private agent, or local models.</p>
             </div>
           </InfoTip>
           <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: chatKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
@@ -218,7 +218,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
               <div className="stack">
                 <p>Model: {model?.name} <span className="muted">{model?.provider} / {model?.modelId}</span></p>
                 <p className="muted small">Host owner ID: {host.ownerId}<br />Connection ID: {host.id}</p>
-                <p>This creates a new session, not access to the host's personal Pi history or old sessions. Publishing an agent does not grant use of its host. Your GitHub credentials are not sent to the host; model credentials stay on it.</p>
+                <p>This creates a new session, not access to the host's personal Pi history or old sessions. Publishing an agent does not grant use of its host. Your Git account credentials are not sent to the host; model credentials stay on it.</p>
               </div>
             </InfoTip>
           </>)}
@@ -228,7 +228,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
             <InfoTip label="Repositories for this session">
               <div className="stack">
                 <ul>{repositories.map(repository => <li key={repository.id}><strong>{repository.fullName}</strong> <span className="muted">at <code>{repository.ref}</code></span></li>)}</ul>
-                <p>Repositories are read with your GitHub access as session owner, not the host owner's or an admin's. Each ref is pinned to a commit before the session runs.</p>
+                <p>Repository access uses your connected Git account as session owner, not the host owner's or an admin's. Each ref is pinned to a commit before the session runs.</p>
                 <RepositorySnapshotPolicy />
               </div>
             </InfoTip>

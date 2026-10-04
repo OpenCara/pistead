@@ -11,6 +11,7 @@ import { fail, testMode } from './http.js';
 import { registerConnectorCredentials, registerConnectors } from './connectors.js';
 import { registerRestoreRoutes } from './restore-routes.js';
 import { registerRepositories } from './repositories.js';
+import { registerGitAccounts } from './git/accounts.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -48,6 +49,7 @@ registerConnectorCredentials(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
 registerRepositories(app);
+registerGitAccounts(app);
 registerConnectors(app);
 registerSessions(app);
 registerBackups(app);

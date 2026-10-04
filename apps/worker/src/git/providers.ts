@@ -1,0 +1,546 @@
+import {
+  gitProviderNames, repositoryLimits, validGitHost, validRepositoryId, validRepositoryName,
+  type ProviderRepository, type TokenGitProvider,
+} from '../../../../packages/shared/src/repositories.js';
+import { fail } from '../http.js';
+import { boundedRepositoryBody, repositoryRef } from '../repositories.js';
+import type { GitCredential, GitProviderAdapter, RepositoryArchive, RepositoryRef } from './types.js';
+
+const pageSize = 30;
+const jsonBytes = 512 * 1024;
+// Azure DevOps lists every repository of an organization in one response (no server paging).
+const azureListBytes = 4 * 1024 * 1024;
+const remoteTimeout = 20_000;
+const userAgent = 'OpenCara-Agent-Workspace';
+const deniedStatuses: readonly number[] = [401, 403, 404];
+// Azure DevOps answers unauthenticated requests with 203 (sign-in HTML) or a 302 to its sign-in service.
+const azureDeniedStatuses: readonly number[] = [203, 302, 401, 403, 404];
+const redirectStatuses: readonly number[] = [301, 302, 303, 307, 308];
+const sha1 = /^[0-9a-f]{40}$/;
+const sha256 = /^[0-9a-f]{64}$/;
+const azureOrganization = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,48}[A-Za-z0-9])?$/;
+
+type Headers = Record<string, string>;
+type JsonObject = Record<string, unknown>;
+interface ReadOptions { verify?: boolean; denied?: readonly number[]; limit?: number }
+
+const label = (provider: TokenGitProvider): string => gitProviderNames[provider];
+
+function accessFailure(provider: TokenGitProvider, verify: boolean): never {
+  if (verify) fail(400, 'git_account_rejected', 'The provider rejected this token. Check the token, its scopes and the host.');
+  return fail(403, 'git_repository_unavailable',
+    `${label(provider)} repository access could not be verified. Check the connected account's access and try again.`);
+}
+function providerUnavailable(provider: TokenGitProvider): never {
+  return fail(502, 'git_provider_unavailable', `${label(provider)} could not complete the repository request.`);
+}
+function invalidResponse(provider: TokenGitProvider): never {
+  return fail(502, 'invalid_git_response', `${label(provider)} returned invalid repository metadata.`);
+}
+function emptyRepository(provider: TokenGitProvider): never {
+  return fail(409, 'git_repository_empty', `This ${label(provider)} repository has no default branch yet. Push a commit first.`);
+}
+function untrustedRedirect(provider: TokenGitProvider): never {
+  return fail(502, 'invalid_archive_redirect', `${label(provider)} returned an untrusted archive location.`);
+}
+
+async function discard(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => {});
+}
+
+/** Every upstream request: no automatic redirects, bounded time, no cookies, fixed User-Agent. */
+async function request(provider: TokenGitProvider, url: string, headers: Headers): Promise<Response> {
+  try {
+    return await fetch(url, { headers: { ...headers, 'User-Agent': userAgent }, redirect: 'manual', signal: AbortSignal.timeout(remoteTimeout) });
+  } catch {
+    return providerUnavailable(provider);
+  }
+}
+
+async function expectOk(provider: TokenGitProvider, response: Response, options: ReadOptions): Promise<void> {
+  if (response.status === 200) return;
+  await discard(response);
+  if ((options.denied ?? deniedStatuses).includes(response.status)) accessFailure(provider, options.verify ?? false);
+  providerUnavailable(provider);
+}
+
+async function readText(provider: TokenGitProvider, response: Response, limit: number): Promise<string> {
+  const bytes = await boundedRepositoryBody(response, limit);
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { return invalidResponse(provider); }
+}
+
+async function getJson(provider: TokenGitProvider, url: string, headers: Headers, options: ReadOptions = {}): Promise<{ body: unknown; response: Response }> {
+  const response = await request(provider, url, { Accept: 'application/json', ...headers });
+  await expectOk(provider, response, options);
+  const text = await readText(provider, response, options.limit ?? jsonBytes);
+  try { return { body: JSON.parse(text), response }; }
+  catch { return invalidResponse(provider); }
+}
+
+function record(provider: TokenGitProvider, value: unknown): JsonObject {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) invalidResponse(provider);
+  return value as JsonObject;
+}
+function list(provider: TokenGitProvider, value: unknown): unknown[] {
+  if (!Array.isArray(value)) invalidResponse(provider);
+  return value;
+}
+function login(provider: TokenGitProvider, value: unknown): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 255 || value !== value.trim() || /[\x00-\x1f\x7f]/.test(value)) invalidResponse(provider);
+  return value;
+}
+function identity(provider: TokenGitProvider, value: unknown): string {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value);
+  if (!validRepositoryId(value)) invalidResponse(provider);
+  return value;
+}
+function canonicalName(provider: TokenGitProvider, value: unknown): string {
+  if (!validRepositoryName(provider, value)) invalidResponse(provider);
+  return value;
+}
+function branch(provider: TokenGitProvider, value: unknown): string {
+  try { return repositoryRef(value); }
+  catch { return invalidResponse(provider); }
+}
+function flag(provider: TokenGitProvider, value: unknown): boolean {
+  if (typeof value !== 'boolean') invalidResponse(provider);
+  return value;
+}
+function commitSha(provider: TokenGitProvider, value: unknown): string {
+  if (typeof value === 'string' && sha256.test(value)) {
+    fail(422, 'unsupported_repository_format', `This ${label(provider)} repository uses SHA-256 object names, which are not supported.`);
+  }
+  if (typeof value !== 'string' || !sha1.test(value)) invalidResponse(provider);
+  return value;
+}
+
+function target(provider: TokenGitProvider, repository: RepositoryRef): RepositoryRef {
+  if (!validRepositoryId(repository.id) || !validRepositoryName(provider, repository.fullName)) {
+    fail(400, 'invalid_repository', `Use a valid ${label(provider)} repository.`);
+  }
+  return repository;
+}
+function pinnedCommit(commit: string): string {
+  if (!sha1.test(commit)) fail(400, 'invalid_repository_commit', 'A 40-character lowercase commit SHA is required.');
+  return commit;
+}
+function pageNumber(page: number): number {
+  if (!Number.isSafeInteger(page) || page < 1 || page > 1000) fail(400, 'invalid_page', 'Repository page must be between 1 and 1000.');
+  return page;
+}
+/** Origin of a self-hosted provider; only validated public DNS names over HTTPS. */
+function selfHostedOrigin(credential: GitCredential): URL {
+  if (!validGitHost(credential.host)) fail(400, 'invalid_git_host', 'The connected account has an invalid host.');
+  return new URL(`https://${credential.host}`);
+}
+function basic(user: string, password: string): string {
+  let binary = '';
+  for (const byte of new TextEncoder().encode(`${user}:${password}`)) binary += String.fromCharCode(byte);
+  return `Basic ${btoa(binary)}`;
+}
+
+/** Resolves and checks one archive redirect; credentials are never attached to the follow-up request. */
+function redirectTarget(provider: TokenGitProvider, location: string | null, base: string, allowed: (url: URL) => boolean): string {
+  if (!location) untrustedRedirect(provider);
+  let url: URL;
+  try { url = new URL(location, base); } catch { return untrustedRedirect(provider); }
+  if (url.protocol !== 'https:' || url.username || url.password || location.includes('#') || !allowed(url)) untrustedRedirect(provider);
+  return url.href;
+}
+
+interface ArchiveRequest {
+  provider: TokenGitProvider;
+  url: string;
+  headers: Headers;
+  format: RepositoryArchive['format'];
+  /** Allowed single redirect target, or null when the provider must answer 200 directly. */
+  redirect: ((url: URL) => boolean) | null;
+  redirectRequired?: boolean;
+  denied?: readonly number[];
+}
+async function download(input: ArchiveRequest): Promise<RepositoryArchive> {
+  const { provider } = input;
+  let response = await request(provider, input.url, input.headers);
+  if ((input.denied ?? deniedStatuses).includes(response.status)) { await discard(response); accessFailure(provider, false); }
+  if (redirectStatuses.includes(response.status)) {
+    const location = response.headers.get('location');
+    await discard(response);
+    if (!input.redirect) untrustedRedirect(provider);
+    const url = redirectTarget(provider, location, input.url, input.redirect);
+    response = await request(provider, url, { Accept: input.format === 'zip' ? 'application/zip' : 'application/gzip' });
+  } else if (input.redirectRequired) {
+    await discard(response);
+    fail(502, 'invalid_archive_redirect', `${label(provider)} did not return the expected archive redirect.`);
+  }
+  if (response.status !== 200) { await discard(response); fail(502, 'repository_download_failed', `${label(provider)} could not supply the pinned archive.`); }
+  const bytes = await boundedRepositoryBody(response, repositoryLimits.archiveBytes);
+  const magic = input.format === 'zip' ? bytes[0] === 0x50 && bytes[1] === 0x4b : bytes[0] === 0x1f && bytes[1] === 0x8b;
+  if (bytes.length < 4 || !magic) {
+    fail(502, 'invalid_repository_archive', `${label(provider)} did not return a ${input.format === 'zip' ? 'zip' : 'gzip'} archive.`);
+  }
+  return { bytes, format: input.format };
+}
+
+// GitHub Enterprise Server: REST v3 under /api/v3.
+function githubEnterpriseApi(credential: GitCredential): { origin: URL; base: string; headers: Headers } {
+  const origin = selfHostedOrigin(credential);
+  return { origin, base: `${origin.origin}/api/v3`, headers: { Authorization: `Bearer ${credential.token}`, Accept: 'application/vnd.github+json' } };
+}
+function githubEnterpriseRepository(value: unknown): ProviderRepository {
+  const provider = 'github-enterprise';
+  const item = record(provider, value);
+  return { id: identity(provider, item.id), fullName: canonicalName(provider, item.full_name),
+    defaultBranch: branch(provider, item.default_branch), private: flag(provider, item.private) };
+}
+const githubEnterprise: GitProviderAdapter = {
+  async verify(credential) {
+    const api = githubEnterpriseApi(credential);
+    const { body } = await getJson('github-enterprise', `${api.base}/user`, api.headers, { verify: true });
+    return { login: login('github-enterprise', record('github-enterprise', body).login) };
+  },
+  async list(credential, page) {
+    const api = githubEnterpriseApi(credential);
+    const { body, response } = await getJson('github-enterprise',
+      `${api.base}/user/repos?per_page=${pageSize}&page=${pageNumber(page)}&sort=full_name&direction=asc`, api.headers);
+    return { repositories: list('github-enterprise', body).map(githubEnterpriseRepository),
+      hasMore: /<[^>]*>\s*;\s*rel="next"/.test(response.headers.get('link') ?? '') };
+  },
+  async repository(credential, repository) {
+    const api = githubEnterpriseApi(credential);
+    const { id } = target('github-enterprise', repository);
+    const { body } = await getJson('github-enterprise', `${api.base}/repositories/${encodeURIComponent(id)}`, api.headers);
+    return githubEnterpriseRepository(body);
+  },
+  async commit(credential, repository, ref) {
+    const api = githubEnterpriseApi(credential);
+    const { fullName } = target('github-enterprise', repository);
+    // The sha media type answers with the bare commit id instead of the full commit (and its file list).
+    const response = await request('github-enterprise', `${api.base}/repos/${fullName}/commits/${encodeURIComponent(repositoryRef(ref))}`,
+      { ...api.headers, Accept: 'application/vnd.github.sha' });
+    await expectOk('github-enterprise', response, { denied: [...deniedStatuses, 422] });
+    return commitSha('github-enterprise', (await readText('github-enterprise', response, 1024)).trim());
+  },
+  async archive(credential, repository, commit) {
+    const api = githubEnterpriseApi(credential);
+    const { fullName } = target('github-enterprise', repository);
+    const host = api.origin.host;
+    return download({
+      provider: 'github-enterprise', url: `${api.base}/repos/${fullName}/tarball/${pinnedCommit(commit)}`, headers: api.headers,
+      format: 'tar.gz', redirectRequired: true,
+      // GHES serves archives from codeload.<host> (subdomain isolation) or from <host>/_codeload.
+      redirect: url => url.host === host || url.host === `codeload.${host}`,
+    });
+  },
+};
+
+// GitLab (gitlab.com and self-managed): REST v4.
+function gitlabApi(credential: GitCredential): { base: string; headers: Headers } {
+  return { base: `${selfHostedOrigin(credential).origin}/api/v4`, headers: { Authorization: `Bearer ${credential.token}` } };
+}
+function gitlabRepository(value: unknown): ProviderRepository | null {
+  const item = record('gitlab', value);
+  if (item.default_branch === null || item.default_branch === undefined) return null;
+  if (item.visibility !== 'public' && item.visibility !== 'internal' && item.visibility !== 'private') invalidResponse('gitlab');
+  return { id: identity('gitlab', item.id), fullName: canonicalName('gitlab', item.path_with_namespace),
+    defaultBranch: branch('gitlab', item.default_branch), private: item.visibility !== 'public' };
+}
+const gitlab: GitProviderAdapter = {
+  async verify(credential) {
+    const api = gitlabApi(credential);
+    const { body } = await getJson('gitlab', `${api.base}/user`, api.headers, { verify: true });
+    return { login: login('gitlab', record('gitlab', body).username) };
+  },
+  async list(credential, page) {
+    const api = gitlabApi(credential);
+    // simple=true omits `visibility`, so the full representation is requested.
+    const { body, response } = await getJson('gitlab',
+      `${api.base}/projects?membership=true&per_page=${pageSize}&page=${pageNumber(page)}&order_by=path&sort=asc`, api.headers);
+    const items = list('gitlab', body);
+    const next = response.headers.get('x-next-page');
+    return {
+      repositories: items.map(gitlabRepository).filter((item): item is ProviderRepository => item !== null),
+      hasMore: next === null ? items.length === pageSize : next.trim() !== '',
+    };
+  },
+  async repository(credential, repository) {
+    const api = gitlabApi(credential);
+    const { id } = target('gitlab', repository);
+    const { body } = await getJson('gitlab', `${api.base}/projects/${encodeURIComponent(id)}`, api.headers);
+    return gitlabRepository(body) ?? emptyRepository('gitlab');
+  },
+  async commit(credential, repository, ref) {
+    const api = gitlabApi(credential);
+    const { id } = target('gitlab', repository);
+    const { body } = await getJson('gitlab',
+      `${api.base}/projects/${encodeURIComponent(id)}/repository/commits/${encodeURIComponent(repositoryRef(ref))}`, api.headers);
+    return commitSha('gitlab', record('gitlab', body).id);
+  },
+  async archive(credential, repository, commit) {
+    const api = gitlabApi(credential);
+    const { id } = target('gitlab', repository);
+    return download({
+      provider: 'gitlab', url: `${api.base}/projects/${encodeURIComponent(id)}/repository/archive.tar.gz?sha=${pinnedCommit(commit)}`,
+      headers: api.headers, format: 'tar.gz', redirect: null,
+    });
+  },
+};
+
+// Gitea and Forgejo: REST v1.
+function giteaApi(credential: GitCredential): { base: string; headers: Headers } {
+  return { base: `${selfHostedOrigin(credential).origin}/api/v1`, headers: { Authorization: `token ${credential.token}` } };
+}
+function giteaRepository(value: unknown): ProviderRepository | null {
+  const item = record('gitea', value);
+  if (item.empty === true) return null;
+  return { id: identity('gitea', item.id), fullName: canonicalName('gitea', item.full_name),
+    defaultBranch: branch('gitea', item.default_branch), private: flag('gitea', item.private) };
+}
+const gitea: GitProviderAdapter = {
+  async verify(credential) {
+    const api = giteaApi(credential);
+    const { body } = await getJson('gitea', `${api.base}/user`, api.headers, { verify: true });
+    return { login: login('gitea', record('gitea', body).login) };
+  },
+  async list(credential, page) {
+    const api = giteaApi(credential);
+    const { body } = await getJson('gitea', `${api.base}/user/repos?page=${pageNumber(page)}&limit=${pageSize}`, api.headers);
+    const items = list('gitea', body);
+    return { repositories: items.map(giteaRepository).filter((item): item is ProviderRepository => item !== null), hasMore: items.length === pageSize };
+  },
+  async repository(credential, repository) {
+    const api = giteaApi(credential);
+    const { id } = target('gitea', repository);
+    const { body } = await getJson('gitea', `${api.base}/repositories/${encodeURIComponent(id)}`, api.headers);
+    return giteaRepository(body) ?? emptyRepository('gitea');
+  },
+  async commit(credential, repository, ref) {
+    const api = giteaApi(credential);
+    const { fullName } = target('gitea', repository);
+    const { body } = await getJson('gitea',
+      `${api.base}/repos/${fullName}/commits?sha=${encodeURIComponent(repositoryRef(ref))}&limit=1&stat=false&verification=false&files=false`, api.headers);
+    const items = list('gitea', body);
+    if (items.length === 0) accessFailure('gitea', false);
+    return commitSha('gitea', record('gitea', items[0]).sha);
+  },
+  async archive(credential, repository, commit) {
+    const api = giteaApi(credential);
+    const { fullName } = target('gitea', repository);
+    return download({
+      provider: 'gitea', url: `${api.base}/repos/${fullName}/archive/${pinnedCommit(commit)}.tar.gz`,
+      headers: api.headers, format: 'tar.gz', redirect: null,
+    });
+  },
+};
+
+// Bitbucket Cloud: REST 2.0. Cross-workspace listing (GET /2.0/repositories) was removed by CHANGE-2770, so
+// repositories are listed per workspace from GET /2.0/user/workspaces.
+const bitbucketApi = 'https://api.bitbucket.org/2.0';
+const bitbucketWeb = 'https://bitbucket.org';
+const bitbucketWorkspacePages = 10;
+function bitbucketHeaders(credential: GitCredential): Headers {
+  return { Authorization: credential.username ? basic(credential.username, credential.token) : `Bearer ${credential.token}` };
+}
+function bitbucketRepository(value: unknown): ProviderRepository | null {
+  const item = record('bitbucket', value);
+  if (item.mainbranch === null || item.mainbranch === undefined) return null;
+  return { id: identity('bitbucket', item.uuid), fullName: canonicalName('bitbucket', item.full_name),
+    defaultBranch: branch('bitbucket', record('bitbucket', item.mainbranch).name), private: flag('bitbucket', item.is_private) };
+}
+function bitbucketPage(body: unknown): { values: unknown[]; next: boolean; size: number | null } {
+  const item = record('bitbucket', body);
+  const size = typeof item.size === 'number' && Number.isSafeInteger(item.size) && item.size >= 0 ? item.size : null;
+  return { values: list('bitbucket', item.values), next: typeof item.next === 'string', size };
+}
+async function bitbucketWorkspaces(headers: Headers): Promise<string[]> {
+  const slugs: string[] = [];
+  for (let page = 1; page <= bitbucketWorkspacePages; page++) {
+    const { body } = await getJson('bitbucket', `${bitbucketApi}/user/workspaces?pagelen=100&page=${page}&sort=slug`, headers);
+    const result = bitbucketPage(body);
+    for (const value of result.values) {
+      const slug = record('bitbucket', record('bitbucket', value).workspace).slug;
+      if (typeof slug !== 'string' || !/^[A-Za-z0-9_.-]{1,100}$/.test(slug)) invalidResponse('bitbucket');
+      slugs.push(slug);
+    }
+    if (!result.next) break;
+  }
+  return slugs;
+}
+const bitbucket: GitProviderAdapter = {
+  async verify(credential) {
+    const headers = bitbucketHeaders(credential);
+    const response = await request('bitbucket', `${bitbucketApi}/user`, { Accept: 'application/json', ...headers });
+    if ((response.status === 401 || response.status === 403) && !credential.username) {
+      // Workspace/project/repository access tokens have no user; they authenticate but cannot read /user.
+      await discard(response);
+      await getJson('bitbucket', `${bitbucketApi}/user/workspaces?pagelen=1`, headers, { verify: true });
+      return { login: 'access token' };
+    }
+    await expectOk('bitbucket', response, { verify: true });
+    const text = await readText('bitbucket', response, jsonBytes);
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { invalidResponse('bitbucket'); }
+    return { login: login('bitbucket', record('bitbucket', body).username) };
+  },
+  async list(credential, page) {
+    const headers = bitbucketHeaders(credential);
+    // Global position across workspaces (sorted by slug), each listed by full_name.
+    const skip = (pageNumber(page) - 1) * pageSize;
+    let seen = 0;
+    const repositories: ProviderRepository[] = [];
+    let taken = 0;
+    for (const workspace of await bitbucketWorkspaces(headers)) {
+      let workspacePage = 1;
+      for (;;) {
+        const { body } = await getJson('bitbucket',
+          `${bitbucketApi}/repositories/${workspace}?role=member&pagelen=${pageSize}&page=${workspacePage}&sort=full_name`, headers);
+        const result = bitbucketPage(body);
+        if (workspacePage === 1 && result.size !== null && seen + result.size <= skip) { seen += result.size; break; }
+        if (workspacePage === 1 && result.size !== null && skip - seen >= pageSize) {
+          // Jump straight to the page that contains the first wanted repository.
+          const pages = Math.floor((skip - seen) / pageSize);
+          seen += pages * pageSize;
+          workspacePage += pages;
+          continue;
+        }
+        for (const value of result.values) {
+          if (seen++ < skip) continue;
+          if (taken === pageSize) return { repositories, hasMore: true };
+          taken++;
+          const repository = bitbucketRepository(value);
+          if (repository) repositories.push(repository);
+        }
+        if (!result.next) break;
+        if (taken === pageSize) return { repositories, hasMore: true };
+        workspacePage++;
+      }
+    }
+    return { repositories, hasMore: false };
+  },
+  async repository(credential, repository) {
+    const { fullName } = target('bitbucket', repository);
+    const { body } = await getJson('bitbucket', `${bitbucketApi}/repositories/${fullName}`, bitbucketHeaders(credential));
+    return bitbucketRepository(body) ?? emptyRepository('bitbucket');
+  },
+  async commit(credential, repository, ref) {
+    const { fullName } = target('bitbucket', repository);
+    const { body } = await getJson('bitbucket',
+      `${bitbucketApi}/repositories/${fullName}/commit/${encodeURIComponent(repositoryRef(ref))}`, bitbucketHeaders(credential));
+    return commitSha('bitbucket', record('bitbucket', body).hash);
+  },
+  async archive(credential, repository, commit) {
+    const { fullName } = target('bitbucket', repository);
+    // Not part of the REST API: the web download endpoint accepts the same API credentials. A single redirect is
+    // followed only to bitbucket.org or its subdomains, without credentials; a sign-in redirect means no access.
+    return download({
+      provider: 'bitbucket', url: `${bitbucketWeb}/${fullName}/get/${pinnedCommit(commit)}.tar.gz`,
+      headers: bitbucketHeaders(credential), format: 'tar.gz',
+      redirect: url => {
+        if (url.hostname === 'id.atlassian.com' || (url.hostname === 'bitbucket.org' && url.pathname.startsWith('/account/'))) accessFailure('bitbucket', false);
+        return url.port === '' && (url.hostname === 'bitbucket.org' || url.hostname.endsWith('.bitbucket.org'));
+      },
+    });
+  },
+};
+
+// Azure DevOps Services: REST 7.1 under https://dev.azure.com/{organization}.
+function azureApi(credential: GitCredential): { organization: string; base: string; headers: Headers } {
+  const organization = credential.organization;
+  if (!azureOrganization.test(organization)) fail(400, 'invalid_git_account', 'The connected Azure DevOps account has an invalid organization.');
+  return { organization, base: `https://dev.azure.com/${organization}`, headers: { Authorization: basic('', credential.token) } };
+}
+function azureTarget(credential: GitCredential, repository: RepositoryRef): { organization: string; base: string; headers: Headers; id: string } {
+  const api = azureApi(credential);
+  const { id, fullName } = target('azure-devops', repository);
+  if (fullName.split('/')[0] !== api.organization) accessFailure('azure-devops', false);
+  return { ...api, id: encodeURIComponent(id) };
+}
+function azureRepository(organization: string, value: unknown): ProviderRepository | null {
+  const item = record('azure-devops', value);
+  const project = record('azure-devops', item.project);
+  if (item.isDisabled === true || typeof item.defaultBranch !== 'string' || !item.defaultBranch.startsWith('refs/heads/')) return null;
+  if (typeof project.name !== 'string' || typeof item.name !== 'string') invalidResponse('azure-devops');
+  return {
+    id: identity('azure-devops', item.id),
+    fullName: canonicalName('azure-devops', `${organization}/${project.name}/${item.name}`),
+    defaultBranch: branch('azure-devops', item.defaultBranch.slice('refs/heads/'.length)),
+    private: project.visibility !== 'public',
+  };
+}
+async function azureRefs(api: { base: string; headers: Headers; id: string }, filter: string, peel: boolean): Promise<JsonObject[]> {
+  const { body } = await getJson('azure-devops',
+    `${api.base}/_apis/git/repositories/${api.id}/refs?filter=${encodeURIComponent(filter)}${peel ? '&peelTags=true' : ''}&api-version=7.1`,
+    api.headers, { denied: azureDeniedStatuses });
+  return list('azure-devops', record('azure-devops', body).value).map(item => record('azure-devops', item));
+}
+const azureDevOps: GitProviderAdapter = {
+  async verify(credential) {
+    const api = azureApi(credential);
+    // connectionData only exists as a preview API; any failure other than an auth rejection falls back to projects.
+    const response = await request('azure-devops', `${api.base}/_apis/connectionData?api-version=7.1-preview`, { Accept: 'application/json', ...api.headers });
+    if (azureDeniedStatuses.includes(response.status)) { await discard(response); accessFailure('azure-devops', true); }
+    if (response.status === 200) {
+      let body: unknown;
+      try { body = JSON.parse(await readText('azure-devops', response, jsonBytes)); } catch { body = undefined; }
+      const user = body && typeof body === 'object' && 'authenticatedUser' in body ? body.authenticatedUser : undefined;
+      const name = user && typeof user === 'object' && 'providerDisplayName' in user ? user.providerDisplayName : undefined;
+      if (typeof name === 'string' && name.trim() && name.length <= 255 && !/[\x00-\x1f\x7f]/.test(name)) return { login: name.trim() };
+    } else await discard(response);
+    await getJson('azure-devops', `${api.base}/_apis/projects?$top=1&api-version=7.1`, api.headers, { verify: true, denied: azureDeniedStatuses });
+    return { login: api.organization };
+  },
+  async list(credential, page) {
+    const api = azureApi(credential);
+    const offset = (pageNumber(page) - 1) * pageSize;
+    const { body } = await getJson('azure-devops', `${api.base}/_apis/git/repositories?api-version=7.1`, api.headers,
+      { denied: azureDeniedStatuses, limit: azureListBytes });
+    const repositories = list('azure-devops', record('azure-devops', body).value)
+      .map(item => azureRepository(api.organization, item))
+      .filter((item): item is ProviderRepository => item !== null)
+      .sort((a, b) => (a.fullName < b.fullName ? -1 : a.fullName > b.fullName ? 1 : 0));
+    return { repositories: repositories.slice(offset, offset + pageSize), hasMore: repositories.length > offset + pageSize };
+  },
+  async repository(credential, repository) {
+    const api = azureTarget(credential, repository);
+    const { body } = await getJson('azure-devops', `${api.base}/_apis/git/repositories/${api.id}?api-version=7.1`, api.headers, { denied: azureDeniedStatuses });
+    const item = record('azure-devops', body);
+    if (item.isDisabled === true) accessFailure('azure-devops', false);
+    return azureRepository(api.organization, item) ?? emptyRepository('azure-devops');
+  },
+  async commit(credential, repository, ref) {
+    const api = azureTarget(credential, repository);
+    const name = repositoryRef(ref);
+    if (sha1.test(name)) {
+      const { body } = await getJson('azure-devops', `${api.base}/_apis/git/repositories/${api.id}/commits/${name}?api-version=7.1`,
+        api.headers, { denied: azureDeniedStatuses });
+      if (commitSha('azure-devops', record('azure-devops', body).commitId) !== name) invalidResponse('azure-devops');
+      return name;
+    }
+    // refs filters are prefix matches; only an exact branch, then tag, name is accepted.
+    const head = (await azureRefs(api, `heads/${name}`, false)).find(item => item.name === `refs/heads/${name}`);
+    if (head) return commitSha('azure-devops', head.objectId);
+    const tag = (await azureRefs(api, `tags/${name}`, true)).find(item => item.name === `refs/tags/${name}`);
+    if (tag) return commitSha('azure-devops', tag.peeledObjectId ?? tag.objectId);
+    return accessFailure('azure-devops', false);
+  },
+  async archive(credential, repository, commit) {
+    const api = azureTarget(credential, repository);
+    const organizationHost = `${api.organization.toLowerCase()}.visualstudio.com`;
+    return download({
+      provider: 'azure-devops',
+      url: `${api.base}/_apis/git/repositories/${api.id}/items?path=/&versionDescriptor.version=${pinnedCommit(commit)}` +
+        '&versionDescriptor.versionType=commit&$format=zip&download=true&api-version=7.1',
+      headers: { ...api.headers, Accept: 'application/zip' }, format: 'zip', denied: deniedStatuses,
+      redirect: url => url.port === '' && (url.hostname.endsWith('.blob.core.windows.net') || url.hostname === organizationHost ||
+        (url.hostname === 'dev.azure.com' && url.pathname.startsWith(`/${api.organization}/`))),
+    });
+  },
+};
+
+export const gitProviderAdapters: Record<TokenGitProvider, GitProviderAdapter> = {
+  'github-enterprise': githubEnterprise,
+  gitlab,
+  bitbucket,
+  'azure-devops': azureDevOps,
+  gitea,
+};

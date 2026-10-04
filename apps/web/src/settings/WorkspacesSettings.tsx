@@ -1,14 +1,14 @@
 import { useState, type FormEvent } from "react";
 import type { AgentVersion, UserProfile, Workspace, WorkspaceRole } from "../../../../packages/shared/src/types";
-import { repositoryLimits, type GitHubRepository, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
+import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { useConnections } from "../hosts";
 import { Icon } from "../icons";
 import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
-import { RepositorySnapshotPolicy, useWorkspaceRepositories } from "../repositories";
+import { gitAccountLabel, gitProviderLabel, RepositorySnapshotPolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
-import { Alert, Button, CardBody, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
+import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
 
 interface Member { userId: string; role: WorkspaceRole; displayName?: string; githubLogin?: string | null }
 
@@ -63,7 +63,7 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
       <Row title="Your role" trailing={<StatusBadge tone={admin ? "success" : "neutral"}>{roleLabel[role]}</StatusBadge>} />
     </Section>
     <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />
-    <Repositories user={user} workspace={workspace} admin={admin} {...repositories} />
+    <Repositories workspace={workspace} admin={admin} {...repositories} />
     <Members workspace={workspace} admin={admin} />
   </>;
 }
@@ -86,8 +86,9 @@ function Setup({ user, workspace, admin, repositoryCount }: { user: UserProfile;
   </Section>;
 }
 
-function Repositories({ user, workspace, admin, repositories, loading, error, refresh }: { user: UserProfile; workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; loading: boolean; error: string; refresh: () => void }) {
+function Repositories({ workspace, admin, repositories, loading, error, refresh }: { workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; loading: boolean; error: string; refresh: () => void }) {
   const action = useAction();
+  const accounts = useGitAccounts(admin);
   const [picking, setPicking] = useState(false);
   const full = (repositories?.length ?? 0) >= repositoryLimits.repositories;
   async function remove(repository: WorkspaceRepository) {
@@ -105,7 +106,7 @@ function Repositories({ user, workspace, admin, repositories, loading, error, re
       refresh();
     }, "Repository removed. Existing sessions keep their pinned snapshots.");
   }
-  const canAdd = admin && user.githubConnected && !full;
+  const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
   return <Section bare title="Repositories" info={<div className="stack">
     {!admin && <p>Only workspace owners and admins can add or remove repositories.</p>}
     <p>Changes apply to new sessions only. To change a ref, remove and re-add the repository.</p>
@@ -115,31 +116,38 @@ function Repositories({ user, workspace, admin, repositories, loading, error, re
       <div className="card">
         <ResourceState loading={loading} error={error} retry={refresh}>
           {!repositories?.length
-            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a GitHub repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
-            : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<code>{repository.ref}</code>} trailing={<>
+            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
+            : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<>{gitProviderLabel(repository.provider, repository.host)} · <code>{repository.ref}</code></>} trailing={<>
               <StatusBadge>{repository.private ? "Private" : "Public"}</StatusBadge>
               {admin && <Button variant="outline" size="sm" disabled={action.busy} aria-label={`Remove ${repository.fullName}`} onClick={() => void remove(repository)}>Remove</Button>}
             </>} />)}
           {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
         </ResourceState>
       </div>
-      {admin && !user.githubConnected && <Alert variant="warning" title="GitHub not connected" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Connect your GitHub account before choosing repositories.</Alert>}
-      {admin && user.githubConnected && full && <Alert variant="info" title="Repository limit reached">The workspace has reached its {repositoryLimits.repositories}-repository limit. Remove a binding to choose another.</Alert>}
+      {admin && accounts.error && <Alert variant="error" title="Unable to load Git accounts" actions={<Button variant="outline" size="sm" onClick={accounts.refresh}>Try again</Button>}>{accounts.error}</Alert>}
+      {admin && accounts.accounts && !accounts.accounts.length && <Alert variant="warning" title="No Git accounts connected" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Connect GitHub or add a Git account in Settings → Profile before choosing repositories.</Alert>}
+      {admin && Boolean(accounts.accounts?.length) && full && <Alert variant="info" title="Repository limit reached">The workspace has reached its {repositoryLimits.repositories}-repository limit. Remove a binding to choose another.</Alert>}
     </div>
-    {canAdd && <RepositoryPicker open={picking} workspace={workspace} repositories={repositories ?? []} disabled={loading || Boolean(error) || action.busy} refresh={refresh} close={() => setPicking(false)} />}
+    {canAdd && <RepositoryPicker open={picking} workspace={workspace} accounts={accounts.accounts ?? []} repositories={repositories ?? []} disabled={loading || Boolean(error) || action.busy} refresh={refresh} close={() => setPicking(false)} />}
   </Section>;
 }
 
-function RepositoryPicker({ open, workspace, repositories, disabled, refresh, close }: { open: boolean; workspace: Workspace; repositories: WorkspaceRepository[]; disabled: boolean; refresh: () => void; close: () => void }) {
+function RepositoryPicker({ open, workspace, accounts, repositories, disabled, refresh, close }: { open: boolean; workspace: Workspace; accounts: GitAccount[]; repositories: WorkspaceRepository[]; disabled: boolean; refresh: () => void; close: () => void }) {
+  const [accountId, setAccountId] = useState("");
   const [page, setPage] = useState(1);
   const [selectedId, setSelectedId] = useState("");
   const [ref, setRef] = useState("");
-  const resource = useResource<{ repositories: GitHubRepository[]; page: number; hasMore: boolean }>(open ? `/api/github/repositories?page=${page}` : null);
+  // The API lists the GitHub sign-in account first when connected, so it is the default.
+  const account = accounts.find(item => item.id === accountId) ?? accounts[0];
+  const resource = useResource<{ repositories: ProviderRepository[]; page: number; hasMore: boolean }>(open && account ? `/api/git/accounts/${segment(account.id)}/repositories?page=${page}` : null);
   const action = useAction();
-  const selected = resource.data?.repositories.find(repository => String(repository.id) === selectedId);
-  const alreadyBound = (repository: GitHubRepository) => repositories.some(binding => binding.repositoryId === repository.id || binding.fullName.toLowerCase() === repository.fullName.toLowerCase());
-  const blocked = disabled || action.busy || resource.loading || Boolean(resource.error) || !selected || alreadyBound(selected) || repositories.length >= repositoryLimits.repositories;
+  const selected = resource.data?.repositories.find(repository => repository.id === selectedId);
+  const alreadyBound = (repository: ProviderRepository) => repositories.some(binding => binding.provider === account?.provider && binding.host === account.host
+    && (binding.repositoryId === repository.id || binding.fullName.toLowerCase() === repository.fullName.toLowerCase()));
+  const blocked = disabled || action.busy || resource.loading || Boolean(resource.error) || !account || !selected || alreadyBound(selected) || repositories.length >= repositoryLimits.repositories;
+  const providerName = account ? gitProviderNames[account.provider] : "Git";
   function changePage(next: number) { setSelectedId(""); setRef(""); setPage(next); }
+  function chooseAccount(id: string) { setAccountId(id); changePage(1); }
   function dismiss() {
     if (action.busy) return;
     setSelectedId("");
@@ -148,9 +156,9 @@ function RepositoryPicker({ open, workspace, repositories, disabled, refresh, cl
   }
   function add(event: FormEvent) {
     event.preventDefault();
-    if (blocked || !selected) return;
+    if (blocked || !selected || !account) return;
     void action.run(async () => {
-      await api(`/api/workspaces/${segment(workspace.id)}/repositories`, { method: "POST", body: { repositoryId: selected.id, fullName: selected.fullName, ...(ref.trim() ? { ref: ref.trim() } : {}) } });
+      await api(`/api/workspaces/${segment(workspace.id)}/repositories`, { method: "POST", body: { provider: account.provider, host: account.host, repositoryId: selected.id, fullName: selected.fullName, ...(ref.trim() ? { ref: ref.trim() } : {}) } });
       refresh();
       setSelectedId("");
       setRef("");
@@ -162,12 +170,16 @@ function RepositoryPicker({ open, workspace, repositories, disabled, refresh, cl
     <Button variant="default" type="submit" form="repository-picker-form" disabled={blocked}>{action.busy ? "Binding..." : "Bind repository"}</Button>
   </>}>
     <form id="repository-picker-form" className="stack" onSubmit={add}>
-      <p className="muted small">Only repositories your GitHub account can access are listed. Never paste a token or clone URL</p>
+      <div className="field"><span className="field-label">Account</span>
+        <Combobox<string> label="Account" placeholder="Choose an account" value={account?.id ?? ""} disabled={disabled || action.busy}
+          options={accounts.map(item => ({ value: item.id, label: gitAccountLabel(item), hint: item.login }))} onChange={chooseAccount} />
+      </div>
+      <p className="muted small">Only repositories this {providerName} account can access are listed. Sessions read them with their owner's own account for the same provider. Never paste a token or clone URL</p>
       <ResourceState {...resource} retry={resource.refresh}>
         {!resource.data?.repositories.length
-          ? <EmptyState title="No repositories on this page">Check your GitHub account and organization access, or return to a previous page</EmptyState>
+          ? <EmptyState title="No repositories on this page">Check your {providerName} account and organization access, or return to a previous page</EmptyState>
           : <>
-            <Field label="GitHub repository">
+            <Field label={`${providerName} repository`}>
               <select className="select" required value={selectedId} disabled={disabled || action.busy} onChange={event => { setSelectedId(event.target.value); setRef(""); }}>
                 <option value="">Choose a repository</option>
                 {resource.data.repositories.map(repository => <option key={repository.id} value={repository.id} disabled={alreadyBound(repository)}>{repository.fullName} / {repository.private ? "Private" : "Public"}{alreadyBound(repository) ? " / Already configured" : ""}</option>)}
@@ -180,10 +192,10 @@ function RepositoryPicker({ open, workspace, repositories, disabled, refresh, cl
       </ResourceState>
       <div className="inline">
         <Button variant="ghost" size="sm" icon="chevron-left" disabled={page === 1 || resource.loading || action.busy} onClick={() => changePage(page - 1)}>Previous</Button>
-        <span className="muted small" role="status">GitHub page {page}</span>
+        <span className="muted small" role="status">{providerName} page {page}</span>
         <Button variant="ghost" size="sm" disabled={!resource.data?.hasMore || resource.loading || Boolean(resource.error) || action.busy} onClick={() => changePage(page + 1)}>Next<Icon name="chevron-right" size={16} /></Button>
       </div>
-      {resource.error && <p className="muted small">Review your <a href={href({ name: "settings", section: "profile" })}>GitHub connection</a> and repository access, then retry. An owner or admin with access can also configure this workspace</p>}
+      {resource.error && <p className="muted small">Review your <a href={href({ name: "settings", section: "profile" })}>Git accounts</a> and repository access, then retry. An owner or admin with access can also configure this workspace</p>}
       <Feedback error={action.error} />
     </form>
   </Sheet>;

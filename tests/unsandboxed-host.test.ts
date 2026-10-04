@@ -119,3 +119,19 @@ test("unsandboxed repository caches unpack pinned archives once and refuse unsaf
   await workspace.materializeRepositories([pin], [tarGz([{ name: "alpha-main/", type: "5" }, { name: "alpha-main/README.md", body: "reset" }])], authorize);
   assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "edited", "a ready cache never overwrites edits");
 });
+
+test("unsandboxed workspaces materialize deep provider pins under their host directory", hostMode, async t => {
+  const gitlab: SessionRepository = { bindingId: "binding-gitlab", provider: "gitlab", host: "gitlab.example.com", repositoryId: "4242", fullName: "group/sub/project", path: "gitlab.example.com/group/sub/project", ref: "main", commit: "b".repeat(40) };
+  const azure: SessionRepository = { bindingId: "binding-azure", provider: "azure-devops", host: "dev.azure.com", repositoryId: "6f0c1b2a-0d4e-4c5b-9a7e-1d2c3b4a5f60", fullName: "org/My Project/repo", path: "dev.azure.com/org/My-Project/repo", ref: "main", commit: "c".repeat(40) };
+  const { workspace } = await hostWorkspace(t, [gitlab, azure, pin]);
+  const repositories = [pin, azure, gitlab];
+  await workspace.materializeRepositories(repositories, [
+    tarGz([{ name: "alpha-main/", type: "5" }, { name: "alpha-main/README.md", body: "github" }]),
+    tarGz([{ name: "repo/", type: "5" }, { name: "repo/src/main.cs", body: "azure" }]),
+    tarGz([{ name: "project-bbbb/", type: "5" }, { name: "project-bbbb/README.md", body: "gitlab" }]),
+  ], authorize);
+  assert.equal(await workspace.repositoryCachesReady(repositories, authorize), true);
+  assert.equal(await workspace.readFile("gitlab.example.com/group/sub/project/README.md", authorize), "gitlab");
+  assert.equal(await workspace.readFile("dev.azure.com/org/My-Project/repo/src/main.cs", authorize), "azure");
+  assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "github");
+});

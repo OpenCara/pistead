@@ -14,7 +14,7 @@ const HELP = `Usage: pistead connect [options]
 
 Connect your local Pi to a Pistead workspace using outbound WebSocket only.
 Use Node.js 24 on Linux or WSL2 (or macOS with --unsafe-no-sandbox). In the web app,
-configure authorized GitHub repositories for your workspace and pair Pi with it, then run:
+configure authorized repositories for your workspace and pair Pi with it, then run:
   npx pistead@latest connect --server https://pistead.com --pairing-id PAIRING_ID
 The pairing code is requested privately on a terminal, never as an argument.
 Subsequent runs use the private saved connector token.
@@ -41,6 +41,9 @@ isolated sandbox. Native Windows is unsupported; run this command inside WSL2.
 --unsafe-no-sandbox needs only Git on PATH, but approved commands then run as your
 user with access to your files, credentials and network, and no resource limits.
 Session repositories are pinned into private session caches, not your current folder.
+GitLab, Azure DevOps, Bitbucket, Gitea/Forgejo and GitHub Enterprise repositories are
+connected in the web app (Settings > Profile > Git accounts) with personal access tokens;
+the connector receives pinned snapshots only, never those tokens.
 Production bash additionally requires verified per-session aggregate cgroups and a
 bounded private filesystem;
 --resources does not provision these. Missing resource limits never enable host shell.

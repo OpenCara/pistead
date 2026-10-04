@@ -40,12 +40,16 @@ export function repositoryIdentity(repositories: RunnerBinding['session']['repos
   if (repositories === undefined) return '[]';
   if (!Array.isArray(repositories)) fail(409, 'invalid_restore', 'Invalid session repository pins.');
   return JSON.stringify(repositories.map(repository => {
-    if (!repository || typeof repository.bindingId !== 'string' || typeof repository.repositoryId !== 'number' ||
+    const provider = repository && 'provider' in repository;
+    if (!repository || typeof repository.bindingId !== 'string' || typeof repository.repositoryId !== (provider ? 'string' : 'number') ||
         typeof repository.fullName !== 'string' || typeof repository.ref !== 'string' ||
-        typeof repository.commit !== 'string' || typeof repository.path !== 'string') {
+        typeof repository.commit !== 'string' || typeof repository.path !== 'string' ||
+        (provider && (typeof repository.provider !== 'string' || typeof repository.host !== 'string'))) {
       fail(409, 'invalid_restore', 'Invalid session repository pins.');
     }
-    return [repository.bindingId, repository.repositoryId, repository.fullName, repository.ref, repository.commit, repository.path];
+    // GitHub pins keep their original identity tuple; other providers add provider and host.
+    const identity = [repository.bindingId, repository.repositoryId, repository.fullName, repository.ref, repository.commit, repository.path];
+    return 'provider' in repository ? [...identity, repository.provider, repository.host] : identity;
   }));
 }
 

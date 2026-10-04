@@ -5,6 +5,7 @@ import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { repositoryPinIdentity } from "./protocol.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 
@@ -761,25 +762,20 @@ export function text(value: unknown, label: string, limit: number, multiline = f
 export function repositoryPins(repositories: readonly SessionRepository[]): SessionRepository[] {
   if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) throw new Error("Invalid repository pin set");
   const names = new Set<string>();
-  const ids = new Set<number>();
+  const ids = new Set<string>();
   const bindings = new Set<string>();
   return repositories.map((repository) => {
-    if (!repository || typeof repository !== "object") throw new Error("Invalid repository pin");
+    const id = repositoryPinIdentity(repository);
+    if (!id) throw new Error("Invalid repository pin");
+    if (names.has(repository.path.toLowerCase()) || ids.has(id) || bindings.has(repository.bindingId)) throw new Error("Invalid or duplicate repository pin");
+    names.add(repository.path.toLowerCase());
+    ids.add(id);
+    bindings.add(repository.bindingId);
+    if ("provider" in repository) {
+      const { bindingId, provider, host, repositoryId, fullName, ref, commit, path } = repository;
+      return { bindingId, provider, host, repositoryId, fullName, ref, commit, path };
+    }
     const { bindingId, repositoryId, fullName, ref, commit, path } = repository;
-    text(bindingId, "repository binding id", 256);
-    text(ref, "repository ref", 1024);
-    if (typeof fullName !== "string" || !/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d_.-]{1,100}$/i.test(fullName)) {
-      throw new Error("Invalid repository name");
-    }
-    if (fullName.split("/").some((part) => [".", "..", ".git"].includes(part.toLowerCase()))
-      || path !== fullName || typeof commit !== "string" || !/^[a-f\d]{40}$/.test(commit)
-      || !Number.isSafeInteger(repositoryId) || repositoryId <= 0
-      || names.has(fullName.toLowerCase()) || ids.has(repositoryId) || bindings.has(bindingId)) {
-      throw new Error("Invalid or duplicate repository pin");
-    }
-    names.add(fullName.toLowerCase());
-    ids.add(repositoryId);
-    bindings.add(bindingId);
     return { bindingId, repositoryId, fullName, ref, commit, path };
   }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 }

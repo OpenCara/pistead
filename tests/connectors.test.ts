@@ -210,7 +210,7 @@ async function sharedAgent(f: Fixture, tools: AgentVersion['tools'] = ['identity
   await addMember(admin, team.id, host); await addMember(admin, team.id, creator);
   f.sqlite.prepare(`INSERT INTO workspace_repositories
     (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
-    .run('shared-repository', team.id, 7, 'owner/repo', 'main', 1, new Date().toISOString());
+    .run('shared-repository', team.id, '7', 'owner/repo', 'main', 1, new Date().toISOString());
   const creatorRequest = creator.request;
   creator.request = async (method, path, body, headers) => {
     if (method !== 'POST' || path !== '/api/sessions') return creatorRequest(method, path, body, headers);
@@ -412,6 +412,7 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'duplicate thinking level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['off', 'off'] }] }, code: 'invalid_manifest' },
     { name: 'empty thinking levels', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: [] }] }, code: 'invalid_manifest' },
     { name: 'non-boolean chat options', value: { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: 'true' } }, code: 'invalid_manifest' },
+    { name: 'non-boolean git providers', value: { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: 1 } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -746,7 +747,7 @@ test('claim, socket, and self routes require TLS except for explicitly enabled l
   const f = fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
   f.sqlite.prepare(`INSERT INTO workspace_repositories
     (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
-    .run('tls-repository', team.id, 7, 'owner/repo', 'main', 1, new Date().toISOString());
+    .run('tls-repository', team.id, '7', 'owner/repo', 'main', 1, new Date().toISOString());
   const connector = await connect(f, owner, team.id);
   const pending = await pairing(owner, 'Local Pi', team.id);
   const claimBody = { code: pending.code, ...manifest };

@@ -1,5 +1,6 @@
 import type { Context } from 'hono';
 import type { Permission, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
+import type { GitProvider, TokenGitProvider } from '../../../packages/shared/src/repositories';
 
 export interface Env {
   DB: D1Database;
@@ -53,6 +54,14 @@ export interface SessionRow {
   connector_id?: string | null; connector_owner_id?: string | null;
   repositories_json?: string;
   visibility?: 'private' | 'workspace';
+}
+export interface RepositoryRow {
+  id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;
+  ref: string; private: number; created_at: string;
+}
+export interface GitCredentialRow {
+  id: string; user_id: string; provider: TokenGitProvider; host: string; organization: string; username: string | null;
+  login: string; ciphertext: string; created_at: string; updated_at: string;
 }
 export interface SessionAccess { row: SessionRow; permissions: Permission[] }
 export type PublicProfile = UserProfile;

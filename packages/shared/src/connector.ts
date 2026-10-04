@@ -16,6 +16,8 @@ export interface ConnectorCapabilities {
   unsandboxed?: boolean;
   /** The connector applies per-message model, reasoning and access choices. Absent on older connectors. */
   chatOptions?: boolean;
+  /** The connector accepts repositories from providers other than github.com (provider/host pins). Absent on older connectors. */
+  gitProviders?: boolean;
 }
 
 export interface ConnectorInfo {

@@ -6,22 +6,22 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { Sandbox, type SandboxAuthorize, type SnapshotFile } from "../apps/runner/src/sandbox.js";
-import { repositoryLimits, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { repositoryLimits, type GitHubSessionRepository, type SessionRepository } from "../packages/shared/src/repositories.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 
 // Like runner.test.ts, Linux requires real bwrap FD mounts/user namespaces, Python and Git.
 // The explicit faux shell exercises those mounts; it does not bypass the sandbox.
 const linux = { skip: process.platform !== "linux" };
 const authorize: SandboxAuthorize = async () => {};
-const alpha: SessionRepository = {
+const alpha: GitHubSessionRepository = {
   bindingId: "binding-alpha", repositoryId: 101, fullName: "acme/alpha", path: "acme/alpha",
   ref: "main", commit: "a".repeat(40),
 };
-const beta: SessionRepository = {
+const beta: GitHubSessionRepository = {
   bindingId: "binding-beta", repositoryId: 202, fullName: "acme/beta", path: "acme/beta",
   ref: "release/v1", commit: "b".repeat(40),
 };
-const gamma: SessionRepository = {
+const gamma: GitHubSessionRepository = {
   bindingId: "binding-gamma", repositoryId: 303, fullName: "other/gamma", path: "other/gamma",
   ref: "v2", commit: "c".repeat(40),
 };
@@ -590,7 +590,7 @@ test("queued repository materialization rechecks authorization at effect time", 
   await recover(f);
 });
 
-const pinChanges: [string, Partial<SessionRepository>][] = [
+const pinChanges: [string, Partial<GitHubSessionRepository>][] = [
   ["bindingId", { bindingId: "another-binding" }],
   ["repositoryId", { repositoryId: 999 }],
   ["fullName", { fullName: "acme/renamed" }],

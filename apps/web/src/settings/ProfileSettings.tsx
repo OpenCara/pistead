@@ -2,8 +2,8 @@ import { useState, type FormEvent } from "react";
 import type { UserProfile } from "../../../../packages/shared/src/types";
 import { api } from "../api";
 import { useApp } from "../app-context";
-import { GitHubMark } from "../icons";
-import { Button, CardBody, CopyButton, Feedback, Field, LinkButton, Row, Section, StatusBadge, useAction } from "../ui";
+import { Button, CardBody, CopyButton, Feedback, Field, Row, Section, useAction } from "../ui";
+import { GitAccountsSection } from "./GitAccounts";
 import "./settings.css";
 
 type EnvRow = { id: string; key: string; value: string };
@@ -31,14 +31,14 @@ export function ProfileSettings() {
   const update = (id: string, change: Partial<EnvRow>) => setRows(current => current.map(item => item.id === id ? { ...item, ...change } : item));
   return <>
     <form className="settings-form" onSubmit={submit}>
-      <Section title="Identity" info="Sessions you own act with this Git identity and your GitHub account. New sessions use the saved values.">
+      <Section title="Identity" info="Sessions you own act with this Git identity and your connected Git accounts. New sessions use the saved values.">
         <CardBody>
           <Field label="Display name"><input className="input" required maxLength={120} value={displayName} onChange={event => setDisplayName(event.target.value)} autoComplete="name" /></Field>
           <Field label="Git author name"><input className="input" required maxLength={120} value={gitName} onChange={event => setGitName(event.target.value)} /></Field>
           <Field label="Git author email"><input className="input" required type="email" value={gitEmail} onChange={event => setGitEmail(event.target.value)} autoComplete="email" /></Field>
         </CardBody>
       </Section>
-      <Section title="Environment" info="Nonsecret APP_ variables only. They are sent to the host of every session you own. Never put GitHub tokens, provider keys or other credentials here; model credentials belong in Pi on your host."
+      <Section title="Environment" info="Nonsecret APP_ variables only. They are sent to the host of every session you own. Never put Git tokens, provider keys or other credentials here; model credentials belong in Pi on your host."
         action={<Button variant="outline" size="sm" icon="plus" onClick={() => setRows(current => [...current, { id: crypto.randomUUID(), key: "APP_", value: "" }])}>Add variable</Button>}>
         {!rows.length && <Row title="No variables" hint="Add APP_ variables your sessions need" />}
         {rows.map((row, index) => <Row key={row.id}
@@ -55,13 +55,7 @@ export function ProfileSettings() {
         <Button type="submit" variant="default" disabled={action.busy}>{action.busy ? "Saving..." : "Save profile"}</Button>
       </div>
     </form>
-    <Section title="GitHub" info="Your login is managed by the server. Members can view workspace-visible sessions read-only without direct GitHub access or tool execution. Viewing a session, sharing a host or publishing an agent never replaces the session owner's identity or grants GitHub access.">
-      <Row leading={<GitHubMark />} title={user.githubLogin ? `@${user.githubLogin}` : user.displayName}
-        trailing={<>
-          <StatusBadge tone={user.githubConnected ? "success" : "warning"}>{user.githubConnected ? "Connected" : "Not connected"}</StatusBadge>
-          {!user.githubConnected && <LinkButton variant="outline" size="sm" href="/api/auth/github">Connect GitHub</LinkButton>}
-        </>} />
-    </Section>
+    <GitAccountsSection />
     <Section title="Account">
       <Row title="User ID" hint={<code>{user.id}</code>} trailing={<CopyButton value={user.id} label="Copy user ID" />} />
       <Row title="Sign out" trailing={<Button variant="outline" size="sm" onClick={signOut}>Sign out</Button>} />

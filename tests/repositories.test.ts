@@ -3,16 +3,17 @@ import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import { gzipSync } from 'node:zlib';
+import { crc32, deflateRawSync, gunzipSync, gzipSync } from 'node:zlib';
 import { HTTPException } from 'hono/http-exception';
 import { app } from '../apps/worker/src/index.js';
 import type { ConnectorRelayEnvelope } from '../apps/worker/src/connector-transport.js';
 import { archiveRedirect, boundedRepositoryBody } from '../apps/worker/src/repositories.js';
+import { gitProviderAdapters } from '../apps/worker/src/git/providers.js';
 import type { Env } from '../apps/worker/src/types.js';
 import { encryptToken } from '../apps/worker/src/vault.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
-import { repositoryLimits, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
+import { repositoryLimits, type GitAccount, type ProviderRepository, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
 import type { AgentVersion, ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
 
 const origin = 'http://localhost:8787';
@@ -21,7 +22,8 @@ const internalSecret = 'repositories-internal-secret-not-for-deployment';
 const commitA = 'a'.repeat(40);
 const commitB = 'b'.repeat(40);
 const metadata = { id: 1701, full_name: 'acme/private-repo', default_branch: 'main', private: true };
-const repositoryInput = { repositoryId: metadata.id, fullName: metadata.full_name, ref: 'release/stable' };
+const repositoryInput = { provider: 'github', host: 'github.com', repositoryId: String(metadata.id), fullName: metadata.full_name, ref: 'release/stable' };
+const githubPicker = '/api/git/accounts/github/repositories';
 const manifest = {
   models: [{ provider: 'local-native', modelId: 'local/model-v1', name: 'Local model' }],
   capabilities: { platform: 'linux', sandbox: true, productionShell: false },
@@ -150,10 +152,10 @@ async function bindRepository(actor: Client, workspaceId: string, input = reposi
 async function pair(host: Client, workspaceId: string) {
   return (await json<{ pairing: ConnectorPairing }>(await host.request('POST', '/api/connectors/pairings', { name: 'Repository host', workspaceId }), 201)).pairing;
 }
-async function connect(f: Fixture, host: Client, workspaceId: string): Promise<Connected> {
+async function connect(f: Fixture, host: Client, workspaceId: string, claim: object = manifest): Promise<Connected> {
   const pending = await pair(host, workspaceId);
   const { credentials } = await json<{ credentials: ConnectorCredentials }>(await f.request('POST',
-    `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 201);
+    `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...claim }), 201);
   const connectionToken = token();
   // Only the WebSocket generation is seeded; pairing, sharing and catalog import use real routes.
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connectionToken), credentials.connectorId);
@@ -267,7 +269,7 @@ test('repository API separates cookie/CSRF authentication, administrator writes,
   const owner = await f.client('owner'); const admin = await f.client('admin'); const reader = await f.client('reader'); const outsider = await f.client('outsider');
   const team = await workspace(owner); const path = `/api/workspaces/${team.id}/repositories`;
   await member(owner, team.id, admin, 'admin'); await member(owner, team.id, reader);
-  for (const path of ['/api/github/repositories', `/api/workspaces/${team.id}/repositories`]) {
+  for (const path of [githubPicker, '/api/git/accounts', `/api/workspaces/${team.id}/repositories`]) {
     await denied(await f.request('GET', path), 401, 'unauthorized');
     await denied(await f.request('GET', path, undefined, { Authorization: `Bearer ${internalSecret}` }), 401, 'unauthorized');
   }
@@ -297,17 +299,17 @@ test('picker uses the acting GitHub token, projects safe metadata and bounds pag
   const f = fixture(t); const remote = github(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   remote.state.picker = async () => Response.json([{ ...metadata, token: alice.githubToken, clone_url: 'credential-bearing upstream field' }]);
   for (const actor of [alice, bob]) {
-    const result = await json(await actor.request('GET', '/api/github/repositories?page=2'));
-    assert.deepEqual(result, { repositories: [{ id: metadata.id, fullName: metadata.full_name, defaultBranch: 'main', private: true }], page: 2, hasMore: false });
+    const result = await json(await actor.request('GET', `${githubPicker}?page=2`));
+    assert.deepEqual(result, { repositories: [{ id: String(metadata.id), fullName: metadata.full_name, defaultBranch: 'main', private: true }], page: 2, hasMore: false });
     assert.equal(remote.calls.at(-1)!.authorization, `Bearer ${actor.githubToken}`);
   }
-  for (const page of ['0', '-1', '01', '1.5', '1001', '1e2']) await denied(await alice.request('GET', `/api/github/repositories?page=${page}`), 400, 'invalid_page');
+  for (const page of ['0', '-1', '01', '1.5', '1001', '1e2']) await denied(await alice.request('GET', `${githubPicker}?page=${page}`), 400, 'invalid_page');
   assert.equal(remote.calls.length, 2);
   remote.state.picker = async () => Response.json(Array.from({ length: 30 }, (_, index) => ({ ...metadata, id: index + 1, full_name: `acme/repo-${index}` })));
-  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', '/api/github/repositories'))).hasMore, true);
-  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', '/api/github/repositories?page=1000'))).hasMore, false);
+  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', githubPicker))).hasMore, true);
+  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', `${githubPicker}?page=1000`))).hasMore, false);
   remote.state.picker = async () => Response.json(Array.from({ length: 31 }, () => metadata));
-  await denied(await alice.request('GET', '/api/github/repositories'), 502, 'invalid_github_response');
+  await denied(await alice.request('GET', githubPicker), 502, 'invalid_github_response');
 });
 
 test('shared repository configuration never lends another member a GitHub token', async t => {
@@ -318,7 +320,7 @@ test('shared repository configuration never lends another member a GitHub token'
   f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(admin.user.id);
   remote.calls.length = 0;
   for (const [actor, status] of [[admin, 409], [synthetic, 403]] as const) {
-    await denied(await actor.request('GET', '/api/github/repositories'), status, 'github_not_connected');
+    await denied(await actor.request('GET', githubPicker), status, 'github_not_connected');
     await denied(await actor.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput), status, 'github_not_connected');
     assert.equal((await actor.request('GET', `/api/workspaces/${team.id}/repositories`)).status, 200);
   }
@@ -339,15 +341,15 @@ for (const changed of [{ id: metadata.id + 1 }, { full_name: 'acme/renamed' }, {
 test('binding validates numeric IDs and allowed fields before fetching, defaults the ref, and rejects duplicates', async t => {
   const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
   const path = `/api/workspaces/${team.id}/repositories`;
-  for (const repositoryId of ['1701', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, null]) {
+  for (const repositoryId of [metadata.id, '0', '-1', '1.5', '01', String(Number.MAX_SAFE_INTEGER + 1), 'acme', null]) {
     await denied(await actor.request('POST', path, { ...repositoryInput, repositoryId }), 400, 'invalid_repository');
   }
-  for (const extra of [{ token: actor.githubToken }, { path: '../escape' }, { commit: commitA }]) {
-    await denied(await actor.request('POST', path, { ...repositoryInput, ...extra }), 400, 'invalid_repository');
+  for (const extra of [{ token: actor.githubToken }, { path: '../escape' }, { commit: commitA }, { provider: 'svn' }, { host: 'evil.example.com' }]) {
+    await denied(await actor.request('POST', path, { ...repositoryInput, ...extra }), 400, extra.host ? 'invalid_git_host' : 'invalid_repository');
   }
   assert.equal(remote.calls.length, 0);
   const { repository } = await json<{ repository: WorkspaceRepository }>(await actor.request('POST', path, {
-    repositoryId: metadata.id, fullName: metadata.full_name,
+    provider: 'github', repositoryId: String(metadata.id), fullName: metadata.full_name,
   }), 201);
   assert.equal(repository.ref, 'main');
   assert.equal(repository.private, true);
@@ -363,7 +365,7 @@ for (const route of ['picker', 'binding'] as const) {
       return Response.json(route === 'picker' ? [metadata] : metadata);
     };
     if (route === 'picker') remote.state.picker = revoke; else remote.state.metadata = revoke;
-    const response = route === 'picker' ? await actor.request('GET', '/api/github/repositories') :
+    const response = route === 'picker' ? await actor.request('GET', githubPicker) :
       await actor.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput);
     await denied(response, 403, 'github_access_changed');
     assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
@@ -683,7 +685,7 @@ test('connector archive callbacks require the exact credential, generation, sess
   for (const extra of [{ url: 'https://evil.example/archive' }, { ownerId: s.host.user.id }, { repositoryId: metadata.id }, { ref: 'main' }]) {
     await denied(await download(s.f, session, pin, s.connector, { ...body, ...extra }), 400, 'invalid_repository_download');
   }
-  await denied(await s.f.request('GET', '/api/github/repositories', undefined, { Authorization: `Bearer ${s.connector.token}` }), 401, 'unauthorized');
+  await denied(await s.f.request('GET', githubPicker, undefined, { Authorization: `Bearer ${s.connector.token}` }), 401, 'unauthorized');
   assert.equal(s.remote.calls.length, 0);
 });
 
@@ -902,11 +904,11 @@ test('GitHub metadata has a separate small size bound and rejects malformed JSON
   remote.state.picker = async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
     headers: { 'Content-Length': String(512 * 1024 + 1) },
   });
-  await denied(await owner.request('GET', '/api/github/repositories'), 502, 'repository_size_limit');
+  await denied(await owner.request('GET', githubPicker), 502, 'repository_size_limit');
   assert.equal(cancelled, true);
   for (const body of [new TextEncoder().encode('{broken'), new Uint8Array([0xff])]) {
     remote.state.picker = async () => new Response(body);
-    await denied(await owner.request('GET', '/api/github/repositories'), 502, 'invalid_github_response');
+    await denied(await owner.request('GET', githubPicker), 502, 'invalid_github_response');
   }
 });
 
@@ -915,7 +917,7 @@ test('picker accepts underscore/Unicode refs and session resolution URL-encodes 
   let bindingId = s.repository.id;
   for (const ref of ['_prefix', '\u4fee\u590d/#issue']) {
     s.remote.state.picker = async () => Response.json([{ ...metadata, default_branch: ref }]);
-    const picked = await json<{ repositories: { defaultBranch: string }[] }>(await s.owner.request('GET', '/api/github/repositories'));
+    const picked = await json<{ repositories: { defaultBranch: string }[] }>(await s.owner.request('GET', githubPicker));
     assert.equal(picked.repositories[0].defaultBranch, ref);
     assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/repositories/${bindingId}`)).status, 204);
     bindingId = (await bindRepository(s.admin, s.team.id, { ...repositoryInput, ref })).id;
@@ -927,4 +929,271 @@ test('picker accepts underscore/Unicode refs and session resolution URL-encodes 
     assert.ok(s.remote.calls.some(call => call.url === `https://api.github.com/repos/${metadata.full_name}/commits/${encodeURIComponent(ref)}`));
     for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
   }
+});
+
+// Token providers, exercised through Gitea's real adapter HTTP calls (fetch is mocked).
+const giteaHost = 'git.acme.dev';
+const giteaApi = `https://${giteaHost}/api/v1`;
+const giteaMetadata = { id: 42, full_name: 'acme/tools', default_branch: 'main', private: true };
+const giteaInput = { provider: 'gitea', host: giteaHost, repositoryId: '42', fullName: giteaMetadata.full_name, ref: 'main' };
+const giteaRepository = `${giteaApi}/repositories/42`;
+const giteaCommit = `${giteaApi}/repos/acme/tools/commits?sha=main&limit=1&stat=false&verification=false&files=false`;
+const giteaArchive = `${giteaApi}/repos/acme/tools/archive/${commitA}.tar.gz`;
+const providerManifest = { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: true } };
+const giteaToken = (client: Client) => `gitea-secret-for-${client.user.id}`;
+
+function gitea(t: TestContext) {
+  const calls: { url: string; authorization: string | null; redirect: RequestRedirect | undefined }[] = [];
+  const unexpected: string[] = [];
+  const state = {
+    user: async (): Promise<Response> => Response.json({ login: 'gitea-user' }),
+    picker: async (): Promise<Response> => Response.json([giteaMetadata]),
+    metadata: async (): Promise<Response> => Response.json(giteaMetadata),
+    resolve: async (): Promise<Response> => Response.json([{ sha: commitA }]),
+    archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
+  };
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, authorization: new Headers(init?.headers).get('authorization'), redirect: init?.redirect });
+    if (url === `${giteaApi}/user`) return state.user();
+    if (url === `${giteaApi}/user/repos?page=1&limit=30`) return state.picker();
+    if (url === giteaRepository) return state.metadata();
+    if (url === giteaCommit) return state.resolve();
+    if (url === giteaArchive) return state.archive();
+    unexpected.push(url);
+    throw new Error('Unexpected outbound repository request');
+  });
+  t.after(() => {
+    assert.deepEqual(unexpected, []);
+    for (const call of calls) assert.equal(call.redirect, 'manual');
+  });
+  return { state, calls };
+}
+async function connectGitea(client: Client, input: Record<string, unknown> = {}) {
+  return (await json<{ account: GitAccount }>(await client.request('POST', '/api/git/accounts', {
+    provider: 'gitea', host: 'https://Git.Acme.dev/', token: giteaToken(client), ...input,
+  }), 201)).account;
+}
+function zipArchive(files: Record<string, string>): Uint8Array<ArrayBuffer> {
+  const locals: Buffer[] = []; const centrals: Buffer[] = []; let offset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const data = Buffer.from(content); const packed = deflateRawSync(data); const path = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0x0800, 6); local.writeUInt16LE(8, 8);
+    local.writeUInt32LE(crc32(data), 14); local.writeUInt32LE(packed.length, 18); local.writeUInt32LE(data.length, 22); local.writeUInt16LE(path.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6); central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(8, 10); central.writeUInt32LE(crc32(data), 16); central.writeUInt32LE(packed.length, 20);
+    central.writeUInt32LE(data.length, 24); central.writeUInt16LE(path.length, 28); central.writeUInt32LE(offset, 42);
+    locals.push(local, path, packed); centrals.push(central, path);
+    offset += local.length + path.length + packed.length;
+  }
+  const directory = Buffer.concat(centrals); const end = Buffer.alloc(22); const count = Object.keys(files).length;
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(count, 8); end.writeUInt16LE(count, 10);
+  end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return new Uint8Array(Buffer.concat([...locals, directory, end]));
+}
+
+async function providerSetup(t: TestContext, claim: object = providerManifest) {
+  const f = fixture(t); const remote = gitea(t);
+  const admin = await f.client('admin'); const host = await f.client('host'); const owner = await f.client('owner');
+  const team = await workspace(admin);
+  await member(admin, team.id, host); await member(admin, team.id, owner);
+  await connectGitea(admin); await connectGitea(owner);
+  const repository = await bindRepository(admin, team.id, giteaInput);
+  assert.deepEqual(remote.calls.at(-1), { url: giteaRepository, authorization: `token ${giteaToken(admin)}`, redirect: 'manual' });
+  const connector = await connect(f, host, team.id, claim);
+  await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
+  const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
+  const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
+    name: 'Gitea agent', description: '', instructions: '', tools: ['identity'], modelId: models[0].id,
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: team.id }), 201);
+  const provisions = provisionHub(f);
+  const input = { workspaceId: team.id, agentVersionId: agent.id, trustedConnectorId: connector.connectorId, title: 'Gitea session' };
+  const start = async () => (await json<{ session: SessionRecord }>(await owner.request('POST', '/api/sessions', input), 201)).session;
+  remote.calls.length = 0;
+  return { f, remote, admin, host, owner, team, repository, connector, provisions, input, start };
+}
+
+test('token accounts are verified, stored encrypted, never returned, private to their user and replaced in place', async t => {
+  const f = fixture(t); const remote = gitea(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  const account = await connectGitea(alice);
+  assert.deepEqual({ ...account, id: '', createdAt: '' }, { id: '', provider: 'gitea', host: giteaHost, organization: '', login: 'gitea-user', createdAt: '' });
+  assert.deepEqual(remote.calls.map(call => [call.url, call.authorization]), [[`${giteaApi}/user`, `token ${giteaToken(alice)}`]]);
+  const stored = () => String(f.sqlite.prepare('SELECT ciphertext FROM git_credentials WHERE id = ?').get(account.id)!.ciphertext);
+  const first = stored();
+  assert.ok(!first.includes(giteaToken(alice)));
+  const listed = await json<{ accounts: GitAccount[] }>(await alice.request('GET', '/api/git/accounts'));
+  assert.deepEqual(listed.accounts, [{ id: 'github', provider: 'github', host: 'github.com', organization: '', login: '', createdAt: null }, account]);
+  const again = await connectGitea(alice, { token: 'rotated-gitea-token' });
+  assert.equal(again.id, account.id);
+  assert.notEqual(stored(), first);
+  assert.deepEqual((await json<{ accounts: GitAccount[] }>(await bob.request('GET', '/api/git/accounts'))).accounts.map(item => item.id), ['github']);
+  await denied(await bob.request('GET', `/api/git/accounts/${account.id}/repositories`), 404, 'not_found');
+  await denied(await bob.request('DELETE', `/api/git/accounts/${account.id}`), 404, 'not_found');
+  remote.state.picker = async () => Response.json([{ ...giteaMetadata, clone_url: 'https://user:secret@git.acme.dev/acme/tools.git', permissions: { admin: true } }]);
+  const page = await json(await alice.request('GET', `/api/git/accounts/${account.id}/repositories`));
+  assert.deepEqual(page, { repositories: [{ id: '42', fullName: 'acme/tools', defaultBranch: 'main', private: true } satisfies ProviderRepository], page: 1, hasMore: false });
+  assert.equal(remote.calls.at(-1)!.authorization, 'token rotated-gitea-token');
+  await denied(await alice.request('GET', `/api/git/accounts/${account.id}/repositories?page=1001`), 400, 'invalid_page');
+  await denied(await alice.request('DELETE', '/api/git/accounts/github'), 400, 'github_account_fixed');
+  await denied(await alice.request('DELETE', `/api/git/accounts/${account.id}`, undefined, { 'X-CSRF-Token': '' }), 403, 'invalid_csrf');
+  assert.equal((await alice.request('DELETE', `/api/git/accounts/${account.id}`)).status, 204);
+  await denied(await alice.request('GET', `/api/git/accounts/${account.id}/repositories`), 404, 'not_found');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM git_credentials').get()!.n, 0);
+  const audit = f.sqlite.prepare("SELECT action, detail_json FROM audit WHERE action LIKE 'git.account.%' ORDER BY created_at, action").all();
+  assert.deepEqual(audit.map(row => row.action).sort(), ['git.account.connected', 'git.account.connected', 'git.account.removed']);
+  for (const secret of [giteaToken(alice), 'rotated-gitea-token']) assert.ok(!JSON.stringify(audit).includes(secret));
+});
+
+test('account input is validated before any provider request and rejected tokens are not stored', async t => {
+  const f = fixture(t); const remote = gitea(t); const alice = await f.client('alice');
+  const token = 'valid-token';
+  for (const [input, code] of [
+    [{ provider: 'github', token }, 'invalid_git_provider'],
+    [{ provider: 'svn', host: giteaHost, token }, 'invalid_git_provider'],
+    [{ provider: 'gitea', token }, 'invalid_git_host'],
+    ...['10.0.0.1', 'localhost', 'git.internal', 'http://git.acme.dev', 'git.acme.dev/path', 'github.com', 'user@git.acme.dev']
+      .map(host => [{ provider: 'gitea', host, token }, 'invalid_git_host'] as const),
+    [{ provider: 'bitbucket', host: 'bitbucket.example.com', token }, 'invalid_git_host'],
+    [{ provider: 'azure-devops', token }, 'invalid_git_organization'],
+    [{ provider: 'azure-devops', organization: '../x', token }, 'invalid_git_organization'],
+    [{ provider: 'gitea', host: giteaHost, organization: 'acme', token }, 'invalid_git_organization'],
+    [{ provider: 'gitlab', username: 'me', token }, 'invalid_git_username'],
+    [{ provider: 'bitbucket', username: 'me:you', token }, 'invalid_git_username'],
+    [{ provider: 'gitea', host: giteaHost, token: '' }, 'invalid_git_token'],
+    [{ provider: 'gitea', host: giteaHost, token: 'two words' }, 'invalid_git_token'],
+    [{ provider: 'gitea', host: giteaHost, token: 'x'.repeat(4097) }, 'invalid_git_token'],
+    [{ provider: 'gitea', host: giteaHost, token, password: 'x' }, 'invalid_git_account'],
+  ] as const) {
+    await denied(await alice.request('POST', '/api/git/accounts', input), 400, code);
+  }
+  assert.equal(remote.calls.length, 0);
+  remote.state.user = async () => Response.json({ message: 'token is invalid' }, { status: 401 });
+  const rejected = await alice.request('POST', '/api/git/accounts', { provider: 'gitea', host: giteaHost, token });
+  const body = await json<{ code: string; error: string }>(rejected, 400);
+  assert.equal(body.code, 'git_account_rejected');
+  assert.ok(!body.error.includes('token is invalid'), 'Provider error text never reaches clients');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM git_credentials').get()!.n, 0);
+});
+
+test('token-provider bindings and session pins use each actor\'s own account and the exact provider pin shape', async t => {
+  const s = await providerSetup(t);
+  assert.deepEqual({ ...s.repository, id: '', createdAt: '' }, { id: '', workspaceId: s.team.id, provider: 'gitea', host: giteaHost,
+    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '' });
+  assert.deepEqual((await json<{ repositories: WorkspaceRepository[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/repositories`))).repositories, [s.repository]);
+  const session = await s.start();
+  const pin = session.repositories![0];
+  const expected = { bindingId: s.repository.id, provider: 'gitea', host: giteaHost, repositoryId: '42', fullName: 'acme/tools',
+    ref: 'main', commit: commitA, path: 'git.acme.dev/acme/tools' };
+  assert.deepEqual(pin, expected);
+  assert.equal(String(s.f.sqlite.prepare('SELECT repositories_json FROM sessions WHERE id = ?').get(session.id)!.repositories_json), JSON.stringify([expected]));
+  assert.deepEqual(s.remote.calls.map(call => call.url), [giteaRepository, giteaCommit, giteaRepository]);
+  for (const call of s.remote.calls) assert.equal(call.authorization, `token ${giteaToken(s.owner)}`);
+  assert.equal(s.provisions.length, 1);
+  assert.deepEqual((JSON.parse(s.provisions[0].request.body) as RunnerBinding).session.repositories, [expected]);
+  for (const secret of [giteaToken(s.owner), giteaToken(s.admin), s.owner.githubToken]) {
+    assert.ok(!JSON.stringify(s.provisions).includes(secret));
+    assert.ok(!JSON.stringify(session).includes(secret));
+  }
+  // The same repository cannot be bound twice, even by a differently cased name.
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/repositories`, { ...giteaInput, fullName: 'Acme/Tools' }), 409, 'repository_identity_changed');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/repositories`, giteaInput), 409, 'repository_binding_conflict');
+});
+
+test('a missing token account fails with git_account_required; GitHub sign-in never lends other providers', async t => {
+  const s = await providerSetup(t);
+  s.f.sqlite.prepare('DELETE FROM git_credentials WHERE user_id = ?').run(s.owner.user.id);
+  const body = await json<{ code: string; error: string }>(await s.owner.request('POST', '/api/sessions', s.input), 409);
+  assert.deepEqual(body, { code: 'git_account_required', error: 'Connect Gitea / Forgejo (git.acme.dev) in Settings → Profile to use acme/tools.' });
+  s.f.sqlite.prepare('DELETE FROM git_credentials WHERE user_id = ?').run(s.admin.user.id);
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/repositories`, { ...giteaInput, repositoryId: '43', fullName: 'acme/other' }), 409, 'git_account_required');
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  assert.equal(s.remote.calls.length, 0);
+});
+
+test('connectors without gitProviders refuse provider sessions before any provider request', async t => {
+  const s = await providerSetup(t, manifest);
+  const body = await json<{ code: string; error: string }>(await s.owner.request('POST', '/api/sessions', s.input), 409);
+  assert.deepEqual(body, { code: 'connector_update_required', error: 'Update the host\'s connector (npx pistead@latest connect) to use Gitea / Forgejo repositories.' });
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  assert.equal(s.provisions.length, 0);
+  assert.equal(s.remote.calls.length, 0);
+});
+
+for (const change of ['token-rotated', 'token-deleted', 'account-reassigned', 'connector-downgraded'] as const) {
+  test(`session admission rechecks token account ${change} atomically after repository resolution`, async t => {
+    const s = await providerSetup(t);
+    const rotated = await encryptToken(s.f.env, s.owner.user.id, 'rotated-gitea-token');
+    beforeStatement(t, s.f, /^INSERT INTO sessions\b/, () => {
+      if (change === 'token-rotated') s.f.sqlite.prepare('UPDATE git_credentials SET ciphertext = ? WHERE user_id = ?').run(rotated, s.owner.user.id);
+      if (change === 'token-deleted') s.f.sqlite.prepare('DELETE FROM git_credentials WHERE user_id = ?').run(s.owner.user.id);
+      if (change === 'account-reassigned') {
+        s.f.sqlite.prepare('DELETE FROM git_credentials WHERE user_id = ?').run(s.admin.user.id);
+        s.f.sqlite.prepare('UPDATE git_credentials SET user_id = ? WHERE user_id = ?').run(s.admin.user.id, s.owner.user.id);
+      }
+      if (change === 'connector-downgraded') {
+        s.f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_remove(capabilities_json, '$.gitProviders') WHERE id = ?").run(s.connector.connectorId);
+      }
+    });
+    await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'session_configuration_changed');
+    assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+    assert.equal(s.provisions.length, 0);
+    assert.equal(s.remote.calls.length, 3, 'Repository resolution completed before the authority change');
+  });
+}
+
+test('token-provider binding rechecks the acting account in its final write', async t => {
+  const f = fixture(t); const remote = gitea(t); const admin = await f.client('admin'); const team = await workspace(admin);
+  await connectGitea(admin);
+  const rotated = await encryptToken(f.env, admin.user.id, 'rotated-gitea-token');
+  beforeStatement(t, f, /^INSERT INTO workspace_repositories\b/, () => {
+    f.sqlite.prepare('UPDATE git_credentials SET ciphertext = ? WHERE user_id = ?').run(rotated, admin.user.id);
+  });
+  await denied(await admin.request('POST', `/api/workspaces/${team.id}/repositories`, giteaInput), 409, 'repository_binding_conflict');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
+  assert.equal(remote.calls.length, 2);
+});
+
+test('token-provider archives are pinned, owner-authorized, checksummed and withheld when the account changes', async t => {
+  const s = await providerSetup(t); const session = await s.start(); const pin = session.repositories![0];
+  s.remote.calls.length = 0;
+  const response = await download(s.f, session, pin, s.connector);
+  assert.equal(response.status, 200);
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), archiveBytes);
+  assert.equal(response.headers.get('x-repository-commit'), commitA);
+  assert.equal(response.headers.get('x-archive-sha256'), createHash('sha256').update(archiveBytes).digest('base64url'));
+  assert.deepEqual(s.remote.calls.map(call => call.url), [giteaRepository, giteaArchive, giteaRepository]);
+  for (const call of s.remote.calls) assert.equal(call.authorization, `token ${giteaToken(s.owner)}`);
+  const rotated = await encryptToken(s.f.env, s.owner.user.id, 'rotated-gitea-token');
+  s.remote.state.archive = async () => {
+    s.f.sqlite.prepare('UPDATE git_credentials SET ciphertext = ? WHERE user_id = ?').run(rotated, s.owner.user.id);
+    return new Response(archiveBytes);
+  };
+  const changed = await download(s.f, session, pin, s.connector);
+  assert.equal(changed.headers.get('x-archive-sha256'), null);
+  await denied(changed, 403, 'git_access_changed');
+  s.f.sqlite.prepare('DELETE FROM git_credentials WHERE user_id = ?').run(s.owner.user.id);
+  await denied(await download(s.f, session, pin, s.connector), 409, 'git_account_required');
+});
+
+test('zip snapshots are converted to a single-directory tar.gz before checksumming', async t => {
+  const s = await providerSetup(t); const session = await s.start(); const pin = session.repositories![0];
+  let archive = zipArchive({ 'README.md': 'hello from a zip snapshot', 'src/main.ts': 'export {};\n' });
+  t.mock.method(gitProviderAdapters.gitea, 'archive', async () => ({ bytes: archive, format: 'zip' as const }));
+  s.remote.calls.length = 0;
+  const response = await download(s.f, session, pin, s.connector);
+  assert.equal(response.status, 200);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  assert.deepEqual([...bytes.subarray(0, 2)], [0x1f, 0x8b]);
+  assert.equal(response.headers.get('content-length'), String(bytes.length));
+  assert.equal(response.headers.get('x-archive-sha256'), createHash('sha256').update(bytes).digest('base64url'));
+  const tar = new TextDecoder('latin1').decode(gunzipSync(bytes));
+  const top = `tools-${commitA.slice(0, 12)}/`;
+  assert.ok(tar.startsWith(top));
+  for (const text of [`${top}README.md`, `${top}src/main.ts`, 'hello from a zip snapshot']) assert.ok(tar.includes(text), text);
+  assert.deepEqual(s.remote.calls.map(call => call.url), [giteaRepository, giteaRepository]);
+  archive = new Uint8Array(new TextEncoder().encode('PK not really a zip'));
+  await denied(await download(s.f, session, pin, s.connector), 502, 'invalid_repository_archive');
 });

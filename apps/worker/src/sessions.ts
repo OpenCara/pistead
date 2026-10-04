@@ -166,20 +166,29 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       title, visibility, policy_version: 1, status: 'provisioning', created_at: now(),
       connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
-    const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId);
+    // Older connectors only understand GitHub pins; refuse before contacting any provider.
+    const host = row.connector_id
+      ? await c.env.DB.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').bind(row.connector_id).first<{ capabilities_json: string }>()
+      : null;
+    const gitProviders = !row.connector_id || (JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).gitProviders === true;
+    const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
     row.repositories_json = JSON.stringify(resolved.repositories);
+    const providerPins = resolved.repositories.some(repository => 'provider' in repository) ? 1 : 0;
     await requireMember(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
-    // Admit pins only while the exact owner credential used to resolve them is still current.
+    // Admit pins only while every exact owner credential used to resolve them is still current.
     const inserted = await c.env.DB.prepare(`INSERT INTO sessions
       (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
       AND (SELECT json_group_array(id) FROM (SELECT id FROM workspace_repositories WHERE workspace_id = ? ORDER BY id)) = ?
       AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ?
-        AND ((session_owner.auth_kind = 'github' AND session_owner.github_id = ?
-          AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))
-          OR (? = 1 AND session_owner.auth_kind = 'test')))
+        AND ((? = 1 AND session_owner.auth_kind = 'github') OR (? = 1 AND session_owner.auth_kind = 'test'))
+        AND (? IS NULL OR (session_owner.auth_kind = 'github' AND session_owner.github_id = ?
+          AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))))
+      AND (SELECT COUNT(*) FROM json_each(?) used JOIN git_credentials credential
+        ON credential.id = json_extract(used.value, '$.id') AND credential.ciphertext = json_extract(used.value, '$.ciphertext')
+        AND credential.user_id = ?) = ?
       AND (? IS NULL OR EXISTS (
         SELECT 1 FROM connectors host JOIN connector_workspaces association ON association.connector_id = host.id
         JOIN workspace_members member ON member.workspace_id = association.workspace_id AND member.user_id = host.owner_id
@@ -190,16 +199,20 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
             WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
           AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id
           AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
+          AND (? = 0 OR json_extract(host.capabilities_json, '$.gitProviders') = 1)
           AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
             WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
       )) RETURNING id`)
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
         row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility,
         workspaceId, ownerId, workspaceId, resolved.bindingIds,
-        ownerId, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
-        resolved.githubAuthority === null && testMode(c.env) ? 1 : 0, row.connector_id ?? null,
-        model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId, testMode(c.env) ? 1 : 0).first();
-    if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, GitHub access, membership, or connector authority changed. Try again.');
+        // Real owners need pinned repositories; legacy empty sessions are synthetic test-mode fixtures only.
+        ownerId, resolved.repositories.length ? 1 : 0, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
+        resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
+        JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
+        row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
+        testMode(c.env) ? 1 : 0, providerPins).first();
+    if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
     await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }).run();
     try {
       const binding = await bindingForSession(c, row);

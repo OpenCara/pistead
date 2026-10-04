@@ -174,7 +174,7 @@ function RepositoriesSection({ session, refresh }: { session: SessionRecord; ref
   const repositories = session.repositories ?? [];
   return <Section
     title={<>Repositories <span className="muted">{repositories.length}</span></>}
-    info={<><RepositorySnapshotPolicy /><p>Pins are fixed at session start using the session owner's GitHub access, not the host owner's or a collaborator's. They record source inputs, not live cache status; later workspace changes don't affect them.</p></>}
+    info={<><RepositorySnapshotPolicy /><p>Pins are fixed at session start using the session owner's connected Git accounts, not the host owner's or a collaborator's. They record source inputs, not live cache status; later workspace changes don't affect them.</p></>}
     action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh repositories" title="Refresh" onClick={refresh} />}
     bare
   >
@@ -376,7 +376,7 @@ function AccessSection({ session, view, user }: { session: SessionRecord; view: 
   const visibility = session.visibility ?? "private";
   return <Section title="Access" info={<p>{visibility === "workspace"
     ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
-    : "Private: only the owner and members with a session grant can view prompts and output."} Viewing doesn't grant ask, write, approve or manage permissions, GitHub access, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
+    : "Private: only the owner and members with a session grant can view prompts and output."} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
     {view ? <>
       <Row leading={<Icon name="user" size={16} />} title={<>Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""}</>} hint={view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} />
       <Row leading={<Icon name="git-branch" size={16} />} title="Commits as" hint={<>{view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</>} />

@@ -7,7 +7,7 @@ import { HTTPException } from 'hono/http-exception';
 import type { Env, WorkerEnv } from '../apps/worker/src/types.js';
 import type { RunnerBinding, RunnerTicket } from '../packages/shared/src/types.js';
 import type { RestoreInput } from '../packages/shared/src/connector.js';
-import type { SessionRepository } from '../packages/shared/src/repositories.js';
+import type { GitHubSessionRepository, SessionRepository } from '../packages/shared/src/repositories.js';
 import { sha256, verifyToken } from '../packages/shared/src/crypto.js';
 import { registerRestoreRoutes, downloadRestoreSnapshot } from '../apps/worker/src/restore-routes.js';
 import { registerBackups } from '../apps/worker/src/backups.js';
@@ -19,7 +19,7 @@ const bearer = 'b'.repeat(43);
 const connection = 'c'.repeat(43);
 const downloadToken = 'd'.repeat(43);
 const restorePath = '/api/sessions/source/backups/backup/restore';
-const repositoryPins: SessionRepository[] = [{ bindingId: 'original-binding', repositoryId: 123,
+const repositoryPins: GitHubSessionRepository[] = [{ bindingId: 'original-binding', repositoryId: 123,
   fullName: 'Owner/Project', ref: 'main', commit: 'a'.repeat(40), path: 'Owner/Project' }];
 
 interface SnapshotFixture {
@@ -284,13 +284,14 @@ test('snapshot pin comparison allows property order and legacy absent pins, but 
   const source = structuredClone(f.binding);
   source.session.repositories = [];
   assert.doesNotThrow(() => validateSnapshot(JSON.stringify(f.snapshot), source));
-  const pins = [...repositoryPins, { bindingId: 'second-binding', repositoryId: 456, fullName: 'Other/Project',
+  const pins: GitHubSessionRepository[] = [...repositoryPins, { bindingId: 'second-binding', repositoryId: 456, fullName: 'Other/Project',
     ref: 'stable', commit: 'b'.repeat(40), path: 'Other/Project' }];
   source.session.repositories = pins;
-  f.snapshot.binding.session.repositories = pins.map(pin => ({ path: pin.path, commit: pin.commit, ref: pin.ref,
+  const reordered: GitHubSessionRepository[] = pins.map(pin => ({ path: pin.path, commit: pin.commit, ref: pin.ref,
     fullName: pin.fullName, repositoryId: pin.repositoryId, bindingId: pin.bindingId }));
+  f.snapshot.binding.session.repositories = reordered;
   assert.doesNotThrow(() => validateSnapshot(JSON.stringify(f.snapshot), source));
-  f.snapshot.binding.session.repositories.reverse();
+  reordered.reverse();
   let response: Response | undefined;
   assert.throws(() => validateSnapshot(JSON.stringify(f.snapshot), source), (error: unknown) => {
     assert.ok(error instanceof HTTPException);
