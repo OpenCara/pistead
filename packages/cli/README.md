@@ -27,6 +27,8 @@ Run `npx pistead connect --help` for all options.
 
 Model credentials stay in Pi on your host. Pairing keeps the host private to you; sharing it with a workspace is a separate, explicit action in the web app.
 
+The connector offers the models matched by `enabledModels` in Pi's `settings.json` (the same patterns Pi uses for model cycling, e.g. `"anthropic/*"`, `"*/claude-opus-5-5*"`), or every authenticated Pi model when that list is unset. `--model PROVIDER/MODEL` (repeatable) overrides both.
+
 ## macOS and hosts without bubblewrap
 
 The isolated sandbox needs Linux. On macOS, or Linux without bubblewrap, you can opt out of isolation:

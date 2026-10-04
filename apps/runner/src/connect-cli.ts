@@ -6,7 +6,7 @@ import { createInterface } from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createConnector, controlPlaneOrigin, readConnectorState } from "./connector.js";
-import { createFauxLocalModels, loadLocalPiModels } from "./local-pi.js";
+import { createFauxLocalModels, loadLocalPiModels, readPiEnabledModels } from "./local-pi.js";
 import { ConnectorSetupError } from "./protocol.js";
 import type { ResourceConfig } from "./resources.js";
 
@@ -26,7 +26,9 @@ Options:
   --pairing-id ID          One-use pairing id from the web app
   --state-dir PATH         Private connector state (default ~/.local/share/opencara/connector)
   --pi-agent-dir PATH      Pi config/auth directory (default: Pi's own getAgentDir())
-  --model PROVIDER/MODEL   Advertise this configured local model (repeatable)
+  --model PROVIDER/MODEL   Advertise this configured local model (repeatable); without it,
+                           the models matched by enabledModels in Pi's settings.json are
+                           advertised, or every authenticated Pi model when that is unset
   --resources PATH        Operator-provisioned resource configuration JSON
   --allow-insecure-loopback  Permit HTTP/WS only on localhost/127.0.0.1/[::1]
   --allow-test-shell       Fixture shell opt-in; requires --allow-faux
@@ -44,7 +46,7 @@ bounded private filesystem;
 --resources does not provision these. Missing resource limits never enable host shell.
 Pi model/auth configuration is used locally, including Pi's OAuth refresh. Provider
 credentials, private history and personal extensions are not uploaded or shared.
-Catalogs over 200 models require explicit --model selection. Restart to reload config.
+Catalogs over 200 models need enabledModels in Pi's settings or --model. Restart to reload config.
 `;
 
 export function promptPairingCode(): Promise<string> {
@@ -190,8 +192,13 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     return { provider: reference.slice(0, slash), modelId: reference.slice(slash + 1) };
   });
   if (values["allow-faux"] && (values["pi-agent-dir"] || models)) throw new ConnectorSetupError("Fixture mode cannot select personal Pi models.");
-  const localModels = values["allow-faux"] ? createFauxLocalModels() : await loadLocalPiModels({ agentDir: values["pi-agent-dir"], models });
-  if (!(await localModels.manifest()).length) throw new ConnectorSetupError("No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
+  const enabledModels = values["allow-faux"] || models ? undefined : await readPiEnabledModels(values["pi-agent-dir"]).catch(error => {
+    throw new ConnectorSetupError(`Pi settings could not be read: ${error instanceof SyntaxError ? "settings.json is not valid JSON" : error instanceof Error ? error.message : "unknown error"}.`);
+  });
+  const localModels = values["allow-faux"] ? createFauxLocalModels() : await loadLocalPiModels({ agentDir: values["pi-agent-dir"], models, enabledModels });
+  if (!(await localModels.manifest()).length) throw new ConnectorSetupError(enabledModels
+    ? "None of the models enabled in Pi's settings.json (enabledModels) are authenticated on this machine."
+    : "No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
   const resources = values.resources ? await resourceConfig(values.resources) : undefined;
   const dataDir = values["state-dir"] ?? join(homedir(), ".local", "share", "opencara", "connector");
   if (!values["pairing-id"] && !await readConnectorState(dataDir, undefined, values["allow-insecure-loopback"])) {

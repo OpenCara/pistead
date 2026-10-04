@@ -1,6 +1,7 @@
+import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { getSupportedThinkingLevels, type Models } from "@earendil-works/pi-ai/models";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, ModelRuntime, resolveModelScopeWithDiagnostics } from "@earendil-works/pi-coding-agent";
 import type { LocalModelSummary } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { thinkingLevels, type ModelDefinition } from "../../../packages/shared/src/types.js";
@@ -36,7 +37,23 @@ export interface LocalPiOptions {
   agentDir?: string;
   /** Optional explicit subset when a local catalog exceeds the wire limit. */
   models?: readonly { provider: string; modelId: string }[];
+  /** Pi's `enabledModels` patterns (same globs as Pi's model cycling); explicit `models` take precedence. */
+  enabledModels?: readonly string[];
   runtimeFactory?: (options: { authPath?: string; modelsPath?: string; refreshOnCreate: false; allowModelNetwork: false }) => Promise<LocalPiRuntime>;
+}
+
+/** Reads `enabledModels` from Pi's global settings.json; project settings never apply to a connector. */
+export async function readPiEnabledModels(agentDir?: string): Promise<string[] | undefined> {
+  const path = join(agentDir === undefined ? getAgentDir() : resolve(agentDir), "settings.json");
+  let text: string;
+  try { text = await readFile(path, "utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  const value = (JSON.parse(text) as { enabledModels?: unknown }).enabledModels;
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some(pattern => typeof pattern !== "string" || !pattern.trim()) || value.length > 200) {
+    throw new Error("Pi settings.json enabledModels must be a list of model patterns");
+  }
+  return value.length ? value : undefined;
 }
 
 export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<LocalModels> {
@@ -56,8 +73,11 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
     // Pi 1.0.0's synchronous configured-auth snapshot starts empty when catalog
     // refresh is disabled. getAvailable performs local auth/availability checks,
     // without refreshing the model catalog or extracting request credentials.
+    const enabled = !selected && options.enabledModels?.length ? [...options.enabledModels] : undefined;
     const available = selectedProviders
       ? (await Promise.all(selectedProviders.map(provider => runtime.getAvailable(provider, { signal })))).flat()
+      // Same resolution as Pi's own model cycling: globs over "provider/id" or bare ids, best alias for exact names.
+      : enabled ? (await resolveModelScopeWithDiagnostics(enabled, runtime as never, { signal })).scopedModels.map(scoped => scoped.model)
       : await runtime.getAvailable(undefined, { signal });
     const seen = new Set<string>();
     const result: LocalModelSummary[] = [];
@@ -68,7 +88,7 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
       result.push(modelSummary({ provider: model.provider, modelId: model.id, name: model.name, thinkingLevels: getSupportedThinkingLevels(model) }));
     }
     if (selected && [...selected].some(key => !seen.has(key))) throw new Error("A selected local Pi model is unavailable or lacks configured authentication");
-    if (result.length > connectorLimits.models) throw new Error("Local Pi catalog exceeds 200 models; select a subset with --model");
+    if (result.length > connectorLimits.models) throw new Error("Local Pi catalog exceeds 200 models; narrow enabledModels in Pi's settings or pass --model");
     return result.sort((a, b) => a.provider.localeCompare(b.provider) || a.modelId.localeCompare(b.modelId));
   };
   await manifest();

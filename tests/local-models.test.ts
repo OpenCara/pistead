@@ -11,7 +11,7 @@ import type { ModelDefinition } from '../packages/shared/src/types.js';
 import type { LocalPiOptions, LocalPiRuntime } from '../apps/runner/src/local-pi.js';
 import { connectorLimits } from '../packages/shared/src/connector.js';
 import { connectorManifest } from '../apps/runner/src/connector.js';
-import { createFauxLocalModels, loadLocalPiModels, modelSummary } from '../apps/runner/src/local-pi.js';
+import { createFauxLocalModels, loadLocalPiModels, modelSummary, readPiEnabledModels } from '../apps/runner/src/local-pi.js';
 import { runnerModels } from '../apps/runner/src/provider.js';
 
 const secret = 'fixture-only-provider-credential-never-publish';
@@ -195,6 +195,37 @@ test('oversized native catalogs require a subset rather than silently truncating
   assert.deepEqual(await local.manifest(), [{ provider: 'native.fixture', modelId: 'model-200', name: 'Model 200', thinkingLevels: ['off'] }]);
   await assert.rejects(local.resolve(definition('native.fixture', 'model-0')), /unavailable/);
   assert.strictEqual((await local.resolve(definition('native.fixture', 'model-200'))).models, fixture.runtime);
+});
+
+test('Pi enabledModels picks the advertised subset like Pi model cycling; explicit selections win', async () => {
+  const fixture = runtimeFixture([
+    { provider: 'relay', id: 'gpt-6-sol', name: 'Relay GPT' },
+    { provider: 'anthropic', id: 'claude-opus-5-5', name: 'Opus' },
+    { provider: 'anthropic', id: 'claude-haiku-4-5', name: 'Haiku' },
+    { provider: 'locked', id: 'claude-opus-5-5', name: 'Locked opus' },
+  ]);
+  fixture.state.configured.delete('locked');
+  const enabledModels = ['relay/*', '*/claude-opus-5-5*', '*/no-such-model*'];
+  const local = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory, enabledModels });
+  // Unauthenticated providers stay hidden even when a pattern matches their model.
+  assert.deepEqual((await local.manifest()).map(model => `${model.provider}/${model.modelId}`), ['anthropic/claude-opus-5-5', 'relay/gpt-6-sol']);
+  await assert.rejects(local.resolve(definition('anthropic', 'claude-haiku-4-5')), /unavailable/);
+  const explicit = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory, enabledModels, models: [{ provider: 'anthropic', modelId: 'claude-haiku-4-5' }] });
+  assert.deepEqual((await explicit.manifest()).map(model => model.modelId), ['claude-haiku-4-5']);
+});
+
+test('Pi enabledModels is read from the global settings file and rejects malformed lists', async t => {
+  const agentDir = await mkdtemp(join(tmpdir(), 'local-pi-settings-fixture-'));
+  t.after(() => rm(agentDir, { recursive: true, force: true }));
+  assert.equal(await readPiEnabledModels(agentDir), undefined);
+  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ defaultThinkingLevel: 'high' }));
+  assert.equal(await readPiEnabledModels(agentDir), undefined);
+  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ enabledModels: ['relay/*', '*/claude-opus-5-5*'] }));
+  assert.deepEqual(await readPiEnabledModels(agentDir), ['relay/*', '*/claude-opus-5-5*']);
+  for (const enabledModels of ['relay/*', [42], ['']]) {
+    await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ enabledModels }));
+    await assert.rejects(readPiEnabledModels(agentDir), /enabledModels must be a list/);
+  }
 });
 
 test('faux is explicit fixture-only opt-in and never an unsupported-provider fallback', async () => {
