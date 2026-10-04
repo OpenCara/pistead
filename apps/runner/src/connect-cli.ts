@@ -161,6 +161,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   if (process.platform === "darwin" && !unsandboxed) {
     throw new ConnectorSetupError("macOS has no isolated sandbox: it needs Linux or WSL2 with bubblewrap. To run agent work directly on this Mac, re-run with --unsafe-no-sandbox and read its warning.");
   }
+  if (process.platform === "win32") throw new ConnectorSetupError("Native Windows is not supported. Install WSL2 (in PowerShell: wsl --install), open the Ubuntu terminal, install Node.js 24, Pi, bubblewrap, Python 3, Git and util-linux there, then run this same command inside WSL2.");
   if (process.platform !== "linux" && process.platform !== "darwin") throw new ConnectorSetupError(`Unsupported platform "${process.platform}": use Linux, WSL2 or macOS.`);
   if (unsandboxed && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
   if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorSetupError("--allow-test-shell requires --allow-faux.");
