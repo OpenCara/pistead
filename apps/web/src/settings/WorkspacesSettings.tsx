@@ -1,0 +1,256 @@
+import { useState, type FormEvent } from "react";
+import type { AgentVersion, UserProfile, Workspace, WorkspaceRole } from "../../../../packages/shared/src/types";
+import { repositoryLimits, type GitHubRepository, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
+import { api, segment } from "../api";
+import { useApp } from "../app-context";
+import { useConnections } from "../hosts";
+import { Icon } from "../icons";
+import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
+import { RepositorySnapshotPolicy, useWorkspaceRepositories } from "../repositories";
+import { href } from "../router";
+import { Alert, Button, CardBody, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
+
+interface Member { userId: string; role: WorkspaceRole; displayName?: string; githubLogin?: string | null }
+
+const roleLabel: Record<WorkspaceRole, string> = { owner: "Owner", admin: "Admin", member: "Member" };
+
+export function WorkspacesSettings({ id }: { id?: string }) {
+  const { user, workspaces, workspacesLoading, workspacesError, refreshWorkspaces } = useApp();
+  const [creating, setCreating] = useState(false);
+  const sheet = <NewWorkspaceSheet open={creating} onClose={() => setCreating(false)} />;
+  if (id) {
+    const workspace = workspaces.find(item => item.id === id);
+    if (!workspace) {
+      if (workspacesLoading) return <PageLoading />;
+      return <>
+        <BackLink />
+        {workspacesError
+          ? <Alert variant="error" title="Unable to load workspaces" actions={<Button variant="outline" size="sm" onClick={refreshWorkspaces}>Try again</Button>}>{workspacesError}</Alert>
+          : <EmptyState title="Workspace not found" />}
+      </>;
+    }
+    return <><BackLink /><WorkspaceDetail key={workspace.id} user={user} workspace={workspace} /></>;
+  }
+  if (workspacesLoading && !workspaces.length) return <PageLoading />;
+  if (workspacesError && !workspaces.length) return <Alert variant="error" title="Unable to load workspaces" actions={<Button variant="outline" size="sm" onClick={refreshWorkspaces}>Try again</Button>}>{workspacesError}</Alert>;
+  if (!workspaces.length) return <>
+    <EmptyState title="No workspaces yet" action={<Button variant="default" icon="plus" onClick={() => setCreating(true)}>New workspace</Button>} />
+    {sheet}
+  </>;
+  return <>
+    <Section title="Workspaces" info="A shared home for your repositories, people, agents and sessions" action={<Button variant="outline" size="sm" icon="plus" onClick={() => setCreating(true)}>New workspace</Button>}>
+      {workspaces.map(workspace => <Row key={workspace.id} leading={<IdentityBadge name={workspace.name} id={workspace.id} />} title={workspace.name} hint={roleLabel[workspaceRole(workspace, user)]} href={href({ name: "settings", section: "workspaces", id: workspace.id })} chevron />)}
+    </Section>
+    {sheet}
+  </>;
+}
+
+function BackLink() {
+  return <a className="btn ghost sm" href={href({ name: "settings", section: "workspaces" })}><Icon name="chevron-left" size={16} />Workspaces</a>;
+}
+
+function workspaceRole(workspace: Workspace, user: UserProfile): WorkspaceRole {
+  return workspace.ownerId === user.id ? "owner" : workspace.role ?? "member";
+}
+
+function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Workspace }) {
+  const role = workspaceRole(workspace, user);
+  const admin = role === "owner" || role === "admin";
+  const repositories = useWorkspaceRepositories(workspace.id);
+  return <>
+    <Section title="General">
+      <Row title="Name" trailing={<span>{workspace.name}</span>} />
+      <Row title="Your role" trailing={<StatusBadge tone={admin ? "success" : "neutral"}>{roleLabel[role]}</StatusBadge>} />
+    </Section>
+    <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />
+    <Repositories user={user} workspace={workspace} admin={admin} {...repositories} />
+    <Members workspace={workspace} admin={admin} />
+  </>;
+}
+
+function Setup({ user, workspace, admin, repositoryCount }: { user: UserProfile; workspace: Workspace; admin: boolean; repositoryCount: number | null }) {
+  const { sessions, sessionsLoading } = useApp();
+  const connectors = useConnections(`/api/workspaces/${segment(workspace.id)}/connectors`);
+  const agents = useResource<{ agents: AgentVersion[] }>("/api/agents");
+  // Only show the checklist once every signal is known, so it never flashes in and out.
+  if (repositoryCount === null || !connectors.data || !agents.data || sessionsLoading) return null;
+  const steps = [
+    { label: "Bind a repository", done: repositoryCount > 0, hint: admin ? undefined : "An owner or admin does this", onClick: () => document.getElementById("workspace-repositories")?.scrollIntoView({ behavior: "smooth" }) },
+    { label: "Pair a host", done: connectors.data.connectors.some(connector => !connector.revokedAt && connector.online && (connector.ownerId === user.id || connector.workspaceIds.includes(workspace.id))), link: href({ name: "settings", section: "hosts" }) },
+    { label: "Create an agent", done: agents.data.agents.length > 0, link: href({ name: "settings", section: "agents", id: "new" }) },
+    { label: "Start a session", done: sessions.some(session => session.workspaceId === workspace.id), link: href({ name: "new", workspaceId: workspace.id }) },
+  ];
+  if (steps.every(step => step.done)) return null;
+  return <Section title="Setup" action={<span className="muted small">{steps.filter(step => step.done).length} / {steps.length}</span>}>
+    {steps.map(step => <Row key={step.label} leading={<StatusDot tone={step.done ? "success" : "neutral"} label={step.done ? "Done" : "To do"} />} title={step.label} hint={step.done ? undefined : step.hint} href={step.done ? undefined : step.link} onClick={step.done ? undefined : step.onClick} chevron={!step.done} />)}
+  </Section>;
+}
+
+function Repositories({ user, workspace, admin, repositories, loading, error, refresh }: { user: UserProfile; workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; loading: boolean; error: string; refresh: () => void }) {
+  const action = useAction();
+  const [picking, setPicking] = useState(false);
+  const full = (repositories?.length ?? 0) >= repositoryLimits.repositories;
+  async function remove(repository: WorkspaceRepository) {
+    if (action.busy || !admin) return;
+    const last = repositories?.length === 1;
+    const confirmed = await confirmDialog({
+      title: "Remove repository",
+      message: `Remove ${repository.fullName} from ${workspace.name}? Existing sessions keep their pinned snapshots.${last ? " With no repositories, new sessions, pairing and sharing will be disabled until an owner or admin adds a repository." : " This changes new sessions only."}`,
+      confirmLabel: "Remove",
+      destructive: true,
+    });
+    if (!confirmed) return;
+    void action.run(async () => {
+      await api(`/api/workspaces/${segment(workspace.id)}/repositories/${segment(repository.id)}`, { method: "DELETE" });
+      refresh();
+    }, "Repository removed. Existing sessions keep their pinned snapshots.");
+  }
+  const canAdd = admin && user.githubConnected && !full;
+  return <Section bare title="Repositories" info={<div className="stack">
+    {!admin && <p>Only workspace owners and admins can add or remove repositories.</p>}
+    <p>Changes apply to new sessions only. To change a ref, remove and re-add the repository.</p>
+    <RepositorySnapshotPolicy />
+  </div>} action={canAdd && <Button variant="outline" size="sm" icon="plus" disabled={loading || Boolean(error) || action.busy} onClick={() => setPicking(true)}>Add repository</Button>}>
+    <div className="stack" id="workspace-repositories">
+      <div className="card">
+        <ResourceState loading={loading} error={error} retry={refresh}>
+          {!repositories?.length
+            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a GitHub repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
+            : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<code>{repository.ref}</code>} trailing={<>
+              <StatusBadge>{repository.private ? "Private" : "Public"}</StatusBadge>
+              {admin && <Button variant="outline" size="sm" disabled={action.busy} aria-label={`Remove ${repository.fullName}`} onClick={() => void remove(repository)}>Remove</Button>}
+            </>} />)}
+          {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+        </ResourceState>
+      </div>
+      {admin && !user.githubConnected && <Alert variant="warning" title="GitHub not connected" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Connect your GitHub account before choosing repositories.</Alert>}
+      {admin && user.githubConnected && full && <Alert variant="info" title="Repository limit reached">The workspace has reached its {repositoryLimits.repositories}-repository limit. Remove a binding to choose another.</Alert>}
+    </div>
+    {canAdd && <RepositoryPicker open={picking} workspace={workspace} repositories={repositories ?? []} disabled={loading || Boolean(error) || action.busy} refresh={refresh} close={() => setPicking(false)} />}
+  </Section>;
+}
+
+function RepositoryPicker({ open, workspace, repositories, disabled, refresh, close }: { open: boolean; workspace: Workspace; repositories: WorkspaceRepository[]; disabled: boolean; refresh: () => void; close: () => void }) {
+  const [page, setPage] = useState(1);
+  const [selectedId, setSelectedId] = useState("");
+  const [ref, setRef] = useState("");
+  const resource = useResource<{ repositories: GitHubRepository[]; page: number; hasMore: boolean }>(open ? `/api/github/repositories?page=${page}` : null);
+  const action = useAction();
+  const selected = resource.data?.repositories.find(repository => String(repository.id) === selectedId);
+  const alreadyBound = (repository: GitHubRepository) => repositories.some(binding => binding.repositoryId === repository.id || binding.fullName.toLowerCase() === repository.fullName.toLowerCase());
+  const blocked = disabled || action.busy || resource.loading || Boolean(resource.error) || !selected || alreadyBound(selected) || repositories.length >= repositoryLimits.repositories;
+  function changePage(next: number) { setSelectedId(""); setRef(""); setPage(next); }
+  function dismiss() {
+    if (action.busy) return;
+    setSelectedId("");
+    setRef("");
+    close();
+  }
+  function add(event: FormEvent) {
+    event.preventDefault();
+    if (blocked || !selected) return;
+    void action.run(async () => {
+      await api(`/api/workspaces/${segment(workspace.id)}/repositories`, { method: "POST", body: { repositoryId: selected.id, fullName: selected.fullName, ...(ref.trim() ? { ref: ref.trim() } : {}) } });
+      refresh();
+      setSelectedId("");
+      setRef("");
+      close();
+    });
+  }
+  return <Sheet open={open} title="Add repository" onClose={dismiss} footer={<>
+    <Button disabled={action.busy} onClick={dismiss}>Cancel</Button>
+    <Button variant="default" type="submit" form="repository-picker-form" disabled={blocked}>{action.busy ? "Binding..." : "Bind repository"}</Button>
+  </>}>
+    <form id="repository-picker-form" className="stack" onSubmit={add}>
+      <p className="muted small">Only repositories your GitHub account can access are listed. Never paste a token or clone URL</p>
+      <ResourceState {...resource} retry={resource.refresh}>
+        {!resource.data?.repositories.length
+          ? <EmptyState title="No repositories on this page">Check your GitHub account and organization access, or return to a previous page</EmptyState>
+          : <>
+            <Field label="GitHub repository">
+              <select className="select" required value={selectedId} disabled={disabled || action.busy} onChange={event => { setSelectedId(event.target.value); setRef(""); }}>
+                <option value="">Choose a repository</option>
+                {resource.data.repositories.map(repository => <option key={repository.id} value={repository.id} disabled={alreadyBound(repository)}>{repository.fullName} / {repository.private ? "Private" : "Public"}{alreadyBound(repository) ? " / Already configured" : ""}</option>)}
+              </select>
+            </Field>
+            <Field label="Branch, tag or commit" hint={`Optional. Leave blank to use ${selected ? `the default branch, ${selected.defaultBranch}` : "the repository's default branch"}. New sessions pin this ref to a commit; existing sessions never follow branch changes`}>
+              <input className="input" value={ref} onChange={event => setRef(event.target.value)} disabled={disabled || action.busy || !selected} autoComplete="off" spellCheck={false} maxLength={255} placeholder={selected?.defaultBranch ?? "Repository default branch"} />
+            </Field>
+          </>}
+      </ResourceState>
+      <div className="inline">
+        <Button variant="ghost" size="sm" icon="chevron-left" disabled={page === 1 || resource.loading || action.busy} onClick={() => changePage(page - 1)}>Previous</Button>
+        <span className="muted small" role="status">GitHub page {page}</span>
+        <Button variant="ghost" size="sm" disabled={!resource.data?.hasMore || resource.loading || Boolean(resource.error) || action.busy} onClick={() => changePage(page + 1)}>Next<Icon name="chevron-right" size={16} /></Button>
+      </div>
+      {resource.error && <p className="muted small">Review your <a href={href({ name: "settings", section: "profile" })}>GitHub connection</a> and repository access, then retry. An owner or admin with access can also configure this workspace</p>}
+      <Feedback error={action.error} />
+    </form>
+  </Sheet>;
+}
+
+function Members({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
+  const path = `/api/workspaces/${segment(workspace.id)}/members`;
+  const resource = useResource<{ members: Member[] }>(path);
+  const [adding, setAdding] = useState(false);
+  const action = useAction();
+  async function remove(member: Member) {
+    const confirmed = await confirmDialog({ title: "Remove member", message: `Remove ${member.displayName || member.userId} from this workspace?`, confirmLabel: "Remove", destructive: true });
+    if (!confirmed) return;
+    void action.run(async () => {
+      await api(`${path}/${segment(member.userId)}`, { method: "DELETE" });
+      resource.refresh();
+    }, "Membership removed.");
+  }
+  return <>
+    <Section title="Members" info={<div className="stack">
+      {!admin && <p>Only workspace owners and admins can manage membership.</p>}
+      <p>Members can use published agents and follow workspace-visible sessions read-only, which shows prompts, tool output and repository content in the transcript. Private sessions, and ask, write, approve or manage permissions, require explicit grants.</p>
+      <p>Membership never grants GitHub access, tool execution, or use of anyone's private Pi host.</p>
+    </div>} action={admin && <Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add member</Button>}>
+      <ResourceState {...resource} retry={resource.refresh}>
+        {!resource.data?.members.length
+          ? <CardBody><span className="muted">No members to display</span></CardBody>
+          : resource.data.members.map(member => <Row key={member.userId} leading={<IdentityBadge name={member.displayName || member.githubLogin || member.userId} id={member.userId} />} title={member.displayName || member.githubLogin || member.userId} trailing={<>
+            <StatusBadge tone={member.role === "member" ? "neutral" : "success"}>{roleLabel[member.role]}</StatusBadge>
+            {admin && member.userId !== workspace.ownerId && <DropdownMenu label={`Actions for ${member.displayName || member.userId}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
+          </>} />)}
+        {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+      </ResourceState>
+    </Section>
+    {admin && <AddMember open={adding} path={path} close={() => setAdding(false)} saved={resource.refresh} />}
+  </>;
+}
+
+function AddMember({ open, path, close, saved }: { open: boolean; path: string; close: () => void; saved: () => void }) {
+  const [userId, setUserId] = useState("");
+  const [role, setRole] = useState<"member" | "admin">("member");
+  const action = useAction();
+  function save(event: FormEvent) {
+    event.preventDefault();
+    if (action.busy || !userId.trim()) return;
+    void action.run(async () => {
+      await api(path, { method: "POST", body: { userId: userId.trim(), role } });
+      setUserId("");
+      saved();
+      close();
+    });
+  }
+  return <Sheet open={open} title="Add member" onClose={() => { if (!action.busy) close(); }} footer={<>
+    <Button disabled={action.busy} onClick={close}>Cancel</Button>
+    <Button variant="default" type="submit" form="add-member-form" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save"}</Button>
+  </>}>
+    <form id="add-member-form" className="stack" onSubmit={save}>
+      <Field label="User ID" hint="Copy it from their profile. Saving an existing member updates their role">
+        <input className="input" required autoFocus value={userId} onChange={event => setUserId(event.target.value)} placeholder="User ID" autoComplete="off" spellCheck={false} />
+      </Field>
+      <Field label="Role">
+        <select className="select" value={role} onChange={event => setRole(event.target.value as "member" | "admin")}>
+          <option value="member">Member</option>
+          <option value="admin">Admin</option>
+        </select>
+      </Field>
+      <Feedback error={action.error} />
+    </form>
+  </Sheet>;
+}

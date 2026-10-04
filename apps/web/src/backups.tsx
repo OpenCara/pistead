@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SessionRecord } from "../../../packages/shared/src/types";
 import { api, errorMessage, segment } from "./api";
-import { Feedback, ResourceState, Timestamp, useResource } from "./ui";
+import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert, useResource } from "./ui";
+import { Icon } from "./icons";
 
 export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string };
 type Attempt = { requestId: string; title?: string; targetSessionId?: string };
@@ -9,7 +10,6 @@ type RestoreResponse = {
   session: SessionRecord;
   restore: { id: string; status: "completed"; sourceSessionId: string; backupId: string; targetSessionId: string };
 };
-type Props = { sourceId: string; ownerId: string; latestBackup: Backup | null; openSession?: (id: string) => void };
 
 // Keep uncertain mutations stable across selection changes and component remounts.
 const attempts = new Map<string, Attempt>();
@@ -34,7 +34,12 @@ function getAttempt(key: string): Attempt | undefined {
   return attempt;
 }
 
-export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: Props) {
+export function backupDownloadHref(sessionId: string, backupId: string) {
+  return `/api/sessions/${segment(sessionId)}/backups/${segment(backupId)}/download`;
+}
+
+/** Backup rows inside the Backups card; selecting one reveals download and restore-into-new-session. */
+export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSession }: { sourceId: string; ownerId: string; latestBackup: Backup | null; refreshKey: number; openSession: (id: string) => void }) {
   const base = `/api/sessions/${segment(sourceId)}`;
   const backups = useResource<{ backups: Backup[] }>(`${base}/backups`);
   const [selectedId, setSelectedId] = useState("");
@@ -47,10 +52,11 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
   const selected = backups.data?.backups.find(backup => backup.id === selectedId);
 
   useEffect(() => {
-    if (latestBackup) backups.refresh();
-  }, [latestBackup, backups.refresh]);
+    if (latestBackup || refreshKey) backups.refresh();
+  }, [latestBackup, refreshKey, backups.refresh]);
 
   function chooseBackup(id: string) {
+    if (pending) return;
     setSelectedId(id);
     setError("");
     setStorageError("");
@@ -68,7 +74,7 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
 
   async function restore(event: FormEvent) {
     event.preventDefault();
-    if (!selected || !openSession || inFlight.current || storageError) return;
+    if (!selected || inFlight.current || storageError) return;
     inFlight.current = true;
     setPending(true);
     setError("");
@@ -78,7 +84,7 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
       if (!request) {
         const newTitle = title.trim();
         if (newTitle.length > 200 || newTitle.includes("\0")) {
-          throw new Error("Use a title of at most 200 characters with no NUL characters, or leave it blank.");
+          throw new Error("Use a title of at most 200 characters with no NUL characters, or leave it blank");
         }
         request = { requestId: crypto.randomUUID(), ...(newTitle ? { title: newTitle } : {}) };
         // Persist before sending: reloads and network errors must not mint another target.
@@ -112,39 +118,38 @@ export function BackupRestore({ sourceId, ownerId, latestBackup, openSession }: 
     }
   }
 
+  if (backups.loading) return <Row title={<Loading>Loading backups...</Loading>} />;
+  if (backups.error) return <Row title="Unable to load backups" hint={backups.error} trailing={<Button variant="outline" size="sm" onClick={backups.refresh}>Try again</Button>} />;
+  const list = backups.data?.backups ?? [];
+  if (!list.length) return <Row title="No backups yet" hint="Listing and downloading work while the host is offline" />;
   return <>
-    <div className="section-heading">
-      <h3>Restore to a new session</h3>
-      <button type="button" className="button secondary small" disabled={backups.loading || pending} onClick={backups.refresh}>Refresh backups</button>
-    </div>
-    <p className="metadata">Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p>
-    {!openSession && <p className="notice">Restore isn't available in this view. You can still download backups.</p>}
-    <ResourceState {...backups} retry={backups.refresh}>
-      {backups.data && (backups.data.backups.length ? <form onSubmit={restore}>
-        <fieldset disabled={pending}>
-          <label className="field">Source backup
-            <select value={selectedId} onChange={event => chooseBackup(event.target.value)} required>
-              <option value="">Choose a backup</option>
-              {backups.data.backups.map(backup => <option key={backup.id} value={backup.id}>{backup.createdAt} - {backup.id} - {backup.size} bytes</option>)}
-            </select>
-          </label>
-          {selected && <>
-            <p className="metadata">Created <Timestamp value={selected.createdAt} />; {selected.size} bytes; SHA-256 <code>{selected.sha256}</code></p>
-            <a className="button secondary" href={`${base}/backups/${segment(selected.id)}/download`}>Download backup</a>
-            <label className="field">New session title (optional)
-              <input autoComplete="off" maxLength={200} value={title} disabled={Boolean(attempt) || Boolean(storageError)} onChange={event => setTitle(event.target.value)} />
-            </label>
-            {attempt && <p className="metadata">Restore request <code>{attempt.requestId}</code>. Retrying reuses this request ID and title, so it resolves the same new session instead of creating another.</p>}
-            <button className="button primary" disabled={!openSession || Boolean(storageError)}>
+    {list.map(backup => <div key={backup.id} className="backup-item">
+      <Row
+        leading={<Icon name="archive" size={16} />}
+        title={<Timestamp value={backup.createdAt} />}
+        hint={`${backup.size} bytes`}
+        trailing={<Icon name={backup.id === selectedId ? "chevron-down" : "chevron-right"} size={16} />}
+        onClick={() => chooseBackup(backup.id === selectedId ? "" : backup.id)}
+      />
+      {selected?.id === backup.id && <form className="backup-detail" onSubmit={restore}>
+        <fieldset disabled={pending} className="stack">
+          <p className="muted small">ID <code>{selected.id}</code>; SHA-256 <code>{selected.sha256}</code></p>
+          <div className="inline"><LinkButton variant="outline" size="sm" icon="external" href={backupDownloadHref(sourceId, selected.id)}>Download backup</LinkButton></div>
+          <Field label="New session title" hint="Optional. Restore creates a new private session and never overwrites this one">
+            <input className="input" autoComplete="off" maxLength={200} value={title} disabled={Boolean(attempt) || Boolean(storageError)} onChange={event => setTitle(event.target.value)} />
+          </Field>
+          {attempt && <p className="muted small">Restore request <code>{attempt.requestId}</code>. Retrying reuses this request ID and title, so it resolves the same new session instead of creating another.</p>}
+          <div className="inline">
+            <Button type="submit" variant="secondary" size="sm" disabled={Boolean(storageError)}>
               {pending ? "Restoring..." : attempt?.targetSessionId ? "Open restored session" : attempt ? "Retry same restore" : "Restore into new private session"}
-            </button>
-          </>}
+            </Button>
+            {pending && <Loading>Waiting for the server to confirm the new session...</Loading>}
+          </div>
+          <Feedback error={storageError || error} />
+          {error && attempt && !attempt.targetSessionId && <Alert variant="warning" title="Outcome not confirmed">Retry the same restore; an error doesn't mean no session was created.</Alert>}
+          {attempt?.targetSessionId && <p className="muted small" role="status">Restored session: <code>{attempt.targetSessionId}</code>. It is private; only its owner can change visibility.</p>}
         </fieldset>
-      </form> : <p>No backups yet.</p>)}
-    </ResourceState>
-    <Feedback error={storageError || error} />
-    {error && attempt && !attempt.targetSessionId && <p className="notice">The outcome is not confirmed. Retry the same restore; an error doesn't mean no session was created.</p>}
-    {attempt?.targetSessionId && <p role="status">Restored session: <code>{attempt.targetSessionId}</code>. It is private; only its owner can change visibility.</p>}
-    {pending && <p role="status">Waiting for the server to confirm the new session...</p>}
+      </form>}
+    </div>)}
   </>;
 }

@@ -1,0 +1,167 @@
+@layer screens {
+  /* Workspace pane: header, scrolling transcript, composer; optional right panel. */
+  .session-screen {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    height: 100%;
+    min-height: 0;
+  }
+  .session-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
+  .session-pane > .page-loading { flex: 1 1 auto; min-height: 0; }
+  .session-badges { display: inline-flex; align-items: center; gap: var(--space-1); margin-right: var(--space-2); }
+  .session-alerts { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4) 0; }
+
+  .chat-column { width: 100%; max-width: var(--chat-width); margin: 0 auto; padding: 0 var(--space-4); }
+
+  .session-transcript { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .session-transcript > .chat-column { display: grid; gap: var(--space-4); align-content: start; padding-top: var(--space-6); padding-bottom: var(--space-6); }
+  .session-transcript .empty-state { margin-top: var(--space-12); }
+
+  .entry-user { display: grid; justify-items: end; gap: 2px; }
+  .entry-bubble {
+    max-width: 85%;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-xl);
+    background: var(--surface2);
+    font-size: var(--font-content);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .entry-assistant { font-size: var(--font-content); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .entry-actor { color: var(--foreground-muted); font-size: var(--font-xs); white-space: normal; }
+  .entry-assistant > .entry-actor { margin-top: var(--space-1); }
+
+  .entry-tool > summary {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: fit-content;
+    max-width: 100%;
+    padding: 2px var(--space-2) 2px 0;
+    border-radius: var(--radius);
+    color: var(--foreground-muted);
+    font-size: var(--font-sm);
+    list-style: none;
+    cursor: pointer;
+  }
+  .entry-tool > summary::-webkit-details-marker { display: none; }
+  .entry-tool > summary:hover { color: var(--foreground); }
+  .entry-tool > summary > .icon:last-child { transition: transform 120ms ease; }
+  .entry-tool[open] > summary > .icon:last-child { transform: rotate(90deg); }
+  .entry-tool > pre { max-height: 420px; margin-top: var(--space-2); }
+
+  /* Bottom stack: pinned approvals, queue line, composer. */
+  .session-bottom { flex: 0 0 auto; max-height: 70%; overflow-y: auto; padding: var(--space-2) 0 var(--space-4); }
+  .approval-card { display: grid; gap: var(--space-2); padding: var(--space-3); }
+  .approval-card > pre { max-height: 200px; }
+  .approval-head { display: flex; align-items: center; gap: var(--space-2); }
+  .approval-kind { font-weight: var(--weight-medium); }
+
+  .queue-line > summary {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--font-xs);
+    list-style: none;
+    cursor: pointer;
+  }
+  .queue-line > summary::-webkit-details-marker { display: none; }
+  .queue-line > summary:hover { color: var(--foreground); }
+  .queue-detail {
+    max-height: 30vh;
+    margin-top: var(--space-2);
+    padding: var(--space-3);
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+  .queue-items { display: grid; gap: var(--space-2); }
+  .queue-items > li { display: grid; gap: 2px; font-size: var(--font-sm); }
+
+  .composer {
+    display: grid;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    background: var(--surface1);
+    transition: border-color 120ms ease;
+  }
+  .composer:focus-within { border-color: var(--border-accent); }
+  .composer > textarea {
+    width: 100%;
+    min-height: 24px;
+    max-height: 40vh;
+    padding: 0 var(--space-1);
+    overflow-y: auto;
+    border: 0;
+    background: transparent;
+    font-size: var(--font-content);
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+  }
+  .composer > textarea::placeholder { color: var(--foreground-muted); }
+  .composer-toolbar { display: flex; align-items: center; gap: var(--space-2); min-width: 0; }
+  .composer-hint { flex: 1 1 auto; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); }
+  .composer-send.btn { width: var(--control-sm); padding: 0; border-radius: var(--radius-full); }
+
+  .readonly-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    background: var(--surface2);
+  }
+  .readonly-bar > .btn { margin-left: auto; }
+
+  /* Right panel: pinned column on wide screens, overlay below. */
+  .session-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    border-left: 1px solid var(--border);
+    background: var(--background);
+  }
+  .session-panel-header { display: flex; align-items: center; gap: var(--space-2); min-height: 48px; padding: 0 var(--space-3); border-bottom: 1px solid var(--border); }
+  .session-panel-body { min-height: 0; padding: var(--space-4) var(--space-4) var(--space-8); overflow-y: auto; }
+  .session-panel .card > .alert { margin: var(--space-3); }
+  .backup-detail { padding: 0 var(--space-4) var(--space-4); }
+  .backup-item + .backup-item, .card > .row + .backup-item { border-top: 1px solid var(--border); }
+  .session-permissions { min-width: 0; margin: 0; padding: 0; border: 0; }
+  .session-scrim { display: none; }
+
+  @media (min-width: 1100px) {
+    .session-screen.panel-open { grid-template-columns: minmax(0, 1fr) 360px; }
+  }
+  @media (max-width: 1099px) {
+    .session-panel {
+      position: absolute;
+      inset: 0 0 0 auto;
+      z-index: 30;
+      width: min(360px, 100%);
+      box-shadow: var(--shadow);
+    }
+    .session-scrim {
+      position: absolute;
+      inset: 0;
+      z-index: 29;
+      display: block;
+      border: 0;
+      background: color-mix(in srgb, var(--foreground) 18%, transparent);
+      cursor: default;
+    }
+  }
+  @media (max-width: 600px) {
+    .session-badges > .badge:last-child { display: none; }
+    .chat-column { padding: 0 var(--space-3); }
+  }
+}
