@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, realpath } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -13,7 +14,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { signToken, sha256 } from "../packages/shared/src/crypto.js";
 import type { RunnerBinding, RunnerTicket, RunnerAction, Permission, AuthorizationRequest } from "../packages/shared/src/types.js";
 import type { RestoreDescriptor, RestoreInput } from "../packages/shared/src/connector.js";
-import { assertId, requestKey, stableJson, validateBinding, validateOperation, verifyRunnerTicket } from "../apps/runner/src/protocol.js";
+import { RunnerError, assertId, requestKey, stableJson, validateBinding, validateOperation, verifyRunnerTicket } from "../apps/runner/src/protocol.js";
 import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
 import { RunnerSession } from "../apps/runner/src/session.js";
 import { acquireRunnerLease } from "../apps/runner/src/lease.js";
@@ -359,4 +360,86 @@ test("kernel runner lease admits one owner and releases without deleting stale f
   const next = await acquireRunnerLease(directory, () => { lost = true; });
   await next();
   assert.equal(lost, false);
+});
+
+// Host mode needs only Git, so chat-option behavior is exercised on macOS and Linux alike.
+const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
+async function hostFixture(t: { after: (fn: () => Promise<void>) => void }, extra: Partial<RunnerService["config"]> = {}) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runner-host-")));
+  const grants: Record<string, Permission[]> = { "test:alice": ["read", "ask", "write", "approve", "manage"], "test:bob": ["read", "ask", "write"] };
+  const authorize = async (input: AuthorizationRequest) => ({ allowed: grants[input.actorId]?.includes(input.permission) ?? false, ownerId: input.ownerId, policyVersion: 1 });
+  const service = new RunnerService({ dataDir: directory, sharedSecret: SECRET, controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true, authorize, ...extra });
+  await service.initialize();
+  t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
+  return { service };
+}
+
+test("read access withholds write tools and auto access runs owner commands immediately", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const session = await service.provision(binding("options-session"), await ticket("options-session", "create"));
+  await session.submit(await ticket("options-session", "submit"), { content: "TEST_WRITE read-only.txt\nleaked", requestId: "read", options: { access: "read" } }, "write");
+  await idle(session);
+  await assert.rejects(session.sandbox.readFile("read-only.txt", allowTestOperation));
+  let view = await session.view();
+  assert.ok(view.entries.some(entry => entry.text.includes("Denied: write_file")));
+  assert.equal(view.access, "read");
+  assert.equal(view.approvals.length, 0);
+
+  await session.submit(await ticket("options-session", "submit"), { content: "TEST_BASH echo auto-output-marker", requestId: "auto", options: { access: "auto" } }, "write");
+  await idle(session);
+  view = await session.view();
+  assert.equal(view.access, "auto");
+  assert.equal(view.approvals.length, 1);
+  const [approval] = view.approvals;
+  assert.equal(approval!.status, "executed");
+  assert.equal(approval!.automatic, true);
+  assert.equal(approval!.decidedBy, "test:alice");
+  assert.match(approval!.result ?? "", /auto-output-marker/);
+
+  // Without options the next run returns to per-command human approval.
+  await session.submit(await ticket("options-session", "submit"), { content: "TEST_BASH echo pending-marker", requestId: "default" }, "write");
+  await idle(session);
+  view = await session.view();
+  assert.equal(view.access, undefined);
+  const pending = view.approvals.find(candidate => candidate.id !== approval!.id);
+  assert.equal(pending?.status, "pending");
+  assert.equal(pending?.automatic, undefined);
+});
+
+test("chat options are validated against owner, mode, model and request idempotency", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const id = "validate-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  const status = (code: number) => (error: unknown) => error instanceof RunnerError && error.status === code;
+  await assert.rejects(session.submit(await ticket(id, "submit", "test:bob"), { content: "TEST_IDENTITY", requestId: "bob-auto", options: { access: "auto" } }, "write"), status(403));
+  await assert.rejects(session.submit(await ticket(id, "ask"), { content: "TEST_IDENTITY", requestId: "ask-access", options: { access: "read" } }, "ask"), status(422));
+  await assert.rejects(session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "thinking", options: { thinkingLevel: "high" } }, "write"), status(422));
+  await assert.rejects(session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "model", options: { model: { provider: "faux", modelId: "other" } } }, "write"), status(422));
+  await assert.rejects(session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "extra", options: { access: "read", extra: true } as never }, "write"), status(422));
+  const input = { content: "TEST_IDENTITY", requestId: "stable", options: { access: "read" as const, thinkingLevel: "off" as const, model: { provider: "faux", modelId: "faux-1" } } };
+  const first = await session.submit(await ticket(id, "submit"), input, "write");
+  assert.equal((await session.submit(await ticket(id, "submit"), input, "write")).submissionId, first.submissionId);
+  await assert.rejects(session.submit(await ticket(id, "submit"), { ...input, options: { access: "approval" } }, "write"), status(409));
+  await assert.rejects(session.submit(await ticket(id, "submit"), { content: input.content, requestId: input.requestId }, "write"), status(409));
+  await idle(session);
+  assert.deepEqual((await session.view()).agent, { provider: "faux", modelId: "faux-1", thinkingLevel: "off" });
+});
+
+test("failed model turns expose provider, model and HTTP status but never the provider message", hostMode, async t => {
+  const providerText = "401 invalid key sk-provider-detail for account acct-private";
+  const { service } = await hostFixture(t, { resolveModels: async model => {
+    const models = createModels();
+    const faux = fauxProvider({ models: [{ id: model.modelId }] });
+    faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: providerText })]);
+    models.setProvider(faux.provider);
+    return { models, provider: model.provider, modelId: model.modelId };
+  } });
+  const session = await service.provision(binding("error-session"), await ticket("error-session", "create"));
+  await session.submit(await ticket("error-session", "submit"), { content: "hello", requestId: "fails" }, "write");
+  await idle(session);
+  const view = await session.view();
+  const failed = view.entries.find(entry => entry.error);
+  assert.deepEqual(failed?.error, { provider: "faux", modelId: "faux-1", status: 401 });
+  assert.equal(JSON.stringify(view).includes("sk-provider-detail"), false);
+  assert.equal(JSON.stringify(view).includes("acct-private"), false);
 });

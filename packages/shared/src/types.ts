@@ -110,6 +110,8 @@ export interface ApprovalRecord {
   result?: string;
   createdAt: string;
   admissionId?: string;
+  /** Executed without a per-command human decision because the session owner chose auto-approve access. */
+  automatic?: boolean;
   reviewHash?: string;
 }
 export interface EntryView {
@@ -119,6 +121,8 @@ export interface EntryView {
   text: string;
   actorId?: string;
   conversationId?: string;
+  /** The model request behind this entry failed. Only the provider/model and HTTP status cross the boundary, never provider text. */
+  error?: { provider?: string; modelId?: string; status?: number };
 }
 export interface SessionView {
   sessionId: string;
@@ -128,11 +132,27 @@ export interface SessionView {
   conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
   busy: boolean;
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
+  /** The shared conversation's current model and reasoning level. */
+  agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
+  /** Access mode of the latest shared-conversation submission; absent means "approval". */
+  access?: AccessMode;
+}
+export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof thinkingLevels)[number];
+/** read: inspect only, no edits or commands. approval: every command and commit needs a human decision. auto: the owner's commands and commits run immediately. */
+export const accessModes = ["read", "approval", "auto"] as const;
+export type AccessMode = (typeof accessModes)[number];
+/** Per-message choices. Omitted model/thinkingLevel keep the conversation's current ones; omitted access means "approval". */
+export interface ChatOptions {
+  model?: { provider: string; modelId: string };
+  thinkingLevel?: ThinkingLevel;
+  access?: AccessMode;
 }
 export interface SubmitInput {
   content: string;
   requestId: string;
   admissionId?: string;
+  options?: ChatOptions;
 }
 export interface SubmitResult {
   submissionId: string;

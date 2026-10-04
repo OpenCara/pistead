@@ -75,7 +75,7 @@ test('native Pi chat resolution preserves the exact injected Models runtime with
   const local = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory });
   assert.deepEqual(fixture.configurations, [{ refreshOnCreate: false, allowModelNetwork: false }]);
   const manifest = await local.manifest();
-  assert.deepEqual(manifest, [{ provider: nativeModel.provider, modelId: nativeModel.id, name: nativeModel.name }]);
+  assert.deepEqual(manifest, [{ provider: nativeModel.provider, modelId: nativeModel.id, name: nativeModel.name, thinkingLevels: ['off'] }]);
   assert.equal(JSON.stringify(manifest).includes(secret), false);
   assert.deepEqual(await connectorManifest(local), manifest);
 
@@ -139,9 +139,9 @@ test('catalog filters unauthenticated providers, deduplicates and sorts without 
   fixture.state.configured.delete('no-auth');
   const local = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory });
   assert.deepEqual(await local.manifest(), [
-    { provider: 'a-native', modelId: 'first', name: 'A first' },
-    { provider: 'a-native', modelId: 'second', name: 'A second' },
-    { provider: 'z-native', modelId: 'second', name: 'Z' },
+    { provider: 'a-native', modelId: 'first', name: 'A first', thinkingLevels: ['off'] },
+    { provider: 'a-native', modelId: 'second', name: 'A second', thinkingLevels: ['off'] },
+    { provider: 'z-native', modelId: 'second', name: 'Z', thinkingLevels: ['off'] },
   ]);
   assert.deepEqual(entries, before);
   await assert.rejects(local.resolve(definition('no-auth', 'hidden')), /unavailable/);
@@ -192,7 +192,7 @@ test('oversized native catalogs require a subset rather than silently truncating
   const local = await loadLocalPiModels({
     runtimeFactory: fixture.runtimeFactory, models: [{ provider: 'native.fixture', modelId: 'model-200' }],
   });
-  assert.deepEqual(await local.manifest(), [{ provider: 'native.fixture', modelId: 'model-200', name: 'Model 200' }]);
+  assert.deepEqual(await local.manifest(), [{ provider: 'native.fixture', modelId: 'model-200', name: 'Model 200', thinkingLevels: ['off'] }]);
   await assert.rejects(local.resolve(definition('native.fixture', 'model-0')), /unavailable/);
   assert.strictEqual((await local.resolve(definition('native.fixture', 'model-200'))).models, fixture.runtime);
 });
@@ -200,7 +200,7 @@ test('oversized native catalogs require a subset rather than silently truncating
 test('faux is explicit fixture-only opt-in and never an unsupported-provider fallback', async () => {
   const local = createFauxLocalModels('chosen-fixture');
   assert.deepEqual(await local.manifest(), [{
-    provider: 'faux', modelId: 'chosen-fixture', name: 'Deterministic test provider (not an LLM)',
+    provider: 'faux', modelId: 'chosen-fixture', name: 'Deterministic test provider (not an LLM)', thinkingLevels: ['off'],
   }]);
   await assert.rejects(connectorManifest(local), /Invalid or disabled local model/);
   assert.deepEqual(await connectorManifest(local, true), await local.manifest());
@@ -249,8 +249,8 @@ test('pinned ModelRuntime discovers selected configured models without catalog n
     agentDir, models: [{ provider, modelId }, { provider: keyless, modelId }],
   });
   assert.deepEqual(await local.manifest(), [
-    { provider, modelId, name: 'Fixture configured chat' },
-    { provider: keyless, modelId, name: 'Fixture configured chat' },
+    { provider, modelId, name: 'Fixture configured chat', thinkingLevels: ['off'] },
+    { provider: keyless, modelId, name: 'Fixture configured chat', thinkingLevels: ['off'] },
   ]);
   const resolved = await local.resolve(definition(provider, modelId));
   assert.ok(resolved.models instanceof ModelRuntime);

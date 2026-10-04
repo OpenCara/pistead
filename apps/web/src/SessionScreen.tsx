@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage, segment } from "./api";
 import { useApp } from "./app-context";
+import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
@@ -111,6 +114,15 @@ function usePanelOpen() {
   return [open, set] as const;
 }
 
+/** Why a model request failed, from the only details that cross the host boundary: provider, model and HTTP status. */
+function modelFailure({ provider, modelId, status }: NonNullable<EntryView["error"]>): string {
+  const name = provider ?? "the provider";
+  if (status === 401 || status === 403) return `The host's Pi credentials for ${name} were rejected. The host owner should check Pi's login or API key, then restart the connector.`;
+  if (status === 429) return `Rate limited by ${name}. Try again shortly.`;
+  if (status !== undefined && status >= 500 && status < 600) return `${name} is unavailable. Try again shortly.`;
+  return `The request to ${[provider, modelId].filter(Boolean).join("/") || "the model"} failed${status ? ` (HTTP ${status})` : ""}`;
+}
+
 /** User messages are bubbles; assistant text is plain; tool calls, results and system entries collapse to one row. */
 function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
@@ -121,6 +133,12 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
       <summary><Icon name={call ? "tool" : "terminal"} size={14} /><span className="truncate">{label}{actor && <> · {actor}</>}</span><Icon name="chevron-right" size={14} /></summary>
       <pre>{entry.text}</pre>
     </details>;
+  }
+  if (entry.error) {
+    return <div className="entry-error" title={entry.kind}>
+      <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>
+      {actor && <div className="entry-actor">by {actor}</div>}
+    </div>;
   }
   if (entry.role === "user") {
     return <div className="entry-user" title={entry.kind}>
@@ -152,6 +170,8 @@ function SessionPane({ id }: { id: string }) {
   const canAsk = permissions.includes("ask");
   const canApprove = permissions.includes("approve");
   const isOwner = session?.ownerId === user.id;
+  const hosts = useConnections(session?.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null);
+  const host = hosts.data?.connectors.find(item => item.id === session?.connectorId);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({
@@ -216,7 +236,7 @@ function SessionPane({ id }: { id: string }) {
       {!view ? (!live.error ? <PageLoading />
         : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
         : <div className="session-transcript" />) : session && <Conversation
-        id={id} user={user} session={session} view={view} stale={Boolean(live.error)} refresh={live.refresh}
+        id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
         pinned={<>
           {session.hostUnsandboxed && (canWrite || canApprove) && <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => <ApprovalCard approval={approval} key={approval.id}>
@@ -235,12 +255,15 @@ function SessionPane({ id }: { id: string }) {
     </div>
     {session && panelOpen && <>
       <button type="button" className="session-scrim" aria-label="Close session panel" onClick={() => setPanelOpen(false)} />
-      <SessionPanel session={session} view={view} user={user} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
+      <SessionPanel session={session} view={view} user={user} hosts={hosts} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
     </>}
   </div>;
 }
 
-function Conversation({ id, user, session, view, stale, refresh, pinned }: { id: string; user: UserProfile; session: SessionRecord; view: SessionView; stale: boolean; refresh: () => void; pinned: ReactNode }) {
+function Conversation({ id, user, session, view, host, stale, refresh, pinned }: { id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode }) {
+  const owner = session.ownerId === user.id;
+  // Initialised once per session (SessionPane remounts per id); view refreshes never reset the user's picks.
+  const [selection, setSelection] = useState<ChatSelection>(() => initialSelection(view, owner));
   const [mode, setMode] = useState<"write" | "ask">("write");
   // A first message that failed to send from the new-session screen is handed over here.
   const [content, setContent] = useState(() => {
@@ -289,13 +312,15 @@ function Conversation({ id, user, session, view, stale, refresh, pinned }: { id:
     if (!permitted || !content.trim() || submission.busy) return;
     setReceipt(null);
     const sent = content;
-    const key = `${actualMode}:${sent}`;
+    const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
+    // Changing the options is a different request, so it needs a new idempotency key.
+    const key = `${actualMode}:${JSON.stringify(options ?? null)}:${sent}`;
     // Retry the same failed submission with the same idempotency key, not a duplicate turn.
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
     const requestId = request.current.id;
     stick.current = true;
     void submission.run(async () => {
-      const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId } });
+      const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
@@ -357,6 +382,7 @@ function Conversation({ id, user, session, view, stale, refresh, pinned }: { id:
               { value: "", label: "All my side asks" },
               ...sideConversations.map((conversation, index) => ({ value: conversation.id, label: `Side ask ${index + 1}`, hint: conversation.id.slice(0, 8) })),
             ]} />}
+            {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
           </>}
         />
         <Feedback error={submission.error} />

@@ -1,5 +1,6 @@
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
+import { thinkingLevels, type ThinkingLevel } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import { requireMember } from './db.js';
@@ -22,7 +23,7 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const seen = new Set<string>();
   const models = input.models.map(value => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Invalid model metadata.');
-    onlyFields(value, ['provider', 'modelId', 'name']);
+    onlyFields(value, ['provider', 'modelId', 'name', 'thinkingLevels']);
     const provider = text(value.provider, 'provider', 80);
     const modelId = text(value.modelId, 'modelId', 200);
     const name = text(value.name, 'name', 120);
@@ -31,16 +32,20 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
     const key = JSON.stringify([provider, modelId]);
     if (seen.has(key)) fail(400, 'invalid_manifest', 'Duplicate model metadata.');
     seen.add(key);
-    return { provider, modelId, name };
+    const levels = value.thinkingLevels;
+    if (levels !== undefined && (!Array.isArray(levels) || !levels.length || levels.some(level => !thinkingLevels.includes(level))
+      || new Set(levels).size !== levels.length)) fail(400, 'invalid_manifest', 'Invalid reasoning levels.');
+    return { provider, modelId, name, ...(levels ? { thinkingLevels: [...levels] as ThinkingLevel[] } : {}) };
   });
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');
   const cap = value as Record<string, unknown>;
-  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed']);
+  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions']);
   const platform = text(cap.platform, 'platform', 40);
   if (!/^[a-zA-Z0-9._-]+$/.test(platform) || typeof cap.sandbox !== 'boolean' || typeof cap.productionShell !== 'boolean' || (cap.productionShell && !cap.sandbox)
-    || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)) fail(400, 'invalid_manifest', 'Invalid capabilities.');
-  return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}) } };
+    || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)
+    || (cap.chatOptions !== undefined && typeof cap.chatOptions !== 'boolean')) fail(400, 'invalid_manifest', 'Invalid capabilities.');
+  return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}) } };
 }
 
 function requireConnectorTLS(c: AppContext): void {

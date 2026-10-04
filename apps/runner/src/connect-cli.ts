@@ -120,6 +120,8 @@ Agent work for sessions on this host runs directly as "${userInfo().username}" o
     approval desk before approving it.
   - Anyone you share this Pi with, and anyone granted approve permission on a session that
     runs here, can cause approved commands to run on this machine.
+  - A session owner who turns on Auto-approve in the chat box lets their agent run
+    commands and commits here immediately, with no per-command approval.
 Pistead shows this host as "Unsandboxed" to everyone who can see it.
 
 `;

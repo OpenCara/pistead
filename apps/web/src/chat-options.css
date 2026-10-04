@@ -1,0 +1,7 @@
+@layer screens {
+  /* Chat box model / reasoning / access pickers. */
+  .chat-options-hint { flex: 0 1 auto; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); }
+  .chat-access { display: inline-flex; min-width: 0; }
+  .chat-access .btn { gap: var(--space-1); }
+  .chat-access.auto .btn { color: var(--status-warning); background: color-mix(in srgb, var(--status-warning) 12%, transparent); }
+}

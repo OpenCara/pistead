@@ -408,6 +408,10 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'unsandboxed production shell', value: { ...manifest, capabilities: { ...manifest.capabilities, sandbox: false, productionShell: true } }, code: 'invalid_manifest' },
     { name: 'sandboxed host claiming no sandbox', value: { ...manifest, capabilities: { ...manifest.capabilities, sandbox: true, unsandboxed: true } }, code: 'invalid_manifest' },
     { name: 'non-boolean unsandboxed', value: { ...manifest, capabilities: { ...manifest.capabilities, sandbox: false, unsandboxed: 'yes' } }, code: 'invalid_manifest' },
+    { name: 'unknown thinking level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['off', 'extreme'] }] }, code: 'invalid_manifest' },
+    { name: 'duplicate thinking level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['off', 'off'] }] }, code: 'invalid_manifest' },
+    { name: 'empty thinking levels', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: [] }] }, code: 'invalid_manifest' },
+    { name: 'non-boolean chat options', value: { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: 'true' } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -1036,6 +1040,61 @@ test('only a Worker-issued write admission produces an approvable model review a
     repository: operation.repository, issue: operation.issue, body: operation.body,
   }));
   assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('per-message chat options are checked against the session host, mode and owner before reaching the runtime', async t => {
+  const f = fixture(t); const s = await sharedSession(f);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'ask', 'write'] }));
+  const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
+  const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
+  const path = `/api/sessions/${s.session.id}`;
+  const model = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'outdated', options: { access: 'read' } }), 409, 'connector_update_required');
+  // An empty choice is the same as none, so it still works against an outdated host.
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'empty', options: {} }), 202);
+  assert.equal(Object.hasOwn(JSON.parse(requests.at(-1)!.request.body), 'options'), false);
+  await json(await self(f, s.connector, 'manifest', {
+    models: [{ ...manifest.models[0], thinkingLevels: ['off', 'high'] }], capabilities: { ...manifest.capabilities, chatOptions: true },
+  }));
+  const before = requests.length;
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'foreign', options: { model: { provider: 'local-native', modelId: 'not-on-host' } } }), 403, 'model_not_on_host');
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'level', options: { model, thinkingLevel: 'xhigh' } }), 400, 'invalid_options');
+  await denied(await s.creator.request('POST', `${path}/ask`, { content: 'Hi', requestId: 'ask-access', options: { access: 'read' } }), 400, 'invalid_options');
+  await denied(await s.admin.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'writer-auto', options: { access: 'auto' } }), 403, 'owner_required');
+  assert.equal(requests.length, before, 'rejected choices never reach the host');
+  await json(await s.admin.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'writer-read', options: { access: 'read' } }), 202);
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { access: 'read' });
+  const options = { model, thinkingLevel: 'high', access: 'auto' };
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'owner-auto', options }), 202);
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, options);
+  await json(await s.creator.request('POST', `${path}/ask`, { content: 'Hi', requestId: 'ask-model', options: { model, thinkingLevel: 'off' } }), 202);
+  assert.equal(requests.at(-1)!.request.ticket.action, 'ask');
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { model, thinkingLevel: 'off' });
+});
+
+test('automatic approvals are shown only for the owner\'s own decided commands, never comments or pending work', async t => {
+  const f = fixture(t); const s = await sharedSession(f);
+  const owner = s.creator.user.id;
+  const valid: ApprovalRecord = { id: 'auto-approval', sessionId: s.session.id, requestedBy: owner, decidedBy: owner, automatic: true,
+    operation: { kind: 'bash', command: 'npm test' }, status: 'executed', result: 'ok', createdAt: new Date().toISOString() };
+  let advertised = valid;
+  rpcHub(f, s.connector, () => Response.json({ view: {
+    sessionId: s.session.id,
+    owner: { id: owner, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+    entries: [], approvals: [advertised], conversations: [], busy: false,
+  } }));
+  const path = `/api/sessions/${s.session.id}/view`;
+  const { view } = await json<{ view: SessionView }>(await s.creator.request('GET', path));
+  assert.equal(view.approvals[0].automatic, true);
+  for (const forged of [
+    { ...valid, requestedBy: s.admin.user.id },
+    { ...valid, decidedBy: s.admin.user.id },
+    { ...valid, status: 'pending' as const, decidedBy: undefined },
+    { ...valid, operation: { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'text' } },
+  ]) {
+    advertised = forged;
+    await denied(await s.creator.request('GET', path), 502, 'invalid_runner_response');
+  }
 });
 
 for (const invalid of ['ask', 'expired', 'foreign-session', 'foreign-actor'] as const) {

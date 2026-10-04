@@ -1,7 +1,8 @@
 import type { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
-import type { ApprovalRecord, Permission, RunnerBinding, SessionView, SubmitResult } from '../../../packages/shared/src/types.js';
-import { permissions } from '../../../packages/shared/src/types.js';
+import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionView, SubmitResult } from '../../../packages/shared/src/types.js';
+import { accessModes, permissions, thinkingLevels } from '../../../packages/shared/src/types.js';
+import type { ConnectorCapabilities, LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
@@ -13,6 +14,48 @@ import { requireConnectorSession } from './connectors.js';
 import { presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
+
+/**
+ * Per-message model, reasoning and access. The model must be one the session's own host advertises; auto-approve is the
+ * owner's alone. The runner re-checks all of it, but only the Worker can say whether the host understands options at all.
+ */
+async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask', value: unknown): Promise<ChatOptions | undefined> {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_options', 'Invalid chat options.');
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => !['model', 'thinkingLevel', 'access'].includes(key))) fail(400, 'invalid_options', 'Invalid chat options.');
+  if (!Object.keys(input).length) return undefined;
+  if (!row.connector_id) fail(400, 'options_unsupported', 'This session\'s runner cannot change model, reasoning or access.');
+  const host = await c.env.DB.prepare('SELECT models_json, capabilities_json FROM connectors WHERE id = ? AND revoked_at IS NULL')
+    .bind(row.connector_id).first<{ models_json: string; capabilities_json: string }>();
+  if (!host) fail(409, 'connector_unavailable', 'The session\'s host is no longer available.');
+  if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).chatOptions !== true) {
+    fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to choose model, reasoning or access.');
+  }
+  const options: ChatOptions = {};
+  if (input.model !== undefined) {
+    const model = input.model as Record<string, unknown>;
+    if (!model || typeof model !== 'object' || Array.isArray(model) || Object.keys(model).some(key => key !== 'provider' && key !== 'modelId')) fail(400, 'invalid_options', 'Invalid model choice.');
+    const provider = text(model.provider, 'provider', 80);
+    const modelId = text(model.modelId, 'modelId', 200);
+    const advertised = (JSON.parse(host.models_json) as LocalModelSummary[]).find(item => item.provider === provider && item.modelId === modelId);
+    if (!advertised) fail(403, 'model_not_on_host', 'Only models offered by this session\'s host can be chosen.');
+    if (input.thinkingLevel !== undefined && advertised.thinkingLevels && !advertised.thinkingLevels.includes(input.thinkingLevel as never)) {
+      fail(400, 'invalid_options', 'The model does not support this reasoning level.');
+    }
+    options.model = { provider, modelId };
+  }
+  if (input.thinkingLevel !== undefined) {
+    if (!thinkingLevels.includes(input.thinkingLevel as never)) fail(400, 'invalid_options', 'Invalid reasoning level.');
+    options.thinkingLevel = input.thinkingLevel as ChatOptions['thinkingLevel'];
+  }
+  if (input.access !== undefined) {
+    if (mode !== 'submit' || !accessModes.includes(input.access as never)) fail(400, 'invalid_options', 'Side asks are always read-only.');
+    if (input.access === 'auto' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can auto-approve commands.');
+    options.access = input.access as ChatOptions['access'];
+  }
+  return options;
+}
 
 export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
   const [owner, agent] = await Promise.all([
@@ -222,10 +265,11 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
       const content = text(input.content, 'content', 60000);
       const requestId = text(input.requestId, 'requestId', 128);
+      const options = await chatOptions(c, row, mode, input.options);
       const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId) : undefined;
-      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}) }));
+      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}) }));
       if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
-      await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId }).run();
+      await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}) }).run();
       return c.json(result, 202);
     });
   }

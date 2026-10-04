@@ -2,17 +2,18 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { Type, type Models } from "@earendil-works/pi-ai";
-import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type Cursor, type Conversation, type ConversationId, type EntryRecord, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
+import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
+import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ModelDefinition, Operation, Permission, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, ModelDefinition, Operation, Permission, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
+import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
-import { Sandbox } from "./sandbox.js";
+import { Sandbox, SandboxProcessError } from "./sandbox.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 
@@ -23,10 +24,19 @@ type Run = {
   sequence?: number;
   started?: boolean;
   admissionId?: string;
+  /** Worker-signed per-message choices, applied to the conversation when the run starts. */
+  options?: ChatOptions;
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number };
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
+/** Tools that never change files or run commands; the whole toolset of read-only access and side asks. */
+const readOnlyTools = ["identity", "read_file", "list_files", "git_status"];
+/** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
+function boundedResult(value: string): string {
+  if (value.length <= 8000) return value;
+  return `${value.slice(0, 2000)}\n… ${value.length - 7500} characters omitted …\n${value.slice(-5500)}`;
+}
 export type RunnerConfig = {
   dataDir: string; controlPlaneUrl: string; sharedSecret: string; allowFaux: boolean; allowTestShell?: boolean; fetch?: typeof fetch;
   connectorId?: string;
@@ -51,6 +61,7 @@ export class RunnerSession {
   private closing = false;
   private draining = false;
   private modelRef!: { provider: string; modelId: string };
+  private models!: Models;
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -210,7 +221,7 @@ export class RunnerSession {
     if (!await this.sandbox.repositoryCachesReady(repositories, authorize)) throw new RunnerError(409, "Repository cache initialization did not complete");
   }
 
-  private agentInstructions(mode: "write" | "ask"): string {
+  private agentInstructions(mode: "write" | "ask" | "read"): string {
     let instructions = this.binding.agent.instructions;
     const repositories = this.binding.session.repositories ?? [];
     if (repositories.length) {
@@ -220,6 +231,7 @@ export class RunnerSession {
         + "\nOperate only on isolated session files. These are pinned source snapshots, not full upstream Git histories.";
     }
     if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
+    if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
     return instructions;
   }
 
@@ -232,7 +244,8 @@ export class RunnerSession {
     const resolved = this.config.resolveModels ? await this.config.resolveModels(this.binding.model)
       : { models: runnerModels(this.binding.model, this.config.allowFaux), provider: this.binding.model.provider, modelId: this.binding.model.modelId };
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
-    const models = resolved.models;
+    this.models = resolved.models;
+    const models = this.models;
     const storage = await openNodeSqliteStorage(this.sqlitePath);
     try { this.harness = await Harness.open(storage, { models, registry }, context); }
     catch (error) { await storage.close(context); throw error; }
@@ -267,9 +280,11 @@ export class RunnerSession {
       }
       const conversation = await this.harness.conversation(run.conversationId as ConversationId, context);
       if (!conversation) throw new Error("Persisted branch is missing");
-      const submission = run.submissionId === undefined
-        ? await conversation.submit({ type: "input", content: run.content, requestId: run.key }, context)
-        : await this.harness.submission(run.submissionId as SubmissionId, context);
+      let submission;
+      if (run.submissionId === undefined) {
+        await this.applyOptions(conversation, run);
+        submission = await conversation.submit({ type: "input", content: run.content, requestId: run.key }, context);
+      } else submission = await this.harness.submission(run.submissionId as SubmissionId, context);
       if (submission) {
         await this.mutate(meta => { const saved = meta.runs[run.key]!; saved.submissionId = submission.id; saved.status = "running"; });
         this.observeRun(run.key, submission.id);
@@ -344,6 +359,7 @@ export class RunnerSession {
           meta.runs[run.key]!.started = true;
           meta.runs[run.key]!.startEntry = transcript.entries.at(-1)?.id ?? 0;
         });
+        await this.applyOptions(conversation, run);
         const submission = await conversation.submit({ type: "input", content: run.content, requestId: run.key }, context);
         await this.mutate(meta => {
           meta.runs[run.key]!.submissionId = submission.id;
@@ -356,6 +372,61 @@ export class RunnerSession {
       .finally(() => { this.draining = false; });
   }
 
+  /** Applies a run's model, reasoning and access before its input is admitted; the conversation is idle here. */
+  private async applyOptions(conversation: Conversation, run: Run): Promise<void> {
+    const options = run.options ?? {};
+    const access = options.access ?? "approval";
+    const change: AgentChange = {
+      ...(options.model ? { model: { provider: options.model.provider, modelId: options.model.modelId } } : {}),
+      ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+      // Every shared run states its toolset, so a read-only request never leaks into the next one.
+      ...(run.mode === "write" ? {
+        tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never) && (access !== "read" || readOnlyTools.includes(tool.name))),
+        instructions: this.agentInstructions(access === "read" ? "read" : "write"),
+      } : {}),
+    };
+    if (Object.keys(change).length) await conversation.configure(change, context);
+  }
+
+  /** Validates per-message choices against this host's models and the actor's rights. */
+  private async chatOptions(input: unknown, mode: "write" | "ask", actorId: string): Promise<ChatOptions | undefined> {
+    if (input === undefined) return undefined;
+    // 422 carries this fixed, runner-authored reason through the Worker to the person choosing.
+    const invalid = (message = "Invalid chat options") => new RunnerError(422, message);
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw invalid();
+    const value = input as Record<string, unknown>;
+    if (Object.keys(value).some(key => !["model", "thinkingLevel", "access"].includes(key))) throw invalid();
+    const options: ChatOptions = {};
+    if (value.model !== undefined) {
+      const model = value.model as Record<string, unknown>;
+      if (!model || typeof model !== "object" || Object.keys(model).some(key => key !== "provider" && key !== "modelId")
+        || typeof model.provider !== "string" || typeof model.modelId !== "string" || !model.provider || !model.modelId
+        || model.provider.length > 128 || model.modelId.length > 256) throw invalid();
+      const requested = { provider: model.provider, modelId: model.modelId };
+      const binding = this.binding.model;
+      if (this.config.resolveModels) {
+        // The host decides availability and authentication; a model it cannot serve is refused here, not mid-run.
+        const resolved = await this.config.resolveModels({ ...binding, provider: requested.provider, modelId: requested.modelId })
+          .catch(() => { throw invalid("Model is not available on this host"); });
+        if (resolved.provider !== requested.provider || resolved.modelId !== requested.modelId) throw invalid("Model is not available on this host");
+      } else if (requested.provider !== binding.provider || requested.modelId !== binding.modelId) throw invalid("This runner serves only the session's pinned model");
+      options.model = requested;
+    }
+    if (value.thinkingLevel !== undefined) {
+      if (!thinkingLevels.includes(value.thinkingLevel as never)) throw invalid();
+      const target = options.model ?? (await this.root.agent(context)).model ?? this.modelRef;
+      const model = this.models.getModel(target.provider, target.modelId);
+      if (!model || !getSupportedThinkingLevels(model).includes(value.thinkingLevel as never)) throw invalid("Reasoning level is not supported by the model");
+      options.thinkingLevel = value.thinkingLevel as ChatOptions["thinkingLevel"];
+    }
+    if (value.access !== undefined) {
+      if (!accessModes.includes(value.access as never) || mode !== "write") throw invalid();
+      if (value.access === "auto" && actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can auto-approve");
+      options.access = value.access as ChatOptions["access"];
+    }
+    return Object.keys(options).length ? options : undefined;
+  }
+
   async submit(ticket: RunnerTicket, input: SubmitInput, mode: "write" | "ask"): Promise<SubmitResult> {
     this.assertTicket(ticket);
     if (typeof input?.content !== "string" || input.content.length > 100_000 || !input.content.trim()
@@ -366,6 +437,7 @@ export class RunnerSession {
     return this.exclusive(async () => {
       if (this.closing) throw new RunnerError(503, "Session is closing");
       await this.authorize(ticket.actorId, mode === "ask" ? "ask" : "write", ticket.policyVersion);
+      const options = await this.chatOptions(input.options, mode, ticket.actorId);
       const key = await requestKey(ticket.actorId, mode, input.requestId);
       const hash = await sha256(input.content);
       const state = await this.metadata();
@@ -373,6 +445,7 @@ export class RunnerSession {
       if (existing) {
         if (existing.contentHash !== hash) throw new RunnerError(409, "requestId reused with different content");
         if (existing.admissionId !== input.admissionId) throw new RunnerError(409, "requestId reused with a different Worker admission");
+        if (stableJson(existing.options ?? null) !== stableJson(options ?? null)) throw new RunnerError(409, "requestId reused with different chat options");
         return { submissionId: key, conversationId: String(existing.conversationId), status: existing.status };
       }
       if (Object.values(state.runs).filter(run => ["queued", "running", "admitting"].includes(run.status)).length >= 64)
@@ -387,15 +460,17 @@ export class RunnerSession {
       if (mode === "ask") {
         const transcript = await this.root.context(context);
         const head = transcript.entries.at(-1);
-        const options = { ownership: { kind: "ownerless" as const }, agent: {
-          model: this.modelRef, instructions: this.agentInstructions("ask"),
-          tools: this.tools.filter(tool => ["identity", "read_file", "list_files", "git_status"].includes(tool.name) && this.binding.agent.tools.includes(tool.name as never)),
+        const fork = { ownership: { kind: "ownerless" as const }, agent: {
+          // A side ask starts from the shared conversation's current model; its own choices apply when it runs.
+          model: (await this.root.agent(context)).model ?? this.modelRef, instructions: this.agentInstructions("ask"),
+          tools: this.tools.filter(tool => readOnlyTools.includes(tool.name) && this.binding.agent.tools.includes(tool.name as never)),
         } };
-        conversation = head ? await this.root.fork(head.id, options, context) : await this.harness.createConversation(options, context);
+        conversation = head ? await this.root.fork(head.id, fork, context) : await this.harness.createConversation(fork, context);
       }
       const transcript = await conversation.context(context);
       const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0 };
       if (input.admissionId !== undefined) run.admissionId = input.admissionId;
+      if (options) run.options = options;
       await this.mutate(meta => {
         meta.runs[key] = run;
         meta.nextSequence = (meta.nextSequence ?? 0) + 1;
@@ -411,7 +486,7 @@ export class RunnerSession {
     const state: Metadata = JSON.parse(doc!.json);
     const saved = state.toolActors[String(api.taskId)];
     const run = saved ? state.runs[saved.runKey] : Object.values(state.runs).find(candidate => candidate.conversationId === api.conversationId && (candidate.status === "running" || candidate.status === "admitting"));
-    if (!run || !["admitting", "running"].includes(run.status) || run.ownerId !== this.binding.owner.id || (write && run.mode !== "write")) throw new RunnerError(403, "Tool has no authorized writable submission");
+    if (!run || !["admitting", "running"].includes(run.status) || run.ownerId !== this.binding.owner.id || (write && (run.mode !== "write" || run.options?.access === "read"))) throw new RunnerError(403, "Tool has no authorized writable submission");
     await this.authorize(run.initiatedBy, run.mode === "ask" ? "ask" : "write");
     await api.commit(async tx => {
       const current = await tx.doc(RunnerState);
@@ -451,10 +526,10 @@ export class RunnerSession {
       defineTool({ name: "git_status", description: "Read local git status without mutation or network.", parameters: Type.Object({}), execute: async (_args, api) => {
         const attribution = await this.toolActor(api, false); return text({ ...attribution, status: await this.sandbox.gitStatus(() => this.recheckTool(attribution)) });
       } }),
-      defineTool({ name: "git_commit", description: "Request human approval of an exact owner-attributed local commit; never executes automatically.", parameters: Type.Object({ message: Type.String() }), execute: async (args, api) => {
+      defineTool({ name: "git_commit", description: "Commit the session worktree as the owner. Waits for an exact human approval unless the owner enabled auto-approve for this request; the result says which.", parameters: Type.Object({ message: Type.String() }), execute: async (args, api) => {
         const attribution = await this.toolActor(api, true); return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.commit", message: args.message }, String(api.taskId)));
       } }),
-      defineTool({ name: "bash", description: "Request human approval of an exact sandboxed shell command, network disabled.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api) => {
+      defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api) => {
         const attribution = await this.toolActor(api, true); return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId)));
       } }),
       defineTool({ name: "github_comment", description: "Request human approval of an exact GitHub comment through the owner's broker; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api) => {
@@ -470,6 +545,7 @@ export class RunnerSession {
     if (!this.binding.agent.tools.includes(toolName as never)) throw new RunnerError(403, "Operation not enabled by pinned agent version");
     await this.authorize(actorId, "write");
     let admissionId: string | undefined;
+    let automatic = false;
     if (toolTaskId !== undefined) {
       const state = await this.metadata();
       const attribution = state.toolActors[toolTaskId];
@@ -478,11 +554,36 @@ export class RunnerSession {
         || !["admitting", "running"].includes(run.status)) throw new RunnerError(403, "Approval has no active originating write");
       admissionId = run.admissionId;
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
+      // GitHub comments need a Worker-minted broker capability, so they always wait for a human decision.
+      automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment";
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
-    const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), status: "pending", createdAt: new Date().toISOString() };
+    const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
+      ...(automatic ? { status: "executing", decidedBy: this.binding.owner.id, automatic: true } : { status: "pending" }) };
     if (admissionId !== undefined) approval.admissionId = admissionId;
-    await this.mutate(meta => { meta.approvals[id] ??= approval; });
+    let created = false;
+    await this.mutate(meta => { if (!meta.approvals[id]) { meta.approvals[id] = approval; created = true; } });
+    // A replayed tool task finds its record and never repeats the effect; reopening marks interrupted executions.
+    if (automatic && created) return this.executeAutomatically(id, actorId);
+    return (await this.metadata()).approvals[id]!;
+  }
+
+  private async executeAutomatically(id: string, actorId: string): Promise<ApprovalRecord> {
+    const operation = (await this.metadata()).approvals[id]!.operation;
+    let status: ApprovalRecord["status"];
+    let result: string;
+    try {
+      result = await this.sandbox.execute(operation, false, async () => {
+        this.requireShellCapability(operation);
+        await this.authorize(actorId, "write");
+      }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true });
+      status = "executed";
+    } catch (error) {
+      // A non-zero exit is a definite outcome the agent can act on; anything else may have had partial effects.
+      if (error instanceof SandboxProcessError) { status = "failed"; result = `${error.message}${error.stdout ? `\n${error.stdout}` : ""}`; }
+      else { status = "interrupted"; result = "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited."; }
+    }
+    await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: boundedResult(result) }); });
     return (await this.metadata()).approvals[id]!;
   }
 
@@ -528,7 +629,7 @@ export class RunnerSession {
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
         }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true });
-        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executed", result }); });
+        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executed", result: boundedResult(result) }); });
       } catch {
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "interrupted", result: "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited." }); });
       }
@@ -568,12 +669,17 @@ export class RunnerSession {
         entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy));
       }
     }
+    const agent = await this.root.agent(context);
+    const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
+    const access = latestWrite?.options?.access;
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
       approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
       busy: Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing"),
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
         .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.status })),
+      ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
+      ...(access && access !== "approval" ? { access } : {}),
     };
   }
 
@@ -583,7 +689,13 @@ export class RunnerSession {
       if (typeof message.content === "string") return [message.content];
       return (message.content ?? []).flatMap(block => block.type === "text" ? [block.text] : block.type === "toolCall" ? [`${block.name}(${JSON.stringify(block.arguments)})`] : []);
     }).join("\n");
-    return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch) };
+    const failed = messages.find(message => message.role === "assistant" && message.stopReason === "error");
+    // Provider error text can carry account or endpoint details; only the HTTP status leaves the host.
+    const status = failed?.role === "assistant" ? Number(/^(\d{3})\b/.exec(failed.errorMessage ?? "")?.[1]) : NaN;
+    const error = failed?.role === "assistant" ? {
+      provider: String(failed.provider).slice(0, 128), modelId: String(failed.model).slice(0, 256), ...(status >= 100 && status <= 599 ? { status } : {}),
+    } : undefined;
+    return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch), ...(error ? { error } : {}) };
   }
 
   async restart(): Promise<void> {

@@ -209,7 +209,7 @@ export function DropdownMenu({ label, icon = "more", items, align = "end", side 
       {items.map((item, index) => item === "separator"
         ? <div className="menu-separator" key={`separator-${index}`} role="separator" />
         : <button key={item.label} type="button" role="menuitem" className={item.destructive ? "menu-item destructive" : "menu-item"} disabled={item.disabled} onClick={event => { event.stopPropagation(); setOpen(false); item.onSelect(); }}>
-          {item.icon && <Icon name={item.icon} size={14} />}<span>{item.label}</span>{item.hint && <span className="menu-hint">{item.hint}</span>}
+          {item.icon && <Icon name={item.icon} size={14} />}<span className="menu-text"><span>{item.label}</span>{item.hint && <span className="menu-hint">{item.hint}</span>}</span>
         </button>)}
     </div>}
   </div>;

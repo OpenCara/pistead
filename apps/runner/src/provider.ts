@@ -31,14 +31,16 @@ export function runnerModels(model: ModelDefinition, allowFaux: boolean) {
         const newline = prompt.indexOf("\n");
         tool = "write_file";
         args = { path: prompt.slice(11, newline), content: prompt.slice(newline + 1) };
-      } else if (/^TEST_HOLD (?:0|[1-9][0-9]{0,3})$/.test(prompt)) {
+      } else if (/^TEST_BASH [^\r\n]+$/.test(prompt)) { tool = "bash"; args = { command: prompt.slice(10) }; }
+      else if (/^TEST_COMMIT [^\r\n]+$/.test(prompt)) { tool = "git_commit"; args = { message: prompt.slice(12) }; }
+      else if (/^TEST_HOLD (?:0|[1-9][0-9]{0,3})$/.test(prompt)) {
         const delay = Number(prompt.slice(10));
         if (delay <= 5000) {
           await sleep(delay);
           return fauxAssistantMessage(`Deterministic test provider held for ${delay}ms.`);
         }
       }
-      if (!tool) return fauxAssistantMessage("Deterministic test provider only accepts TEST_IDENTITY, TEST_READ <path>, TEST_WRITE <path>\\n<content>, and TEST_HOLD <0..5000>. This is not an LLM.");
+      if (!tool) return fauxAssistantMessage("Deterministic test provider only accepts TEST_IDENTITY, TEST_READ <path>, TEST_WRITE <path>\\n<content>, TEST_BASH <command>, TEST_COMMIT <message>, and TEST_HOLD <0..5000>. This is not an LLM.");
       const available = new Set<string>();
       for (const message of context.messages) {
         if (message.role !== "system") continue;

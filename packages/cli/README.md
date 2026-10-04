@@ -41,7 +41,11 @@ This needs only Git on your `PATH` (on macOS: `xcode-select --install` or `brew 
 - File tools are confined to each session folder by path checks only.
 - Anyone you share the Pi with, and anyone granted approve permission on a session that runs on it, can cause approved commands to run on your machine.
 
-Every command still needs an exact human approval, and Pistead labels the host **Unsandboxed** to everyone who can see it.
+Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands and commits run immediately (GitHub comments still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
+
+## Chat options
+
+In a session's chat box you can pick any model this host's Pi offers, its reasoning level, and the access mode for each message: **Read only**, **Ask before acting** (the default) or **Auto-approve** (session owner only). Hosts running a connector older than 0.3.0 keep each session's pinned model; restart the connector with `npx pistead@latest connect` to enable the options.
 
 ## License
 

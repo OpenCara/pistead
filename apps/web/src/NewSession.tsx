@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, 
 import type { AgentVersion, ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
+import { ChatOptionsBar, chatOptionsBody, type ChatSelection } from "./chat-options";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { RepositorySnapshotPolicy, useWorkspaceRepositories } from "./repositories";
@@ -97,6 +98,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && repositories.length);
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const canStart = Boolean(selected && host && available && repositoriesReady && trusted && !action.busy);
+  // Picks belong to one agent version and its pinned model; switching agents starts from that model again.
+  const chatKey = `${selected?.id}:${model?.id}`;
+  const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
+  const selection: ChatSelection = chat?.key === chatKey ? chat.value : { model: model && { provider: model.provider, modelId: model.modelId }, access: "approval" };
 
   // A trust acknowledgement covers one agent on one host against one repository set.
   useEffect(() => { setTrustedHost(""); }, [selected?.id, host?.id, host?.ownerId, repositories]);
@@ -112,13 +117,14 @@ function Composer({ workspace }: { workspace: Workspace }) {
     event?.preventDefault();
     if (!canStart || !selected || !host) return;
     const message = content.trim();
+    const options = chatOptionsBody(host, selection, "submit");
     void action.run(async () => {
       const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, agentVersionId: selected.id, title: deriveTitle(content, selected.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
       const sessionId = result.session.id;
       writeStorage(() => localStorage, LAST_AGENT_KEY, selected.id);
       if (message) {
         try {
-          await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID() } });
+          await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}) } });
         } catch {
           // The session exists; keep the unsent text for its composer instead of failing the start.
           writeStorage(() => sessionStorage, `pistead.draft.${sessionId}`, message);
@@ -189,6 +195,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
               <p>You are the session owner; the agent author and host owner are separate roles. Viewing never grants GitHub access, and visibility does not share your Pi host, private agent, or local models.</p>
             </div>
           </InfoTip>
+          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: chatKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
           <span className="spacer" />
           {action.busy && <Loading>Preparing repositories...</Loading>}
           <Button type="submit" variant="default" icon="send" className="composer-send" aria-label="Start session" title="Start session" disabled={!canStart} />

@@ -1,9 +1,11 @@
-import type { RunnerBinding, RunnerTicket } from "./types.js";
+import type { RunnerBinding, RunnerTicket, ThinkingLevel } from "./types.js";
 
 export interface LocalModelSummary {
   provider: string;
   modelId: string;
   name: string;
+  /** Reasoning levels the host's Pi supports for this model; absent from connectors older than chat options. */
+  thinkingLevels?: ThinkingLevel[];
 }
 
 export interface ConnectorCapabilities {
@@ -12,6 +14,8 @@ export interface ConnectorCapabilities {
   productionShell: boolean;
   /** Owner explicitly opted out of isolation: approved work runs directly as the host user. Absent means false. */
   unsandboxed?: boolean;
+  /** The connector applies per-message model, reasoning and access choices. Absent on older connectors. */
+  chatOptions?: boolean;
 }
 
 export interface ConnectorInfo {

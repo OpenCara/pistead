@@ -2,7 +2,7 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { permissions, type ApprovalRecord, type Operation, type Permission, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
-import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
+import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
 import { Icon } from "./icons";
 import { RepositorySnapshotPolicy } from "./repositories";
 import { href } from "./router";
@@ -64,8 +64,11 @@ const approvalTone: Record<ApprovalRecord["status"], Tone> = {
   pending: "warning", approved: "info", executing: "running", executed: "success", denied: "neutral", interrupted: "warning", failed: "danger",
 };
 
-export function ApprovalStatus({ status }: { status: ApprovalRecord["status"] }) {
-  return <StatusBadge tone={approvalTone[status]} dot={status === "executing"}>{status}</StatusBadge>;
+export function ApprovalStatus({ approval }: { approval: ApprovalRecord }) {
+  return <>
+    {approval.automatic && <StatusBadge tone="warning">Auto-approved</StatusBadge>}
+    <StatusBadge tone={approvalTone[approval.status]} dot={approval.status === "executing"}>{approval.status}</StatusBadge>
+  </>;
 }
 
 function detailText(detail: unknown): string {
@@ -80,6 +83,8 @@ type PanelProps = {
   session: SessionRecord;
   view: SessionView | null;
   user: UserProfile;
+  /** The session's workspace connector listing, shared with the chat box. */
+  hosts: ConnectionsResource;
   tab: PanelTab;
   setTab: (tab: PanelTab) => void;
   onClose: () => void;
@@ -124,21 +129,21 @@ export function SessionPanel(props: PanelProps) {
 /** One approval record; decision controls, when allowed, come in as children. */
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   return <article className="approval-card card">
-    <div className="approval-head"><span className="approval-kind">{approval.operation.kind}</span><span className="spacer" /><ApprovalStatus status={approval.status} /></div>
+    <div className="approval-head"><span className="approval-kind">{approval.operation.kind}</span><span className="spacer" /><ApprovalStatus approval={approval} /></div>
     <pre>{JSON.stringify(approval.operation, null, 2)}</pre>
-    <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.decidedBy && <> · Decision by {approval.decidedBy}</>}</p>
+    <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : approval.decidedBy && <> · Decision by {approval.decidedBy}</>}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
   </article>;
 }
 
-function PanelDetails({ session, view, user, refresh, audit, actions, openSession }: PanelProps) {
+function PanelDetails({ session, view, user, hosts, refresh, audit, actions, openSession }: PanelProps) {
   const ownPermissions = session.permissions ?? [];
   const isOwner = session.ownerId === user.id;
   const canWrite = ownPermissions.includes("write");
   const changed = () => { audit.refresh(); refresh(); };
   return <div>
-    <HostSection session={session} user={user} />
+    <HostSection session={session} user={user} hosts={hosts} />
     <RepositoriesSection session={session} refresh={refresh} />
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && <BackupsSection session={session} actions={actions} openSession={openSession} />}
@@ -147,8 +152,7 @@ function PanelDetails({ session, view, user, refresh, audit, actions, openSessio
   </div>;
 }
 
-function HostSection({ session, user }: { session: SessionRecord; user: UserProfile }) {
-  const hosts = useConnections(session.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null);
+function HostSection({ session, user, hosts }: { session: SessionRecord; user: UserProfile; hosts: ConnectionsResource }) {
   const host = hosts.data?.connectors.find(item => item.id === session.connectorId);
   return <Section title="Host" info={<p>Work runs as the session owner ({session.ownerId === user.id ? "you" : session.ownerId}), not the host owner. The host operator can access prompts and files processed on it. Sharing a host doesn't change who can view or control this session, and doesn't expose its owner's local history.</p>}>
     {!session.connectorId ? <Row leading={<Icon name="server" size={16} />} title="Operator-managed session" hint="No local host is pinned" /> : <>

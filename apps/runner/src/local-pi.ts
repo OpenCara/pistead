@@ -1,9 +1,9 @@
 import { join, resolve } from "node:path";
-import type { Models } from "@earendil-works/pi-ai/models";
+import { getSupportedThinkingLevels, type Models } from "@earendil-works/pi-ai/models";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { LocalModelSummary } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
-import type { ModelDefinition } from "../../../packages/shared/src/types.js";
+import { thinkingLevels, type ModelDefinition } from "../../../packages/shared/src/types.js";
 import { runnerModels } from "./provider.js";
 
 export interface ResolvedLocalModel {
@@ -21,10 +21,12 @@ export interface LocalModels {
 export function modelSummary(value: LocalModelSummary): LocalModelSummary {
   if (!value || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.provider)
     || typeof value.modelId !== "string" || !value.modelId || value.modelId.length > 256 || /[\s\x00-\x1f\x7f]/.test(value.modelId)
-    || typeof value.name !== "string" || !value.name.trim() || value.name.length > 200 || /[\x00-\x1f\x7f]/.test(value.name)) {
+    || typeof value.name !== "string" || !value.name.trim() || value.name.length > 200 || /[\x00-\x1f\x7f]/.test(value.name)
+    || (value.thinkingLevels !== undefined && (!Array.isArray(value.thinkingLevels) || !value.thinkingLevels.length
+      || value.thinkingLevels.some(level => !thinkingLevels.includes(level)) || new Set(value.thinkingLevels).size !== value.thinkingLevels.length))) {
     throw new Error("Invalid local model metadata");
   }
-  return { provider: value.provider, modelId: value.modelId, name: value.name };
+  return { provider: value.provider, modelId: value.modelId, name: value.name, ...(value.thinkingLevels ? { thinkingLevels: [...value.thinkingLevels] } : {}) };
 }
 
 export type LocalPiRuntime = Models;
@@ -63,7 +65,7 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
       const key = JSON.stringify([model.provider, model.id]);
       if (seen.has(key) || (selected && !selected.has(key))) continue;
       seen.add(key);
-      result.push(modelSummary({ provider: model.provider, modelId: model.id, name: model.name }));
+      result.push(modelSummary({ provider: model.provider, modelId: model.id, name: model.name, thinkingLevels: getSupportedThinkingLevels(model) }));
     }
     if (selected && [...selected].some(key => !seen.has(key))) throw new Error("A selected local Pi model is unavailable or lacks configured authentication");
     if (result.length > connectorLimits.models) throw new Error("Local Pi catalog exceeds 200 models; select a subset with --model");
@@ -85,7 +87,7 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
 
 /** Deliberate fixture opt-in, never a fallback for an unsupported provider. */
 export function createFauxLocalModels(modelId = "fixture"): LocalModels {
-  const summary = modelSummary({ provider: "faux", modelId, name: "Deterministic test provider (not an LLM)" });
+  const summary = modelSummary({ provider: "faux", modelId, name: "Deterministic test provider (not an LLM)", thinkingLevels: ["off"] });
   return {
     async manifest() { return [{ ...summary }]; },
     async resolve(model) {

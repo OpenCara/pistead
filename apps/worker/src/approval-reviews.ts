@@ -56,6 +56,12 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       createdAt: text(raw.createdAt, 'createdAt', 64),
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
       ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
+    // Only the owner's own commands and commits may run without a human decision, and never a GitHub comment.
+    if (raw.automatic !== undefined) {
+      if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id
+        || approval.status === 'pending' || operation.kind === 'github.comment') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
+      approval.automatic = true;
+    }
     if (explicit && (requestedBy !== explicit.requestedBy || JSON.stringify(operation) !== JSON.stringify(explicit.operation) || raw.admissionId !== undefined)) {
       fail(502, 'approval_changed', 'The runtime changed the explicitly requested operation.');
     }
