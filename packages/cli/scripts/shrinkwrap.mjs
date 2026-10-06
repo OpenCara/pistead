@@ -6,9 +6,10 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const packageDir = new URL("..", import.meta.url).pathname;
+const packageDir = fileURLToPath(new URL("..", import.meta.url));
 const manifestPath = join(packageDir, "package.json");
 const shrinkwrapPath = join(packageDir, "npm-shrinkwrap.json");
 const read = path => JSON.parse(readFileSync(path, "utf8"));
