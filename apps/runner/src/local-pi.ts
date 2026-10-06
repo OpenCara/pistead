@@ -70,9 +70,9 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
   const selectedProviders = options.models && [...new Set(options.models.map(model => model.provider))];
   const manifest = async (): Promise<LocalModelSummary[]> => {
     const signal = AbortSignal.timeout(15_000);
-    // Pi 1.0.0's synchronous configured-auth snapshot starts empty when catalog
-    // refresh is disabled. getAvailable performs local auth/availability checks,
-    // without refreshing the model catalog or extracting request credentials.
+    // ModelRuntime's synchronous configured-auth snapshot starts empty when it is
+    // created without a catalog refresh. getAvailable performs local auth/availability
+    // checks, without refreshing the model catalog or extracting request credentials.
     const enabled = !selected && options.enabledModels?.length ? [...options.enabledModels] : undefined;
     const available = selectedProviders
       ? (await Promise.all(selectedProviders.map(provider => runtime.getAvailable(provider, { signal })))).flat()

@@ -21,10 +21,10 @@
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote --config apps/worker/wrangler.jsonc"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0",
+    "@earendil-works/chord": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-durable": "1.0.4",
     "@hono/node-server": "1.19.11",
     "hono": "4.12.8",
     "react": "19.2.0",
