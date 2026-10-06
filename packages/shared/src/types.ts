@@ -1,9 +1,9 @@
-import type { SessionRepository } from "./repositories.js";
+import type { GitProvider, SessionRepository } from "./repositories.js";
 
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "git_status", "git_commit", "bash", "github_comment"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "git_status", "git_commit", "bash", "github_comment", "git_push"] as const;
 export type ToolName = (typeof toolNames)[number];
 export interface UserProfile {
   id: string;
@@ -96,10 +96,84 @@ export interface AuthorizationResult {
   policyVersion: number;
   ownerId: string;
 }
+/** A pull request the control plane opens as the session owner after a successful push. `base` defaults to the default branch. */
+export interface PullRequestRequest {
+  title: string;
+  body: string;
+  base?: string;
+}
+/**
+ * Pushes the session commits of one pinned repository, up to `commit`, to `branch` on its Git provider.
+ * `repository` is the pin's worktree path; `commit` is the exact session commit that was approved.
+ * Key order is canonical: kind, repository, branch, commit, pullRequest (title, body, base).
+ */
+export interface GitPushOperation {
+  kind: "git.push";
+  repository: string;
+  branch: string;
+  commit: string;
+  pullRequest?: PullRequestRequest;
+}
 export type Operation =
   | { kind: "git.commit"; message: string }
   | { kind: "bash"; command: string }
-  | { kind: "github.comment"; repository: string; issue: number; body: string };
+  | { kind: "github.comment"; repository: string; issue: number; body: string }
+  | GitPushOperation;
+/** A short-lived push credential minted by the control plane for exactly one approved push. Never persisted by the runner. */
+export interface PushCredential {
+  /** Control-plane ledger id; echoed back when the push completes so the credential is revoked. */
+  credentialId: string;
+  /** HTTPS smart-HTTP repository URL without credentials, e.g. https://github.com/owner/repo.git */
+  remote: string;
+  /** Complete Authorization header value for requests to `remote` only. */
+  authorization: string;
+  expiresAt: string;
+}
+/** `unknown`: the push failed during or after the upload, so the remote branch may or may not have moved. */
+export type PushOutcome = "pushed" | "up-to-date" | "failed" | "unknown";
+export interface PushCompletionResult {
+  pullRequest?: { url: string; number: number; created: boolean };
+}
+/** Runner -> control plane: mint the credential for one approved push. */
+export interface PushCredentialRequest {
+  sessionId: string;
+  approvalId: string;
+  /** The human approver (explicit approvals) or the session owner (automatic approvals). */
+  actorId: string;
+  operation: GitPushOperation;
+  /** Explicit approvals: the single-use broker capability minted when the human approved. */
+  capability?: string;
+  /** Automatic approvals: the owner's write admission, issued with auto-approve access. */
+  admissionId?: string;
+}
+/** Runner -> control plane: the push finished; revoke its credential and open the requested pull request. */
+export interface PushCompleteRequest {
+  sessionId: string;
+  approvalId: string;
+  credentialId: string;
+  outcome: PushOutcome;
+  /** The commit now at refs/heads/<branch>; required unless the outcome is "failed". */
+  tip?: string;
+}
+/** How a workspace push identity mints its short-lived tokens. */
+export const pushIdentityKinds = ["github-app", "entra-federation", "bitbucket-client-credentials", "oauth-refresh", "forgejo-integration"] as const;
+export type PushIdentityKind = (typeof pushIdentityKinds)[number];
+/** Public view of a workspace push identity; secrets never leave the control plane. */
+export interface PushIdentity {
+  id: string;
+  workspaceId: string;
+  provider: GitProvider;
+  host: string;
+  /** Azure DevOps organization or Bitbucket workspace (lowercase); empty when the identity covers the whole host. */
+  scope: string;
+  kind: PushIdentityKind;
+  /** Non-secret settings: appId/slug, tenantId/clientId, key, clientId/login, audience. */
+  config: Record<string, string>;
+  status: "ready" | "authorization_required";
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
 export interface ApprovalRecord {
   id: string;
   sessionId: string;

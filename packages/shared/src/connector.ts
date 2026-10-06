@@ -18,6 +18,8 @@ export interface ConnectorCapabilities {
   chatOptions?: boolean;
   /** The connector accepts repositories from providers other than github.com (provider/host pins). Absent on older connectors. */
   gitProviders?: boolean;
+  /** The connector pushes session commits with control-plane minted credentials (git_push). Absent on older connectors. */
+  gitPush?: boolean;
 }
 
 export interface ConnectorInfo {

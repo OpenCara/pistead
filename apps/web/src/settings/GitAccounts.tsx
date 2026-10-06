@@ -9,11 +9,11 @@ import { Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState,
 const tokenProviders = gitProviders.filter((provider): provider is TokenGitProvider => provider !== "github");
 
 const tokenScopes: Record<TokenGitProvider, string> = {
-  "github-enterprise": "Fine-grained: Contents and Metadata read (or classic repo)",
-  gitlab: "read_api and read_repository",
-  bitbucket: "API token with read:repository:bitbucket and read:user:bitbucket (enter your Atlassian email above), or a workspace/repository access token with repository read",
-  "azure-devops": "Code (Read)",
-  gitea: "read:repository and read:user",
+  "github-enterprise": "Fine-grained: Contents and Metadata read (or classic repo); opening pull requests needs Pull requests write (or classic repo)",
+  gitlab: "read_api and read_repository; opening merge requests needs api",
+  bitbucket: "API token with read:repository:bitbucket and read:user:bitbucket, connected with your Atlassian account email above; agent pushes need this API token (workspace or repository access tokens can browse but cannot pass the push owner check); opening pull requests needs write:pullrequest:bitbucket",
+  "azure-devops": "Code (Read); opening pull requests needs Code (Read & write)",
+  gitea: "read:repository and read:user; opening pull requests needs write:repository",
 };
 
 /** Profile section listing the GitHub sign-in account and personal-access-token accounts for other Git providers. */
@@ -118,7 +118,7 @@ function AddGitAccountSheet({ open, close, added }: { open: boolean; close: () =
         {provider === "azure-devops" && <Field label="Organization" hint={`From dev.azure.com/<organization>`}>
           <input className="input" required value={organization} onChange={event => setOrganization(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} maxLength={100} />
         </Field>}
-        {provider === "bitbucket" && <Field label="Username or email" hint="Optional. Your Atlassian account email when using an API token; leave blank for a workspace or repository access token">
+        {provider === "bitbucket" && <Field label="Username or email" hint="Your Atlassian account email when using an API token (required for agent pushes); leave blank for a workspace or repository access token, which can browse but not push">
           <input className="input" value={username} onChange={event => setUsername(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} maxLength={254} />
         </Field>}
         <Field label="Token" hint={`Scopes: ${tokenScopes[provider]}. Verified with ${gitProviderNames[provider]}, then encrypted on the server`}>

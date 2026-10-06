@@ -12,6 +12,7 @@ import { authenticateConnector, requireConnectorSession } from './connectors.js'
 import { legacyRestoreDownload } from './restore-routes.js';
 import { requireBrokerReview } from './approval-reviews.js';
 import { repositoryDownload } from './repositories.js';
+import { pushComplete, pushCredential } from './push/broker.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   const configured = c.env.RUNNER_SHARED_SECRET;
@@ -27,6 +28,8 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.use('/api/internal/*', internalAuthentication);
   app.post('/api/internal/authorize', c => authorizeSession(c, null));
   app.post('/api/internal/github/comment', c => githubComment(c, null));
+  app.post('/api/internal/git/push/credential', c => pushCredential(c, null));
+  app.post('/api/internal/git/push/complete', c => pushComplete(c, null));
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
   app.post('/api/internal/repositories/:bindingId/download', c => repositoryDownload(c, null));
 }

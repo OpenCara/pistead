@@ -4,6 +4,7 @@ import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
 import { fail, now, randomToken, testMode, text } from './http.js';
 import type { AppContext, SessionRow } from './types.js';
+import type { AccessMode } from '../../../packages/shared/src/types.js';
 
 const ADMISSION_TTL_SECONDS = 3600;
 const MAX_SESSION_ACTOR_PENDING = 1000;
@@ -58,17 +59,17 @@ async function admissionStorage<T>(operation: Promise<T>): Promise<T> {
   catch { fail(503, 'admission_unavailable', 'Run admission storage is temporarily unavailable.'); }
 }
 
-export async function issueRunAdmission(c: AppContext, row: SessionRow, content: string, requestId: string): Promise<string> {
+export async function issueRunAdmission(c: AppContext, row: SessionRow, content: string, requestId: string, access?: AccessMode): Promise<string> {
   // Authentication middleware derives this identity from the cookie, never the submit body.
   const actorId = c.get('auth')?.userId;
   if (!actorId) fail(401, 'unauthorized', 'Authentication is required.');
   text(content, 'content', 60000);
   text(requestId, 'requestId', 128);
 
-  const access = await sessionAccess(c.env, row.id, actorId);
-  if (!access) fail(404, 'not_found', 'Session not found.');
-  if (!hasPermission(access.permissions, 'write')) fail(403, 'forbidden', 'Session write permission is required.');
-  const current = access.row;
+  const actor = await sessionAccess(c.env, row.id, actorId);
+  if (!actor) fail(404, 'not_found', 'Session not found.');
+  if (!hasPermission(actor.permissions, 'write')) fail(403, 'forbidden', 'Session write permission is required.');
+  const current = actor.row;
   if (current.workspace_id !== row.workspace_id || current.owner_id !== row.owner_id ||
       current.agent_version_id !== row.agent_version_id || current.policy_version !== row.policy_version ||
       (current.connector_id ?? null) !== (row.connector_id ?? null) ||
@@ -88,8 +89,8 @@ export async function issueRunAdmission(c: AppContext, row: SessionRow, content:
   // Tenant-local quotas share the insertion statement; one account cannot consume a global gate.
   // Never delete proof rows or renew their expiry, including after ambiguous dispatches.
   await admissionStorage(c.env.DB.prepare(`WITH eligible AS (${ELIGIBLE_SESSION})
-    INSERT INTO run_admissions (id, session_id, actor_id, mode, request_id, content_hash, expires_at, created_at)
-    SELECT ?, eligible.id, ?, 'write', ?, ?, ?, ? FROM eligible
+    INSERT INTO run_admissions (id, session_id, actor_id, mode, request_id, content_hash, expires_at, created_at, access)
+    SELECT ?, eligible.id, ?, 'write', ?, ?, ?, ?, ? FROM eligible
     WHERE (SELECT COUNT(*) FROM (
       SELECT 1 FROM run_admissions WHERE session_id = ? AND actor_id = ? AND expires_at > ? LIMIT ?
     )) < ?
@@ -101,7 +102,7 @@ export async function issueRunAdmission(c: AppContext, row: SessionRow, content:
         WHERE owned.owner_id = ? AND admission.expires_at > ? LIMIT ?
       )) < ?
     ON CONFLICT(session_id, actor_id, request_id) DO NOTHING`)
-    .bind(...guardBindings, randomToken(), actorId, requestId, contentHash, issuedAt + ADMISSION_TTL_SECONDS, createdAt,
+    .bind(...guardBindings, randomToken(), actorId, requestId, contentHash, issuedAt + ADMISSION_TTL_SECONDS, createdAt, access ?? null,
       current.id, actorId, issuedAt, MAX_SESSION_ACTOR_PENDING, MAX_SESSION_ACTOR_PENDING,
       actorId, issuedAt, MAX_ACTOR_PENDING, MAX_ACTOR_PENDING,
       current.owner_id, issuedAt, MAX_OWNER_PENDING, MAX_OWNER_PENDING).run());

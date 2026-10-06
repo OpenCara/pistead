@@ -1,5 +1,23 @@
-import type { Operation } from '../../../packages/shared/src/types.js';
+import type { Operation, PullRequestRequest } from '../../../packages/shared/src/types.js';
+import { validPushBranch } from '../../../packages/shared/src/repositories.js';
 import { fail, text } from './http.js';
+
+/** A pinned repository's worktree path, as produced by repositoryPath(): 2-64 safe segments. */
+export function validRepositoryPath(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 512 && /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+){1,63}$/.test(value)
+    && !value.split('/').some(part => ['.', '..', '.git'].includes(part.toLowerCase()));
+}
+
+function pullRequest(value: unknown): PullRequestRequest {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_operation', 'Invalid pull request.');
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => !['title', 'body', 'base'].includes(key))) fail(400, 'invalid_operation', 'Invalid pull request.');
+  const title = text(input.title, 'pull request title', 256);
+  if (!title.trim() || /[\r\n]/.test(title)) fail(400, 'invalid_operation', 'Invalid pull request title.');
+  const body = text(input.body, 'pull request body', 60000, 0);
+  if (input.base !== undefined && !validPushBranch(input.base)) fail(400, 'invalid_operation', 'Invalid pull request base branch.');
+  return { title, body, ...(input.base === undefined ? {} : { base: input.base as string }) };
+}
 
 export function parseOperation(input: unknown): Operation {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail(400, 'invalid_operation', 'Expected an operation.');
@@ -14,6 +32,14 @@ export function parseOperation(input: unknown): Operation {
       }
       if (!Number.isSafeInteger(value.issue) || Number(value.issue) < 1) fail(400, 'invalid_operation', 'Invalid issue number.');
       return { kind: value.kind, repository, issue: Number(value.issue), body: text(value.body, 'comment body', 60000) };
+    }
+    case 'git.push': {
+      if (!validRepositoryPath(value.repository)) fail(400, 'invalid_operation', 'Expected a pinned repository path.');
+      if (!validPushBranch(value.branch)) fail(400, 'invalid_operation', 'Invalid branch name.');
+      if (typeof value.commit !== 'string' || !/^[0-9a-f]{40}$/.test(value.commit)) fail(400, 'invalid_operation', 'Expected a 40-character session commit.');
+      // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
+      return { kind: value.kind, repository: value.repository, branch: value.branch, commit: value.commit,
+        ...(value.pullRequest === undefined ? {} : { pullRequest: pullRequest(value.pullRequest) }) };
     }
     default: fail(400, 'invalid_operation', 'Unsupported operation.');
   }

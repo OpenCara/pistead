@@ -12,6 +12,8 @@ import { registerConnectorCredentials, registerConnectors } from './connectors.j
 import { registerRestoreRoutes } from './restore-routes.js';
 import { registerRepositories } from './repositories.js';
 import { registerGitAccounts } from './git/accounts.js';
+import { registerOidc } from './push/oidc.js';
+import { registerPushIdentities } from './push/identities.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -46,9 +48,11 @@ app.get('/api/health', async c => {
 registerAuth(app);
 registerInternal(app);
 registerConnectorCredentials(app);
+registerOidc(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
 registerRepositories(app);
+registerPushIdentities(app);
 registerGitAccounts(app);
 registerConnectors(app);
 registerSessions(app);

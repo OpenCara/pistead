@@ -170,7 +170,13 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const host = row.connector_id
       ? await c.env.DB.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').bind(row.connector_id).first<{ capabilities_json: string }>()
       : null;
-    const gitProviders = !row.connector_id || (JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).gitProviders === true;
+    const capabilities = JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities;
+    const gitProviders = !row.connector_id || capabilities.gitProviders === true;
+    // Older connectors cannot carry approved pushes; refuse agents that would offer git_push.
+    const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
+    if (gitPush && capabilities.gitPush !== true) {
+      fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use git_push.');
+    }
     const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
     row.repositories_json = JSON.stringify(resolved.repositories);
     const providerPins = resolved.repositories.some(repository => 'provider' in repository) ? 1 : 0;
@@ -200,6 +206,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
           AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id
           AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
           AND (? = 0 OR json_extract(host.capabilities_json, '$.gitProviders') = 1)
+          AND (? = 0 OR json_extract(host.capabilities_json, '$.gitPush') = 1)
           AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
             WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
       )) RETURNING id`)
@@ -211,7 +218,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
         resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
         JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
         row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
-        testMode(c.env) ? 1 : 0, providerPins).first();
+        testMode(c.env) ? 1 : 0, providerPins, gitPush).first();
     if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
     await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }).run();
     try {
@@ -279,7 +286,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       const content = text(input.content, 'content', 60000);
       const requestId = text(input.requestId, 'requestId', 128);
       const options = await chatOptions(c, row, mode, input.options);
-      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId) : undefined;
+      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access) : undefined;
       const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}) }));
       if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
       await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}) }).run();
@@ -321,7 +328,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       await reviewedApproval(c, row, approvalId, input.reviewHash);
       const fresh = await requireSession(c, row.id, 'approve');
       if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-      if (operation.kind === 'github.comment') {
+      if (operation.kind === 'github.comment' || operation.kind === 'git.push') {
         const existing = await c.env.DB.prepare('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');
         brokerCapability = randomToken();

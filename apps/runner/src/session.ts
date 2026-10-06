@@ -5,7 +5,7 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, ModelDefinition, Operation, Permission, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
 import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -13,7 +13,8 @@ import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
-import { Sandbox, SandboxProcessError } from "./sandbox.js";
+import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.js";
+import { performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 
@@ -42,6 +43,10 @@ export type RunnerConfig = {
   connectorId?: string;
   authorize?: (request: AuthorizationRequest) => Promise<AuthorizationResult>;
   githubComment?: (request: { sessionId: string; actorId: string; approvalId: string; capability: string; repository: string; issue: number; body: string }) => Promise<{ id: number; url: string }>;
+  /** Mints the short-lived credential for one approved push; held only in this process's memory. */
+  pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential>;
+  /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
+  pushComplete?: (request: PushCompleteRequest) => Promise<PushCompletionResult>;
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
   readRepository?: (repository: SessionRepository, sessionId: string) => Promise<Uint8Array>;
@@ -62,6 +67,8 @@ export class RunnerSession {
   private draining = false;
   private modelRef!: { provider: string; modelId: string };
   private models!: Models;
+  /** Pushes (approved ones settle after decide() returns; automatic ones inline); close() aborts and awaits them. */
+  private pushes = new Set<{ controller: AbortController; done: Promise<void> }>();
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -229,6 +236,10 @@ export class RunnerSession {
         + "The execution root is the isolated session worktree. File-tool paths are relative to that worktree, not to a repository root.\n"
         + repositories.map(repository => `- Source snapshot: worktree/${repository.path}; file-tool path prefix: ${repository.path}/; pinned commit: ${repository.commit}.`).join("\n")
         + "\nOperate only on isolated session files. These are pinned source snapshots, not full upstream Git histories.";
+      if (this.binding.agent.tools.includes("git_push"))
+        instructions += "\ngit_push publishes one repository's committed session changes to a branch on its Git provider: commit first with git_commit; "
+          + "the session commits that touch that repository path are replayed onto its pinned commit, so the branch contains only your changes. "
+          + "Pushes are fast-forward only (never forced); a branch that moved elsewhere is refused. Optionally request a pull request with pull_request {title, body, base?}.";
     }
     if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
     if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
@@ -535,13 +546,24 @@ export class RunnerSession {
       defineTool({ name: "github_comment", description: "Request human approval of an exact GitHub comment through the owner's broker; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api) => {
         const attribution = await this.toolActor(api, true); return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId)));
       } }),
+      defineTool({ name: "git_push", description: "Push the committed session changes of one pinned repository (its worktree path) to a branch on its Git provider, fast-forward only, optionally opening a pull request as the owner. Commit first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
+        repository: Type.String(), branch: Type.String(),
+        pull_request: Type.Optional(Type.Object({ title: Type.String(), body: Type.String(), base: Type.Optional(Type.String()) })),
+      }), execute: async (args, api) => {
+        const attribution = await this.toolActor(api, true);
+        const commit = await this.sandbox.head(() => this.recheckTool(attribution));
+        const request = args.pull_request;
+        const operation: GitPushOperation = { kind: "git.push", repository: args.repository, branch: args.branch, commit,
+          ...(request ? { pullRequest: { title: request.title, body: request.body, ...(request.base !== undefined ? { base: request.base } : {}) } } : {}) };
+        return approvalText(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId)));
+      } }),
     ];
   }
 
   async createApproval(actorId: string, input: Operation, toolTaskId?: string): Promise<ApprovalRecord> {
     const operation = validateOperation(input);
     this.requireShellCapability(operation);
-    const toolName = { "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment" }[operation.kind];
+    const toolName = { "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "git.push": "git_push" }[operation.kind];
     if (!this.binding.agent.tools.includes(toolName as never)) throw new RunnerError(403, "Operation not enabled by pinned agent version");
     await this.authorize(actorId, "write");
     let admissionId: string | undefined;
@@ -554,8 +576,10 @@ export class RunnerSession {
         || !["admitting", "running"].includes(run.status)) throw new RunnerError(403, "Approval has no active originating write");
       admissionId = run.admissionId;
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
-      // GitHub comments need a Worker-minted broker capability, so they always wait for a human decision.
-      automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment";
+      // GitHub comments need a Worker-minted broker capability, so they always wait for a human decision;
+      // automatic pushes mint their credential from the run's owner admission instead.
+      automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
+        && (operation.kind !== "git.push" || admissionId !== undefined);
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -569,9 +593,23 @@ export class RunnerSession {
   }
 
   private async executeAutomatically(id: string, actorId: string): Promise<ApprovalRecord> {
-    const operation = (await this.metadata()).approvals[id]!.operation;
+    const approval = (await this.metadata()).approvals[id]!;
+    const operation = approval.operation;
     let status: ApprovalRecord["status"];
     let result: string;
+    if (operation.kind === "git.push") {
+      // Tracked like approved pushes so close() aborts it and awaits its settlement before the harness closes.
+      const entry = { controller: new AbortController(), done: Promise.resolve() };
+      const settled = (async () => {
+        const outcome = await this.runPush(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); }, entry.controller.signal);
+        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: boundedResult(outcome.result) }); });
+      })();
+      entry.done = settled.then(() => undefined, () => undefined);
+      this.pushes.add(entry);
+      try { await settled; }
+      finally { this.pushes.delete(entry); }
+      return (await this.metadata()).approvals[id]!;
+    }
     try {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation);
@@ -604,8 +642,29 @@ export class RunnerSession {
       this.requireShellCapability(approval.operation);
       await this.authorize(approval.requestedBy, "write");
       if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status))) throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
-      if (approval.operation.kind === "github.comment" && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
+      if ((approval.operation.kind === "github.comment" || approval.operation.kind === "git.push") && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
       await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executing", decidedBy: ticket.actorId }); });
+      if (approval.operation.kind === "git.push") {
+        // Pushes can outlast the connector RPC deadline: report executing now and settle in the background.
+        const operation = approval.operation;
+        const controller = new AbortController();
+        const generation = this.generation;
+        const entry = { controller, done: Promise.resolve() };
+        entry.done = (async () => {
+          const outcome = await this.runPush(id, operation, { actorId: ticket.actorId, capability: input.brokerCapability! }, async () => {
+            await this.authorize(approval.requestedBy, "write");
+            await this.authorize(ticket.actorId, "approve");
+          }, controller.signal);
+          if (generation !== this.generation) return;
+          await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: boundedResult(outcome.result) }); });
+        })().catch(() => { /* Reopening marks a still-executing approval interrupted; never retry the push. */ })
+          .finally(() => {
+            this.pushes.delete(entry);
+            if (generation === this.generation && !this.closing) this.drainQueue();
+          });
+        this.pushes.add(entry);
+        return (await this.metadata()).approvals[id]!;
+      }
       try {
         let result: string;
         if (approval.operation.kind === "github.comment") {
@@ -719,7 +778,68 @@ export class RunnerSession {
 
   async close(): Promise<void> {
     this.closing = true;
+    // Aborted pushes still settle their approval (interrupted) and report completion before the harness closes.
+    for (const push of this.pushes) push.controller.abort();
+    await Promise.allSettled([...this.pushes].map(push => push.done));
     this.generation++;
     await this.harness.close(context);
+  }
+
+  /** Credential → push → completion. The credential stays in this frame; results carry only fixed, credential-free text. */
+  private async runPush(id: string, operation: GitPushOperation, auth: { actorId: string; capability?: string; admissionId?: string }, recheck: SandboxAuthorize, signal?: AbortSignal): Promise<{ status: "executed" | "failed" | "interrupted"; result: string }> {
+    const repository = validateRepositories(this.binding.session.repositories).find(pin => pin.path === operation.repository);
+    if (!repository) return { status: "failed", result: "Push failed: the repository is not pinned in this session. Nothing was pushed." };
+    const request: PushCredentialRequest = { sessionId: this.binding.session.id, approvalId: id, actorId: auth.actorId, operation,
+      ...(auth.capability !== undefined ? { capability: auth.capability } : {}), ...(auth.admissionId !== undefined ? { admissionId: auth.admissionId } : {}) };
+    let credential: PushCredential;
+    try {
+      await recheck();
+      credential = this.config.pushCredential ? await this.config.pushCredential(request) : await this.controlPlane<PushCredential>("/api/internal/git/push/credential", request);
+      if (!credential || typeof credential.credentialId !== "string" || typeof credential.remote !== "string" || typeof credential.authorization !== "string")
+        throw new RunnerError(502, "Invalid push credential");
+    } catch (error) {
+      const reason = error instanceof RunnerError ? `: ${error.message}` : "";
+      return { status: "failed", result: `Push credential was refused${reason}. Nothing was pushed.` };
+    }
+    let pushed: PushResult | undefined;
+    let failure: { status: "failed" | "interrupted"; result: string } | undefined;
+    try {
+      pushed = await performPush({ workspace: this.sandbox, operation, repository, credential, authorize: recheck, signal });
+    } catch (error) {
+      failure = error instanceof PushError && !signal?.aborted
+        ? { status: "failed", result: `Push failed: ${error.message}. Nothing was pushed.` }
+        : { status: "interrupted", result: "Push was interrupted; the remote branch may or may not have changed. Inspect it; automatic retry is prohibited." };
+    }
+    const outcome: PushOutcome = pushed?.outcome ?? (failure?.status === "failed" ? "failed" : "unknown");
+    const complete: PushCompleteRequest = { sessionId: this.binding.session.id, approvalId: id, credentialId: credential.credentialId, outcome, ...(pushed ? { tip: pushed.tip } : {}) };
+    let completion: PushCompletionResult | undefined;
+    let completionFailure = "";
+    try {
+      completion = this.config.pushComplete ? await this.config.pushComplete(complete) : await this.controlPlane<PushCompletionResult>("/api/internal/git/push/complete", complete);
+    } catch (error) {
+      completionFailure = error instanceof RunnerError ? `: ${error.message}` : "";
+    }
+    if (!pushed) return failure!;
+    const confirmation = completion ? "" : operation.pullRequest
+      ? `\nThe pull request was not opened${completionFailure || "; the control plane did not confirm completion"}.`
+      : "\nThe control plane did not confirm completion.";
+    return { status: "executed", result: pushSummary(pushed, completion?.pullRequest) + confirmation };
+  }
+
+  /** Shared-secret internal control-plane call; Worker errors carry fixed, credential-free messages. */
+  private async controlPlane<T>(path: string, body: unknown): Promise<T> {
+    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}${path}`, {
+      method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(30_000), redirect: "error",
+    });
+    const text = await response.text();
+    if (text.length > 65536) throw new RunnerError(502, "Control-plane response is too large");
+    let value: unknown;
+    try { value = text ? JSON.parse(text) : undefined; } catch { value = undefined; }
+    if (!response.ok) {
+      const message = value && typeof value === "object" && "error" in value && typeof value.error === "string" ? value.error.slice(0, 1000) : `HTTP ${response.status}`;
+      throw new RunnerError(response.status, message);
+    }
+    return value as T;
   }
 }

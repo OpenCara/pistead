@@ -1081,7 +1081,7 @@ test('account input is validated before any provider request and rejected tokens
 test('token-provider bindings and session pins use each actor\'s own account and the exact provider pin shape', async t => {
   const s = await providerSetup(t);
   assert.deepEqual({ ...s.repository, id: '', createdAt: '' }, { id: '', workspaceId: s.team.id, provider: 'gitea', host: giteaHost,
-    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '' });
+    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '', forbidDefaultBranchPush: false });
   assert.deepEqual((await json<{ repositories: WorkspaceRepository[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/repositories`))).repositories, [s.repository]);
   const session = await s.start();
   const pin = session.repositories![0];
@@ -1120,6 +1120,30 @@ test('connectors without gitProviders refuse provider sessions before any provid
   assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
   assert.equal(s.provisions.length, 0);
   assert.equal(s.remote.calls.length, 0);
+});
+
+test('agents with git_push need a connector that claims gitPush, checked again inside the session insert', async t => {
+  const s = await providerSetup(t);
+  const { models } = await json<{ models: ModelDefinition[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/models`));
+  const { agent: draft } = await json<{ agent: AgentVersion }>(await s.host.request('POST', '/api/agents', {
+    name: 'Pushing agent', description: '', instructions: '', tools: ['identity', 'git_push'], modelId: models[0].id,
+  }), 201);
+  const { agent } = await json<{ agent: AgentVersion }>(await s.host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: s.team.id }), 201);
+  const input = { ...s.input, agentVersionId: agent.id };
+  const body = await json<{ code: string; error: string }>(await s.owner.request('POST', '/api/sessions', input), 409);
+  assert.deepEqual(body, { code: 'connector_update_required', error: 'Update the host\'s connector (npx pistead@latest connect) to use git_push.' });
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  assert.equal(s.provisions.length, 0);
+  assert.equal(s.remote.calls.length, 0);
+
+  s.f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_set(capabilities_json, '$.gitPush', json('true')) WHERE id = ?").run(s.connector.connectorId);
+  beforeStatement(t, s.f, /^INSERT INTO sessions\b/, () => {
+    s.f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_remove(capabilities_json, '$.gitPush') WHERE id = ?").run(s.connector.connectorId);
+  });
+  await denied(await s.owner.request('POST', '/api/sessions', input), 409, 'session_configuration_changed');
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
+  // Agents without git_push are unaffected by the missing capability.
+  assert.equal((await s.start()).status, 'ready');
 });
 
 for (const change of ['token-rotated', 'token-deleted', 'account-reassigned', 'connector-downgraded'] as const) {

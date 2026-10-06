@@ -1,5 +1,5 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { permissions, type ApprovalRecord, type Operation, type Permission, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { permissions, type ApprovalRecord, type GitPushOperation, type Operation, type Permission, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
@@ -130,11 +130,21 @@ export function SessionPanel(props: PanelProps) {
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   return <article className="approval-card card">
     <div className="approval-head"><span className="approval-kind">{approval.operation.kind}</span><span className="spacer" /><ApprovalStatus approval={approval} /></div>
+    {approval.operation.kind === "git.push" && <GitPushSummary operation={approval.operation} />}
     <pre>{JSON.stringify(approval.operation, null, 2)}</pre>
     <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : approval.decidedBy && <> · Decision by {approval.decidedBy}</>}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
   </article>;
+}
+
+function GitPushSummary({ operation }: { operation: GitPushOperation }) {
+  return <dl className="small">
+    <dt className="muted">Repository</dt><dd><code>{operation.repository}</code></dd>
+    <dt className="muted">Branch</dt><dd><code>{operation.branch}</code></dd>
+    <dt className="muted">Commit</dt><dd><code title={operation.commit}>{operation.commit.slice(0, 12)}</code></dd>
+    {operation.pullRequest && <><dt className="muted">Pull request</dt><dd>{operation.pullRequest.title}{operation.pullRequest.base ? <> → <code>{operation.pullRequest.base}</code></> : " → default branch"}</dd></>}
+  </dl>;
 }
 
 function PanelDetails({ session, view, user, hosts, refresh, audit, actions, openSession }: PanelProps) {
@@ -321,10 +331,12 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
   </Section>;
 }
 
+type ManualKind = "git.commit" | "bash" | "github.comment";
+
 function OperationSection({ session, changed }: { session: SessionRecord; changed: () => void }) {
   const form = useAction();
   const [approval, setApproval] = useState<Pick<ApprovalRecord, "id" | "status"> | null>(null);
-  const [kind, setKind] = useState<Operation["kind"]>("git.commit");
+  const [kind, setKind] = useState<ManualKind>("git.commit");
   const [message, setMessage] = useState("");
   const [command, setCommand] = useState("");
   const [repository, setRepository] = useState("");
@@ -353,7 +365,7 @@ function OperationSection({ session, changed }: { session: SessionRecord; change
       <form onSubmit={requestOperation}>
         <fieldset disabled={form.busy} className="stack">
           <Field label="Operation">
-            <select className="select" value={kind} onChange={event => setKind(event.target.value as Operation["kind"])}>
+            <select className="select" value={kind} onChange={event => setKind(event.target.value as ManualKind)}>
               <option value="git.commit">Git commit</option><option value="bash">Bash command</option><option value="github.comment">GitHub comment</option>
             </select>
           </Field>
