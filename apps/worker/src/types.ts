@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import type { Permission, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
+import type { Permission, PushIdentityKind, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
 import type { GitProvider, TokenGitProvider } from '../../../packages/shared/src/repositories';
 
 export interface Env {
@@ -18,6 +18,12 @@ export interface Env {
   TEST_AUTH_ENABLED?: string;
   TEST_AUTH_SECRET?: string;
   TEST_AUTH_EXPIRES_AT?: string;
+  /** Operator GitHub App for github.com pushes: numeric app id, URL slug, and RSA private key (PEM, PKCS#1 or PKCS#8; secret). */
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_SLUG?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
+  /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
+  OIDC_SIGNING_KEY?: string;
 }
 export interface AuthIdentity {
   userId: string;
@@ -62,6 +68,17 @@ export interface RepositoryRow {
 export interface GitCredentialRow {
   id: string; user_id: string; provider: TokenGitProvider; host: string; organization: string; username: string | null;
   login: string; ciphertext: string; created_at: string; updated_at: string;
+}
+export interface PushIdentityRow {
+  id: string; workspace_id: string; provider: GitProvider; host: string; scope: string; kind: PushIdentityKind;
+  config_json: string; secret_ciphertext: string | null; status: 'ready' | 'authorization_required'; lease_until: number | null;
+  created_by: string; created_at: string; updated_at: string;
+}
+export interface PushCredentialRow {
+  id: string; session_id: string; approval_id: string; requested_by: string; identity_id: string | null; kind: string;
+  binding_id: string; operation_json: string; automatic: number; revocation_ciphertext: string | null; expires_at: number;
+  created_at: string; completed_at: string | null; outcome: 'pushed' | 'up-to-date' | 'failed' | null; tip: string | null;
+  pull_request_url: string | null;
 }
 export interface SessionAccess { row: SessionRow; permissions: Permission[] }
 export type PublicProfile = UserProfile;

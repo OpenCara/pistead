@@ -14,7 +14,7 @@ import type { AuthorizationRequest, AuthorizationResult, RunnerAction, RunnerBin
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
-import { assertId, ConnectorSetupError, verifyRunnerTicket } from "./protocol.js";
+import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
 import { recoverResourceOrphans } from "./resources.js";
 import { RunnerService, createRunnerApp } from "./server.js";
 import type { RunnerConfig } from "./session.js";
@@ -163,8 +163,8 @@ function capabilities(value?: ConnectorCapabilities, unsandboxed = false): Conne
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
   // The host mode, not caller-supplied metadata, decides whether isolation is disclosed as absent.
   // Every connector of this version applies per-message model, reasoning and access choices.
-  if (unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true };
+  if (unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true };
 }
 
 export async function claimConnectorPairing(options: {
@@ -412,6 +412,31 @@ export class LocalConnector {
             id: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
           }).strict().parse(await this.callback(generation, "/api/connectors/self/github/comment", payload));
         },
+        // Minting can take several upstream calls, so push callbacks get the full RPC budget.
+        pushCredential: async request => {
+          const payload = {
+            sessionId: request.sessionId, approvalId: request.approvalId, actorId: request.actorId, operation: request.operation,
+            ...(request.capability !== undefined ? { capability: request.capability } : {}),
+            ...(request.admissionId !== undefined ? { admissionId: request.admissionId } : {}),
+          };
+          return z.object({
+            credentialId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+            remote: z.string().max(2048).regex(/^https:\/\/[^/@\s]+\/\S*$/),
+            authorization: z.string().regex(/^(Basic|Bearer) [A-Za-z0-9+/=._~-]{1,8000}$/),
+            expiresAt: z.string().datetime(),
+          }).strict().parse(await this.pushCallback(generation, "/api/connectors/self/git/push/credential", payload));
+        },
+        pushComplete: async request => {
+          const payload = {
+            sessionId: request.sessionId, approvalId: request.approvalId, credentialId: request.credentialId, outcome: request.outcome,
+            ...(request.tip !== undefined ? { tip: request.tip } : {}),
+          };
+          return z.object({
+            pullRequest: z.object({
+              url: z.string().max(2048).regex(/^https:\/\/\S+$/), number: z.number().int().positive(), created: z.boolean(),
+            }).strict().optional(),
+          }).strict().parse(await this.pushCallback(generation, "/api/connectors/self/git/push/complete", payload));
+        },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
         readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
       };
@@ -467,6 +492,28 @@ export class LocalConnector {
     const bytes = await boundedBody(response, CALLBACK_LIMIT, AbortSignal.any([generation.abort.signal, AbortSignal.timeout(15_000)]));
     this.requireGeneration(generation);
     return bytes.length ? decodeJson(bytes) : undefined;
+  }
+
+  /**
+   * Push callbacks pass the control plane's refusal on: its messages are fixed, credential-free and actionable
+   * (e.g. which push identity to set up). Minting can take several upstream calls, so they get the full RPC budget.
+   */
+  private async pushCallback(generation: Generation, path: string, body: unknown): Promise<unknown> {
+    this.requireGeneration(generation);
+    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(RPC_TIMEOUT)]);
+    const response = await (this.options.fetch ?? fetch)(`${this.state!.controlPlaneUrl}${path}`, {
+      method: "POST", redirect: "error", credentials: "omit",
+      headers: { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken!, "content-type": "application/json" },
+      body: JSON.stringify(body), signal,
+    });
+    const bytes = await boundedBody(response, CALLBACK_LIMIT, signal);
+    this.requireGeneration(generation);
+    const value = bytes.length ? decodeJson(bytes) : undefined;
+    if (!response.ok) {
+      const error = value && typeof value === "object" && "error" in value ? value.error : undefined;
+      throw new RunnerError(response.status, typeof error === "string" && /^[\x20-\x7e\u00a0-\uffff]{1,500}$/.test(error) ? error : "Scoped connector callback denied or unavailable");
+    }
+    return value;
   }
 
   private async authorize(generation: Generation, request: AuthorizationRequest): Promise<AuthorizationResult> {

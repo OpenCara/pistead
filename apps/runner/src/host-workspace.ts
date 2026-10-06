@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats, type Stats } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { crc32, inflateRawSync } from "node:zlib";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
+import type { PushPreparation } from "./push.js";
 import {
   MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, ownerGitConfig, pinOwnerConfig, repositoryPins, sessionEnvironment, text,
   type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
@@ -17,10 +18,16 @@ const CACHE_MARKER = "repository-cache.json";
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const queues = new Map<string, Promise<void>>();
+const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
+const PUSH_CAPTURE_BYTES = 64 * 1024 * 1024;
+const PUSH_ID = /^[0-9a-f]{32}$/;
+const OID = /^[0-9a-f]{40}$/;
+const ZERO = "0".repeat(40);
 
 type Captured = { code: number | null; stdout: string; stderr: string };
 type ArchiveNode = "file" | "directory";
 type ArchiveFile = { path: string[]; body: Buffer; mode: number };
+type PushProcess = { stdout: AsyncIterable<Buffer>; done: Promise<{ code: number | null; stdout: Buffer }>; kill: () => void };
 
 /**
  * Owner-consented host mode for macOS or Linux without bubblewrap. It runs as the
@@ -40,6 +47,7 @@ export class HostWorkspace {
   #ready = false;
   #closed = false;
   #cancelActive: (() => void) | undefined;
+  readonly #pushStreams = new Map<string, () => void>();
 
   constructor(binding: RunnerBinding, root: string) {
     if (!["linux", "darwin"].includes(process.platform) || !isAbsolute(root) || resolve(root) === sep) {
@@ -207,6 +215,191 @@ export class HostWorkspace {
     }
     const byPath = new Map(repositories.map((repository, index) => [repository.path, Buffer.from(archives[index]!)]));
     await this.#operation(authorize, () => this.#materialize(this.#repositories.map((repository) => byPath.get(repository.path)!)));
+  }
+
+  head(authorize: SandboxAuthorize): Promise<string> {
+    return this.#operation(authorize, async () => {
+      await this.#requireCache();
+      const head = (await this.#git(["rev-parse", "--verify", "HEAD"])).stdout.trim();
+      if (!OID.test(head)) throw hostError("session HEAD is not a commit");
+      return head;
+    });
+  }
+
+  /** Rewrites session commits under `path` onto the upstream `base` in a scratch repository (see PushWorkspace). */
+  pushPrepare(id: string, input: { path: string; base: string; commit: string }, pack: AsyncIterable<Uint8Array>, authorize: SandboxAuthorize): Promise<PushPreparation> {
+    const directory = this.#pushDirectory(id);
+    const { path, base, commit } = input;
+    if (!this.#repositories.some(repository => repository.path === path) || !OID.test(base) || !OID.test(commit)) return Promise.reject(hostError("invalid push request"));
+    return this.#operation(authorize, async () => {
+      await this.#requireCache();
+      const gitDirectory = join(this.worktree, ".git");
+      const scratch = join(gitDirectory, "pistead-push");
+      await mkdir(scratch, { mode: 0o700 }).catch(error => { if (errorCode(error) !== "EEXIST") throw error; });
+      if (!(await lstat(scratch)).isDirectory()) throw hostError("push scratch directory is unsafe");
+      await mkdir(directory, { mode: 0o700 });
+      for (const name of ["objects/info", "objects/pack", "refs/heads", "refs/tags"]) await mkdir(join(directory, name), { recursive: true, mode: 0o700 });
+      await writeFile(join(directory, "HEAD"), "ref: refs/heads/main\n", { flag: "wx", mode: 0o600 });
+      await writeFile(join(directory, "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = true\n", { flag: "wx", mode: 0o600 });
+      await writeFile(join(directory, "objects/info/alternates"), `${join(gitDirectory, "objects")}\n`, { flag: "wx", mode: 0o600 });
+      const git = async (args: string[], stdin?: Buffer | AsyncIterable<Uint8Array>, env?: Record<string, string>) => {
+        const result = await this.#pushSpawn(directory, args, stdin, env).done;
+        if (result.code !== 0) throw hostError("push rewrite failed");
+        return result.stdout;
+      };
+      await git(["index-pack", "--stdin", "--fix-thin"], pack);
+      if ((await this.#pushSpawn(directory, ["cat-file", "-t", base]).done).stdout.toString().trim() !== "commit") throw hostError("pinned commit is missing from the upstream pack");
+      await writeFile(join(directory, "shallow"), `${base}\n`, { flag: "wx", mode: 0o600 });
+      const marker: unknown = JSON.parse(new TextDecoder().decode((await readAt(gitDirectory, CACHE_MARKER, 65536)).data));
+      const baseline = marker && typeof marker === "object" && "baseline" in marker ? marker.baseline : undefined;
+      if (typeof baseline !== "string" || !OID.test(baseline)) throw hostError("invalid repository cache baseline");
+      if ((await this.#pushSpawn(directory, ["cat-file", "-t", commit]).done).stdout.toString().trim() !== "commit"
+        || (await this.#pushSpawn(directory, ["merge-base", "--is-ancestor", baseline, commit]).done).code !== 0) throw hostError("push commit is not a session commit");
+      const sources = (await git(["rev-list", "--reverse", "--first-parent", `${baseline}..${commit}`])).toString().split("\n").filter(Boolean);
+      await git(["read-tree", `${base}^{tree}`]);
+      let previous = base;
+      let previousTree = (await git(["rev-parse", `${base}^{tree}`])).toString().trim();
+      const prefix = new TextEncoder().encode(`${path}/`);
+      const commits: PushPreparation["commits"] = [];
+      for (const source of sources) {
+        if (!OID.test(source)) throw hostError("push rewrite failed");
+        const fields = splitNul(await git(["diff-tree", "-r", "-z", "--raw", "--no-renames", "--full-index", `${source}^1`, source, "--", `${path}/`]));
+        const records: Buffer[] = [];
+        for (let index = 0; index + 1 < fields.length && fields[index]!.length; index += 2) {
+          const meta = new TextDecoder("latin1").decode(fields[index]!).slice(1).split(" ");
+          const name = fields[index + 1]!;
+          if (meta.length !== 5 || !prefix.every((byte, offset) => name[offset] === byte) || name.length === prefix.length) throw hostError("push rewrite failed");
+          const relative = name.subarray(prefix.length);
+          records.push(Buffer.from(meta[4] === "D" ? `0 ${ZERO}\t` : `${meta[1]} ${meta[3]}\t`), relative, Buffer.from([0]));
+        }
+        if (records.length) await git(["update-index", "-z", "--replace", "--index-info"], Buffer.concat(records));
+        const tree = (await git(["write-tree", "--missing-ok"])).toString().trim();
+        if (tree === previousTree) continue;
+        const raw = await git(["cat-file", "commit", source]);
+        const split = raw.findIndex((byte, offset) => byte === 10 && raw[offset + 1] === 10);
+        const header = new TextDecoder().decode(split < 0 ? raw : raw.subarray(0, split)).split("\n");
+        const message = split < 0 ? Buffer.alloc(0) : raw.subarray(split + 2);
+        const ident = (kind: "author" | "committer") => {
+          const match = header.map(line => new RegExp(`^${kind} (.*) <([^<>]*)> ([0-9]+) ([+-][0-9]{4})$`).exec(line)).find(Boolean);
+          if (!match) throw hostError("push rewrite failed");
+          return { name: match[1]!, email: match[2]!, date: `@${match[3]} ${match[4]}` };
+        };
+        const author = ident("author"), committer = ident("committer");
+        const rewritten = (await git(["commit-tree", tree, "-p", previous], message, {
+          GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email, GIT_AUTHOR_DATE: author.date,
+          GIT_COMMITTER_NAME: committer.name, GIT_COMMITTER_EMAIL: committer.email, GIT_COMMITTER_DATE: committer.date,
+        })).toString().trim();
+        if (!OID.test(rewritten)) throw hostError("push rewrite failed");
+        commits.push({ source, rewritten, subject: new TextDecoder().decode(message).split("\n", 1)[0]!.slice(0, 200) });
+        previous = rewritten;
+        previousTree = tree;
+      }
+      if (!commits.length) throw hostError("session commits do not change the repository");
+      return { tip: previous, base, commits };
+    });
+  }
+
+  /** Streams the pack of `tip` minus `exclude` from the scratch repository; the session queue is held until it ends. */
+  async pushPack(id: string, input: { tip: string; exclude: string[] }, authorize: SandboxAuthorize): Promise<AsyncIterable<Uint8Array>> {
+    const directory = this.#pushDirectory(id);
+    if (!OID.test(input.tip) || !Array.isArray(input.exclude) || input.exclude.length > 16 || !input.exclude.every(oid => OID.test(oid))) throw hostError("invalid push request");
+    const started = Promise.withResolvers<PushProcess>();
+    const finished = this.#operation(authorize, async () => {
+      if (!(await lstat(directory)).isDirectory()) throw hostError("push scratch directory is unsafe");
+      const pack = this.#pushSpawn(directory, ["-c", "core.bigFileThreshold=64m", "pack-objects", "--stdout", "--revs", "--delta-base-offset", "-q"],
+        Buffer.from(`${input.tip}\n${input.exclude.map(oid => `^${oid}\n`).join("")}`), undefined, true);
+      this.#pushStreams.set(id, pack.kill);
+      started.resolve(pack);
+      try {
+        if ((await pack.done).code !== 0) throw hostError("push pack failed");
+      } finally { this.#pushStreams.delete(id); }
+    });
+    finished.catch(error => started.reject(error));
+    const pack = await started.promise;
+    return (async function* () {
+      let complete = false;
+      try {
+        for await (const chunk of pack.stdout) yield chunk;
+        await finished;
+        complete = true;
+      } finally {
+        if (!complete) { pack.kill(); await finished.catch(() => undefined); }
+      }
+    })();
+  }
+
+  async pushCleanup(id: string): Promise<void> {
+    const directory = this.#pushDirectory(id);
+    this.#pushStreams.get(id)?.();
+    await this.#exclusive(async () => {
+      const scratch = join(this.worktree, ".git", "pistead-push");
+      if (!await exists(scratch)) return;
+      if (!(await lstat(scratch)).isDirectory()) throw hostError("push scratch directory is unsafe");
+      await rm(directory, { recursive: true, force: true });
+    });
+  }
+
+  #pushDirectory(id: string): string {
+    if (typeof id !== "string" || !PUSH_ID.test(id)) throw hostError("invalid push id");
+    return join(this.worktree, ".git", "pistead-push", id);
+  }
+
+  /** Git in a scratch push repository: clean config, the same hardening flags, no output cap when streaming. */
+  #pushSpawn(directory: string, args: string[], input?: Buffer | AsyncIterable<Uint8Array>, env: Record<string, string> = {}, stream = false): PushProcess {
+    const child = spawn("git", ["--no-pager", "--literal-pathspecs",
+      "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+      "-c", "core.attributesFile=/dev/null", "-c", "core.sshCommand=/usr/bin/false",
+      "-c", "credential.helper=", "-c", "commit.gpgSign=false",
+      "-c", "tag.gpgSign=false", "-c", "protocol.allow=never",
+      "-c", "core.pager=cat", "-c", "core.editor=/usr/bin/false",
+      "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+      "-c", "core.preloadIndex=false", "-c", "index.threads=1",
+      "-c", `safe.directory=${directory}`, `--git-dir=${directory}`, ...args], {
+      cwd: directory, detached: true, stdio: ["pipe", "pipe", "pipe"],
+      env: { ...this.#environment, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_INDEX_FILE: join(directory, "pistead-index"), ...env },
+    });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let failure: unknown;
+    const kill = () => {
+      if (!child.pid) return;
+      try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (errorCode(error) !== "ESRCH") child.kill("SIGKILL"); }
+    };
+    const cancel = () => { failure ??= hostError("push was cancelled"); kill(); };
+    this.#cancelActive = cancel;
+    const timer = setTimeout(() => { failure ??= hostError("push exceeded its time limit"); kill(); }, PUSH_TIMEOUT_MS);
+    if (!stream) {
+      child.stdout.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > PUSH_CAPTURE_BYTES) { failure ??= hostError("push output exceeds its limit"); kill(); } else chunks.push(chunk);
+      });
+    }
+    child.stderr.resume();
+    child.stdin.on("error", () => { /* Early exit closes stdin; the exit status is authoritative. */ });
+    const { promise: done, resolve: resolveResult, reject } = Promise.withResolvers<{ code: number | null; stdout: Buffer }>();
+    child.once("error", () => { clearTimeout(timer); reject(hostError("cannot start git")); });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (this.#cancelActive === cancel) this.#cancelActive = undefined;
+      if (failure || signal) reject(failure ?? hostError("push rewrite failed"));
+      else resolveResult({ code, stdout: Buffer.concat(chunks) });
+    });
+    if (input === undefined || Buffer.isBuffer(input)) child.stdin.end(input ?? "");
+    else {
+      void (async () => {
+        for await (const chunk of input) {
+          if (child.stdin.destroyed) break;
+          if (!child.stdin.write(chunk)) {
+            const { promise, resolve: next } = Promise.withResolvers<void>();
+            child.stdin.once("drain", next);
+            child.stdin.once("close", next);
+            await promise;
+          }
+        }
+        child.stdin.end();
+      })().catch(error => { failure ??= error; kill(); });
+    }
+    return { stdout: child.stdout, done, kill: cancel };
   }
 
   async close(): Promise<void> {
@@ -778,4 +971,12 @@ function parseArchive(data: Buffer, budget: number, destination: string): { file
     files.push({ path, body: file.body, mode: file.mode });
   }
   return { files, nodes, count: Math.max(entries, nodes.size), copied };
+}
+
+function splitNul(data: Buffer): Buffer[] {
+  const fields: Buffer[] = [];
+  let start = 0;
+  for (let end = data.indexOf(0); end >= 0; start = end + 1, end = data.indexOf(0, start)) fields.push(data.subarray(start, end));
+  if (start < data.length) fields.push(data.subarray(start));
+  return fields;
 }

@@ -9,11 +9,11 @@ import { Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState,
 const tokenProviders = gitProviders.filter((provider): provider is TokenGitProvider => provider !== "github");
 
 const tokenScopes: Record<TokenGitProvider, string> = {
-  "github-enterprise": "Fine-grained: Contents and Metadata read (or classic repo)",
-  gitlab: "read_api and read_repository",
-  bitbucket: "API token with read:repository:bitbucket and read:user:bitbucket (enter your Atlassian email above), or a workspace/repository access token with repository read",
-  "azure-devops": "Code (Read)",
-  gitea: "read:repository and read:user",
+  "github-enterprise": "Fine-grained: Contents and Metadata read (or classic repo); opening pull requests needs Pull requests write (or classic repo)",
+  gitlab: "read_api and read_repository; opening merge requests needs api",
+  bitbucket: "API token with read:repository:bitbucket and read:user:bitbucket (enter your Atlassian email above), or a workspace/repository access token with repository read; opening pull requests needs pullrequest:write",
+  "azure-devops": "Code (Read); opening pull requests needs Code (Read & write)",
+  gitea: "read:repository and read:user; opening pull requests needs write:repository",
 };
 
 /** Profile section listing the GitHub sign-in account and personal-access-token accounts for other Git providers. */

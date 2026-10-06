@@ -43,7 +43,9 @@ user with access to your files, credentials and network, and no resource limits.
 Session repositories are pinned into private session caches, not your current folder.
 GitLab, Azure DevOps, Bitbucket, Gitea/Forgejo and GitHub Enterprise repositories are
 connected in the web app (Settings > Profile > Git accounts) with personal access tokens;
-the connector receives pinned snapshots only, never those tokens.
+the connector receives pinned snapshots only, never those tokens. Approved git_push
+operations use a short-lived token minted for that push, held only in connector memory
+and sent only to the repository's Git host; the sandbox never sees it.
 Production bash additionally requires verified per-session aggregate cgroups and a
 bounded private filesystem;
 --resources does not provision these. Missing resource limits never enable host shell.

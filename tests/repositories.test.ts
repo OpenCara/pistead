@@ -1081,7 +1081,7 @@ test('account input is validated before any provider request and rejected tokens
 test('token-provider bindings and session pins use each actor\'s own account and the exact provider pin shape', async t => {
   const s = await providerSetup(t);
   assert.deepEqual({ ...s.repository, id: '', createdAt: '' }, { id: '', workspaceId: s.team.id, provider: 'gitea', host: giteaHost,
-    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '' });
+    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '', forbidDefaultBranchPush: false });
   assert.deepEqual((await json<{ repositories: WorkspaceRepository[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/repositories`))).repositories, [s.repository]);
   const session = await s.start();
   const pin = session.repositories![0];

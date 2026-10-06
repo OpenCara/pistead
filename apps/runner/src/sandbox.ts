@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
@@ -7,9 +8,14 @@ import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryPinIdentity } from "./protocol.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
+import type { PushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 
 export const TIMEOUT_MS = 30_000;
+/** Push rewrites and packs move whole repositories; only push kinds get this deadline. */
+const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
+const PUSH_ID = /^[0-9a-f]{32}$/;
+const OID = /^[0-9a-f]{40}$/;
 export const MAX_FILE_BYTES = 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
@@ -69,14 +75,21 @@ type Request =
   | { kind: "write"; path: string; content: string }
   | { kind: "status" | "snapshot" }
   | { kind: "commit"; message: string }
-  | { kind: "bash"; command: string };
+  | { kind: "bash"; command: string }
+  | { kind: "head" }
+  | { kind: "push-prepare"; id: string; path: string; base: string; commit: string }
+  | { kind: "push-pack"; id: string; tip: string; exclude: string[] }
+  | { kind: "push-cleanup"; id: string };
+
+/** Push transfers: a pack streamed after the request line, or stdout handed over uncapped. */
+interface Transfer { input?: AsyncIterable<Uint8Array>; output?: (stdout: Readable, kill: () => void) => void }
 
 /* All untrusted filesystem access happens here, after entering the namespace.
  * realpath is only a policy check: actual opens walk pinned directory descriptors
  * with O_NOFOLLOW, so swapping a checked parent for a symlink cannot win a race.
  */
 const HELPER = String.raw`
-import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, stat, subprocess, sys, zlib
+import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, shutil, stat, subprocess, sys, zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -88,12 +101,22 @@ for fd_name in os.listdir('/proc/self/fd'):
         except OSError:
             pass
 os.umask(0o077)
-# These remain defense in depth for fixed helpers/test fixtures, NOT session quotas.
-resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-resource.setrlimit(resource.RLIMIT_CPU, (25, 25))
-resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
-resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+PUSH_KINDS = ('push-prepare', 'push-pack')
+
+
+def limits(kind):
+    # These remain defense in depth for fixed helpers/test fixtures, NOT session quotas.
+    # Push rewrites and packs handle whole repositories, so only they get larger bounds.
+    push = kind in PUSH_KINDS
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600) if push else (25, 25))
+    size = (16 if push else 1 / 16) * 1024 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_FSIZE, (int(size), int(size)))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+    memory = (4096 if push else 512) * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+
+
 HOME = os.environ['HOME']
 WORK = os.environ['SANDBOX_WORKTREE']
 MAX_FILE = 1024 * 1024
@@ -589,17 +612,18 @@ def write_at(root, parts, content):
         os.close(parent)
 
 
-GIT = ['/usr/bin/git', '--no-pager',
-       '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
-       '-c', 'core.attributesFile=/dev/null', '-c', 'core.sshCommand=/usr/bin/false',
-       '-c', 'credential.helper=', '-c', 'commit.gpgSign=false',
-       '-c', 'tag.gpgSign=false', '-c', 'protocol.allow=never',
-       '-c', 'core.pager=cat', '-c', 'core.editor=/usr/bin/false',
-       '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
-       '-c', 'core.preloadIndex=false', '-c', 'index.threads=1',
-       '-c', 'core.worktree=' + WORK, '-c', 'safe.directory=' + WORK,
-       '-c', 'user.name=' + os.environ['GIT_AUTHOR_NAME'],
-       '-c', 'user.email=' + os.environ['GIT_AUTHOR_EMAIL']]
+# Hardening shared by every Git invocation; session commands add the worktree and owner identity below.
+GIT_HARDENED = ['/usr/bin/git', '--no-pager',
+                '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+                '-c', 'core.attributesFile=/dev/null', '-c', 'core.sshCommand=/usr/bin/false',
+                '-c', 'credential.helper=', '-c', 'commit.gpgSign=false',
+                '-c', 'tag.gpgSign=false', '-c', 'protocol.allow=never',
+                '-c', 'core.pager=cat', '-c', 'core.editor=/usr/bin/false',
+                '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
+                '-c', 'core.preloadIndex=false', '-c', 'index.threads=1']
+GIT = GIT_HARDENED + ['-c', 'core.worktree=' + WORK, '-c', 'safe.directory=' + WORK,
+                      '-c', 'user.name=' + os.environ['GIT_AUTHOR_NAME'],
+                      '-c', 'user.email=' + os.environ['GIT_AUTHOR_EMAIL']]
 
 
 def run(argv, data=None):
@@ -658,9 +682,163 @@ def snapshot():
         os.close(home)
 
 
+OID = re.compile('[0-9a-f]{40}')
+ZERO_OID = '0' * 40
+
+
+def push_directory(request):
+    push_id = request['id']
+    if not isinstance(push_id, str) or not re.fullmatch('[0-9a-f]{32}', push_id):
+        raise ValueError('invalid push id')
+    return os.path.join(WORK, '.git', 'pistead-push'), os.path.join(WORK, '.git', 'pistead-push', push_id)
+
+
+def push_spawn(directory, arguments, stdout=subprocess.PIPE, extra=None):
+    # Scratch repositories get a clean config and the same hardening flags; never the session config.
+    env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
+               GIT_INDEX_FILE=os.path.join(directory, 'pistead-index'))
+    env.update(extra or {})
+    argv = GIT_HARDENED + ['--literal-pathspecs', '-c', 'safe.directory=' + directory, '--git-dir=' + directory] + arguments
+    return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL,
+                            cwd=directory, env=env, close_fds=True)
+
+
+def push_git(directory, arguments, data=b'', extra=None, success=True):
+    child = push_spawn(directory, arguments, extra=extra)
+    output, _ = child.communicate(data)
+    if success and child.returncode:
+        raise ValueError('push rewrite failed')
+    return output if success else (child.returncode, output)
+
+
+def push_prepare(request, git):
+    path, base, commit = request['path'], request['base'], request['commit']
+    if (not any(repository['path'] == path for repository in request['expectedRepositories'])
+            or not isinstance(base, str) or not OID.fullmatch(base) or not isinstance(commit, str) or not OID.fullmatch(commit)):
+        raise ValueError('invalid push request')
+    scratch, directory = push_directory(request)
+    try:
+        os.mkdir(scratch, 0o700)
+    except FileExistsError:
+        pass
+    if not stat.S_ISDIR(os.lstat(scratch).st_mode):
+        raise ValueError('push scratch directory is unsafe')
+    os.mkdir(directory, 0o700)
+    for name in ('objects/info', 'objects/pack', 'refs/heads', 'refs/tags'):
+        os.makedirs(os.path.join(directory, name), 0o700)
+    for name, content in (('HEAD', 'ref: refs/heads/main\n'),
+                          ('config', '[core]\n\trepositoryformatversion = 0\n\tbare = true\n'),
+                          ('objects/info/alternates', os.path.join(WORK, '.git', 'objects') + '\n')):
+        with open(os.path.join(directory, name), 'x', encoding='utf-8') as stream:
+            stream.write(content)
+    # The upstream pack follows the request line on stdin.
+    child = push_spawn(directory, ['index-pack', '--stdin', '--fix-thin'], stdout=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read1(65536)
+            if not chunk:
+                break
+            child.stdin.write(chunk)
+        child.stdin.close()
+    except BrokenPipeError:
+        pass
+    if child.wait():
+        raise ValueError('upstream pack could not be indexed')
+    if push_git(directory, ['cat-file', '-t', base], success=False)[1].strip() != b'commit':
+        raise ValueError('pinned commit is missing from the upstream pack')
+    with open(os.path.join(directory, 'shallow'), 'x', encoding='ascii') as stream:
+        stream.write(base + '\n')
+    raw, _ = read_at(git, CACHE_MARKER, 65536)
+    baseline = json.loads(raw).get('baseline')
+    if not isinstance(baseline, str) or not OID.fullmatch(baseline):
+        raise ValueError('invalid repository cache baseline')
+    if (push_git(directory, ['cat-file', '-t', commit], success=False)[1].strip() != b'commit'
+            or push_git(directory, ['merge-base', '--is-ancestor', baseline, commit], success=False)[0]):
+        raise ValueError('push commit is not a session commit')
+    sources = push_git(directory, ['rev-list', '--reverse', '--first-parent', baseline + '..' + commit]).decode('ascii').split()
+    push_git(directory, ['read-tree', base + '^{tree}'])
+    previous = base
+    previous_tree = push_git(directory, ['rev-parse', base + '^{tree}']).strip()
+    prefix = path.encode('utf-8') + b'/'
+    commits = []
+    for source in sources:
+        if not OID.fullmatch(source):
+            raise ValueError('push rewrite failed')
+        fields = push_git(directory, ['diff-tree', '-r', '-z', '--raw', '--no-renames', '--full-index',
+                                      source + '^1', source, '--', path + '/']).split(b'\0')
+        records, index = [], 0
+        while index + 1 < len(fields) and fields[index]:
+            meta, name = fields[index][1:].split(b' '), fields[index + 1]
+            index += 2
+            if len(meta) != 5 or not name.startswith(prefix) or name == prefix:
+                raise ValueError('push rewrite failed')
+            entry = b'0 ' + ZERO_OID.encode('ascii') if meta[4] == b'D' else meta[1] + b' ' + meta[3]
+            records.append(entry + b'\t' + name[len(prefix):] + b'\0')
+        if records:
+            push_git(directory, ['update-index', '-z', '--replace', '--index-info'], b''.join(records))
+        tree = push_git(directory, ['write-tree', '--missing-ok']).strip()
+        if tree == previous_tree:
+            continue
+        header, separator, message = push_git(directory, ['cat-file', 'commit', source]).partition(b'\n\n')
+        identities = {}
+        for line in header.split(b'\n'):
+            match = re.fullmatch(rb'(author|committer) (.*) <([^<>]*)> ([0-9]+) ([+-][0-9]{4})', line)
+            if match and match.group(1) not in identities:
+                identities[match.group(1)] = match
+        if set(identities) != {b'author', b'committer'}:
+            raise ValueError('push rewrite failed')
+        extra = {}
+        for kind, label in ((b'author', 'AUTHOR'), (b'committer', 'COMMITTER')):
+            match = identities[kind]
+            extra['GIT_' + label + '_NAME'] = os.fsdecode(match.group(2))
+            extra['GIT_' + label + '_EMAIL'] = os.fsdecode(match.group(3))
+            extra['GIT_' + label + '_DATE'] = '@' + match.group(4).decode('ascii') + ' ' + match.group(5).decode('ascii')
+        rewritten = push_git(directory, ['commit-tree', tree.decode('ascii'), '-p', previous], message, extra).decode('ascii').strip()
+        if not OID.fullmatch(rewritten):
+            raise ValueError('push rewrite failed')
+        commits.append({'source': source, 'rewritten': rewritten,
+                        'subject': message.split(b'\n', 1)[0].decode('utf-8', 'replace')[:200]})
+        previous, previous_tree = rewritten, tree
+    if not commits:
+        raise ValueError('session commits do not change the repository')
+    return {'tip': previous, 'base': base, 'commits': commits}
+
+
+def push_pack(request):
+    _, directory = push_directory(request)
+    tip, exclude = request['tip'], request['exclude']
+    if (not isinstance(tip, str) or not OID.fullmatch(tip) or not isinstance(exclude, list) or len(exclude) > 16
+            or not all(isinstance(oid, str) and OID.fullmatch(oid) for oid in exclude)):
+        raise ValueError('invalid push request')
+    if not stat.S_ISDIR(os.lstat(directory).st_mode):
+        raise ValueError('push scratch directory is unsafe')
+    sys.stdout.flush()
+    # The pack streams straight to the runner on the helper's stdout.
+    child = push_spawn(directory, ['-c', 'core.bigFileThreshold=64m', 'pack-objects', '--stdout', '--revs',
+                                   '--delta-base-offset', '-q'], stdout=None)
+    child.communicate((tip + '\n' + ''.join('^' + oid + '\n' for oid in exclude)).encode('ascii'))
+    if child.returncode:
+        raise ValueError('push pack failed')
+
+
+def push_cleanup(request):
+    scratch, directory = push_directory(request)
+    try:
+        if not stat.S_ISDIR(os.lstat(scratch).st_mode):
+            raise ValueError('push scratch directory is unsafe')
+    except FileNotFoundError:
+        return
+    try:
+        shutil.rmtree(directory)
+    except FileNotFoundError:
+        pass
+
+
 def main():
-    request = json.load(sys.stdin)
+    # One JSON line; push-prepare streams the upstream pack after it.
+    request = json.loads(sys.stdin.buffer.readline())
     kind = request['kind']
+    limits(kind)
     repositories = request['expectedRepositories']
     if kind == 'initialize':
         try:
@@ -694,11 +872,23 @@ def main():
                 return
             if not ready:
                 raise ValueError('repository cache is not prepared')
+        if kind == 'push-prepare':
+            print(json.dumps(push_prepare(request, git), ensure_ascii=True))
+            return
+        if kind == 'push-pack':
+            push_pack(request)
+            return
+        if kind == 'push-cleanup':
+            push_cleanup(request)
+            return
     finally:
         if lock is not None:
             os.close(lock)
         os.close(git)
         os.close(work)
+    if kind == 'head':
+        run(GIT + ['rev-parse', '--verify', 'HEAD'])
+        return
     if kind == 'bash':
         run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
         return
@@ -936,6 +1126,7 @@ export class Sandbox {
   #mounts: Mounts | undefined;
   #closed = false;
   #cancelActive: (() => void) | undefined;
+  readonly #pushStreams = new Map<string, () => void>();
 
   constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig) {
     if (process.platform !== "linux" || !isAbsolute(root) || resolve(root) === sep) {
@@ -1107,6 +1298,73 @@ export class Sandbox {
     }, false, authorize, true);
   }
 
+  async head(authorize: SandboxAuthorize): Promise<string> {
+    const head = (await this.#operation({ kind: "head" }, true, authorize)).trim();
+    if (!OID.test(head)) throw new Error("Session HEAD is not a commit");
+    return head;
+  }
+
+  /** Rewrites session commits under `path` onto the upstream `base` in a scratch repository under the session Git dir. */
+  async pushPrepare(id: string, input: { path: string; base: string; commit: string }, pack: AsyncIterable<Uint8Array>, authorize: SandboxAuthorize): Promise<PushPreparation> {
+    if (!PUSH_ID.test(id) || !this.#repositories.some((repository) => repository.path === input.path) || !OID.test(input.base) || !OID.test(input.commit)) {
+      throw new Error("Invalid push request");
+    }
+    if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
+    await this.initialize();
+    const output = await this.#exclusive(async () => {
+      if (this.#closed) throw new Error("Sandbox is closed");
+      await authorize();
+      if (this.#closed) throw new Error("Sandbox is closed");
+      return this.#run({ kind: "push-prepare", id, path: input.path, base: input.base, commit: input.commit }, false, true, false, { input: pack });
+    });
+    const value = JSON.parse(output) as PushPreparation;
+    if (!value || value.base !== input.base || !OID.test(value.tip) || !Array.isArray(value.commits) || !value.commits.length
+      || value.commits.some((commit) => !OID.test(commit.source) || !OID.test(commit.rewritten) || typeof commit.subject !== "string")
+      || value.commits.at(-1)!.rewritten !== value.tip) throw new Error("Invalid push preparation");
+    return { tip: value.tip, base: value.base, commits: value.commits.map(({ source, rewritten, subject }) => ({ source, rewritten, subject })) };
+  }
+
+  /** Streams the pack of `tip` minus `exclude`; the session queue is held until the stream ends. */
+  async pushPack(id: string, input: { tip: string; exclude: string[] }, authorize: SandboxAuthorize): Promise<AsyncIterable<Uint8Array>> {
+    if (!PUSH_ID.test(id) || !OID.test(input.tip) || !Array.isArray(input.exclude) || input.exclude.length > 16 || !input.exclude.every((oid) => OID.test(oid))) {
+      throw new Error("Invalid push request");
+    }
+    if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
+    await this.initialize();
+    const started = Promise.withResolvers<{ stdout: Readable; kill: () => void }>();
+    const finished = this.#exclusive(async () => {
+      if (this.#closed) throw new Error("Sandbox is closed");
+      await authorize();
+      if (this.#closed) throw new Error("Sandbox is closed");
+      try {
+        await this.#run({ kind: "push-pack", id, tip: input.tip, exclude: [...input.exclude] }, true, false, false, {
+          output: (stdout, kill) => { this.#pushStreams.set(id, kill); started.resolve({ stdout, kill }); },
+        });
+      } finally { this.#pushStreams.delete(id); }
+    });
+    finished.catch((error) => started.reject(error));
+    const pack = await started.promise;
+    return (async function* () {
+      let complete = false;
+      try {
+        for await (const chunk of pack.stdout) yield chunk as Uint8Array;
+        await finished;
+        complete = true;
+      } finally {
+        if (!complete) { pack.kill(); await finished.catch(() => undefined); }
+      }
+    })();
+  }
+
+  async pushCleanup(id: string): Promise<void> {
+    if (!PUSH_ID.test(id)) throw new Error("Invalid push id");
+    this.#pushStreams.get(id)?.();
+    if (!this.#mounts) await this.initialize();
+    await this.#exclusive(async () => {
+      await this.#run({ kind: "push-cleanup", id }, false, true);
+    });
+  }
+
   /** Release pinned descriptors when the owning runner session closes. */
   async close(): Promise<void> {
     this.#closed = true;
@@ -1119,7 +1377,7 @@ export class Sandbox {
     });
   }
 
-  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false): Promise<string> {
+  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false, transfer: Transfer = {}): Promise<string> {
     const mounts = this.#mounts;
     if (!mounts) return Promise.reject(new Error("Sandbox is not initialized"));
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
@@ -1181,10 +1439,11 @@ export class Sandbox {
         kill();
       };
       this.#cancelActive = cancel;
+      const deadline = request.kind === "push-prepare" || request.kind === "push-pack" ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
       const timer = setTimeout(() => {
-        failure ??= `Sandbox exceeded ${TIMEOUT_MS}ms time limit`;
+        failure ??= `Sandbox exceeded ${deadline}ms time limit`;
         kill();
-      }, TIMEOUT_MS);
+      }, deadline);
       const capture = (target: Buffer[], chunk: Buffer) => {
         const remaining = Math.max(0, limit - bytes);
         if (remaining) target.push(chunk.subarray(0, remaining));
@@ -1194,7 +1453,9 @@ export class Sandbox {
           kill();
         }
       };
-      child.stdout!.on("data", (chunk: Buffer) => capture(stdout, chunk));
+      // Push packs stream to the forge uncapped; stderr stays bounded.
+      if (transfer.output) transfer.output(child.stdout!, cancel);
+      else child.stdout!.on("data", (chunk: Buffer) => capture(stdout, chunk));
       child.stderr!.on("data", (chunk: Buffer) => capture(stderr, chunk));
       for (const stream of [child.stdout!, child.stderr!]) {
         stream.on("error", () => {
@@ -1231,7 +1492,29 @@ export class Sandbox {
           resolveResult(request.kind === "bash" || request.kind === "commit" || request.kind === "status" ? out + err : out);
         }
       });
-      child.stdin!.end(JSON.stringify({ ...request, expectedRepositories: this.#repositories }));
+      const line = JSON.stringify({ ...request, expectedRepositories: this.#repositories });
+      const input = transfer.input;
+      if (!input) child.stdin!.end(line);
+      else {
+        // One request line, then the upstream pack with backpressure.
+        void (async () => {
+          const stdin = child.stdin!;
+          stdin.write(`${line}\n`);
+          for await (const chunk of input) {
+            if (stdin.destroyed) break;
+            if (!stdin.write(chunk)) {
+              const { promise, resolve: next } = Promise.withResolvers<void>();
+              stdin.once("drain", next);
+              stdin.once("close", next);
+              await promise;
+            }
+          }
+          stdin.end();
+        })().catch(() => {
+          failure ??= "Could not stream the upstream pack";
+          kill();
+        });
+      }
     });
   }
 }

@@ -279,7 +279,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       const content = text(input.content, 'content', 60000);
       const requestId = text(input.requestId, 'requestId', 128);
       const options = await chatOptions(c, row, mode, input.options);
-      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId) : undefined;
+      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access) : undefined;
       const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}) }));
       if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
       await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}) }).run();
@@ -321,7 +321,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       await reviewedApproval(c, row, approvalId, input.reviewHash);
       const fresh = await requireSession(c, row.id, 'approve');
       if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-      if (operation.kind === 'github.comment') {
+      if (operation.kind === 'github.comment' || operation.kind === 'git.push') {
         const existing = await c.env.DB.prepare('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');
         brokerCapability = randomToken();

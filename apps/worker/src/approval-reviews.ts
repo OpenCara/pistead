@@ -9,7 +9,7 @@ type ReviewRow = {
   source: 'explicit' | 'model'; admission_id: string | null; review_hash: string; created_at: string;
 };
 type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: string; expires_at: number };
-const operationTools: Record<Operation['kind'], string> = { 'github.comment': 'github_comment', 'git.commit': 'git_commit', bash: 'bash' };
+const operationTools: Record<Operation['kind'], string> = { 'github.comment': 'github_comment', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push' };
 const statuses: readonly string[] = ['pending', 'approved', 'denied', 'executing', 'executed', 'interrupted', 'failed'];
 
 async function toolsFor(env: Env, row: SessionRow): Promise<string[]> {
@@ -56,7 +56,7 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       createdAt: text(raw.createdAt, 'createdAt', 64),
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
       ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
-    // Only the owner's own commands and commits may run without a human decision, and never a GitHub comment.
+    // Only the owner's own commands, commits and pushes may run without a human decision, and never a GitHub comment.
     if (raw.automatic !== undefined) {
       if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id
         || approval.status === 'pending' || operation.kind === 'github.comment') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');

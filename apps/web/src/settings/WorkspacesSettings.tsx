@@ -9,6 +9,7 @@ import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
 import { gitAccountLabel, gitProviderLabel, RepositorySnapshotPolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
 import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
+import { PushAccess } from "./PushAccess";
 
 interface Member { userId: string; role: WorkspaceRole; displayName?: string; githubLogin?: string | null }
 
@@ -64,6 +65,7 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
     </Section>
     <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />
     <Repositories workspace={workspace} admin={admin} {...repositories} />
+    <PushAccess workspace={workspace} admin={admin} />
     <Members workspace={workspace} admin={admin} />
   </>;
 }
@@ -106,6 +108,13 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
       refresh();
     }, "Repository removed. Existing sessions keep their pinned snapshots.");
   }
+  function setPushPolicy(repository: WorkspaceRepository, allowDefault: boolean) {
+    if (action.busy || !admin) return;
+    void action.run(async () => {
+      await api(`/api/workspaces/${segment(workspace.id)}/repositories/${segment(repository.id)}/push-policy`, { method: "PUT", body: { forbidDefaultBranch: !allowDefault } });
+      refresh();
+    }, "Push policy saved.");
+  }
   const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
   return <Section bare title="Repositories" info={<div className="stack">
     {!admin && <p>Only workspace owners and admins can add or remove repositories.</p>}
@@ -118,6 +127,7 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
           {!repositories?.length
             ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
             : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<>{gitProviderLabel(repository.provider, repository.host)} · <code>{repository.ref}</code></>} trailing={<>
+              <label className="inline small"><input type="checkbox" className="checkbox" checked={!repository.forbidDefaultBranchPush} disabled={!admin || action.busy} onChange={event => setPushPolicy(repository, event.target.checked)} />Allow agent pushes to the default branch</label>
               <StatusBadge>{repository.private ? "Private" : "Public"}</StatusBadge>
               {admin && <Button variant="outline" size="sm" disabled={action.busy} aria-label={`Remove ${repository.fullName}`} onClick={() => void remove(repository)}>Remove</Button>}
             </>} />)}

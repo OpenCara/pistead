@@ -1,3 +1,5 @@
+import type { PushIdentityKind } from "./types.js";
+
 /**
  * Git hosting providers for workspace repositories. GitHub (github.com) uses the sign-in OAuth token; every other
  * provider uses a personal access token the user connects in Settings. Sign-in itself stays GitHub-only.
@@ -99,7 +101,30 @@ export interface WorkspaceRepository {
   ref: string;
   private: boolean;
   createdAt: string;
+  /** Workspace admins may forbid agent pushes to the repository's default branch. */
+  forbidDefaultBranchPush: boolean;
 }
+
+/**
+ * A branch an agent may push to: one `git check-ref-format --branch` compatible name, never a full ref, `HEAD`
+ * or an option-like name. Whether the default branch is allowed is a per-repository workspace policy.
+ */
+export function validPushBranch(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 200 && value !== "HEAD" && value !== "@"
+    && !value.startsWith("-") && !value.startsWith("refs/") && !/[\s\x00-\x1f\x7f\\~^:?*[]/.test(value)
+    && !/[\uD800-\uDFFF]/u.test(value) && !value.includes("..") && !value.includes("@{") && !value.endsWith(".")
+    && !value.endsWith("/") && !value.split("/").some(part => !part || part.startsWith(".") || part.endsWith(".lock"));
+}
+
+/** Push identity kinds each provider supports. Gitea/Forgejo hosts use an OAuth app, or a Forgejo Authorized Integration. */
+export const pushIdentityKindsByProvider: Record<GitProvider, readonly PushIdentityKind[]> = {
+  github: ["github-app"],
+  "github-enterprise": ["github-app"],
+  gitlab: ["oauth-refresh"],
+  bitbucket: ["bitbucket-client-credentials"],
+  "azure-devops": ["entra-federation"],
+  gitea: ["oauth-refresh", "forgejo-integration"],
+};
 
 /**
  * Immutable session pin. GitHub pins keep their original shape (numeric repositoryId, no provider/host) so existing

@@ -1,7 +1,7 @@
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
-import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validGitHost, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
+import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -107,5 +107,19 @@ export function validateOperation(value: unknown): Operation {
   if (op.kind === "bash" && text(op.command, 8192) && Object.keys(op).length === 2) return op;
   if (op.kind === "github.comment" && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(op.repository) && !op.repository.endsWith("/.") && !op.repository.endsWith("/..")
     && Number.isSafeInteger(op.issue) && op.issue > 0 && text(op.body, 60000) && Object.keys(op).length === 4) return op;
+  if (op.kind === "git.push") {
+    const keys = Object.keys(op);
+    const request = op.pullRequest as Record<string, unknown> | undefined;
+    const validRequest = request === undefined || (!!request && typeof request === "object" && !Array.isArray(request)
+      && Object.keys(request).every(key => ["title", "body", "base"].includes(key))
+      && text(request.title, 256) && !/[\r\n]/.test(request.title as string)
+      && typeof request.body === "string" && request.body.length <= 60000 && !request.body.includes("\0")
+      && (request.base === undefined || validPushBranch(request.base)));
+    if (typeof op.repository === "string" && op.repository.length <= 512 && /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+){1,63}$/.test(op.repository)
+      && !op.repository.split("/").some(part => [".", "..", ".git"].includes(part.toLowerCase()))
+      && validPushBranch(op.branch) && typeof op.commit === "string" && /^[0-9a-f]{40}$/.test(op.commit)
+      && keys.every(key => ["kind", "repository", "branch", "commit", "pullRequest"].includes(key))
+      && keys.length === (request === undefined ? 4 : 5) && validRequest) return op;
+  }
   throw new RunnerError(400, "Invalid operation");
 }

@@ -13,9 +13,9 @@ import {
 import { gitProviderAdapters } from './git/providers.js';
 import { zipToTarGz } from './git/zip.js';
 
-interface GitHubAccess { token: string; ciphertext: string; userId: string; githubId: string }
+export interface GitHubAccess { token: string; ciphertext: string; userId: string; githubId: string }
 /** The acting user's credential for one provider/host: the sign-in OAuth token for github.com, a token account otherwise. */
-type RepositoryAccess = { provider: 'github'; github: GitHubAccess } | { provider: TokenGitProvider; account: LoadedCredential };
+export type RepositoryAccess = { provider: 'github'; github: GitHubAccess } | { provider: TokenGitProvider; account: LoadedCredential };
 interface ExpectedRepository { repositoryId: string; fullName: string }
 interface RepositoryResolution {
   repositories: SessionRepository[];
@@ -53,12 +53,14 @@ function bindingRepositoryId(provider: GitProvider, value: unknown): string {
   } else if (!validRepositoryId(value)) fail(400, 'invalid_repository', `A ${gitProviderNames[provider]} repository identity is required.`);
   return value;
 }
-function publicRepository(row: RepositoryRow): WorkspaceRepository {
+export function publicRepository(row: RepositoryRow & { forbid_default_branch?: number | null }): WorkspaceRepository {
   return { id: row.id, workspaceId: row.workspace_id, provider: row.provider, host: row.host, repositoryId: row.repository_id,
-    fullName: row.full_name, ref: row.ref, private: !!row.private, createdAt: row.created_at };
+    fullName: row.full_name, ref: row.ref, private: !!row.private, createdAt: row.created_at, forbidDefaultBranchPush: row.forbid_default_branch === 1 };
 }
-async function workspaceRepositories(env: Env, workspaceId: string): Promise<WorkspaceRepository[]> {
-  const rows = await env.DB.prepare('SELECT * FROM workspace_repositories WHERE workspace_id = ? ORDER BY id').bind(workspaceId).all<RepositoryRow>();
+export async function workspaceRepositories(env: Env, workspaceId: string): Promise<WorkspaceRepository[]> {
+  const rows = await env.DB.prepare(`SELECT r.*, p.forbid_default_branch FROM workspace_repositories r
+    LEFT JOIN repository_push_policies p ON p.binding_id = r.id WHERE r.workspace_id = ? ORDER BY r.id`)
+    .bind(workspaceId).all<RepositoryRow & { forbid_default_branch: number | null }>();
   return rows.results.map(publicRepository);
 }
 export async function legacyRepositoryFixture(env: Env, userId: string): Promise<boolean> {
@@ -87,13 +89,13 @@ async function recheckGitHubAccess(env: Env, access: GitHubAccess): Promise<void
     WHERE t.user_id = ? AND u.auth_kind = 'github' AND u.github_id = ?`).bind(access.userId, access.githubId).first<{ ciphertext: string }>();
   if (row?.ciphertext !== access.ciphertext) fail(403, 'github_access_changed', 'GitHub access changed; retry with the current connection.');
 }
-async function repositoryAccess(env: Env, userId: string, provider: GitProvider, host: string, fullName: string): Promise<RepositoryAccess> {
+export async function repositoryAccess(env: Env, userId: string, provider: GitProvider, host: string, fullName: string): Promise<RepositoryAccess> {
   if (provider === 'github') return { provider, github: await githubAccess(env, userId) };
   const account = await loadCredential(env, userId, provider, host, credentialOrganization(provider, fullName));
   if (!account) gitAccountRequired(provider, host, fullName);
   return { provider, account };
 }
-async function recheckAccess(env: Env, access: RepositoryAccess): Promise<void> {
+export async function recheckAccess(env: Env, access: RepositoryAccess): Promise<void> {
   if (access.provider === 'github') await recheckGitHubAccess(env, access.github);
   else await recheckCredential(env, access.account);
 }
@@ -161,7 +163,7 @@ export async function githubRepositoryPage(env: Env, userId: string, page: numbe
   return { repositories, page, hasMore: repositories.length === 30 && page < 1000 };
 }
 /** Current metadata must still carry the bound identity and exact canonical name (renames and transfers fail closed). */
-async function verifyRepository(access: RepositoryAccess, expected: ExpectedRepository): Promise<ProviderRepository> {
+export async function verifyRepository(access: RepositoryAccess, expected: ExpectedRepository): Promise<ProviderRepository> {
   const name = repositoryName(access.provider, expected.fullName);
   const metadata = access.provider === 'github'
     ? githubRepository(await githubJSON(access.github, `/repos/${name}`))
@@ -277,7 +279,7 @@ export function registerRepositories(app: Hono<WorkerEnv>): void {
 }
 
 /** A pin must have exactly one of the two persisted shapes, with the path the server would have assigned. */
-function validPin(pin: SessionRepository): boolean {
+export function validPin(pin: SessionRepository): boolean {
   const keys = Object.keys(pin).sort().join(',');
   if (!('provider' in pin)) {
     return keys === 'bindingId,commit,fullName,path,ref,repositoryId' && Number.isSafeInteger(pin.repositoryId) && pin.repositoryId > 0 &&

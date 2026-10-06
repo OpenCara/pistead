@@ -134,7 +134,7 @@ function selfHostedOrigin(credential: GitCredential): URL {
   if (!validGitHost(credential.host)) fail(400, 'invalid_git_host', 'The connected account has an invalid host.');
   return new URL(`https://${credential.host}`);
 }
-function basic(user: string, password: string): string {
+export function basic(user: string, password: string): string {
   let binary = '';
   for (const byte of new TextEncoder().encode(`${user}:${password}`)) binary += String.fromCharCode(byte);
   return `Basic ${btoa(binary)}`;
