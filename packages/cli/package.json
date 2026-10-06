@@ -7,17 +7,18 @@
   "keywords": ["pistead", "pi", "agent", "connector"],
   "type": "module",
   "bin": { "pistead": "dist/pistead.js" },
-  "files": ["dist"],
+  "files": ["dist", "npm-shrinkwrap.json"],
   "engines": { "node": ">=24.0.0" },
   "scripts": {
     "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node24 --packages=external --outfile=dist/cli.js && esbuild src/pistead.ts --platform=node --format=esm --target=node16 --outfile=dist/pistead.js --banner:js=\"#!/usr/bin/env node\"",
-    "prepublishOnly": "pnpm run build"
+    "shrinkwrap": "node scripts/shrinkwrap.mjs",
+    "prepublishOnly": "node scripts/shrinkwrap.mjs --check && pnpm run build"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0",
+    "@earendil-works/chord": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-durable": "1.0.4",
     "hono": "4.12.8",
     "zod": "4.3.6"
   },

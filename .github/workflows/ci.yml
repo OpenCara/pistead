@@ -26,6 +26,8 @@ jobs:
             --cap-drop ALL --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
             --symlink usr/bin /bin --proc /proc --dev /dev -- /usr/bin/true
       - run: pnpm install --frozen-lockfile
+      - name: Connector shrinkwrap matches package.json
+        run: node packages/cli/scripts/shrinkwrap.mjs --check
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
