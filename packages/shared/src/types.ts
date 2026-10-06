@@ -129,7 +129,8 @@ export interface PushCredential {
   authorization: string;
   expiresAt: string;
 }
-export type PushOutcome = "pushed" | "up-to-date" | "failed";
+/** `unknown`: the push failed during or after the upload, so the remote branch may or may not have moved. */
+export type PushOutcome = "pushed" | "up-to-date" | "failed" | "unknown";
 export interface PushCompletionResult {
   pullRequest?: { url: string; number: number; created: boolean };
 }

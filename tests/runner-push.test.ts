@@ -2,11 +2,14 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { gzipSync } from "node:zlib";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -302,4 +305,71 @@ test("sessions run approved pushes in the background, auto-push only with an adm
   assert.match(failed.result ?? "", /fast-forward only/);
   assert.deepEqual(completions.at(-1), { sessionId: id, approvalId: moved.id, credentialId: "credential-3", outcome: "failed" });
   assert.equal(git(["--git-dir", bare, "rev-parse", "refs/heads/moved"]).trim(), other);
+});
+
+test("push-prepare removes orphaned scratch repositories and snapshots never carry them", hostMode, async t => {
+  const { bare, pin, archive, credential } = await upstream(t);
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-push-scratch-")));
+  const workspace = new HostWorkspace(binding("host-scratch", [pin]), join(directory, "session"));
+  t.after(async () => { await workspace.close(); await rm(directory, { recursive: true, force: true }); });
+  await workspace.initialize();
+  await workspace.materializeRepositories([pin], [archive], authorize);
+  const head = await commit(workspace, { "acme/alpha/README.md": "scratch\n" }, "Scratch");
+  const scratch = join(workspace.worktree, ".git", "pistead-push");
+  const stale = join(scratch, "0".repeat(32));
+  await mkdir(join(stale, "objects", "pack"), { recursive: true });
+  await writeFile(join(stale, "objects", "pack", "orphan.pack"), "left by an interrupted push");
+  const files = await workspace.snapshot(authorize);
+  assert.ok(files.length > 0);
+  assert.ok(!files.some(file => file.path.startsWith("git/pistead-push")), "snapshots exclude push scratch repositories");
+  const pushed = await performPush({ workspace, credential, authorize, repository: pin, operation: { kind: "git.push", repository: pin.path, branch: "scratch", commit: head } });
+  assert.equal(pushed.outcome, "pushed");
+  assert.equal(git(["--git-dir", bare, "rev-parse", "refs/heads/scratch"]).trim(), pushed.tip);
+  assert.ok(!existsSync(stale), "the next push removes the orphaned scratch repository");
+  assert.deepEqual(await readdir(scratch), [], "the push cleans up its own scratch repository");
+});
+
+test("close() during an automatic push aborts it, awaits settlement and reports an unknown outcome", hostMode, async t => {
+  const { pin, archive, credential } = await upstream(t);
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-push-close-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // A forge that accepts the connection and never answers: the push is in flight until aborted.
+  let requests = 0;
+  const hanging = createServer(() => { requests++; });
+  hanging.listen(0, "127.0.0.1");
+  await once(hanging, "listening");
+  t.after(() => { hanging.closeAllConnections(); hanging.close(); });
+  const { port } = hanging.address() as AddressInfo;
+  const credentialRequests: PushCredentialRequest[] = [];
+  const completions: PushCompleteRequest[] = [];
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("write_file", { path: "acme/alpha/README.md", content: "from the agent\n" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("git_commit", { message: "Agent change" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("git_push", { repository: "acme/alpha", branch: "auto" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Done."),
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: SECRET, controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
+    authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    readRepository: async () => archive,
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    pushCredential: async request => { credentialRequests.push(request); return { ...credential, remote: `http://127.0.0.1:${port}/acme/alpha.git` }; },
+    pushComplete: async request => { completions.push(request); return {}; },
+  });
+  await service.initialize();
+  let closed = false;
+  t.after(() => { if (!closed) return service.close(); });
+  const id = "push-close";
+  const session = await service.provision(binding(id, [pin], "faux"), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "Change and push.", requestId: "auto", admissionId: await sha256("admission"), options: { access: "auto" } }, "write");
+  for (let count = 0; requests === 0 && count < 1000; count++) await delay(10);
+  assert.equal(requests > 0, true, "the push reached the forge");
+  assert.equal(completions.length, 0);
+  await service.close();
+  closed = true;
+  assert.deepEqual(completions, [{ sessionId: id, approvalId: credentialRequests[0]!.approvalId, credentialId: credential.credentialId, outcome: "unknown" }],
+    "close() waits for the aborted push, which reports an ambiguous outcome");
 });

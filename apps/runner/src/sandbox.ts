@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
@@ -674,7 +674,8 @@ def snapshot():
         visit(home, 'home', ('.gitconfig',))
         add(home, '.gitconfig', 'owner.gitconfig')
         visit(work, 'worktree', ('.git',))
-        visit(git, 'git')
+        # Push scratch repositories are transient and never belong in a backup.
+        visit(git, 'git', ('pistead-push',))
         return files
     finally:
         os.close(git)
@@ -723,6 +724,10 @@ def push_prepare(request, git):
         pass
     if not stat.S_ISDIR(os.lstat(scratch).st_mode):
         raise ValueError('push scratch directory is unsafe')
+    # Pushes are serialized per session: any existing scratch repository is an orphan of an interrupted push.
+    for name in os.listdir(scratch):
+        if stat.S_ISDIR(os.lstat(os.path.join(scratch, name)).st_mode):
+            shutil.rmtree(os.path.join(scratch, name))
     os.mkdir(directory, 0o700)
     for name in ('objects/info', 'objects/pack', 'refs/heads', 'refs/tags'):
         os.makedirs(os.path.join(directory, name), 0o700)
@@ -937,6 +942,16 @@ except (OSError, ValueError, KeyError, TypeError, UnicodeError, zlib.error) as e
     print('sandbox: ' + str(error), file=sys.stderr)
     sys.exit(1)
 `;
+
+/** Waits for a writable to drain or close, removing whichever listener did not fire so long streams never accumulate listeners. */
+export function drained(stream: Writable): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  if (stream.destroyed) { resolve(); return promise; }
+  const done = () => { stream.off("drain", done); stream.off("close", done); resolve(); };
+  stream.on("drain", done);
+  stream.on("close", done);
+  return promise;
+}
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | null)?.code;
@@ -1502,12 +1517,7 @@ export class Sandbox {
           stdin.write(`${line}\n`);
           for await (const chunk of input) {
             if (stdin.destroyed) break;
-            if (!stdin.write(chunk)) {
-              const { promise, resolve: next } = Promise.withResolvers<void>();
-              stdin.once("drain", next);
-              stdin.once("close", next);
-              await promise;
-            }
+            if (!stdin.write(chunk)) await drained(stdin);
           }
           stdin.end();
         })().catch(() => {

@@ -8,7 +8,7 @@ import { repositoryLimits, type SessionRepository } from "../../../packages/shar
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import type { PushPreparation } from "./push.js";
 import {
-  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, ownerGitConfig, pinOwnerConfig, repositoryPins, sessionEnvironment, text,
+  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, drained, ownerGitConfig, pinOwnerConfig, repositoryPins, sessionEnvironment, text,
   type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
 } from "./sandbox.js";
 
@@ -195,7 +195,8 @@ export class HostWorkspace {
       await visit(this.home, "home");
       await add(this.#root, "owner.gitconfig", "owner.gitconfig");
       await visit(this.worktree, "worktree", [".git"]);
-      await visit(join(this.worktree, ".git"), "git");
+      // Push scratch repositories are transient and never belong in a backup.
+      await visit(join(this.worktree, ".git"), "git", ["pistead-push"]);
       return files;
     });
   }
@@ -237,6 +238,10 @@ export class HostWorkspace {
       const scratch = join(gitDirectory, "pistead-push");
       await mkdir(scratch, { mode: 0o700 }).catch(error => { if (errorCode(error) !== "EEXIST") throw error; });
       if (!(await lstat(scratch)).isDirectory()) throw hostError("push scratch directory is unsafe");
+      // Pushes are serialized per session: any existing scratch repository is an orphan of an interrupted push.
+      for (const name of await readdir(scratch)) {
+        if ((await lstat(join(scratch, name))).isDirectory()) await rm(join(scratch, name), { recursive: true, force: true });
+      }
       await mkdir(directory, { mode: 0o700 });
       for (const name of ["objects/info", "objects/pack", "refs/heads", "refs/tags"]) await mkdir(join(directory, name), { recursive: true, mode: 0o700 });
       await writeFile(join(directory, "HEAD"), "ref: refs/heads/main\n", { flag: "wx", mode: 0o600 });
@@ -389,12 +394,7 @@ export class HostWorkspace {
       void (async () => {
         for await (const chunk of input) {
           if (child.stdin.destroyed) break;
-          if (!child.stdin.write(chunk)) {
-            const { promise, resolve: next } = Promise.withResolvers<void>();
-            child.stdin.once("drain", next);
-            child.stdin.once("close", next);
-            await promise;
-          }
+          if (!child.stdin.write(chunk)) await drained(child.stdin);
         }
         child.stdin.end();
       })().catch(error => { failure ??= error; kill(); });

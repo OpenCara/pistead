@@ -8,6 +8,7 @@ import { Alert, Button, CardBody, CopyField, DropdownMenu, Feedback, Field, Link
 interface PushIdentitiesResponse {
   identities: PushIdentity[];
   oidc: { issuer: string; subject: string } | null;
+  redirectUri: string | null;
   githubApp: { slug: string; installUrl: string } | null;
 }
 
@@ -44,7 +45,8 @@ export function PushAccess({ workspace, admin }: { workspace: Workspace; admin: 
   const data = resource.data;
   return <Section title="Push access" info={<div className="stack">
     {!admin && <p>Only workspace owners and admins can manage push identities.</p>}
-    <p>Agents push with short-lived credentials minted from these workspace app or bot identities, held only in the host's memory. The session owner must also be able to push to the repository; pull requests are opened as the session owner.</p>
+    <p>Agents push with short-lived credentials minted from these workspace app or bot identities, held only in the host's memory. The session owner must also be able to push to the repository, and to the branch where the host reports branch permissions; pull requests are opened as the session owner.</p>
+    <p>Except for GitHub, the minted token carries everything the identity can reach until it expires, and the host running the session receives it. Give bot accounts, OAuth consumers, service principals and integrations access only to this workspace's repositories; for Forgejo integrations, add claim rules on the <code>repository</code> and <code>ref</code> claims.</p>
     <p>Secrets are write-only: they are never shown again after saving.</p>
   </div>} action={admin && <Button variant="outline" size="sm" icon="plus" onClick={() => setEditing({ provider: "github" })}>Add identity</Button>}>
     <ResourceState {...resource} retry={resource.refresh}>
@@ -61,7 +63,7 @@ export function PushAccess({ workspace, admin }: { workspace: Workspace; admin: 
         </>} />)}
       {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
     </ResourceState>
-    {admin && editing && <PushIdentitySheet key={editing.identity?.id ?? "new"} path={path} oidc={data?.oidc ?? null} initial={editing} close={() => setEditing(null)} saved={resource.refresh} authorize={authorize} />}
+    {admin && editing && <PushIdentitySheet key={editing.identity?.id ?? "new"} path={path} oidc={data?.oidc ?? null} redirectUri={data?.redirectUri ?? null} initial={editing} close={() => setEditing(null)} saved={resource.refresh} />}
   </Section>;
 }
 
@@ -69,7 +71,7 @@ function scopeLabel(identity: PushIdentity): string {
   return `${gitProviderLabel(identity.provider, identity.host)}${identity.scope ? ` · ${identity.scope}` : ""}`;
 }
 
-function PushIdentitySheet({ path, oidc, initial, close, saved, authorize }: { path: string; oidc: PushIdentitiesResponse["oidc"]; initial: { provider: GitProvider; identity?: PushIdentity }; close: () => void; saved: () => void; authorize: (identity: PushIdentity) => void }) {
+function PushIdentitySheet({ path, oidc, redirectUri, initial, close, saved }: { path: string; oidc: PushIdentitiesResponse["oidc"]; redirectUri: string | null; initial: { provider: GitProvider; identity?: PushIdentity }; close: () => void; saved: () => void }) {
   const existing = initial.identity;
   const [provider, setProvider] = useState<GitProvider>(initial.provider);
   const [kind, setKind] = useState<PushIdentityKind>(existing?.kind ?? pushIdentityKindsByProvider[initial.provider][0]);
@@ -113,6 +115,12 @@ function PushIdentitySheet({ path, oidc, initial, close, saved, authorize }: { p
       else close();
     });
   }
+  function authorize(identity: PushIdentity) {
+    void action.run(async () => {
+      const result = await api<{ url: string }>(`${path}/${segment(identity.id)}/authorize`, { method: "POST" });
+      window.location.assign(result.url);
+    });
+  }
   const text = (name: string, label: string, hint?: string, placeholder?: string) => <Field label={label} hint={hint}>
     <input className="input" required value={field(name)} onChange={event => setField(name, event.target.value)} autoComplete="off" spellCheck={false} placeholder={placeholder} />
   </Field>;
@@ -124,8 +132,8 @@ function PushIdentitySheet({ path, oidc, initial, close, saved, authorize }: { p
     </div>
     : <Alert variant="warning" title="OIDC issuer unavailable">The operator has not configured Pistead's OIDC signing key, so this identity cannot be used yet.</Alert>;
   return <Sheet open title={existing ? "Replace push identity" : "Add push identity"} onClose={dismiss} footer={created ? <>
-    <Button onClick={close}>Later</Button>
-    <Button variant="default" onClick={() => authorize(created)}>Authorize</Button>
+    <Button disabled={action.busy} onClick={close}>Later</Button>
+    <Button variant="default" disabled={action.busy} onClick={() => authorize(created)}>Authorize</Button>
   </> : <>
     <Button disabled={action.busy} onClick={dismiss}>Cancel</Button>
     <Button variant="default" type="submit" form="push-identity-form" disabled={!ready || action.busy}>{action.busy ? "Verifying..." : "Save"}</Button>
@@ -167,8 +175,10 @@ function PushIdentitySheet({ path, oidc, initial, close, saved, authorize }: { p
           <Field label="Secret" hint="Write-only"><input className="input" type="password" required value={secret} onChange={event => setSecret(event.target.value)} autoComplete="new-password" /></Field>
         </>}
         {kind === "oauth-refresh" && <>
-          <p className="muted small">Register an OAuth application on the instance ({provider === "gitlab" ? "scope write_repository" : "scope write:repository, Gitea 1.23 or later"}) with this redirect URI. After saving, sign in as a dedicated bot account with push access and authorize it.</p>
-          <CopyField label="Redirect URI" value={`${location.origin}/api/push-identities/oauth/callback`} />
+          <p className="muted small">Register an OAuth application on the instance ({provider === "gitlab" ? "scopes write_repository and read_user" : "scopes write:repository and read:user, Gitea 1.23 or later"}) with this redirect URI. After saving, sign in as a dedicated bot account with push access and authorize it.</p>
+          {redirectUri
+            ? <CopyField label="Redirect URI" value={redirectUri} />
+            : <Alert variant="warning" title="Redirect URI unavailable">The operator has not configured Pistead's application origin, so this identity cannot be authorized yet.</Alert>}
           {text("clientId", "Client ID")}
           <Field label="Client secret" hint="Write-only"><input className="input" type="password" required value={secret} onChange={event => setSecret(event.target.value)} autoComplete="new-password" /></Field>
         </>}

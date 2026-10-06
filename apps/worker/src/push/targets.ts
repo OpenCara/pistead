@@ -102,19 +102,60 @@ function remote(pin: SessionRepository): string {
   }
 }
 
-async function ownerCanPush(target: Api, pin: SessionRepository): Promise<{ canPush: boolean; azureProjectId?: string }> {
+/** Azure DevOps Git security token segment: the UTF-16LE bytes of one branch segment as lowercase hex. */
+function azureSegment(segment: string): string {
+  let hex = '';
+  for (let index = 0; index < segment.length; index++) {
+    const unit = segment.charCodeAt(index);
+    hex += (unit & 0xff).toString(16).padStart(2, '0') + (unit >> 8).toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+/** The branch security token; permissions set on the repository or project reach new branches through inheritance. */
+function azureBranchToken(projectId: string, repositoryId: string, branch: string): string {
+  return `repoV2/${projectId}/${repositoryId}/refs/heads/${branch.split('/').map(azureSegment).join('/')}`;
+}
+
+/** A branch read as the owner: its JSON when it exists, null when it does not (a new branch). */
+async function existingBranch(target: Api, url: string): Promise<Record<string, unknown> | null> {
+  const result = await call(target, url);
+  if (result.status === 200) return object(target, result.body);
+  if (result.status === 404) return null;
+  if (result.status === 401 || result.status === 403) permissionRequired(target.provider);
+  return unavailable(target.provider);
+}
+
+async function ownerCanPush(target: Api, pin: SessionRepository, branch: string): Promise<{ canPush: boolean; azureProjectId?: string }> {
   const id = encodeURIComponent(String(pin.repositoryId));
+  // Branch names in URL paths: each `/`-separated segment encoded on its own.
+  const branchPath = branch.split('/').map(encodeURIComponent).join('/');
   switch (target.provider) {
-    case 'github': return { canPush: object(target, (await read(target, `${target.base}/repos/${pin.fullName}`)).permissions).push === true };
-    case 'github-enterprise':
-    case 'gitea': return { canPush: object(target, (await read(target, `${target.base}/repositories/${id}`)).permissions).push === true };
+    case 'github':
+    case 'github-enterprise': {
+      const repository = target.provider === 'github'
+        ? await read(target, `${target.base}/repos/${pin.fullName}`)
+        : await read(target, `${target.base}/repositories/${id}`);
+      if (object(target, repository.permissions).push !== true) return { canPush: false };
+      // Protected branches carry rules a push identity could bypass; they go through pull requests instead.
+      const existing = await existingBranch(target, `${target.base}/repos/${pin.fullName}/branches/${branchPath}`);
+      if (existing?.protected === true) fail(403, 'protected_branch', 'Protected branches are not pushed through push identities; open a pull request instead.');
+      return { canPush: true };
+    }
+    case 'gitea': {
+      if (object(target, (await read(target, `${target.base}/repositories/${id}`)).permissions).push !== true) return { canPush: false };
+      const existing = await existingBranch(target, `${target.base}/repos/${pin.fullName}/branches/${branchPath}`);
+      return { canPush: existing === null || existing.user_can_push === true };
+    }
     case 'gitlab': {
       const permissions = object(target, (await read(target, `${target.base}/projects/${id}`)).permissions);
       const level = (value: unknown): number => {
         const item = value && typeof value === 'object' ? (value as Record<string, unknown>).access_level : undefined;
         return typeof item === 'number' ? item : 0;
       };
-      return { canPush: Math.max(level(permissions.project_access), level(permissions.group_access)) >= 30 };
+      if (Math.max(level(permissions.project_access), level(permissions.group_access)) < 30) return { canPush: false };
+      // GitLab takes the branch as one path parameter, so its slashes are encoded too.
+      const existing = await existingBranch(target, `${target.base}/projects/${id}/repository/branches/${encodeURIComponent(branch)}`);
+      return { canPush: existing === null || existing.can_push === true };
     }
     case 'bitbucket': {
       if (!target.headers.Authorization!.startsWith('Basic ')) unverifiable(target.provider, 'connect an Atlassian API token with your account email in Settings → Profile.');
@@ -127,7 +168,8 @@ async function ownerCanPush(target: Api, pin: SessionRepository): Promise<{ canP
       const repository = await read(target, `${target.base}/_apis/git/repositories/${id}?api-version=7.1`);
       const projectId = object(target, repository.project).id;
       if (typeof projectId !== 'string' || !/^[0-9a-fA-F-]{36}$/.test(projectId)) unavailable(target.provider);
-      const tokens = encodeURIComponent(`repoV2/${projectId}/${String(pin.repositoryId)}`);
+      // GenericContribute (4) on the branch token: branch policies and inherited repository permissions both apply.
+      const tokens = encodeURIComponent(azureBranchToken(projectId, String(pin.repositoryId), branch));
       const result = await call(target, `${target.base}/_apis/permissions/2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87/4?tokens=${tokens}&api-version=7.1`);
       if (result.status !== 200) unverifiable(target.provider, 'the connected token cannot read repository permissions.');
       const value = array(target, object(target, result.body).value);
@@ -136,11 +178,11 @@ async function ownerCanPush(target: Api, pin: SessionRepository): Promise<{ canP
   }
 }
 
-/** Confirms the binding identity, the owner's write access, the default branch and the credential-free remote. */
-export async function pushTarget(access: RepositoryAccess, pin: SessionRepository): Promise<PushTarget> {
+/** Confirms the binding identity, the owner's write access to the branch, the default branch and the credential-free remote. */
+export async function pushTarget(access: RepositoryAccess, pin: SessionRepository, branch: string): Promise<PushTarget> {
   const target = api(access, pin);
   const metadata = await verifyRepository(access, { repositoryId: String(pin.repositoryId), fullName: pin.fullName });
-  const permission = await ownerCanPush(target, pin);
+  const permission = await ownerCanPush(target, pin, branch);
   return { canPush: permission.canPush, defaultBranch: metadata.defaultBranch, remote: remote(pin),
     ...(permission.azureProjectId ? { azureProjectId: permission.azureProjectId } : {}) };
 }

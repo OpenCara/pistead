@@ -18,7 +18,8 @@ export interface MintedToken {
   expiresAt: number;                 // unix seconds
   revocation?: { kind: 'github-installation'; apiBase: string; token: string };
 }
-export interface OAuthSecret { clientSecret: string; refreshToken?: string }
+/** Vault-encrypted oauth-refresh secret; the current access token is cached so concurrent pushes reuse it (GitLab revokes it on refresh). */
+export interface OAuthSecret { clientSecret: string; refreshToken?: string; accessToken?: string; accessExpiresAt?: number }
 interface GitHubApp { appId: string; slug: string; privateKey: string }
 interface Upstream { status: number; body: Record<string, unknown> | null }
 /** Minting failures are 502s; save-time verification reports rejected settings as 400s. */
@@ -34,6 +35,8 @@ const tokenPattern = /^[\x21-\x7e]{1,16384}$/;
 const leaseSeconds = 60;
 const leaseAttempts = 40;
 const leaseRetryMs = 250;
+// A cached access token (expiry in epoch seconds) is handed out only while it outlives the longest push by a wide margin.
+const accessReuseSeconds = 15 * 60;
 
 /** Vault associated data for a push identity's secret. */
 export function identitySecretContext(identityId: string): string {
@@ -42,11 +45,11 @@ export function identitySecretContext(identityId: string): string {
 export function oauthRedirectUri(env: Env): string {
   return `${appOrigin(env)}/api/push-identities/oauth/callback`;
 }
-/** GitLab and Gitea OAuth2 endpoints and the narrowest scope that allows pushing. */
+/** GitLab and Gitea OAuth2 endpoints and the narrowest scopes that allow pushing and reading the bot's login. */
 export function oauthEndpoints(provider: GitProvider, host: string): { authorize: string; token: string; scope: string } {
   return provider === 'gitlab'
-    ? { authorize: `https://${host}/oauth/authorize`, token: `https://${host}/oauth/token`, scope: 'write_repository' }
-    : { authorize: `https://${host}/login/oauth/authorize`, token: `https://${host}/login/oauth/access_token`, scope: 'write:repository' };
+    ? { authorize: `https://${host}/oauth/authorize`, token: `https://${host}/oauth/token`, scope: 'write_repository read_user' }
+    : { authorize: `https://${host}/login/oauth/authorize`, token: `https://${host}/login/oauth/access_token`, scope: 'write:repository read:user' };
 }
 export function githubApiBase(provider: GitProvider, host: string): string {
   return provider === 'github' ? 'https://api.github.com' : `https://${host}/api/v3`;
@@ -59,10 +62,15 @@ export function oauthSecret(value: string): OAuthSecret {
   try { parsed = JSON.parse(value); } catch { parsed = null; }
   const secret = parsed as Partial<OAuthSecret> | null;
   if (!secret || typeof secret.clientSecret !== 'string' || !secret.clientSecret ||
-      (secret.refreshToken !== undefined && (typeof secret.refreshToken !== 'string' || !tokenPattern.test(secret.refreshToken)))) {
+      [secret.refreshToken, secret.accessToken].some(value => value !== undefined && (typeof value !== 'string' || !tokenPattern.test(value))) ||
+      (secret.accessToken === undefined) !== (secret.accessExpiresAt === undefined) ||
+      (secret.accessExpiresAt !== undefined && !Number.isSafeInteger(secret.accessExpiresAt))) {
     fail(500, 'vault_error', 'Unable to read connected account credentials.');
   }
-  return secret.refreshToken === undefined ? { clientSecret: secret.clientSecret } : { clientSecret: secret.clientSecret, refreshToken: secret.refreshToken };
+  const result: OAuthSecret = { clientSecret: secret.clientSecret };
+  if (secret.refreshToken !== undefined) result.refreshToken = secret.refreshToken;
+  if (secret.accessToken !== undefined) { result.accessToken = secret.accessToken; result.accessExpiresAt = secret.accessExpiresAt!; }
+  return result;
 }
 
 function unavailable(purpose: Purpose): never {
@@ -203,12 +211,25 @@ async function acquireLease(env: Env, row: PushIdentityRow): Promise<PushIdentit
   }
 }
 
+function cachedAccess(row: PushIdentityRow, secret: OAuthSecret): MintedToken | null {
+  if (secret.accessToken === undefined || secret.refreshToken === undefined ||
+      secret.accessExpiresAt! - Math.floor(Date.now() / 1000) < accessReuseSeconds) return null;
+  return { kind: 'oauth-refresh', identityId: row.id, authorization: basic('oauth2', secret.accessToken), expiresAt: secret.accessExpiresAt! };
+}
+
 async function mintOAuth(env: Env, row: PushIdentityRow): Promise<MintedToken> {
+  if (row.secret_ciphertext) {
+    const cached = cachedAccess(row, oauthSecret(await identitySecret(env, row)));
+    if (cached) return cached;
+  }
   const leased = await acquireLease(env, row);
   let released = false;
   try {
     const config = JSON.parse(leased.config_json) as Record<string, string>;
     const secret = oauthSecret(await identitySecret(env, leased));
+    // A concurrent request may have refreshed while this one waited for the lease.
+    const cached = cachedAccess(leased, secret);
+    if (cached) return cached;
     const response = secret.refreshToken === undefined ? null : await upstream('mint', oauthEndpoints(leased.provider, leased.host).token, {
       method: 'POST', headers: { 'Content-Type': formType },
       body: new URLSearchParams({ client_id: config.clientId!, client_secret: secret.clientSecret, refresh_token: secret.refreshToken,
@@ -225,13 +246,14 @@ async function mintOAuth(env: Env, row: PushIdentityRow): Promise<MintedToken> {
     const body = expectStatus('mint', response, 200);
     const accessToken = token('mint', body.access_token);
     const refreshToken = body.refresh_token === undefined ? secret.refreshToken! : token('mint', body.refresh_token);
-    const rotated = await encryptToken(env, identitySecretContext(leased.id), JSON.stringify({ clientSecret: secret.clientSecret, refreshToken }));
-    // Store the rotated refresh token and release the lease together; a replaced identity keeps its own secret.
+    const accessExpiresAt = expiresAt(body.expires_in, leased.provider === 'gitlab' ? 7200 : 3600);
+    const rotated = await encryptToken(env, identitySecretContext(leased.id),
+      JSON.stringify({ clientSecret: secret.clientSecret, refreshToken, accessToken, accessExpiresAt } satisfies OAuthSecret));
+    // Store the new tokens and release the lease together; a replaced identity keeps its own secret.
     await env.DB.prepare('UPDATE push_identities SET secret_ciphertext = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND secret_ciphertext = ?')
       .bind(rotated, now(), leased.id, leased.secret_ciphertext).run();
     released = true;
-    return { kind: 'oauth-refresh', identityId: leased.id, authorization: basic('oauth2', accessToken),
-      expiresAt: expiresAt(body.expires_in, leased.provider === 'gitlab' ? 7200 : 3600) };
+    return { kind: 'oauth-refresh', identityId: leased.id, authorization: basic('oauth2', accessToken), expiresAt: accessExpiresAt };
   } finally {
     if (!released) await env.DB.prepare('UPDATE push_identities SET lease_until = NULL WHERE id = ? AND lease_until = ?').bind(leased.id, leased.lease_until).run();
   }
@@ -291,7 +313,7 @@ export async function verifyIdentity(env: Env, input: {
     case 'github-app': {
       const jwt = await appJwt('verify', { appId: config.appId!, slug: config.slug!, privateKey: input.secret ?? '' });
       const app = expectStatus('verify', await upstream('verify', `${githubApiBase(input.provider, input.host)}/app`, { headers: githubHeaders(jwt) }), 200);
-      if (app.id !== Number(config.appId)) rejected('verify');
+      if (app.id !== Number(config.appId) || app.slug !== config.slug) rejected('verify');
       return config;
     }
     case 'entra-federation':

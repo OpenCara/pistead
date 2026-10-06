@@ -8,7 +8,7 @@ import { app } from '../apps/worker/src/index.js';
 import type { Env } from '../apps/worker/src/types.js';
 import { decryptToken, encryptToken } from '../apps/worker/src/vault.js';
 import { importRsaPrivateKey, publicJwk, signJwt } from '../apps/worker/src/push/jwt.js';
-import { mintPushToken, revokePushToken, type MintTarget } from '../apps/worker/src/push/mint.js';
+import { mintPushToken, oauthEndpoints, revokePushToken, type MintTarget } from '../apps/worker/src/push/mint.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
 const origin = 'http://localhost:8787';
@@ -201,7 +201,8 @@ test('github.com falls back to the operator GitHub App only when it is configure
   assert.equal(minted.revocation?.apiBase, 'https://api.github.com');
   assert.equal(decodeJwt(calls[0]!.headers.authorization!.replace(/^Bearer /, ''), appKey.publicKey).claims.iss, '9');
   const listed = await (await bob.request('GET', `/api/workspaces/${workspaceId}/push-identities`)).json() as Record<string, unknown>;
-  assert.deepEqual(listed, { identities: [], oidc: null, githubApp: { slug: 'pistead-operator', installUrl: 'https://github.com/apps/pistead-operator/installations/new' } });
+  assert.deepEqual(listed, { identities: [], oidc: null, redirectUri: `${origin}/api/push-identities/oauth/callback`,
+    githubApp: { slug: 'pistead-operator', installUrl: 'https://github.com/apps/pistead-operator/installations/new' } });
 });
 
 test('Entra federation exchanges a Pistead assertion; Bitbucket uses client credentials; Forgejo gets a scoped JWT', async t => {
@@ -246,7 +247,7 @@ test('Entra federation exchanges a Pistead assertion; Bitbucket uses client cred
   assert.equal(otherScope.code, 'push_identity_required');
 });
 
-test('OAuth refresh identities rotate the refresh token, serialize with a lease, and require reauthorization on invalid_grant', async t => {
+test('OAuth refresh identities reuse a fresh access token, rotate the refresh token, serialize with a lease, and require reauthorization on invalid_grant', async t => {
   const f = fixture();
   const { alice, workspaceId } = await f.team();
   const identityId = await f.identity({ workspaceId, provider: 'gitlab', host: 'gitlab.com', kind: 'oauth-refresh', config: { clientId: 'gl-client', login: 'bot' },
@@ -254,7 +255,7 @@ test('OAuth refresh identities rotate the refresh token, serialize with a lease,
   let grant: 'ok' | 'invalid' = 'ok';
   const calls = mockFetch(t, {
     'POST https://gitlab.com/oauth/token': () => grant === 'ok'
-      ? Response.json({ access_token: 'access-1', refresh_token: 'refresh-2', expires_in: 7200 })
+      ? Response.json({ access_token: `access-${calls.length}`, refresh_token: `refresh-${calls.length + 1}`, expires_in: 7200 })
       : Response.json({ error: 'invalid_grant' }, { status: 400 }),
   });
   const gitlab = target(workspaceId, { provider: 'gitlab', host: 'gitlab.com', fullName: 'group/app', repositoryId: '99' });
@@ -264,35 +265,62 @@ test('OAuth refresh identities rotate the refresh token, serialize with a lease,
   assert.deepEqual(Object.fromEntries(new URLSearchParams(calls[0]!.body)), { client_id: 'gl-client', client_secret: 'gl-secret', refresh_token: 'refresh-1',
     grant_type: 'refresh_token', redirect_uri: `${origin}/api/push-identities/oauth/callback` });
   const stored = () => f.sqlite.prepare('SELECT status, lease_until, secret_ciphertext FROM push_identities WHERE id = ?').get(identityId) as { status: string; lease_until: number | null; secret_ciphertext: string };
+  const secret = async () => JSON.parse(await decryptToken(f.env, `push-identity:${identityId}`, stored().secret_ciphertext)) as Record<string, unknown>;
+  const seconds = () => Math.floor(Date.now() / 1000);
   assert.equal(stored().lease_until, null);
-  assert.deepEqual(JSON.parse(await decryptToken(f.env, `push-identity:${identityId}`, stored().secret_ciphertext)), { clientSecret: 'gl-secret', refreshToken: 'refresh-2' });
+  const first = await secret();
+  assert.ok(Math.abs((first.accessExpiresAt as number) - (seconds() + 7200)) <= 2);
+  assert.deepEqual(first, { clientSecret: 'gl-secret', refreshToken: 'refresh-2', accessToken: 'access-1', accessExpiresAt: first.accessExpiresAt });
+  assert.equal(minted.expiresAt, first.accessExpiresAt);
 
-  // A concurrent refresh holds the lease: waiters give up with a busy error (retry sleeps run immediately here).
-  f.sqlite.prepare('UPDATE push_identities SET lease_until = ? WHERE id = ?').run(Math.floor(Date.now() / 1000) + 60, identityId);
+  // With at least 15 minutes left the cached token is handed out without a refresh, even while another request holds the lease.
+  f.sqlite.prepare('UPDATE push_identities SET lease_until = ? WHERE id = ?').run(seconds() + 60, identityId);
+  const reused = await mintPushToken(f.env, gitlab);
+  assert.deepEqual([reused.authorization, reused.expiresAt], [basicHeader('oauth2', 'access-1'), first.accessExpiresAt]);
+  assert.equal(calls.length, 1);
+  f.sqlite.prepare('UPDATE push_identities SET lease_until = NULL WHERE id = ?').run(identityId);
+  const setSecret = async (value: Record<string, unknown>) => f.sqlite.prepare('UPDATE push_identities SET secret_ciphertext = ? WHERE id = ?')
+    .run(await encryptToken(f.env, `push-identity:${identityId}`, JSON.stringify(value)), identityId);
+  await setSecret({ ...first, accessExpiresAt: seconds() + 15 * 60 + 30 });
+  assert.equal((await mintPushToken(f.env, gitlab)).authorization, basicHeader('oauth2', 'access-1'));
+  assert.equal(calls.length, 1);
+
+  // Under 15 minutes left: refresh and persist the new access token, its expiry and the rotated refresh token.
+  await setSecret({ ...first, accessExpiresAt: seconds() + 14 * 60 });
+  const refreshed = await mintPushToken(f.env, gitlab);
+  assert.equal(refreshed.authorization, basicHeader('oauth2', 'access-2'));
+  assert.equal(new URLSearchParams(calls[1]!.body).get('refresh_token'), 'refresh-2');
+  const second = await secret();
+  assert.deepEqual(second, { clientSecret: 'gl-secret', refreshToken: 'refresh-3', accessToken: 'access-2', accessExpiresAt: refreshed.expiresAt });
+  assert.equal(stored().lease_until, null);
+
+  // A concurrent refresh holds the lease and the cache is stale: waiters give up with a busy error (retry sleeps run immediately here).
+  await setSecret({ ...second, accessExpiresAt: seconds() + 60 });
+  f.sqlite.prepare('UPDATE push_identities SET lease_until = ? WHERE id = ?').run(seconds() + 60, identityId);
   const sleep = t.mock.method(globalThis, 'setTimeout', ((callback: () => void) => { queueMicrotask(callback); return 0; }) as unknown as typeof setTimeout);
   assert.deepEqual(await failure(mintPushToken(f.env, gitlab)).then(({ status, code }) => ({ status, code })), { status: 409, code: 'push_identity_busy' });
   assert.ok(sleep.mock.callCount() >= 10);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   sleep.mock.restore();
   f.sqlite.prepare('UPDATE push_identities SET lease_until = NULL WHERE id = ?').run(identityId);
 
   grant = 'invalid';
   const rejected = await failure(mintPushToken(f.env, gitlab));
   assert.deepEqual([rejected.status, rejected.code], [409, 'push_identity_reauthorize']);
-  assert.equal(new URLSearchParams(calls[1]!.body).get('refresh_token'), 'refresh-2');
+  assert.equal(new URLSearchParams(calls[2]!.body).get('refresh_token'), 'refresh-3');
   assert.equal(stored().status, 'authorization_required');
   assert.equal(stored().lease_until, null);
-  assert.deepEqual(JSON.parse(await decryptToken(f.env, `push-identity:${identityId}`, stored().secret_ciphertext)), { clientSecret: 'gl-secret' });
+  assert.deepEqual(await secret(), { clientSecret: 'gl-secret' });
   assert.equal((await failure(mintPushToken(f.env, gitlab))).code, 'push_identity_reauthorize');
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 });
 
 test('only workspace owners and admins manage push identities, and settings are verified live', async t => {
   const f = fixture({ OIDC_SIGNING_KEY: oidcKey.privateKey });
   const { alice, bob, carol, workspaceId } = await f.team();
-  let appId = 123; let appStatus = 200;
+  let appId = 123; let appSlug = 'pistead-bot'; let appStatus = 200;
   mockFetch(t, {
-    'GET https://api.github.com/app': () => Response.json({ id: appId, slug: 'pistead-bot' }, { status: appStatus }),
+    'GET https://api.github.com/app': () => Response.json({ id: appId, slug: appSlug }, { status: appStatus }),
     'GET https://forge.example.org/api/v1/user': call => {
       decodeJwt(call.headers.authorization!.replace(/^Bearer /, ''), oidcKey.publicKey);
       return Response.json({ login: 'forgejo-bot' });
@@ -309,7 +337,9 @@ test('only workspace owners and admins manage push identities, and settings are 
 
   appId = 999;
   assert.deepEqual(await errorCode(await carol.request('POST', path, githubApp)), { status: 400, code: 'push_identity_rejected' });
-  appId = 123; appStatus = 401;
+  appId = 123; appSlug = 'someone-elses-app';
+  assert.deepEqual(await errorCode(await carol.request('POST', path, githubApp)), { status: 400, code: 'push_identity_rejected' });
+  appSlug = 'pistead-bot'; appStatus = 401;
   assert.deepEqual(await errorCode(await carol.request('POST', path, githubApp)), { status: 400, code: 'push_identity_rejected' });
   assert.deepEqual(await errorCode(await carol.request('POST', path, { ...githubApp, secret: rsa('pkcs8', 1024).privateKey })), { status: 400, code: 'invalid_private_key' });
   assert.deepEqual(await errorCode(await carol.request('POST', path, { ...githubApp, config: { appId: '123' } })), { status: 400, code: 'invalid_push_identity' });
@@ -317,6 +347,10 @@ test('only workspace owners and admins manage push identities, and settings are 
   assert.deepEqual(await errorCode(await carol.request('POST', path, { provider: 'azure-devops', kind: 'entra-federation',
     config: { tenantId: 'not-a-guid', clientId: 'x' }, scope: 'contoso' })), { status: 400, code: 'invalid_push_identity' });
 
+  for (const audience of ['api://AzureADTokenExchange', 'API://azureadtokenexchange']) {
+    assert.deepEqual(await errorCode(await alice.request('POST', path, { provider: 'gitea', host: 'forge.example.org', kind: 'forgejo-integration', config: { audience } })),
+      { status: 400, code: 'invalid_push_identity' });
+  }
   const forgejo = await alice.request('POST', path, { provider: 'gitea', host: 'https://Forge.Example.org/', kind: 'forgejo-integration', config: { audience: 'forgejo-push' } });
   assert.equal(forgejo.status, 201);
   const forgejoIdentity = (await forgejo.json() as { identity: { id: string; host: string; config: Record<string, string> } }).identity;
@@ -325,10 +359,11 @@ test('only workspace owners and admins manage push identities, and settings are 
   const listed = await bob.request('GET', path);
   const listedText = await listed.text();
   assert.ok(!listedText.includes('PRIVATE KEY') && !listedText.includes('ciphertext'));
-  const body = JSON.parse(listedText) as { identities: { id: string }[]; oidc: unknown; githubApp: unknown };
+  const body = JSON.parse(listedText) as { identities: { id: string }[]; oidc: unknown; redirectUri: unknown; githubApp: unknown };
   assert.equal(body.identities.length, 2);
   assert.deepEqual(body.oidc, { issuer: origin, subject: `pistead:workspace:${workspaceId}` });
   assert.equal(body.githubApp, null);
+  assert.equal(body.redirectUri, `${origin}/api/push-identities/oauth/callback`);
 
   assert.deepEqual(await errorCode(await bob.request('DELETE', `${path}/${forgejoIdentity.id}`)), { status: 403, code: 'forbidden' });
   assert.equal((await carol.request('DELETE', `${path}/${forgejoIdentity.id}`)).status, 204);
@@ -360,7 +395,8 @@ test('OAuth authorization binds a single-use PKCE state to the starting admin an
   assert.equal(`${url.origin}${url.pathname}`, 'https://git.example.org/login/oauth/authorize');
   assert.deepEqual([url.searchParams.get('client_id'), url.searchParams.get('scope'), url.searchParams.get('response_type'),
     url.searchParams.get('code_challenge_method'), url.searchParams.get('redirect_uri')],
-    ['client-1', 'write:repository', 'code', 'S256', `${origin}/api/push-identities/oauth/callback`]);
+    ['client-1', 'write:repository read:user', 'code', 'S256', `${origin}/api/push-identities/oauth/callback`]);
+  assert.equal(oauthEndpoints('gitlab', 'gitlab.com').scope, 'write_repository read_user');
   const state = url.searchParams.get('state')!;
   const callback = (code: string, value = state) => `/api/push-identities/oauth/callback?code=${code}&state=${value}`;
 

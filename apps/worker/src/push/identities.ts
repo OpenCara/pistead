@@ -60,6 +60,10 @@ function identityInput(input: Record<string, unknown>): IdentityInput {
     if (typeof value !== 'string' || !pattern.test(value)) invalid(`Invalid ${field}.`);
     config[field] = lower ? value.toLowerCase() : value;
   }
+  // Entra's federation audience would let this workspace's assertions double as Azure DevOps credentials.
+  if (kind === 'forgejo-integration' && config.audience!.trim().toLowerCase() === 'api://azureadtokenexchange') {
+    invalid('Choose an audience other than api://AzureADTokenExchange.');
+  }
   let secret: string | null = null;
   if (kind === 'entra-federation' || kind === 'forgejo-integration') {
     if (input.secret !== undefined && input.secret !== null) invalid('This identity kind has no secret.');
@@ -88,6 +92,7 @@ export function registerPushIdentities(app: Hono<WorkerEnv>): void {
     return c.json({
       identities: rows.results.map(publicIdentity),
       oidc: c.env.OIDC_SIGNING_KEY ? { issuer: appOrigin(c.env), subject: workspaceSubject(workspaceId) } : null,
+      redirectUri: c.env.APP_ORIGIN ? oauthRedirectUri(c.env) : null,
       githubApp: GITHUB_APP_ID && GITHUB_APP_SLUG && GITHUB_APP_PRIVATE_KEY
         ? { slug: GITHUB_APP_SLUG, installUrl: githubInstallUrl('github', 'github.com', GITHUB_APP_SLUG) } : null,
     });

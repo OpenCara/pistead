@@ -55,17 +55,21 @@ CREATE TABLE push_credentials (
   binding_id TEXT NOT NULL,
   operation_json TEXT NOT NULL CHECK (json_valid(operation_json)),
   automatic INTEGER NOT NULL CHECK (automatic IN (0, 1)),
+  -- Automatic pushes only: the auto-approve run admission that authorized them (bounds pushes per admission).
+  admission_id TEXT CHECK ((automatic = 1) = (admission_id IS NOT NULL)),
   -- Revocable tokens (GitHub installation tokens) are kept vault-encrypted with 'push-credential:<id>' as AAD until revoked.
   revocation_ciphertext TEXT,
   expires_at INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   completed_at TEXT,
-  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('pushed', 'up-to-date', 'failed')),
+  -- 'unknown': the push failed during or after upload, so the branch may have moved.
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('pushed', 'up-to-date', 'failed', 'unknown')),
   tip TEXT CHECK (tip IS NULL OR (length(tip) = 40 AND tip NOT GLOB '*[^0-9a-f]*')),
   pull_request_url TEXT,
   UNIQUE (session_id, approval_id)
 );
 CREATE INDEX push_credentials_expiry ON push_credentials(expires_at) WHERE completed_at IS NULL;
+CREATE INDEX push_credentials_admission ON push_credentials(admission_id) WHERE admission_id IS NOT NULL;
 
 -- The owner's per-message access choice, so the control plane can confirm an automatic (auto-approve) push.
 ALTER TABLE run_admissions ADD COLUMN access TEXT CHECK (access IS NULL OR access IN ('read', 'approval', 'auto'));

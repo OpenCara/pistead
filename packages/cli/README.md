@@ -49,21 +49,21 @@ Every command needs an exact human approval unless the session's owner turns on 
 
 ## Pushing commits
 
-Agents with the `git_push` tool push their committed session work to a branch of a workspace repository (connector 0.5.0 or newer). A push needs an approval that shows the repository, the branch and the exact session commit, unless the session owner chose **Auto-approve** for that message. Pushes are fast-forward only and never forced: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so files the snapshot left out stay untouched and a later push to the same branch uploads only new objects. The agent can also ask for a pull request; Pistead opens it as the session owner with the owner's connected account (non-GitHub tokens then need write scopes: GitHub Enterprise pull requests write, GitLab `api`, Bitbucket `pullrequest:write`, Azure DevOps Code (Read & write), Gitea `write:repository`).
+Agents with the `git_push` tool push their committed session work to a branch of a workspace repository (connector 0.5.0 or newer). A push needs an approval that shows the repository, the branch and the exact session commit, unless the session owner chose **Auto-approve** for that message. Pushes are fast-forward only and never forced: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so files the snapshot left out stay untouched and a later push to the same branch uploads only new objects. The agent can also ask for a pull request; Pistead opens it as the session owner with the owner's connected account (non-GitHub tokens then need write scopes: GitHub Enterprise pull requests write, GitLab `api`, Bitbucket `write:pullrequest:bitbucket`, Azure DevOps Code (Read & write), Gitea `write:repository`).
 
-Your account tokens never reach the connector. For each push, Pistead checks that the session owner may push to the repository, then mints a short-lived token from a push identity that a workspace owner or admin sets up under **Settings → Workspaces → Push access**. The connector keeps that token in memory only and talks to the Git host directly, so large files never pass through the Pistead server, and the agent's shell and sandbox never see the token.
+Your account tokens never reach the connector. For each push, Pistead checks with the session owner's own account that the owner may push to the repository and, where the Git host reports it, to that branch (GitLab, Gitea/Forgejo and Azure DevOps branch permissions; GitHub protected branches are refused). Bitbucket owners need an Atlassian API token connected with their account email for this check. Pistead then mints a short-lived token from a push identity that a workspace owner or admin sets up under **Settings → Workspaces → Push access**. The connector keeps that token in memory only and talks to the Git host directly, so large files never pass through the Pistead server, and the agent's shell and sandbox never see the token.
 
 | Provider | Push identity | Token |
 |---|---|---|
 | GitHub | The Pistead GitHub App installed on the repository, or your own GitHub App | 1 hour, this repository only, revoked after the push |
 | GitHub Enterprise Server | A GitHub App registered on your server | 1 hour, this repository only, revoked after the push |
-| GitLab | An OAuth application authorized once by a bot account (`write_repository`) | 2 hours, the bot's projects |
-| Bitbucket Cloud | An OAuth consumer of the Bitbucket workspace with Repositories: Write | About 1 hour, the workspace's repositories |
+| GitLab | An OAuth application authorized once by a bot account (`write_repository read_user`) | Up to 2 hours, the bot's projects |
+| Bitbucket Cloud | An OAuth consumer of the Bitbucket workspace with Repositories: Write | 1–2 hours as Bitbucket issues it, the workspace's repositories |
 | Azure DevOps | A Microsoft Entra app with a federated credential that trusts Pistead, its service principal added to the organization | About 1 hour, what you grant the service principal |
-| Forgejo v16 or newer | A Generic JWT Authorized Integration that trusts Pistead | 10 minutes, the repositories you select |
-| Gitea 1.23 or newer | An OAuth2 application authorized once by a bot account (`write:repository`) | 1 hour, the bot's repositories |
+| Forgejo v16 or newer | A Generic JWT Authorized Integration that trusts Pistead | 10 minutes, what the integration allows |
+| Gitea 1.23 or newer | An OAuth2 application authorized once by a bot account (`write:repository read:user`) | Up to 1 hour, the bot's repositories |
 
-Workspace owners and admins can forbid agent pushes to a repository's default branch.
+Except for GitHub, a push token carries everything its identity can reach until it expires, and the host that runs the session receives it. Give each bot, consumer, service principal or integration access to the workspace's repositories only; a Forgejo integration can also require the `repository` and `ref` claims Pistead adds to each token. Workspace owners and admins can forbid agent pushes to a repository's default branch, and removing a repository from the workspace stops pushes from sessions pinned to it.
 
 ## Chat options
 

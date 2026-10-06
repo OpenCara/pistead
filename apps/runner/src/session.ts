@@ -67,7 +67,7 @@ export class RunnerSession {
   private draining = false;
   private modelRef!: { provider: string; modelId: string };
   private models!: Models;
-  /** Explicitly approved pushes run after decide() returns; close() aborts and awaits them. */
+  /** Pushes (approved ones settle after decide() returns; automatic ones inline); close() aborts and awaits them. */
   private pushes = new Set<{ controller: AbortController; done: Promise<void> }>();
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
@@ -598,8 +598,16 @@ export class RunnerSession {
     let status: ApprovalRecord["status"];
     let result: string;
     if (operation.kind === "git.push") {
-      ({ status, result } = await this.runPush(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); }));
-      await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: boundedResult(result) }); });
+      // Tracked like approved pushes so close() aborts it and awaits its settlement before the harness closes.
+      const entry = { controller: new AbortController(), done: Promise.resolve() };
+      const settled = (async () => {
+        const outcome = await this.runPush(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); }, entry.controller.signal);
+        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: boundedResult(outcome.result) }); });
+      })();
+      entry.done = settled.then(() => undefined, () => undefined);
+      this.pushes.add(entry);
+      try { await settled; }
+      finally { this.pushes.delete(entry); }
       return (await this.metadata()).approvals[id]!;
     }
     try {
@@ -802,7 +810,7 @@ export class RunnerSession {
         ? { status: "failed", result: `Push failed: ${error.message}. Nothing was pushed.` }
         : { status: "interrupted", result: "Push was interrupted; the remote branch may or may not have changed. Inspect it; automatic retry is prohibited." };
     }
-    const outcome: PushOutcome = pushed?.outcome ?? "failed";
+    const outcome: PushOutcome = pushed?.outcome ?? (failure?.status === "failed" ? "failed" : "unknown");
     const complete: PushCompleteRequest = { sessionId: this.binding.session.id, approvalId: id, credentialId: credential.credentialId, outcome, ...(pushed ? { tip: pushed.tip } : {}) };
     let completion: PushCompletionResult | undefined;
     let completionFailure = "";

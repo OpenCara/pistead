@@ -76,8 +76,8 @@ export interface PushIdentityRow {
 }
 export interface PushCredentialRow {
   id: string; session_id: string; approval_id: string; requested_by: string; identity_id: string | null; kind: string;
-  binding_id: string; operation_json: string; automatic: number; revocation_ciphertext: string | null; expires_at: number;
-  created_at: string; completed_at: string | null; outcome: 'pushed' | 'up-to-date' | 'failed' | null; tip: string | null;
+  binding_id: string; operation_json: string; automatic: number; admission_id: string | null; revocation_ciphertext: string | null; expires_at: number;
+  created_at: string; completed_at: string | null; outcome: 'pushed' | 'up-to-date' | 'failed' | 'unknown' | null; tip: string | null;
   pull_request_url: string | null;
 }
 export interface SessionAccess { row: SessionRow; permissions: Permission[] }
