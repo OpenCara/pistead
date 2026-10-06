@@ -8,7 +8,9 @@ export class ApiError extends Error {
 async function decode(response: Response): Promise<unknown> {
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) {
-    throw new ApiError(response.status, "BACKEND_UNAVAILABLE", "The API is not available. Start the Worker on localhost:8787 for development, or configure the deployed Worker and its bindings.");
+    // Cloudflare answers with an HTML page, e.g. error 1027 once a Workers Free account has spent its daily requests.
+    if (response.status === 429) throw new ApiError(429, "RATE_LIMITED", "Pistead is over its request limit right now (HTTP 429). Try again later.");
+    throw new ApiError(response.status, "BACKEND_UNAVAILABLE", `The API is not available (HTTP ${response.status}). Start the Worker on localhost:8787 for development, or configure the deployed Worker and its bindings.`);
   }
   const body = await response.json() as { error?: string | { code?: string; message?: string }; code?: string };
   if (!response.ok) {
