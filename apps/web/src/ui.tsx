@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ButtonHTMLAttribu
 import { createRoot } from "react-dom/client";
 import { api, errorMessage } from "./api";
 import { Icon, type IconName } from "./icons";
+import { Popover } from "./popover";
 
 /* ---------- Data hooks ---------- */
 
@@ -173,11 +174,16 @@ export function Field({ label, hint, error, children }: { label: ReactNode; hint
 
 /* ---------- Pickers and overlays ---------- */
 
+/** Closes on Escape or on a pointer press outside both the anchor and the (portaled) popover. */
 function useDismiss(open: boolean, close: () => void) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
-    const pointer = (event: PointerEvent) => { if (!ref.current?.contains(event.target as Node)) close(); };
+    const pointer = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (ref.current?.contains(target) || (target instanceof Element && target.closest(".popover.portal"))) return;
+      close();
+    };
     const key = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
     document.addEventListener("pointerdown", pointer);
     document.addEventListener("keydown", key);
@@ -205,19 +211,19 @@ export function DropdownMenu({ label, icon = "more", items, align = "end", side 
     {trigger
       ? <button type="button" className="btn ghost sm" aria-haspopup="menu" aria-expanded={open} aria-controls={id} onClick={() => setOpen(value => !value)}>{trigger}</button>
       : <Button variant="ghost" size="xs" icon={icon} aria-label={label} title={label} aria-haspopup="menu" aria-expanded={open} aria-controls={id} onClick={event => { event.stopPropagation(); setOpen(value => !value); }} />}
-    {open && <div className={`popover ${side} ${align === "end" ? "align-end" : ""}`} role="menu" id={id}>
+    {open && <Popover anchor={ref} side={side} align={align} role="menu" id={id} className="menu-scroll">
       {items.map((item, index) => item === "separator"
         ? <div className="menu-separator" key={`separator-${index}`} role="separator" />
         : <button key={item.label} type="button" role="menuitem" className={item.destructive ? "menu-item destructive" : "menu-item"} disabled={item.disabled} onClick={event => { event.stopPropagation(); setOpen(false); item.onSelect(); }}>
           {item.icon && <Icon name={item.icon} size={14} />}<span className="menu-text"><span>{item.label}</span>{item.hint && <span className="menu-hint">{item.hint}</span>}</span>
         </button>)}
-    </div>}
+    </Popover>}
   </div>;
 }
 
 export interface Option<T extends string> { value: T; label: string; hint?: string }
 
-/** Searchable picker for long lists (models, agents, hosts). */
+/** Searchable picker for long lists (models, agents, hosts). The list scrolls within the space the viewport leaves. */
 export function Combobox<T extends string>({ value, options, onChange, placeholder = "Select...", label, disabled, side = "below" }: { value: T | ""; options: Option<T>[]; onChange: (value: T) => void; placeholder?: string; label: string; disabled?: boolean; side?: "below" | "above" }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -229,14 +235,14 @@ export function Combobox<T extends string>({ value, options, onChange, placehold
     <button type="button" className="btn ghost sm" aria-label={label} title={label} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} onClick={() => setOpen(current => !current)}>
       <span className="truncate">{selected?.label ?? placeholder}</span><Icon name="chevron-down" size={14} />
     </button>
-    {open && <div className={`popover ${side}`} role="dialog" aria-label={label}>
-      {options.length > 7 && <input className="input" autoFocus placeholder="Search" value={query} onChange={event => setQuery(event.target.value)} aria-label={`Search ${label}`} style={{ height: 32, marginBottom: 4 }} />}
-      <div role="listbox" style={{ maxHeight: 300, overflow: "auto" }}>
+    {open && <Popover anchor={ref} side={side} role="dialog" label={label} className="listbox-popover">
+      {options.length > 7 && <input className="input listbox-search" autoFocus placeholder="Search" value={query} onChange={event => setQuery(event.target.value)} aria-label={`Search ${label}`} />}
+      <div role="listbox" className="listbox">
         {filtered.length ? filtered.map(option => <button key={option.value} type="button" role="option" aria-selected={option.value === value} className="menu-item" onClick={() => { onChange(option.value); close(); }}>
           <span className="truncate">{option.label}</span>{option.hint && <span className="menu-hint">{option.hint}</span>}
         </button>) : <div className="menu-label">No matches</div>}
       </div>
-    </div>}
+    </Popover>}
   </div>;
 }
 
@@ -253,7 +259,7 @@ export function InfoTip({ children, label = "More information" }: { children: Re
   const ref = useDismiss(open, close);
   return <div className="info-tip menu-anchor" ref={ref}>
     <button type="button" aria-label={label} aria-expanded={open} onClick={() => setOpen(value => !value)}><Icon name="info" size={14} /></button>
-    {open && <div className="popover text below" role="note" style={{ width: 320 }}>{children}</div>}
+    {open && <Popover anchor={ref} side="below" role="note" className="text menu-scroll" style={{ width: 320 }}>{children}</Popover>}
   </div>;
 }
 

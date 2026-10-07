@@ -57,7 +57,9 @@ function useAgentCatalog(user: UserProfile, workspace: Workspace | null) {
   const runnableIds = new Set([...privateVersions, ...publishedVersions].map(version => version.id));
   const groups = groupAgents([...publishedVersions, ...ownAgents], runnableIds, new Set(ownAgents.map(agent => agent.id)), workspace?.id);
   const hosts = connections.data?.connectors ?? [];
-  const localModels = (models.data?.models ?? []).filter(model => hosts.some(host => host.id === model.connectorId && !host.revokedAt && (host.ownerId === user.id || Boolean(workspace && host.workspaceIds.includes(workspace.id))) && host.models.some(local => local.provider === model.provider && local.modelId === model.modelId)));
+  const localModels = (models.data?.models ?? [])
+    .filter(model => hosts.some(host => host.id === model.connectorId && !host.revokedAt && (host.ownerId === user.id || Boolean(workspace && host.workspaceIds.includes(workspace.id))) && host.models.some(local => local.provider === model.provider && local.modelId === model.modelId)))
+    .sort((a, b) => a.name.localeCompare(b.name));
   const hostNames = new Map(hosts.map(host => [host.id, host.name]));
   return { own, published, models, connections, groups, localModels, hostNames, runnableIds };
 }

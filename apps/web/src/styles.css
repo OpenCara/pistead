@@ -255,8 +255,9 @@
 
   .row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: var(--space-3);
+    gap: var(--space-2) var(--space-3);
     width: 100%;
     min-height: 52px;
     padding: var(--space-3) var(--space-4);
@@ -270,10 +271,12 @@
   button.row, a.row { cursor: pointer; }
   button.row:hover, a.row:hover { background: var(--interaction); }
   .row-leading { display: grid; flex: 0 0 auto; place-items: center; color: var(--foreground-muted); }
-  .row-content { display: grid; flex: 1 1 auto; gap: 2px; min-width: 0; }
-  .row-title { overflow-wrap: anywhere; }
+  /* The content keeps at least 12 characters; a wide trailing group wraps below it instead of squeezing it. */
+  .row-content { display: grid; flex: 1 1 12ch; gap: 2px; min-width: 0; }
+  .row-title { min-width: 0; overflow-wrap: anywhere; }
+  .row-title > .truncate { display: block; }
   .row-hint { color: var(--foreground-muted); font-size: var(--font-sm); overflow-wrap: anywhere; }
-  .row-trailing { display: flex; flex: 0 0 auto; align-items: center; gap: var(--space-2); color: var(--foreground-muted); }
+  .row-trailing { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--space-2); margin-left: auto; color: var(--foreground-muted); }
 
   .collapsible > summary {
     display: flex;
@@ -414,7 +417,7 @@
     z-index: 50;
     width: max-content;
     min-width: 200px;
-    max-width: min(360px, calc(100vw - 24px));
+    max-width: min(360px, calc(100vw - 16px));
     padding: 4px;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
@@ -422,11 +425,18 @@
     background: var(--surface1);
     box-shadow: var(--shadow);
   }
+  /* Rendered into <body> above dialogs and drawers; sized by popover.tsx so it never leaves the viewport. */
+  .popover.portal { z-index: 120; }
+  .popover.menu-scroll { overflow-y: auto; }
+  .popover.listbox-popover { display: flex; flex-direction: column; min-width: 240px; }
+  .listbox-search { flex: 0 0 auto; height: 32px; margin-bottom: 4px; }
+  .listbox { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
   .popover.text { padding: var(--space-3); color: var(--foreground-muted); font-size: var(--font-sm); line-height: 1.5; }
   .popover.text > * + * { margin-top: var(--space-2); }
   .popover.align-end { right: 0; }
   .popover.below { top: calc(100% + 4px); }
   .popover.above { bottom: calc(100% + 4px); }
+  .popover.portal.below, .popover.portal.above, .popover.portal.align-end { top: auto; right: auto; bottom: auto; }
   .menu-item {
     display: flex;
     align-items: center;
@@ -615,15 +625,16 @@
       inset: 0 auto 0 0;
       z-index: 60;
       width: min(86vw, 320px);
+      visibility: hidden;
       transform: translateX(-100%);
-      transition: transform 180ms ease;
+      transition: transform 180ms ease, visibility 0s 180ms;
       box-shadow: var(--shadow);
     }
-    .app.sidebar-open .sidebar { transform: none; }
+    .app.sidebar-open .sidebar { visibility: visible; transform: none; transition: transform 180ms ease; }
     .app.sidebar-open .scrim { position: fixed; inset: 0; z-index: 55; display: block; background: rgb(0 0 0 / 40%); }
     .content-column { padding: var(--space-5) var(--space-4) var(--space-10); }
     .settings-shell { grid-template-columns: minmax(0, 1fr); align-content: start; }
-    .settings-list { position: static; height: auto; display: flex; gap: var(--space-1); padding: var(--space-2); border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+    .settings-list { position: static; height: auto; display: flex; flex-wrap: wrap; gap: var(--space-1); padding: var(--space-2); border-right: 0; border-bottom: 1px solid var(--border); }
     .settings-list-title { display: none; }
     .settings-list .nav-item { flex: 0 0 auto; width: auto; }
     .settings-list .nav-item > .label { overflow: visible; }
