@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
-import { api, ApiError, errorMessage, segment } from "./api";
+import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon } from "./icons";
+import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import {
@@ -13,8 +14,6 @@ import {
   Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
-
-type StreamStatus = "connecting" | "online" | "reconnecting" | "offline";
 
 function useLiveSession(id: string) {
   const [session, setSession] = useState<SessionRecord | null>(null);
@@ -26,78 +25,16 @@ function useLiveSession(id: string) {
   const refresh = useCallback(() => refreshRef.current(), []);
   const reconnect = useCallback(() => setRevision(current => current + 1), []);
   useEffect(() => {
-    const controller = new AbortController();
-    let stream: EventSource | null = null;
-    let retryTimer: number | undefined;
-    // The poll transport ends every stream after a few seconds; only a reconnect that lingers is news.
-    let reconnectNotice: number | undefined;
-    let retryDelay = 1000;
-    let fetching = false;
-    let queued = false;
-    let stopped = false;
-    const base = `/api/sessions/${segment(id)}`;
     setStatus("connecting");
-    async function fetchCommittedView() {
-      if (stopped || controller.signal.aborted) return;
-      if (fetching) { queued = true; return; }
-      fetching = true;
-      let checkingAccess = true;
-      try {
-        const metadata = await api<{ session: SessionRecord }>(base, { signal: controller.signal });
-        checkingAccess = false;
-        if (!controller.signal.aborted) setSession(metadata.session);
-        const snapshot = await api<{ view: SessionView }>(`${base}/view`, { signal: controller.signal });
-        if (!controller.signal.aborted && !stopped) {
-          setView(snapshot.view);
-          setError("");
-        }
-      } catch (reason) {
-        if (!controller.signal.aborted) {
-          setError(errorMessage(reason));
-          if (checkingAccess && reason instanceof ApiError && [401, 403, 404].includes(reason.status)) {
-            // Do not keep a previously authorized transcript visible after access is revoked.
-            stopped = true;
-            stream?.close();
-            setSession(null);
-            setView(null);
-            setStatus("offline");
-          }
-        }
-      } finally {
-        fetching = false;
-        if (queued && !controller.signal.aborted && !stopped) { queued = false; void fetchCommittedView(); }
-      }
-    }
-    refreshRef.current = () => { void fetchCommittedView(); };
-    function openStream() {
-      if (controller.signal.aborted || stopped) return;
-      stream = new EventSource(`${base}/events`, { withCredentials: true });
-      stream.onopen = () => { retryDelay = 1000; window.clearTimeout(reconnectNotice); reconnectNotice = undefined; setStatus("online"); void fetchCommittedView(); };
-      stream.onerror = () => {
-        if (stopped || controller.signal.aborted) return;
-        reconnectNotice ??= window.setTimeout(() => setStatus("reconnecting"), 3000);
-        stream?.close();
-        void fetchCommittedView();
-        // Recreate even a permanently CLOSED stream after HTTP or content-type failures.
-        retryTimer = window.setTimeout(openStream, retryDelay);
-        retryDelay = Math.min(retryDelay * 2, 16000);
-      };
-      // Events invalidate the committed view; token deltas are never rendered as durable history.
-      stream.onmessage = () => { void fetchCommittedView(); };
-      stream.addEventListener("view", () => { void fetchCommittedView(); });
-      stream.addEventListener("revoked", () => { setStatus("reconnecting"); void fetchCommittedView(); });
-    }
-    void fetchCommittedView().then(openStream);
-    // Revalidate permissions even when a quiet session produces no history events.
-    const interval = window.setInterval(() => { void fetchCommittedView(); }, 15000);
-    return () => { controller.abort(); stream?.close(); window.clearTimeout(retryTimer); window.clearTimeout(reconnectNotice); window.clearInterval(interval); refreshRef.current = () => {}; };
+    const live = startLiveSession(id, { session: setSession, view: setView, error: setError, status: setStatus });
+    refreshRef.current = live.refresh;
+    return () => { live.stop(); refreshRef.current = () => {}; };
   }, [id, revision]);
   return { session, view, error, status, refresh, reconnect };
 }
 
 const PANEL_KEY = "pistead.sessionPanel";
 const toolCall = /^([a-z_]+)\(.*\)$/s;
-const activeStatuses = ["queued", "admitting", "running"];
 
 function usePanelOpen() {
   const [open, setOpen] = useState(() => {
@@ -172,6 +109,13 @@ function SessionPane({ id }: { id: string }) {
   const isOwner = session?.ownerId === user.id;
   const hosts = useConnections(session?.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null);
   const host = hosts.data?.connectors.find(item => item.id === session?.connectorId);
+  const hostOnline = host?.online;
+  const previousHostOnline = useRef(hostOnline);
+  useEffect(() => {
+    // A host that reconnects would otherwise wait out the live-update backoff (up to a minute).
+    if (previousHostOnline.current === false && hostOnline) live.refresh();
+    previousHostOnline.current = hostOnline;
+  }, [hostOnline, live.refresh]);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({
