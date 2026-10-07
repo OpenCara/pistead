@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 
-const directory = new URL('../apps/worker/migrations/', import.meta.url);
+const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const repositoryMigration = '0005_repositories.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 

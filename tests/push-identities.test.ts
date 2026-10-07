@@ -1,54 +1,26 @@
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey, generateKeyPairSync, verify } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { HTTPException } from 'hono/http-exception';
-import { app } from '../apps/worker/src/index.js';
-import type { Env } from '../apps/worker/src/types.js';
-import { decryptToken, encryptToken } from '../apps/worker/src/vault.js';
-import { importRsaPrivateKey, publicJwk, signJwt } from '../apps/worker/src/push/jwt.js';
-import { mintPushToken, oauthEndpoints, revokePushToken, type MintTarget } from '../apps/worker/src/push/mint.js';
+import { app } from '../apps/server/src/index.js';
+import type { Env } from '../apps/server/src/types.js';
+import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
+import { importRsaPrivateKey, publicJwk, signJwt } from '../apps/server/src/push/jwt.js';
+import { mintPushToken, oauthEndpoints, revokePushToken, type MintTarget } from '../apps/server/src/push/mint.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
+import { testDatabase } from './helpers/control-plane.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'push-identities-test-secret-not-for-deployment';
-const migrationsDirectory = new URL('../apps/worker/migrations/', import.meta.url);
-const migrationFiles = readdirSync(migrationsDirectory).filter(name => name.endsWith('.sql')).sort();
 const rsa = (format: 'pkcs1' | 'pkcs8', modulusLength = 2048) =>
   generateKeyPairSync('rsa', { modulusLength, publicKeyEncoding: { type: 'spki', format: 'pem' }, privateKeyEncoding: { type: format, format: 'pem' } });
 const appKey = rsa('pkcs1');
 const oidcKey = rsa('pkcs8');
 
-function fixture(extra: Partial<Env> = {}) {
-  const sqlite = new DatabaseSync(':memory:');
-  sqlite.exec('PRAGMA foreign_keys = ON');
-  for (const file of migrationFiles) sqlite.exec(readFileSync(new URL(file, migrationsDirectory), 'utf8'));
-  class Prepared {
-    values: (string | number | null)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null)[]) { this.values = values; return this; }
-    execute() {
-      const results = sqlite.prepare(this.sql).all(...this.values);
-      const changes = /^\s*SELECT\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
-      return { success: true, results, meta: { changes } };
-    }
-    async all() { return this.execute(); }
-    async run() { return this.execute(); }
-    async first(column?: string) {
-      const row = this.execute().results[0];
-      return row ? column ? row[column] : row : null;
-    }
-  }
-  const database = {
-    prepare(sql: string) { return new Prepared(sql); },
-    async batch(statements: Prepared[]) {
-      sqlite.exec('BEGIN');
-      try { const result = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return result; }
-      catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-    },
-  };
-  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: testSecret,
+async function fixture(t: TestContext, extra: Partial<Env> = {}) {
+  const { db, sqlite } = await testDatabase();
+  t.after(() => db.close());
+  const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: testSecret,
     TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(), VAULT_KEY: Buffer.alloc(32, 9).toString('base64url'), ...extra };
   async function client(name: string) {
     const login = await app.request('/api/auth/test', { method: 'POST', headers: { Origin: origin, Authorization: `Bearer ${testSecret}`, 'Content-Type': 'application/json' },
@@ -119,7 +91,7 @@ const basicHeader = (user: string, secret: string) => `Basic ${Buffer.from(`${us
 const target = (workspaceId: string, values: Partial<MintTarget>): MintTarget =>
   ({ workspaceId, sessionId: 'session-1', provider: 'github', host: 'github.com', fullName: 'acme/app', repositoryId: '7', branch: 'feature/x', ...values });
 
-test('PKCS#1 and PKCS#8 keys sign verifiable RS256 JWTs; JWKS kid is the RFC 7638 thumbprint', async () => {
+test('PKCS#1 and PKCS#8 keys sign verifiable RS256 JWTs; JWKS kid is the RFC 7638 thumbprint', async t => {
   for (const format of ['pkcs1', 'pkcs8'] as const) {
     const pair = rsa(format);
     const jwt = await signJwt(await importRsaPrivateKey(pair.privateKey), { alg: 'RS256', typ: 'JWT' }, { sub: format });
@@ -133,10 +105,10 @@ test('PKCS#1 and PKCS#8 keys sign verifiable RS256 JWTs; JWKS kid is the RFC 763
   await assert.rejects(importRsaPrivateKey(rsa('pkcs8', 1024).privateKey), /2048 bits/);
   await assert.rejects(importRsaPrivateKey('not a key'), /RSA key/);
 
-  const disabled = fixture();
+  const disabled = await fixture(t);
   const missing = await app.request('/.well-known/jwks.json', {}, disabled.env);
   assert.deepEqual(await errorCode(missing), { status: 404, code: 'oidc_unavailable' });
-  const enabled = fixture({ OIDC_SIGNING_KEY: oidcKey.privateKey });
+  const enabled = await fixture(t, { OIDC_SIGNING_KEY: oidcKey.privateKey });
   const discovery = await (await app.request('/.well-known/openid-configuration', {}, enabled.env)).json() as Record<string, unknown>;
   assert.deepEqual(discovery, { issuer: origin, jwks_uri: `${origin}/.well-known/jwks.json`, response_types_supported: ['id_token'],
     subject_types_supported: ['public'], id_token_signing_alg_values_supported: ['RS256'] });
@@ -145,7 +117,7 @@ test('PKCS#1 and PKCS#8 keys sign verifiable RS256 JWTs; JWKS kid is the RFC 763
 });
 
 test('GitHub App identities mint repository-scoped installation tokens and report missing installations', async t => {
-  const f = fixture();
+  const f = await fixture(t);
   const { alice, workspaceId } = await f.team();
   await f.identity({ workspaceId, provider: 'github-enterprise', host: 'git.example.com', kind: 'github-app', config: { appId: '42', slug: 'pistead' },
     secret: appKey.privateKey, createdBy: alice.user.id });
@@ -180,14 +152,14 @@ test('GitHub App identities mint repository-scoped installation tokens and repor
 });
 
 test('github.com falls back to the operator GitHub App only when it is configured', async t => {
-  const plain = fixture();
+  const plain = await fixture(t);
   const owner = await plain.client('owner');
   const workspace = (await (await owner.request('POST', '/api/workspaces', { name: 'w' })).json() as { workspace: { id: string } }).workspace;
   const required = await failure(mintPushToken(plain.env, target(workspace.id, {})));
   assert.deepEqual([required.status, required.code], [409, 'push_identity_required']);
   assert.match(required.message, /Settings → Workspaces/);
 
-  const f = fixture({ GITHUB_APP_ID: '9', GITHUB_APP_SLUG: 'pistead-operator', GITHUB_APP_PRIVATE_KEY: appKey.privateKey });
+  const f = await fixture(t, { GITHUB_APP_ID: '9', GITHUB_APP_SLUG: 'pistead-operator', GITHUB_APP_PRIVATE_KEY: appKey.privateKey });
   const { bob, workspaceId } = await f.team();
   const expires = new Date(Date.now() + 3600_000).toISOString();
   const calls = mockFetch(t, {
@@ -206,7 +178,7 @@ test('github.com falls back to the operator GitHub App only when it is configure
 });
 
 test('Entra federation exchanges a Pistead assertion; Bitbucket uses client credentials; Forgejo gets a scoped JWT', async t => {
-  const f = fixture({ OIDC_SIGNING_KEY: oidcKey.privateKey });
+  const f = await fixture(t, { OIDC_SIGNING_KEY: oidcKey.privateKey });
   const { alice, workspaceId } = await f.team();
   const tenantId = '11111111-2222-3333-4444-555555555555'; const clientId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
   await f.identity({ workspaceId, provider: 'azure-devops', host: 'dev.azure.com', scope: 'contoso', kind: 'entra-federation', config: { tenantId, clientId }, createdBy: alice.user.id });
@@ -248,7 +220,7 @@ test('Entra federation exchanges a Pistead assertion; Bitbucket uses client cred
 });
 
 test('OAuth refresh identities reuse a fresh access token, rotate the refresh token, serialize with a lease, and require reauthorization on invalid_grant', async t => {
-  const f = fixture();
+  const f = await fixture(t);
   const { alice, workspaceId } = await f.team();
   const identityId = await f.identity({ workspaceId, provider: 'gitlab', host: 'gitlab.com', kind: 'oauth-refresh', config: { clientId: 'gl-client', login: 'bot' },
     secret: JSON.stringify({ clientSecret: 'gl-secret', refreshToken: 'refresh-1' }), createdBy: alice.user.id });
@@ -316,7 +288,7 @@ test('OAuth refresh identities reuse a fresh access token, rotate the refresh to
 });
 
 test('only workspace owners and admins manage push identities, and settings are verified live', async t => {
-  const f = fixture({ OIDC_SIGNING_KEY: oidcKey.privateKey });
+  const f = await fixture(t, { OIDC_SIGNING_KEY: oidcKey.privateKey });
   const { alice, bob, carol, workspaceId } = await f.team();
   let appId = 123; let appSlug = 'pistead-bot'; let appStatus = 200;
   mockFetch(t, {
@@ -373,7 +345,7 @@ test('only workspace owners and admins manage push identities, and settings are 
 });
 
 test('OAuth authorization binds a single-use PKCE state to the starting admin and stores the bot refresh token', async t => {
-  const f = fixture();
+  const f = await fixture(t);
   const { alice, carol, workspaceId } = await f.team();
   const calls = mockFetch(t, {
     'POST https://git.example.org/login/oauth/access_token': () => Response.json({ access_token: 'gitea-access', refresh_token: 'gitea-refresh', token_type: 'bearer' }),
@@ -422,8 +394,8 @@ test('OAuth authorization binds a single-use PKCE state to the starting admin an
   assert.ok(f.sqlite.prepare("SELECT 1 FROM audit WHERE action = 'push.identity.authorized'").get());
 });
 
-test('repository push policy is admin-managed and reflected in the workspace repository list', async () => {
-  const f = fixture();
+test('repository push policy is admin-managed and reflected in the workspace repository list', async t => {
+  const f = await fixture(t);
   const { alice, bob, carol, workspaceId } = await f.team();
   const other = (await (await alice.request('POST', '/api/workspaces', { name: 'other' })).json() as { workspace: { id: string } }).workspace;
   const insert = f.sqlite.prepare(`INSERT INTO workspace_repositories (id, workspace_id, provider, host, repository_id, full_name, ref, private, created_at)

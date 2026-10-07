@@ -1,0 +1,69 @@
+import type { Hono } from 'hono';
+import { sha256 } from '../../../packages/shared/src/crypto.js';
+import { bindingForSession } from './sessions.js';
+import type { WorkerEnv } from './types.js';
+import { auditStatement, requireSession } from './db.js';
+import { fail, id, identifier, now } from './http.js';
+import { runnerRequest } from './runner.js';
+import { boundedSnapshotText, loadBackupSnapshot, validateSnapshot, type BackupRow } from './restore-snapshot.js';
+function backupInfo(row: BackupRow) {
+  return { id: row.id, sessionId: row.session_id, size: row.size, sha256: row.sha256, createdAt: row.created_at };
+}
+
+export function registerBackups(app: Hono<WorkerEnv>): void {
+  app.post('/api/sessions/:id/backup', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can create its backups.');
+    if (!c.env.BUCKET) fail(503, 'backup_unavailable', 'Durable backup storage is not configured.');
+    const response = await runnerRequest(c, row, 'backup', '', {});
+    if (!response.headers.get('content-type')?.includes('application/json')) {
+      await response.body?.cancel();
+      fail(502, 'invalid_backup', 'The runner returned an invalid backup format.');
+    }
+    // A bounded snapshot avoids exhausting the server heap. The execution authority checkpoints it first.
+    const bytes = await boundedSnapshotText(response);
+    validateSnapshot(bytes, await bindingForSession(c, row));
+    await requireSession(c, row.id, 'manage');
+    const backupId = id();
+    const encoded = new TextEncoder().encode(bytes);
+    const record: BackupRow = { id: backupId, session_id: row.id, owner_id: row.owner_id,
+      object_key: `sessions/${row.owner_id}/${row.id}/${backupId}.json`, sha256: await sha256(bytes),
+      size: encoded.byteLength, created_at: now() };
+    try {
+      await c.env.BUCKET.put(record.object_key, encoded, {
+        contentType: 'application/json',
+        custom: { ownerId: row.owner_id, sessionId: row.id, sha256: record.sha256, format: 'pi-runner-backup-v1' },
+      });
+    } catch { fail(503, 'backup_unavailable', 'Durable backup storage is unavailable.'); }
+    // An orphaned private object on DB failure is safer than a downloadable DB row with no object.
+    await c.env.DB.batch([
+      c.env.DB.query('INSERT INTO backups (id, session_id, owner_id, object_key, sha256, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(record.id, record.session_id, record.owner_id, record.object_key, record.sha256, record.size, record.created_at),
+      auditStatement(c.env, c.get('auth').userId, 'backup.created', row.workspace_id, row.id, { backupId, sha256: record.sha256, size: record.size }),
+    ]);
+    return c.json({ backup: backupInfo(record) }, 201);
+  });
+  app.get('/api/sessions/:id/backups', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can list its backups.');
+    const result = await c.env.DB.query<BackupRow>('SELECT * FROM backups WHERE session_id = ? AND owner_id = ? ORDER BY created_at DESC LIMIT 100')
+      .bind(row.id, row.owner_id).all();
+    return c.json({ backups: result.map(backupInfo) });
+  });
+  app.get('/api/sessions/:id/backups/:backupId/download', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can download its backups.');
+    if (!c.env.BUCKET) fail(503, 'backup_unavailable', 'Durable backup storage is not configured.');
+    const record = await c.env.DB.query<BackupRow>('SELECT * FROM backups WHERE id = ? AND session_id = ? AND owner_id = ?')
+      .bind(identifier(c.req.param('backupId'), 'backupId'), row.id, row.owner_id).first();
+    if (!record) fail(404, 'not_found', 'Backup not found.');
+    const bytes = await loadBackupSnapshot(c.env, record, await bindingForSession(c, row));
+    await requireSession(c, row.id, 'manage');
+    await auditStatement(c.env, c.get('auth').userId, 'backup.downloaded', row.workspace_id, row.id, { backupId: record.id }).run();
+    return new Response(bytes, { headers: {
+      'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="session-${row.id}-${record.id}.json"`,
+      'Content-Length': String(record.size), 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
+      'X-Backup-SHA256': record.sha256,
+    } });
+  });
+}

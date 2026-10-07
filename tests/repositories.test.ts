@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { crc32, deflateRawSync, gunzipSync, gzipSync } from 'node:zlib';
 import { HTTPException } from 'hono/http-exception';
-import { app } from '../apps/worker/src/index.js';
-import type { ConnectorRelayEnvelope } from '../apps/worker/src/connector-transport.js';
-import { archiveRedirect, boundedRepositoryBody } from '../apps/worker/src/repositories.js';
-import { gitProviderAdapters } from '../apps/worker/src/git/providers.js';
-import type { Env } from '../apps/worker/src/types.js';
-import { encryptToken } from '../apps/worker/src/vault.js';
+import { app } from '../apps/server/src/index.js';
+import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
+import { archiveRedirect, boundedRepositoryBody } from '../apps/server/src/repositories.js';
+import { gitProviderAdapters } from '../apps/server/src/git/providers.js';
+import type { Env } from '../apps/server/src/types.js';
+import { encryptToken } from '../apps/server/src/vault.js';
+import { fakeHub, testDatabase } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { repositoryLimits, type GitAccount, type ProviderRepository, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
@@ -61,42 +61,10 @@ async function repositoryFailure(operation: Promise<unknown>, code: string) {
   await denied(response, 502, code);
 }
 
-function fixture(t: TestContext) {
-  const sqlite = new DatabaseSync(':memory:');
-  t.after(() => sqlite.close());
-  sqlite.exec('PRAGMA foreign_keys = ON');
-  const directory = new URL('../apps/worker/migrations/', import.meta.url);
-  for (const file of readdirSync(directory).filter(name => name.endsWith('.sql')).sort()) {
-    sqlite.exec('BEGIN');
-    try { sqlite.exec(readFileSync(new URL(file, directory), 'utf8')); sqlite.exec('COMMIT'); }
-    catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  }
-  class Prepared {
-    values: (string | number | null | Uint8Array)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null | Uint8Array)[]) { this.values = values; return this; }
-    execute() {
-      const results = sqlite.prepare(this.sql).all(...this.values);
-      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
-      return { success: true, results, meta: { changes, duration: 0, last_row_id: 0, changed_db: changes > 0,
-        size_after: 0, rows_read: results.length, rows_written: changes } };
-    }
-    async all() { return this.execute(); }
-    async run() { return this.execute(); }
-    async first(column?: string) {
-      const row = this.execute().results[0];
-      return row ? column ? row[column] : row : null;
-    }
-  }
-  const database = {
-    prepare(sql: string) { return new Prepared(sql); },
-    async batch(statements: Prepared[]) {
-      sqlite.exec('BEGIN');
-      try { const results = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return results; }
-      catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-    },
-  };
-  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
+async function fixture(t: TestContext): Promise<Fixture> {
+  const { db, sqlite } = await testDatabase();
+  t.after(() => db.close());
+  const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
     TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
     RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url') };
   const request: ApiRequest = async (method, path, body, headers = {}) => app.request(`${origin}${path}`, {
@@ -131,11 +99,11 @@ function fixture(t: TestContext) {
 }
 
 function beforeStatement(t: TestContext, f: Fixture, pattern: RegExp, change: () => void) {
-  const prepare = f.env.DB.prepare.bind(f.env.DB);
+  const query = f.env.DB.query.bind(f.env.DB);
   let changed = false;
-  t.mock.method(f.env.DB, 'prepare', (sql: string) => {
+  t.mock.method(f.env.DB, 'query', (sql: string) => {
     if (!changed && pattern.test(sql)) { changed = true; change(); }
-    return prepare(sql);
+    return query(sql);
   });
   t.after(() => assert.ok(changed, 'The test must reach the guarded write'));
 }
@@ -163,22 +131,12 @@ async function connect(f: Fixture, host: Client, workspaceId: string, claim: obj
 }
 function provisionHub(f: Fixture) {
   const requests: ConnectorRelayEnvelope[] = [];
-  f.env.CONNECTOR_HUB = {
-    idFromName(name: string) { return name; },
-    get(connectorId: string) {
-      return { async fetch(input: RequestInfo | URL, init?: RequestInit) {
-        const request = new Request(input, init);
-        if (request.url === 'https://connector.internal/status' && request.method === 'GET') return Response.json({ online: true });
-        assert.equal(request.url, 'https://connector.internal/rpc');
-        assert.equal(request.method, 'POST');
-        const envelope = await request.json() as ConnectorRelayEnvelope;
-        assert.equal(envelope.connectorId, connectorId);
-        assert.equal(envelope.request.ticket.action, 'create');
-        requests.push(envelope);
-        return Response.json({ ok: true }, { status: 201 });
-      } };
-    },
-  } as unknown as DurableObjectNamespace;
+  f.env.CONNECTOR_HUB = fakeHub({ rpc(connectorId, envelope) {
+    assert.equal(envelope.connectorId, connectorId);
+    assert.equal(envelope.request.ticket.action, 'create');
+    requests.push(envelope);
+    return Response.json({ ok: true }, { status: 201 });
+  } });
   return requests;
 }
 
@@ -219,7 +177,7 @@ function github(t: TestContext) {
 }
 
 async function connectedSetup(t: TestContext) {
-  const f = fixture(t); const remote = github(t);
+  const f = await fixture(t); const remote = github(t);
   const admin = await f.client('admin'); const host = await f.client('host'); const owner = await f.client('owner');
   const team = await workspace(admin);
   await member(admin, team.id, host); await member(admin, team.id, owner);
@@ -246,7 +204,7 @@ function download(f: Fixture, session: SessionRecord, pin: SessionRepository, co
 
 // Existing legacy rows must remain downloadable, but new production sessions cannot create them.
 async function legacySetup(t: TestContext) {
-  const f = fixture(t); const remote = github(t); const owner = await f.client('legacy-owner');
+  const f = await fixture(t); const remote = github(t); const owner = await f.client('legacy-owner');
   const team = await workspace(owner); const repository = await bindRepository(owner, team.id);
   const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
     name: 'Legacy model', provider: 'openai', modelId: 'legacy-model',
@@ -265,7 +223,7 @@ async function legacySetup(t: TestContext) {
 }
 
 test('repository API separates cookie/CSRF authentication, administrator writes, and member reads', async t => {
-  const f = fixture(t); const remote = github(t);
+  const f = await fixture(t); const remote = github(t);
   const owner = await f.client('owner'); const admin = await f.client('admin'); const reader = await f.client('reader'); const outsider = await f.client('outsider');
   const team = await workspace(owner); const path = `/api/workspaces/${team.id}/repositories`;
   await member(owner, team.id, admin, 'admin'); await member(owner, team.id, reader);
@@ -296,7 +254,7 @@ test('repository API separates cookie/CSRF authentication, administrator writes,
 });
 
 test('picker uses the acting GitHub token, projects safe metadata and bounds pagination', async t => {
-  const f = fixture(t); const remote = github(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  const f = await fixture(t); const remote = github(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   remote.state.picker = async () => Response.json([{ ...metadata, token: alice.githubToken, clone_url: 'credential-bearing upstream field' }]);
   for (const actor of [alice, bob]) {
     const result = await json(await actor.request('GET', `${githubPicker}?page=2`));
@@ -313,7 +271,7 @@ test('picker uses the acting GitHub token, projects safe metadata and bounds pag
 });
 
 test('shared repository configuration never lends another member a GitHub token', async t => {
-  const f = fixture(t); const remote = github(t); const owner = await f.client('owner'); const admin = await f.client('admin');
+  const f = await fixture(t); const remote = github(t); const owner = await f.client('owner'); const admin = await f.client('admin');
   const synthetic = await f.client('synthetic', false); const team = await workspace(owner);
   await member(owner, team.id, admin, 'admin'); await member(owner, team.id, synthetic, 'admin');
   await bindRepository(owner, team.id);
@@ -329,7 +287,7 @@ test('shared repository configuration never lends another member a GitHub token'
 
 for (const changed of [{ id: metadata.id + 1 }, { full_name: 'acme/renamed' }, { full_name: 'Acme/private-repo' }]) {
   test(`binding rejects exact numeric/name identity mismatch: ${JSON.stringify(changed)}`, async t => {
-    const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
+    const f = await fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
     remote.state.metadata = async () => Response.json({ ...metadata, ...changed });
     await denied(await actor.request('POST', `/api/workspaces/${team.id}/repositories`, repositoryInput), 409, 'repository_identity_changed');
     assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_repositories').get()!.n, 0);
@@ -339,7 +297,7 @@ for (const changed of [{ id: metadata.id + 1 }, { full_name: 'acme/renamed' }, {
 }
 
 test('binding validates numeric IDs and allowed fields before fetching, defaults the ref, and rejects duplicates', async t => {
-  const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
+  const f = await fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
   const path = `/api/workspaces/${team.id}/repositories`;
   for (const repositoryId of [metadata.id, '0', '-1', '1.5', '01', String(Number.MAX_SAFE_INTEGER + 1), 'acme', null]) {
     await denied(await actor.request('POST', path, { ...repositoryInput, repositoryId }), 400, 'invalid_repository');
@@ -359,7 +317,7 @@ test('binding validates numeric IDs and allowed fields before fetching, defaults
 
 for (const route of ['picker', 'binding'] as const) {
   test(`${route} rechecks the acting token after asynchronous metadata`, async t => {
-    const f = fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
+    const f = await fixture(t); const remote = github(t); const actor = await f.client('actor'); const team = await workspace(actor);
     const revoke = async () => {
       f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(actor.user.id);
       return Response.json(route === 'picker' ? [metadata] : metadata);
@@ -480,7 +438,7 @@ for (const change of ['token-deleted', 'token-rotated', 'github-identity', 'auth
   });
 
   test(`repository binding rechecks ${change} in its final write`, async t => {
-    const f = fixture(t); const remote = github(t); const owner = await f.client('owner');
+    const f = await fixture(t); const remote = github(t); const owner = await f.client('owner');
     const team = await workspace(owner);
     const rotated = await encryptToken(f.env, owner.user.id, 'rotated-owner-token');
     beforeStatement(t, f, /^INSERT INTO workspace_repositories\b/, () => {
@@ -497,7 +455,7 @@ for (const change of ['token-deleted', 'token-rotated', 'github-identity', 'auth
 
 for (const change of ['identity', 'test-mode'] as const) {
   test(`legacy empty repository session admission rechecks fixture ${change}`, async t => {
-    const f = fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
+    const f = await fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
     const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
       name: 'Faux', provider: 'faux', modelId: 'faux',
     }), 201);
@@ -576,7 +534,7 @@ test('real users still require configured workspaces for pairing, claim, share a
 });
 
 test('testMode does not let a real user start an unconnected faux-model session', async t => {
-  const f = fixture(t); const owner = await f.client('owner'); const team = await workspace(owner);
+  const f = await fixture(t); const owner = await f.client('owner'); const team = await workspace(owner);
   const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
     name: 'Faux', provider: 'faux', modelId: 'faux',
   }), 201);
@@ -588,7 +546,7 @@ test('testMode does not let a real user start an unconnected faux-model session'
 });
 
 test('configured pairing claims privately associate and import models, but lost membership leaves a pairing unused', async t => {
-  const f = fixture(t); github(t);
+  const f = await fixture(t); github(t);
   const admin = await f.client('admin'); const host = await f.client('host');
   const team = await workspace(admin);
   await member(admin, team.id, host);
@@ -614,7 +572,7 @@ test('configured pairing claims privately associate and import models, but lost 
 });
 
 test('only explicitly enabled synthetic fixtures can claim a legacy workspace-free pairing', async t => {
-  const f = fixture(t); const synthetic = await f.client('synthetic', false); const real = await f.client('real');
+  const f = await fixture(t); const synthetic = await f.client('synthetic', false); const real = await f.client('real');
   assert.equal((await real.request('POST', '/api/connectors/pairings', { name: 'No workspace' })).status, 400);
   const pending = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Legacy fixture' }), 201)).pairing;
   const other = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Disabled fixture' }), 201)).pairing;
@@ -632,7 +590,7 @@ test('only explicitly enabled synthetic fixtures can claim a legacy workspace-fr
 
 for (const scoped of [false, true]) {
   test(`legacy ${scoped ? 'workspace-bound' : 'workspace-free'} pairing rechecks test-mode expiry at the write`, async t => {
-    const f = fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
+    const f = await fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
     beforeStatement(t, f, /^INSERT INTO connector_pairings\b/, () => {
       f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
     });
@@ -644,7 +602,7 @@ for (const scoped of [false, true]) {
 }
 
 test('legacy pairing claim rechecks test-mode expiry without consuming its code', async t => {
-  const f = fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
+  const f = await fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
   const pending = await pair(owner, team.id);
   beforeStatement(t, f, /^INSERT INTO connectors\b/, () => {
     f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
@@ -658,7 +616,7 @@ test('legacy pairing claim rechecks test-mode expiry without consuming its code'
 });
 
 test('legacy sharing rechecks test-mode expiry before sharing an unconfigured workspace', async t => {
-  const f = fixture(t); const owner = await f.client('synthetic', false);
+  const f = await fixture(t); const owner = await f.client('synthetic', false);
   const existing = await workspace(owner); const target = await workspace(owner);
   const connector = await connect(f, owner, existing.id);
   beforeStatement(t, f, /^INSERT INTO connector_shares\b/, () => {
@@ -900,7 +858,7 @@ test('repository body deadline cancels a stalled stream without real-time waits'
 });
 
 test('GitHub metadata has a separate small size bound and rejects malformed JSON/UTF-8', async t => {
-  const f = fixture(t); const remote = github(t); const owner = await f.client('owner'); let cancelled = false;
+  const f = await fixture(t); const remote = github(t); const owner = await f.client('owner'); let cancelled = false;
   remote.state.picker = async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
     headers: { 'Content-Length': String(512 * 1024 + 1) },
   });
@@ -995,7 +953,7 @@ function zipArchive(files: Record<string, string>): Uint8Array<ArrayBuffer> {
 }
 
 async function providerSetup(t: TestContext, claim: object = providerManifest) {
-  const f = fixture(t); const remote = gitea(t);
+  const f = await fixture(t); const remote = gitea(t);
   const admin = await f.client('admin'); const host = await f.client('host'); const owner = await f.client('owner');
   const team = await workspace(admin);
   await member(admin, team.id, host); await member(admin, team.id, owner);
@@ -1017,7 +975,7 @@ async function providerSetup(t: TestContext, claim: object = providerManifest) {
 }
 
 test('token accounts are verified, stored encrypted, never returned, private to their user and replaced in place', async t => {
-  const f = fixture(t); const remote = gitea(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  const f = await fixture(t); const remote = gitea(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   const account = await connectGitea(alice);
   assert.deepEqual({ ...account, id: '', createdAt: '' }, { id: '', provider: 'gitea', host: giteaHost, organization: '', login: 'gitea-user', createdAt: '' });
   assert.deepEqual(remote.calls.map(call => [call.url, call.authorization]), [[`${giteaApi}/user`, `token ${giteaToken(alice)}`]]);
@@ -1048,7 +1006,7 @@ test('token accounts are verified, stored encrypted, never returned, private to 
 });
 
 test('account input is validated before any provider request and rejected tokens are not stored', async t => {
-  const f = fixture(t); const remote = gitea(t); const alice = await f.client('alice');
+  const f = await fixture(t); const remote = gitea(t); const alice = await f.client('alice');
   const token = 'valid-token';
   for (const [input, code] of [
     [{ provider: 'github', token }, 'invalid_git_provider'],
@@ -1169,7 +1127,7 @@ for (const change of ['token-rotated', 'token-deleted', 'account-reassigned', 'c
 }
 
 test('token-provider binding rechecks the acting account in its final write', async t => {
-  const f = fixture(t); const remote = gitea(t); const admin = await f.client('admin'); const team = await workspace(admin);
+  const f = await fixture(t); const remote = gitea(t); const admin = await f.client('admin'); const team = await workspace(admin);
   await connectGitea(admin);
   const rotated = await encryptToken(f.env, admin.user.id, 'rotated-gitea-token');
   beforeStatement(t, f, /^INSERT INTO workspace_repositories\b/, () => {

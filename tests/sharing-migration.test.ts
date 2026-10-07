@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import { sessionAccess } from '../apps/worker/src/db.js';
-import type { Env } from '../apps/worker/src/types.js';
+import { sessionAccess } from '../apps/server/src/db.js';
+import { openDatabase } from '../apps/server/src/db/index.js';
+import type { Env } from '../apps/server/src/types.js';
 
-const directory = new URL('../apps/worker/migrations/', import.meta.url);
+const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const sharingMigration = '0006_sharing_defaults.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 
@@ -20,8 +23,9 @@ function migrate(sqlite: DatabaseSync, files: string[]) {
 }
 
 function fixture(t: TestContext) {
-  const sqlite = new DatabaseSync(':memory:');
-  t.after(() => sqlite.close());
+  const path = join(mkdtempSync(join(tmpdir(), 'pistead-sharing-')), 'control-plane.sqlite');
+  const sqlite = new DatabaseSync(path);
+  t.after(() => { sqlite.close(); rmSync(dirname(path), { recursive: true, force: true }); });
   sqlite.exec('PRAGMA foreign_keys = ON');
   assert.ok(migrationFiles.includes(sharingMigration));
   migrate(sqlite, migrationFiles.filter(file => file < sharingMigration));
@@ -63,11 +67,11 @@ function fixture(t: TestContext) {
     INSERT INTO backups (id, session_id, owner_id, object_key, sha256, size, created_at)
       VALUES ('backup', 'connected-session', 'owner', 'private-backup-key', 'digest', 1, '2026-01-04');
   `);
-  return sqlite;
+  return { sqlite, path };
 }
 
 test('sharing migration backfills every populated share without creating new grants or losing legacy rows', async t => {
-  const sqlite = fixture(t);
+  const { sqlite, path } = fixture(t);
   const tables = ['users', 'workspaces', 'workspace_members', 'connectors', 'connector_shares', 'models',
     'agents', 'agent_versions', 'sessions', 'session_grants', 'backups'];
   const original = tables.map(table => ({ table, rows: sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all() }));
@@ -87,12 +91,11 @@ test('sharing migration backfills every populated share without creating new gra
   ]);
   assert.deepEqual(sqlite.prepare('PRAGMA foreign_key_check').all(), []);
   assert.equal(sqlite.prepare('PRAGMA foreign_keys').get()!.foreign_keys, 1);
+  // Read the migrated file through the real provider; it must not re-run the hand-applied migrations.
+  const db = await openDatabase(`sqlite://${path}`);
+  t.after(() => db.close());
   const env: Env = {
-    DB: { prepare(sql: string) {
-      return { bind(...values: (string | number | null)[]) {
-        return { async first() { return sqlite.prepare(sql).get(...values) ?? null; } };
-      } };
-    } } as unknown as D1Database,
+    DB: db,
     APP_ORIGIN: 'http://localhost:8787', TEST_AUTH_ENABLED: 'true',
     TEST_AUTH_SECRET: 'sharing-migration-test-secret-not-for-deployment',
     TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
@@ -107,7 +110,7 @@ test('sharing migration backfills every populated share without creating new gra
 });
 
 test('sharing migration constrains visibility and associations while keeping association and runtime grants independent', t => {
-  const sqlite = fixture(t);
+  const { sqlite } = fixture(t);
   migrate(sqlite, [sharingMigration]);
   const insert = sqlite.prepare('INSERT INTO connector_workspaces (connector_id, workspace_id, created_at) VALUES (?, ?, ?)');
   assert.throws(() => insert.run('shared-host', 'team', '2026-01-05'), /UNIQUE/);

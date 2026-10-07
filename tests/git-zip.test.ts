@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { crc32, deflateRawSync, gunzipSync } from 'node:zlib';
 import { HTTPException } from 'hono/http-exception';
-import { zipToTarGz } from '../apps/worker/src/git/zip.js';
+import { zipToTarGz } from '../apps/server/src/git/zip.js';
 import { repositoryLimits } from '../packages/shared/src/repositories.js';
 
 interface ZipInput {

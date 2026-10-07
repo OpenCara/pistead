@@ -1,18 +1,19 @@
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import test from 'node:test';
-import { app } from '../apps/worker/src/index.js';
-import type { Env } from '../apps/worker/src/types.js';
-import { decryptToken, encryptToken } from '../apps/worker/src/vault.js';
-import { userIdentifier } from '../apps/worker/src/http.js';
-import { sessionAccess } from '../apps/worker/src/db.js';
+import test, { type TestContext } from 'node:test';
+import { app } from '../apps/server/src/index.js';
+import type { Env } from '../apps/server/src/types.js';
+import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
+import { userIdentifier } from '../apps/server/src/http.js';
+import { sessionAccess } from '../apps/server/src/db.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
+import { testDatabase } from './helpers/control-plane.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'control-plane-test-secret-not-for-deployment';
 const internalSecret = 'control-plane-internal-secret-not-for-deployment';
-const migrationsDirectory = new URL('../apps/worker/migrations/', import.meta.url);
+const migrationsDirectory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const migrationFiles = readdirSync(migrationsDirectory).filter(name => name.endsWith('.sql')).sort();
 
 function migrate(sqlite: DatabaseSync, files = migrationFiles) {
@@ -29,39 +30,10 @@ function migrate(sqlite: DatabaseSync, files = migrationFiles) {
   }
 }
 
-function fixture() {
-  const sqlite = new DatabaseSync(':memory:');
-  migrate(sqlite);
-  let queryCount = 0;
-  class Prepared {
-    values: (string | number | null | Uint8Array)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null | Uint8Array)[]) { this.values = values; return this; }
-    execute() {
-      queryCount++;
-      const results = sqlite.prepare(this.sql).all(...this.values);
-      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
-      return { success: true, results, meta: { changes, duration: 0, last_row_id: 0, changed_db: changes > 0, size_after: 0, rows_read: results.length, rows_written: changes } };
-    }
-    async all() { return this.execute(); }
-    async run() { return this.execute(); }
-    async first(column?: string) {
-      const row = this.execute().results[0];
-      return row ? column ? row[column] : row : null;
-    }
-  }
-  const database = {
-    prepare(sql: string) { return new Prepared(sql); },
-    async batch(statements: Prepared[]) {
-      sqlite.exec('BEGIN');
-      try {
-        const result = statements.map(statement => statement.execute());
-        sqlite.exec('COMMIT');
-        return result;
-      } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-    },
-  };
-  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
+async function fixture(t: TestContext) {
+  const { db, sqlite, queryCount } = await testDatabase();
+  t.after(() => db.close());
+  const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
     TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
     RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url') };
   async function client(name: string) {
@@ -77,7 +49,7 @@ function fixture() {
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers }, body: body === undefined ? undefined : JSON.stringify(body) }, env);
     } };
   }
-  return { sqlite, env, client, queryCount: () => queryCount };
+  return { sqlite, env, client, queryCount };
 }
 
 function seedLegacySchema(sqlite: DatabaseSync) {
@@ -139,8 +111,8 @@ test('connector migration preserves populated legacy rows, foreign keys, and imm
   }
 });
 
-test('connector schema enforces credentials, shares, catalog identity, and paired immutable session routing', t => {
-  const f = fixture(); t.after(() => f.sqlite.close());
+test('connector schema enforces credentials, shares, catalog identity, and paired immutable session routing', async t => {
+  const f = await fixture(t);
   const sqlite = f.sqlite;
   seedLegacySchema(sqlite);
   const insertConnector = sqlite.prepare('INSERT INTO connectors (id, owner_id, name, credential_hash, created_at) VALUES (?, ?, ?, ?, ?)');
@@ -208,7 +180,7 @@ test('connector schema enforces credentials, shares, catalog identity, and paire
 });
 
 test('test auth is disabled by default, secret gated, isolated, and expires existing cookies', async t => {
-  const f = fixture(); t.after(() => f.sqlite.close());
+  const f = await fixture(t);
   f.env.TEST_AUTH_ENABLED = 'false';
   let response = await app.request('/api/auth/test', { method: 'POST', headers: { Authorization: `Bearer ${testSecret}`, 'Content-Type': 'application/json' }, body: '{}' }, f.env);
   assert.equal(response.status, 404);
@@ -229,7 +201,7 @@ test('test auth is disabled by default, secret gated, isolated, and expires exis
 });
 
 test('cookie mutations require CSRF and reject hostile origins; logout revokes the DB session', async t => {
-  const f = fixture(); t.after(() => f.sqlite.close());
+  const f = await fixture(t);
   const alice = await f.client('alice');
   assert.equal((await alice.request('POST', '/api/workspaces', { name: 'blocked' }, { 'x-csrf-token': '' })).status, 403);
   assert.equal((await alice.request('POST', '/api/workspaces', { name: 'blocked' }, { Origin: 'https://attacker.invalid' })).status, 403);
@@ -239,7 +211,7 @@ test('cookie mutations require CSRF and reject hostile origins; logout revokes t
 });
 
 test('published definitions are immutable and do not grant authors access to another owner session', async t => {
-  const f = fixture(); t.after(() => f.sqlite.close());
+  const f = await fixture(t);
   const alice = await f.client('alice'); const bob = await f.client('bob'); const eve = await f.client('eve');
   const workspace = (await (await alice.request('POST', '/api/workspaces', { name: 'team' })).json() as { workspace: { id: string } }).workspace;
   assert.equal((await alice.request('POST', `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: 'member' })).status, 200);
@@ -278,7 +250,7 @@ test('AES-GCM vault binds ciphertext to the account and rejects tampering', asyn
 });
 
 test('internal broker rejects wrong operations and consumes exact approval capability before GitHub', async t => {
-  const f = fixture(); t.after(() => f.sqlite.close());
+  const f = await fixture(t);
   const ownerId = 'github:7'; const createdAt = new Date().toISOString();
   f.sqlite.prepare('INSERT INTO users (id,github_id,github_login,display_name,git_name,git_email,auth_kind,created_at) VALUES (?,?,?,?,?,?,?,?)')
     .run(ownerId, '7', 'owner', 'Owner', 'Owner', 'owner@example.test', 'github', createdAt);
@@ -342,7 +314,7 @@ test('namespace-aware user IDs accept real GitHub members and reject malformed i
   for (const value of ['github:0', 'github:01', 'github:-1', 'github:abc', 'test:', 'other:123', `test:${'a'.repeat(129)}`]) {
     assert.throws(() => userIdentifier(value));
   }
-  const f = fixture(); t.after(() => f.sqlite.close());
+  const f = await fixture(t);
   const alice = await f.client('alice');
   const workspace = (await (await alice.request('POST', '/api/workspaces', { name: 'real memberships' })).json() as { workspace: { id: string } }).workspace;
   f.sqlite.prepare('INSERT INTO users (id,github_id,github_login,display_name,git_name,git_email,auth_kind,created_at) VALUES (?,?,?,?,?,?,?,?)')
@@ -353,8 +325,8 @@ test('namespace-aware user IDs accept real GitHub members and reject malformed i
   assert.equal((await alice.request('DELETE', `/api/workspaces/${workspace.id}/members/github%3A12345`)).status, 204);
 });
 
-async function pollingFixture() {
-  const f = fixture();
+async function pollingFixture(t: TestContext) {
+  const f = await fixture(t);
   const owner = await f.client('poll-owner');
   const reader = await f.client('poll-reader');
   const workspace = (await (await owner.request('POST', '/api/workspaces', { name: 'polling' })).json() as { workspace: { id: string } }).workspace;
@@ -372,7 +344,7 @@ async function pollingFixture() {
 }
 
 test('poll SSE emits at most four authoritative views within the subrequest budget', async t => {
-  const f = await pollingFixture(); t.after(() => f.sqlite.close());
+  const f = await pollingFixture(t);
   const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let polls = 0;
@@ -398,11 +370,11 @@ test('poll SSE emits at most four authoritative views within the subrequest budg
   assert.equal((await reader.read()).done, true);
   assert.equal(polls, 4);
   assert.equal((body.match(/event: view/g) ?? []).length, 4);
-  assert.ok(f.queryCount() - before + polls <= 27, 'Four snapshots including restore-state checks must fit the Free-plan subrequest budget');
+  assert.ok(f.queryCount() - before + polls <= 27, 'Four snapshots including restore-state checks must fit the query budget');
 });
 
 test('poll SSE rechecks live grants after fetching and before emitting each snapshot', async t => {
-  const f = await pollingFixture(); t.after(() => f.sqlite.close());
+  const f = await pollingFixture(t);
   const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let polls = 0;
@@ -432,7 +404,7 @@ test('poll SSE rechecks live grants after fetching and before emitting each snap
 });
 
 test('poll SSE stops polling after the consumer disconnects', async t => {
-  const f = await pollingFixture(); t.after(() => f.sqlite.close());
+  const f = await pollingFixture(t);
   const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let polls = 0;
@@ -447,7 +419,7 @@ test('poll SSE stops polling after the consumer disconnects', async t => {
 });
 
 test('poll SSE deadline remains effective while a consumer applies backpressure', async t => {
-  const f = await pollingFixture(); t.after(() => f.sqlite.close());
+  const f = await pollingFixture(t);
   const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let polls = 0;
@@ -478,7 +450,7 @@ test('poll SSE deadline remains effective while a consumer applies backpressure'
 });
 
 test('poll SSE deadline also closes a stalled upstream without exposing errors', async t => {
-  const f = await pollingFixture(); t.after(() => f.sqlite.close());
+  const f = await pollingFixture(t);
   const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   let began!: () => void;

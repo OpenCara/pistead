@@ -1,16 +1,13 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { app } from '../apps/worker/src/index.js';
-import type { Env } from '../apps/worker/src/types.js';
-import { encryptToken } from '../apps/worker/src/vault.js';
+import { app } from '../apps/server/src/index.js';
+import type { Env } from '../apps/server/src/types.js';
+import { encryptToken } from '../apps/server/src/vault.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
+import { testDatabase } from './helpers/control-plane.js';
 
 const internalSecret = 'push-broker-internal-secret-not-for-deployment';
-const migrationsDirectory = new URL('../apps/worker/migrations/', import.meta.url);
-const migrationFiles = readdirSync(migrationsDirectory).filter(name => name.endsWith('.sql')).sort();
 const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const owner = 'github:7'; const approver = 'github:8'; const viewer = 'github:9';
 const sessionCommit = 'a'.repeat(40); const pinnedCommit = 'b'.repeat(40); const tip = 'c'.repeat(40);
@@ -29,29 +26,10 @@ const azurePin = { bindingId: 'binding-az', commit: pinnedCommit, fullName: 'con
 type Route = (url: URL, init: RequestInit) => Response | undefined;
 interface Call { method: string; url: string; authorization: string | null; redirect?: RequestRedirect; body?: unknown }
 
-function database(sqlite: DatabaseSync): D1Database {
-  class Prepared {
-    values: (string | number | null)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null)[]) { this.values = values; return this; }
-    execute() {
-      const results = sqlite.prepare(this.sql).all(...this.values);
-      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
-      return { success: true, results, meta: { changes } };
-    }
-    async all() { return this.execute(); }
-    async run() { return this.execute(); }
-    async first(column?: string) { const row = this.execute().results[0]; return row ? column ? row[column] : row : null; }
-  }
-  return { prepare: (sql: string) => new Prepared(sql), batch: async (statements: Prepared[]) => statements.map(item => item.execute()) } as unknown as D1Database;
-}
-
 async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbucketWrite?: boolean } = {}) {
-  const sqlite = new DatabaseSync(':memory:');
-  sqlite.exec('PRAGMA foreign_keys = ON');
-  for (const file of migrationFiles) sqlite.exec(readFileSync(new URL(file, migrationsDirectory), 'utf8'));
-  t.after(() => sqlite.close());
-  const env: Env = { DB: database(sqlite), APP_ORIGIN: 'http://localhost:8787', TEST_AUTH_ENABLED: 'true',
+  const { db, sqlite } = await testDatabase();
+  t.after(() => db.close());
+  const env: Env = { DB: db, APP_ORIGIN: 'http://localhost:8787', TEST_AUTH_ENABLED: 'true',
     TEST_AUTH_SECRET: 'push-broker-test-secret-not-for-deployment', TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
     RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url'),
     GITHUB_APP_ID: '4242', GITHUB_APP_SLUG: 'pistead-test', GITHUB_APP_PRIVATE_KEY: privateKey } as Env;
