@@ -109,6 +109,13 @@ function SessionPane({ id }: { id: string }) {
   const isOwner = session?.ownerId === user.id;
   const hosts = useConnections(session?.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null);
   const host = hosts.data?.connectors.find(item => item.id === session?.connectorId);
+  const hostOnline = host?.online;
+  const previousHostOnline = useRef(hostOnline);
+  useEffect(() => {
+    // A host that reconnects would otherwise wait out the live-update backoff (up to a minute).
+    if (previousHostOnline.current === false && hostOnline) live.refresh();
+    previousHostOnline.current = hostOnline;
+  }, [hostOnline, live.refresh]);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({

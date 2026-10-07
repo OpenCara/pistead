@@ -143,7 +143,6 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
       handlers.status("online");
       showView(snapshot.view);
     });
-    current.addEventListener("revoked", () => { if (stream === current) void load(true); });
     // EventSource reports the end of every stream as an error, including the Worker's normal close.
     current.addEventListener("error", () => {
       if (stream !== current) return;
