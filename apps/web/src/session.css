@@ -107,7 +107,10 @@
   }
   .composer > textarea::placeholder { color: var(--foreground-muted); }
   .composer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); min-width: 0; }
-  .composer-hint { flex: 1 1 0; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); }
+  .composer-toolbar .menu-anchor { min-width: 0; max-width: 100%; }
+  .composer-toolbar .menu-anchor > .btn { max-width: 100%; }
+  /* The hint takes what is left of the row; below ~160px it wraps to its own line rather than truncating. */
+  .composer-hint { flex: 1 1 160px; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
   .composer-send.btn { width: var(--control-sm); margin-left: auto; padding: 0; border-radius: var(--radius-full); }
 
   /* Right panel: pinned column on wide screens, overlay below. */

@@ -359,7 +359,7 @@ function ComposerInput({ value, onChange, onSubmit, busy, disabled, label, place
       onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} />
     <div className="composer-toolbar">
       {tools}
-      <span className="composer-hint truncate">{hint}</span>
+      <span className="composer-hint">{hint}</span>
       <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !value.trim()} />
     </div>
   </form>;

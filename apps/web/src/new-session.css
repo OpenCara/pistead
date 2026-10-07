@@ -41,8 +41,10 @@
     outline: none;
   }
   .composer-input::placeholder { color: var(--foreground-muted); }
-  .composer-toolbar { display: flex; align-items: center; gap: var(--space-1); min-width: 0; }
-  .composer-toolbar .menu-anchor { min-width: 0; }
+  .composer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); min-width: 0; }
+  .composer-toolbar .menu-anchor { min-width: 0; max-width: 100%; }
+  .composer-toolbar .menu-anchor > .btn { max-width: 100%; }
+  .composer-toolbar > .spacer { flex: 1 1 0; }
   .composer-send { flex: 0 0 auto; border-radius: var(--radius-full); }
   .composer-send.btn.icon-only { width: var(--control-md); }
 
@@ -54,5 +56,6 @@
 
   @media (max-width: 640px) {
     .new-session { padding: var(--space-8) var(--space-4); justify-content: flex-end; }
+    .new-session-subtitle { flex-wrap: wrap; justify-content: center; }
   }
 }
