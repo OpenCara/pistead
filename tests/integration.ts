@@ -471,8 +471,8 @@ const health = await alice.request("GET", "/api/health");
 if (!health.backupsConfigured && process.env.ALLOW_MISSING_BACKUPS === "true") {
   const unavailable = await alice.request("POST", `/api/sessions/${aliceSession!.id}/backup`, {}, [503]);
   assert.equal(unavailable.code ?? unavailable.error?.code, "backup_unavailable");
-  report.push({ name: "SQLite-consistent backup upload/download and owner-only access", status: "blocked: R2 not configured" });
-  console.warn("BLOCKED backup upload/download: R2 not configured; verified explicit 503 instead.");
+  report.push({ name: "SQLite-consistent backup upload/download and owner-only access", status: "blocked: backup storage not configured" });
+  console.warn("BLOCKED backup upload/download: backup storage not configured; verified explicit 503 instead.");
 } else {
   await check("SQLite-consistent backup upload/download and owner-only access", async () => {
     const { backup } = await alice.request("POST", `/api/sessions/${aliceSession.id}/backup`, {});

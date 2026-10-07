@@ -1,0 +1,34 @@
+# Copy apps/server/.env.example to .env next to this file and fill in APP_ORIGIN, SESSION_SECRET and VAULT_KEY.
+# By default the server keeps SQLite and backups in the pistead-data volume. For Postgres, run
+# `docker compose --profile postgres up` and set in .env:
+#   DATABASE_URL=postgres://pistead:change-me@postgres:5432/pistead
+services:
+  pistead:
+    build: .
+    image: pistead
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8787:8787"
+    volumes:
+      - pistead-data:/data
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: [postgres]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pistead
+      POSTGRES_USER: pistead
+      POSTGRES_PASSWORD: change-me
+    volumes:
+      - pistead-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pistead"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pistead-data:
+  pistead-postgres:

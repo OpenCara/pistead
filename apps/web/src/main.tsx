@@ -41,7 +41,7 @@ function SignIn({ error, retry }: { error: string; retry: () => void }) {
       <h1>Pistead</h1>
       <p>Run Pi agents on your own machine, and work on them together with your team.</p>
       {problem && <Alert variant="error" title="Sign-in problem">{problem}</Alert>}
-      {unconfigured && <Alert variant="warning" title="GitHub sign-in is not configured">The operator needs to configure the GitHub OAuth app, callback URL and Worker secrets.</Alert>}
+      {unconfigured && <Alert variant="warning" title="GitHub sign-in is not configured">The operator needs to configure the GitHub OAuth app, its callback URL and the server's GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and VAULT_KEY settings.</Alert>}
       <div className="actions">
         {!unconfigured && <a className="btn default lg" href="/api/auth/github"><GitHubMark />Continue with GitHub</a>}
         {(problem || unconfigured) && <Button onClick={() => { retry(); health.refresh(); }}>Try again</Button>}

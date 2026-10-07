@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 
-const directory = new URL('../apps/worker/migrations/', import.meta.url);
+const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const providerMigration = '0007_git_providers.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 const pins = JSON.stringify([{ bindingId: 'binding-1', repositoryId: 123, fullName: 'Owner/Project',

@@ -1,18 +1,18 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
-import type { Env, WorkerEnv } from '../apps/worker/src/types.js';
+import type { Env, WorkerEnv } from '../apps/server/src/types.js';
 import type { RunnerBinding, RunnerTicket } from '../packages/shared/src/types.js';
 import type { RestoreInput } from '../packages/shared/src/connector.js';
 import type { GitHubSessionRepository, SessionRepository } from '../packages/shared/src/repositories.js';
 import { sha256, verifyToken } from '../packages/shared/src/crypto.js';
-import { registerRestoreRoutes, downloadRestoreSnapshot } from '../apps/worker/src/restore-routes.js';
-import { registerBackups } from '../apps/worker/src/backups.js';
-import { boundedSnapshotText, MAX_BACKUP_BYTES, validateSnapshot } from '../apps/worker/src/restore-snapshot.js';
-import { sessionAccess } from '../apps/worker/src/db.js';
+import { registerRestoreRoutes, downloadRestoreSnapshot } from '../apps/server/src/restore-routes.js';
+import { registerBackups } from '../apps/server/src/backups.js';
+import { boundedSnapshotText, MAX_BACKUP_BYTES, validateSnapshot } from '../apps/server/src/restore-snapshot.js';
+import { sessionAccess } from '../apps/server/src/db.js';
+import { memoryStorage, testDatabase } from './helpers/control-plane.js';
 
 const secret = 'restore-internal-test-secret-not-for-deployment';
 const bearer = 'b'.repeat(43);
@@ -31,44 +31,14 @@ interface SnapshotFixture {
 }
 
 async function fixture(t: TestContext, connected = false, repositories: SessionRepository[] = []) {
-  const sqlite = new DatabaseSync(':memory:');
-  t.after(() => sqlite.close());
-  sqlite.exec('PRAGMA foreign_keys = ON');
-  const directory = new URL('../apps/worker/migrations/', import.meta.url);
-  for (const file of readdirSync(directory).filter(name => name.endsWith('.sql')).sort()) {
-    sqlite.exec('BEGIN');
-    try { sqlite.exec(readFileSync(new URL(file, directory), 'utf8')); sqlite.exec('COMMIT'); }
-    catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  }
-  class Prepared {
-    values: (string | number | null)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null)[]) { this.values = values; return this; }
-    execute() {
-      const results = sqlite.prepare(this.sql).all(...this.values);
-      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS n').get()!.n);
-      return { results, success: true, meta: { changes } };
-    }
-    async first() { return this.execute().results[0] ?? null; }
-    async all() { return this.execute(); }
-    async run() { return this.execute(); }
-  }
-  const database = { prepare(sql: string) { return new Prepared(sql); }, async batch(statements: Prepared[]) {
-    sqlite.exec('BEGIN');
-    try { const results = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return results; }
-    catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  } };
-  const objects = new Map<string, Uint8Array>();
-  const reads: string[] = [];
-  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: 'http://localhost:8787',
+  const { db, sqlite } = await testDatabase();
+  t.after(() => db.close());
+  const storage = memoryStorage();
+  const { objects, reads } = storage;
+  const env: Env = { DB: db, APP_ORIGIN: 'http://localhost:8787',
     TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: 'restore-auth-test-secret-not-for-deployment',
     TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(), RUNNER_URL: 'http://localhost:9001',
-    RUNNER_SHARED_SECRET: secret, BUCKET: { async get(key: string) {
-      reads.push(key);
-      const bytes = objects.get(key);
-      if (!bytes) return null;
-      return { size: bytes.byteLength, body: new Response(new Uint8Array(bytes)).body };
-    } } as unknown as R2Bucket };
+    RUNNER_SHARED_SECRET: secret, BUCKET: storage };
   sqlite.exec(`
     INSERT INTO users (id,display_name,git_name,git_email,env_json,auth_kind,created_at) VALUES
       ('test:owner','Owner','Current Owner','current@example.test','{"APP_PROJECT":"current"}','test','2026-01-01'),
@@ -213,7 +183,7 @@ test('restore pins one new target, uses current owner profile and copies no gran
   assert.equal(await sessionAccess(f.env, targetId, 'test:manager'), null);
   assert.deepEqual(f.sqlite.prepare("SELECT * FROM sessions WHERE id='source'").get(), sourceBefore);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_grants WHERE session_id=?').get(targetId)!.n, 0);
-  f.objects.clear(); // Completed receipts must not depend on another R2 read or runner RPC.
+  f.objects.clear(); // Completed receipts must not depend on another storage read or runner RPC.
   const replay = await f.request(restorePath, { requestId: 'request', title: 'Restored title' });
   assert.equal(replay.status, 200);
   assert.deepEqual(await replay.json(), await f.request(restorePath, { requestId: 'request', title: 'Restored title' }).then(r => r.json()));
@@ -391,7 +361,7 @@ test('snapshot identity, digest, size and fixed object key are verified before t
   }
 });
 
-test('legacy pulls require authentication and exact unexpired descriptor; no arbitrary R2 key', async t => {
+test('legacy pulls require authentication and exact unexpired descriptor; no arbitrary storage key', async t => {
   const f = await fixture(t);
   const descriptor = await f.pending();
   const path = '/api/internal/restores/restore/download';
@@ -450,14 +420,14 @@ test('regular owner backup downloads retain bounded integrity checks', async t =
   assert.equal(f.reads.length, reads);
 });
 
-test('current connection is rechecked after R2 reading, before snapshot bytes are returned', async t => {
+test('current connection is rechecked after storage reading, before snapshot bytes are returned', async t => {
   const f = await fixture(t, true);
   const descriptor = await f.pending();
   const bytes = f.objects.get(f.key)!;
-  f.env.BUCKET = { async get() {
+  f.env.BUCKET = { provider: 'filesystem', async get() {
     f.sqlite.prepare('UPDATE connectors SET connection_hash=?').run(await sha256('n'.repeat(43)));
-    return { size: bytes.byteLength, body: new Response(new Uint8Array(bytes)).body };
-  } } as unknown as R2Bucket;
+    return { size: bytes.byteLength, body: new Uint8Array(bytes), metadata: { contentType: 'application/json', custom: {} } };
+  }, async put() {}, async delete() {} };
   const response = await f.request('/api/connectors/self/restores/restore/download', descriptor,
     { Authorization: `Bearer ${bearer}`, 'X-Connection-Token': connection });
   assert.equal(response.status, 401);

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import { app } from '../apps/worker/src/index.js';
-import type { ConnectorRelayEnvelope } from '../apps/worker/src/connector-transport.js';
-import type { Env } from '../apps/worker/src/types.js';
-import { encryptToken } from '../apps/worker/src/vault.js';
+import { HTTPException } from 'hono/http-exception';
+import { app } from '../apps/server/src/index.js';
+import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
+import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
+import type { Env } from '../apps/server/src/types.js';
+import { encryptToken } from '../apps/server/src/vault.js';
+import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, ModelDefinition, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
@@ -51,51 +53,10 @@ async function denied(response: Response, status: number, code: string) {
   assert.equal(body.code, code);
 }
 
-function fixture(t: TestContext): Fixture {
-  const sqlite = new DatabaseSync(':memory:');
-  t.after(() => sqlite.close());
-  sqlite.exec('PRAGMA foreign_keys = ON');
-  const directory = new URL('../apps/worker/migrations/', import.meta.url);
-  for (const file of readdirSync(directory).filter(name => name.endsWith('.sql')).sort()) {
-    sqlite.exec('BEGIN');
-    try {
-      sqlite.exec(readFileSync(new URL(file, directory), 'utf8'));
-      sqlite.exec('COMMIT');
-    } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  }
-  let queryCount = 0;
-  let beforeQuery: ((sql: string) => void) | undefined;
-  class Prepared {
-    values: (string | number | null | Uint8Array)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null | Uint8Array)[]) { this.values = values; return this; }
-    execute() {
-      beforeQuery?.(this.sql);
-      queryCount++;
-      const results = sqlite.prepare(this.sql).all(...this.values);
-      const changes = /^\s*(SELECT|PRAGMA)\b/i.test(this.sql) ? 0 : Number(sqlite.prepare('SELECT changes() AS count').get()!.count);
-      return { success: true, results, meta: { changes, duration: 0, last_row_id: 0, changed_db: changes > 0,
-        size_after: 0, rows_read: results.length, rows_written: changes } };
-    }
-    async all() { return this.execute(); }
-    async run() { return this.execute(); }
-    async first(column?: string) {
-      const row = this.execute().results[0];
-      return row ? column ? row[column] : row : null;
-    }
-  }
-  const database = {
-    prepare(sql: string) { return new Prepared(sql); },
-    async batch(statements: Prepared[]) {
-      sqlite.exec('BEGIN');
-      try {
-        const result = statements.map(statement => statement.execute());
-        sqlite.exec('COMMIT');
-        return result;
-      } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-    },
-  };
-  const env: Env = { DB: database as unknown as D1Database, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
+async function fixture(t: TestContext): Promise<Fixture> {
+  const { db, sqlite, queryCount, setBeforeQuery } = await testDatabase();
+  t.after(() => db.close());
+  const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true',
     TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
     RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url') };
   function request(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
@@ -127,8 +88,7 @@ function fixture(t: TestContext): Fixture {
       .run(id, await encryptToken(env, id, githubToken), createdAt);
     return browser({ id }, `test-auth=${cookieToken}`);
   }
-  return { sqlite, env, request, client, githubClient, queryCount: () => queryCount,
-    setBeforeQuery(hook) { beforeQuery = hook; } };
+  return { sqlite, env, request, client, githubClient, queryCount, setBeforeQuery };
 }
 
 async function pairing(owner: Client, name = 'Local Pi', workspaceId?: string) {
@@ -164,43 +124,24 @@ async function addMember(admin: Client, workspaceId: string, member: Client) {
 function provisionHub(f: Fixture) {
   const requests: ConnectorRelayEnvelope[] = [];
   const unexpected: string[] = [];
-  f.env.CONNECTOR_HUB = {
-    idFromName(name: string) { return name; },
-    get(connectorId: string) {
-      return { async fetch(input: RequestInfo | URL, init?: RequestInit) {
-        const request = new Request(input, init);
-        if (request.url === 'https://connector.internal/status' && request.method === 'GET') return Response.json({ online: true });
-        if (request.url === 'https://connector.internal/rpc' && request.method === 'POST') {
-          const envelope = await request.json() as ConnectorRelayEnvelope;
-          requests.push(envelope);
-          if (envelope.connectorId === connectorId && envelope.request.ticket.action === 'create') return Response.json({ ok: true }, { status: 201 });
-        }
-        unexpected.push(`${request.method} ${request.url}`);
-        return Response.json({ error: 'Unsupported test relay request' }, { status: 503 });
-      } };
-    },
-  } as unknown as DurableObjectNamespace;
+  f.env.CONNECTOR_HUB = fakeHub({ rpc(connectorId, envelope) {
+    requests.push(envelope);
+    if (envelope.connectorId === connectorId && envelope.request.ticket.action === 'create') return Response.json({ ok: true }, { status: 201 });
+    unexpected.push(`rpc ${connectorId} ${envelope.request.ticket.action}`);
+    return Response.json({ error: 'Unsupported test relay request' }, { status: 503 });
+  } });
   return { requests, unexpected };
 }
 
 function rpcHub(f: Fixture, connector: Connected, respond: (envelope: ConnectorRelayEnvelope) => Response | Promise<Response>) {
   const requests: ConnectorRelayEnvelope[] = [];
-  f.env.CONNECTOR_HUB = {
-    idFromName(name: string) { return name; },
-    get(connectorId: string) {
-      return { async fetch(input: RequestInfo | URL, init?: RequestInit) {
-        const request = new Request(input, init);
-        assert.equal(request.url, 'https://connector.internal/rpc');
-        assert.equal(request.method, 'POST');
-        assert.equal(connectorId, connector.connectorId);
-        const envelope = await request.json() as ConnectorRelayEnvelope;
-        requests.push(envelope);
-        assert.equal(envelope.connectorId, connector.connectorId);
-        assert.equal(envelope.connectionHash, await sha256(connector.connectionToken));
-        return respond(envelope);
-      } };
-    },
-  } as unknown as DurableObjectNamespace;
+  f.env.CONNECTOR_HUB = fakeHub({ async rpc(connectorId, envelope) {
+    assert.equal(connectorId, connector.connectorId);
+    requests.push(envelope);
+    assert.equal(envelope.connectorId, connector.connectorId);
+    assert.equal(envelope.connectionHash, await sha256(connector.connectionToken));
+    return respond(envelope);
+  } });
   return requests;
 }
 
@@ -312,7 +253,7 @@ function githubFetch(t: TestContext) {
 }
 
 test('pairings require a CSRF-protected cookie, retain its owner, are single-use, and hash secrets at rest', async t => {
-  const f = fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  const f = await fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Pi' }), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Pi' }, { Cookie: alice.cookie }), 403, 'invalid_csrf');
   await denied(await alice.request('POST', '/api/connectors/pairings', { name: 'Pi' }, { Origin: 'https://hostile.invalid' }), 403, 'invalid_origin');
@@ -350,7 +291,7 @@ test('pairings require a CSRF-protected cookie, retain its owner, are single-use
 });
 
 test('pairing expiry is enforced at claim time and the ten-minute per-owner bound includes claimed pairings', async t => {
-  const f = fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
+  const f = await fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   const pending: ConnectorPairing[] = [];
   for (let i = 0; i < 5; i++) pending.push(await pairing(alice));
   await denied(await alice.request('POST', '/api/connectors/pairings', { name: 'Sixth' }), 429, 'pairing_limit');
@@ -373,7 +314,7 @@ test('pairing expiry is enforced at claim time and the ten-minute per-owner boun
 });
 
 test('the active connector bound is checked again at claim and revocation releases capacity', async t => {
-  const f = fixture(t); const owner = await f.client('owner');
+  const f = await fixture(t); const owner = await f.client('owner');
   const insert = f.sqlite.prepare('INSERT INTO connectors (id,owner_id,name,credential_hash,created_at) VALUES (?,?,?,?,?)');
   for (let i = 0; i < 19; i++) insert.run(`existing-${i}`, owner.user.id, 'Existing', await sha256(token()), new Date().toISOString());
   const first = await pairing(owner); const second = await pairing(owner);
@@ -388,7 +329,7 @@ test('the active connector bound is checked again at claim and revocation releas
 });
 
 test('claim and manifest updates reject malformed metadata and secret-bearing fields without storing them', async t => {
-  const f = fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const f = await fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
   const pending = await pairing(owner); const secret = 'provider-credential-must-never-be-persisted';
   const invalid: { name: string; value: object; code: string }[] = [
     ...['apiKey', 'token', 'env', 'auth'].map(field => ({ name: `top-level ${field}`, value: { ...manifest, [field]: secret }, code: 'invalid_metadata' })),
@@ -436,7 +377,7 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
 });
 
 test('connector bearer credentials cannot authenticate browser or internal APIs, and self routes require the current connection', async t => {
-  const f = fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const f = await fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
   const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
   await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
@@ -464,7 +405,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
 });
 
 test('sharing is connector-owner-only with live workspace membership and imports only safe catalog metadata', async t => {
-  const f = fixture(t); const admin = await f.client('admin'); const host = await f.client('host'); const outsider = await f.client('outsider');
+  const f = await fixture(t); const admin = await f.client('admin'); const host = await f.client('host'); const outsider = await f.client('outsider');
   const team = await workspace(admin); const connector = await connect(f, host);
   const path = `/api/connectors/${connector.connectorId}/shares/${team.id}`;
   await denied(await admin.request('PUT', path), 404, 'not_found');
@@ -510,7 +451,7 @@ test('sharing is connector-owner-only with live workspace membership and imports
 });
 
 test('foreign-host sessions require exact trust and retain the creator identity in storage and the provisioning envelope', async t => {
-  const f = fixture(t); const s = await sharedAgent(f);
+  const f = await fixture(t); const s = await sharedAgent(f);
   for (const trustedConnectorId of [undefined, 'another-connector', s.host.user.id]) {
     await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId }), 400, 'connector_trust_required');
   }
@@ -565,7 +506,7 @@ test('foreign-host sessions require exact trust and retain the creator identity 
 });
 
 test('API-created model and session routing bindings cannot be rewritten through the database', async t => {
-  const f = fixture(t); const s = await sharedSession(f); const other = await connect(f, s.host);
+  const f = await fixture(t); const s = await sharedSession(f); const other = await connect(f, s.host);
   const modelBefore = f.sqlite.prepare('SELECT * FROM models WHERE id = ?').get(s.model.id);
   for (const [column, value] of [
     ['workspace_id', 'different-workspace'], ['provider', 'different-provider'], ['model_id', 'different-model'],
@@ -588,7 +529,7 @@ test('API-created model and session routing bindings cannot be rewritten through
 });
 
 test('callbacks are scoped to the exact session connector, not merely its owner or a shared workspace', async t => {
-  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
   const sameHost = await connect(f, s.host); const otherHost = await connect(f, s.admin);
   const payload = await brokerPayload(f, s.session);
   for (const [connector, owner] of [[sameHost, s.host], [otherHost, s.admin]] as const) {
@@ -610,7 +551,7 @@ test('callbacks are scoped to the exact session connector, not merely its owner 
 
 for (const mutation of ['revoke', 'unshare', 'remove-host', 'remove-owner', 'remove-approver', 'remove-requester'] as const) {
   test(`${mutation} immediately denies existing connector callbacks and unconsumed broker capabilities`, async t => {
-    const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+    const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
     const collaborator = await f.client('collaborator');
     await addMember(s.admin, s.team.id, collaborator);
     await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: collaborator.user.id, permissions: ['write', 'approve'] }));
@@ -623,7 +564,7 @@ for (const mutation of ['revoke', 'unshare', 'remove-host', 'remove-owner', 'rem
     assert.equal(fetch.mock.callCount(), 1);
     const pending = await brokerPayload(f, s.session, actorId, requestedBy);
     const versionBefore = Number(f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id)!.policy_version);
-    // Authorization must fail from live D1 state even without a hub available to close the socket.
+    // Authorization must fail from live database state even without a hub available to close the socket.
     delete f.env.CONNECTOR_HUB;
     if (mutation === 'revoke') {
       assert.equal((await s.host.request('DELETE', `/api/connectors/${s.connector.connectorId}`)).status, 204);
@@ -662,7 +603,7 @@ for (const mutation of ['revoke', 'unshare', 'remove-host', 'remove-owner', 'rem
 }
 
 test('broker authentication and approval capabilities require exact tokens and payloads before any fetch', async t => {
-  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
   const payload = await brokerPayload(f, s.session);
   for (const secret of [internalSecret.slice(1), `${internalSecret}-suffix`, changedToken(internalSecret)]) {
     await denied(await f.request('POST', '/api/internal/github/comment', payload, { Authorization: `Bearer ${secret}` }), 401, 'unauthorized');
@@ -688,7 +629,7 @@ test('broker authentication and approval capabilities require exact tokens and p
 });
 
 test('connector shares are bounded at fifty, idempotent at the limit, and unsharing releases a slot', async t => {
-  const f = fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const f = await fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
   const createdAt = new Date().toISOString();
   // Seed the existing population; exercise both sides of the boundary through the API.
   for (let i = 0; i < 51; i++) {
@@ -715,7 +656,7 @@ test('connector shares are bounded at fifty, idempotent at the limit, and unshar
 });
 
 test('callbacks require both an available imported model and its exact provider/model in the live manifest', async t => {
-  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
   const payload = await brokerPayload(f, s.session);
   assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
   await json(await self(f, s.connector, 'manifest', { ...manifest, models: [] }));
@@ -744,7 +685,7 @@ test('callbacks require both an available imported model and its exact provider/
 });
 
 test('claim, socket, and self routes require TLS except for explicitly enabled loopback tests', async t => {
-  const f = fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
+  const f = await fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
   f.sqlite.prepare(`INSERT INTO workspace_repositories
     (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
     .run('tls-repository', team.id, '7', 'owner/repo', 'main', 1, new Date().toISOString());
@@ -754,25 +695,66 @@ test('claim, socket, and self routes require TLS except for explicitly enabled l
   const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
   const routes = [
     { method: 'POST', path: `/api/connectors/pairings/${pending.id}/claim`, body: claimBody },
-    { method: 'GET', path: '/api/connectors/socket', body: undefined },
     { method: 'POST', path: '/api/connectors/self/manifest', body: manifest },
   ];
+  const socketHeaders = new Headers({ 'Sec-WebSocket-Protocol': `opencara-pi-v1, bearer.${connector.token}` });
+  f.env.CONNECTOR_HUB = fakeHub();
   for (const route of routes) {
     await denied(await f.request(route.method, `http://remote.invalid${route.path}`, route.body, headers), 400, 'secure_transport_required');
   }
+  await socketDenied(f, socketHeaders, new URL('http://remote.invalid/api/connectors/socket'), 400, 'secure_transport_required');
   await json(await self(f, connector, 'manifest', manifest));
+  assert.deepEqual(await authenticateConnectorSocket(f.env, socketHeaders, new URL(`${origin}/api/connectors/socket`)),
+    { connectorId: connector.connectorId, credentialHash: await sha256(connector.token) });
   f.env.TEST_AUTH_ENABLED = 'false';
   f.env.APP_ORIGIN = 'https://workspace.example.test';
   for (const route of routes) {
     await denied(await f.request(route.method, `${origin}${route.path}`, route.body, headers), 400, 'secure_transport_required');
   }
+  await socketDenied(f, socketHeaders, new URL(`${origin}/api/connectors/socket`), 400, 'secure_transport_required');
   const secureHeaders = { ...headers, Origin: f.env.APP_ORIGIN };
   await json(await f.request('POST', `${f.env.APP_ORIGIN}/api/connectors/pairings/${pending.id}/claim`, claimBody, secureHeaders), 201);
   await json(await f.request('POST', `${f.env.APP_ORIGIN}/api/connectors/self/manifest`, manifest, secureHeaders));
+  assert.deepEqual(await authenticateConnectorSocket(f.env, socketHeaders, new URL(`${f.env.APP_ORIGIN}/api/connectors/socket`)),
+    { connectorId: connector.connectorId, credentialHash: await sha256(connector.token) });
+});
+
+async function socketDenied(f: Fixture, headers: Headers, url: URL, status: number, code: string) {
+  let response: Response | undefined;
+  await assert.rejects(authenticateConnectorSocket(f.env, headers, url), (error: unknown) => {
+    assert.ok(error instanceof HTTPException);
+    response = error.getResponse();
+    return true;
+  });
+  assert.ok(response);
+  await denied(response, status, code);
+}
+
+test('socket upgrades are authenticated outside Hono with the connector credential subprotocol', async t => {
+  const f = await fixture(t); const owner = await f.client('owner'); const connector = await connect(f, owner);
+  const url = new URL(`${origin}/api/connectors/socket`);
+  const valid = () => new Headers({ 'Sec-WebSocket-Protocol': `opencara-pi-v1, bearer.${connector.token}` });
+  await denied(await f.request('GET', '/api/connectors/socket', undefined, { Upgrade: 'websocket' }), 426, 'upgrade_required');
+  await socketDenied(f, valid(), url, 503, 'connector_unavailable');
+  f.env.CONNECTOR_HUB = fakeHub();
+  assert.deepEqual(await authenticateConnectorSocket(f.env, valid(), url), { connectorId: connector.connectorId, credentialHash: await sha256(connector.token) });
+  const hostile = valid(); hostile.set('Origin', 'https://evil.example.test');
+  await socketDenied(f, hostile, url, 403, 'invalid_origin');
+  const crossSite = valid(); crossSite.set('Sec-Fetch-Site', 'cross-site');
+  await socketDenied(f, crossSite, url, 403, 'invalid_origin');
+  const browser = valid(); browser.set('Cookie', 'test-auth=abc');
+  await socketDenied(f, browser, url, 401, 'connector_authentication_required');
+  await socketDenied(f, new Headers({ 'Sec-WebSocket-Protocol': `bearer.${connector.token}` }), url, 401, 'connector_authentication_required');
+  await socketDenied(f, new Headers({ 'Sec-WebSocket-Protocol': `opencara-pi-v1, bearer.${connector.token}, extra` }), url, 401, 'connector_authentication_required');
+  await socketDenied(f, new Headers({ 'Sec-WebSocket-Protocol': `opencara-pi-v1, bearer.${'x'.repeat(43)}` }), url, 401, 'connector_authentication_required');
+  await socketDenied(f, new Headers({ 'Sec-WebSocket-Protocol': 'opencara-pi-v1, chat' }), url, 401, 'connector_authentication_required');
+  assert.equal((await owner.request('DELETE', `/api/connectors/${connector.connectorId}`)).status, 204);
+  assert.deepEqual((f.env.CONNECTOR_HUB as FakeHub).revoked, [connector.connectorId]);
+  await socketDenied(f, valid(), url, 401, 'connector_authentication_required');
 });
 
 test('production session creation rejects a legacy non-connector model even for an authenticated GitHub owner', async t => {
-  const f = fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
+  const f = await fixture(t); const owner = await f.githubClient(); const team = await workspace(owner);
   const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
     name: 'Legacy model', provider: 'openai', modelId: 'legacy-model',
   }), 201);
@@ -792,7 +774,7 @@ test('production session creation rejects a legacy non-connector model even for 
 });
 
 test('connected SSE emits only two authoritative snapshots within the fifty-query budget', async t => {
-  const f = fixture(t); const s = await sharedSession(f);
+  const f = await fixture(t); const s = await sharedSession(f);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read'] }));
   const view: SessionView = {
     sessionId: s.session.id,
@@ -828,13 +810,13 @@ test('connected SSE emits only two authoritative snapshots within the fifty-quer
   const data = body.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
   assert.deepEqual(data, [{ view }, { view }]);
   const queries = f.queryCount() - before;
-  assert.ok(queries > 0, 'Count the real Worker authorization queries, not only relay calls');
-  assert.ok(queries + requests.length <= 50, `Connected polling used ${queries} D1 queries plus ${requests.length} relay calls`);
+  assert.ok(queries > 0, 'Count the real control-plane authorization queries, not only relay calls');
+  assert.ok(queries + requests.length <= 50, `Connected polling used ${queries} database queries plus ${requests.length} relay calls`);
 });
 
 for (const mutation of ['operation', 'requester'] as const) {
   test(`a reviewed explicit approval rejects a host ${mutation} swap before capability minting`, async t => {
-    const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+    const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
     await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
       userId: s.admin.user.id, permissions: ['write'],
     }));
@@ -904,7 +886,7 @@ for (const mutation of ['operation', 'requester'] as const) {
 }
 
 test('a read-only approver cannot turn an unadmitted host candidate into a reviewed operation or broker capability', async t => {
-  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
     userId: s.admin.user.id, permissions: ['read', 'approve'],
   }));
@@ -948,7 +930,7 @@ test('a read-only approver cannot turn an unadmitted host candidate into a revie
 });
 
 test('only a Worker-issued write admission produces an approvable model review and the exact broker effect', async t => {
-  const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
     userId: s.admin.user.id, permissions: ['read', 'approve'],
   }));
@@ -1044,7 +1026,7 @@ test('only a Worker-issued write admission produces an approvable model review a
 });
 
 test('per-message chat options are checked against the session host, mode and owner before reaching the runtime', async t => {
-  const f = fixture(t); const s = await sharedSession(f);
+  const f = await fixture(t); const s = await sharedSession(f);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'ask', 'write'] }));
   const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
   const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
@@ -1074,7 +1056,7 @@ test('per-message chat options are checked against the session host, mode and ow
 });
 
 test('automatic approvals are shown only for the owner\'s own decided commands, never comments or pending work', async t => {
-  const f = fixture(t); const s = await sharedSession(f);
+  const f = await fixture(t); const s = await sharedSession(f);
   const owner = s.creator.user.id;
   const valid: ApprovalRecord = { id: 'auto-approval', sessionId: s.session.id, requestedBy: owner, decidedBy: owner, automatic: true,
     operation: { kind: 'bash', command: 'npm test' }, status: 'executed', result: 'ok', createdAt: new Date().toISOString() };
@@ -1100,7 +1082,7 @@ test('automatic approvals are shown only for the owner\'s own decided commands, 
 
 for (const invalid of ['ask', 'expired', 'foreign-session', 'foreign-actor'] as const) {
   test(`${invalid} admission cannot authorize a model review while history remains readable`, async t => {
-    const f = fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+    const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
     await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
       userId: s.admin.user.id, permissions: ['write'],
     }));
@@ -1157,7 +1139,7 @@ for (const invalid of ['ask', 'expired', 'foreign-session', 'foreign-actor'] as 
 }
 
 test('broker callbacks require github_comment in the immutable pinned agent even with a matching review and capability', async t => {
-  const f = fixture(t); const s = await sharedSession(f, ['identity']); const fetch = githubFetch(t);
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']); const fetch = githubFetch(t);
   assert.deepEqual(s.agent.tools, ['identity']);
   assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
   const payload = await brokerPayload(f, s.session);
@@ -1167,7 +1149,7 @@ test('broker callbacks require github_comment in the immutable pinned agent even
 });
 
 test('write admission quota follows an actor across sessions without blocking another owner or losing ambiguous receipts', async t => {
-  const f = fixture(t); const s = await sharedSession(f);
+  const f = await fixture(t); const s = await sharedSession(f);
   const cloneSession = f.sqlite.prepare(`INSERT INTO sessions
     (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
     SELECT ?,workspace_id,?,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id
@@ -1220,7 +1202,7 @@ test('write admission quota follows an actor across sessions without blocking an
 });
 
 test('owner admission budgets aggregate collaborators but do not impose a cross-tenant global gate', async t => {
-  const f = fixture(t); const s = await sharedSession(f);
+  const f = await fixture(t); const s = await sharedSession(f);
   const createdAt = new Date().toISOString();
   const expiresAt = Math.floor(Date.now() / 1000) + 3600;
   const content = 'Owner-budget write';
@@ -1281,7 +1263,7 @@ test('owner admission budgets aggregate collaborators but do not impose a cross-
 });
 
 test('workspace pairing imports a private connector catalog without granting teammates discovery or guessed model access', async t => {
-  const f = fixture(t); const s = await privateWorkspace(f);
+  const f = await fixture(t); const s = await privateWorkspace(f);
   const associations = f.sqlite.prepare('SELECT workspace_id FROM connector_workspaces WHERE connector_id = ?').all(s.connector.connectorId);
   assert.deepEqual(associations.map(row => row.workspace_id), [s.team.id]);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares').get()!.n, 0);
@@ -1312,7 +1294,7 @@ test('workspace pairing imports a private connector catalog without granting tea
 });
 
 test('owner runs an unpublished agent on an unshared host and the default session is listed and readable only as read by members', async t => {
-  const f = fixture(t); const s = await privateHostSession(f);
+  const f = await fixture(t); const s = await privateHostSession(f);
   assert.equal(s.agent.workspaceId, null);
   assert.equal(s.session.visibility, 'workspace');
   assert.equal(f.sqlite.prepare('SELECT visibility FROM sessions WHERE id = ?').get(s.session.id)!.visibility, 'workspace');
@@ -1348,7 +1330,7 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {
-  const f = fixture(t); const s = await privateHostSession(f);
+  const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
   const personalValue = 'owner-personal-environment-not-for-teammates';
   await json(await s.owner.request('PATCH', '/api/me', { env: { APP_CONTEXT: personalValue } }));
@@ -1359,8 +1341,8 @@ test('workspace read does not grant mutations, connector credentials, personal e
     .run('private-backup', s.session.id, s.owner.user.id, 'private-object-key', 'private-digest', 1, new Date().toISOString());
   const requests = rpcHub(f, s.connector, () => Response.json({ view: s.view }));
   let storageCalls = 0;
-  f.env.BUCKET = { async get() { storageCalls++; throw new Error('Unauthorized backup read'); },
-    async put() { storageCalls++; throw new Error('Unauthorized backup write'); } } as unknown as R2Bucket;
+  f.env.BUCKET = { provider: 'filesystem', async get() { storageCalls++; throw new Error('Unauthorized backup read'); },
+    async put() { storageCalls++; throw new Error('Unauthorized backup write'); }, async delete() { storageCalls++; } };
   for (const [method, suffix, body] of [
     ['POST', '/ask', { content: 'Question', requestId: 'read-only-ask' }],
     ['POST', '/submit', { content: 'Write', requestId: 'read-only-write' }],
@@ -1397,7 +1379,7 @@ test('workspace read does not grant mutations, connector credentials, personal e
 });
 
 test('root visibility PATCH is CSRF protected, owner-only, versioned and unions rather than replaces explicit grants', async t => {
-  const f = fixture(t); const s = await privateHostSession(f);
+  const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
   const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id);
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { 'X-CSRF-Token': '' })).status, 403);
@@ -1447,7 +1429,7 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
 });
 
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {
-  const f = fixture(t); const s = await privateHostSession(f);
+  const f = await fixture(t); const s = await privateHostSession(f);
   const { session: privateSession } = await json<{ session: SessionRecord }>(await s.owner.request('POST', '/api/sessions', {
     ...s.input, visibility: 'private',
   }), 201);
@@ -1473,7 +1455,7 @@ test('explicitly private creation stays unlisted until granted and membership re
 for (const mutation of ['privacy', 'membership'] as const) {
   for (const transport of ['view', 'events'] as const) {
     test(`${mutation} revocation suppresses an in-flight workspace ${transport} response`, async t => {
-      const f = fixture(t); const s = await privateHostSession(f);
+      const f = await fixture(t); const s = await privateHostSession(f);
       const began = Promise.withResolvers<void>(); const release = Promise.withResolvers<void>();
       t.after(() => release.resolve());
       if (transport === 'events') t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -1532,7 +1514,7 @@ for (const mutation of ['privacy', 'membership'] as const) {
 }
 
 test('opt-in sharing admits a teammate runtime; unshare blocks foreign sessions but preserves workspace views of the owner session; revoke blocks all runtimes', async t => {
-  const f = fixture(t); const s = await privateHostSession(f);
+  const f = await fixture(t); const s = await privateHostSession(f);
   const { agent } = await json<{ agent: AgentVersion }>(await s.owner.request('POST', `/api/agents/${s.agent.agentId}/publish`, { workspaceId: s.team.id }), 201);
   const input = { workspaceId: s.team.id, agentVersionId: agent.id, trustedConnectorId: s.connector.connectorId };
   await denied(await s.member.request('POST', '/api/sessions', input), 403, 'connector_unavailable');
@@ -1585,7 +1567,7 @@ test('opt-in sharing admits a teammate runtime; unshare blocks foreign sessions 
 });
 
 test('workspace session listing stays query-bounded with sixty implicit readers and still filters private and owner-membership policy', async t => {
-  const f = fixture(t); const s = await privateHostSession(f);
+  const f = await fixture(t); const s = await privateHostSession(f);
   const clone = f.sqlite.prepare(`INSERT INTO sessions
     (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id,repositories_json,visibility)
     SELECT ?,workspace_id,?,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id,repositories_json,?
@@ -1616,7 +1598,7 @@ test('workspace session listing stays query-bounded with sixty implicit readers 
 
 for (const mutation of ['owner-membership', 'policy-version'] as const) {
   test(`visibility PATCH compare-and-swap rejects a concurrent ${mutation} change without an audit or runtime effect`, async t => {
-    const f = fixture(t); const s = await sharedSession(f);
+    const f = await fixture(t); const s = await sharedSession(f);
     const path = `/api/sessions/${s.session.id}`;
     const before = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
     let changed = false;

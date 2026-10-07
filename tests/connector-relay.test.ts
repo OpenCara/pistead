@@ -1,34 +1,40 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import { createServer } from 'node:http';
 import test, { type TestContext } from 'node:test';
-import { ConnectorHub } from '../apps/worker/src/connector-hub.js';
-import { connectorPath, connectorRequest, validateConnectorRpc, connectorUtf8Bytes, connectorJsonValid, type ConnectorRelayEnvelope } from '../apps/worker/src/connector-transport.js';
-import type { AppContext, Env, SessionRow } from '../apps/worker/src/types.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { WebSocket } from 'ws';
+import { ConnectorHubRegistry } from '../apps/server/src/connector-hub.js';
+import { connectorPath, connectorRequest, validateConnectorRpc, connectorUtf8Bytes, connectorJsonValid, type ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
+import { openDatabase } from '../apps/server/src/db/index.js';
+import type { Database, Query, SqlValue } from '../apps/server/src/db/types.js';
+import type { AppContext, Env, SessionRow } from '../apps/server/src/types.js';
 import { connectorLimits, type ConnectorRpcRequest } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import type { RunnerAction } from '../packages/shared/src/types.js';
 
-const NativeResponse = Response;
+/** A connector-side client: records relayed requests and the server's close code. */
 class RelaySocket {
-  readyState = 1;
-  attachment: unknown = null;
-  sent: string[] = [];
-  closes: { code: number; reason: string }[] = [];
-  requests: ConnectorRpcRequest[] = [];
-  waiters: ((request: ConnectorRpcRequest) => void)[] = [];
-  serializeAttachment(value: unknown) { this.attachment = structuredClone(value); }
-  deserializeAttachment() { return structuredClone(this.attachment); }
-  send(raw: string) {
-    if (this.readyState !== 1) throw new Error('closed');
-    this.sent.push(raw);
-    const message = JSON.parse(raw) as ConnectorRpcRequest;
-    if (message.type === 'request') {
+  readonly requests: ConnectorRpcRequest[] = [];
+  readonly messages: string[] = [];
+  readonly closed: Promise<{ code: number; reason: string }>;
+  private readonly waiters: ((request: ConnectorRpcRequest) => void)[] = [];
+
+  constructor(readonly ws: WebSocket) {
+    this.closed = new Promise(resolve => ws.once('close', (code, reason) => resolve({ code, reason: reason.toString() })));
+    ws.on('message', (data, isBinary) => {
+      const text = isBinary ? '' : data.toString();
+      this.messages.push(text);
+      if (text === 'pong' || text === '') return;
+      const message = JSON.parse(text) as ConnectorRpcRequest;
+      if (message.type !== 'request') return;
       const waiter = this.waiters.shift();
       if (waiter) waiter(message); else this.requests.push(message);
-    }
+    });
   }
-  close(code: number, reason: string) { this.closes.push({ code, reason }); this.readyState = 3; }
+  get readyState(): number { return this.ws.readyState; }
+  send(raw: string | Buffer): void {
+    try { this.ws.send(raw); } catch { /* A closed socket cannot answer; the assertions check the outcome. */ }
+  }
   async nextRequest(): Promise<ConnectorRpcRequest> {
     const existing = this.requests.shift();
     if (existing) return existing;
@@ -36,158 +42,152 @@ class RelaySocket {
     this.waiters.push(resolve);
     return promise;
   }
+  async close(): Promise<void> {
+    if (this.ws.readyState === WebSocket.CLOSED) return;
+    this.ws.close(1000, '');
+    await this.closed;
+  }
 }
 
 async function fixture(t: TestContext) {
-  const globals = ['WebSocketPair', 'WebSocketRequestResponsePair', 'Response'];
-  const descriptors = globals.map(name => Object.getOwnPropertyDescriptor(globalThis, name));
-  Object.defineProperty(globalThis, 'WebSocketPair', { configurable: true, value: class {
-    0 = new RelaySocket();
-    1 = new RelaySocket();
-  } });
-  Object.defineProperty(globalThis, 'WebSocketRequestResponsePair', { configurable: true, value: class {
-    constructor(readonly request: string, readonly response: string) {}
-  } });
-  Object.defineProperty(globalThis, 'Response', { configurable: true, value: class extends NativeResponse {
-    constructor(body?: BodyInit | null, init?: ResponseInit) {
-      super(body, init?.status === 101 ? { ...init, status: 200 } : init);
-      if (init?.status === 101) {
-        Object.defineProperty(this, 'status', { value: 101 });
-        Object.defineProperty(this, 'webSocket', { value: init.webSocket });
-      }
-    }
-  } });
-  const db = new DatabaseSync(':memory:');
-  const local = new DatabaseSync(':memory:');
-  db.exec('PRAGMA foreign_keys = ON');
-  const migrations = new URL('../apps/worker/migrations/', import.meta.url);
-  for (const file of readdirSync(migrations).filter(name => name.endsWith('.sql')).sort()) {
-    db.exec(`BEGIN; ${readFileSync(new URL(file, migrations), 'utf8')} COMMIT;`);
-  }
+  const db = await openDatabase('sqlite::memory:');
+  await db.migrate();
+  const run = (sql: string, ...values: SqlValue[]) => db.query(sql).bind(...values).run();
+  const exec = async (sql: string) => {
+    for (const statement of sql.split(';').map(part => part.trim()).filter(Boolean)) await run(statement);
+  };
   const created = new Date().toISOString();
   for (const [user, github] of [['owner', '1'], ['host', '2'], ['guest', '3']]) {
-    db.prepare('INSERT INTO users (id, github_id, display_name, git_name, git_email, auth_kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(user, github, user, user, `${user}@example.test`, 'github', created);
+    await run('INSERT INTO users (id, github_id, display_name, git_name, git_email, auth_kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      user, github, user, user, `${user}@example.test`, 'github', created);
   }
-  db.prepare('INSERT INTO workspaces VALUES (?, ?, ?, ?)').run('workspace', 'Workspace', 'owner', created);
-  for (const user of ['owner', 'host', 'guest']) db.prepare('INSERT INTO workspace_members VALUES (?, ?, ?, ?)').run('workspace', user, user === 'owner' ? 'owner' : 'member', created);
+  await run('INSERT INTO workspaces VALUES (?, ?, ?, ?)', 'workspace', 'Workspace', 'owner', created);
+  for (const user of ['owner', 'host', 'guest']) await run('INSERT INTO workspace_members VALUES (?, ?, ?, ?)', 'workspace', user, user === 'owner' ? 'owner' : 'member', created);
   const credentialHash = await sha256('fixture-connector-bearer-not-a-global-secret');
-  db.prepare('INSERT INTO connectors (id, owner_id, name, credential_hash, created_at, models_json, capabilities_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run('connector', 'host', 'Local host', credentialHash, created, JSON.stringify([{ provider: 'openai', modelId: 'local-model', name: 'Local model' }]), JSON.stringify({ platform: 'linux', sandbox: true, productionShell: false }));
-  db.prepare('INSERT INTO connector_shares VALUES (?, ?, ?)').run('connector', 'workspace', created);
-  db.prepare('INSERT INTO connector_workspaces VALUES (?, ?, ?)').run('connector', 'workspace', created);
-  db.prepare('INSERT INTO models (id, workspace_id, name, provider, model_id, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run('model', 'workspace', 'Model', 'openai', 'local-model', created, 'connector', 'host');
-  db.prepare('INSERT INTO agents VALUES (?, ?, ?)').run('agent', 'owner', created);
-  db.prepare('INSERT INTO agent_versions (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run('version', 'agent', 'owner', 'workspace', 1, 'Agent', '', '', '[]', 'model', created);
-  db.prepare("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private')")
-    .run('session', 'workspace', 'owner', 'version', 'Session', 1, 'ready', created, 'connector', 'host');
-  db.prepare('INSERT INTO session_grants VALUES (?, ?, ?, ?)').run('session', 'guest', '["read","manage"]', created);
+  await run('INSERT INTO connectors (id, owner_id, name, credential_hash, created_at, models_json, capabilities_json) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    'connector', 'host', 'Local host', credentialHash, created, JSON.stringify([{ provider: 'openai', modelId: 'local-model', name: 'Local model' }]), JSON.stringify({ platform: 'linux', sandbox: true, productionShell: false }));
+  await run('INSERT INTO connector_shares VALUES (?, ?, ?)', 'connector', 'workspace', created);
+  await run('INSERT INTO connector_workspaces VALUES (?, ?, ?)', 'connector', 'workspace', created);
+  await run('INSERT INTO models (id, workspace_id, name, provider, model_id, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    'model', 'workspace', 'Model', 'openai', 'local-model', created, 'connector', 'host');
+  await run('INSERT INTO agents VALUES (?, ?, ?)', 'agent', 'owner', created);
+  await run('INSERT INTO agent_versions (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'version', 'agent', 'owner', 'workspace', 1, 'Agent', '', '', '[]', 'model', created);
+  await run("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private')",
+    'session', 'workspace', 'owner', 'version', 'Session', 1, 'ready', created, 'connector', 'host');
+  await run('INSERT INTO session_grants VALUES (?, ?, ?, ?)', 'session', 'guest', '["read","manage"]', created);
   let beforeQuery: ((sql: string) => Promise<void>) | undefined;
-  class Prepared {
-    values: (string | number | null)[] = [];
-    constructor(readonly sql: string) {}
-    bind(...values: (string | number | null)[]) { this.values = values; return this; }
-    async first(column?: string) {
-      await beforeQuery?.(this.sql);
-      const row = db.prepare(this.sql).get(...this.values);
-      return row ? column ? row[column] : row : null;
-    }
-    async run() {
-      await beforeQuery?.(this.sql);
-      const result = db.prepare(this.sql).run(...this.values);
-      return { success: true, results: [], meta: { changes: Number(result.changes) } };
-    }
-  }
-  const env = { DB: { prepare(sql: string) { return new Prepared(sql); } }, APP_ORIGIN: 'https://app.example.test' } as unknown as Env;
-  const sockets: RelaySocket[] = [];
-  let ready: Promise<unknown> = Promise.resolve();
-  let autoResponse: unknown;
-  const state = {
-    storage: { sql: { exec(sql: string, ...bindings: (string | number | null)[]) {
-      const rows = local.prepare(sql).all(...bindings);
-      return { toArray: () => rows };
-    } } },
-    blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T> {
-      const result = ready.then(callback);
-      ready = result;
-      return result;
+  // The hub sees a provider whose statements can be held mid-flight to reproduce admission races.
+  const hooked: Database = {
+    provider: db.provider,
+    batch: statements => db.batch(statements),
+    transaction: work => db.transaction(work),
+    migrate: () => db.migrate(),
+    close: () => db.close(),
+    query<T>(sql: string): Query<T> {
+      let inner = db.query<T>(sql);
+      const outer: Query<T> = {
+        bind: (...values) => { inner = inner.bind(...values); return outer; },
+        first: (async (column?: keyof T) => { await beforeQuery?.(sql); return column === undefined ? inner.first() : inner.first(column); }) as Query<T>['first'],
+        all: async () => { await beforeQuery?.(sql); return inner.all(); },
+        run: async () => { await beforeQuery?.(sql); return inner.run(); },
+      };
+      return outer;
     },
-    getWebSockets: () => sockets.filter(socket => socket.readyState === 1),
-    acceptWebSocket(socket: RelaySocket) { sockets.push(socket); },
-    setWebSocketAutoResponse(pair: unknown) { autoResponse = pair; },
   };
-  let hub = new ConnectorHub(state as unknown as DurableObjectState, env);
-  await ready;
-  async function connect() {
-    const response = await hub.fetch(new Request('https://connector.internal/socket', { headers: {
-      Upgrade: 'websocket', 'X-Connector-Id': 'connector', 'X-Connector-Credential-Hash': credentialHash,
-      'Sec-WebSocket-Protocol': 'opencara-pi-v1',
-    } }));
-    assert.equal(response.status, 101);
-    assert.equal(response.headers.get('sec-websocket-protocol'), 'opencara-pi-v1');
-    const socket = sockets.at(-1)!;
-    const welcome = JSON.parse(socket.sent[0]) as { type: string; connectorId: string; connectionToken: string };
+  const env = { DB: hooked, APP_ORIGIN: 'https://app.example.test' } as Env;
+  const hub = new ConnectorHubRegistry(env);
+  env.CONNECTOR_HUB = hub;
+  const server = createServer((_request, response) => { response.statusCode = 404; response.end(); });
+  const upgrades: Promise<void>[] = [];
+  server.on('upgrade', (request, socket, head) => {
+    socket.on('error', () => {});
+    const connectorId = request.headers['x-connector-id'];
+    const credential = request.headers['x-connector-credential-hash'];
+    upgrades.push(hub.connect(request, socket, head, String(connectorId ?? ''), String(credential ?? '')));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('No listen address');
+  const origin = `ws://127.0.0.1:${address.port}`;
+  const sockets: RelaySocket[] = [];
+  async function connect(headers: Record<string, string> = { 'X-Connector-Id': 'connector', 'X-Connector-Credential-Hash': credentialHash }) {
+    const ws = new WebSocket(`${origin}/api/connectors/socket`, ['opencara-pi-v1', 'bearer.unused'], { headers });
+    const socket = new RelaySocket(ws);
+    sockets.push(socket);
+    const welcome = await new Promise<{ type: string; connectorId: string; connectionToken: string }>((resolve, reject) => {
+      ws.once('unexpected-response', (_request, response) => {
+        let body = '';
+        response.on('data', chunk => { body += chunk; });
+        response.on('end', () => reject(Object.assign(new Error(`rejected ${response.statusCode}: ${body}`), { status: response.statusCode, body })));
+      });
+      ws.once('error', reject);
+      ws.once('message', data => resolve(JSON.parse(data.toString())));
+    });
+    assert.equal(ws.protocol, 'opencara-pi-v1');
     assert.equal(welcome.type, 'welcome');
+    assert.equal(welcome.connectorId, 'connector');
     return { socket, welcome };
   }
+  t.after(async () => {
+    beforeQuery = undefined;
+    for (const socket of sockets) await socket.close();
+    await Promise.allSettled(upgrades);
+    await hub.close();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await db.close();
+  });
   const initial = await connect();
   async function envelope(action: RunnerAction = 'view', body = '', actorId = 'owner'): Promise<ConnectorRelayEnvelope> {
-    const current = db.prepare('SELECT connection_hash FROM connectors WHERE id = ?').get('connector')!;
+    const connectionHash = await db.query<{ connection_hash: string }>('SELECT connection_hash FROM connectors WHERE id = ?').bind('connector').first('connection_hash');
     const issuedAt = Math.floor(Date.now() / 1000);
     const requestId = crypto.randomUUID();
-    return { connectorId: 'connector', credentialHash, connectionHash: current.connection_hash as string,
+    return { connectorId: 'connector', credentialHash, connectionHash: connectionHash!,
       request: { type: 'request', id: requestId, method: action === 'view' || action === 'events' ? 'GET' : 'POST',
         path: connectorPath(action, 'session', action === 'approve' ? 'approval' : ''), body,
         ticket: { aud: 'runner', connectorId: 'connector', sessionId: 'session', actorId, ownerId: 'owner', action,
           policyVersion: 1, iat: issuedAt, exp: issuedAt + 60, jti: requestId, bodyHash: await sha256(body) } } };
   }
-  function rpc(value: ConnectorRelayEnvelope) {
-    return hub.fetch(new Request('https://connector.internal/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) }));
-  }
-  async function reply(socket: RelaySocket, request: ConnectorRpcRequest, body = '{"ok":true}', status = 200) {
-    await hub.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({ type: 'response', id: request.id, status, body }));
-  }
-  t.after(async () => {
-    beforeQuery = undefined;
-    for (const socket of sockets) await hub.webSocketClose(socket as unknown as WebSocket, 1000, '', true);
-    db.close(); local.close();
-    globals.forEach((name, index) => {
-      if (descriptors[index]) Object.defineProperty(globalThis, name, descriptors[index]!);
-      else Reflect.deleteProperty(globalThis, name);
-    });
-  });
-  return { db, local, env, initial, connect, envelope, rpc, reply,
-    get hub() { return hub; }, get autoResponse() { return autoResponse; },
-    setBeforeQuery(hook?: (sql: string) => Promise<void>) { beforeQuery = hook; },
-    async hibernate() { hub = new ConnectorHub(state as unknown as DurableObjectState, env); await ready; },
+  const rpc = (value: ConnectorRelayEnvelope) => hub.rpc('connector', value);
+  const reply = (socket: RelaySocket, request: ConnectorRpcRequest, body = '{"ok":true}', status = 200) => {
+    socket.send(JSON.stringify({ type: 'response', id: request.id, status, body }));
   };
+  const connectionHash = () => db.query<{ connection_hash: string | null }>('SELECT connection_hash FROM connectors WHERE id = ?').bind('connector').first('connection_hash');
+  return { db, env, hub, initial, connect, envelope, rpc, reply, exec, connectionHash,
+    setBeforeQuery(hook?: (sql: string) => Promise<void>) { beforeQuery = hook; } };
 }
 
-test('outbound connector handshake persists only hashes, restores hibernation identity and auto-heartbeats', async t => {
+/** Lets in-flight frames land; used only to prove that nothing was sent. */
+const settled = () => delay(30);
+
+test('connector handshake stores only the connection hash, negotiates the protocol and answers heartbeats', async t => {
   const f = await fixture(t);
   const { socket, welcome } = f.initial;
-  const stored = f.db.prepare('SELECT connection_hash FROM connectors').get()!;
-  assert.equal(stored.connection_hash, await sha256(welcome.connectionToken));
-  assert.ok(!JSON.stringify(f.local.prepare('SELECT * FROM connector_identity').all()).includes(welcome.connectionToken));
-  assert.ok(!JSON.stringify(socket.attachment).includes(welcome.connectionToken));
-  assert.deepEqual({ ...f.autoResponse as object }, { request: 'ping', response: 'pong' });
-  await f.hibernate();
-  assert.deepEqual(await (await f.hub.fetch(new Request('https://connector.internal/status'))).json(), { online: true });
+  assert.equal(await f.connectionHash(), await sha256(welcome.connectionToken));
+  socket.send('ping');
+  await delay(30);
+  assert.ok(socket.messages.includes('pong'), 'ping is answered with pong');
+  assert.equal(await f.hub.status('connector', 1000), true);
+  assert.equal(await f.hub.status('other', 1000), false);
   const pending = f.rpc(await f.envelope());
   const wire = await socket.nextRequest();
-  await f.reply(socket, wire);
+  f.reply(socket, wire);
   assert.deepEqual(await (await pending).json(), { ok: true });
+});
+
+test('handshake rejects wrong credentials and stale generations with HTTP errors before upgrading', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.connect({ 'X-Connector-Id': 'connector', 'X-Connector-Credential-Hash': 'x'.repeat(43) }), { status: 403 });
+  await assert.rejects(f.connect({ 'X-Connector-Id': 'other', 'X-Connector-Credential-Hash': 'x'.repeat(43) }), { status: 403 });
+  assert.equal(f.initial.socket.readyState, WebSocket.OPEN, 'rejected handshakes do not disturb the live connection');
+  assert.equal(await f.hub.status('connector', 1000), true);
 });
 
 test('transport preserves session ownership and restore ticket claims without any global secret', async t => {
   const f = await fixture(t);
-  const namespace = { idFromName(name: string) { assert.equal(name, 'connector'); return name; }, get() { return { fetch(url: string, init: RequestInit) { return f.hub.fetch(new Request(url, init)); } }; } };
-  f.env.CONNECTOR_HUB = namespace as unknown as DurableObjectNamespace;
   const c = { env: f.env, get: () => ({ userId: 'owner' }) } as unknown as AppContext;
-  const row = f.db.prepare('SELECT * FROM sessions').get() as unknown as SessionRow;
-  const pending = connectorRequest(c, row, 'restore', '', { restore: { id: 'restore' } });
+  const row = await f.db.query<SessionRow>('SELECT * FROM sessions').first();
+  const pending = connectorRequest(c, row!, 'restore', '', { restore: { id: 'restore' } });
   const wire = await f.initial.socket.nextRequest();
   assert.equal(wire.path, '/v1/sessions/session/restore');
   assert.equal(wire.ticket.ownerId, 'owner');
@@ -195,7 +195,7 @@ test('transport preserves session ownership and restore ticket claims without an
   assert.equal(wire.ticket.exp - wire.ticket.iat, 60);
   assert.equal(wire.ticket.bodyHash, await sha256(wire.body));
   assert.ok(!JSON.stringify(wire).includes('credentialHash'));
-  await f.reply(f.initial.socket, wire, '{"restored":true}');
+  f.reply(f.initial.socket, wire, '{"restored":true}');
   assert.deepEqual(await (await pending).json(), { restored: true });
 });
 
@@ -214,7 +214,21 @@ test('RPC validation rejects path confusion, body tampering, ticket mismatch, SS
     assert.equal((await f.rpc(value)).status, 400);
   }
   await assert.rejects(validateConnectorRpc(await f.envelope('submit', 'x'.repeat(connectorLimits.requestBytes + 1))));
+  assert.equal((await f.hub.rpc('other', await f.envelope())).status, 503, 'an unknown connector id is offline');
+  await settled();
   assert.equal(f.initial.socket.requests.length, 0);
+});
+
+test('the caller envelope keeps its own request id while the wire carries a hub-minted nonce', async t => {
+  const f = await fixture(t);
+  const value = await f.envelope();
+  const pending = f.rpc(value);
+  const wire = await f.initial.socket.nextRequest();
+  assert.notEqual(wire.id, value.request.id);
+  assert.equal(wire.ticket.jti, wire.id);
+  assert.equal(value.request.id, value.request.ticket.jti, 'the caller still holds its original ticket');
+  f.reply(f.initial.socket, wire);
+  assert.equal((await pending).status, 200);
 });
 
 const revocations: Record<string, string> = {
@@ -232,18 +246,19 @@ const revocations: Record<string, string> = {
 };
 for (const [name, mutation] of Object.entries(revocations)) {
   for (const stage of ['dispatch', 'response']) {
-    test(`${name} is checked against live D1 before ${stage}`, async t => {
+    test(`${name} is checked against the live database before ${stage}`, async t => {
       const f = await fixture(t);
       const value = await f.envelope('view', '', 'guest');
       if (stage === 'dispatch') {
-        f.db.exec(mutation);
+        await f.exec(mutation);
         assert.ok([403, 503].includes((await f.rpc(value)).status));
+        await settled();
         assert.equal(f.initial.socket.requests.length, 0);
       } else {
         const pending = f.rpc(value);
         const wire = await f.initial.socket.nextRequest();
-        f.db.exec(mutation);
-        await f.reply(f.initial.socket, wire, '{"private":"must-not-leak"}');
+        await f.exec(mutation);
+        f.reply(f.initial.socket, wire, '{"private":"must-not-leak"}');
         const response = await pending;
         assert.ok([403, 503].includes(response.status));
         assert.ok(!(await response.text()).includes('must-not-leak'));
@@ -267,18 +282,20 @@ test('reconnect fails ambiguous in-flight work and old sockets cannot answer or 
   const oldWire = await old.nextRequest();
   const next = await f.connect();
   assert.equal((await pending).status, 503);
+  assert.deepEqual(await old.closed, { code: 1012, reason: 'Connection replaced' });
   const nextHash = await sha256(next.welcome.connectionToken);
   const nextPending = f.rpc(await f.envelope());
   const nextWire = await next.socket.nextRequest();
-  await f.reply(old, nextWire, '{"wrong":true}');
-  await f.reply(old, oldWire, '{"late":true}');
-  await f.hub.webSocketClose(old as unknown as WebSocket, 1000, '', true);
-  assert.equal(f.db.prepare('SELECT connection_hash FROM connectors').get()!.connection_hash, nextHash);
-  await f.reply(next.socket, nextWire, '{"generation":"new"}');
+  f.reply(old, nextWire, '{"wrong":true}');
+  f.reply(old, oldWire, '{"late":true}');
+  await old.close();
+  await settled();
+  assert.equal(await f.connectionHash(), nextHash);
+  f.reply(next.socket, nextWire, '{"generation":"new"}');
   assert.deepEqual(await (await nextPending).json(), { generation: 'new' });
 });
 
-test('socket replacement during a pending D1 admission fences dispatch', async t => {
+test('socket replacement during a pending database admission fences dispatch', async t => {
   const f = await fixture(t);
   const { promise: gate, resolve: release } = Promise.withResolvers<void>();
   const { promise: entered, resolve: signal } = Promise.withResolvers<void>();
@@ -291,6 +308,7 @@ test('socket replacement during a pending D1 admission fences dispatch', async t
   const replacement = await f.connect();
   release();
   assert.ok([403, 503].includes((await pending).status));
+  await settled();
   assert.equal(f.initial.socket.requests.length, 0);
   assert.equal(replacement.socket.requests.length, 0);
 });
@@ -300,36 +318,41 @@ test('unsolicited and duplicate replies fail closed without satisfying another R
   const value = await f.envelope();
   const first = f.rpc(value);
   const firstWire = await f.initial.socket.nextRequest();
-  await f.reply(f.initial.socket, firstWire);
+  f.reply(f.initial.socket, firstWire);
   await (await first).text();
   const second = f.rpc(value);
   const secondWire = await f.initial.socket.nextRequest();
   assert.notEqual(secondWire.id, firstWire.id);
-  await f.reply(f.initial.socket, firstWire, '{"duplicate":true}');
+  f.reply(f.initial.socket, firstWire, '{"duplicate":true}');
   assert.equal((await second).status, 502);
-  assert.equal(f.initial.socket.readyState, 3);
+  assert.equal((await f.initial.socket.closed).code, 1008);
 });
 
 test('concurrent duplicate response cannot race through asynchronous policy checks', async t => {
   const f = await fixture(t);
   const pending = f.rpc(await f.envelope());
   const wire = await f.initial.socket.nextRequest();
-  await Promise.all([f.reply(f.initial.socket, wire), f.reply(f.initial.socket, wire)]);
+  f.reply(f.initial.socket, wire);
+  f.reply(f.initial.socket, wire);
   assert.equal((await pending).status, 502);
 });
 
-test('malformed, binary and oversized responses close the generation and fail requests', async t => {
+test('malformed, binary, oversized and over-limit frames close the generation and fail requests', async t => {
   const f = await fixture(t);
-  for (const kind of ['malformed', 'binary', 'oversized', 'status']) {
+  for (const kind of ['malformed', 'binary', 'oversized', 'status', 'frame']) {
     const { socket } = kind === 'malformed' ? f.initial : await f.connect();
     const pending = f.rpc(await f.envelope());
     const wire = await socket.nextRequest();
-    if (kind === 'malformed') await f.hub.webSocketMessage(socket as unknown as WebSocket, '{');
-    if (kind === 'binary') await f.hub.webSocketMessage(socket as unknown as WebSocket, new ArrayBuffer(1));
-    if (kind === 'oversized') await f.reply(socket, wire, 'x'.repeat(connectorLimits.responseBytes + 1));
-    if (kind === 'status') await f.reply(socket, wire, 'body', 204);
-    assert.ok([403, 502].includes((await pending).status));
-    assert.equal(socket.readyState, 3);
+    if (kind === 'malformed') socket.send('{');
+    if (kind === 'binary') socket.send(Buffer.alloc(1));
+    if (kind === 'oversized') f.reply(socket, wire, 'x'.repeat(connectorLimits.responseBytes + 1));
+    if (kind === 'status') f.reply(socket, wire, 'body', 204);
+    if (kind === 'frame') socket.send(Buffer.alloc(connectorLimits.frameBytes + 1, 0x20));
+    const response = await pending;
+    assert.equal(response.status, 502, `${kind}: ${response.status}`);
+    // ws itself refuses frames above maxPayload with 1009 before the relay sees them.
+    assert.equal((await socket.closed).code, kind === 'frame' ? 1009 : 1008, kind);
+    assert.equal(await f.connectionHash(), null, `${kind} clears the generation`);
   }
 });
 
@@ -342,13 +365,13 @@ test('pending RPC and undrained completed response counts remain aggregate bound
     wires.push(await f.initial.socket.nextRequest());
   }
   assert.equal((await f.rpc(await f.envelope())).status, 429);
-  for (const wire of wires) await f.reply(f.initial.socket, wire);
+  for (const wire of wires) f.reply(f.initial.socket, wire);
   const responses = await Promise.all(pending);
   assert.equal((await f.rpc(await f.envelope())).status, 429, 'undrained replies retain concurrency slots');
   await Promise.all(responses.map(response => response.body!.cancel()));
   const accepted = f.rpc(await f.envelope());
   const wire = await f.initial.socket.nextRequest();
-  await f.reply(f.initial.socket, wire);
+  f.reply(f.initial.socket, wire);
   assert.equal((await accepted).status, 200);
   await (await accepted).body!.cancel();
 });
@@ -359,7 +382,7 @@ test('aggregate response buffering rejects overflow even below individual respon
   for (let i = 0; i < 3; i++) {
     const pending = f.rpc(await f.envelope());
     const wire = await f.initial.socket.nextRequest();
-    await f.reply(f.initial.socket, wire, JSON.stringify('x'.repeat(9 * 1024 * 1024)));
+    f.reply(f.initial.socket, wire, JSON.stringify('x'.repeat(9 * 1024 * 1024)));
     const response = await pending;
     if (i < 2) { assert.equal(response.status, 200); responses.push(response); }
     else assert.equal(response.status, 502, 'wire frame plus decoded body exceeds aggregate capacity');
@@ -374,24 +397,45 @@ test('deadline closes ambiguous generation and late replies never replay effects
   const wire = await f.initial.socket.nextRequest();
   t.mock.timers.tick(30001);
   assert.equal((await pending).status, 504);
-  await f.reply(f.initial.socket, wire, '{"late":true}');
-  assert.equal(f.initial.socket.sent.filter(raw => JSON.parse(raw).type === 'request').length, 1);
   t.mock.timers.reset();
+  assert.deepEqual(await f.initial.socket.closed, { code: 1008, reason: 'Connector timed out' });
+  f.reply(f.initial.socket, wire, '{"late":true}');
+  assert.equal(f.initial.socket.requests.length, 0);
+  assert.equal(f.initial.socket.messages.filter(raw => raw.startsWith('{') && JSON.parse(raw).type === 'request').length, 1);
 });
 
-test('revoke is namespace scoped, requires D1 revocation and drains active requests', async t => {
+test('revoke is namespace scoped, requires database revocation and drains active requests', async t => {
   const f = await fixture(t);
-  const revoke = (connectorId: string) => f.hub.fetch(new Request('https://connector.internal/revoke', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ connectorId }),
-  }));
-  assert.equal((await revoke('other')).status, 404);
-  assert.equal((await revoke('connector')).status, 409);
+  await assert.rejects(f.hub.revoke('other'), { status: 404 });
+  await assert.rejects(f.hub.revoke('connector'), { status: 409 });
   const pending = f.rpc(await f.envelope());
   await f.initial.socket.nextRequest();
-  f.db.exec("UPDATE connectors SET revoked_at = 'revoked'");
-  assert.equal((await revoke('connector')).status, 204);
+  await f.exec("UPDATE connectors SET revoked_at = 'revoked'");
+  await f.hub.revoke('connector');
   assert.equal((await pending).status, 403);
-  assert.deepEqual(await (await f.hub.fetch(new Request('https://connector.internal/status'))).json(), { online: false });
+  assert.deepEqual(await f.initial.socket.closed, { code: 1008, reason: 'Connector revoked' });
+  assert.equal(await f.hub.status('connector', 1000), false);
+});
+
+test('status reports false once the database generation no longer matches or the lookup times out', async t => {
+  const f = await fixture(t);
+  assert.equal(await f.hub.status('connector', 1000), true);
+  f.setBeforeQuery(async () => { await delay(200); });
+  assert.equal(await f.hub.status('connector', 20), false, 'a slow database check reports offline');
+  f.setBeforeQuery(undefined);
+  await f.exec("UPDATE connectors SET connection_hash = 'changed'");
+  assert.equal(await f.hub.status('connector', 1000), false);
+  assert.equal(f.initial.socket.readyState, WebSocket.OPEN, 'status is read-only');
+});
+
+test('hub close disconnects every connector and clears its generation', async t => {
+  const f = await fixture(t);
+  const pending = f.rpc(await f.envelope());
+  await f.initial.socket.nextRequest();
+  await f.hub.close();
+  assert.equal((await pending).status, 503);
+  assert.deepEqual(await f.initial.socket.closed, { code: 1012, reason: 'Server shutting down' });
+  assert.equal(await f.connectionHash(), null);
 });
 
 test('allocation-free byte counts and JSON validation handle UTF-8, escapes and bounded nesting', () => {
@@ -411,7 +455,7 @@ test('backup may finish after ticket admission expiry but never beyond its relay
   const pending = f.rpc(await f.envelope('backup', '{}'));
   const wire = await f.initial.socket.nextRequest();
   t.mock.timers.tick(61000);
-  await f.reply(f.initial.socket, wire, '{"snapshot":true}');
+  f.reply(f.initial.socket, wire, '{"snapshot":true}');
   assert.deepEqual(await (await pending).json(), { snapshot: true });
   t.mock.timers.reset();
 });
@@ -420,17 +464,18 @@ test('an unsolicited id closes the socket without forwarding connector-controlle
   const f = await fixture(t);
   const pending = f.rpc(await f.envelope());
   const wire = await f.initial.socket.nextRequest();
-  await f.reply(f.initial.socket, { ...wire, id: 'unsolicited' }, '{"private":"not-a-correlated-reply"}');
+  f.reply(f.initial.socket, { ...wire, id: 'unsolicited' }, '{"private":"not-a-correlated-reply"}');
   const response = await pending;
   assert.equal(response.status, 502);
   assert.ok(!(await response.text()).includes('not-a-correlated-reply'));
+  assert.deepEqual(await f.initial.socket.closed, { code: 1008, reason: 'Unsolicited connector response' });
 });
 
 test('non-JSON upstream responses are rejected instead of relabeled application/json', async t => {
   const f = await fixture(t);
   const pending = f.rpc(await f.envelope());
   const wire = await f.initial.socket.nextRequest();
-  await f.reply(f.initial.socket, wire, '<html>not a runner response</html>');
+  f.reply(f.initial.socket, wire, '<html>not a runner response</html>');
   assert.equal((await pending).status, 502);
 });
 
@@ -439,7 +484,7 @@ test('chunked replies preserve surrogate pairs across chunk boundaries', async t
   const pending = f.rpc(await f.envelope());
   const wire = await f.initial.socket.nextRequest();
   const body = JSON.stringify('a'.repeat(16382) + '\ud83d\ude00' + 'z'.repeat(20000));
-  await f.reply(f.initial.socket, wire, body);
+  f.reply(f.initial.socket, wire, body);
   assert.equal(await (await pending).text(), body);
 });
 
@@ -453,30 +498,30 @@ test('replacement during response policy lookup discards the old response', asyn
   f.setBeforeQuery(async sql => {
     if (!held && sql.includes('FROM sessions s')) { held = true; signal(); await gate; }
   });
-  const oldReply = f.reply(f.initial.socket, wire, '{"private":"old-response"}');
+  f.reply(f.initial.socket, wire, '{"private":"old-response"}');
   await entered;
   const replacement = await f.connect();
   release();
-  await oldReply;
   const response = await pending;
   assert.equal(response.status, 503);
   assert.ok(!(await response.text()).includes('old-response'));
-  assert.equal(f.db.prepare('SELECT connection_hash FROM connectors').get()!.connection_hash, await sha256(replacement.welcome.connectionToken));
+  assert.equal(await f.connectionHash(), await sha256(replacement.welcome.connectionToken));
 });
 
 test('workspace visibility authorizes relay reads without granting any mutation or backup action', async t => {
   const f = await fixture(t);
-  f.db.exec("DELETE FROM session_grants; UPDATE sessions SET visibility = 'workspace'");
+  await f.exec("DELETE FROM session_grants; UPDATE sessions SET visibility = 'workspace'");
   const value = await f.envelope('view', '', 'guest');
   const pending = f.rpc(value);
   const wire = await f.initial.socket.nextRequest();
   assert.equal(wire.ticket.actorId, 'guest');
   assert.equal(wire.ticket.ownerId, 'owner');
-  await f.reply(f.initial.socket, wire, '{"view":"workspace-readable"}');
+  f.reply(f.initial.socket, wire, '{"view":"workspace-readable"}');
   assert.deepEqual(await (await pending).json(), { view: 'workspace-readable' });
   for (const action of ['ask', 'submit', 'operations', 'approve', 'backup', 'restore', 'restart', 'create'] as const) {
     assert.equal((await f.rpc(await f.envelope(action, '{}', 'guest'))).status, 403, action);
   }
+  await settled();
   assert.equal(f.initial.socket.requests.length, 0);
 });
 
@@ -484,20 +529,21 @@ for (const mutation of ['privacy', 'membership'] as const) {
   for (const stage of ['dispatch', 'response'] as const) {
     test(`workspace ${mutation} is rechecked by the relay before ${stage} without an explicit grant`, async t => {
       const f = await fixture(t);
-      f.db.exec("DELETE FROM session_grants; UPDATE sessions SET visibility = 'workspace'");
+      await f.exec("DELETE FROM session_grants; UPDATE sessions SET visibility = 'workspace'");
       const value = await f.envelope('view', '', 'guest');
       const sql = mutation === 'privacy' ? "UPDATE sessions SET visibility = 'private'"
         : "DELETE FROM workspace_members WHERE user_id = 'guest'";
       // Do not bump policy_version: live access must be sufficient even with an unchanged ticket.
       if (stage === 'dispatch') {
-        f.db.exec(sql);
+        await f.exec(sql);
         assert.equal((await f.rpc(value)).status, 403);
+        await settled();
         assert.equal(f.initial.socket.requests.length, 0);
       } else {
         const pending = f.rpc(value);
         const wire = await f.initial.socket.nextRequest();
-        f.db.exec(sql);
-        await f.reply(f.initial.socket, wire, '{"private":"workspace-revoked-must-not-leak"}');
+        await f.exec(sql);
+        f.reply(f.initial.socket, wire, '{"private":"workspace-revoked-must-not-leak"}');
         const response = await pending;
         assert.equal(response.status, 403);
         assert.ok(!(await response.text()).includes('workspace-revoked-must-not-leak'));
@@ -514,7 +560,7 @@ const isolatedRevocations: Record<string, string> = {
 for (const name of ['share', 'privacy', 'membership', 'revocation', 'credential', 'generation']) {
   test(`${name} response denial isolates session policy but preserves host-generation fencing`, async t => {
     const f = await fixture(t);
-    f.db.exec(`DELETE FROM session_grants;
+    await f.exec(`DELETE FROM session_grants;
       UPDATE sessions SET visibility = 'workspace';
       INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status,
         created_at, connector_id, connector_owner_id, visibility)
@@ -528,25 +574,26 @@ for (const name of ['share', 'privacy', 'membership', 'revocation', 'credential'
     ownerEnvelope.request.ticket.ownerId = 'host';
     const owner = f.rpc(ownerEnvelope);
     const ownerWire = await f.initial.socket.nextRequest();
-    const generation = f.db.prepare("SELECT connection_hash FROM connectors WHERE id = 'connector'").get()!.connection_hash;
+    const generation = await f.connectionHash();
     const isolated = name in isolatedRevocations;
-    f.db.exec(isolatedRevocations[name] ?? revocations[name]!);
-    await f.reply(f.initial.socket, viewerWire, '{"private":"revoked-content-must-not-leak"}');
+    await f.exec(isolatedRevocations[name] ?? revocations[name]!);
+    f.reply(f.initial.socket, viewerWire, '{"private":"revoked-content-must-not-leak"}');
     const denied = await viewer;
     assert.equal(denied.status, 403);
     assert.ok(!(await denied.text()).includes('revoked-content-must-not-leak'));
     if (!isolated) {
       assert.equal((await owner).status, 403);
-      assert.equal(f.initial.socket.readyState, 3, 'host revocation still closes the entire generation');
+      assert.equal((await f.initial.socket.closed).code, 1008, 'host revocation still closes the entire generation');
       return;
     }
-    assert.equal(f.initial.socket.readyState, 1, 'session revocation must not disconnect the host');
-    assert.equal(f.db.prepare("SELECT connection_hash FROM connectors WHERE id = 'connector'").get()!.connection_hash, generation);
-    await f.reply(f.initial.socket, ownerWire, '{"owner":"uninterrupted"}');
+    await settled();
+    assert.equal(f.initial.socket.readyState, WebSocket.OPEN, 'session revocation must not disconnect the host');
+    assert.equal(await f.connectionHash(), generation);
+    f.reply(f.initial.socket, ownerWire, '{"owner":"uninterrupted"}');
     assert.deepEqual(await (await owner).json(), { owner: 'uninterrupted' });
     const continued = f.rpc(ownerEnvelope);
     const continuedWire = await f.initial.socket.nextRequest();
-    await f.reply(f.initial.socket, continuedWire, '{"owner":"still-connected"}');
+    f.reply(f.initial.socket, continuedWire, '{"owner":"still-connected"}');
     assert.deepEqual(await (await continued).json(), { owner: 'still-connected' });
   });
 }

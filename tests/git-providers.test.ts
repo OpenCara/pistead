@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import { HTTPException } from 'hono/http-exception';
-import { gitProviderAdapters } from '../apps/worker/src/git/providers.js';
-import type { GitCredential } from '../apps/worker/src/git/types.js';
+import { gitProviderAdapters } from '../apps/server/src/git/providers.js';
+import type { GitCredential } from '../apps/server/src/git/types.js';
 
 const sha = 'a'.repeat(40);
 const tarGz = new Uint8Array(gzipSync(Buffer.alloc(1024)));
