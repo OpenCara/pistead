@@ -1,11 +1,11 @@
 import type { Hono } from 'hono';
-import type { GitAccount, GitProvider, ProviderRepository, TokenGitProvider } from '../../../../packages/shared/src/repositories.js';
-import { gitProviderHosts, gitProviderNames, gitProviders, validGitHost, validRepositoryId, validRepositoryName } from '../../../../packages/shared/src/repositories.js';
+import type { GitAccount, GitProvider, ProviderRepository, ProviderRepositoryList, TokenGitProvider } from '../../../../packages/shared/src/repositories.js';
+import { gitProviderHosts, gitProviderNames, gitProviders, repositoryLimits, validGitHost, validRepositoryId, validRepositoryName } from '../../../../packages/shared/src/repositories.js';
 import type { Env, GitCredentialRow, WorkerEnv } from '../types.js';
 import { auditStatement, getUser } from '../db.js';
 import { fail, id, identifier, jsonObject, now, testMode } from '../http.js';
 import { decryptToken, encryptToken } from '../vault.js';
-import { githubRepositoryPage, validRepositoryRef } from '../repositories.js';
+import { githubRepositories, validRepositoryRef } from '../repositories.js';
 import { gitProviderAdapters } from './providers.js';
 import type { GitCredential } from './types.js';
 
@@ -180,20 +180,17 @@ export function registerGitAccounts(app: Hono<WorkerEnv>): void {
   app.get('/api/git/accounts/:id/repositories', async c => {
     const userId = c.get('auth').userId;
     const accountId = c.req.param('id');
-    const rawPage = c.req.query('page') ?? '1';
-    if (!/^[1-9]\d{0,3}$/.test(rawPage) || Number(rawPage) > 1000) fail(400, 'invalid_page', 'Repository page must be between 1 and 1000.');
-    const page = Number(rawPage);
-    if (accountId === 'github') return c.json(await githubRepositoryPage(c.env, userId, page));
+    if (accountId === 'github') return c.json(await githubRepositories(c.env, userId));
     const row = await c.env.DB.query<GitCredentialRow>('SELECT * FROM git_credentials WHERE id = ? AND user_id = ?')
       .bind(identifier(accountId), userId).first();
     if (!row) fail(404, 'not_found', 'Git account not found.');
     const access = await loaded(c.env, row);
-    const result = await gitProviderAdapters[row.provider].list(access.credential, page);
-    if (!Array.isArray(result?.repositories) || result.repositories.length > 30) {
+    const result = await gitProviderAdapters[row.provider].list(access.credential);
+    if (!Array.isArray(result?.repositories) || result.repositories.length > repositoryLimits.pickerRepositories) {
       fail(502, 'invalid_git_response', `${gitProviderNames[row.provider]} returned invalid repository metadata.`);
     }
     const repositories = result.repositories.map(item => providerRepository(row.provider, item));
     await recheckCredential(c.env, access);
-    return c.json({ repositories, page, hasMore: result.hasMore === true && page < 1000 });
+    return c.json({ repositories, truncated: result.truncated === true } satisfies ProviderRepositoryList);
   });
 }

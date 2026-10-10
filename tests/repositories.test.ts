@@ -13,7 +13,7 @@ import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
-import { repositoryLimits, type GitAccount, type ProviderRepository, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
+import { repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
 import type { AgentVersion, ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
 
 const origin = 'http://localhost:8787';
@@ -148,7 +148,7 @@ function github(t: TestContext) {
     ref: repositoryInput.ref,
     metadata: async (): Promise<Response> => Response.json(metadata),
     resolve: async (): Promise<Response> => Response.json({ sha: state.commit }),
-    picker: async (): Promise<Response> => Response.json([metadata]),
+    picker: async (_url: string): Promise<Response> => Response.json([metadata]),
     redirect: (): Response => new Response(null, { status: 302,
       headers: { Location: `https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/${state.commit}` } }),
     archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
@@ -159,7 +159,7 @@ function github(t: TestContext) {
     if (url === `https://api.github.com/repos/${metadata.full_name}`) return state.metadata();
     if (url === `https://api.github.com/repos/${metadata.full_name}/commits/${encodeURIComponent(state.ref)}` ||
         url === `https://api.github.com/repos/${metadata.full_name}/commits/main`) return state.resolve();
-    if (/^https:\/\/api\.github\.com\/user\/repos\?per_page=30&page=\d+&sort=full_name&direction=asc$/.test(url)) return state.picker();
+    if (/^https:\/\/api\.github\.com\/user\/repos\?per_page=100&page=\d+&sort=full_name&direction=asc$/.test(url)) return state.picker(url);
     if (url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitA}` ||
         url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitB}`) return state.redirect();
     if (url.startsWith(`https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/`)) return state.archive();
@@ -253,20 +253,31 @@ test('repository API separates cookie/CSRF authentication, administrator writes,
   assert.equal(remote.calls.length, 1);
 });
 
-test('picker uses the acting GitHub token, projects safe metadata and bounds pagination', async t => {
+test('picker uses the acting GitHub token, projects safe metadata and lists every page up to the limit', async t => {
   const f = await fixture(t); const remote = github(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   remote.state.picker = async () => Response.json([{ ...metadata, token: alice.githubToken, clone_url: 'credential-bearing upstream field' }]);
   for (const actor of [alice, bob]) {
-    const result = await json(await actor.request('GET', `${githubPicker}?page=2`));
-    assert.deepEqual(result, { repositories: [{ id: String(metadata.id), fullName: metadata.full_name, defaultBranch: 'main', private: true }], page: 2, hasMore: false });
+    const result = await json(await actor.request('GET', githubPicker));
+    assert.deepEqual(result, { repositories: [{ id: String(metadata.id), fullName: metadata.full_name, defaultBranch: 'main', private: true }], truncated: false });
     assert.equal(remote.calls.at(-1)!.authorization, `Bearer ${actor.githubToken}`);
   }
-  for (const page of ['0', '-1', '01', '1.5', '1001', '1e2']) await denied(await alice.request('GET', `${githubPicker}?page=${page}`), 400, 'invalid_page');
-  assert.equal(remote.calls.length, 2);
-  remote.state.picker = async () => Response.json(Array.from({ length: 30 }, (_, index) => ({ ...metadata, id: index + 1, full_name: `acme/repo-${index}` })));
-  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', githubPicker))).hasMore, true);
-  assert.equal((await json<{ hasMore: boolean }>(await alice.request('GET', `${githubPicker}?page=1000`))).hasMore, false);
-  remote.state.picker = async () => Response.json(Array.from({ length: 31 }, () => metadata));
+  const pageOf = (url: string) => Number(new URL(url).searchParams.get('page'));
+  const repos = (page: number, length: number) =>
+    Array.from({ length }, (_, index) => ({ ...metadata, id: page * 1000 + index, full_name: `acme/repo-${page}-${index}` }));
+  const pickerCalls = () => remote.calls.filter(call => call.url.startsWith('https://api.github.com/user/repos?'));
+  let before = pickerCalls().length;
+  remote.state.picker = async url => Response.json(repos(pageOf(url), pageOf(url) === 1 ? 100 : 1));
+  const two = await json<ProviderRepositoryList>(await alice.request('GET', githubPicker));
+  assert.equal(two.repositories.length, 101);
+  assert.equal(two.truncated, false);
+  assert.deepEqual(pickerCalls().slice(before).map(call => pageOf(call.url)), [1, 2]);
+  before = pickerCalls().length;
+  remote.state.picker = async url => Response.json(repos(pageOf(url), 100));
+  const full = await json<ProviderRepositoryList>(await alice.request('GET', githubPicker));
+  assert.equal(full.repositories.length, 3000);
+  assert.equal(full.truncated, true);
+  assert.deepEqual(pickerCalls().slice(before).map(call => pageOf(call.url)), Array.from({ length: 30 }, (_, index) => index + 1));
+  remote.state.picker = async () => Response.json(repos(1, 101));
   await denied(await alice.request('GET', githubPicker), 502, 'invalid_github_response');
 });
 
@@ -860,7 +871,7 @@ test('repository body deadline cancels a stalled stream without real-time waits'
 test('GitHub metadata has a separate small size bound and rejects malformed JSON/UTF-8', async t => {
   const f = await fixture(t); const remote = github(t); const owner = await f.client('owner'); let cancelled = false;
   remote.state.picker = async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
-    headers: { 'Content-Length': String(512 * 1024 + 1) },
+    headers: { 'Content-Length': String(2 * 1024 * 1024 + 1) },
   });
   await denied(await owner.request('GET', githubPicker), 502, 'repository_size_limit');
   assert.equal(cancelled, true);
@@ -992,9 +1003,8 @@ test('token accounts are verified, stored encrypted, never returned, private to 
   await denied(await bob.request('DELETE', `/api/git/accounts/${account.id}`), 404, 'not_found');
   remote.state.picker = async () => Response.json([{ ...giteaMetadata, clone_url: 'https://user:secret@git.acme.dev/acme/tools.git', permissions: { admin: true } }]);
   const page = await json(await alice.request('GET', `/api/git/accounts/${account.id}/repositories`));
-  assert.deepEqual(page, { repositories: [{ id: '42', fullName: 'acme/tools', defaultBranch: 'main', private: true } satisfies ProviderRepository], page: 1, hasMore: false });
+  assert.deepEqual(page, { repositories: [{ id: '42', fullName: 'acme/tools', defaultBranch: 'main', private: true } satisfies ProviderRepository], truncated: false });
   assert.equal(remote.calls.at(-1)!.authorization, 'token rotated-gitea-token');
-  await denied(await alice.request('GET', `/api/git/accounts/${account.id}/repositories?page=1001`), 400, 'invalid_page');
   await denied(await alice.request('DELETE', '/api/git/accounts/github'), 400, 'github_account_fixed');
   await denied(await alice.request('DELETE', `/api/git/accounts/${account.id}`, undefined, { 'X-CSRF-Token': '' }), 403, 'invalid_csrf');
   assert.equal((await alice.request('DELETE', `/api/git/accounts/${account.id}`)).status, 204);

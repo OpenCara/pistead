@@ -221,7 +221,7 @@ export function DropdownMenu({ label, icon = "more", items, align = "end", side 
   </div>;
 }
 
-export interface Option<T extends string> { value: T; label: string; hint?: string }
+export interface Option<T extends string> { value: T; label: string; hint?: string; disabled?: boolean }
 
 /** Searchable picker for long lists (models, agents, hosts). The list scrolls within the space the viewport leaves. */
 export function Combobox<T extends string>({ value, options, onChange, placeholder = "Select...", label, disabled, side = "below" }: { value: T | ""; options: Option<T>[]; onChange: (value: T) => void; placeholder?: string; label: string; disabled?: boolean; side?: "below" | "above" }) {
@@ -238,7 +238,7 @@ export function Combobox<T extends string>({ value, options, onChange, placehold
     {open && <Popover anchor={ref} side={side} role="dialog" label={label} className="listbox-popover">
       {options.length > 7 && <input className="input listbox-search" autoFocus placeholder="Search" value={query} onChange={event => setQuery(event.target.value)} aria-label={`Search ${label}`} />}
       <div role="listbox" className="listbox">
-        {filtered.length ? filtered.map(option => <button key={option.value} type="button" role="option" aria-selected={option.value === value} className="menu-item" onClick={() => { onChange(option.value); close(); }}>
+        {filtered.length ? filtered.map(option => <button key={option.value} type="button" role="option" aria-selected={option.value === value} disabled={option.disabled} className="menu-item" onClick={() => { onChange(option.value); close(); }}>
           <span className="truncate">{option.label}</span>{option.hint && <span className="menu-hint">{option.hint}</span>}
         </button>) : <div className="menu-label">No matches</div>}
       </div>
