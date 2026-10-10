@@ -5,7 +5,8 @@ const GAP = 4;
 const MARGIN = 8;
 
 export interface PopoverPlacement {
-  top: number;
+  /** Offset of the edge facing the anchor from the viewport's top (below) or bottom (above); content that shrinks stays attached. */
+  edge: number;
   left: number;
   /** Height the content may use before it has to scroll. */
   maxHeight: number;
@@ -27,11 +28,10 @@ export function placePopover(anchor: DOMRect, size: { width: number; height: num
   const chosen = preferred >= size.height || preferred >= other ? side : side === "below" ? "above" : "below";
   const room = chosen === "below" ? below : above;
   const maxHeight = Math.max(80, Math.floor(room));
-  const height = Math.min(size.height, maxHeight);
-  const top = chosen === "below" ? anchor.bottom + GAP : anchor.top - GAP - height;
+  const edge = chosen === "below" ? anchor.bottom + GAP : document.documentElement.clientHeight - anchor.top + GAP;
   const wanted = align === "end" ? anchor.right - size.width : anchor.left;
   const left = Math.min(Math.max(MARGIN, wanted), Math.max(MARGIN, viewportWidth - MARGIN - size.width));
-  return { top, left, maxHeight, side: chosen };
+  return { edge, left, maxHeight, side: chosen };
 }
 
 /**
@@ -55,20 +55,27 @@ export function Popover({ anchor, side = "below", align = "start", className = "
     const element = ref.current;
     const target = anchor.current;
     if (!element || !target) return;
-    const update = () => {
-      // Measure the natural size with no height cap, then fit it.
+    let size = { width: 0, height: 0 };
+    const measure = () => {
+      // The natural size with no height cap. Restore the rendered cap afterwards: React only rewrites styles that change.
+      const cap = element.style.maxHeight;
       element.style.maxHeight = "";
       const { width, height } = element.getBoundingClientRect();
-      setPlacement(placePopover(target.getBoundingClientRect(), { width, height }, side, align));
+      element.style.maxHeight = cap;
+      size = { width, height };
     };
-    update();
-    window.addEventListener("resize", update);
-    document.addEventListener("scroll", update, true);
-    return () => { window.removeEventListener("resize", update); document.removeEventListener("scroll", update, true); };
+    // Scrolling moves the anchor but never resizes the content; re-measuring there would reset a scrolled list.
+    const place = () => setPlacement(placePopover(target.getBoundingClientRect(), size, side, align));
+    const resize = () => { measure(); place(); };
+    resize();
+    window.addEventListener("resize", resize);
+    document.addEventListener("scroll", place, true);
+    return () => { window.removeEventListener("resize", resize); document.removeEventListener("scroll", place, true); };
   }, [anchor, side, align]);
   const positioned: CSSProperties = placement
-    ? { position: "fixed", top: placement.top, left: placement.left, maxHeight: placement.maxHeight, visibility: "visible" }
-    : { position: "fixed", top: 0, left: 0, visibility: "hidden" };
+    ? { position: "fixed", ...(placement.side === "below" ? { top: placement.edge } : { bottom: placement.edge }), left: placement.left, maxHeight: placement.maxHeight }
+    // Unplaced for one layout pass that is never painted; transparent rather than hidden so autoFocus content gets focus.
+    : { position: "fixed", top: 0, left: 0, opacity: 0, pointerEvents: "none" };
   // A modal <dialog> makes the rest of the document inert, so a popover opened from a sheet must live inside it.
   const host = anchor.current?.closest("dialog[open]") ?? document.body;
   return createPortal(

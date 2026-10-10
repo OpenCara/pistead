@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import type { AgentVersion, UserProfile, Workspace, WorkspaceRole } from "../../../../packages/shared/src/types";
-import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
+import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { useConnections } from "../hosts";
@@ -144,20 +144,19 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
 
 function RepositoryPicker({ open, workspace, accounts, repositories, disabled, refresh, close }: { open: boolean; workspace: Workspace; accounts: GitAccount[]; repositories: WorkspaceRepository[]; disabled: boolean; refresh: () => void; close: () => void }) {
   const [accountId, setAccountId] = useState("");
-  const [page, setPage] = useState(1);
   const [selectedId, setSelectedId] = useState("");
   const [ref, setRef] = useState("");
   // The API lists the GitHub sign-in account first when connected, so it is the default.
   const account = accounts.find(item => item.id === accountId) ?? accounts[0];
-  const resource = useResource<{ repositories: ProviderRepository[]; page: number; hasMore: boolean }>(open && account ? `/api/git/accounts/${segment(account.id)}/repositories?page=${page}` : null);
+  const resource = useResource<ProviderRepositoryList>(open && account ? `/api/git/accounts/${segment(account.id)}/repositories` : null);
   const action = useAction();
   const selected = resource.data?.repositories.find(repository => repository.id === selectedId);
   const alreadyBound = (repository: ProviderRepository) => repositories.some(binding => binding.provider === account?.provider && binding.host === account.host
     && (binding.repositoryId === repository.id || binding.fullName.toLowerCase() === repository.fullName.toLowerCase()));
   const blocked = disabled || action.busy || resource.loading || Boolean(resource.error) || !account || !selected || alreadyBound(selected) || repositories.length >= repositoryLimits.repositories;
   const providerName = account ? gitProviderNames[account.provider] : "Git";
-  function changePage(next: number) { setSelectedId(""); setRef(""); setPage(next); }
-  function chooseAccount(id: string) { setAccountId(id); changePage(1); }
+  function choose(id: string) { setSelectedId(id); setRef(""); }
+  function chooseAccount(id: string) { setAccountId(id); choose(""); }
   function dismiss() {
     if (action.busy) return;
     setSelectedId("");
@@ -187,24 +186,19 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
       <p className="muted small">Only repositories this {providerName} account can access are listed. Sessions read them with their owner's own account for the same provider. Never paste a token or clone URL</p>
       <ResourceState {...resource} retry={resource.refresh}>
         {!resource.data?.repositories.length
-          ? <EmptyState title="No repositories on this page">Check your {providerName} account and organization access, or return to a previous page</EmptyState>
+          ? <EmptyState title="No repositories found">Check your {providerName} account and organization access</EmptyState>
           : <>
-            <Field label={`${providerName} repository`}>
-              <select className="select" required value={selectedId} disabled={disabled || action.busy} onChange={event => { setSelectedId(event.target.value); setRef(""); }}>
-                <option value="">Choose a repository</option>
-                {resource.data.repositories.map(repository => <option key={repository.id} value={repository.id} disabled={alreadyBound(repository)}>{repository.fullName} / {repository.private ? "Private" : "Public"}{alreadyBound(repository) ? " / Already configured" : ""}</option>)}
-              </select>
-            </Field>
+            <div className="field"><span className="field-label">{providerName} repository</span>
+              <Combobox<string> label={`${providerName} repository`} placeholder="Choose a repository" value={selected?.id ?? ""} disabled={disabled || action.busy}
+                options={resource.data.repositories.map(repository => ({ value: repository.id, label: repository.fullName, disabled: alreadyBound(repository),
+                  hint: `${repository.private ? "Private" : "Public"}${alreadyBound(repository) ? " · Already configured" : ""}` }))} onChange={choose} />
+              {resource.data.truncated && <span className="field-hint">Only the first {repositoryLimits.pickerRepositories.toLocaleString()} repositories this account can access are listed</span>}
+            </div>
             <Field label="Branch, tag or commit" hint={`Optional. Leave blank to use ${selected ? `the default branch, ${selected.defaultBranch}` : "the repository's default branch"}. New sessions pin this ref to a commit; existing sessions never follow branch changes`}>
               <input className="input" value={ref} onChange={event => setRef(event.target.value)} disabled={disabled || action.busy || !selected} autoComplete="off" spellCheck={false} maxLength={255} placeholder={selected?.defaultBranch ?? "Repository default branch"} />
             </Field>
           </>}
       </ResourceState>
-      <div className="inline">
-        <Button variant="ghost" size="sm" icon="chevron-left" disabled={page === 1 || resource.loading || action.busy} onClick={() => changePage(page - 1)}>Previous</Button>
-        <span className="muted small" role="status">{providerName} page {page}</span>
-        <Button variant="ghost" size="sm" disabled={!resource.data?.hasMore || resource.loading || Boolean(resource.error) || action.busy} onClick={() => changePage(page + 1)}>Next<Icon name="chevron-right" size={16} /></Button>
-      </div>
       {resource.error && <p className="muted small">Review your <a href={href({ name: "settings", section: "profile" })}>Git accounts</a> and repository access, then retry. An owner or admin with access can also configure this workspace</p>}
       <Feedback error={action.error} />
     </form>

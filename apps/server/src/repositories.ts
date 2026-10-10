@@ -1,5 +1,5 @@
 import type { Hono } from 'hono';
-import type { GitProvider, ProviderRepository, SessionRepository, TokenGitProvider, WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
+import type { GitProvider, ProviderRepository, ProviderRepositoryList, SessionRepository, TokenGitProvider, WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
 import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
 import type { AppContext, Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
 import { getUser, requireMember, sessionAccess } from './db.js';
@@ -10,7 +10,7 @@ import {
   credentialOrganization, gitAccountRequired, gitHost, loadCredential, providerRepository, recheckCredential, tokenProvider, validProviderHost,
   type LoadedCredential,
 } from './git/accounts.js';
-import { gitProviderAdapters } from './git/providers.js';
+import { collectRepositories, gitProviderAdapters, listBytes, listPageSize } from './git/providers.js';
 import { zipToTarGz } from './git/zip.js';
 
 export interface GitHubAccess { token: string; ciphertext: string; userId: string; githubId: string }
@@ -134,14 +134,14 @@ export async function boundedRepositoryBody(response: Response, limit: number): 
   } finally { clearTimeout(timer); reader.releaseLock(); }
   return bytes.slice(0, size);
 }
-async function githubJSON(access: GitHubAccess, path: string): Promise<unknown> {
+async function githubJSON(access: GitHubAccess, path: string, limit = jsonBytes): Promise<unknown> {
   const response = await remoteFetch(`${apiOrigin}${path}`, { headers: headers(access) });
   if (!response.ok || response.status !== 200) {
     await response.body?.cancel();
     fail(response.status === 403 || response.status === 404 || response.status === 401 ? 403 : 502,
       'github_repository_unavailable', 'GitHub repository access could not be verified. Check repository access and try again.');
   }
-  const bytes = await boundedRepositoryBody(response, jsonBytes);
+  const bytes = await boundedRepositoryBody(response, limit);
   try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
   catch { return fail(502, 'invalid_github_response', 'GitHub returned invalid repository metadata.'); }
 }
@@ -153,14 +153,16 @@ function githubRepository(value: unknown): ProviderRepository {
   return { id: String(item.id), fullName: repositoryName('github', item.full_name),
     defaultBranch: repositoryRef(item.default_branch), private: item.private };
 }
-/** The sign-in account's picker page (account id "github"). */
-export async function githubRepositoryPage(env: Env, userId: string, page: number): Promise<{ repositories: ProviderRepository[]; page: number; hasMore: boolean }> {
+/** Every repository the sign-in account (account id "github") can read, up to repositoryLimits.pickerRepositories. */
+export async function githubRepositories(env: Env, userId: string): Promise<ProviderRepositoryList> {
   const access = await githubAccess(env, userId);
-  const result = await githubJSON(access, `/user/repos?per_page=30&page=${page}&sort=full_name&direction=asc`);
-  if (!Array.isArray(result) || result.length > 30) fail(502, 'invalid_github_response', 'GitHub returned invalid repository metadata.');
-  const repositories = result.map(githubRepository);
+  const listing = await collectRepositories(listPageSize, async page => {
+    const result = await githubJSON(access, `/user/repos?per_page=${listPageSize}&page=${page}&sort=full_name&direction=asc`, listBytes);
+    if (!Array.isArray(result) || result.length > listPageSize) fail(502, 'invalid_github_response', 'GitHub returned invalid repository metadata.');
+    return { repositories: result.map(githubRepository), hasMore: result.length === listPageSize };
+  });
   await recheckGitHubAccess(env, access);
-  return { repositories, page, hasMore: repositories.length === 30 && page < 1000 };
+  return listing;
 }
 /** Current metadata must still carry the bound identity and exact canonical name (renames and transfers fail closed). */
 export async function verifyRepository(access: RepositoryAccess, expected: ExpectedRepository): Promise<ProviderRepository> {

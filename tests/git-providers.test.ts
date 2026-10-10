@@ -53,7 +53,8 @@ test('GitHub Enterprise Server uses /api/v3 with bearer tokens and credential-fr
   const repository = { id: 7, full_name: 'acme/app', default_branch: 'main', private: true };
   const calls = mockFetch(t, {
     [`${api}/user`]: json({ login: 'octo' }),
-    [`${api}/user/repos?per_page=30&page=2&sort=full_name&direction=asc`]: json([repository], { headers: { link: `<${api}/user/repos?page=3>; rel="next"` } }),
+    [`${api}/user/repos?per_page=100&page=1&sort=full_name&direction=asc`]: json([repository], { headers: { link: `<${api}/user/repos?page=2>; rel="next"` } }),
+    [`${api}/user/repos?per_page=100&page=2&sort=full_name&direction=asc`]: json([{ id: 8, full_name: 'acme/lib', default_branch: 'dev', private: false }]),
     [`${api}/repositories/7`]: json(repository),
     [`${api}/repos/acme/app/commits/release%2F1`]: text(`${sha}\n`),
     [`${api}/repos/acme/app/tarball/${sha}`]: redirect(`https://codeload.git.example.com/acme/app/legacy.tar.gz/${sha}?token=short`),
@@ -61,17 +62,18 @@ test('GitHub Enterprise Server uses /api/v3 with bearer tokens and credential-fr
   });
   assert.deepEqual(await adapter.verify(credential), { login: 'octo' });
   const expected = { id: '7', fullName: 'acme/app', defaultBranch: 'main', private: true };
-  assert.deepEqual(await adapter.list(credential, 2), { repositories: [expected], hasMore: true });
+  const expected2 = { id: '8', fullName: 'acme/lib', defaultBranch: 'dev', private: false };
+  assert.deepEqual(await adapter.list(credential), { repositories: [expected, expected2], truncated: false });
   assert.deepEqual(await adapter.repository(credential, { id: '7', fullName: 'acme/app' }), expected);
   assert.equal(await adapter.commit(credential, { id: '7', fullName: 'acme/app' }, 'release/1'), sha);
   assert.deepEqual(await adapter.archive(credential, { id: '7', fullName: 'acme/app' }, sha), { bytes: tarGz, format: 'tar.gz' });
-  for (const call of calls.slice(0, 5)) {
+  for (const call of calls.slice(0, 6)) {
     assert.equal(call.headers.authorization, 'Bearer ghe-token');
     assert.equal(call.redirect, 'manual');
   }
   assert.equal(calls[0]!.headers.accept, 'application/vnd.github+json');
-  assert.equal(calls[3]!.headers.accept, 'application/vnd.github.sha');
-  assert.equal(calls[5]!.headers.authorization, undefined);
+  assert.equal(calls[4]!.headers.accept, 'application/vnd.github.sha');
+  assert.equal(calls[6]!.headers.authorization, undefined);
 });
 
 test('GitHub Enterprise Server failures map to fixed errors', async t => {
@@ -105,7 +107,7 @@ test('GitLab uses /api/v4 with bearer PATs and skips empty projects', async t =>
   const project = { id: 42, path_with_namespace: 'group/sub/app', default_branch: 'main', visibility: 'internal' };
   const calls = mockFetch(t, {
     [`${api}/user`]: json({ username: 'gl-user' }),
-    [`${api}/projects?membership=true&per_page=30&page=1&order_by=path&sort=asc`]: json(
+    [`${api}/projects?membership=true&per_page=100&page=1&order_by=path&sort=asc`]: json(
       [project, { id: 43, path_with_namespace: 'group/empty', default_branch: null, visibility: 'private' },
         { id: 44, path_with_namespace: 'group/open', default_branch: 'trunk', visibility: 'public' }],
       { headers: { 'x-next-page': '' } }),
@@ -118,10 +120,10 @@ test('GitLab uses /api/v4 with bearer PATs and skips empty projects', async t =>
     [`${api}/projects/46`]: json({ message: '404 Project Not Found' }, { status: 404 }),
   });
   assert.deepEqual(await adapter.verify(credential), { login: 'gl-user' });
-  assert.deepEqual(await adapter.list(credential, 1), {
+  assert.deepEqual(await adapter.list(credential), {
     repositories: [{ id: '42', fullName: 'group/sub/app', defaultBranch: 'main', private: true },
       { id: '44', fullName: 'group/open', defaultBranch: 'trunk', private: false }],
-    hasMore: false,
+    truncated: false,
   });
   assert.deepEqual(await adapter.repository(credential, { id: '42', fullName: 'group/sub/app' }),
     { id: '42', fullName: 'group/sub/app', defaultBranch: 'main', private: true });
@@ -151,14 +153,14 @@ test('Gitea and Forgejo use /api/v1 with token authorization', async t => {
     [`${api}/repos/team/repo5/commits?sha=missing&limit=1&stat=false&verification=false&files=false`]: json([]),
     [`${api}/repos/team/repo5/archive/${sha}.tar.gz`]: bytes(tarGz),
     [`${api}/repositories/6`]: json({ ...repository(6), default_branch: 'bad..branch' }),
+    'https://other.example.org/api/v1/user/repos?page=1&limit=30': json(Array.from({ length: 31 }, (_, index) => repository(index + 1))),
   });
   assert.deepEqual(await adapter.verify(credential), { login: 'tea' });
-  const first = await adapter.list(credential, 1);
-  assert.equal(first.repositories.length, 30);
-  assert.equal(first.hasMore, true);
-  assert.deepEqual(await adapter.list(credential, 2), {
-    repositories: [{ id: '31', fullName: 'team/repo31', defaultBranch: 'main', private: false }], hasMore: false,
-  });
+  const listed = await adapter.list(credential);
+  assert.equal(listed.repositories.length, 31);
+  assert.equal(listed.truncated, false);
+  assert.deepEqual(listed.repositories.at(-1), { id: '31', fullName: 'team/repo31', defaultBranch: 'main', private: false });
+  assert.deepEqual(await failure(adapter.list({ ...credential, host: 'other.example.org' })), malformed);
   assert.deepEqual(await adapter.repository(credential, { id: '5', fullName: 'team/repo5' }),
     { id: '5', fullName: 'team/repo5', defaultBranch: 'main', private: false });
   assert.equal(await adapter.commit(credential, { id: '5', fullName: 'team/repo5' }, 'feature/x'), sha);
@@ -177,8 +179,8 @@ test('Bitbucket Cloud lists per workspace and downloads archives with the same c
   const calls = mockFetch(t, {
     [`${api}/user`]: json({ username: 'bb-user' }),
     [`${api}/user/workspaces?pagelen=100&page=1&sort=slug`]: json({ values: [{ workspace: { slug: 'alpha' } }, { workspace: { slug: 'beta' } }] }),
-    [`${api}/repositories/alpha?role=member&pagelen=30&page=1&sort=full_name`]: json({ size: 2, values: [repo('alpha', 'one'), repo('alpha', 'empty', null)] }),
-    [`${api}/repositories/beta?role=member&pagelen=30&page=1&sort=full_name`]: json({ size: 1, values: [repo('beta', 'two')] }),
+    [`${api}/repositories/alpha?role=member&pagelen=100&page=1&sort=full_name`]: json({ size: 2, values: [repo('alpha', 'one'), repo('alpha', 'empty', null)] }),
+    [`${api}/repositories/beta?role=member&pagelen=100&page=1&sort=full_name`]: json({ size: 1, values: [repo('beta', 'two')] }),
     [`${api}/repositories/alpha/one`]: json(repo('alpha', 'one')),
     [`${api}/repositories/alpha/one/commit/release%2Fv2`]: json({ hash: sha }),
     [`https://bitbucket.org/alpha/one/get/${sha}.tar.gz`]: redirect(`https://downloads.bitbucket.org/alpha/one/${sha}.tar.gz?signature=x`),
@@ -186,10 +188,10 @@ test('Bitbucket Cloud lists per workspace and downloads archives with the same c
   });
   const auth = `Basic ${Buffer.from('me@example.com:api-token').toString('base64')}`;
   assert.deepEqual(await adapter.verify(credential), { login: 'bb-user' });
-  assert.deepEqual(await adapter.list(credential, 1), {
+  assert.deepEqual(await adapter.list(credential), {
     repositories: [{ id: '{one-uuid}', fullName: 'alpha/one', defaultBranch: 'main', private: true },
       { id: '{two-uuid}', fullName: 'beta/two', defaultBranch: 'main', private: true }],
-    hasMore: false,
+    truncated: false,
   });
   assert.deepEqual(await adapter.repository(credential, { id: '{one-uuid}', fullName: 'alpha/one' }),
     { id: '{one-uuid}', fullName: 'alpha/one', defaultBranch: 'main', private: true });
@@ -204,26 +206,22 @@ test('Bitbucket Cloud paging, access tokens and redirect policy', async t => {
   const credential: GitCredential = { id: 'acct', provider: 'bitbucket', host: 'bitbucket.org', organization: '', username: null, token: 'access' };
   const api = 'https://api.bitbucket.org/2.0';
   const repo = (index: number) => ({ uuid: `{r${index}}`, full_name: `big/r${String(index).padStart(3, '0')}`, mainbranch: { name: 'main' }, is_private: false });
-  const page = (number: number) => Array.from({ length: 30 }, (_, index) => repo((number - 1) * 30 + index));
+  const all = Array.from({ length: 150 }, (_, index) => repo(index + 1));
   const calls = mockFetch(t, {
     [`${api}/user`]: json({ type: 'error' }, { status: 401 }),
     [`${api}/user/workspaces?pagelen=1`]: json({ values: [] }),
     [`${api}/user/workspaces?pagelen=100&page=1&sort=slug`]: json({ values: [{ workspace: { slug: 'big' } }, { workspace: { slug: 'zed' } }] }),
-    [`${api}/repositories/big?role=member&pagelen=30&page=1&sort=full_name`]: json({ size: 75, values: page(1), next: 'x' }),
-    [`${api}/repositories/big?role=member&pagelen=30&page=2&sort=full_name`]: json({ size: 75, values: page(2), next: 'x' }),
-    [`${api}/repositories/big?role=member&pagelen=30&page=3&sort=full_name`]: json({ size: 75, values: page(3).slice(0, 15) }),
-    [`${api}/repositories/zed?role=member&pagelen=30&page=1&sort=full_name`]: json({ size: 0, values: [] }),
+    [`${api}/repositories/big?role=member&pagelen=100&page=1&sort=full_name`]: json({ values: all.slice(0, 100), next: 'x' }),
+    [`${api}/repositories/big?role=member&pagelen=100&page=2&sort=full_name`]: json({ values: all.slice(100) }),
+    [`${api}/repositories/zed?role=member&pagelen=100&page=1&sort=full_name`]: json({ values: [], next: 'x' }),
     [`https://bitbucket.org/big/r001/get/${sha}.tar.gz`]: redirect('https://evil.example.com/archive.tar.gz'),
     [`https://bitbucket.org/big/r002/get/${sha}.tar.gz`]: redirect('/account/signin/?next=/big/r002/get/x'),
     [`https://bitbucket.org/big/r003/get/${sha}.tar.gz`]: text('<html>', 404),
   });
   assert.deepEqual(await adapter.verify(credential), { login: 'access token' });
-  const second = await adapter.list(credential, 2);
-  assert.deepEqual(second.repositories.map(item => item.fullName), page(2).map(item => item.full_name));
-  assert.equal(second.hasMore, true);
-  const third = await adapter.list(credential, 3);
-  assert.equal(third.repositories.length, 15);
-  assert.equal(third.hasMore, false);
+  const listed = await adapter.list(credential);
+  assert.deepEqual(listed.repositories.map(item => item.fullName), all.map(item => item.full_name));
+  assert.equal(listed.truncated, false);
   assert.deepEqual(await failure(adapter.archive(credential, { id: '{r1}', fullName: 'big/r001' }, sha)), untrusted);
   assert.deepEqual(await failure(adapter.archive(credential, { id: '{r2}', fullName: 'big/r002' }, sha)), unavailable);
   assert.deepEqual(await failure(adapter.archive(credential, { id: '{r3}', fullName: 'big/r003' }, sha)), unavailable);
@@ -231,7 +229,29 @@ test('Bitbucket Cloud paging, access tokens and redirect policy', async t => {
   assert.ok(!calls.some(call => call.url.startsWith('https://evil.example.com')));
 });
 
-test('Azure DevOps scopes every call to the organization and pages repositories locally', async t => {
+test('Bitbucket Cloud stops listing at the picker limit', async t => {
+  const adapter = gitProviderAdapters.bitbucket;
+  const credential: GitCredential = { id: 'acct', provider: 'bitbucket', host: 'bitbucket.org', organization: '', username: null, token: 'access' };
+  const api = 'https://api.bitbucket.org/2.0';
+  const routes: Record<string, Route> = {
+    [`${api}/user/workspaces?pagelen=100&page=1&sort=slug`]: json({ values: [{ workspace: { slug: 'huge' } }, { workspace: { slug: 'later' } }] }),
+  };
+  for (let page = 1; page <= 31; page++) {
+    const values = Array.from({ length: 100 }, (_, index) => {
+      const id = (page - 1) * 100 + index;
+      return { uuid: `{h${id}}`, full_name: `huge/r${String(id).padStart(4, '0')}`, mainbranch: { name: 'main' }, is_private: true };
+    });
+    routes[`${api}/repositories/huge?role=member&pagelen=100&page=${page}&sort=full_name`] = json({ values, next: 'x' });
+  }
+  const calls = mockFetch(t, routes);
+  const listed = await adapter.list(credential);
+  assert.equal(listed.repositories.length, 3000);
+  assert.equal(listed.truncated, true);
+  assert.equal(calls.filter(call => call.url.startsWith(`${api}/repositories/huge?`)).length, 30);
+  assert.ok(!calls.some(call => call.url.includes('/repositories/later')));
+});
+
+test('Azure DevOps scopes every call to the organization and lists repositories in one request', async t => {
   const adapter = gitProviderAdapters['azure-devops'];
   const credential: GitCredential = { id: 'acct', provider: 'azure-devops', host: 'dev.azure.com', organization: 'contoso', username: null, token: 'pat' };
   const base = 'https://dev.azure.com/contoso';
@@ -260,15 +280,14 @@ test('Azure DevOps scopes every call to the organization and pages repositories 
   const auth = `Basic ${Buffer.from(':pat').toString('base64')}`;
   const ref = { id: guid, fullName: 'contoso/Core/Engine Room' };
   assert.deepEqual(await adapter.verify(credential), { login: 'Ada Lovelace' });
-  assert.deepEqual(await adapter.list(credential, 1), {
+  assert.deepEqual(await adapter.list(credential), {
     repositories: [
       { id: guid, fullName: 'contoso/Core/Engine Room', defaultBranch: 'main', private: true },
       { id: 'c-id', fullName: 'contoso/Core/api', defaultBranch: 'main', private: false },
       { id: 'b-id', fullName: 'contoso/Web/site', defaultBranch: 'main', private: true },
     ],
-    hasMore: false,
+    truncated: false,
   });
-  assert.deepEqual((await adapter.list(credential, 2)).repositories, []);
   assert.deepEqual(await adapter.repository(credential, ref), { id: guid, fullName: 'contoso/Core/Engine Room', defaultBranch: 'main', private: true });
   assert.equal(await adapter.commit(credential, ref, 'main'), sha);
   assert.equal(await adapter.commit(credential, ref, 'v1'), sha);

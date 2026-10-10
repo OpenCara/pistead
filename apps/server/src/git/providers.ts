@@ -1,12 +1,17 @@
 import {
   gitProviderNames, repositoryLimits, validGitHost, validRepositoryId, validRepositoryName,
-  type ProviderRepository, type TokenGitProvider,
+  type ProviderRepository, type ProviderRepositoryList, type TokenGitProvider,
 } from '../../../../packages/shared/src/repositories.js';
 import { fail } from '../http.js';
 import { boundedRepositoryBody, repositoryRef } from '../repositories.js';
 import type { GitCredential, GitProviderAdapter, RepositoryArchive, RepositoryRef } from './types.js';
 
-const pageSize = 30;
+// GitHub, GitHub Enterprise Server, GitLab and Bitbucket serve at most 100 repositories per list page.
+export const listPageSize = 100;
+// One list page of full repository objects; GitHub's run about 6 KiB each.
+export const listBytes = 2 * 1024 * 1024;
+// Gitea clamps `limit` to its MAX_RESPONSE_ITEMS setting and a short page ends the listing, so keep its default.
+const giteaPageSize = 30;
 const jsonBytes = 512 * 1024;
 // Azure DevOps lists every repository of an organization in one response (no server paging).
 const azureListBytes = 4 * 1024 * 1024;
@@ -86,6 +91,12 @@ function list(provider: TokenGitProvider, value: unknown): unknown[] {
   if (!Array.isArray(value)) invalidResponse(provider);
   return value;
 }
+/** One list page: an array of at most the `size` entries requested. */
+function pageItems(provider: TokenGitProvider, value: unknown, size: number): unknown[] {
+  const items = list(provider, value);
+  if (items.length > size) invalidResponse(provider);
+  return items;
+}
 function login(provider: TokenGitProvider, value: unknown): string {
   if (typeof value !== 'string' || value.length < 1 || value.length > 255 || value !== value.trim() || /[\x00-\x1f\x7f]/.test(value)) invalidResponse(provider);
   return value;
@@ -125,9 +136,21 @@ function pinnedCommit(commit: string): string {
   if (!sha1.test(commit)) fail(400, 'invalid_repository_commit', 'A 40-character lowercase commit SHA is required.');
   return commit;
 }
-function pageNumber(page: number): number {
-  if (!Number.isSafeInteger(page) || page < 1 || page > 1000) fail(400, 'invalid_page', 'Repository page must be between 1 and 1000.');
-  return page;
+/**
+ * Requests pages 1, 2, ... of `size` entries until the provider reports no more, keeping at most
+ * repositoryLimits.pickerRepositories. The page count is bounded too, so skipped entries cannot extend a listing.
+ */
+export async function collectRepositories(size: number,
+  page: (number: number) => Promise<{ repositories: ProviderRepository[]; hasMore: boolean }>): Promise<ProviderRepositoryList> {
+  const limit = repositoryLimits.pickerRepositories;
+  const repositories: ProviderRepository[] = [];
+  for (let number = 1; number <= Math.ceil(limit / size); number++) {
+    const result = await page(number);
+    repositories.push(...result.repositories);
+    if (repositories.length >= limit) return { repositories: repositories.slice(0, limit), truncated: repositories.length > limit || result.hasMore };
+    if (!result.hasMore) return { repositories, truncated: false };
+  }
+  return { repositories, truncated: true };
 }
 /** Origin of a self-hosted provider; only validated public DNS names over HTTPS. */
 function selfHostedOrigin(credential: GitCredential): URL {
@@ -199,12 +222,14 @@ const githubEnterprise: GitProviderAdapter = {
     const { body } = await getJson('github-enterprise', `${api.base}/user`, api.headers, { verify: true });
     return { login: login('github-enterprise', record('github-enterprise', body).login) };
   },
-  async list(credential, page) {
+  async list(credential) {
     const api = githubEnterpriseApi(credential);
-    const { body, response } = await getJson('github-enterprise',
-      `${api.base}/user/repos?per_page=${pageSize}&page=${pageNumber(page)}&sort=full_name&direction=asc`, api.headers);
-    return { repositories: list('github-enterprise', body).map(githubEnterpriseRepository),
-      hasMore: /<[^>]*>\s*;\s*rel="next"/.test(response.headers.get('link') ?? '') };
+    return collectRepositories(listPageSize, async page => {
+      const { body, response } = await getJson('github-enterprise',
+        `${api.base}/user/repos?per_page=${listPageSize}&page=${page}&sort=full_name&direction=asc`, api.headers, { limit: listBytes });
+      return { repositories: pageItems('github-enterprise', body, listPageSize).map(githubEnterpriseRepository),
+        hasMore: /<[^>]*>\s*;\s*rel="next"/.test(response.headers.get('link') ?? '') };
+    });
   },
   async repository(credential, repository) {
     const api = githubEnterpriseApi(credential);
@@ -251,17 +276,19 @@ const gitlab: GitProviderAdapter = {
     const { body } = await getJson('gitlab', `${api.base}/user`, api.headers, { verify: true });
     return { login: login('gitlab', record('gitlab', body).username) };
   },
-  async list(credential, page) {
+  async list(credential) {
     const api = gitlabApi(credential);
-    // simple=true omits `visibility`, so the full representation is requested.
-    const { body, response } = await getJson('gitlab',
-      `${api.base}/projects?membership=true&per_page=${pageSize}&page=${pageNumber(page)}&order_by=path&sort=asc`, api.headers);
-    const items = list('gitlab', body);
-    const next = response.headers.get('x-next-page');
-    return {
-      repositories: items.map(gitlabRepository).filter((item): item is ProviderRepository => item !== null),
-      hasMore: next === null ? items.length === pageSize : next.trim() !== '',
-    };
+    return collectRepositories(listPageSize, async page => {
+      // simple=true omits `visibility`, so the full representation is requested.
+      const { body, response } = await getJson('gitlab',
+        `${api.base}/projects?membership=true&per_page=${listPageSize}&page=${page}&order_by=path&sort=asc`, api.headers, { limit: listBytes });
+      const items = pageItems('gitlab', body, listPageSize);
+      const next = response.headers.get('x-next-page');
+      return {
+        repositories: items.map(gitlabRepository).filter((item): item is ProviderRepository => item !== null),
+        hasMore: next === null ? items.length === listPageSize : next.trim() !== '',
+      };
+    });
   },
   async repository(credential, repository) {
     const api = gitlabApi(credential);
@@ -302,11 +329,13 @@ const gitea: GitProviderAdapter = {
     const { body } = await getJson('gitea', `${api.base}/user`, api.headers, { verify: true });
     return { login: login('gitea', record('gitea', body).login) };
   },
-  async list(credential, page) {
+  async list(credential) {
     const api = giteaApi(credential);
-    const { body } = await getJson('gitea', `${api.base}/user/repos?page=${pageNumber(page)}&limit=${pageSize}`, api.headers);
-    const items = list('gitea', body);
-    return { repositories: items.map(giteaRepository).filter((item): item is ProviderRepository => item !== null), hasMore: items.length === pageSize };
+    return collectRepositories(giteaPageSize, async page => {
+      const { body } = await getJson('gitea', `${api.base}/user/repos?page=${page}&limit=${giteaPageSize}`, api.headers);
+      const items = pageItems('gitea', body, giteaPageSize);
+      return { repositories: items.map(giteaRepository).filter((item): item is ProviderRepository => item !== null), hasMore: items.length === giteaPageSize };
+    });
   },
   async repository(credential, repository) {
     const api = giteaApi(credential);
@@ -347,10 +376,9 @@ function bitbucketRepository(value: unknown): ProviderRepository | null {
   return { id: identity('bitbucket', item.uuid), fullName: canonicalName('bitbucket', item.full_name),
     defaultBranch: branch('bitbucket', record('bitbucket', item.mainbranch).name), private: flag('bitbucket', item.is_private) };
 }
-function bitbucketPage(body: unknown): { values: unknown[]; next: boolean; size: number | null } {
+function bitbucketPage(body: unknown): { values: unknown[]; next: boolean } {
   const item = record('bitbucket', body);
-  const size = typeof item.size === 'number' && Number.isSafeInteger(item.size) && item.size >= 0 ? item.size : null;
-  return { values: list('bitbucket', item.values), next: typeof item.next === 'string', size };
+  return { values: pageItems('bitbucket', item.values, listPageSize), next: typeof item.next === 'string' };
 }
 async function bitbucketWorkspaces(headers: Headers): Promise<string[]> {
   const slugs: string[] = [];
@@ -382,40 +410,30 @@ const bitbucket: GitProviderAdapter = {
     try { body = JSON.parse(text); } catch { invalidResponse('bitbucket'); }
     return { login: login('bitbucket', record('bitbucket', body).username) };
   },
-  async list(credential, page) {
+  async list(credential) {
     const headers = bitbucketHeaders(credential);
-    // Global position across workspaces (sorted by slug), each listed by full_name.
-    const skip = (pageNumber(page) - 1) * pageSize;
-    let seen = 0;
+    const limit = repositoryLimits.pickerRepositories;
     const repositories: ProviderRepository[] = [];
-    let taken = 0;
-    for (const workspace of await bitbucketWorkspaces(headers)) {
-      let workspacePage = 1;
-      for (;;) {
+    // Workspaces sorted by slug, each listed by full_name.
+    const workspaces = await bitbucketWorkspaces(headers);
+    for (const [index, workspace] of workspaces.entries()) {
+      for (let page = 1; ; page++) {
         const { body } = await getJson('bitbucket',
-          `${bitbucketApi}/repositories/${workspace}?role=member&pagelen=${pageSize}&page=${workspacePage}&sort=full_name`, headers);
+          `${bitbucketApi}/repositories/${workspace}?role=member&pagelen=${listPageSize}&page=${page}&sort=full_name`, headers, { limit: listBytes });
         const result = bitbucketPage(body);
-        if (workspacePage === 1 && result.size !== null && seen + result.size <= skip) { seen += result.size; break; }
-        if (workspacePage === 1 && result.size !== null && skip - seen >= pageSize) {
-          // Jump straight to the page that contains the first wanted repository.
-          const pages = Math.floor((skip - seen) / pageSize);
-          seen += pages * pageSize;
-          workspacePage += pages;
-          continue;
-        }
         for (const value of result.values) {
-          if (seen++ < skip) continue;
-          if (taken === pageSize) return { repositories, hasMore: true };
-          taken++;
           const repository = bitbucketRepository(value);
           if (repository) repositories.push(repository);
         }
-        if (!result.next) break;
-        if (taken === pageSize) return { repositories, hasMore: true };
-        workspacePage++;
+        // An empty page ends the workspace even when it links another.
+        const more = result.next && result.values.length > 0;
+        if (repositories.length >= limit) {
+          return { repositories: repositories.slice(0, limit), truncated: repositories.length > limit || more || index < workspaces.length - 1 };
+        }
+        if (!more) break;
       }
     }
-    return { repositories, hasMore: false };
+    return { repositories, truncated: false };
   },
   async repository(credential, repository) {
     const { fullName } = target('bitbucket', repository);
@@ -489,16 +507,16 @@ const azureDevOps: GitProviderAdapter = {
     await getJson('azure-devops', `${api.base}/_apis/projects?$top=1&api-version=7.1`, api.headers, { verify: true, denied: azureDeniedStatuses });
     return { login: api.organization };
   },
-  async list(credential, page) {
+  async list(credential) {
     const api = azureApi(credential);
-    const offset = (pageNumber(page) - 1) * pageSize;
     const { body } = await getJson('azure-devops', `${api.base}/_apis/git/repositories?api-version=7.1`, api.headers,
       { denied: azureDeniedStatuses, limit: azureListBytes });
     const repositories = list('azure-devops', record('azure-devops', body).value)
       .map(item => azureRepository(api.organization, item))
       .filter((item): item is ProviderRepository => item !== null)
       .sort((a, b) => (a.fullName < b.fullName ? -1 : a.fullName > b.fullName ? 1 : 0));
-    return { repositories: repositories.slice(offset, offset + pageSize), hasMore: repositories.length > offset + pageSize };
+    const limit = repositoryLimits.pickerRepositories;
+    return { repositories: repositories.slice(0, limit), truncated: repositories.length > limit };
   },
   async repository(credential, repository) {
     const api = azureTarget(credential, repository);

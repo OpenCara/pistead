@@ -79,6 +79,13 @@ export interface ProviderRepository {
   private: boolean;
 }
 
+/** Every repository a connected account can read, in the provider's stable order, as listed by the repository picker. */
+export interface ProviderRepositoryList {
+  repositories: ProviderRepository[];
+  /** The listing stopped at repositoryLimits.pickerRepositories; the account may read more. */
+  truncated: boolean;
+}
+
 /** A connected Git account. The GitHub sign-in account has id "github"; token accounts have generated ids. */
 export interface GitAccount {
   id: string;
@@ -172,4 +179,6 @@ export const repositoryLimits = {
   // Real repositories vendor prebuilt binaries (multi-MiB dylibs/tools); the aggregate bounds above still apply.
   fileBytes: 8 * 1024 * 1024,
   entries: 10000,
+  // One repository picker listing; larger accounts list their first repositories in provider order.
+  pickerRepositories: 3000,
 } as const;
