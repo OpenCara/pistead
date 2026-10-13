@@ -443,3 +443,20 @@ test("failed model turns expose provider, model and HTTP status but never the pr
   assert.equal(JSON.stringify(view).includes("sk-provider-detail"), false);
   assert.equal(JSON.stringify(view).includes("acct-private"), false);
 });
+
+test("a run Pi settles without an answer shows as a failed model turn instead of silence", hostMode, async t => {
+  // A model the host no longer offers ends the run like a failed compaction does: unanswered, with no entry for it.
+  const { service } = await hostFixture(t, { resolveModels: async model => {
+    const models = createModels();
+    models.setProvider(fauxProvider({ models: [{ id: "another-model" }] }).provider);
+    return { models, provider: model.provider, modelId: model.modelId };
+  } });
+  const id = "unanswered-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "hello", requestId: "unanswered" }, "write");
+  await idle(session);
+  const entries = (await session.view()).entries;
+  assert.deepEqual(entries.map(entry => [entry.role, entry.text]), [["user", "hello"], ["assistant", ""]]);
+  assert.deepEqual(entries[1]!.error, { provider: "faux", modelId: "faux-1" });
+  assert.equal(entries[1]!.actorId, "test:alice");
+});
