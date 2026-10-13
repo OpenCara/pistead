@@ -519,3 +519,17 @@ test("a backup fails instead of copying a database that did not close cleanly", 
   assert.equal(await service.get(id), session);
   assert.ok((await session.view()).entries.length > 0);
 });
+
+test("entries carry how long each reply took and each tool ran", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const id = "duration-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "timed" }, "write");
+  await idle(session);
+  const entries = (await session.view()).entries;
+  const timed = (role: string) => entries.filter(entry => entry.role === role).map(entry => typeof entry.durationMs === "number" && entry.durationMs >= 0);
+  // The identity call and the answer after it, then the identity tool's own run.
+  assert.deepEqual(timed("assistant"), [true, true]);
+  assert.deepEqual(timed("toolResult"), [true]);
+  assert.deepEqual(timed("user"), [false]);
+});

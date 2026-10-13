@@ -199,6 +199,8 @@ export interface EntryView {
   conversationId?: string;
   /** The model request behind this entry failed. Only the provider/model and HTTP status cross the boundary, never provider text. */
   error?: { provider?: string; modelId?: string; status?: number };
+  /** How long the model took to write this reply, or the tool to run; absent for entries recorded before Pi 1.1.0. */
+  durationMs?: number;
 }
 export interface SessionView {
   sessionId: string;
