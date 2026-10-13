@@ -5,10 +5,12 @@ import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
+import { Markdown } from "./markdown";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
+import { splitToolCalls } from "./transcript";
 import {
   Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, PageLoading, ScreenHeader, SegmentedControl,
   Spinner, StatusBadge, useAction, useResource, type MenuItem,
@@ -34,7 +36,6 @@ function useLiveSession(id: string) {
 }
 
 const PANEL_KEY = "pistead.sessionPanel";
-const toolCall = /^([a-z_]+)\(.*\)$/s;
 
 function usePanelOpen() {
   const [open, setOpen] = useState(() => {
@@ -60,16 +61,22 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
   return `The request to ${[provider, modelId].filter(Boolean).join("/") || "the model"} failed${status ? ` (HTTP ${status})` : ""}`;
 }
 
-/** User messages are bubbles; assistant text is plain; tool calls, results and system entries collapse to one row. */
+/** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
+function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconName; label: ReactNode; text: string }) {
+  return <details className="entry-tool" data-role={role}>
+    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span><Icon name="chevron-right" size={14} /></summary>
+    <pre>{text}</pre>
+  </details>;
+}
+
+/** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
 function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
-  const call = entry.role === "assistant" ? toolCall.exec(entry.text.trim()) : null;
-  if (call || entry.role === "system" || entry.role === "toolResult") {
-    const label = call ? `Tool · ${call[1]}` : entry.role === "toolResult" ? "Tool result" : "System";
-    return <details className="entry-tool" data-role={entry.role}>
-      <summary><Icon name={call ? "tool" : "terminal"} size={14} /><span className="truncate">{label}{actor && <> · {actor}</>}</span><Icon name="chevron-right" size={14} /></summary>
-      <pre>{entry.text}</pre>
-    </details>;
+  const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
+  const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
+  if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
+    const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{actor && <> · {actor}</>}</>} text={entry.text} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -84,7 +91,8 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
     </div>;
   }
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
-    {entry.text}
+    <Markdown text={prose} />
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
     {actor && <div className="entry-actor">by {actor}</div>}
   </div>;
 }
