@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { constants } from "node:fs";
-import { mkdir, realpath, lstat, open, link, unlink } from "node:fs/promises";
+import { mkdir, realpath, lstat, open, link, rename, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
@@ -89,7 +89,7 @@ export async function readConnectorState(directory: string, origin?: string, all
   } finally { await file.close(); }
 }
 
-export async function writeConnectorState(directory: string, value: ConnectorCredentials, allowInsecureLoopback = false): Promise<void> {
+export async function writeConnectorState(directory: string, value: ConnectorCredentials, allowInsecureLoopback = false, replace = false): Promise<void> {
   const path = await privateDirectory(directory);
   const saved = credentials(value, undefined, allowInsecureLoopback);
   const temporary = join(path, `.connector-${randomUUID()}.tmp`);
@@ -98,10 +98,16 @@ export async function writeConnectorState(directory: string, value: ConnectorCre
     await file.writeFile(JSON.stringify({ version: 1, credentials: saved }));
     await file.sync();
   } finally { await file.close(); }
-  try {
-    // No replacement: racing companions cannot silently replace another token.
-    await link(temporary, join(path, STATE_FILE));
-  } finally { await unlink(temporary); }
+  if (replace) {
+    // Only a forced re-pairing replaces, under the runner lease. Rename swaps the entry itself (a symlink is never
+    // followed) and atomically, so a crash leaves the old token or the new one, never neither.
+    try { await rename(temporary, join(path, STATE_FILE)); } catch (error) { await unlink(temporary); throw error; }
+  } else {
+    try {
+      // No replacement: racing companions cannot silently replace another token.
+      await link(temporary, join(path, STATE_FILE));
+    } finally { await unlink(temporary); }
+  }
   const directoryHandle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
 }
@@ -240,6 +246,8 @@ export interface ConnectorOptions {
   dataDir: string;
   server?: string;
   pairing?: { id: string; code: string };
+  /** With `pairing`, claim it and replace any saved credentials instead of refusing an already paired state directory. */
+  replacePairing?: boolean;
   localModels: LocalModels;
   allowInsecureLoopback?: boolean;
   allowFaux?: boolean;
@@ -322,12 +330,15 @@ export class LocalConnector {
       catch { this.options.onWarning?.("resources-unavailable"); }
     }
     const origin = this.options.server === undefined ? undefined : controlPlaneOrigin(this.options.server, this.options.allowInsecureLoopback);
-    this.state = await readConnectorState(this.directory, origin, this.options.allowInsecureLoopback);
-    if (this.state && this.options.pairing) throw new ConnectorSetupError("This machine is already paired; run without --pairing-id, or use a separate --state-dir for another connection");
+    const replace = this.options.pairing !== undefined && this.options.replacePairing === true;
+    // Replacing never reads the saved token: it may be revoked, unreadable or bound to another server.
+    this.state = replace ? undefined : await readConnectorState(this.directory, origin, this.options.allowInsecureLoopback);
+    if (this.state && this.options.pairing) throw new ConnectorSetupError("This machine is already paired; run without --pairing-id, add --force to replace the saved pairing, or use a separate --state-dir for another connection");
     if (!this.state) {
       if (!origin || !this.options.pairing) throw new ConnectorSetupError("First connection requires --server and --pairing-id");
+      // Claimed before anything is written: a wrong, expired or used code keeps the saved pairing.
       this.state = await claimConnectorPairing({ ...this.options, server: origin, pairing: this.options.pairing, signal: this.lifetime.signal });
-      await writeConnectorState(this.directory, this.state, this.options.allowInsecureLoopback);
+      await writeConnectorState(this.directory, this.state, this.options.allowInsecureLoopback, replace);
     }
     this.lifetime.signal.throwIfAborted();
     this.loop = this.connectLoop();

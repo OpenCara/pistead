@@ -23,6 +23,14 @@ Enter the single-use code when prompted; it is never accepted as an argument. La
 npx pistead@latest connect
 ```
 
+To pair the machine again, for example after removing its host in Pistead or to move it to another workspace or server, create a new pairing code and add `--force` to its command:
+
+```sh
+npx pistead@latest connect --server https://pistead.com --pairing-id PAIRING_ID --force
+```
+
+The saved token is replaced only once the new code is accepted. The old host stays in **Connections**, offline, until you remove it there; its sessions are not moved to the new host.
+
 Run `npx pistead connect --help` for all options.
 
 Workspace repositories can come from GitHub, GitHub Enterprise Server, GitLab (gitlab.com or self-managed), Bitbucket Cloud, Azure DevOps and Gitea/Forgejo. Connect the non-GitHub accounts in the web app under **Settings → Profile → Git accounts** with personal access tokens. The Pistead server downloads pinned snapshots; the connector never receives those tokens. Non-GitHub repositories need connector 0.4.0 or newer.
