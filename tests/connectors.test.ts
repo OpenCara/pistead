@@ -11,6 +11,7 @@ import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, ModelDefinition, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import { toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
 const origin = 'http://localhost:8787';
@@ -1327,6 +1328,37 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
   await denied(await s.outsider.request('GET', `/api/sessions/${s.session.id}/view`), 404, 'not_found');
   assert.deepEqual(await json(await s.outsider.request('GET', '/api/sessions')), { sessions: [] });
   assert.equal(requests.length, 1);
+});
+
+test('a session started from a model gets its own chat agent with every tool its host carries, outside the catalog', async t => {
+  const f = await fixture(t); const s = await privateWorkspace(f);
+  const start = (client: Client, body: Record<string, unknown>) => client.request('POST', '/api/sessions', { workspaceId: s.team.id, ...body });
+  const startedAgent = () => (JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding).agent;
+
+  // Exactly one of an agent version and a model; a teammate cannot start on the owner's unshared host.
+  await denied(await start(s.owner, {}), 400, 'invalid_input');
+  await denied(await start(s.owner, { agentVersionId: s.agent.id, modelId: s.model.id }), 400, 'invalid_input');
+  await denied(await start(s.member, { modelId: s.model.id, trustedConnectorId: s.connector.connectorId }), 404, 'not_found');
+  assert.equal(s.hub.requests.length, 0);
+
+  // This host cannot carry pushes, so the chat agent leaves git_push out instead of refusing the start.
+  const { session } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
+  assert.equal(session.status, 'ready');
+  const agent = startedAgent();
+  assert.equal(agent.id, session.agentVersionId);
+  assert.deepEqual(agent.tools, toolNames.filter(tool => tool !== 'git_push'));
+  assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
+
+  // Chat agents stay out of their author's catalog and cannot be revised or published.
+  assert.deepEqual((await json<{ agents: AgentVersion[] }>(await s.owner.request('GET', '/api/agents'))).agents.map(item => item.id), [s.agent.id]);
+  await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/versions`, s.agentInput), 404, 'not_found');
+  await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/publish`, { workspaceId: s.team.id }), 404, 'not_found');
+
+  // Once the host carries pushes, the next session's own chat agent offers git_push too.
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
+  const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
+  assert.notEqual(second.agentVersionId, session.agentVersionId);
+  assert.deepEqual(startedAgent().tools, [...toolNames]);
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {

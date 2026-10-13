@@ -104,7 +104,7 @@ function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id
     ))`;
 }
 
-async function requireModel(env: Env, modelId: string, actorId: string): Promise<ModelRow> {
+export async function requireModel(env: Env, modelId: string, actorId: string): Promise<ModelRow> {
   const model = await env.DB.query<ModelRow>(`SELECT m.* FROM models m
     INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
     WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
@@ -114,7 +114,8 @@ async function requireModel(env: Env, modelId: string, actorId: string): Promise
 }
 
 async function requireAuthor(env: Env, agentId: string, actorId: string): Promise<void> {
-  const agent = await env.DB.query<{ id: string }>('SELECT id FROM agents WHERE id = ? AND author_id = ?')
+  // Chat agents belong to one session each: never revised or published.
+  const agent = await env.DB.query<{ id: string }>('SELECT id FROM agents WHERE id = ? AND author_id = ? AND chat = 0')
     .bind(agentId, actorId).first();
   if (!agent) fail(404, 'not_found', 'Agent not found.');
 }
@@ -171,6 +172,26 @@ async function versionBatch(env: Env, statements: Query<AgentRow>[], versionInde
     if (versionConflict(error)) fail(409, 'version_conflict', 'Another agent version was created. Refresh and try again.');
     throw error;
   }
+}
+
+/**
+ * The agent of a session started from a model instead of a chosen agent: every tool the host can carry, since the
+ * message's access mode still gates writes, commands and pushes, and no instructions beyond the runner's own context.
+ * Each such session gets its own chat agent, which stays out of the author's catalog.
+ */
+export async function chatAgentVersion(env: Env, ownerId: string, model: ModelRow, gitPush: boolean): Promise<AgentRow> {
+  const agentId = id();
+  const createdAt = now();
+  const tools = toolNames.filter(tool => gitPush || tool !== 'git_push');
+  const input: AgentInput = { name: model.name, description: '', instructions: '', toolsJson: JSON.stringify(tools), modelId: model.id };
+  return versionBatch(env, [
+    env.DB.query<never>(`INSERT INTO agents (id, author_id, created_at, chat)
+      SELECT ?, ?, ?, 1 FROM models m
+      INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
+      WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
+      .bind(agentId, ownerId, createdAt, ownerId, model.id, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0),
+    privateVersionStatement(env, ownerId, agentId, id(), input, createdAt),
+  ], 1);
 }
 
 export function registerCatalog(app: Hono<WorkerEnv>): void {
@@ -308,7 +329,7 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
   app.get('/api/agents', async c => {
     const result = await c.env.DB.query<AgentRow>(`SELECT v.* FROM agent_versions v
       INNER JOIN agents a ON a.id = v.agent_id AND a.author_id = v.author_id
-      WHERE a.author_id = ? ORDER BY v.created_at DESC, v.agent_id, v.version DESC`)
+      WHERE a.author_id = ? AND a.chat = 0 ORDER BY v.created_at DESC, v.agent_id, v.version DESC`)
       .bind(c.get('auth').userId).all();
     return c.json({ agents: result.map(agentVersion) });
   });

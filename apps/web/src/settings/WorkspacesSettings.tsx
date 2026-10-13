@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import type { AgentVersion, UserProfile, Workspace, WorkspaceRole } from "../../../../packages/shared/src/types";
+import type { UserProfile, Workspace, WorkspaceRole } from "../../../../packages/shared/src/types";
 import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
@@ -73,13 +73,11 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
 function Setup({ user, workspace, admin, repositoryCount }: { user: UserProfile; workspace: Workspace; admin: boolean; repositoryCount: number | null }) {
   const { sessions, sessionsLoading } = useApp();
   const connectors = useConnections(`/api/workspaces/${segment(workspace.id)}/connectors`);
-  const agents = useResource<{ agents: AgentVersion[] }>("/api/agents");
   // Only show the checklist once every signal is known, so it never flashes in and out.
-  if (repositoryCount === null || !connectors.data || !agents.data || sessionsLoading) return null;
+  if (repositoryCount === null || !connectors.data || sessionsLoading) return null;
   const steps = [
     { label: "Bind a repository", done: repositoryCount > 0, hint: admin ? undefined : "An owner or admin does this", onClick: () => document.getElementById("workspace-repositories")?.scrollIntoView({ behavior: "smooth" }) },
     { label: "Pair a host", done: connectors.data.connectors.some(connector => !connector.revokedAt && connector.online && (connector.ownerId === user.id || connector.workspaceIds.includes(workspace.id))), link: href({ name: "settings", section: "hosts" }) },
-    { label: "Create an agent", done: agents.data.agents.length > 0, link: href({ name: "settings", section: "agents", id: "new" }) },
     { label: "Start a session", done: sessions.some(session => session.workspaceId === workspace.id), link: href({ name: "new", workspaceId: workspace.id }) },
   ];
   if (steps.every(step => step.done)) return null;

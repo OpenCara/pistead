@@ -70,7 +70,7 @@ async function fixture(t: TestContext) {
   await run('INSERT INTO connector_workspaces VALUES (?, ?, ?)', 'connector', 'workspace', created);
   await run('INSERT INTO models (id, workspace_id, name, provider, model_id, created_at, connector_id, connector_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     'model', 'workspace', 'Model', 'openai', 'local-model', created, 'connector', 'host');
-  await run('INSERT INTO agents VALUES (?, ?, ?)', 'agent', 'owner', created);
+  await run('INSERT INTO agents (id, author_id, created_at) VALUES (?, ?, ?)', 'agent', 'owner', created);
   await run('INSERT INTO agent_versions (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     'version', 'agent', 'owner', 'workspace', 1, 'Agent', '', '', '[]', 'model', created);
   await run("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private')",

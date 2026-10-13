@@ -12,8 +12,8 @@ import "./new-session.css";
 
 /** Set by the agent settings "Start a session" action; consumed once. Holds an agent version id or agent id. */
 const HANDOFF_KEY = "pistead.newSessionAgent";
-/** The agent version most recently used to start a session. */
-const LAST_AGENT_KEY = "pistead.lastAgent";
+/** How the last session started: `agent:<version id>`, or `model:<workspace model id>` when started from a model. */
+const LAST_START_KEY = "pistead.lastStart";
 const TITLE_LIMIT = 80;
 
 type Visibility = "workspace" | "private";
@@ -41,6 +41,8 @@ function deriveTitle(content: string, fallback: string): string {
   return Array.from(firstLine).slice(0, TITLE_LIMIT).join("").trim() || fallback;
 }
 
+const sameModel = (a: { provider: string; modelId: string }, b: { provider: string; modelId: string }) => a.provider === b.provider && a.modelId === b.modelId;
+
 export function NewSession({ workspaceId }: { workspaceId: string }) {
   const { workspaces, workspacesLoading, workspacesError, refreshWorkspaces, currentWorkspace, selectWorkspace } = useApp();
   const workspace = workspaces.find(item => item.id === workspaceId) ?? null;
@@ -67,10 +69,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repos = useWorkspaceRepositories(workspace.id);
 
   const [handoff] = useState(() => readStorage(() => sessionStorage, HANDOFF_KEY));
-  const [lastUsed] = useState(() => readStorage(() => localStorage, LAST_AGENT_KEY));
+  const [lastStart] = useState(() => readStorage(() => localStorage, LAST_START_KEY));
   useEffect(() => { writeStorage(() => sessionStorage, HANDOFF_KEY, null); }, []);
 
-  const [selectedId, setSelectedId] = useState("");
+  const [choice, setChoice] = useState("");
   const [content, setContent] = useState("");
   const [visibility, setVisibility] = useState<Visibility>("workspace");
   const [trustedHost, setTrustedHost] = useState("");
@@ -78,33 +80,51 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const input = useRef<HTMLTextAreaElement>(null);
 
   const modelList = models.data?.models;
+  const connectors = connections.data?.connectors;
   // Runnable: your own private versions whose model this workspace offers, plus versions published here.
   const versions = useMemo(() => {
     const workspaceModelIds = new Set((modelList ?? []).map(model => model.id));
     const privateVersions = (own.data?.agents ?? []).filter(agent => !agent.workspaceId && agent.authorId === user.id && workspaceModelIds.has(agent.modelId));
     return [...privateVersions, ...(published.data?.agents ?? [])];
   }, [own.data, published.data, modelList, user.id]);
+  // Hosts with a model you can use here, yours first. Starting on one needs no agent: just a model.
+  const hosts = useMemo(() => {
+    const offering = new Set((modelList ?? []).map(model => model.connectorId));
+    return (connectors ?? []).filter(host => offering.has(host.id) && !host.revokedAt)
+      .sort((a, b) => Number(b.ownerId === user.id) - Number(a.ownerId === user.id));
+  }, [connectors, modelList, user.id]);
   const agentsLoading = own.loading || published.loading || models.loading;
   const agentsError = own.error || published.error || models.error;
 
-  const selected = versions.find(version => version.id === selectedId) ?? findVersion(versions, handoff) ?? findVersion(versions, lastUsed) ?? versions[0];
-  const model = modelList?.find(item => item.id === selected?.modelId);
-  const connectors = connections.data?.connectors;
-  const host = connectors?.find(item => item.id === model?.connectorId);
+  // `host:<connector id>` chats with a model on that host; `agent:<version id>` runs an agent on its pinned model.
+  const remembered = lastStart.startsWith("model:") ? modelList?.find(model => model.id === lastStart.slice(6)) : undefined;
+  const preferredVersion = findVersion(versions, handoff) ?? (lastStart.startsWith("agent:") ? findVersion(versions, lastStart.slice(6)) : undefined);
+  const preferredHost = hosts.find(host => host.id === remembered?.connectorId) ?? hosts.find(host => host.online) ?? hosts[0];
+  const startKeys = new Set([...hosts.map(host => `host:${host.id}`), ...versions.map(version => `agent:${version.id}`)]);
+  const startKey = [choice, preferredVersion && `agent:${preferredVersion.id}`, preferredHost && `host:${preferredHost.id}`, versions[0] && `agent:${versions[0].id}`]
+    .find(key => key && startKeys.has(key)) ?? "";
+  const version = startKey.startsWith("agent:") ? versions.find(item => item.id === startKey.slice(6)) : undefined;
+  const agentModel = version && modelList?.find(item => item.id === version.modelId);
+  const host = startKey.startsWith("host:") ? hosts.find(item => item.id === startKey.slice(5)) : connectors?.find(item => item.id === agentModel?.connectorId);
+  const hostModel = (wanted?: { provider: string; modelId: string }) => wanted && host && host.models.some(item => sameModel(item, wanted))
+    ? modelList?.find(item => item.connectorId === host.id && sameModel(item, wanted)) : undefined;
+  // Picks belong to one start choice; switching starts from its model again: the agent's, else the model last
+  // started on this host, else the host's first model.
+  const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
+  const initialModel = version ? agentModel : hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
+  const selection: ChatSelection = chat?.key === startKey ? chat.value : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, access: "approval" };
+  // An agent pins its own model; without one, the session starts on the model picked here.
+  const model = version ? agentModel : hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);
-  const availableModel = Boolean(host?.models.some(item => item.provider === model?.provider && item.modelId === model?.modelId));
+  const availableModel = Boolean(model && host?.models.some(item => sameModel(item, model)));
   const available = Boolean(host?.online && !host.revokedAt && availableModel && (host.ownerId === user.id || host.workspaceIds.includes(workspace.id)));
   const repositories = repos.repositories;
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && repositories.length);
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
-  const canStart = Boolean(selected && host && available && repositoriesReady && trusted && !action.busy);
-  // Picks belong to one agent version and its pinned model; switching agents starts from that model again.
-  const chatKey = `${selected?.id}:${model?.id}`;
-  const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
-  const selection: ChatSelection = chat?.key === chatKey ? chat.value : { model: model && { provider: model.provider, modelId: model.modelId }, access: "approval" };
+  const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
 
-  // A trust acknowledgement covers one agent on one host against one repository set.
-  useEffect(() => { setTrustedHost(""); }, [selected?.id, host?.id, host?.ownerId, repositories]);
+  // A trust acknowledgement covers one start choice on one host against one repository set.
+  useEffect(() => { setTrustedHost(""); }, [startKey, host?.id, host?.ownerId, repositories]);
 
   useLayoutEffect(() => {
     const element = input.current;
@@ -115,13 +135,14 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   function start(event?: FormEvent) {
     event?.preventDefault();
-    if (!canStart || !selected || !host) return;
+    if (!canStart || !model || !host) return;
     const message = content.trim();
     const options = chatOptionsBody(host, selection, "submit");
+    const from = version ? { agentVersionId: version.id } : { modelId: model.id };
     void action.run(async () => {
-      const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, agentVersionId: selected.id, title: deriveTitle(content, selected.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
+      const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, ...from, title: deriveTitle(content, version?.name ?? model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
       const sessionId = result.session.id;
-      writeStorage(() => localStorage, LAST_AGENT_KEY, selected.id);
+      writeStorage(() => localStorage, LAST_START_KEY, version ? `agent:${version.id}` : `model:${model.id}`);
       if (message) {
         try {
           await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}) } });
@@ -151,12 +172,13 @@ function Composer({ workspace }: { workspace: Workspace }) {
   function blockingAlert() {
     if (repos.error) return <Alert variant="warning" title="Unable to load repositories" actions={<Button variant="outline" size="sm" onClick={repos.refresh}>Retry</Button>}>{repos.error}</Alert>;
     if (repositories && !repositories.length) return <Alert variant="warning" title="No repositories in this workspace" actions={<LinkButton variant="outline" size="sm" href={workspaceSettings}>Add repository</LinkButton>}>Sessions need at least one repository. Workspace owners and admins can bind one in workspace settings.</Alert>;
-    if (agentsError) return <Alert variant="error" title="Unable to load agents" actions={<Button variant="outline" size="sm" onClick={() => { own.refresh(); published.refresh(); models.refresh(); }}>Retry</Button>}>{agentsError}</Alert>;
-    if (!agentsLoading && !versions.length) return <Alert variant="info" title="No agents yet" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "agents", id: "new" })}>Create an agent</LinkButton>}>Create a private agent to run on your own Pi, or ask a workspace member to publish one here.</Alert>;
-    if (!selected || connections.loading || !modelList) return null;
+    if (agentsError) return <Alert variant="error" title="Unable to load models and agents" actions={<Button variant="outline" size="sm" onClick={() => { own.refresh(); published.refresh(); models.refresh(); }}>Retry</Button>}>{agentsError}</Alert>;
+    if (!agentsLoading && !connections.loading && !connections.error && !hosts.length && !versions.length) return <Alert variant="info" title="No host to chat with yet" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "hosts" })}>Pair a host</LinkButton>}>Pair your own Pi to chat with its models, or ask a workspace member to share their host here.</Alert>;
+    if (!startKey || connections.loading || !modelList) return null;
     const refreshHost = <Button variant="outline" size="sm" onClick={connections.refresh}>Refresh host status</Button>;
     if (connections.error) return <Alert variant="warning" title="Unable to check host" actions={refreshHost}>{connections.error}</Alert>;
     if (!host) return <Alert variant="warning" title="No available host for this agent" actions={refreshHost}>Connect your own Pi, ask the host owner to share access, or save a revision with a model available to you.</Alert>;
+    if (!model) return <Alert variant="warning" title={`No model on ${host.name}`} actions={refreshHost}>{host.name} offers no model you can use in this workspace.</Alert>;
     if (!availableModel) return <Alert variant="warning" title="Model no longer offered" actions={refreshHost}>This pinned model is no longer offered by {host.name}. Ask the host owner to restore it; no substitute will be chosen.</Alert>;
     if (!available) return <Alert variant="warning" title={`${host.name} is unavailable`} actions={refreshHost}>{host.revokedAt ? "This host was revoked." : !host.online ? "It must reconnect before work can run." : "This host isn't shared with this workspace."}</Alert>;
     if (foreign) return <Alert variant="warning" title={`Hosted by ${host.ownerName}`}>
@@ -187,7 +209,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
       <fieldset disabled={action.busy}>
         <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} placeholder="Describe the task" aria-label="First message" autoFocus />
         <div className="composer-toolbar">
-          <Combobox label="Agent" placeholder={agentsLoading ? "Loading agents..." : "Choose an agent"} disabled={!versions.length} value={selected?.id ?? ""} options={versions.map(version => ({ value: version.id, label: version.name, hint: `v${version.version} · ${hostName(version)}` }))} onChange={setSelectedId} />
+          <Combobox label="Host or agent" placeholder={agentsLoading || connections.loading ? "Loading..." : "Choose a host or agent"} disabled={!startKeys.size} value={startKey}
+            options={[...hosts.map(item => ({ value: `host:${item.id}`, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` })),
+              ...versions.map(item => ({ value: `agent:${item.id}`, label: item.name, hint: `Agent v${item.version} · ${hostName(item)}` }))]}
+            onChange={setChoice} />
           <DropdownMenu label="Visibility" align="start" items={visibilityItems} trigger={<><Icon name={visibility === "workspace" ? "globe" : "lock"} size={14} />{visibility === "workspace" ? "Workspace" : "Private"}</>} />
           <InfoTip label="Who can see and do what">
             <div className="stack">
@@ -195,7 +220,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
               <p>You are the session owner; the agent author and host owner are separate roles. Viewing never grants access to your Git accounts, and visibility does not share your Pi host, private agent, or local models.</p>
             </div>
           </InfoTip>
-          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: chatKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
+          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: startKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
           <span className="spacer" />
           {action.busy && <Loading>Preparing repositories...</Loading>}
           <Button type="submit" variant="default" icon="send" className="composer-send" aria-label="Start session" title="Start session" disabled={!canStart} />
@@ -207,7 +232,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
       {action.busy
         ? <span role="status">Resolving repository commits and downloading snapshots to the Pi host's private session cache. The agent starts once every repository is ready.</span>
         : <>
-          {selected && (connections.loading || models.loading ? <Loading>Checking host...</Loading> : host && <>
+          {startKey && (connections.loading || models.loading ? <Loading>Checking host...</Loading> : host && <>
             <ConnectionStatus connector={host} />
             <span>{host.name}</span>
             <span>·</span>

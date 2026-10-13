@@ -210,6 +210,21 @@ if (connectedRuntime) {
       workspaceId: workspace.id, agentVersionId: own.id, title: "No private agent use", trustedConnectorId: aliceConnector!.id,
     }, [403, 404]);
   });
+  await check("a session started from a model runs on the owner's Pi without choosing an agent", async () => {
+    const ownModel = ((await alice.request("GET", `/api/workspaces/${workspace.id}/models`)).models as ModelDefinition[])
+      .find(item => item.connectorId === aliceConnector!.id)!;
+    const session: SessionRecord = (await alice.request("POST", "/api/sessions", {
+      workspaceId: workspace.id, modelId: ownModel.id, title: "Chat without an agent",
+    })).session;
+    assert.equal(session.connectorId, aliceConnector!.id);
+    const agents: AgentVersion[] = (await alice.request("GET", "/api/agents")).agents;
+    assert.ok(!agents.some(item => item.id === session.agentVersionId), "the session's own chat agent stays out of the catalog");
+    await alice.submit(session.id, "TEST_IDENTITY");
+    await alice.settled(session.id, "alice-test");
+    await bob.request("POST", "/api/sessions", {
+      workspaceId: workspace.id, modelId: ownModel.id, title: "No private model use", trustedConnectorId: aliceConnector!.id,
+    }, [403, 404]);
+  });
   await check("workspace viewing follows membership and privacy changes immediately, without granting control", async () => {
     const sessionId = workspaceVisibleSession!.id;
     await alice.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: eve.user.id, role: "member" });

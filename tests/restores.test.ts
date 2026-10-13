@@ -56,7 +56,7 @@ async function fixture(t: TestContext, connected = false, repositories: SessionR
   }
   sqlite.prepare(`INSERT INTO models (id,workspace_id,name,provider,model_id,connector_id,connector_owner_id,created_at)
     VALUES ('model','workspace','Model','faux','faux-v1',?,?,'2026-01-01')`).run(connected ? 'connector' : null, connected ? 'test:host' : null);
-  sqlite.exec(`INSERT INTO agents VALUES ('agent','test:host','2026-01-01');
+  sqlite.exec(`INSERT INTO agents (id, author_id, created_at) VALUES ('agent','test:host','2026-01-01');
     INSERT INTO agent_versions VALUES ('version','agent','test:host','workspace',1,'Agent','Description','Instructions','["read_file"]','model','2026-01-01')`);
   sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id,repositories_json)
     VALUES ('source','workspace','test:owner','version','Original',7,'ready','2026-01-01',?,?,?)`)
