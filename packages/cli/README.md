@@ -83,6 +83,8 @@ Agents change files with `edit_file`, which replaces exact text in place, or wit
 
 A new session needs no agent: pick a host and one of its models, and the session gets every tool that host supports with no extra instructions. The access mode still decides what runs without asking. Agents remain for reusable instructions and tool sets, and for sharing them with a workspace.
 
+When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call waits up to an hour for the answer, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes and GitHub comments still need their own approval unless the message auto-approves. Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
+
 ## License
 
 MIT

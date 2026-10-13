@@ -16,7 +16,7 @@ const levelLabels: Record<ThinkingLevel, string> = {
 };
 
 const accessInfo: Record<AccessMode, { label: string; icon: IconName; hint: string }> = {
-  read: { label: "Read only", icon: "eye", hint: "Inspect files only; no edits, commands or commits" },
+  read: { label: "Read only", icon: "eye", hint: "Inspect files; edits, commands and commits ask the session owner first" },
   approval: { label: "Ask before acting", icon: "shield", hint: "Edits are automatic; commands, commits and GitHub comments need approval" },
   auto: { label: "Auto-approve", icon: "alert", hint: "Commands and commits run immediately as the owner" },
 };

@@ -153,20 +153,27 @@ function SessionPane({ id }: { id: string }) {
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
 
-  async function decide(approval: ApprovalRecord, decision: "approve" | "deny") {
+  /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
+  async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
     if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
-    if (decision === "approve" && !await confirmDialog({
+    // A permission card is itself the owner's prompt; an operation confirms its exact effect first.
+    if (decision === "approve" && approval.operation.kind !== "permission" && !await confirmDialog({
       title: "Approve this exact operation?",
       message: session?.hostUnsandboxed
         ? "It will run as the session owner on an UNSANDBOXED host: directly on the host owner's machine, with their full user permissions and network access, and no resource limits."
-        : "It will run as the session owner.",
+        : approval.unbounded
+          ? "It will run as the session owner, in the sandbox but without resource limits: no cap on CPU, memory, processes or disk."
+          : "It will run as the session owner.",
       confirmLabel: "Approve",
     })) return;
+    const notice = approval.operation.kind === "permission"
+      ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
+      : decision === "approve" ? "Approval decision recorded" : "Operation denied";
     await approvalAction.run(async () => {
-      await api(`/api/sessions/${segment(id)}/approvals/${segment(approval.id)}`, { method: "POST", body: { decision, reviewHash: approval.reviewHash } });
+      await api(`/api/sessions/${segment(id)}/approvals/${segment(approval.id)}`, { method: "POST", body: { decision, reviewHash: approval.reviewHash, ...(scope ? { scope } : {}) } });
       live.refresh();
       audit.refresh();
-    }, decision === "approve" ? "Approval decision recorded" : "Operation denied");
+    }, notice);
   }
 
   // A failed start explains itself in the conversation area, where the chat box restarts it.
@@ -195,16 +202,26 @@ function SessionPane({ id }: { id: string }) {
         id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
         pinned={<>
           {session.hostUnsandboxed && (canWrite || canApprove) && <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>}
-          {view.approvals.filter(approval => approval.status === "pending").map(approval => <ApprovalCard approval={approval} key={approval.id}>
-            {canApprove ? <>
-              {!approval.reviewHash && <Alert variant="warning" title="No verified review commitment" actions={<Button variant="outline" size="sm" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</Button>}>Refresh before deciding; the server must bind the displayed operation and requester.</Alert>}
-              <div className="inline">
-                <Button variant="default" size="sm" disabled={approvalAction.busy || !approval.reviewHash} onClick={() => void decide(approval, "approve")}>Approve</Button>
-                <Button variant="outline" size="sm" disabled={approvalAction.busy || !approval.reviewHash} onClick={() => void decide(approval, "deny")}>Deny</Button>
-                <span className="muted small">Each approval covers one exact operation and its arguments</span>
-              </div>
-            </> : <p className="muted small">Waiting for an authorized approver</p>}
-          </ApprovalCard>)}
+          {view.approvals.filter(approval => approval.status === "pending").map(approval => {
+            const permission = approval.operation.kind === "permission";
+            // Only the session owner can let a call do more than the session allows.
+            const decides = permission ? isOwner && canApprove : canApprove;
+            const disabled = approvalAction.busy || !approval.reviewHash;
+            return <ApprovalCard approval={approval} key={approval.id}>
+              {decides ? <>
+                {!approval.reviewHash && <Alert variant="warning" title="No verified review commitment" actions={<Button variant="outline" size="sm" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</Button>}>Refresh before deciding; the server must bind the displayed operation and requester.</Alert>}
+                {permission ? <div className="inline">
+                  <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "call")}>Allow once</Button>
+                  <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "session")}>Allow for this session</Button>
+                  <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
+                </div> : <div className="inline">
+                  <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve")}>Approve</Button>
+                  <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
+                  <span className="muted small">Each approval covers one exact operation and its arguments</span>
+                </div>}
+              </> : <p className="muted small">{permission ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
+            </ApprovalCard>;
+          })}
           <Feedback {...approvalAction} />
         </>}
       />}

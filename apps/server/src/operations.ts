@@ -1,4 +1,5 @@
-import type { Operation, PullRequestRequest } from '../../../packages/shared/src/types.js';
+import type { Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
+import { permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
 import { validPushBranch } from '../../../packages/shared/src/repositories.js';
 import { fail, text } from './http.js';
 
@@ -40,6 +41,15 @@ export function parseOperation(input: unknown): Operation {
       // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
       return { kind: value.kind, repository: value.repository, branch: value.branch, commit: value.commit,
         ...(value.pullRequest === undefined ? {} : { pullRequest: pullRequest(value.pullRequest) }) };
+    }
+    case 'permission': {
+      const needs = value.needs;
+      if (!toolNames.includes(value.tool as ToolName)) fail(400, 'invalid_operation', 'Unknown tool.');
+      // Unique and in permissionNeeds order, so equal requests hash equally.
+      if (!Array.isArray(needs) || !needs.length || needs.join() !== permissionNeeds.filter(need => needs.includes(need)).join()) {
+        fail(400, 'invalid_operation', 'Invalid permission needs.');
+      }
+      return { kind: value.kind, tool: value.tool as ToolName, target: text(value.target, 'target', 8192, 0), needs: [...needs] as PermissionNeed[] };
     }
     default: fail(400, 'invalid_operation', 'Unsupported operation.');
   }

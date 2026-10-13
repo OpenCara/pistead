@@ -116,11 +116,26 @@ export interface GitPushOperation {
   commit: string;
   pullRequest?: PullRequestRequest;
 }
+/** What a tool call lacks: a tool the agent doesn't include, changes in a Read-only message, or a shell without resource limits. */
+export const permissionNeeds = ["tool", "write", "unbounded-shell"] as const;
+export type PermissionNeed = (typeof permissionNeeds)[number];
+/**
+ * A tool call that needs more than the session allows. The call waits while the session owner allows it once or for the
+ * rest of the session, or denies it. `target` is what the call touches (a path or a command), shown on the card.
+ */
+export interface PermissionRequest {
+  kind: "permission";
+  tool: ToolName;
+  target: string;
+  /** In `permissionNeeds` order. */
+  needs: PermissionNeed[];
+}
 export type Operation =
   | { kind: "git.commit"; message: string }
   | { kind: "bash"; command: string }
   | { kind: "github.comment"; repository: string; issue: number; body: string }
-  | GitPushOperation;
+  | GitPushOperation
+  | PermissionRequest;
 /** A short-lived push credential minted by the control plane for exactly one approved push. Never persisted by the runner. */
 export interface PushCredential {
   /** Control-plane ledger id; echoed back when the push completes so the credential is revoked. */
@@ -189,6 +204,10 @@ export interface ApprovalRecord {
   /** Executed without a per-command human decision because the session owner chose auto-approve access. */
   automatic?: boolean;
   reviewHash?: string;
+  /** A permission request the owner allowed: for that one call, or for the rest of the session. */
+  scope?: "call" | "session";
+  /** A shell command the host's owner allowed to run without resource limits, which this host lacks. */
+  unbounded?: boolean;
 }
 export interface EntryView {
   id: string;

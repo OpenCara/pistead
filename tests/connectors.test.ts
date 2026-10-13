@@ -10,7 +10,7 @@ import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ApprovalRecord, ModelDefinition, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import type { AgentVersion, ApprovalRecord, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
@@ -1026,6 +1026,73 @@ test('only a Worker-issued write admission produces an approvable model review a
     repository: operation.repository, issue: operation.issue, body: operation.body,
   }));
   assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('only the session owner answers a permission request, for one call or the session, and only allowed tools reach review', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'approve'] }));
+  const path = `/api/sessions/${s.session.id}`;
+  const pending = (id: string, operation: Operation): ApprovalRecord => ({
+    id, sessionId: s.session.id, requestedBy: s.creator.user.id, operation, status: 'pending', createdAt: new Date().toISOString(),
+  });
+  const once = pending('permission-call-1', { kind: 'permission', tool: 'bash', target: 'npm test', needs: ['tool'] });
+  const always = pending('permission-call-2', { kind: 'permission', tool: 'git_commit', target: 'Fix it', needs: ['tool'] });
+  const unlimited = pending('permission-call-3', { kind: 'permission', tool: 'bash', target: 'make', needs: ['unbounded-shell'] });
+  // Operations of tools outside the agent, as a host could present them before or without the owner's permission.
+  const command = pending('tool-call-1', { kind: 'bash', command: 'npm test' });
+  const otherCommand = pending('tool-call-4', { kind: 'bash', command: 'npm test' });
+  const commit = pending('tool-call-5', { kind: 'git.commit', message: 'Fix it' });
+  let approvals = [once, always, unlimited, command, otherCommand, commit];
+  const decisions: unknown[] = [];
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const { admissionId } = JSON.parse(envelope.request.body) as { admissionId: string };
+      approvals = approvals.map(approval => ({ ...approval, admissionId }));
+      return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: true,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string; decision: string; operation: Operation; scope?: 'call' | 'session' };
+    decisions.push({ approvalId: input.approvalId, decision: input.decision, scope: input.scope });
+    const decided: ApprovalRecord = { ...approvals.find(approval => approval.id === input.approvalId)!, status: 'approved', decidedBy: envelope.request.ticket.actorId, ...(input.scope ? { scope: input.scope } : {}) };
+    approvals = approvals.map(approval => approval.id === decided.id ? decided : approval);
+    return Response.json({ approval: decided });
+  });
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Run the tests', requestId: 'permission-write' }), 202);
+  const present = async () => new Map((await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
+  let presented = await present();
+  for (const id of [command.id, otherCommand.id, commit.id]) {
+    assert.equal(presented.get(id)!.status, 'interrupted');
+    assert.equal(Object.hasOwn(presented.get(id)!, 'reviewHash'), false);
+  }
+  const decide = (client: typeof s.creator, id: string, body: Record<string, unknown>) =>
+    client.request('POST', `${path}/approvals/${id}`, { decision: 'approve', reviewHash: presented.get(id)!.reviewHash, ...body });
+  await denied(await decide(s.admin, once.id, { scope: 'call' }), 403, 'owner_required');
+  await denied(await decide(s.creator, once.id, { scope: 'forever' }), 400, 'invalid_decision');
+  // The creator's session runs on the host's machine, and only the host's owner can lift the limits it lacks.
+  await denied(await decide(s.creator, unlimited.id, {}), 403, 'host_owner_required');
+  assert.deepEqual(decisions, []);
+  const allowed = await json<{ approval: ApprovalRecord }>(await decide(s.creator, once.id, { scope: 'call' }));
+  assert.equal(allowed.approval.status, 'approved');
+  assert.equal(allowed.approval.scope, 'call');
+  await json(await decide(s.creator, always.id, { scope: 'session' }));
+  assert.deepEqual(decisions, [{ approvalId: once.id, decision: 'approve', scope: 'call' }, { approvalId: always.id, decision: 'approve', scope: 'session' }]);
+  presented = await present();
+  // The one-call permission covers that call's command only; the session permission covers every commit.
+  assert.equal(presented.get(command.id)!.status, 'pending');
+  assert.ok(presented.get(command.id)!.reviewHash);
+  assert.equal(presented.get(otherCommand.id)!.status, 'interrupted');
+  assert.equal(presented.get(commit.id)!.status, 'pending');
+  assert.ok(presented.get(commit.id)!.reviewHash);
+  assert.equal(presented.get(always.id)!.scope, 'session');
+  // Only permission requests take a scope, and nobody can request a permission directly.
+  await denied(await decide(s.admin, command.id, { scope: 'session' }), 400, 'invalid_decision');
+  await denied(await s.creator.request('POST', `${path}/operations`, { kind: 'permission', tool: 'bash', target: '', needs: ['tool'] }), 400, 'invalid_operation');
 });
 
 test('per-message chat options are checked against the session host, mode and owner before reaching the runtime', async t => {

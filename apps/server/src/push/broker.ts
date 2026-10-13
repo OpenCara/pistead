@@ -121,7 +121,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
       fail(403, 'automatic_push_not_admitted', 'Automatic pushes require an unexpired auto-approve write admission from the session owner.');
     }
     await callbackScope(c, owner.row, connectorId);
-    await requireOperationTool(c.env, owner.row, operation);
+    await requireOperationTool(c.env, owner.row, operation, approvalId);
     // This request's own ledger row does not count against it on the post-mint recheck.
     const used = await c.env.DB.query<{ count: number }>('SELECT COUNT(*) AS count FROM push_credentials WHERE admission_id = ? AND id <> ?')
       .bind(admissionId, credentialId).first();
