@@ -340,7 +340,9 @@ export function RelativeTime({ value }: { value: string }) {
 /** A measured duration: "850 ms", "2.4 s", "14 s", "3 min 5 s". */
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)} ms`;
-  if (ms < 10_000) return `${(ms / 1000).toFixed(1)} s`;
+  // Round first, so 9 951 ms is "10 s" like 10 000 ms rather than "10.0 s".
+  const tenths = Math.round(ms / 100);
+  if (tenths < 100) return `${(tenths / 10).toFixed(1)} s`;
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds} s`;
   return seconds % 60 ? `${Math.floor(seconds / 60)} min ${seconds % 60} s` : `${seconds / 60} min`;
