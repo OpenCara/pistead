@@ -5,8 +5,9 @@ import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
+import { Markdown } from "./markdown";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import {
@@ -35,6 +36,16 @@ function useLiveSession(id: string) {
 
 const PANEL_KEY = "pistead.sessionPanel";
 const toolCall = /^([a-z_]+)\(.*\)$/s;
+/** The line the runner writes for each tool call after an assistant message's text: the name, then JSON arguments. */
+const toolCallLine = /^([a-z_]+)\(\{.*\}\)$/;
+
+/** Splits trailing tool call lines off an assistant message, so markdown never reformats their JSON. */
+function trailingToolCalls(text: string): { prose: string; calls: string[] } {
+  const lines = text.split("\n");
+  let start = lines.length;
+  while (start > 0 && toolCallLine.test(lines[start - 1])) start--;
+  return { prose: lines.slice(0, start).join("\n"), calls: lines.slice(start) };
+}
 
 function usePanelOpen() {
   const [open, setOpen] = useState(() => {
@@ -60,16 +71,21 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
   return `The request to ${[provider, modelId].filter(Boolean).join("/") || "the model"} failed${status ? ` (HTTP ${status})` : ""}`;
 }
 
-/** User messages are bubbles; assistant text is plain; tool calls, results and system entries collapse to one row. */
+/** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
+function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconName; label: ReactNode; text: string }) {
+  return <details className="entry-tool" data-role={role}>
+    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span><Icon name="chevron-right" size={14} /></summary>
+    <pre>{text}</pre>
+  </details>;
+}
+
+/** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
 function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
   const call = entry.role === "assistant" ? toolCall.exec(entry.text.trim()) : null;
   if (call || entry.role === "system" || entry.role === "toolResult") {
     const label = call ? `Tool · ${call[1]}` : entry.role === "toolResult" ? "Tool result" : "System";
-    return <details className="entry-tool" data-role={entry.role}>
-      <summary><Icon name={call ? "tool" : "terminal"} size={14} /><span className="truncate">{label}{actor && <> · {actor}</>}</span><Icon name="chevron-right" size={14} /></summary>
-      <pre>{entry.text}</pre>
-    </details>;
+    return <ToolDetails role={entry.role} icon={call ? "tool" : "terminal"} label={<>{label}{actor && <> · {actor}</>}</>} text={entry.text} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -83,8 +99,10 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
       {actor && entry.actorId !== userId && <div className="entry-actor">by {actor}</div>}
     </div>;
   }
+  const { prose, calls } = entry.role === "assistant" ? trailingToolCalls(entry.text) : { prose: entry.text, calls: [] };
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
-    {entry.text}
+    <Markdown text={prose} />
+    {calls.length > 0 && <ToolDetails icon="tool" label={`Tool · ${toolCallLine.exec(calls[0])?.[1]}`} text={calls.join("\n")} />}
     {actor && <div className="entry-actor">by {actor}</div>}
   </div>;
 }
@@ -222,6 +240,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const lastScrollTop = useRef(0);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
@@ -238,13 +257,16 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (actualMode === "ask") return conversation?.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || entry.conversationId === conversationId);
     return conversation?.mode !== "ask";
   });
-  const lastEntryId = entries.at(-1)?.id;
 
-  // Follow new entries unless the reader has scrolled up.
-  useLayoutEffect(() => {
+  // Follow the transcript as it grows, including diagrams drawn after their entry, unless the reader has scrolled up.
+  useEffect(() => {
     const element = transcript.current;
-    if (element && stick.current) element.scrollTop = element.scrollHeight;
-  }, [lastEntryId, entries.length]);
+    const column = element?.firstElementChild;
+    if (!element || !column) return;
+    const observer = new ResizeObserver(() => { if (stick.current) element.scrollTop = element.scrollHeight; });
+    observer.observe(column);
+    return () => observer.disconnect();
+  }, []);
   useLayoutEffect(() => {
     stick.current = true;
     const element = transcript.current;
@@ -281,7 +303,10 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   return <>
     <div className="session-transcript" ref={transcript} onScroll={event => {
       const element = event.currentTarget;
-      stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+      // Content can grow between a scroll and its event, so only scrolling up stops following; reaching the bottom resumes it.
+      if (element.scrollHeight - element.scrollTop - element.clientHeight < 80) stick.current = true;
+      else if (element.scrollTop < lastScrollTop.current) stick.current = false;
+      lastScrollTop.current = element.scrollTop;
     }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
       <div className="chat-column">
         {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
