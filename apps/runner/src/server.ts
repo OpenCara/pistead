@@ -52,7 +52,11 @@ export class RunnerService {
     assertId(id);
     if (this.closed) throw new RunnerError(503, "Runner service is closed");
     const existing = this.sessions.get(id);
-    if (existing) return existing;
+    if (existing) {
+      const session = await existing;
+      if (session.failed) await session.recover();
+      return session;
+    }
     const opening = (async () => {
       const directory = join(this.dataDir, "sessions", id);
       let binding: RunnerBinding;

@@ -7,7 +7,7 @@ import { join, dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, Harness, type Storage } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -459,4 +459,63 @@ test("a run Pi settles without an answer shows as a failed model turn instead of
   assert.deepEqual(entries.map(entry => [entry.role, entry.text]), [["user", "hello"], ["assistant", ""]]);
   assert.deepEqual(entries[1]!.error, { provider: "faux", modelId: "faux-1" });
   assert.equal(entries[1]!.actorId, "test:alice");
+});
+
+/** Real SQLite storage with faults switched on demand, as a full disk or an I/O error would cause them. */
+function faultyStorage(fault: { calls?: boolean; close?: boolean }) {
+  return async (path: string): Promise<Storage> => {
+    const storage = await openNodeSqliteStorage(path);
+    return new Proxy(storage, { get(target, key) {
+      const value: unknown = Reflect.get(target, key, target);
+      if (typeof value !== "function") return value;
+      // Closing always releases the real database first, so no connection outlives a test.
+      if (key === "close") return async (...args: unknown[]) => {
+        await Reflect.apply(value, target, args);
+        if (fault.close) throw new Error("disk I/O error");
+      };
+      return (...args: unknown[]) => fault.calls ? Promise.reject(new Error("disk I/O error")) : Reflect.apply(value, target, args);
+    } });
+  };
+}
+
+test("a session whose storage failed is reopened from its SQLite file by the next request", hostMode, async t => {
+  const fault = { calls: false };
+  const { service } = await hostFixture(t, { openStorage: faultyStorage(fault) });
+  const id = "storage-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "before" }, "write");
+  await idle(session);
+  const before = (await session.view()).entries;
+
+  fault.calls = true;
+  await assert.rejects(session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "during" }, "write"));
+  for (let count = 0; count < 200 && !session.failed; count++) await delay(10);
+  assert.equal(session.failed, true);
+  // While storage keeps failing, each request tries to reopen the session and reports the failure.
+  await assert.rejects(service.get(id));
+  assert.equal(session.failed, true);
+
+  fault.calls = false;
+  // Requests arriving together share one reopen and all get the fully reopened session.
+  assert.deepEqual(await Promise.all([service.get(id), service.get(id)]), [session, session]);
+  assert.equal(session.failed, false);
+  assert.deepEqual((await session.view()).entries, before);
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "after" }, "write");
+  await idle(session);
+  assert.ok((await session.view()).entries.length > before.length);
+});
+
+test("a backup fails instead of copying a database that did not close cleanly", hostMode, async t => {
+  const fault = { close: false };
+  const { service } = await hostFixture(t, { openStorage: faultyStorage(fault) });
+  const id = "backup-close-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "before" }, "write");
+  await idle(session);
+
+  fault.close = true;
+  await assert.rejects(session.backup(await ticket(id, "backup")), /disk I\/O error/);
+  fault.close = false;
+  assert.equal(await service.get(id), session);
+  assert.ok((await session.view()).entries.length > 0);
 });
