@@ -1,16 +1,18 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { getSupportedThinkingLevels, type Models } from "@earendil-works/pi-ai/models";
+import { clampThinkingLevel, getSupportedThinkingLevels, type Models } from "@earendil-works/pi-ai/models";
 import { getAgentDir, ModelRuntime, resolveModelScopeWithDiagnostics } from "@earendil-works/pi-coding-agent";
 import type { LocalModelSummary } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
-import { thinkingLevels, type ModelDefinition } from "../../../packages/shared/src/types.js";
+import { thinkingLevels, type ModelDefinition, type ThinkingLevel } from "../../../packages/shared/src/types.js";
 import { runnerModels } from "./provider.js";
 
 export interface ResolvedLocalModel {
   models: Models;
   provider: string;
   modelId: string;
+  /** The reasoning level Pi on this host starts the model at. */
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface LocalModels {
@@ -24,10 +26,12 @@ export function modelSummary(value: LocalModelSummary): LocalModelSummary {
     || typeof value.modelId !== "string" || !value.modelId || value.modelId.length > 256 || /[\s\x00-\x1f\x7f]/.test(value.modelId)
     || typeof value.name !== "string" || !value.name.trim() || value.name.length > 200 || /[\x00-\x1f\x7f]/.test(value.name)
     || (value.thinkingLevels !== undefined && (!Array.isArray(value.thinkingLevels) || !value.thinkingLevels.length
-      || value.thinkingLevels.some(level => !thinkingLevels.includes(level)) || new Set(value.thinkingLevels).size !== value.thinkingLevels.length))) {
+      || value.thinkingLevels.some(level => !thinkingLevels.includes(level)) || new Set(value.thinkingLevels).size !== value.thinkingLevels.length))
+    || (value.thinkingLevel !== undefined && (!thinkingLevels.includes(value.thinkingLevel) || (value.thinkingLevels && !value.thinkingLevels.includes(value.thinkingLevel))))) {
     throw new Error("Invalid local model metadata");
   }
-  return { provider: value.provider, modelId: value.modelId, name: value.name, ...(value.thinkingLevels ? { thinkingLevels: [...value.thinkingLevels] } : {}) };
+  return { provider: value.provider, modelId: value.modelId, name: value.name, ...(value.thinkingLevels ? { thinkingLevels: [...value.thinkingLevels] } : {}),
+    ...(value.thinkingLevel ? { thinkingLevel: value.thinkingLevel } : {}) };
 }
 
 export type LocalPiRuntime = Models;
@@ -39,21 +43,51 @@ export interface LocalPiOptions {
   models?: readonly { provider: string; modelId: string }[];
   /** Pi's `enabledModels` patterns (same globs as Pi's model cycling); explicit `models` take precedence. */
   enabledModels?: readonly string[];
+  /** Pi's `defaultThinkingLevel` setting. */
+  defaultThinkingLevel?: ThinkingLevel;
+  /** Pi's `modelThinkingLevels` setting, keyed `provider/modelId`. */
+  modelThinkingLevels?: ReadonlyMap<string, ThinkingLevel>;
   runtimeFactory?: (options: { authPath?: string; modelsPath?: string; refreshOnCreate: false; allowModelNetwork: false }) => Promise<LocalPiRuntime>;
 }
 
-/** Reads `enabledModels` from Pi's global settings.json; project settings never apply to a connector. */
-export async function readPiEnabledModels(agentDir?: string): Promise<string[] | undefined> {
+/** The parts of Pi's global settings.json a connector follows; project settings never apply to a connector. */
+export interface PiSettings {
+  enabledModels?: string[];
+  defaultThinkingLevel?: ThinkingLevel;
+  modelThinkingLevels?: Map<string, ThinkingLevel>;
+}
+
+/** Pi's own starting level when its settings name none (`DEFAULT_THINKING_LEVEL`, which pi-coding-agent does not export). */
+const PI_DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
+
+const isThinkingLevel = (value: unknown): value is ThinkingLevel => typeof value === "string" && thinkingLevels.includes(value as ThinkingLevel);
+
+export async function readPiSettings(agentDir?: string): Promise<PiSettings> {
   const path = join(agentDir === undefined ? getAgentDir() : resolve(agentDir), "settings.json");
   let text: string;
   try { text = await readFile(path, "utf8"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
-  const value = (JSON.parse(text) as { enabledModels?: unknown }).enabledModels;
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.some(pattern => typeof pattern !== "string" || !pattern.trim()) || value.length > 200) {
-    throw new Error("Pi settings.json enabledModels must be a list of model patterns");
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return {}; throw error; }
+  const value = JSON.parse(text) as { enabledModels?: unknown; defaultThinkingLevel?: unknown; modelThinkingLevels?: unknown };
+  const settings: PiSettings = {};
+  const enabled = value.enabledModels;
+  if (enabled !== undefined) {
+    if (!Array.isArray(enabled) || enabled.some(pattern => typeof pattern !== "string" || !pattern.trim()) || enabled.length > 200) {
+      throw new Error("Pi settings.json enabledModels must be a list of model patterns");
+    }
+    if (enabled.length) settings.enabledModels = enabled;
   }
-  return value.length ? value : undefined;
+  if (value.defaultThinkingLevel !== undefined) {
+    if (!isThinkingLevel(value.defaultThinkingLevel)) throw new Error(`Pi settings.json defaultThinkingLevel must be one of ${thinkingLevels.join(", ")}`);
+    settings.defaultThinkingLevel = value.defaultThinkingLevel;
+  }
+  const perModel = value.modelThinkingLevels;
+  if (perModel !== undefined) {
+    if (!perModel || typeof perModel !== "object" || Array.isArray(perModel) || !Object.values(perModel).every(isThinkingLevel)) {
+      throw new Error("Pi settings.json modelThinkingLevels must map provider/model to a reasoning level");
+    }
+    settings.modelThinkingLevels = new Map(Object.entries(perModel as Record<string, ThinkingLevel>));
+  }
+  return settings;
 }
 
 export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<LocalModels> {
@@ -74,18 +108,24 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
     // created without a catalog refresh. getAvailable performs local auth/availability
     // checks, without refreshing the model catalog or extracting request credentials.
     const enabled = !selected && options.enabledModels?.length ? [...options.enabledModels] : undefined;
+    // Same resolution as Pi's own model cycling: globs over "provider/id" or bare ids, best alias for exact names. A
+    // pattern can also name the model's reasoning level, e.g. "anthropic/*:high".
+    const scoped = !selectedProviders && enabled ? (await resolveModelScopeWithDiagnostics(enabled, runtime as never, { signal })).scopedModels : undefined;
     const available = selectedProviders
       ? (await Promise.all(selectedProviders.map(provider => runtime.getAvailable(provider, { signal })))).flat()
-      // Same resolution as Pi's own model cycling: globs over "provider/id" or bare ids, best alias for exact names.
-      : enabled ? (await resolveModelScopeWithDiagnostics(enabled, runtime as never, { signal })).scopedModels.map(scoped => scoped.model)
+      : scoped ? scoped.map(item => item.model)
       : await runtime.getAvailable(undefined, { signal });
+    const patternLevels = new Map(scoped?.flatMap(item => item.thinkingLevel ? [[JSON.stringify([item.model.provider, item.model.id]), item.thinkingLevel] as const] : []));
     const seen = new Set<string>();
     const result: LocalModelSummary[] = [];
     for (const model of available) {
       const key = JSON.stringify([model.provider, model.id]);
       if (seen.has(key) || (selected && !selected.has(key))) continue;
       seen.add(key);
-      result.push(modelSummary({ provider: model.provider, modelId: model.id, name: model.name, thinkingLevels: getSupportedThinkingLevels(model) }));
+      // The level Pi itself starts this model at: the pattern's, then the model's own setting, then the default one.
+      const level = patternLevels.get(key) ?? options.modelThinkingLevels?.get(`${model.provider}/${model.id}`) ?? options.defaultThinkingLevel ?? PI_DEFAULT_THINKING_LEVEL;
+      result.push(modelSummary({ provider: model.provider, modelId: model.id, name: model.name,
+        thinkingLevels: getSupportedThinkingLevels(model), thinkingLevel: clampThinkingLevel(model, level) }));
     }
     if (selected && [...selected].some(key => !seen.has(key))) throw new Error("A selected local Pi model is unavailable or lacks configured authentication");
     if (result.length > connectorLimits.models) throw new Error("Local Pi catalog exceeds 200 models; narrow enabledModels in Pi's settings or pass --model");
@@ -96,11 +136,11 @@ export async function loadLocalPiModels(options: LocalPiOptions = {}): Promise<L
     manifest,
     async resolve(model) {
       const available = await manifest();
-      if (!available.some(item => item.provider === model.provider && item.modelId === model.modelId)
-        || !runtime.getModel(model.provider, model.modelId)) throw new Error("Requested local Pi model is unavailable");
+      const summary = available.find(item => item.provider === model.provider && item.modelId === model.modelId);
+      if (!summary || !runtime.getModel(model.provider, model.modelId)) throw new Error("Requested local Pi model is unavailable");
       // ModelRuntime implements Models. Its request path resolves/refreshes OAuth
       // and custom-provider authentication locally; never extract an API key.
-      return { models: runtime, provider: model.provider, modelId: model.modelId };
+      return { models: runtime, provider: model.provider, modelId: model.modelId, ...(summary.thinkingLevel ? { thinkingLevel: summary.thinkingLevel } : {}) };
     },
   };
 }

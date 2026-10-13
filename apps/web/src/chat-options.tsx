@@ -86,7 +86,8 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
   function selectModel(key: string) {
     const next = host!.models.find(item => modelKey(item) === key);
     if (!next) return;
-    onChange({ ...value, model: { provider: next.provider, modelId: next.modelId }, thinkingLevel: clampLevel(next.thinkingLevels, value.thinkingLevel) });
+    // A model brings its own level on this host's Pi; older connectors don't report one, so keep the current level.
+    onChange({ ...value, model: { provider: next.provider, modelId: next.modelId }, thinkingLevel: next.thinkingLevel ?? clampLevel(next.thinkingLevels, value.thinkingLevel) });
   }
 
   async function selectAccess(access: AccessMode) {

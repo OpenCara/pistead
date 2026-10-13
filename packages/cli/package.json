@@ -1,6 +1,6 @@
 {
   "name": "pistead",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Connect your Linux or WSL2 Pi host to a Pistead workspace.",
   "license": "MIT",
   "homepage": "https://pistead.com",

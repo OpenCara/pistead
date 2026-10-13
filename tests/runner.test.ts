@@ -461,6 +461,52 @@ test("a run Pi settles without an answer shows as a failed model turn instead of
   assert.equal(entries[1]!.actorId, "test:alice");
 });
 
+test("a conversation starts at the host's level for its model, and a model switch without a level takes the new model's", hostMode, async t => {
+  const levels = { "faux-1": "high", "faux-2": "low" } as const;
+  const { service } = await hostFixture(t, { resolveModels: async model => {
+    const models = createModels();
+    const faux = fauxProvider({ models: [{ id: "faux-1", reasoning: true }, { id: "faux-2", reasoning: true }] });
+    faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+    models.setProvider(faux.provider);
+    return { models, provider: model.provider, modelId: model.modelId, thinkingLevel: levels[model.modelId as keyof typeof levels] };
+  } });
+  const id = "level-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  assert.deepEqual((await session.view()).agent, { provider: "faux", modelId: "faux-1", thinkingLevel: "high" });
+  await session.submit(await ticket(id, "submit"), { content: "switch", requestId: "switch", options: { model: { provider: "faux", modelId: "faux-2" } } }, "write");
+  await idle(session);
+  assert.deepEqual((await session.view()).agent, { provider: "faux", modelId: "faux-2", thinkingLevel: "low" });
+  // A level named with the switch wins over the model's own.
+  await session.submit(await ticket(id, "submit"), { content: "back", requestId: "back", options: { model: { provider: "faux", modelId: "faux-1" }, thinkingLevel: "medium" } }, "write");
+  await idle(session);
+  assert.deepEqual((await session.view()).agent, { provider: "faux", modelId: "faux-1", thinkingLevel: "medium" });
+});
+
+test("edit_file replaces exact text in place, keeps a CRLF file CRLF, and refuses an ambiguous edit without writing", hostMode, async t => {
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("edit_file", { path: "notes.txt", edits: [{ oldText: "beta", newText: "BETA" }, { oldText: "alpha\n", newText: "ALPHA\n" }] })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Edited."),
+    fauxAssistantMessage([fauxToolCall("edit_file", { path: "notes.txt", edits: [{ oldText: "a", newText: "b" }] })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Not edited."),
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const { service } = await hostFixture(t, { resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }) });
+  const id = "edit-session";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: [...base.agent.tools, "edit_file"] } }, await ticket(id, "create"));
+  await session.sandbox.writeFile("notes.txt", "alpha\r\nbeta\r\ngamma\r\n", allowTestOperation);
+  // Both edits match the file as it was, the second one across a line break the model wrote as LF.
+  await session.submit(await ticket(id, "submit"), { content: "Edit it.", requestId: "edit" }, "write");
+  await idle(session);
+  assert.equal(await session.sandbox.readFile("notes.txt", allowTestOperation), "ALPHA\r\nBETA\r\ngamma\r\n");
+  await session.submit(await ticket(id, "submit"), { content: "Edit again.", requestId: "ambiguous" }, "write");
+  await idle(session);
+  assert.equal(await session.sandbox.readFile("notes.txt", allowTestOperation), "ALPHA\r\nBETA\r\ngamma\r\n");
+  assert.ok(JSON.stringify((await session.view()).entries).includes("occurs 2 times in notes.txt"));
+});
+
 /** Real SQLite storage with faults switched on demand, as a full disk or an I/O error would cause them. */
 function faultyStorage(fault: { calls?: boolean; close?: boolean }) {
   return async (path: string): Promise<Storage> => {

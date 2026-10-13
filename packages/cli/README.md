@@ -77,6 +77,10 @@ Except for GitHub, a push token carries everything its identity can reach until 
 
 In a session's chat box you can pick any model this host's Pi offers, its reasoning level, and the access mode for each message: **Read only**, **Ask before acting** (the default) or **Auto-approve** (session owner only). Hosts running a connector older than 0.3.0 keep each session's pinned model; restart the connector with `npx pistead@latest connect` to enable the options.
 
+A model starts at the reasoning level Pi on the host gives it: the level in its `enabledModels` pattern (such as `"anthropic/*:high"`), else its entry in `modelThinkingLevels`, else `defaultThinkingLevel`, else Pi's default (medium), moved to the nearest level the model supports. The chat box shows that level when you pick the model (connector 0.5.1 or newer). The levels on offer are the ones Pi reports for the model. If the host's `models.json` redefines a model without its `thinkingLevelMap`, Pi offers only Off to High for it.
+
+Agents change files with `edit_file`, which replaces exact text in place, or with `write_file`, which writes a whole file. `edit_file` needs connector 0.5.1 or newer.
+
 A new session needs no agent: pick a host and one of its models, and the session gets every tool that host supports with no extra instructions. The access mode still decides what runs without asking. Agents remain for reusable instructions and tool sets, and for sharing them with a workspace.
 
 ## License
