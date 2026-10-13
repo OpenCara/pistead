@@ -1,5 +1,5 @@
 import type { Hono } from 'hono';
-import { toolNames } from '../../../packages/shared/src/types.js';
+import { defaultAgentName, toolNames } from '../../../packages/shared/src/types.js';
 import type { Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { agentVersion, auditStatement, modelDefinition, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
@@ -42,9 +42,10 @@ function agentInput(body: Record<string, unknown>): AgentInput {
     fail(400, 'invalid_input', 'Invalid tools.');
   }
   return {
-    name: nameInput(body.name),
-    description: text(body.description, 'description', 4000, 0),
-    instructions: text(body.instructions, 'instructions', 32000, 0),
+    // Name, description and instructions may be omitted; a blank name stores the default.
+    name: text(body.name ?? '', 'name', 200, 0).trim() || defaultAgentName,
+    description: text(body.description ?? '', 'description', 4000, 0),
+    instructions: text(body.instructions ?? '', 'instructions', 32000, 0),
     toolsJson: JSON.stringify(tools),
     modelId: identifier(body.modelId, 'modelId'),
   };

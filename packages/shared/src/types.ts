@@ -43,6 +43,8 @@ export interface AgentVersion {
   modelId: string;
   createdAt: string;
 }
+/** Stored when an agent version is saved without a name; name, description and instructions are optional. */
+export const defaultAgentName = "Untitled agent";
 export interface SessionRecord {
   id: string;
   workspaceId: string;
