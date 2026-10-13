@@ -1,7 +1,6 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useState } from "react";
 
 export type ThemePreference = "system" | "light" | "dark";
-export type ResolvedTheme = "light" | "dark";
 const KEY = "pistead.theme";
 
 function stored(): ThemePreference {
@@ -33,19 +32,4 @@ export function useTheme(): [ThemePreference, (value: ThemePreference) => void] 
     try { localStorage.setItem(KEY, value); } catch { /* Private mode keeps the in-memory choice. */ }
     setPreference(value);
   }];
-}
-
-function resolvedTheme(): ResolvedTheme {
-  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
-}
-
-function subscribeTheme(change: () => void): () => void {
-  const observer = new MutationObserver(change);
-  observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-  return () => observer.disconnect();
-}
-
-/** The theme <html data-theme> shows now; follows a changed preference and, under "system", the OS theme. */
-export function useResolvedTheme(): ResolvedTheme {
-  return useSyncExternalStore(subscribeTheme, resolvedTheme, () => "light");
 }

@@ -15,3 +15,8 @@ test("model-written markdown cannot add markup, run scripts, load images or navi
   assert.match(html, /&lt;script&gt;alert\(2\)&lt;\/script&gt;/);
   assert.match(html, /<a href="https:\/\/attacker\.example\/p\.png\?d=secret" target="_blank" rel="noopener noreferrer">pixel<\/a>/);
 });
+
+test("a linked image is that link's text, so the link keeps its own target", () => {
+  const html = render("[![CI](https://img.shields.io/ci.svg)](https://github.com/o/r/actions)");
+  assert.equal(html, '<div class="markdown"><p><a href="https://github.com/o/r/actions" target="_blank" rel="noopener noreferrer">CI</a></p></div>');
+});

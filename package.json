@@ -44,7 +44,6 @@
     "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^5.0.0",
     "esbuild": "0.28.2",
-    "mermaid": "12.1.0",
     "react-markdown": "10.1.0",
     "remark-breaks": "4.0.0",
     "remark-gfm": "4.0.1",

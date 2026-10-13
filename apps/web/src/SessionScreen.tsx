@@ -10,6 +10,7 @@ import { activeStatuses, startLiveSession, type StreamStatus } from "./live-sess
 import { Markdown } from "./markdown";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
+import { splitToolCalls } from "./transcript";
 import {
   Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, PageLoading, ScreenHeader, SegmentedControl,
   Spinner, StatusBadge, useAction, useResource, type MenuItem,
@@ -35,17 +36,6 @@ function useLiveSession(id: string) {
 }
 
 const PANEL_KEY = "pistead.sessionPanel";
-const toolCall = /^([a-z_]+)\(.*\)$/s;
-/** The line the runner writes for each tool call after an assistant message's text: the name, then JSON arguments. */
-const toolCallLine = /^([a-z_]+)\(\{.*\}\)$/;
-
-/** Splits trailing tool call lines off an assistant message, so markdown never reformats their JSON. */
-function trailingToolCalls(text: string): { prose: string; calls: string[] } {
-  const lines = text.split("\n");
-  let start = lines.length;
-  while (start > 0 && toolCallLine.test(lines[start - 1])) start--;
-  return { prose: lines.slice(0, start).join("\n"), calls: lines.slice(start) };
-}
 
 function usePanelOpen() {
   const [open, setOpen] = useState(() => {
@@ -82,10 +72,11 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
 function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
-  const call = entry.role === "assistant" ? toolCall.exec(entry.text.trim()) : null;
-  if (call || entry.role === "system" || entry.role === "toolResult") {
-    const label = call ? `Tool · ${call[1]}` : entry.role === "toolResult" ? "Tool result" : "System";
-    return <ToolDetails role={entry.role} icon={call ? "tool" : "terminal"} label={<>{label}{actor && <> · {actor}</>}</>} text={entry.text} />;
+  const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
+  const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
+  if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
+    const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{actor && <> · {actor}</>}</>} text={entry.text} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -99,10 +90,9 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
       {actor && entry.actorId !== userId && <div className="entry-actor">by {actor}</div>}
     </div>;
   }
-  const { prose, calls } = entry.role === "assistant" ? trailingToolCalls(entry.text) : { prose: entry.text, calls: [] };
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
-    {calls.length > 0 && <ToolDetails icon="tool" label={`Tool · ${toolCallLine.exec(calls[0])?.[1]}`} text={calls.join("\n")} />}
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
     {actor && <div className="entry-actor">by {actor}</div>}
   </div>;
 }
@@ -240,7 +230,6 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
-  const lastScrollTop = useRef(0);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
@@ -257,16 +246,13 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (actualMode === "ask") return conversation?.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || entry.conversationId === conversationId);
     return conversation?.mode !== "ask";
   });
+  const lastEntryId = entries.at(-1)?.id;
 
-  // Follow the transcript as it grows, including diagrams drawn after their entry, unless the reader has scrolled up.
-  useEffect(() => {
+  // Follow new entries unless the reader has scrolled up.
+  useLayoutEffect(() => {
     const element = transcript.current;
-    const column = element?.firstElementChild;
-    if (!element || !column) return;
-    const observer = new ResizeObserver(() => { if (stick.current) element.scrollTop = element.scrollHeight; });
-    observer.observe(column);
-    return () => observer.disconnect();
-  }, []);
+    if (element && stick.current) element.scrollTop = element.scrollHeight;
+  }, [lastEntryId, entries.length]);
   useLayoutEffect(() => {
     stick.current = true;
     const element = transcript.current;
@@ -303,10 +289,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   return <>
     <div className="session-transcript" ref={transcript} onScroll={event => {
       const element = event.currentTarget;
-      // Content can grow between a scroll and its event, so only scrolling up stops following; reaching the bottom resumes it.
-      if (element.scrollHeight - element.scrollTop - element.clientHeight < 80) stick.current = true;
-      else if (element.scrollTop < lastScrollTop.current) stick.current = false;
-      lastScrollTop.current = element.scrollTop;
+      stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
     }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
       <div className="chat-column">
         {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
