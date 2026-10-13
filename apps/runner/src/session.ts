@@ -27,6 +27,8 @@ type Run = {
   admissionId?: string;
   /** Worker-signed per-message choices, applied to the conversation when the run starts. */
   options?: ChatOptions;
+  /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
+  failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number };
@@ -332,15 +334,20 @@ export class RunnerSession {
     void (async () => {
       const submission = await harness.submission(submissionId, context);
       if (!submission) throw new Error("Missing durable submission");
-      await submission.wait(context);
+      const settled = await submission.wait(context);
       // Placement is not completion: serialize through the last model/tool task.
       if (generation !== this.generation || this.closing) return;
       const state = await this.metadata();
       const conversation = await harness.conversation(state.runs[key]!.conversationId as ConversationId, context);
       await conversation?.waitForIdle(context);
+      const failure: Run["failure"] = settled.status === "unanswered" && (settled.reason === "model_error" || settled.reason === "no_model")
+        ? { reason: settled.reason, ...(await conversation?.agent(context))?.model } : undefined;
       await this.exclusive(async () => {
         if (generation !== this.generation || this.closing) return;
-        await this.mutate(meta => { meta.runs[key]!.status = "settled"; });
+        await this.mutate(meta => {
+          meta.runs[key]!.status = "settled";
+          if (failure) meta.runs[key]!.failure = failure;
+        });
       });
       if (generation === this.generation && !this.closing) this.drainQueue();
     })().catch(() => { /* Recovery reconciles the durable active record; never replay effects here. */ });
@@ -519,7 +526,7 @@ export class RunnerSession {
   }
 
   private buildTools(): ToolRegistration[] {
-    const text = (value: unknown) => ({ content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
+    const text = (value: unknown) => ({ output: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
     const approvalText = (approval: ApprovalRecord) => text({ ...approval, admissionId: undefined });
     return [
       defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api) => {
@@ -723,10 +730,14 @@ export class RunnerSession {
     const state = await this.metadata();
     const entries: SessionView["entries"] = [];
     for (const snapshot of snapshots) {
+      let previous: Run | undefined;
       for (const entry of snapshot.entries) {
         const run = Object.values(state.runs).filter(candidate => (candidate.started || candidate.submissionId !== undefined || candidate.status === "admitting") && candidate.conversationId === entry.conversationId && candidate.startEntry < entry.id).sort((a, b) => b.startEntry - a.startEntry)[0];
+        if (previous?.failure && run !== previous) entries.push(this.failureView(previous, snapshot.branch.id));
+        previous = run;
         entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy));
       }
+      if (previous?.failure) entries.push(this.failureView(previous, snapshot.branch.id));
     }
     const agent = await this.root.agent(context);
     const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
@@ -755,6 +766,13 @@ export class RunnerSession {
       provider: String(failed.provider).slice(0, 128), modelId: String(failed.model).slice(0, 256), ...(status >= 100 && status <= 599 ? { status } : {}),
     } : undefined;
     return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch), ...(error ? { error } : {}) };
+  }
+
+  /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
+  private failureView(run: Run, branch: number): SessionView["entries"][number] {
+    const { provider, modelId } = run.failure!;
+    return { id: `${branch}:failure:${run.key}`, kind: "workspace.run-failure", role: "assistant", text: "", actorId: run.initiatedBy, conversationId: String(branch),
+      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}) } };
   }
 
   async restart(): Promise<void> {
