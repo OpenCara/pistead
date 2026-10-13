@@ -519,7 +519,7 @@ export class RunnerSession {
   }
 
   private buildTools(): ToolRegistration[] {
-    const text = (value: unknown) => ({ content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
+    const text = (value: unknown) => ({ output: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
     const approvalText = (approval: ApprovalRecord) => text({ ...approval, admissionId: undefined });
     return [
       defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api) => {
