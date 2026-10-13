@@ -337,6 +337,15 @@ export function RelativeTime({ value }: { value: string }) {
   return <time dateTime={value} title={Number.isNaN(date.getTime()) ? value : date.toLocaleString()}>{text}</time>;
 }
 
+/** A measured duration: "850 ms", "2.4 s", "14 s", "3 min 5 s". */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)} s`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  return seconds % 60 ? `${Math.floor(seconds / 60)} min ${seconds % 60} s` : `${seconds / 60} min`;
+}
+
 export function CopyButton({ value, label = "Copy" }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {

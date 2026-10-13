@@ -12,7 +12,7 @@ import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "./transcript";
 import {
-  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, PageLoading, ScreenHeader, SegmentedControl,
+  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
@@ -76,7 +76,10 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
-    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{actor && <> · {actor}</>}</>} text={entry.text} />;
+    // A tool call row would show the model's time, not the tool's, so only results carry a duration.
+    const took = entry.role === "toolResult" && entry.durationMs !== undefined
+      && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -90,10 +93,11 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
       {actor && entry.actorId !== userId && <div className="entry-actor">by {actor}</div>}
     </div>;
   }
+  const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
     {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
-    {actor && <div className="entry-actor">by {actor}</div>}
+    {(actor || took) && <div className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</div>}
   </div>;
 }
 

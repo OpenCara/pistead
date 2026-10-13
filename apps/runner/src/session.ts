@@ -804,7 +804,11 @@ export class RunnerSession {
     const error = failed?.role === "assistant" ? {
       provider: String(failed.provider).slice(0, 128), modelId: String(failed.model).slice(0, 256), ...(status >= 100 && status <= 599 ? { status } : {}),
     } : undefined;
-    return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch), ...(error ? { error } : {}) };
+    // Pi measures the model's response for assistant messages and each tool run for tool results.
+    const durations = messages.flatMap(message => (message.role === "assistant" || message.role === "toolResult") && message.durationMs !== undefined ? [message.durationMs] : []);
+    const durationMs = durations.length ? durations.reduce((total, value) => total + value, 0) : undefined;
+    return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch),
+      ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}) };
   }
 
   /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
