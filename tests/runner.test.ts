@@ -7,7 +7,7 @@ import { join, dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createRegistry, defineDoc, Harness } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, Harness, type Storage } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -459,4 +459,39 @@ test("a run Pi settles without an answer shows as a failed model turn instead of
   assert.deepEqual(entries.map(entry => [entry.role, entry.text]), [["user", "hello"], ["assistant", ""]]);
   assert.deepEqual(entries[1]!.error, { provider: "faux", modelId: "faux-1" });
   assert.equal(entries[1]!.actorId, "test:alice");
+});
+
+test("a session whose storage failed is reopened from its SQLite file by the next request", hostMode, async t => {
+  let failing = false;
+  // Real SQLite storage whose calls reject while `failing` is set, as a full disk or an I/O error would.
+  const openStorage = async (path: string): Promise<Storage> => {
+    const storage = await openNodeSqliteStorage(path);
+    return new Proxy(storage, { get(target, key) {
+      const value: unknown = Reflect.get(target, key, target);
+      if (typeof value !== "function" || key === "close") return value;
+      return (...args: unknown[]) => failing ? Promise.reject(new Error("disk I/O error")) : Reflect.apply(value, target, args);
+    } });
+  };
+  const { service } = await hostFixture(t, { openStorage });
+  const id = "storage-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "before" }, "write");
+  await idle(session);
+  const before = (await session.view()).entries;
+
+  failing = true;
+  await assert.rejects(session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "during" }, "write"));
+  for (let count = 0; count < 200 && !session.failed; count++) await delay(10);
+  assert.equal(session.failed, true);
+  // While storage keeps failing, each request tries to reopen the session and reports the failure.
+  await assert.rejects(service.get(id));
+  assert.equal(session.failed, true);
+
+  failing = false;
+  assert.equal(await service.get(id), session);
+  assert.equal(session.failed, false);
+  assert.deepEqual((await session.view()).entries, before);
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "after" }, "write");
+  await idle(session);
+  assert.ok((await session.view()).entries.length > before.length);
 });

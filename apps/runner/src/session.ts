@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
-import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
 import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
@@ -55,6 +55,8 @@ export type RunnerConfig = {
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
+  /** Opens a session's Pi storage; defaults to the SQLite file in its directory. */
+  openStorage?: (path: string) => Promise<Storage>;
 };
 
 export class RunnerSession {
@@ -71,6 +73,8 @@ export class RunnerSession {
   private models!: Models;
   /** Pushes (approved ones settle after decide() returns; automatic ones inline); close() aborts and awaits them. */
   private pushes = new Set<{ controller: AbortController; done: Promise<void> }>();
+  /** Set when Pi closed the Session because its storage failed; the next request reopens it (see `recover`). */
+  #failed = false;
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -111,7 +115,7 @@ export class RunnerSession {
     await this.initializeRepositories(true);
     const resolved = this.config.resolveModels ? await this.config.resolveModels(this.binding.model)
       : { models: runnerModels(this.binding.model, this.config.allowFaux) };
-    const storage = await openNodeSqliteStorage(this.sqlitePath);
+    const storage = await this.openStorage();
     let harness: Harness;
     try { harness = await Harness.open(storage, { models: resolved.models, registry: createRegistry() }, context); }
     catch (error) { await storage.close(context); throw error; }
@@ -259,9 +263,12 @@ export class RunnerSession {
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
     this.models = resolved.models;
     const models = this.models;
-    const storage = await openNodeSqliteStorage(this.sqlitePath);
+    const storage = await this.openStorage();
     try { this.harness = await Harness.open(storage, { models, registry }, context); }
     catch (error) { await storage.close(context); throw error; }
+    this.#failed = false;
+    const harness = this.harness;
+    void harness.closed.then(end => { if (end.reason === "failed" && harness === this.harness) this.#failed = true; });
     this.root = await this.harness.root(context, { agent: {
       model: this.modelRef, extensions: [extension],
       tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never)), instructions: this.agentInstructions("write"),
@@ -305,6 +312,31 @@ export class RunnerSession {
     }
     this.harness.resume();
     this.drainQueue();
+  }
+
+  private openStorage(): Promise<Storage> {
+    return (this.config.openStorage ?? openNodeSqliteStorage)(this.sqlitePath);
+  }
+
+  get failed(): boolean {
+    return this.#failed;
+  }
+
+  /**
+   * Pi closes a Session for good once a storage call fails, and every later call rejects with `SessionFailed`.
+   * Reopen it from the same SQLite file, as Pi recommends. While storage still fails this throws and the session
+   * stays failed, so the next request tries again.
+   */
+  async recover(): Promise<void> {
+    await this.exclusive(async () => {
+      if (!this.#failed) return;
+      await this.close();
+      try { await this.open(); }
+      catch (error) {
+        this.#failed = true;
+        throw error;
+      }
+    });
   }
 
   private async metadata(): Promise<Metadata> {
@@ -800,7 +832,8 @@ export class RunnerSession {
     for (const push of this.pushes) push.controller.abort();
     await Promise.allSettled([...this.pushes].map(push => push.done));
     this.generation++;
-    await this.harness.close(context);
+    // A Session that failed on a storage error has closed itself; closing again can only repeat that error.
+    await this.harness.close(context).catch((error: unknown) => { if (!this.#failed) throw error; });
   }
 
   /** Credential → push → completion. The credential stays in this frame; results carry only fixed, credential-free text. */
