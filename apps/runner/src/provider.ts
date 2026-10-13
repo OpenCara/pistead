@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
@@ -18,7 +19,9 @@ export function runnerModels(model: ModelDefinition, allowFaux: boolean) {
       faux.appendResponses([respond]);
       const latest = context.messages.findLast(message => message.role !== "system");
       if (latest?.role === "toolResult") {
-        const text = latest.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+        // An image is named by its type and digest, so tests can tell which bytes the model received.
+        const text = latest.content.map(part => part.type === "text" ? part.text
+          : `image ${part.mimeType} sha256:${createHash("sha256").update(Buffer.from(part.data, "base64")).digest("hex")}`).join("\n");
         return fauxAssistantMessage(`Deterministic test provider result:\n${text}`);
       }
       const lastUser = context.messages.findLast(message => message.role === "user");

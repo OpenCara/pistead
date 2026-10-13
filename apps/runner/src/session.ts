@@ -14,6 +14,7 @@ import { assertId, requestKey, RunnerError, stableJson, validateOperation, valid
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
 import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.js";
+import { IMAGE_ERROR, prepareImage } from "./images.js";
 import { performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
@@ -571,8 +572,16 @@ export class RunnerSession {
       defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api) => {
         const attribution = await this.toolActor(api, false); return text({ ...await this.sandbox.identity(() => this.recheckTool(attribution)), ...attribution });
       } }),
-      defineTool({ name: "read_file", description: "Read a confined worktree file.", parameters: Type.Object({ path: Type.String() }), execute: async (args, api) => {
-        const attribution = await this.toolActor(api, false); return text({ ...attribution, content: await this.sandbox.readFile(args.path, () => this.recheckTool(attribution)) });
+      defineTool({ name: "read_file", description: "Read a confined worktree file. PNG, JPEG, GIF and WebP images are returned as images, scaled to fit.", parameters: Type.Object({ path: Type.String() }), execute: async (args, api) => {
+        const attribution = await this.toolActor(api, false);
+        const file = await this.sandbox.readContent(args.path, () => this.recheckTool(attribution));
+        if ("text" in file) return text({ ...attribution, content: file.text });
+        const image = await prepareImage(file.image, file.mimeType);
+        if (!image) return { output: [], isError: true, diagnostics: [{ severity: "error" as const, code: "image", message: IMAGE_ERROR }] };
+        return { output: [
+          { type: "text" as const, text: JSON.stringify({ ...attribution, path: args.path, mimeType: image.mimeType, width: image.width, height: image.height }) },
+          { type: "image" as const, data: image.data, mimeType: image.mimeType },
+        ] };
       } }),
       defineTool({ name: "list_files", description: "List confined worktree files.", parameters: Type.Object({ path: Type.Optional(Type.String()) }), execute: async (args, api) => {
         const attribution = await this.toolActor(api, false); return text({ ...attribution, files: await this.sandbox.listFiles(args.path, () => this.recheckTool(attribution)) });
@@ -796,7 +805,8 @@ export class RunnerSession {
     const messages = entry.model ?? [];
     const text = messages.flatMap(message => {
       if (typeof message.content === "string") return [message.content];
-      return (message.content ?? []).flatMap(block => block.type === "text" ? [block.text] : block.type === "toolCall" ? [`${block.name}(${JSON.stringify(block.arguments)})`] : []);
+      // Image data stays on the host; the transcript only notes that the model saw one.
+      return (message.content ?? []).flatMap(block => block.type === "text" ? [block.text] : block.type === "toolCall" ? [`${block.name}(${JSON.stringify(block.arguments)})`] : block.type === "image" ? [`[image ${block.mimeType}]`] : []);
     }).join("\n");
     const failed = messages.find(message => message.role === "assistant" && message.stopReason === "error");
     // Provider error text can carry account or endpoint details; only the HTTP status leaves the host.
