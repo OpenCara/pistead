@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { toolNames, type AgentVersion, type ModelDefinition, type ToolName, type UserProfile, type Workspace } from "../../../../packages/shared/src/types";
+import { defaultAgentName, toolNames, type AgentVersion, type ModelDefinition, type ToolName, type UserProfile, type Workspace } from "../../../../packages/shared/src/types";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { useConnections } from "../hosts";
@@ -176,13 +176,13 @@ function AgentEditor({ agent, readOnly, models, hostNames, connectionsError, not
   return <form className="stack-lg" onSubmit={submit}>
     <Section title="Details">
       <CardBody>
-        <Field label="Name"><input className="input" required maxLength={120} disabled={readOnly} value={name} onChange={event => setName(event.target.value)} placeholder="Repository naturalist" /></Field>
+        <Field label="Name"><input className="input" maxLength={120} disabled={readOnly} value={name} onChange={event => setName(event.target.value)} placeholder={defaultAgentName} /></Field>
         <Field label="Description"><input className="input" maxLength={500} disabled={readOnly} value={description} onChange={event => setDescription(event.target.value)} placeholder="A short note on what this agent is for" /></Field>
       </CardBody>
     </Section>
     <Section title="Instructions">
       <CardBody>
-        <textarea className="textarea" required rows={7} disabled={readOnly} aria-label="Instructions" value={instructions} onChange={event => setInstructions(event.target.value)} placeholder="Describe the agent's purpose, approach and boundaries" />
+        <textarea className="textarea" rows={7} disabled={readOnly} aria-label="Instructions" value={instructions} onChange={event => setInstructions(event.target.value)} placeholder="Describe the agent's purpose, approach and boundaries" />
       </CardBody>
     </Section>
     <Section title="Model" info="Models advertised by hosts you can use in this workspace: your own, or ones a teammate has shared">
@@ -199,7 +199,7 @@ function AgentEditor({ agent, readOnly, models, hostNames, connectionsError, not
     {!readOnly && <div className="inline">
       <Feedback error={action.error} notice={notice} />
       <span className="spacer" />
-      <Button variant="default" type="submit" disabled={action.busy || !models.some(item => item.id === modelId) || !name.trim() || !instructions.trim()}>{action.busy ? "Saving..." : agent ? "Save revision" : "Create agent"}</Button>
+      <Button variant="default" type="submit" disabled={action.busy || !models.some(item => item.id === modelId)}>{action.busy ? "Saving..." : agent ? "Save revision" : "Create agent"}</Button>
     </div>}
   </form>;
 }

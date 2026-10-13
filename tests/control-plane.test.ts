@@ -8,6 +8,7 @@ import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { userIdentifier } from '../apps/server/src/http.js';
 import { sessionAccess } from '../apps/server/src/db.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
+import { defaultAgentName } from '../packages/shared/src/types.js';
 import { testDatabase } from './helpers/control-plane.js';
 
 const origin = 'http://localhost:8787';
@@ -235,6 +236,27 @@ test('published definitions are immutable and do not grant authors access to ano
   assert.equal((await alice.request('GET', '/api/sessions/bob-session')).status, 404);
   assert.equal((await bob.request('POST', '/api/sessions/bob-session/backup', {})).status, 503);
   assert.equal((await bob.request('GET', '/api/sessions/bob-session/view')).status, 503);
+});
+
+test('agent name, description and instructions are optional; a blank name stores the default', async t => {
+  const f = await fixture(t);
+  const alice = await f.client('alice');
+  const workspace = (await (await alice.request('POST', '/api/workspaces', { name: 'team' })).json() as { workspace: { id: string } }).workspace;
+  const model = (await (await alice.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'fixture', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
+  const save = async (path: string, fields: object) => {
+    const response = await alice.request('POST', path, { ...fields, tools: ['identity'], modelId: model.id });
+    assert.equal(response.status, 201);
+    return (await response.json() as { agent: { agentId: string; name: string; description: string; instructions: string } }).agent;
+  };
+  const created = await save('/api/agents', {});
+  assert.deepEqual([created.name, created.description, created.instructions], [defaultAgentName, '', '']);
+  for (const name of [null, '   ']) assert.equal((await save(`/api/agents/${created.agentId}/versions`, { name })).name, defaultAgentName);
+  assert.equal((await save(`/api/agents/${created.agentId}/versions`, { name: '  Reviewer  ' })).name, 'Reviewer');
+  for (const invalid of [{ name: 1 }, { name: 'x'.repeat(201) }, { instructions: ['x'] }]) {
+    assert.equal((await alice.request('POST', '/api/agents', { ...invalid, tools: ['identity'], modelId: model.id })).status, 400);
+  }
+  // Workspace names still go through nameInput and must not be blank.
+  assert.equal((await alice.request('POST', '/api/workspaces', { name: '   ' })).status, 400);
 });
 
 test('AES-GCM vault binds ciphertext to the account and rejects tampering', async () => {
