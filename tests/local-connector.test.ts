@@ -22,6 +22,9 @@ const origin = 'https://control.fixture.invalid';
 const credentials: ConnectorCredentials = {
   connectorId: 'fixture-connector', token: 'fixture_only_connector_token_0123456789abcdef', controlPlaneUrl: origin,
 };
+const replacement: ConnectorCredentials = {
+  connectorId: 'replacement-connector', token: 'replacement_connector_token_0123456789abcdef', controlPlaneUrl: origin,
+};
 const connectionToken = 'fixture_only_connection_token_0123456789abcdef';
 const providerSecret = 'fixture-provider-secret-never-on-wire';
 const verifierSecret = 'fixture-local-verifier-not-a-worker-secret';
@@ -105,7 +108,7 @@ test('connector token state is mode0600 in a private directory and cannot be ove
   assert.deepEqual(await readConnectorState(stateDir, origin), credentials);
 });
 
-test('connector state refuses permissive files/directories, symlinks, hard links and origin mismatch', async t => {
+test('connector state refuses permissive files/directories, symlinks, hard links and origin mismatch; replacing never follows a link', async t => {
   const root = await directory(t);
   const stateDir = join(root, 'state');
   await writeConnectorState(stateDir, credentials);
@@ -130,6 +133,10 @@ test('connector state refuses permissive files/directories, symlinks, hard links
   await assert.rejects(readConnectorState(stateDir, origin), /Cannot safely open connector state/);
   await assert.rejects(writeConnectorState(stateDir, credentials), { code: 'EEXIST' });
   assert.deepEqual(JSON.parse(await readFile(target, 'utf8')), { version: 1, credentials });
+  // A forced re-pairing swaps the link itself for a private file and never writes through it.
+  await writeConnectorState(stateDir, replacement, false, true);
+  assert.deepEqual(JSON.parse(await readFile(target, 'utf8')), { version: 1, credentials });
+  assert.deepEqual(await readConnectorState(stateDir, origin), replacement);
 });
 
 test('control-plane origins are fixed HTTPS origins with only explicit loopback HTTP opt-in', () => {
@@ -535,6 +542,52 @@ test('malformed welcome never creates a runtime or advertises readiness', { time
   assert.equal(fixture.runtimes.length, 0);
   assert.equal(fixture.allCalls.length, 0);
   assert.equal(fixture.statuses.includes('connected'), false);
+});
+
+test('a forced pairing claims the new code first, then replaces the saved token the connector uses', { timeout: 10000 }, async t => {
+  const dataDir = await directory(t);
+  await writeConnectorState(dataDir, credentials);
+  let claim = (): Response => new Response(null, { status: 403 });
+  let claims = 0;
+  const sockets = mailbox<FakeSocket>();
+  const pairedConnector = (replacePairing: boolean) => {
+    const connector = createConnector({
+      dataDir, server: origin, pairing: { id: 'pairing', code: 'fixture_pairing_code' }, replacePairing,
+      localModels: localModels(), capabilities: publicCapabilities,
+      acquireLease: () => Promise.resolve(() => Promise.resolve()),
+      createSocket: (url, protocols) => { const socket = new FakeSocket(url, protocols); sockets.push(socket); return socket; },
+      runtimeFactory: () => Promise.resolve({ fetch: () => Response.json({ ok: true }), close: () => Promise.resolve() }),
+      fetch: (input, init) => {
+        const request = new Request(input, init);
+        if (request.url === `${origin}/api/connectors/pairings/pairing/claim`) { claims++; return Promise.resolve(claim()); }
+        if (request.url === `${origin}/api/connectors/self/manifest`) return Promise.resolve(Response.json({ ok: true }));
+        assert.fail(`Unexpected fixture Worker request: ${request.url}`);
+      },
+    });
+    t.after(() => connector.stop());
+    return connector;
+  };
+
+  // Without --force a paired machine refuses before the code reaches the server.
+  await assert.rejects(pairedConnector(false).start(), /already paired/);
+  assert.equal(claims, 0);
+
+  // A rejected code leaves the saved pairing in place.
+  await assert.rejects(pairedConnector(true).start(), /Pairing rejected/);
+  assert.equal(claims, 1);
+  assert.deepEqual(await readConnectorState(dataDir, origin), credentials);
+
+  // The saved pairing may even belong to another server: replacing never reads it.
+  await writeConnectorState(dataDir, { ...credentials, controlPlaneUrl: 'https://old.fixture.invalid' }, false, true);
+  claim = () => Response.json({ credentials: replacement }, { status: 201 });
+  const starting = pairedConnector(true).start();
+  const socket = await sockets.next();
+  assert.deepEqual(socket.protocols, ['opencara-pi-v1', `bearer.${replacement.token}`]);
+  socket.open();
+  socket.receive({ type: 'welcome', connectorId: replacement.connectorId, connectionToken });
+  await starting;
+  assert.equal(claims, 2);
+  assert.deepEqual(await readConnectorState(dataDir, origin), replacement);
 });
 
 test('small concurrent requests fill the pending limit and complete FIFO on the same socket', { timeout: 15000 }, async t => {

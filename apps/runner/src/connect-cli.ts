@@ -24,6 +24,8 @@ New sessions are workspace-viewable by default, without granting agent control.
 Options:
   --server ORIGIN          HTTPS control-plane origin (required for first pairing)
   --pairing-id ID          One-use pairing id from the web app
+  --force                  With --pairing-id, replace this machine's saved pairing; the
+                           old host stays in Pistead, offline, until you remove it there
   --state-dir PATH         Private connector state (default ~/.local/share/opencara/connector)
   --pi-agent-dir PATH      Pi config/auth directory (default: Pi's own getAgentDir())
   --model PROVIDER/MODEL   Advertise this configured local model (repeatable); without it,
@@ -152,7 +154,7 @@ async function confirmUnsandboxed(): Promise<void> {
 
 export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   const { values } = parseArgs({ args, strict: true, allowPositionals: false, options: {
-    help: { type: "boolean" }, server: { type: "string" }, "pairing-id": { type: "string" },
+    help: { type: "boolean" }, server: { type: "string" }, "pairing-id": { type: "string" }, force: { type: "boolean" },
     "state-dir": { type: "string" }, "pi-agent-dir": { type: "string" }, model: { type: "string", multiple: true },
     resources: { type: "string" }, "allow-insecure-loopback": { type: "boolean" },
     "allow-faux": { type: "boolean" }, "allow-test-shell": { type: "boolean" }, "unsafe-no-sandbox": { type: "boolean" },
@@ -174,6 +176,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
       : "--pairing-id must be the pairing ID shown in Pistead, e.g. 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed.");
   }
   if (pairingId && !values.server) throw new ConnectorSetupError("First pairing requires --server, e.g. --server https://pistead.com.");
+  if (values.force && !pairingId) throw new ConnectorSetupError("--force replaces this machine's saved pairing, so it needs a new one: create a pairing code in Pistead and run its command with --force added.");
   if (values.server) {
     try { controlPlaneOrigin(values.server, values["allow-insecure-loopback"]); }
     catch { throw new ConnectorSetupError("--server must be an HTTPS origin such as https://pistead.com."); }
@@ -207,8 +210,14 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     : "No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
   const resources = values.resources ? await resourceConfig(values.resources) : undefined;
   const dataDir = values["state-dir"] ?? join(homedir(), ".local", "share", "opencara", "connector");
-  if (!values["pairing-id"] && !await readConnectorState(dataDir, undefined, values["allow-insecure-loopback"])) {
+  // Checked before any prompt, so no pairing code is typed for nothing; the connector checks again under its lease.
+  // --force never reads the saved pairing: it may be revoked, unreadable or bound to another server.
+  const paired = !values.force && await readConnectorState(dataDir, undefined, values["allow-insecure-loopback"]) !== undefined;
+  if (!pairingId && !paired) {
     throw new ConnectorSetupError("This machine is not paired yet. In Pistead, open Connections, create a pairing code, then run:\n  npx pistead@latest connect --server https://pistead.com --pairing-id <PAIRING_ID>");
+  }
+  if (pairingId && paired) {
+    throw new ConnectorSetupError("This machine is already paired. Add --force to replace that pairing with this new one, run without --pairing-id to keep using it, or use a separate --state-dir for a second connection.");
   }
   if (unsandboxed) await confirmUnsandboxed();
   const code = pairingId ? await promptPairingCode() : "";
@@ -216,7 +225,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   const pairing = pairingId ? { id: pairingId, code } : undefined;
   const connector = createConnector({
     dataDir,
-    server: values.server, pairing, localModels, resources, unsandboxed,
+    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed,
     allowInsecureLoopback: values["allow-insecure-loopback"], allowFaux: values["allow-faux"], allowTestShell: values["allow-test-shell"],
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
