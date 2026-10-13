@@ -10,6 +10,7 @@ import { repositoryPinIdentity } from "./protocol.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import type { PushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
+import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 
 export const TIMEOUT_MS = 30_000;
 /** Push rewrites and packs move whole repositories; only push kinds get this deadline. */
@@ -19,6 +20,8 @@ const OID = /^[0-9a-f]{40}$/;
 export const MAX_FILE_BYTES = 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
+/** A whole image file as base64 in one JSON object, with room for its key. */
+const MAX_CONTENT_OUTPUT_BYTES = Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 64;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const sessionQueues = new Map<string, Promise<void>>();
 
@@ -71,7 +74,7 @@ type Request =
   | { kind: "initialize" }
   | { kind: "repository-ready" }
   | { kind: "repository-materialize"; archives: string[] }
-  | { kind: "read" | "list"; path: string }
+  | { kind: "read" | "read-content" | "list"; path: string }
   | { kind: "write"; path: string; content: string }
   | { kind: "status" | "snapshot" }
   | { kind: "commit"; message: string }
@@ -120,6 +123,15 @@ def limits(kind):
 HOME = os.environ['HOME']
 WORK = os.environ['SANDBOX_WORKTREE']
 MAX_FILE = 1024 * 1024
+MAX_IMAGE = 16 * 1024 * 1024
+# Mirrors MAX_IMAGE_BYTES and IMAGE_SIGNATURES in images.ts, which re-checks the signature of every image returned.
+IMAGE_SIGNATURES = (
+    ((0, b'\x89PNG\r\n\x1a\n'),),
+    ((0, b'\xff\xd8\xff'),),
+    ((0, b'GIF87a'),),
+    ((0, b'GIF89a'),),
+    ((0, b'RIFF'), (8, b'WEBP')),
+)
 MAX_SNAPSHOT = 32 * 1024 * 1024
 MAX_ENTRIES = 10000
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -913,12 +925,22 @@ def main():
         if kind == 'write':
             write_at(root, parts, request['content'])
             result = None
-        elif kind == 'read':
+        elif kind == 'read' or kind == 'read-content':
             if not parts:
                 raise ValueError('a file path is required')
             parent = walk(root, parts[:-1])
             try:
-                result = read_at(parent, parts[-1], MAX_FILE)[0].decode('utf-8')
+                if kind == 'read':
+                    result = read_at(parent, parts[-1], MAX_FILE)[0].decode('utf-8')
+                else:
+                    data = read_at(parent, parts[-1], MAX_IMAGE)[0]
+                    if any(all(data[offset:offset + len(part)] == part for offset, part in signature)
+                           for signature in IMAGE_SIGNATURES):
+                        result = {'image': base64.b64encode(data).decode('ascii')}
+                    elif len(data) > MAX_FILE:
+                        raise ValueError('file exceeds size limit')
+                    else:
+                        result = {'text': data.decode('utf-8')}
             finally:
                 os.close(parent)
         elif kind == 'list':
@@ -1247,6 +1269,16 @@ export class Sandbox {
     return JSON.parse(output) as string;
   }
 
+  /** Like `readFile`, but an image (by signature, up to `MAX_IMAGE_BYTES`) comes back as its bytes. */
+  async readContent(path: string, authorize: SandboxAuthorize): Promise<FileContent> {
+    const output = JSON.parse(await this.#operation({ kind: "read-content", path: text(path, "path", 1024) }, true, authorize)) as { text: string } | { image: string };
+    if ("text" in output) return { text: output.text };
+    const image = Buffer.from(output.image, "base64");
+    const mimeType = imageType(image);
+    if (!mimeType) throw new Error("Invalid sandbox image response");
+    return { image, mimeType };
+  }
+
   async writeFile(path: string, content: string, authorize: SandboxAuthorize): Promise<void> {
     if (typeof content !== "string" || Buffer.byteLength(content) > MAX_FILE_BYTES) throw new Error("File exceeds size limit");
     await this.#operation({ kind: "write", path: text(path, "path", 1024), content }, false, authorize);
@@ -1415,7 +1447,7 @@ export class Sandbox {
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
-    const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
+    const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
     const launch = requireResources
       ? resourceLaunch(this.#resources!, this.#sessionKey, args)
       : { command: "/usr/bin/bwrap", args };

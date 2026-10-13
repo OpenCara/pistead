@@ -11,6 +11,7 @@ import {
   MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, drained, ownerGitConfig, pinOwnerConfig, repositoryPins, sessionEnvironment, text,
   type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
 } from "./sandbox.js";
+import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 
 const MAX_ENTRIES = 10_000;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
@@ -111,6 +112,22 @@ export class HostWorkspace {
       if (!parts.length) throw hostError("a file path is required");
       const parent = await directoryAt(this.worktree, parts.slice(0, -1));
       return new TextDecoder().decode((await readAt(parent, parts.at(-1)!, MAX_FILE_BYTES)).data);
+    });
+  }
+
+  /** Like `readFile`, but an image (by signature, up to `MAX_IMAGE_BYTES`) comes back as its bytes. */
+  async readContent(path: string, authorize: SandboxAuthorize): Promise<FileContent> {
+    const value = text(path, "path", 1024);
+    return this.#operation(authorize, async () => {
+      await this.#requireCache();
+      const parts = await this.#parts(value, false);
+      if (!parts.length) throw hostError("a file path is required");
+      const parent = await directoryAt(this.worktree, parts.slice(0, -1));
+      const { data } = await readAt(parent, parts.at(-1)!, MAX_IMAGE_BYTES);
+      const mimeType = imageType(data);
+      if (mimeType) return { image: data, mimeType };
+      if (data.length > MAX_FILE_BYTES) throw hostError("file exceeds size limit");
+      return { text: new TextDecoder().decode(data) };
     });
   }
 
