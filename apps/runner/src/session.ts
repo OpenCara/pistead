@@ -14,7 +14,7 @@ import { assertId, requestKey, RunnerError, stableJson, validateOperation, valid
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
 import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.js";
-import { IMAGE_ERROR, prepareImage } from "./images.js";
+import { prepareImage } from "./images.js";
 import { performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
@@ -576,8 +576,9 @@ export class RunnerSession {
         const attribution = await this.toolActor(api, false);
         const file = await this.sandbox.readContent(args.path, () => this.recheckTool(attribution));
         if ("text" in file) return text({ ...attribution, content: file.text });
-        const image = await prepareImage(file.image, file.mimeType);
-        if (!image) return { output: [], isError: true, diagnostics: [{ severity: "error" as const, code: "image", message: IMAGE_ERROR }] };
+        const prepared = await prepareImage(file.image, file.mimeType);
+        if ("error" in prepared) return { output: [], isError: true, diagnostics: [{ severity: "error" as const, code: "image", message: prepared.error }] };
+        const { image } = prepared;
         return { output: [
           { type: "text" as const, text: JSON.stringify({ ...attribution, path: args.path, mimeType: image.mimeType, width: image.width, height: image.height }) },
           { type: "image" as const, data: image.data, mimeType: image.mimeType },

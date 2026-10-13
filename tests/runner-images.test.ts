@@ -52,6 +52,11 @@ function png(width: number, height: number): Buffer {
   for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) rows.set([x % 256, y % 256, (x + y) % 256], y * (width * 3 + 1) + 1 + x * 3);
   return Buffer.concat([PNG_SIGNATURE, header(width, height), chunk("IDAT", deflateSync(rows)), chunk("IEND", Buffer.alloc(0))]);
 }
+/** A GIF of `frames` frames on a 1×1 screen, each the same white pixel. */
+function gif(frames: number): Buffer {
+  const frame = Buffer.from([0x21, 0xf9, 0x04, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00]);
+  return Buffer.concat([Buffer.from("GIF89a"), Buffer.from([1, 0, 1, 0, 0x80, 0, 0, 0xff, 0xff, 0xff, 0, 0, 0]), ...Array.from({ length: frames }, () => frame), Buffer.from([0x3b])]);
+}
 
 async function service(t: TestContext, unsandboxed: boolean): Promise<RunnerSession> {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "runner-images-")));
@@ -85,6 +90,7 @@ async function readsImagesAsTheModelSeesThem(t: TestContext, unsandboxed: boolea
   await writeFile(join(worktree, "wide.png"), png(2400, 30));
   await writeFile(join(worktree, "notes.png"), text);
   await writeFile(join(worktree, "broken.png"), Buffer.concat([PNG_SIGNATURE, header(3, 2)]));
+  await writeFile(join(worktree, "moving.gif"), gif(2));
 
   // Recognised by its signature despite the name, and passed through unchanged: the model gets these exact bytes.
   const pixels = await read(session, "pixels.dat");
@@ -108,6 +114,10 @@ async function readsImagesAsTheModelSeesThem(t: TestContext, unsandboxed: boolea
   assert.match(broken.transcript, /The image cannot be decoded or fitted to the model's image limits/);
   assert.equal(broken.model.some(line => line.startsWith("image ")), false);
   assert.equal(broken.transcript.includes("[image"), false);
+
+  // An animated GIF reaches the model as a still image of its first frame.
+  const moving = await read(session, "moving.gif");
+  assert.deepEqual(JSON.parse(moving.model[0]!), { initiatedBy: "test:alice", actingAs: "test:alice", mode: "write", path: "moving.gif", mimeType: "image/png", width: 1, height: 1 });
 }
 
 test("host read_file gives the model images by signature, prepared to fit, and keeps other files text", hostMode, t => readsImagesAsTheModelSeesThem(t, true));
