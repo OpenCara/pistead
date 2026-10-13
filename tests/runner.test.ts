@@ -461,25 +461,33 @@ test("a run Pi settles without an answer shows as a failed model turn instead of
   assert.equal(entries[1]!.actorId, "test:alice");
 });
 
-test("a session whose storage failed is reopened from its SQLite file by the next request", hostMode, async t => {
-  let failing = false;
-  // Real SQLite storage whose calls reject while `failing` is set, as a full disk or an I/O error would.
-  const openStorage = async (path: string): Promise<Storage> => {
+/** Real SQLite storage with faults switched on demand, as a full disk or an I/O error would cause them. */
+function faultyStorage(fault: { calls?: boolean; close?: boolean }) {
+  return async (path: string): Promise<Storage> => {
     const storage = await openNodeSqliteStorage(path);
     return new Proxy(storage, { get(target, key) {
       const value: unknown = Reflect.get(target, key, target);
-      if (typeof value !== "function" || key === "close") return value;
-      return (...args: unknown[]) => failing ? Promise.reject(new Error("disk I/O error")) : Reflect.apply(value, target, args);
+      if (typeof value !== "function") return value;
+      // Closing always releases the real database first, so no connection outlives a test.
+      if (key === "close") return async (...args: unknown[]) => {
+        await Reflect.apply(value, target, args);
+        if (fault.close) throw new Error("disk I/O error");
+      };
+      return (...args: unknown[]) => fault.calls ? Promise.reject(new Error("disk I/O error")) : Reflect.apply(value, target, args);
     } });
   };
-  const { service } = await hostFixture(t, { openStorage });
+}
+
+test("a session whose storage failed is reopened from its SQLite file by the next request", hostMode, async t => {
+  const fault = { calls: false };
+  const { service } = await hostFixture(t, { openStorage: faultyStorage(fault) });
   const id = "storage-session";
   const session = await service.provision(binding(id), await ticket(id, "create"));
   await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "before" }, "write");
   await idle(session);
   const before = (await session.view()).entries;
 
-  failing = true;
+  fault.calls = true;
   await assert.rejects(session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "during" }, "write"));
   for (let count = 0; count < 200 && !session.failed; count++) await delay(10);
   assert.equal(session.failed, true);
@@ -487,11 +495,27 @@ test("a session whose storage failed is reopened from its SQLite file by the nex
   await assert.rejects(service.get(id));
   assert.equal(session.failed, true);
 
-  failing = false;
-  assert.equal(await service.get(id), session);
+  fault.calls = false;
+  // Requests arriving together share one reopen and all get the fully reopened session.
+  assert.deepEqual(await Promise.all([service.get(id), service.get(id)]), [session, session]);
   assert.equal(session.failed, false);
   assert.deepEqual((await session.view()).entries, before);
   await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "after" }, "write");
   await idle(session);
   assert.ok((await session.view()).entries.length > before.length);
+});
+
+test("a backup fails instead of copying a database that did not close cleanly", hostMode, async t => {
+  const fault = { close: false };
+  const { service } = await hostFixture(t, { openStorage: faultyStorage(fault) });
+  const id = "backup-close-session";
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_IDENTITY", requestId: "before" }, "write");
+  await idle(session);
+
+  fault.close = true;
+  await assert.rejects(session.backup(await ticket(id, "backup")), /disk I\/O error/);
+  fault.close = false;
+  assert.equal(await service.get(id), session);
+  assert.ok((await session.view()).entries.length > 0);
 });

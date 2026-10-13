@@ -75,6 +75,8 @@ export class RunnerSession {
   private pushes = new Set<{ controller: AbortController; done: Promise<void> }>();
   /** Set when Pi closed the Session because its storage failed; the next request reopens it (see `recover`). */
   #failed = false;
+  /** The reopen in progress, which every request waits for instead of reaching a half-open session. */
+  #recovery: Promise<void> | undefined;
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -318,25 +320,30 @@ export class RunnerSession {
     return (this.config.openStorage ?? openNodeSqliteStorage)(this.sqlitePath);
   }
 
+  /** Pi closed the Session on a storage failure, or it is being reopened: call `recover()` before using it. */
   get failed(): boolean {
-    return this.#failed;
+    return this.#failed || this.#recovery !== undefined;
   }
 
   /**
    * Pi closes a Session for good once a storage call fails, and every later call rejects with `SessionFailed`.
-   * Reopen it from the same SQLite file, as Pi recommends. While storage still fails this throws and the session
-   * stays failed, so the next request tries again.
+   * Reopen it from the same SQLite file, as Pi recommends. Concurrent callers share one attempt; while storage still
+   * fails it throws and the session stays failed, so the next request tries again.
    */
-  async recover(): Promise<void> {
-    await this.exclusive(async () => {
+  recover(): Promise<void> {
+    this.#recovery ??= this.exclusive(async () => {
       if (!this.#failed) return;
-      await this.close();
+      // Pushes need only the sandbox and the control plane, so they finish and report on their own; aborting them
+      // would only make their outcome unknown. Their result cannot be recorded on the failed Session either way, and
+      // reopening marks their approvals interrupted.
+      await this.close({ abortPushes: false });
       try { await this.open(); }
       catch (error) {
         this.#failed = true;
         throw error;
       }
-    });
+    }).finally(() => { this.#recovery = undefined; });
+    return this.#recovery;
   }
 
   private async metadata(): Promise<Metadata> {
@@ -826,14 +833,18 @@ export class RunnerSession {
     });
   }
 
-  async close(): Promise<void> {
+  async close({ abortPushes = true }: { abortPushes?: boolean } = {}): Promise<void> {
     this.closing = true;
-    // Aborted pushes still settle their approval (interrupted) and report completion before the harness closes.
-    for (const push of this.pushes) push.controller.abort();
-    await Promise.allSettled([...this.pushes].map(push => push.done));
+    if (abortPushes) {
+      // Aborted pushes still settle their approval (interrupted) and report completion before the harness closes.
+      for (const push of this.pushes) push.controller.abort();
+      await Promise.allSettled([...this.pushes].map(push => push.done));
+    }
     this.generation++;
-    // A Session that failed on a storage error has closed itself; closing again can only repeat that error.
-    await this.harness.close(context).catch((error: unknown) => { if (!this.#failed) throw error; });
+    // A Session that already failed on a storage error has closed itself, and closing again only repeats that error.
+    // Read the flag first: a close that fails now also marks the session failed, and its error must still surface.
+    const failed = this.#failed;
+    await this.harness.close(context).catch((error: unknown) => { if (!failed) throw error; });
   }
 
   /** Credential → push → completion. The credential stays in this frame; results carry only fixed, credential-free text. */
