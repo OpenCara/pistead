@@ -14,6 +14,7 @@ import { requireConnectorSession } from './connectors.js';
 import { presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
+import { chatAgentVersion, requireModel } from './catalog.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host advertises; auto-approve is the
@@ -146,39 +147,49 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const input = await jsonObject(c);
     if (['ownerId', 'permissions', 'githubId', 'repositories', 'repositories_json', 'pins'].some(key => key in input)) fail(400, 'server_owned_identity', 'Session identity, repository pins, and permissions are assigned by the server.');
     const workspaceId = identifier(input.workspaceId, 'workspaceId');
-    const versionId = identifier(input.agentVersionId, 'agentVersionId');
+    // A session runs a chosen agent version, or starts from a model with a chat agent of its own.
+    if ((input.agentVersionId === undefined) === (input.modelId === undefined)) fail(400, 'invalid_input', 'Choose either an agent version or a model.');
     const title = text(input.title ?? 'Untitled session', 'title', 200);
     const visibility = sessionVisibility(input.visibility === undefined ? 'workspace' : input.visibility);
     const ownerId = c.get('auth').userId;
     await requireMember(c.env, workspaceId, ownerId);
-    const agent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ? AND (author_id = ? OR workspace_id = ?)')
-      .bind(versionId, ownerId, workspaceId).first();
-    if (!agent || (agent.workspace_id !== null && agent.workspace_id !== workspaceId)) fail(404, 'not_found', 'Agent version not found in this workspace.');
-    const model = await c.env.DB.query<ModelRow>('SELECT * FROM models WHERE id = ? AND workspace_id = ?').bind(agent.model_id, workspaceId).first();
-    if (!model) fail(400, 'model_workspace_mismatch', 'The agent model must belong to the session workspace.');
+    let agent: AgentRow | null = null;
+    let model: ModelRow | null;
+    if (input.agentVersionId !== undefined) {
+      agent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ? AND (author_id = ? OR workspace_id = ?)')
+        .bind(identifier(input.agentVersionId, 'agentVersionId'), ownerId, workspaceId).first();
+      if (!agent || (agent.workspace_id !== null && agent.workspace_id !== workspaceId)) fail(404, 'not_found', 'Agent version not found in this workspace.');
+      model = await c.env.DB.query<ModelRow>('SELECT * FROM models WHERE id = ? AND workspace_id = ?').bind(agent.model_id, workspaceId).first();
+      if (!model) fail(400, 'model_workspace_mismatch', 'The agent model must belong to the session workspace.');
+    } else {
+      // The same live check as choosing an agent's model: the owner's own host here, or a host shared here.
+      model = await requireModel(c.env, identifier(input.modelId, 'modelId'), ownerId);
+      if (model.workspace_id !== workspaceId) fail(404, 'not_found', 'Model not found.');
+    }
     if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are disabled.');
     const syntheticLegacy = model.provider === 'faux' && await legacyRepositoryFixture(c.env, ownerId);
     if (!model.connector_id && !syntheticLegacy) fail(400, 'connector_required', 'New sessions require a connected model.');
     if (model.connector_id && model.connector_owner_id !== ownerId && input.trustedConnectorId !== model.connector_id) {
       fail(400, 'connector_trust_required', 'Explicitly acknowledge that this host can access this session before continuing.');
     }
-    const row: SessionRow = { id: id(), workspace_id: workspaceId, owner_id: ownerId, agent_version_id: versionId,
-      title, visibility, policy_version: 1, status: 'provisioning', created_at: now(),
-      connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
-    if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
+    const session = { id: id(), workspace_id: workspaceId, owner_id: ownerId, title, visibility, policy_version: 1, status: 'provisioning' as const,
+      created_at: now(), connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
+    if (agent && session.connector_id) await requireConnectorSession(c.env, session.connector_id, { ...session, agent_version_id: agent.id });
     // Older connectors only understand GitHub pins; refuse before contacting any provider.
-    const host = row.connector_id
-      ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(row.connector_id).first()
+    const host = session.connector_id
+      ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(session.connector_id).first()
       : null;
     const capabilities = JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities;
-    const gitProviders = !row.connector_id || capabilities.gitProviders === true;
+    const gitProviders = !session.connector_id || capabilities.gitProviders === true;
     // Older connectors cannot carry approved pushes; refuse agents that would offer git_push.
-    const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
-    if (gitPush && capabilities.gitPush !== true) {
+    if (agent && session.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') && capabilities.gitPush !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use git_push.');
     }
     const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
-    row.repositories_json = JSON.stringify(resolved.repositories);
+    // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind.
+    agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities.gitPush === true);
+    const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: JSON.stringify(resolved.repositories) };
+    const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const providerPins = resolved.repositories.some(repository => 'provider' in repository) ? 1 : 0;
     await requireMember(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
@@ -220,7 +231,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
         row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
         testMode(c.env) ? 1 : 0, providerPins, gitPush).first();
     if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
-    await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: versionId }).run();
+    await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: agent.id }).run();
     try {
       const binding = await bindingForSession(c, row);
       const response = await runnerRequest(c, row, 'create', '', binding);

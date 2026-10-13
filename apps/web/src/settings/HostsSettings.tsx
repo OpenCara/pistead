@@ -141,7 +141,7 @@ function PairHostSheet({ onClose, refresh }: { onClose: () => void; refresh: () 
         <span role="status">Code ready for {workspace?.name}. Expires <Timestamp value={pairing.expiresAt} /></span>
         <Field label="Run this on your host"><CopyField value={`npx pistead@latest connect --server ${window.location.origin} --pairing-id ${pairing.id}`} label="Copy command" /></Field>
         <Field label="Paste at the hidden prompt, not on the command line"><CopyField value={pairing.code} label="Copy code" /></Field>
-        <span className="small muted">Single-use secret: don't share it. It is held only in this page's memory. Hiding it doesn't revoke it; an unused code stays tied to {workspace?.name} until it expires. Once the host is online, <a href={href({ name: "settings", section: "agents" })}>create a private agent</a> with one of its models.</span>
+        <span className="small muted">Single-use secret: don't share it. It is held only in this page's memory. Hiding it doesn't revoke it; an unused code stays tied to {workspace?.name} until it expires.{workspace && <> Once the host is online, <a href={href({ name: "new", workspaceId: workspace.id })}>start a session</a> with one of its models.</>}</span>
       </section>}
       <Collapsible plain title="Host requirements">
         <span className="small">Linux or WSL2 (native Windows is unsupported) with Node.js 24, Pi configured there with its providers and models, and bubblewrap, Python 3, Git and flock installed.</span>
