@@ -5,7 +5,7 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, PermissionNeed, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -27,6 +27,8 @@ type Run = {
   sequence?: number;
   started?: boolean;
   admissionId?: string;
+  /** When the runner accepted the message (epoch ms); its Worker write admission lasts an hour from about then. */
+  submittedAt?: number;
   /** Worker-signed per-message choices, applied to the conversation when the run starts. */
   options?: ChatOptions;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
@@ -40,8 +42,9 @@ const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", vers
 /** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files", "git_status"];
 /**
- * How long a tool call waits on the owner's permission. Deciding needs the message's write admission, which lasts an hour
- * from sending, so an older card can no longer be decided: the call then fails instead of holding the session.
+ * How long after a message is sent its tool calls can wait on the owner's permission. Deciding needs the message's write
+ * admission, which lasts an hour from sending, so a card older than that can't be decided: the call fails instead of
+ * holding the session.
  */
 const PERMISSION_WAIT_MS = 60 * 60 * 1000;
 /** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
@@ -549,7 +552,7 @@ export class RunnerSession {
         conversation = head ? await this.root.fork(head.id, fork, context) : await this.harness.createConversation(fork, context);
       }
       const transcript = await conversation.context(context);
-      const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0 };
+      const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0, submittedAt: Date.now() };
       if (input.admissionId !== undefined) run.admissionId = input.admissionId;
       if (options) run.options = options;
       await this.mutate(meta => {
@@ -617,6 +620,8 @@ export class RunnerSession {
     }
     if (!needs.length) return { unbounded };
     if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
+    const deadline = (run.submittedAt ?? Date.now()) + PERMISSION_WAIT_MS;
+    if (deadline <= Date.now()) throw new Error("This message is over an hour old, so the session owner can no longer allow this call. Ask them to send a new message.");
     const id = `permission-${api.taskId}`;
     // The target only shows the owner what the call touches; keep it within what the control plane accepts.
     const shown = target.replaceAll("\0", "");
@@ -627,7 +632,7 @@ export class RunnerSession {
     let decided: ApprovalRecord;
     let expiry: NodeJS.Timeout | undefined;
     const expired = new Promise<never>((_, reject) => {
-      expiry = setTimeout(() => reject(new Error("The session owner did not answer within an hour.")), PERMISSION_WAIT_MS);
+      expiry = setTimeout(() => reject(new Error("The session owner did not answer within an hour of the message.")), deadline - Date.now());
       expiry.unref();
     });
     try { decided = await awaitWithContext(Promise.race([this.permissionDecision(id), expired]), waiting); }
@@ -640,7 +645,8 @@ export class RunnerSession {
       }).catch(() => {});
       throw error;
     } finally { clearTimeout(expiry); }
-    if (decided.status !== "approved") throw new Error(`The session owner did not allow ${tool}${target ? ` on ${target}` : ""}.`);
+    if (decided.status === "denied") throw new Error(`The session owner did not allow ${tool}${target ? ` on ${target}` : ""}.`);
+    if (decided.status !== "approved") throw new Error("The permission request ended before the session owner answered.");
     return { unbounded };
   }
 
@@ -654,6 +660,12 @@ export class RunnerSession {
       return current;
     }
     return waiter.promise;
+  }
+
+  /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
+  private coveredBy(request: PermissionRequest, grants: Grants): boolean {
+    return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || grants.tools.includes(request.tool)
+      : need === "write" ? grants.write : grants.unboundedShell);
   }
 
   private buildTools(): ToolRegistration[] {
@@ -828,18 +840,28 @@ export class RunnerSession {
           throw new RunnerError(403, "Only the host's owner can allow a shell without resource limits");
         }
         const scope = input.scope ?? "call";
+        let settled: string[] = [];
         await this.mutate(meta => {
+          settled = [id];
           Object.assign(meta.approvals[id]!, input.decision === "approve" ? { status: "approved", decidedBy: ticket.actorId, scope } : { status: "denied", decidedBy: ticket.actorId });
           if (input.decision !== "approve" || scope !== "session") return;
           const grants = meta.grants ??= { tools: [], write: false, unboundedShell: false };
           if (request.needs.includes("tool") && !grants.tools.includes(request.tool)) grants.tools.push(request.tool);
           if (request.needs.includes("write")) grants.write = true;
           if (request.needs.includes("unbounded-shell")) grants.unboundedShell = true;
+          // Parallel calls of the same round that wait on what the session now allows go ahead too.
+          for (const other of Object.values(meta.approvals)) {
+            if (other.id === id || other.status !== "pending" || other.operation.kind !== "permission" || !this.coveredBy(other.operation, grants)) continue;
+            Object.assign(other, { status: "approved", decidedBy: ticket.actorId, scope });
+            settled.push(other.id);
+          }
         });
-        const decided = (await this.metadata()).approvals[id]!;
-        this.#permissionWaiters.get(id)?.resolve(decided);
-        this.#permissionWaiters.delete(id);
-        return decided;
+        const approvals = (await this.metadata()).approvals;
+        for (const decided of settled) {
+          this.#permissionWaiters.get(decided)?.resolve(approvals[decided]!);
+          this.#permissionWaiters.delete(decided);
+        }
+        return approvals[id]!;
       }
       if (input.decision === "deny") {
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "denied", decidedBy: ticket.actorId }); });

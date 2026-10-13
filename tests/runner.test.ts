@@ -509,6 +509,48 @@ test("a tool outside the agent waits for its owner, who allows it once or for th
   await assert.rejects(session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation }), rejectedWith(409, /already been decided/));
 });
 
+test("allowing a tool for the session lets the round's other waiting calls of it go ahead", hostMode, async t => {
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("bash", { command: "echo one" }), fauxToolCall("bash", { command: "echo two" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Both requested."),
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const { service } = await hostFixture(t, { resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }) });
+  const id = "permission-round";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: ["identity", "read_file"] } }, await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "Run both.", requestId: "both" }, "write");
+  // Both calls of the round wait, each on its own card.
+  let requests: ApprovalRecord[] = [];
+  for (let count = 0; count < 500 && requests.length < 2; count++) {
+    requests = (await session.view()).approvals.filter(approval => approval.operation.kind === "permission" && approval.status === "pending");
+    if (requests.length < 2) await delay(20);
+  }
+  assert.equal(requests.length, 2);
+  await session.decide(await ticket(id, "approve"), requests[0]!.id, { decision: "approve", operation: requests[0]!.operation, scope: "session" });
+  await idle(session);
+  const view = await session.view();
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission").map(approval => [approval.status, approval.scope]), [["approved", "session"], ["approved", "session"]]);
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "bash").map(approval => approval.operation.kind === "bash" && approval.operation.command).sort(), ["echo one", "echo two"]);
+});
+
+test("a restart ends a call waiting on its owner, and its card can no longer be decided", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const id = "permission-restart";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: ["identity", "read_file"] } }, await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo waiting", requestId: "waiting" }, "write");
+  const request = await permissionRequest(session);
+  await session.restart();
+  await idle(session);
+  const view = await session.view();
+  assert.deepEqual(view.approvals.map(approval => [approval.id, approval.status]), [[request.id, "interrupted"]]);
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("Tool bash was interrupted")));
+  await assert.rejects(session.decide(await ticket(id, "approve"), request.id, { decision: "approve", operation: request.operation }), rejectedWith(409, /already been decided/));
+});
+
 test("chat options are validated against owner, mode, model and request idempotency", hostMode, async t => {
   const { service } = await hostFixture(t);
   const id = "validate-session";

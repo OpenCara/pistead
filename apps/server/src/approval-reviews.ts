@@ -17,16 +17,21 @@ async function toolsFor(env: Env, row: SessionRow): Promise<string[]> {
   if (!agent) fail(409, 'invalid_binding', 'The pinned agent is unavailable.');
   return JSON.parse(agent.tools_json) as string[];
 }
+/** The tool call a permission request `permission-<call>` waits in; its operation's approval is `tool-<call>`. */
+export function permissionCall(approvalId: string): string | undefined {
+  return /^permission-([A-Za-z0-9_-]+)$/.exec(approvalId)?.[1];
+}
 /**
  * Whether a session may use an operation's tool: its pinned agent's, or one the owner allowed through a permission
  * request, for the session or for the one call whose approval is `tool-<call>`. A permission request asks for the tool
- * itself, so it is always presented; only the owner can decide it.
+ * itself, so it is presented whenever it names its call (a one-call grant must never become a session one); only the
+ * owner can decide it.
  */
 async function sessionTools(env: Env, row: SessionRow): Promise<(operation: Operation, approvalId: string) => boolean> {
   const agentTools = await toolsFor(env, row);
   const grants = await env.DB.query<{ tool: string; call_id: string }>('SELECT tool, call_id FROM session_tool_grants WHERE session_id = ?').bind(row.id).all();
   return (operation, approvalId) => {
-    if (operation.kind === 'permission') return true;
+    if (operation.kind === 'permission') return permissionCall(approvalId) !== undefined;
     const tool = operationTools[operation.kind];
     const call = approvalId.startsWith('tool-') ? approvalId.slice('tool-'.length) : undefined;
     return agentTools.includes(tool) || grants.some(grant => grant.tool === tool && (grant.call_id === '' || grant.call_id === call));

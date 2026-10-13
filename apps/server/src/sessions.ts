@@ -11,7 +11,7 @@ import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, use
 import { runnerJSON, runnerRequest } from './runner.js';
 import { parseOperation } from './operations.js';
 import { requireConnectorSession } from './connectors.js';
-import { presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
+import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
@@ -358,11 +358,12 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
           review.requested_by, await sha256(JSON.stringify(operation)), Math.floor(Date.now() / 1000) + 90, now()).run();
       }
       // Tool grants live here as well as on the host, so a host can't present commands, pushes or comments for a tool
-      // the owner never allowed. A one-call grant covers the command approval of that same tool call.
+      // the owner never allowed. A one-call grant covers the command approval of that same tool call; the review above
+      // only admits permission requests that name their call.
       if (operation.kind === 'permission' && operation.needs.includes('tool')) {
         await c.env.DB.query(`INSERT INTO session_tool_grants (session_id, tool, call_id, approval_id, granted_by, created_at)
           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, tool, call_id) DO NOTHING`)
-          .bind(row.id, operation.tool, scope === 'session' ? '' : approvalId.replace(/^permission-/, ''), approvalId, c.get('auth').userId, now()).run();
+          .bind(row.id, operation.tool, scope === 'session' ? '' : permissionCall(approvalId)!, approvalId, c.get('auth').userId, now()).run();
       }
     }
     const decided = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'approve', approvalId, {

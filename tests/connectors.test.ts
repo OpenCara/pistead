@@ -1038,11 +1038,13 @@ test('only the session owner answers a permission request, for one call or the s
   const once = pending('permission-call-1', { kind: 'permission', tool: 'bash', target: 'npm test', needs: ['tool'] });
   const always = pending('permission-call-2', { kind: 'permission', tool: 'git_commit', target: 'Fix it', needs: ['tool'] });
   const unlimited = pending('permission-call-3', { kind: 'permission', tool: 'bash', target: 'make', needs: ['unbounded-shell'] });
+  // Without its call, allowing it once would grant the tool for the whole session.
+  const unnamed = pending('permission-', { kind: 'permission', tool: 'github_comment', target: 'owner/repo#3', needs: ['tool'] });
   // Operations of tools outside the agent, as a host could present them before or without the owner's permission.
   const command = pending('tool-call-1', { kind: 'bash', command: 'npm test' });
   const otherCommand = pending('tool-call-4', { kind: 'bash', command: 'npm test' });
   const commit = pending('tool-call-5', { kind: 'git.commit', message: 'Fix it' });
-  let approvals = [once, always, unlimited, command, otherCommand, commit];
+  let approvals = [once, always, unlimited, unnamed, command, otherCommand, commit];
   const decisions: unknown[] = [];
   rpcHub(f, s.connector, envelope => {
     const action = envelope.request.ticket.action;
@@ -1066,7 +1068,7 @@ test('only the session owner answers a permission request, for one call or the s
   await json(await s.creator.request('POST', `${path}/submit`, { content: 'Run the tests', requestId: 'permission-write' }), 202);
   const present = async () => new Map((await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
   let presented = await present();
-  for (const id of [command.id, otherCommand.id, commit.id]) {
+  for (const id of [unnamed.id, command.id, otherCommand.id, commit.id]) {
     assert.equal(presented.get(id)!.status, 'interrupted');
     assert.equal(Object.hasOwn(presented.get(id)!, 'reviewHash'), false);
   }
