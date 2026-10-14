@@ -43,6 +43,19 @@ export function clampLevel(levels: ThinkingLevel[] | undefined, level: ThinkingL
   return lower ?? (levels.includes("off") ? "off" : levels[0]);
 }
 
+/**
+ * The reasoning level that applies to `model`: the picked one when the model supports it, else the level the host's Pi
+ * starts that model at, else the nearest supported level. The picker shows it and the request sends it, so the two
+ * always match the model.
+ */
+export function effectiveLevel(model: LocalModelSummary | undefined, level: ThinkingLevel | undefined): ThinkingLevel | undefined {
+  const levels = model?.thinkingLevels;
+  if (!model || !levels?.length) return undefined;
+  if (level && levels.includes(level)) return level;
+  if (model.thinkingLevel && levels.includes(model.thinkingLevel)) return model.thinkingLevel;
+  return clampLevel(levels, level);
+}
+
 /** Starting selection for an existing session: its current model, reasoning and shared-run access. */
 export function initialSelection(view: SessionView, owner: boolean): ChatSelection {
   const access = view.access ?? "approval";
@@ -62,7 +75,8 @@ export function chatOptionsBody(host: ConnectorInfo | undefined, selection: Chat
   const model = findModel(host, selection.model);
   const options: ChatOptions = {};
   if (model) options.model = { provider: model.provider, modelId: model.modelId };
-  if (selection.thinkingLevel && model?.thinkingLevels?.includes(selection.thinkingLevel)) options.thinkingLevel = selection.thinkingLevel;
+  const thinkingLevel = effectiveLevel(model, selection.thinkingLevel);
+  if (thinkingLevel) options.thinkingLevel = thinkingLevel;
   if (mode === "submit") options.access = selection.access;
   return options;
 }
@@ -82,6 +96,7 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
   if (!host.capabilities.chatOptions) return <span className="chat-options-hint truncate" title={CONNECTOR_UPDATE_HINT}>{CONNECTOR_UPDATE_HINT}</span>;
   const model = findModel(host, value.model);
   const levels = offeredLevels(model);
+  const level = effectiveLevel(model, value.thinkingLevel);
 
   function selectModel(key: string) {
     const next = host!.models.find(item => modelKey(item) === key);
@@ -112,8 +127,8 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
   return <>
     <Combobox<string> label="Model" side="above" placeholder="Model" disabled={!host.models.length} value={value.model && model ? modelKey(value.model) : ""}
       options={host.models.map(item => ({ value: modelKey(item), label: item.name, hint: item.provider }))} onChange={selectModel} />
-    {levels.length > 0 && <Combobox<ThinkingLevel> label="Reasoning" side="above" placeholder="Default" value={value.thinkingLevel && levels.includes(value.thinkingLevel) ? value.thinkingLevel : ""}
-      options={levels.map(level => ({ value: level, label: levelLabels[level] }))} onChange={thinkingLevel => onChange({ ...value, thinkingLevel })} />}
+    {levels.length > 0 && <Combobox<ThinkingLevel> label="Reasoning" side="above" placeholder="Default" value={level && levels.includes(level) ? level : ""}
+      options={levels.map(item => ({ value: item, label: levelLabels[item] }))} onChange={thinkingLevel => onChange({ ...value, thinkingLevel })} />}
     {showAccess && <span className={value.access === "auto" ? "chat-access auto" : "chat-access"} title={`Access: ${current.label}`}>
       <DropdownMenu label="Access" align="end" side="above" items={accessItems} trigger={<><Icon name={current.icon} size={14} /><span className="truncate">{current.label}</span></>} />
     </span>}
