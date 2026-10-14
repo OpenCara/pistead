@@ -18,7 +18,7 @@ const levelLabels: Record<ThinkingLevel, string> = {
 const accessInfo: Record<AccessMode, { label: string; icon: IconName; hint: string }> = {
   read: { label: "Read only", icon: "eye", hint: "Inspect files; edits, commands and commits ask the session owner first" },
   approval: { label: "Ask before acting", icon: "shield", hint: "Edits are automatic; commands, commits, GitHub comments and merges need approval" },
-  auto: { label: "Auto-approve", icon: "alert", hint: "Commands and commits run immediately as the owner" },
+  auto: { label: "Auto-approve", icon: "alert", hint: "Commands, commits and pushes run immediately as the owner, without asking" },
 };
 
 export const CONNECTOR_UPDATE_HINT = "Update the host's connector (npx pistead@latest connect) to choose model, reasoning and access";

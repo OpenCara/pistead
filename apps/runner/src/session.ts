@@ -626,6 +626,9 @@ export class RunnerSession {
       if (!grants?.unboundedShell) needs.push("unbounded-shell");
     }
     if (!needs.length) return { unbounded };
+    // The owner's auto-approve access answers these cards for them: they chose to let the agent act without asking.
+    // Only the owner can pick it, and a command without limits got this far only on their own host (checked above).
+    if (run.options?.access === "auto" && run.mode === "write" && run.initiatedBy === this.binding.owner.id) return { unbounded };
     if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
     const deadline = (run.submittedAt ?? Date.now()) + PERMISSION_WAIT_MS;
     if (deadline <= Date.now()) throw new Error("This message is over an hour old, so the session owner can no longer allow this call. Ask them to send a new message.");
