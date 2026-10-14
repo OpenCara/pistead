@@ -46,7 +46,7 @@ function SignIn({ error, retry }: { error: string; retry: () => void }) {
         {!unconfigured && <a className="btn default lg" href="/api/auth/github"><GitHubMark />Continue with GitHub</a>}
         {(problem || unconfigured) && <Button onClick={() => { retry(); health.refresh(); }}>Try again</Button>}
       </div>
-      <p className="welcome-footnote">Model credentials stay on your host. GitHub tokens stay on the server.</p>
+      <p className="welcome-footnote">Model credentials stay on your host. GitHub tokens stay on the server, or go only to your own hosts when you push with your account.</p>
     </main>
   </div>;
 }
