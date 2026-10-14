@@ -410,6 +410,14 @@ test("only the host's owner lets a command run without the resource limits the h
   assert.match(ran.result ?? "", /unlimited-marker/);
 });
 
+test("shell commands may reserve address space they never touch, as gh and node do when they start", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const session = await service.provision(binding("reserve-session"), await ticket("reserve-session", "create"));
+  // Mapped PROT_NONE, 16 GiB commits no memory: only an address-space cap refuses it.
+  const command = "python3 -I -c 'import mmap; mmap.mmap(-1, 16 << 30, flags=mmap.MAP_PRIVATE, prot=0); print(\"reserved\")'";
+  assert.match(await session.sandbox.execute({ kind: "bash", command }, true, allowTestOperation, { allowTestShell: true }), /reserved/);
+});
+
 test("kernel runner lease admits one owner and releases without deleting stale files", { skip: process.platform !== "linux" }, async t => {
   const { directory } = await fixture(t);
   let lost = false;
