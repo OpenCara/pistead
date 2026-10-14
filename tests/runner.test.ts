@@ -12,7 +12,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { signToken, sha256 } from "../packages/shared/src/crypto.js";
-import type { RunnerBinding, RunnerTicket, RunnerAction, Permission, AuthorizationRequest } from "../packages/shared/src/types.js";
+import type { ApprovalRecord, RunnerBinding, RunnerTicket, RunnerAction, Permission, AuthorizationRequest } from "../packages/shared/src/types.js";
 import type { RestoreDescriptor, RestoreInput } from "../packages/shared/src/connector.js";
 import { RunnerError, assertId, requestKey, stableJson, validateBinding, validateOperation, verifyRunnerTicket } from "../apps/runner/src/protocol.js";
 import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
@@ -42,6 +42,16 @@ async function idle(session: RunnerSession): Promise<void> {
   }
   assert.fail("runner did not settle");
 }
+/** Waits for the session's pending permission request: the card its owner answers. */
+async function permissionRequest(session: RunnerSession): Promise<ApprovalRecord> {
+  for (let count = 0; count < 500; count++) {
+    const request = (await session.view()).approvals.find(approval => approval.operation.kind === "permission" && approval.status === "pending");
+    if (request) return request;
+    await delay(20);
+  }
+  assert.fail("no permission request");
+}
+const rejectedWith = (code: number, message: RegExp) => (error: unknown) => error instanceof RunnerError && error.status === code && message.test(error.message);
 async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const directory = await mkdtemp(join(tmpdir(), "runner-unit-"));
   const grants: Record<string, Permission[]> = { "test:alice": ["read", "ask", "write", "approve", "manage"], "test:bob": ["read", "ask", "write"] };
@@ -184,6 +194,11 @@ test("owner restore publishes a new idle session, drops old authority and leaves
   const source = await service.provision(binding("restore-source"), await ticket("restore-source", "create"));
   await source.submit(await ticket("restore-source", "submit"), { requestId: "source-write", content: "TEST_WRITE evidence.txt\noriginal" }, "write");
   await idle(source);
+  // An allowed permission request is settled history; what it allowed for the rest of the session stays with the source.
+  await source.submit(await ticket("restore-source", "submit"), { requestId: "source-read", content: "TEST_WRITE allowed.txt\nonce", options: { access: "read" } }, "write");
+  const permission = await permissionRequest(source);
+  await source.decide(await ticket("restore-source", "approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "session" });
+  await idle(source);
   const approval = await source.createApproval("test:alice", { kind: "git.commit", message: "must not replay" });
   const oldTicket = await ticket("restore-source", "operations");
   await source.consumeTicket(oldTicket);
@@ -228,11 +243,17 @@ test("owner restore publishes a new idle session, drops old authority and leaves
   const view = await restored.view();
   assert.equal(view.busy, false);
   assert.equal(view.approvals.find(item => item.id === approval.id)?.status, "interrupted");
+  assert.equal(view.approvals.find(item => item.id === permission.id)?.status, "approved");
   assert.equal((await source.view()).approvals.find(item => item.id === approval.id)?.status, "pending");
   assert.equal(await restored.sandbox.readFile("evidence.txt", allowTestOperation), "original");
   assert.match(await readFile(join(directory, "sessions", target.session.id, "sandbox", "owner.gitconfig"), "utf8"), /Alice Current/);
   await restored.consumeTicket({ ...oldTicket, sessionId: target.session.id });
   await restored.submit({ ...await ticket(target.session.id, "submit"), policyVersion }, { requestId: "target-write", content: "TEST_WRITE evidence.txt\nnew session" }, "write");
+  await idle(restored);
+  await restored.submit({ ...await ticket(target.session.id, "submit"), policyVersion }, { requestId: "target-read", content: "TEST_WRITE allowed.txt\nagain", options: { access: "read" } }, "write");
+  const asked = await permissionRequest(restored);
+  assert.deepEqual(asked.operation, { kind: "permission", tool: "write_file", target: "allowed.txt", needs: ["write"] });
+  await restored.decide({ ...await ticket(target.session.id, "approve"), policyVersion }, asked.id, { decision: "deny", operation: asked.operation });
   await idle(restored);
   assert.equal(await source.sandbox.readFile("evidence.txt", allowTestOperation), "original");
   await restoredService.close();
@@ -350,6 +371,45 @@ test("connected writes durably bind Worker admission to every model approval wit
   await recoveredService.close();
 });
 
+test("only the host's owner lets a command run without the resource limits the host lacks", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const connectorId = "limitless-connector";
+  // Neither provisioned limits nor the test shell: a command runs within limits, or with the host owner's consent.
+  const limitless = new RunnerService({ ...service.config, connectorId, allowTestShell: false });
+  await limitless.initialize();
+  t.after(() => limitless.close());
+  const admissionId = await sha256("limitless write admission");
+  async function start(id: string, hostOwner: string, command: string) {
+    const target = binding(id);
+    target.session.connectorId = target.model.connectorId = connectorId;
+    target.session.connectorOwnerId = target.model.connectorOwnerId = hostOwner;
+    const session = await limitless.provision(target, { ...await ticket(id, "create"), connectorId });
+    await session.submit({ ...await ticket(id, "submit"), connectorId }, { content: `TEST_BASH ${command}`, requestId: id, admissionId }, "write");
+    return session;
+  }
+  // On someone else's host the call fails without a card: nobody in the session may lift the host's limits.
+  const shared = await start("limitless-shared", "test:host", "echo shared");
+  await idle(shared);
+  const sharedView = await shared.view();
+  assert.deepEqual(sharedView.approvals, []);
+  assert.ok(sharedView.entries.some(entry => entry.role === "toolResult" && entry.text.includes("quota-backed")));
+
+  const own = await start("limitless-own", "test:alice", "echo unlimited-marker");
+  const request = await permissionRequest(own);
+  assert.deepEqual(request.operation, { kind: "permission", tool: "bash", target: "echo unlimited-marker", needs: ["unbounded-shell"] });
+  assert.equal(request.admissionId, admissionId);
+  await own.decide({ ...await ticket("limitless-own", "approve"), connectorId }, request.id, { decision: "approve", operation: request.operation });
+  await idle(own);
+  // The consent covers running unlimited; the command itself still waits for its approval.
+  const command = (await own.view()).approvals.find(approval => approval.operation.kind === "bash");
+  assert.ok(command);
+  assert.equal(command.status, "pending");
+  assert.equal(command.unbounded, true);
+  const ran = await own.decide({ ...await ticket("limitless-own", "approve"), connectorId }, command.id, { decision: "approve", operation: command.operation });
+  assert.equal(ran.status, "executed");
+  assert.match(ran.result ?? "", /unlimited-marker/);
+});
+
 test("kernel runner lease admits one owner and releases without deleting stale files", { skip: process.platform !== "linux" }, async t => {
   const { directory } = await fixture(t);
   let lost = false;
@@ -371,27 +431,31 @@ async function hostFixture(t: { after: (fn: () => Promise<void>) => void }, extr
   const service = new RunnerService({ dataDir: directory, sharedSecret: SECRET, controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true, authorize, ...extra });
   await service.initialize();
   t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
-  return { service };
+  return { service, grants };
 }
 
-test("read access withholds write tools and auto access runs owner commands immediately", hostMode, async t => {
+test("read access asks the owner before a change, and auto access runs owner commands immediately", hostMode, async t => {
   const { service } = await hostFixture(t);
   const session = await service.provision(binding("options-session"), await ticket("options-session", "create"));
   await session.submit(await ticket("options-session", "submit"), { content: "TEST_WRITE read-only.txt\nleaked", requestId: "read", options: { access: "read" } }, "write");
+  const request = await permissionRequest(session);
+  assert.deepEqual(request.operation, { kind: "permission", tool: "write_file", target: "read-only.txt", needs: ["write"] });
+  assert.equal((await session.view()).busy, true, "the call waits on the owner");
+  const denial = await session.decide(await ticket("options-session", "approve"), request.id, { decision: "deny", operation: request.operation });
+  assert.equal(denial.status, "denied");
   await idle(session);
   await assert.rejects(session.sandbox.readFile("read-only.txt", allowTestOperation));
   let view = await session.view();
-  assert.ok(view.entries.some(entry => entry.text.includes("Denied: write_file")));
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("The session owner did not allow write_file on read-only.txt.")));
   assert.equal(view.access, "read");
-  assert.equal(view.approvals.length, 0);
+  assert.deepEqual(view.approvals.map(approval => approval.status), ["denied"]);
 
   await session.submit(await ticket("options-session", "submit"), { content: "TEST_BASH echo auto-output-marker", requestId: "auto", options: { access: "auto" } }, "write");
   await idle(session);
   view = await session.view();
   assert.equal(view.access, "auto");
-  assert.equal(view.approvals.length, 1);
-  const [approval] = view.approvals;
-  assert.equal(approval!.status, "executed");
+  const approval = view.approvals.find(candidate => candidate.operation.kind === "bash");
+  assert.equal(approval?.status, "executed");
   assert.equal(approval!.automatic, true);
   assert.equal(approval!.decidedBy, "test:alice");
   assert.match(approval!.result ?? "", /auto-output-marker/);
@@ -401,9 +465,90 @@ test("read access withholds write tools and auto access runs owner commands imme
   await idle(session);
   view = await session.view();
   assert.equal(view.access, undefined);
-  const pending = view.approvals.find(candidate => candidate.id !== approval!.id);
+  const pending = view.approvals.find(candidate => candidate.operation.kind === "bash" && candidate.id !== approval!.id);
   assert.equal(pending?.status, "pending");
   assert.equal(pending?.automatic, undefined);
+});
+
+test("a tool outside the agent waits for its owner, who allows it once or for the rest of the session", hostMode, async t => {
+  const { service, grants } = await hostFixture(t);
+  grants["test:bob"] = ["read", "ask", "write", "approve"];
+  const id = "permission-session";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: ["identity", "read_file"] } }, await ticket(id, "create"));
+  const commands = () => session.view().then(view => view.approvals.filter(approval => approval.operation.kind === "bash"));
+
+  // Bob may write and approve here, but only the owner lets a call do more than the session allows.
+  await session.submit(await ticket(id, "submit", "test:bob"), { content: "TEST_BASH echo once", requestId: "once" }, "write");
+  const once = await permissionRequest(session);
+  assert.deepEqual(once.operation, { kind: "permission", tool: "bash", target: "echo once", needs: ["tool"] });
+  assert.equal(once.requestedBy, "test:bob");
+  await assert.rejects(session.decide(await ticket(id, "approve", "test:bob"), once.id, { decision: "approve", operation: once.operation }), rejectedWith(403, /session owner/));
+  await assert.rejects(session.decide(await ticket(id, "approve"), once.id, { decision: "approve", operation: once.operation, scope: "forever" as never }), rejectedWith(400, /scope/));
+  const allowedOnce = await session.decide(await ticket(id, "approve"), once.id, { decision: "approve", operation: once.operation, scope: "call" });
+  assert.equal(allowedOnce.status, "approved");
+  assert.equal(allowedOnce.scope, "call");
+  await idle(session);
+  // Allowing the tool doesn't run the command: it still gets its own approval.
+  let pending = await commands();
+  assert.deepEqual(pending.map(approval => [approval.operation, approval.status]), [[{ kind: "bash", command: "echo once" }, "pending"]]);
+  await assert.rejects(session.createApproval("test:alice", { kind: "bash", command: "echo explicit" }), rejectedWith(403, /not enabled/));
+
+  await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo again", requestId: "again" }, "write");
+  const again = await permissionRequest(session);
+  assert.notEqual(again.id, once.id, "one call's permission doesn't cover the next");
+  await session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation, scope: "session" });
+  await idle(session);
+  await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo granted", requestId: "granted" }, "write");
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.approvals.filter(approval => approval.operation.kind === "permission").length, 2, "the session grant asks no more");
+  pending = await commands();
+  assert.deepEqual(pending.map(approval => approval.operation), ["echo once", "echo again", "echo granted"].map(command => ({ kind: "bash", command })));
+  assert.equal((await session.createApproval("test:alice", { kind: "bash", command: "echo explicit" })).status, "pending");
+  await assert.rejects(session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation }), rejectedWith(409, /already been decided/));
+});
+
+test("allowing a tool for the session lets the round's other waiting calls of it go ahead", hostMode, async t => {
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("bash", { command: "echo one" }), fauxToolCall("bash", { command: "echo two" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Both requested."),
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const { service } = await hostFixture(t, { resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }) });
+  const id = "permission-round";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: ["identity", "read_file"] } }, await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "Run both.", requestId: "both" }, "write");
+  // Both calls of the round wait, each on its own card.
+  let requests: ApprovalRecord[] = [];
+  for (let count = 0; count < 500 && requests.length < 2; count++) {
+    requests = (await session.view()).approvals.filter(approval => approval.operation.kind === "permission" && approval.status === "pending");
+    if (requests.length < 2) await delay(20);
+  }
+  assert.equal(requests.length, 2);
+  await session.decide(await ticket(id, "approve"), requests[0]!.id, { decision: "approve", operation: requests[0]!.operation, scope: "session" });
+  await idle(session);
+  const view = await session.view();
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission").map(approval => [approval.status, approval.scope]), [["approved", "session"], ["approved", "session"]]);
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "bash").map(approval => approval.operation.kind === "bash" && approval.operation.command).sort(), ["echo one", "echo two"]);
+});
+
+test("a restart ends a call waiting on its owner, and its card can no longer be decided", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const id = "permission-restart";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: ["identity", "read_file"] } }, await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo waiting", requestId: "waiting" }, "write");
+  const request = await permissionRequest(session);
+  await session.restart();
+  await idle(session);
+  const view = await session.view();
+  assert.deepEqual(view.approvals.map(approval => [approval.id, approval.status]), [[request.id, "interrupted"]]);
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("Tool bash was interrupted")));
+  await assert.rejects(session.decide(await ticket(id, "approve"), request.id, { decision: "approve", operation: request.operation }), rejectedWith(409, /already been decided/));
 });
 
 test("chat options are validated against owner, mode, model and request idempotency", hostMode, async t => {

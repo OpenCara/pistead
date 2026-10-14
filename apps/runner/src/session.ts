@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -27,16 +27,26 @@ type Run = {
   sequence?: number;
   started?: boolean;
   admissionId?: string;
+  /** When the runner accepted the message (epoch ms); its Worker write admission lasts an hour from about then. */
+  submittedAt?: number;
   /** Worker-signed per-message choices, applied to the conversation when the run starts. */
   options?: ChatOptions;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
   failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
-type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number };
+/** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
+type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
+type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
-/** Tools that never change files or run commands; the whole toolset of read-only access and side asks. */
+/** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files", "git_status"];
+/**
+ * How long after a message is sent its tool calls can wait on the owner's permission. Deciding needs the message's write
+ * admission, which lasts an hour from sending, so a card older than that can't be decided: the call fails instead of
+ * holding the session.
+ */
+const PERMISSION_WAIT_MS = 60 * 60 * 1000;
 /** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
 function boundedResult(value: string): string {
   if (value.length <= 8000) return value;
@@ -80,6 +90,8 @@ export class RunnerSession {
   #failed = false;
   /** The reopen in progress, which every request waits for instead of reaching a half-open session. */
   #recovery: Promise<void> | undefined;
+  /** Tool calls waiting on the owner's decision about a permission request, by request id. */
+  #permissionWaiters = new Map<string, PromiseWithResolvers<ApprovalRecord>>();
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -149,6 +161,8 @@ export class RunnerSession {
         state.binding = this.binding;
         state.usedTickets = {};
         state.toolActors = {};
+        // What the owner allowed for the rest of a session covers that session only; the restored one asks again.
+        delete state.grants;
         for (const run of Object.values(state.runs)) delete run.admissionId;
         for (const approval of Object.values(state.approvals)) {
           approval.sessionId = this.binding.session.id;
@@ -253,7 +267,7 @@ export class RunnerSession {
           + "Pushes are fast-forward only (never forced); a branch that moved elsewhere is refused. Optionally request a pull request with pull_request {title, body, base?}.";
     }
     if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
-    if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
+    if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files; any change to files, command or other effect waits for the session owner to allow it.";
     return instructions;
   }
 
@@ -277,7 +291,8 @@ export class RunnerSession {
     this.root = await this.harness.root(context, { agent: {
       // A new conversation starts at the level the host's Pi gives this model, not pi-durable's "off".
       model: this.modelRef, ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}), extensions: [extension],
-      tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never)), instructions: this.agentInstructions("write"),
+      // Every tool is offered; one the session doesn't allow asks the owner when called (see `permit`).
+      tools: this.tools, instructions: this.agentInstructions("write"),
     } });
     await this.root.commit(async tx => {
       const doc = await tx.doc(RunnerState);
@@ -288,6 +303,11 @@ export class RunnerSession {
         if (approval.status === "executing") {
           approval.status = "interrupted";
           approval.result = "Execution interrupted; external effect may have occurred. Reconcile manually; never automatically retry.";
+        }
+        // The tool call waiting on this request ended with the previous process.
+        if (approval.status === "pending" && approval.operation.kind === "permission") {
+          approval.status = "interrupted";
+          approval.result = "The tool call stopped before a decision.";
         }
       }
       doc.json = JSON.stringify(state);
@@ -440,9 +460,10 @@ export class RunnerSession {
     const change: AgentChange = {
       ...(options.model ? { model: { provider: options.model.provider, modelId: options.model.modelId } } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
-      // Every shared run states its toolset, so a read-only request never leaks into the next one.
+      // Every shared run states its toolset and instructions, so a read-only request never leaks into the next one. All
+      // tools are offered: a call the session doesn't allow asks the owner instead of failing.
       ...(run.mode === "write" ? {
-        tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never) && (access !== "read" || readOnlyTools.includes(tool.name))),
+        tools: this.tools,
         instructions: this.agentInstructions(access === "read" ? "read" : "write"),
       } : {}),
     };
@@ -531,7 +552,7 @@ export class RunnerSession {
         conversation = head ? await this.root.fork(head.id, fork, context) : await this.harness.createConversation(fork, context);
       }
       const transcript = await conversation.context(context);
-      const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0 };
+      const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0, submittedAt: Date.now() };
       if (input.admissionId !== undefined) run.admissionId = input.admissionId;
       if (options) run.options = options;
       await this.mutate(meta => {
@@ -549,7 +570,8 @@ export class RunnerSession {
     const state: Metadata = JSON.parse(doc!.json);
     const saved = state.toolActors[String(api.taskId)];
     const run = saved ? state.runs[saved.runKey] : Object.values(state.runs).find(candidate => candidate.conversationId === api.conversationId && (candidate.status === "running" || candidate.status === "admitting"));
-    if (!run || !["admitting", "running"].includes(run.status) || run.ownerId !== this.binding.owner.id || (write && (run.mode !== "write" || run.options?.access === "read"))) throw new RunnerError(403, "Tool has no authorized writable submission");
+    // Side asks offer only read tools; in shared runs, `permit` decides whether a call needs the owner first.
+    if (!run || !["admitting", "running"].includes(run.status) || run.ownerId !== this.binding.owner.id || (write && run.mode !== "write")) throw new RunnerError(403, "Tool has no authorized writable submission");
     await this.authorize(run.initiatedBy, run.mode === "ask" ? "ask" : "write");
     await api.commit(async tx => {
       const current = await tx.doc(RunnerState);
@@ -564,21 +586,100 @@ export class RunnerSession {
     await this.authorize(attribution.initiatedBy, attribution.mode === "ask" ? "ask" : "write");
   }
 
-  private requireShellCapability(operation: Operation): void {
-    if (operation.kind === "bash" && !this.config.resources && !this.config.unsandboxed && !(this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true)) {
+  /** Whether shell commands may run here: within provisioned limits, on an owner-consented unsandboxed host, or as a faux test shell. */
+  private shellAllowed(): boolean {
+    return !!this.config.resources || this.config.unsandboxed === true || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+  }
+
+  /** `unbounded`: the host's owner allowed this command to run without the limits this host lacks. */
+  private requireShellCapability(operation: Operation, unbounded = false): void {
+    if (operation.kind === "bash" && !unbounded && !this.shellAllowed()) {
       throw new RunnerError(403, "Production shell requires a quota-backed runner; bash needs verified resources or explicitly enabled faux test sessions");
     }
+  }
+
+  /**
+   * Lets a tool call go ahead, first asking the session owner when the session doesn't allow it yet: a tool outside the
+   * agent's, a change in a Read-only message, or a shell command on a host without resource limits. The call waits on
+   * the owner's card, which allows it once or for the rest of the session, or denies it. `unbounded`: the command runs
+   * without limits, which only the host's owner can allow, and only in their own session.
+   */
+  private async permit(api: ToolExecutionApi, waiting: Context, tool: ToolName, target: string, effect: { write?: boolean; shell?: boolean } = {}): Promise<{ unbounded: boolean }> {
+    const state = await this.metadata();
+    const actor = state.toolActors[String(api.taskId)];
+    const run = actor && state.runs[actor.runKey];
+    if (!run) throw new RunnerError(403, "Tool has no authorized writable submission");
+    const grants = state.grants;
+    const needs: PermissionNeed[] = [];
+    if (!this.binding.agent.tools.includes(tool) && !grants?.tools.includes(tool)) needs.push("tool");
+    if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
+    const unbounded = effect.shell === true && !this.shellAllowed();
+    if (unbounded) {
+      if (this.binding.session.connectorOwnerId !== this.binding.owner.id) this.requireShellCapability({ kind: "bash", command: target });
+      if (!grants?.unboundedShell) needs.push("unbounded-shell");
+    }
+    if (!needs.length) return { unbounded };
+    if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
+    const deadline = (run.submittedAt ?? Date.now()) + PERMISSION_WAIT_MS;
+    if (deadline <= Date.now()) throw new Error("This message is over an hour old, so the session owner can no longer allow this call. Ask them to send a new message.");
+    const id = `permission-${api.taskId}`;
+    // The target only shows the owner what the call touches; keep it within what the control plane accepts.
+    const shown = target.replaceAll("\0", "");
+    const operation = validateOperation({ kind: "permission", tool, target: shown.length > 8192 ? `${shown.slice(0, 8191)}…` : shown, needs });
+    const request: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: run.initiatedBy, createdAt: new Date().toISOString(), status: "pending", operation,
+      ...(run.admissionId !== undefined ? { admissionId: run.admissionId } : {}) };
+    await this.mutate(meta => { meta.approvals[id] ??= request; });
+    let decided: ApprovalRecord;
+    let expiry: NodeJS.Timeout | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      expiry = setTimeout(() => reject(new Error("The session owner did not answer within an hour of the message.")), deadline - Date.now());
+      expiry.unref();
+    });
+    try { decided = await awaitWithContext(Promise.race([this.permissionDecision(id), expired]), waiting); }
+    catch (error) {
+      // A stopped run takes its card with it.
+      this.#permissionWaiters.delete(id);
+      await this.mutate(meta => {
+        const pending = meta.approvals[id];
+        if (pending?.status === "pending") Object.assign(pending, { status: "interrupted", result: "The tool call stopped before a decision." });
+      }).catch(() => {});
+      throw error;
+    } finally { clearTimeout(expiry); }
+    if (decided.status === "denied") throw new Error(`The session owner did not allow ${tool}${target ? ` on ${target}` : ""}.`);
+    if (decided.status !== "approved") throw new Error("The permission request ended before the session owner answered.");
+    return { unbounded };
+  }
+
+  /** Settles when the owner decides permission request `id`, at once if they already have. */
+  private async permissionDecision(id: string): Promise<ApprovalRecord> {
+    let waiter = this.#permissionWaiters.get(id);
+    if (!waiter) this.#permissionWaiters.set(id, waiter = Promise.withResolvers<ApprovalRecord>());
+    const current = (await this.metadata()).approvals[id];
+    if (current && current.status !== "pending") {
+      this.#permissionWaiters.delete(id);
+      return current;
+    }
+    return waiter.promise;
+  }
+
+  /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
+  private coveredBy(request: PermissionRequest, grants: Grants): boolean {
+    return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || grants.tools.includes(request.tool)
+      : need === "write" ? grants.write : grants.unboundedShell);
   }
 
   private buildTools(): ToolRegistration[] {
     const text = (value: unknown) => ({ output: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
     const approvalText = (approval: ApprovalRecord) => text({ ...approval, admissionId: undefined });
     return [
-      defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api) => {
-        const attribution = await this.toolActor(api, false); return text({ ...await this.sandbox.identity(() => this.recheckTool(attribution)), ...attribution });
-      } }),
-      defineTool({ name: "read_file", description: "Read a confined worktree file. PNG, JPEG, GIF and WebP images are returned as images, scaled to fit.", parameters: Type.Object({ path: Type.String() }), execute: async (args, api) => {
+      defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api, call) => {
         const attribution = await this.toolActor(api, false);
+        await this.permit(api, call, "identity", "");
+        return text({ ...await this.sandbox.identity(() => this.recheckTool(attribution)), ...attribution });
+      } }),
+      defineTool({ name: "read_file", description: "Read a confined worktree file. PNG, JPEG, GIF and WebP images are returned as images, scaled to fit.", parameters: Type.Object({ path: Type.String() }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, false);
+        await this.permit(api, call, "read_file", args.path);
         const file = await this.sandbox.readContent(args.path, () => this.recheckTool(attribution));
         if ("text" in file) return text({ ...attribution, content: file.text });
         const prepared = await prepareImage(file.image, file.mimeType);
@@ -589,53 +690,75 @@ export class RunnerSession {
           { type: "image" as const, data: image.data, mimeType: image.mimeType },
         ] };
       } }),
-      defineTool({ name: "list_files", description: "List confined worktree files.", parameters: Type.Object({ path: Type.Optional(Type.String()) }), execute: async (args, api) => {
-        const attribution = await this.toolActor(api, false); return text({ ...attribution, files: await this.sandbox.listFiles(args.path, () => this.recheckTool(attribution)) });
+      defineTool({ name: "list_files", description: "List confined worktree files.", parameters: Type.Object({ path: Type.Optional(Type.String()) }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, false);
+        await this.permit(api, call, "list_files", args.path ?? "");
+        return text({ ...attribution, files: await this.sandbox.listFiles(args.path, () => this.recheckTool(attribution)) });
       } }),
       // Writes run one at a time: a round with a write is sequential, so an edit never reads a file another call changes.
-      defineTool({ name: "write_file", description: "Write a confined worktree file. Unavailable in read-only asks.", executionMode: "sequential", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute: async (args, api) => {
-        const attribution = await this.toolActor(api, true); await this.sandbox.writeFile(args.path, args.content, () => this.recheckTool(attribution)); return text({ ...attribution, written: args.path });
+      defineTool({ name: "write_file", description: "Write a confined worktree file. In a read-only request it waits for the session owner to allow it.", executionMode: "sequential", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        await this.permit(api, call, "write_file", args.path, { write: true });
+        await this.sandbox.writeFile(args.path, args.content, () => this.recheckTool(attribution));
+        return text({ ...attribution, written: args.path });
       } }),
       defineTool({ name: "edit_file", executionMode: "sequential",
-        description: "Edit a confined worktree text file by exact replacement, without rewriting it. Each edits[].oldText must occur exactly once in the file, including whitespace and line breaks; edits are matched against the file as it was, must not overlap, and apply together. Unavailable in read-only asks.",
+        description: "Edit a confined worktree text file by exact replacement, without rewriting it. Each edits[].oldText must occur exactly once in the file, including whitespace and line breaks; edits are matched against the file as it was, must not overlap, and apply together. In a read-only request it waits for the session owner to allow it.",
         parameters: Type.Object({ path: Type.String(), edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1 }) }),
-        execute: async (args, api) => {
+        execute: async (args, api, call) => {
           const attribution = await this.toolActor(api, true);
+          await this.permit(api, call, "edit_file", args.path, { write: true });
           const recheck = () => this.recheckTool(attribution);
           await this.sandbox.writeFile(args.path, applyEdits(await this.sandbox.readFile(args.path, recheck), args.edits, args.path), recheck);
           return text({ ...attribution, edited: args.path, edits: args.edits.length });
         } }),
-      defineTool({ name: "git_status", description: "Read local git status without mutation or network.", parameters: Type.Object({}), execute: async (_args, api) => {
-        const attribution = await this.toolActor(api, false); return text({ ...attribution, status: await this.sandbox.gitStatus(() => this.recheckTool(attribution)) });
+      defineTool({ name: "git_status", description: "Read local git status without mutation or network.", parameters: Type.Object({}), execute: async (_args, api, call) => {
+        const attribution = await this.toolActor(api, false);
+        await this.permit(api, call, "git_status", "");
+        return text({ ...attribution, status: await this.sandbox.gitStatus(() => this.recheckTool(attribution)) });
       } }),
-      defineTool({ name: "git_commit", description: "Commit the session worktree as the owner. Waits for an exact human approval unless the owner enabled auto-approve for this request; the result says which.", parameters: Type.Object({ message: Type.String() }), execute: async (args, api) => {
-        const attribution = await this.toolActor(api, true); return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.commit", message: args.message }, String(api.taskId)));
+      defineTool({ name: "git_commit", description: "Commit the session worktree as the owner. Waits for an exact human approval unless the owner enabled auto-approve for this request; the result says which.", parameters: Type.Object({ message: Type.String() }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        await this.permit(api, call, "git_commit", args.message, { write: true });
+        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.commit", message: args.message }, String(api.taskId), { permitted: true }));
       } }),
-      defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api) => {
-        const attribution = await this.toolActor(api, true); return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId)));
+      defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        const { unbounded } = await this.permit(api, call, "bash", args.command, { write: true, shell: true });
+        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }));
       } }),
-      defineTool({ name: "github_comment", description: "Request human approval of an exact GitHub comment through the owner's broker; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api) => {
-        const attribution = await this.toolActor(api, true); return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId)));
+      defineTool({ name: "github_comment", description: "Request human approval of an exact GitHub comment through the owner's broker; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        await this.permit(api, call, "github_comment", `${args.repository}#${args.issue}`, { write: true });
+        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId), { permitted: true }));
       } }),
       defineTool({ name: "git_push", description: "Push the committed session changes of one pinned repository (its worktree path) to a branch on its Git provider, fast-forward only, optionally opening a pull request as the owner. Commit first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
         repository: Type.String(), branch: Type.String(),
         pull_request: Type.Optional(Type.Object({ title: Type.String(), body: Type.String(), base: Type.Optional(Type.String()) })),
-      }), execute: async (args, api) => {
+      }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
+        await this.permit(api, call, "git_push", `${args.repository} → ${args.branch}`, { write: true });
         const commit = await this.sandbox.head(() => this.recheckTool(attribution));
         const request = args.pull_request;
         const operation: GitPushOperation = { kind: "git.push", repository: args.repository, branch: args.branch, commit,
           ...(request ? { pullRequest: { title: request.title, body: request.body, ...(request.base !== undefined ? { base: request.base } : {}) } } : {}) };
-        return approvalText(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId)));
+        return approvalText(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId), { permitted: true }));
       } }),
     ];
   }
 
-  async createApproval(actorId: string, input: Operation, toolTaskId?: string): Promise<ApprovalRecord> {
+  /**
+   * `consent.permitted`: a tool call `permit` already let through. `consent.unbounded`: the host's owner allowed this
+   * command to run without the resource limits this host lacks.
+   */
+  async createApproval(actorId: string, input: Operation, toolTaskId?: string, consent: { permitted?: boolean; unbounded?: boolean } = {}): Promise<ApprovalRecord> {
     const operation = validateOperation(input);
-    this.requireShellCapability(operation);
-    const toolName = { "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "git.push": "git_push" }[operation.kind];
-    if (!this.binding.agent.tools.includes(toolName as never)) throw new RunnerError(403, "Operation not enabled by pinned agent version");
+    if (operation.kind === "permission") throw new RunnerError(400, "Permission requests come only from tool calls");
+    this.requireShellCapability(operation, consent.unbounded);
+    const toolName = ({ "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "git.push": "git_push" } as const)[operation.kind];
+    if (!consent.permitted && !this.binding.agent.tools.includes(toolName) && !(await this.metadata()).grants?.tools.includes(toolName)) {
+      throw new RunnerError(403, "Operation not enabled by pinned agent version");
+    }
     await this.authorize(actorId, "write");
     let admissionId: string | undefined;
     let automatic = false;
@@ -654,7 +777,8 @@ export class RunnerSession {
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
-      ...(automatic ? { status: "executing", decidedBy: this.binding.owner.id, automatic: true } : { status: "pending" }) };
+      ...(automatic ? { status: "executing", decidedBy: this.binding.owner.id, automatic: true } : { status: "pending" }),
+      ...(consent.unbounded && operation.kind === "bash" ? { unbounded: true } : {}) };
     if (admissionId !== undefined) approval.admissionId = admissionId;
     let created = false;
     await this.mutate(meta => { if (!meta.approvals[id]) { meta.approvals[id] = approval; created = true; } });
@@ -683,9 +807,9 @@ export class RunnerSession {
     }
     try {
       result = await this.sandbox.execute(operation, false, async () => {
-        this.requireShellCapability(operation);
+        this.requireShellCapability(operation, approval.unbounded === true);
         await this.authorize(actorId, "write");
-      }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true });
+      }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true });
       status = "executed";
     } catch (error) {
       // A non-zero exit is a definite outcome the agent can act on; anything else may have had partial effects.
@@ -696,9 +820,11 @@ export class RunnerSession {
     return (await this.metadata()).approvals[id]!;
   }
 
-  async decide(ticket: RunnerTicket, id: string, input: { decision: "approve" | "deny"; operation: Operation; brokerCapability?: string }): Promise<ApprovalRecord> {
+  /** `scope` applies to permission requests: allow the one call (default), or the same need for the rest of the session. */
+  async decide(ticket: RunnerTicket, id: string, input: { decision: "approve" | "deny"; operation: Operation; brokerCapability?: string; scope?: "call" | "session" }): Promise<ApprovalRecord> {
     this.assertTicket(ticket);
     if (input.decision !== "approve" && input.decision !== "deny") throw new RunnerError(400, "Invalid approval decision");
+    if (input.scope !== undefined && input.scope !== "call" && input.scope !== "session") throw new RunnerError(400, "Invalid approval scope");
     return this.exclusive(async () => {
       await this.authorize(ticket.actorId, "approve", ticket.policyVersion);
       const state = await this.metadata();
@@ -706,11 +832,42 @@ export class RunnerSession {
       if (!approval) throw new RunnerError(404, "Approval not found");
       if (stableJson(validateOperation(input.operation)) !== stableJson(approval.operation)) throw new RunnerError(409, "Approval operation mismatch");
       if (approval.status !== "pending") throw new RunnerError(409, "Approval has already been decided; unsafe effects are never retried");
+      // A tool call is waiting on this request inside a running turn, so it is decided at once rather than after the queue.
+      if (approval.operation.kind === "permission") {
+        const request = approval.operation;
+        if (ticket.actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can allow more than the session allows");
+        if (request.needs.includes("unbounded-shell") && this.binding.session.connectorOwnerId !== this.binding.owner.id) {
+          throw new RunnerError(403, "Only the host's owner can allow a shell without resource limits");
+        }
+        const scope = input.scope ?? "call";
+        let settled: string[] = [];
+        await this.mutate(meta => {
+          settled = [id];
+          Object.assign(meta.approvals[id]!, input.decision === "approve" ? { status: "approved", decidedBy: ticket.actorId, scope } : { status: "denied", decidedBy: ticket.actorId });
+          if (input.decision !== "approve" || scope !== "session") return;
+          const grants = meta.grants ??= { tools: [], write: false, unboundedShell: false };
+          if (request.needs.includes("tool") && !grants.tools.includes(request.tool)) grants.tools.push(request.tool);
+          if (request.needs.includes("write")) grants.write = true;
+          if (request.needs.includes("unbounded-shell")) grants.unboundedShell = true;
+          // Parallel calls of the same round that wait on what the session now allows go ahead too.
+          for (const other of Object.values(meta.approvals)) {
+            if (other.id === id || other.status !== "pending" || other.operation.kind !== "permission" || !this.coveredBy(other.operation, grants)) continue;
+            Object.assign(other, { status: "approved", decidedBy: ticket.actorId, scope });
+            settled.push(other.id);
+          }
+        });
+        const approvals = (await this.metadata()).approvals;
+        for (const decided of settled) {
+          this.#permissionWaiters.get(decided)?.resolve(approvals[decided]!);
+          this.#permissionWaiters.delete(decided);
+        }
+        return approvals[id]!;
+      }
       if (input.decision === "deny") {
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "denied", decidedBy: ticket.actorId }); });
         return (await this.metadata()).approvals[id]!;
       }
-      this.requireShellCapability(approval.operation);
+      this.requireShellCapability(approval.operation, approval.unbounded === true);
       await this.authorize(approval.requestedBy, "write");
       if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status))) throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
       if ((approval.operation.kind === "github.comment" || approval.operation.kind === "git.push") && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
@@ -755,10 +912,10 @@ export class RunnerSession {
           }
           result = JSON.stringify({ id: responseBody.id, url: responseBody.url });
         } else result = await this.sandbox.execute(approval.operation, false, async () => {
-          this.requireShellCapability(approval.operation);
+          this.requireShellCapability(approval.operation, approval.unbounded === true);
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
-        }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true });
+        }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true });
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executed", result: boundedResult(result) }); });
       } catch {
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "interrupted", result: "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited." }); });
@@ -871,6 +1028,8 @@ export class RunnerSession {
       await Promise.allSettled([...this.pushes].map(push => push.done));
     }
     this.generation++;
+    // Calls still waiting on a permission end with the harness; their requests are marked interrupted on reopen.
+    this.#permissionWaiters.clear();
     // A Session that already failed on a storage error has closed itself, and closing again only repeats that error.
     // Read the flag first: a close that fails now also marks the session failed, and its error must still surface.
     const failed = this.#failed;

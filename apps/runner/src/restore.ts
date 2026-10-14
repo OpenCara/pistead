@@ -129,7 +129,10 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
       || (run.started !== undefined && typeof run.started !== "boolean")) invalid("Invalid backup run binding or receipt");
   }
   for (const [id, approval] of Object.entries(manifest.approvals)) {
-    if (!record(approval) || !["pending", "denied", "executed", "interrupted"].includes(approval.status as string)) invalid("Backup requires idle approvals");
+    if (!record(approval)) invalid("Backup requires idle approvals");
+    // An allowed permission request is settled as well: its tool call went ahead, and nothing runs from the record.
+    if (!["pending", "denied", "executed", "interrupted"].includes(approval.status as string)
+      && !(approval.status === "approved" && record(approval.operation) && approval.operation.kind === "permission")) invalid("Backup requires idle approvals");
     if (approval.id !== id || !id || approval.sessionId !== source.session.id
       || typeof approval.requestedBy !== "string" || !approval.requestedBy || approval.requestedBy.length > 256
       || typeof approval.createdAt !== "string" || !Number.isFinite(Date.parse(approval.createdAt))

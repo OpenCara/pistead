@@ -11,7 +11,7 @@ import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, use
 import { runnerJSON, runnerRequest } from './runner.js';
 import { parseOperation } from './operations.js';
 import { requireConnectorSession } from './connectors.js';
-import { presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
+import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
@@ -308,6 +308,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/operations', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
     const operation = parseOperation(await jsonObject(c));
+    if (operation.kind === 'permission') fail(400, 'invalid_operation', 'Permission requests come only from tool calls.');
     await requireOperationTool(c.env, row, operation);
     const result = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'operations', '', { operation }));
     if (!result?.approval || result.approval.sessionId !== row.id || result.approval.requestedBy !== c.get('auth').userId) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval request.');
@@ -323,6 +324,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const approvalId = identifier(c.req.param('approvalId'), 'approvalId');
     const input = await jsonObject(c);
     if (input.decision !== 'approve' && input.decision !== 'deny') fail(400, 'invalid_decision', 'Expected approve or deny.');
+    if (input.scope !== undefined && input.scope !== 'call' && input.scope !== 'session') fail(400, 'invalid_decision', 'Expected the call or session scope.');
     // The browser echoes its displayed commitment. A later runtime view can only confirm it, never replace it.
     const review = await reviewedApproval(c, row, approvalId, input.reviewHash);
     const result = await runnerJSON<{ view: SessionView }>(await runnerRequest(c, row, 'view'));
@@ -332,6 +334,14 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (!approval) fail(404, 'not_found', 'Approval request not found.');
     if (approval.status !== 'pending') fail(409, 'approval_already_decided', 'This approval request is no longer pending.');
     const operation = review.operation;
+    // A permission request lets a tool call do more than the session allows, so only its owner decides it.
+    if (operation.kind === 'permission') {
+      if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can allow more than the session allows.');
+      if (operation.needs.includes('unbounded-shell') && row.connector_owner_id !== row.owner_id) {
+        fail(403, 'host_owner_required', 'Only the host\'s owner can allow a shell without resource limits.');
+      }
+    } else if (input.scope !== undefined) fail(400, 'invalid_decision', 'Only permission requests take a scope.');
+    const scope = operation.kind === 'permission' ? (input.scope === 'session' ? 'session' : 'call') : undefined;
     let brokerCapability: string | undefined;
     if (input.decision === 'approve') {
       const writer = await sessionAccess(c.env, row.id, review.requested_by);
@@ -347,13 +357,21 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(await sha256(brokerCapability), row.id, approvalId, c.get('auth').userId,
           review.requested_by, await sha256(JSON.stringify(operation)), Math.floor(Date.now() / 1000) + 90, now()).run();
       }
+      // Tool grants live here as well as on the host, so a host can't present commands, pushes or comments for a tool
+      // the owner never allowed. A one-call grant covers the command approval of that same tool call; the review above
+      // only admits permission requests that name their call.
+      if (operation.kind === 'permission' && operation.needs.includes('tool')) {
+        await c.env.DB.query(`INSERT INTO session_tool_grants (session_id, tool, call_id, approval_id, granted_by, created_at)
+          VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, tool, call_id) DO NOTHING`)
+          .bind(row.id, operation.tool, scope === 'session' ? '' : permissionCall(approvalId)!, approvalId, c.get('auth').userId, now()).run();
+      }
     }
     const decided = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'approve', approvalId, {
-      approvalId, decision: input.decision, operation, ...(brokerCapability ? { brokerCapability } : {}),
+      approvalId, decision: input.decision, operation, ...(brokerCapability ? { brokerCapability } : {}), ...(scope ? { scope } : {}),
     }));
     if (!decided?.approval || decided.approval.id !== approvalId || decided.approval.sessionId !== row.id) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval result.');
     [decided.approval] = await presentApprovals(c, row, [decided.approval]);
-    await auditStatement(c.env, c.get('auth').userId, `approval.${input.decision}`, row.workspace_id, row.id, { approvalId, kind: operation.kind, status: decided.approval.status }).run();
+    await auditStatement(c.env, c.get('auth').userId, `approval.${input.decision}`, row.workspace_id, row.id, { approvalId, kind: operation.kind, status: decided.approval.status, ...(scope ? { scope } : {}) }).run();
     return c.json(decided);
   });
 

@@ -1,5 +1,5 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { permissions, type ApprovalRecord, type GitPushOperation, type Operation, type Permission, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { permissions, type ApprovalRecord, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
@@ -128,14 +128,41 @@ export function SessionPanel(props: PanelProps) {
 
 /** One approval record; decision controls, when allowed, come in as children. */
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
+  const { operation } = approval;
+  const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
+    ? <> · Allowed by {approval.decidedBy} {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
+    : approval.decidedBy && <> · Decision by {approval.decidedBy}</>;
   return <article className="approval-card card">
-    <div className="approval-head"><span className="approval-kind">{approval.operation.kind}</span><span className="spacer" /><ApprovalStatus approval={approval} /></div>
-    {approval.operation.kind === "git.push" && <GitPushSummary operation={approval.operation} />}
-    <pre>{JSON.stringify(approval.operation, null, 2)}</pre>
-    <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : approval.decidedBy && <> · Decision by {approval.decidedBy}</>}</p>
+    <div className="approval-head">
+      <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />
+      {approval.unbounded && <StatusBadge tone="warning">No resource limits</StatusBadge>}
+      <ApprovalStatus approval={approval} />
+    </div>
+    {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
+      {operation.kind === "git.push" && <GitPushSummary operation={operation} />}
+      <pre>{JSON.stringify(operation, null, 2)}</pre>
+    </>}
+    <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
   </article>;
+}
+
+const permissionNeedText: Record<PermissionNeed, string> = {
+  tool: "A tool this agent doesn't include",
+  write: "A change in a Read-only message",
+  "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk.",
+};
+/** Tools whose effect gets its own approval card after the permission, unless the message auto-approves. */
+const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment"];
+
+function PermissionSummary({ request, pending }: { request: PermissionRequest; pending: boolean }) {
+  return <>
+    <p><code>{request.tool}</code> {pending ? "needs the session owner's permission for:" : "asked the session owner's permission for:"}</p>
+    <ul className="permission-needs small">{request.needs.map(need => <li key={need}>{permissionNeedText[need]}</li>)}</ul>
+    {request.target && <pre>{request.target}</pre>}
+    {pending && approvedTools.includes(request.tool) && <p className="muted small">Allowing it doesn't run anything yet: the operation still gets its own approval, unless the message auto-approves.</p>}
+  </>;
 }
 
 function GitPushSummary({ operation }: { operation: GitPushOperation }) {

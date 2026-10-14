@@ -1,4 +1,4 @@
-import type { ApprovalRecord, Operation } from '../../../packages/shared/src/types.js';
+import type { ApprovalRecord, Operation, ToolName } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow } from './types.js';
 import { fail, identifier, now, text, userIdentifier } from './http.js';
@@ -9,7 +9,7 @@ type ReviewRow = {
   source: 'explicit' | 'model'; admission_id: string | null; review_hash: string; created_at: string;
 };
 type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: string; expires_at: number };
-const operationTools: Record<Operation['kind'], string> = { 'github.comment': 'github_comment', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push' };
+const operationTools: Record<Exclude<Operation['kind'], 'permission'>, ToolName> = { 'github.comment': 'github_comment', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push' };
 const statuses: readonly string[] = ['pending', 'approved', 'denied', 'executing', 'executed', 'interrupted', 'failed'];
 
 async function toolsFor(env: Env, row: SessionRow): Promise<string[]> {
@@ -17,14 +17,35 @@ async function toolsFor(env: Env, row: SessionRow): Promise<string[]> {
   if (!agent) fail(409, 'invalid_binding', 'The pinned agent is unavailable.');
   return JSON.parse(agent.tools_json) as string[];
 }
-export async function requireOperationTool(env: Env, row: SessionRow, operation: Operation): Promise<void> {
-  if (!(await toolsFor(env, row)).includes(operationTools[operation.kind])) fail(403, 'tool_not_allowed', 'The pinned agent does not allow this operation.');
+/** The tool call a permission request `permission-<call>` waits in; its operation's approval is `tool-<call>`. */
+export function permissionCall(approvalId: string): string | undefined {
+  return /^permission-([A-Za-z0-9_-]+)$/.exec(approvalId)?.[1];
+}
+/**
+ * Whether a session may use an operation's tool: its pinned agent's, or one the owner allowed through a permission
+ * request, for the session or for the one call whose approval is `tool-<call>`. A permission request asks for the tool
+ * itself, so it is presented whenever it names its call (a one-call grant must never become a session one); only the
+ * owner can decide it.
+ */
+async function sessionTools(env: Env, row: SessionRow): Promise<(operation: Operation, approvalId: string) => boolean> {
+  const agentTools = await toolsFor(env, row);
+  const grants = await env.DB.query<{ tool: string; call_id: string }>('SELECT tool, call_id FROM session_tool_grants WHERE session_id = ?').bind(row.id).all();
+  return (operation, approvalId) => {
+    if (operation.kind === 'permission') return permissionCall(approvalId) !== undefined;
+    const tool = operationTools[operation.kind];
+    const call = approvalId.startsWith('tool-') ? approvalId.slice('tool-'.length) : undefined;
+    return agentTools.includes(tool) || grants.some(grant => grant.tool === tool && (grant.call_id === '' || grant.call_id === call));
+  };
+}
+export async function requireOperationTool(env: Env, row: SessionRow, operation: Operation, approvalId = ''): Promise<void> {
+  if (!(await sessionTools(env, row))(operation, approvalId)) fail(403, 'tool_not_allowed', 'The pinned agent does not allow this operation.');
 }
 export async function reviewCommitment(sessionId: string, approvalId: string, requestedBy: string, operation: Operation): Promise<string> {
   return sha256(JSON.stringify({ sessionId, approvalId, requestedBy, operation }));
 }
 function unavailable(approval: ApprovalRecord): ApprovalRecord {
-  if (!['pending', 'approved', 'executing'].includes(approval.status)) return approval;
+  // A decided permission request is final: its tool call already went ahead or failed, and nothing runs from it.
+  if (!['pending', 'approved', 'executing'].includes(approval.status) || (approval.operation.kind === 'permission' && approval.status !== 'pending')) return approval;
   return { ...approval, status: 'interrupted', result: 'This approval has no current authorized write admission. Submit a new write request.' };
 }
 function activeAdmission(admission: AdmissionRow | undefined, row: SessionRow, actorId: string): boolean {
@@ -59,8 +80,17 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
     // Only the owner's own commands, commits and pushes may run without a human decision, and never a GitHub comment.
     if (raw.automatic !== undefined) {
       if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id
-        || approval.status === 'pending' || operation.kind === 'github.comment') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
+        || approval.status === 'pending' || operation.kind === 'github.comment' || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
       approval.automatic = true;
+    }
+    // An allowed permission request says how far it reaches; only a command can run without resource limits.
+    if (raw.scope !== undefined) {
+      if ((raw.scope !== 'call' && raw.scope !== 'session') || operation.kind !== 'permission' || approval.status !== 'approved') fail(502, 'invalid_runner_response', 'The runtime returned an invalid permission scope.');
+      approval.scope = raw.scope;
+    }
+    if (raw.unbounded !== undefined) {
+      if (raw.unbounded !== true || operation.kind !== 'bash') fail(502, 'invalid_runner_response', 'The runtime returned an invalid unbounded command.');
+      approval.unbounded = true;
     }
     if (explicit && (requestedBy !== explicit.requestedBy || JSON.stringify(operation) !== JSON.stringify(explicit.operation) || raw.admissionId !== undefined)) {
       fail(502, 'approval_changed', 'The runtime changed the explicitly requested operation.');
@@ -78,7 +108,7 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       WHERE session_id = ? AND id IN (SELECT value FROM json_each(?))`).bind(row.id, JSON.stringify(admissionIds)).all();
     for (const admission of result) admissions.set(admission.id, admission);
   }
-  const tools = await toolsFor(c.env, row);
+  const allows = await sessionTools(c.env, row);
   const candidates: ReviewRow[] = [];
   const commitments = new Map<string, string>();
   for (const item of normalized) {
@@ -93,7 +123,7 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       }
       continue;
     }
-    if (!tools.includes(operationTools[approval.operation.kind])) continue;
+    if (!allows(approval.operation, approval.id)) continue;
     const admission = admissionId ? admissions.get(admissionId) : undefined;
     if (!explicit && !activeAdmission(admission, row, approval.requestedBy)) continue;
     candidates.push({ session_id: row.id, approval_id: approval.id, requested_by: explicit?.requestedBy ?? admission!.actor_id,
@@ -118,7 +148,7 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
     if (review.review_hash !== commitments.get(approval.id) || review.admission_id !== admissionId || (explicit && review.source !== 'explicit')) {
       fail(502, 'approval_changed', 'The runtime changed a previously reviewed operation or requester.');
     }
-    if (!tools.includes(operationTools[approval.operation.kind]) || (review.source === 'model' && !activeAdmission(admissions.get(review.admission_id!), row, review.requested_by))) return unavailable(approval);
+    if (!allows(approval.operation, approval.id) || (review.source === 'model' && !activeAdmission(admissions.get(review.admission_id!), row, review.requested_by))) return unavailable(approval);
     return { ...approval, requestedBy: review.requested_by, operation: parseOperation(JSON.parse(review.operation_json)), reviewHash: review.review_hash };
   });
 }
@@ -129,7 +159,7 @@ export async function reviewedApproval(c: AppContext, row: SessionRow, approvalI
   if (!review || !constantTimeEqual(review.review_hash, reviewHash)) fail(409, 'approval_review_required', 'Refresh and review the exact operation before deciding.');
   const operation = parseOperation(JSON.parse(review.operation_json));
   await requireProvenance(c.env, row, review);
-  await requireOperationTool(c.env, row, operation);
+  await requireOperationTool(c.env, row, operation, approvalId);
   return { ...review, operation };
 }
 
@@ -137,5 +167,5 @@ export async function requireBrokerReview(env: Env, row: SessionRow, approvalId:
   const review = await env.DB.query<ReviewRow>('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
   if (!review || review.requested_by !== requestedBy || review.operation_json !== JSON.stringify(operation)) fail(403, 'invalid_approval_provenance', 'The operation has no matching human-reviewed write request.');
   await requireProvenance(env, row, review);
-  await requireOperationTool(env, row, operation);
+  await requireOperationTool(env, row, operation, approvalId);
 }

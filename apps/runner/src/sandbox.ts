@@ -30,6 +30,11 @@ export type SandboxAuthorize = () => Promise<void>;
 export interface SandboxExecutionOptions {
   /** Trusted harness only: caller must separately require faux + allowTestShell. */
   allowTestShell?: boolean;
+  /**
+   * The host's owner allowed this command to run without the resource limits this host lacks. It still runs inside
+   * the sandbox's namespaces; provisioned limits are always used when present.
+   */
+  unbounded?: boolean;
 }
 
 export interface SnapshotFile {
@@ -1298,12 +1303,14 @@ export class Sandbox {
       case "git.commit":
         if (readOnly) throw new Error("Read-only sandbox cannot commit");
         return this.#operation({ kind: "commit", message: text(operation.message, "commit message", 16 * 1024, true) }, false, authorize, true);
-      case "bash":
+      case "bash": {
         if (options.allowTestShell === true && !this.#testProvider) throw new Error("Test shell bypass is restricted to the explicit faux provider");
-        if (options.allowTestShell !== true && !this.#resources) {
+        const bounded = options.allowTestShell !== true && (!!this.#resources || options.unbounded !== true);
+        if (bounded && !this.#resources) {
           throw new Error("Production bash unavailable: explicitly provisioned cgroup and bounded filesystem resources are required");
         }
-        return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize, false, options.allowTestShell !== true);
+        return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize, false, bounded);
+      }
       case "github.comment":
         throw new Error("GitHub operations require the control-plane credential broker, not the sandbox");
       default:

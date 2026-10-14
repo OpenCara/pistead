@@ -1,6 +1,7 @@
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
+import { permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
 import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
@@ -120,6 +121,13 @@ export function validateOperation(value: unknown): Operation {
       && validPushBranch(op.branch) && typeof op.commit === "string" && /^[0-9a-f]{40}$/.test(op.commit)
       && keys.every(key => ["kind", "repository", "branch", "commit", "pullRequest"].includes(key))
       && keys.length === (request === undefined ? 4 : 5) && validRequest) return op;
+  }
+  if (op.kind === "permission") {
+    const keys = Object.keys(op);
+    // Needs are unique and in permissionNeeds order, so equal requests hash equally.
+    if (keys.length === 4 && keys.every(key => ["kind", "tool", "target", "needs"].includes(key)) && toolNames.includes(op.tool)
+      && typeof op.target === "string" && op.target.length <= 8192 && !op.target.includes("\0") && Array.isArray(op.needs) && op.needs.length > 0
+      && op.needs.join() === permissionNeeds.filter(need => op.needs.includes(need)).join()) return op;
   }
   throw new RunnerError(400, "Invalid operation");
 }

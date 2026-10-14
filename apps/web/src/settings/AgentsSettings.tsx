@@ -190,7 +190,7 @@ function AgentEditor({ agent, readOnly, models, hostNames, connectionsError, not
       {!models.length && !readOnly && <CardBody><Alert variant="warning" title="No models available" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "hosts" })}>Pair a host</LinkButton>}>Pair your Pi or use a host a teammate has shared.</Alert></CardBody>}
       {connectionsError && <CardBody><Feedback error={connectionsError} /></CardBody>}
     </Section>
-    <Section title="Tools" info="Sensitive operations still need approval">
+    <Section title="Tools" info="The agent uses these without asking; any other tool waits for the session owner's permission. Sensitive operations still need approval">
       {toolNames.map(tool => <label className="row check-row" key={tool}>
         <input type="checkbox" className="checkbox" disabled={readOnly} checked={tools.includes(tool)} onChange={event => setTools(current => event.target.checked ? [...current, tool] : current.filter(value => value !== tool))} />
         <span className="mono">{tool}</span>
