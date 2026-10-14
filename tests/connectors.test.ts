@@ -1768,6 +1768,48 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   assert.equal(s.hub.requests.length, 1, 'Visibility changes must not reprovision the pinned runtime');
 });
 
+test('owners rename and archive sessions; archived sessions are read-only and unarchive to their exact status', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  // Rename: owner-only, one line, never mixed with visibility, no policy bump.
+  await json(await s.owner.request('POST', `${path}/grants`, { userId: s.member.user.id, permissions: ['manage'] }));
+  const { policy_version: granted } = f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id) as { policy_version: number };
+  await denied(await s.member.request('PATCH', path, { title: 'Hijacked' }), 403, 'owner_required');
+  for (const title of ['', '   ', 'two\nlines', 'x'.repeat(201), 1, null]) {
+    assert.equal((await s.owner.request('PATCH', path, { title })).status, 400, JSON.stringify(title));
+  }
+  assert.equal((await s.owner.request('PATCH', path, { title: 'Renamed', visibility: 'private' })).status, 400);
+  const renamed = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { title: '  Renamed session  ' }));
+  assert.equal(renamed.session.title, 'Renamed session');
+  assert.equal(renamed.session.policyVersion, granted);
+
+  // Archive: owner-only, bumps the policy version and blocks every mutation.
+  await denied(await s.member.request('POST', `${path}/archive`), 403, 'owner_required');
+  const archived = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/archive`));
+  assert.equal(archived.session.status, 'archived');
+  assert.equal(archived.session.policyVersion, granted + 1);
+  assert.equal(f.sqlite.prepare('SELECT archived_status FROM sessions WHERE id = ?').get(s.session.id)!.archived_status, 'ready');
+  await denied(await s.owner.request('POST', `${path}/archive`), 409, 'session_archived');
+  await denied(await s.owner.request('PATCH', path, { title: 'While archived' }), 409, 'session_archived');
+  await denied(await s.owner.request('PATCH', path, { visibility: 'private' }), 409, 'session_archived');
+  await denied(await s.owner.request('POST', `${path}/submit`, { content: 'hi', requestId: 'archived-request' }), 409, 'session_archived');
+  assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', path))).session.status, 'archived');
+
+  // Unarchive: owner-only, restores the exact previous status.
+  await denied(await s.member.request('POST', `${path}/unarchive`), 403, 'owner_required');
+  const restored = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/unarchive`));
+  assert.equal(restored.session.status, 'ready');
+  assert.equal(restored.session.policyVersion, granted + 2);
+  assert.equal(f.sqlite.prepare('SELECT archived_status FROM sessions WHERE id = ?').get(s.session.id)!.archived_status, null);
+  await denied(await s.owner.request('POST', `${path}/unarchive`), 409, 'session_not_archived');
+  f.sqlite.prepare("UPDATE sessions SET status = 'error' WHERE id = ?").run(s.session.id);
+  await json(await s.owner.request('POST', `${path}/archive`));
+  assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/unarchive`))).session.status, 'error');
+  const actions = (f.sqlite.prepare('SELECT action FROM audit WHERE session_id = ? ORDER BY created_at, rowid').all(s.session.id) as { action: string }[]).map(row => row.action);
+  for (const action of ['session.renamed', 'session.archived', 'session.unarchived']) assert.ok(actions.includes(action), action);
+  assert.equal(s.hub.requests.length, 1, 'Renaming and archiving must not contact the host');
+});
+
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const { session: privateSession } = await json<{ session: SessionRecord }>(await s.owner.request('POST', '/api/sessions', {

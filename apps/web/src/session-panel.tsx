@@ -22,6 +22,10 @@ export interface SessionActions {
   backupBlocked: boolean;
   changeVisibility: () => void;
   createBackup: () => void;
+  /** Resolves true once the new title is saved. */
+  rename: (title: string) => Promise<boolean>;
+  archive: () => void;
+  unarchive: () => void;
 }
 
 export function useSessionActions({ session, user, backupBlocked, onChange }: { session: SessionRecord | null; user: UserProfile; backupBlocked: boolean; onChange: () => void }): SessionActions {
@@ -57,7 +61,40 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       onChange();
     }, "Backup created");
   }
-  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup };
+  async function rename(title: string): Promise<boolean> {
+    const next = title.trim();
+    if (!session || !isOwner || action.busy || !next) return false;
+    if (next === session.title) return true;
+    let saved = false;
+    await action.run(async () => {
+      await api(`/api/sessions/${segment(session.id)}`, { method: "PATCH", body: { title: next } });
+      saved = true;
+      onChange();
+    }, "Session renamed");
+    return saved;
+  }
+  async function archive() {
+    if (!session || !isOwner || action.busy || session.status === "archived") return;
+    const confirmed = await confirmDialog({
+      title: "Archive session?",
+      message: "The session becomes read-only for everyone and is hidden from the sidebar. Its history stays viewable, and nothing is deleted. Pending approvals can't be decided while it's archived. You can unarchive it later.",
+      confirmLabel: "Archive",
+    });
+    if (!confirmed) return;
+    await action.run(async () => {
+      await api(`/api/sessions/${segment(session.id)}/archive`, { method: "POST" });
+      onChange();
+    }, "Session archived");
+  }
+  function unarchive() {
+    if (!session || !isOwner || action.busy || session.status !== "archived") return;
+    void action.run(async () => {
+      await api(`/api/sessions/${segment(session.id)}/unarchive`, { method: "POST" });
+      onChange();
+    }, "Session unarchived");
+  }
+  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup, rename,
+    archive: () => void archive(), unarchive };
 }
 
 const approvalTone: Record<ApprovalRecord["status"], Tone> = {
@@ -195,7 +232,7 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <RepositoriesSection session={session} refresh={refresh} />
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && <BackupsSection session={session} actions={actions} openSession={openSession} />}
-    {canWrite && <OperationSection session={session} changed={changed} />}
+    {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
     <AccessSection session={session} view={view} user={user} />
   </div>;
 }
@@ -309,7 +346,7 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
         : "Only the owner and people with a grant can view prompts and output"}. {isOwner
         ? visibility === "workspace" ? "Making it private keeps explicit grants and can't recall content already viewed or copied" : "Before sharing, check existing prompts, tool output and side asks for secrets"
         : "Only the session owner can change visibility"}</>}
-      trailing={isOwner && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
+      trailing={isOwner && session.status !== "archived" && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
     {canManage ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
       <ResourceState {...grants} retry={grants.refresh}>
@@ -358,7 +395,7 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
       <Button variant="outline" size="sm" disabled={actions.backupBlocked || actions.action.busy} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
     </div>}
   >
-    {actions.backupBlocked && <Row title="Backup unavailable right now" hint="Unavailable while work is queued or running, or the live state can't be confirmed" />}
+    {actions.backupBlocked && <Row title="Backup unavailable right now" hint={session.status === "archived" ? "Unarchive the session to create a backup" : "Unavailable while work is queued or running, or the live state can't be confirmed"} />}
     {backup && <Row
       leading={<Icon name="check" size={16} />}
       title={<>Backup created <Timestamp value={backup.createdAt} /></>}
