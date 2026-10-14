@@ -15,6 +15,7 @@ import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
 import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
+import { hostGitAuthorization } from "./git-credentials.js";
 import { recoverResourceOrphans } from "./resources.js";
 import { RunnerService, createRunnerApp } from "./server.js";
 import type { RunnerConfig } from "./session.js";
@@ -162,20 +163,21 @@ export async function connectorManifest(localModels: LocalModels, allowFaux = fa
   return models;
 }
 
-function capabilities(value?: ConnectorCapabilities, unsandboxed = false): ConnectorCapabilities {
+function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boolean; gitCredentials?: boolean } = {}): ConnectorCapabilities {
   const result = value ?? { platform: process.platform, sandbox: false, productionShell: false };
   if (typeof result.platform !== "string" || !/^[A-Za-z0-9_-]{1,40}$/.test(result.platform)
     || typeof result.sandbox !== "boolean" || typeof result.productionShell !== "boolean"
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
-  // The host mode, not caller-supplied metadata, decides whether isolation is disclosed as absent.
-  // Every connector of this version applies per-message model, reasoning and access choices.
-  if (unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true };
+  // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
+  // pushes may use this host's Git credentials. Every connector of this version applies per-message choices and pushes.
+  const credentials = mode.gitCredentials ? { gitCredentials: true } : {};
+  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, ...credentials };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {
   server: string; pairing: { id: string; code: string }; localModels: LocalModels;
-  capabilities?: ConnectorCapabilities; unsandboxed?: boolean; allowFaux?: boolean; allowInsecureLoopback?: boolean; fetch?: typeof fetch; signal?: AbortSignal;
+  capabilities?: ConnectorCapabilities; unsandboxed?: boolean; gitCredentials?: boolean; allowFaux?: boolean; allowInsecureLoopback?: boolean; fetch?: typeof fetch; signal?: AbortSignal;
 }): Promise<ConnectorCredentials> {
   const origin = controlPlaneOrigin(options.server, options.allowInsecureLoopback);
   const { id, code } = options.pairing;
@@ -184,7 +186,7 @@ export async function claimConnectorPairing(options: {
   const response = await (options.fetch ?? fetch)(`${origin}/api/connectors/pairings/${id}/claim`, {
     method: "POST", redirect: "error", credentials: "omit",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: capabilities(options.capabilities, options.unsandboxed) }),
+    body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: capabilities(options.capabilities, options) }),
     signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]),
   });
   if (!response.ok) { await response.body?.cancel(); throw new ConnectorSetupError("Pairing rejected or unavailable: the code may be wrong, expired (codes last 10 minutes) or already used. Create a new pairing code and try again."); }
@@ -256,6 +258,8 @@ export interface ConnectorOptions {
   resources?: RunnerConfig["resources"];
   /** Run session work directly on the host without isolation; requires explicit owner consent. */
   unsandboxed?: boolean;
+  /** Let pushes in the owner's own sessions use this host's Git credentials (connect --git-credentials). */
+  gitCredentials?: boolean;
   fetch?: typeof fetch;
   createSocket?: (url: string, protocols: string[]) => ConnectorSocket;
   runtimeFactory?: (config: RunnerConfig) => Promise<ConnectorRuntime>;
@@ -430,13 +434,16 @@ export class LocalConnector {
             ...(request.capability !== undefined ? { capability: request.capability } : {}),
             ...(request.admissionId !== undefined ? { admissionId: request.admissionId } : {}),
           };
-          return z.object({
-            credentialId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
-            remote: z.string().max(2048).regex(/^https:\/\/[^/@\s]+\/\S*$/),
-            authorization: z.string().regex(/^(Basic|Bearer) [A-Za-z0-9+/=._~-]{1,8000}$/),
-            expiresAt: z.string().datetime(),
-          }).strict().parse(await this.pushCallback(generation, "/api/connectors/self/git/push/credential", payload));
+          const issued = {
+            credentialId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), remote: z.string().max(2048).regex(/^https:\/\/[^/@\s]+\/\S*$/), expiresAt: z.string().datetime(),
+          };
+          return z.union([
+            z.object({ ...issued, authorization: z.string().regex(/^(Basic|Bearer) [A-Za-z0-9+/=._~-]{1,8000}$/) }).strict(),
+            // Push access with the host's own Git credentials: the session reads them here, so none comes from the control plane.
+            z.object({ ...issued, hostCredentials: z.literal(true) }).strict(),
+          ]).parse(await this.pushCallback(generation, "/api/connectors/self/git/push/credential", payload));
         },
+        ...(this.options.gitCredentials ? { hostGitCredential: (remote: string, signal?: AbortSignal) => hostGitAuthorization(remote, { signal }) } : {}),
         pushComplete: async request => {
           const payload = {
             sessionId: request.sessionId, approvalId: request.approvalId, credentialId: request.credentialId, outcome: request.outcome,
@@ -453,7 +460,7 @@ export class LocalConnector {
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
-      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: capabilities(this.options.capabilities, this.options.unsandboxed) });
+      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: capabilities(this.options.capabilities, this.options) });
       this.requireGeneration(generation);
       generation.runtimeReady.resolve();
       this.options.onStatus?.("connected");

@@ -1,7 +1,7 @@
 import { HTTPException } from 'hono/http-exception';
 import type { GitProvider, SessionRepository } from '../../../../packages/shared/src/repositories.js';
 import { repositoryLimits } from '../../../../packages/shared/src/repositories.js';
-import type { GitPushOperation, PushCompletionResult, PushCredential, PushOutcome } from '../../../../packages/shared/src/types.js';
+import type { GitPushOperation, HostPushCredential, PushCompletionResult, PushCredential, PushOutcome } from '../../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../../packages/shared/src/policy.js';
 import type { AppContext, PushCredentialRow, SessionAccess, SessionRow } from '../types.js';
@@ -179,7 +179,8 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
   let minted: MintedToken;
   try {
     minted = await mintPushToken(c.env, { workspaceId: row.workspace_id, sessionId, provider, host, fullName: pin.fullName,
-      repositoryId: String(pin.repositoryId), branch: operation.branch });
+      repositoryId: String(pin.repositoryId), branch: operation.branch,
+      ownerId: row.owner_id, connectorId: row.connector_id ?? null, hostOwnerId: row.connector_owner_id ?? null, owner: access });
   } catch (error) {
     await closeFailed();
     throw error;
@@ -206,8 +207,10 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
     }
     throw error;
   }
-  const result: PushCredential = { credentialId, remote: target.remote, authorization: minted.authorization,
-    expiresAt: new Date(minted.expiresAt * 1000).toISOString() };
+  const expiresAt = new Date(minted.expiresAt * 1000).toISOString();
+  const result: PushCredential | HostPushCredential = minted.authorization === null
+    ? { credentialId, remote: target.remote, hostCredentials: true, expiresAt }
+    : { credentialId, remote: target.remote, authorization: minted.authorization, expiresAt };
   return c.json(result);
 }
 

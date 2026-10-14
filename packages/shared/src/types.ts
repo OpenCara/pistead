@@ -136,7 +136,10 @@ export type Operation =
   | { kind: "github.comment"; repository: string; issue: number; body: string }
   | GitPushOperation
   | PermissionRequest;
-/** A short-lived push credential minted by the control plane for exactly one approved push. Never persisted by the runner. */
+/**
+ * The credential the control plane issued for exactly one approved push: a short-lived token minted from a workspace app
+ * or bot identity, or the session owner's own token when push access uses their account. Never persisted by the runner.
+ */
 export interface PushCredential {
   /** Control-plane ledger id; echoed back when the push completes so the credential is revoked. */
   credentialId: string;
@@ -144,6 +147,13 @@ export interface PushCredential {
   remote: string;
   /** Complete Authorization header value for requests to `remote` only. */
   authorization: string;
+  expiresAt: string;
+}
+/** Push access uses the host's own Git credentials: the connector reads them for `remote` itself, so none is issued. */
+export interface HostPushCredential {
+  credentialId: string;
+  remote: string;
+  hostCredentials: true;
   expiresAt: string;
 }
 /** `unknown`: the push failed during or after the upload, so the remote branch may or may not have moved. */
@@ -172,8 +182,12 @@ export interface PushCompleteRequest {
   /** The commit now at refs/heads/<branch>; required unless the outcome is "failed". */
   tip?: string;
 }
-/** How a workspace push identity mints its short-lived tokens. */
-export const pushIdentityKinds = ["github-app", "entra-federation", "bitbucket-client-credentials", "oauth-refresh", "forgejo-integration"] as const;
+/**
+ * How a workspace push identity gets the credential for each push: a short-lived token minted from an app or bot
+ * identity, the session owner's own account (`owner-account`), or the host's own Git credentials (`host-credentials`).
+ * The last two serve only sessions running on the session owner's own host.
+ */
+export const pushIdentityKinds = ["github-app", "entra-federation", "bitbucket-client-credentials", "oauth-refresh", "forgejo-integration", "owner-account", "host-credentials"] as const;
 export type PushIdentityKind = (typeof pushIdentityKinds)[number];
 /** Public view of a workspace push identity; secrets never leave the control plane. */
 export interface PushIdentity {

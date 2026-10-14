@@ -89,7 +89,8 @@ function decodeJwt(jwt: string, publicKey: string): { header: Record<string, unk
 }
 const basicHeader = (user: string, secret: string) => `Basic ${Buffer.from(`${user}:${secret}`).toString('base64')}`;
 const target = (workspaceId: string, values: Partial<MintTarget>): MintTarget =>
-  ({ workspaceId, sessionId: 'session-1', provider: 'github', host: 'github.com', fullName: 'acme/app', repositoryId: '7', branch: 'feature/x', ...values });
+  ({ workspaceId, sessionId: 'session-1', provider: 'github', host: 'github.com', fullName: 'acme/app', repositoryId: '7', branch: 'feature/x',
+    ownerId: 'owner', connectorId: null, hostOwnerId: null, owner: { provider: 'github', github: { token: 'owner-token', ciphertext: '', userId: 'owner', githubId: '1' } }, ...values });
 
 test('PKCS#1 and PKCS#8 keys sign verifiable RS256 JWTs; JWKS kid is the RFC 7638 thumbprint', async t => {
   for (const format of ['pkcs1', 'pkcs8'] as const) {
@@ -211,7 +212,7 @@ test('Entra federation exchanges a Pistead assertion; Bitbucket uses client cred
 
   const forgejo = await mintPushToken(f.env, target(workspaceId, { provider: 'gitea', host: 'forge.example.org', fullName: 'team/app', repositoryId: '12', branch: 'main' }));
   assert.equal(calls.length, 2);
-  const jwt = decodeJwt(forgejo.authorization.replace(/^Bearer /, ''), oidcKey.publicKey).claims;
+  const jwt = decodeJwt(forgejo.authorization!.replace(/^Bearer /, ''), oidcKey.publicKey).claims;
   assert.deepEqual([jwt.iss, jwt.sub, jwt.aud, jwt.repository, jwt.ref, jwt.session, Number(jwt.exp) - Number(jwt.iat)],
     [origin, `pistead:workspace:${workspaceId}`, 'forgejo-push', 'team/app', 'refs/heads/main', 'session-1', 600]);
 
@@ -342,6 +343,31 @@ test('only workspace owners and admins manage push identities, and settings are 
   assert.equal((await carol.request('DELETE', `${path}/${forgejoIdentity.id}`)).status, 404);
   const audit = f.sqlite.prepare("SELECT action FROM audit WHERE action LIKE 'push.identity.%' ORDER BY rowid").all().map(row => row.action);
   assert.deepEqual(audit, ['push.identity.saved', 'push.identity.saved', 'push.identity.removed']);
+});
+
+test('push access can use the session owner\'s account or the host\'s Git credentials, with no settings or secret', async t => {
+  const f = await fixture(t);
+  const { carol, workspaceId } = await f.team();
+  // Nothing is verified upstream: each push checks the owner's account, or the host, when it runs.
+  mockFetch(t, {});
+  const path = `/api/workspaces/${workspaceId}/push-identities`;
+  const owner = { provider: 'github', kind: 'owner-account', config: {} };
+  assert.deepEqual(await errorCode(await carol.request('POST', path, { ...owner, secret: 'token' })), { status: 400, code: 'invalid_push_identity' });
+  assert.deepEqual(await errorCode(await carol.request('POST', path, { ...owner, config: { appId: '1' } })), { status: 400, code: 'invalid_push_identity' });
+  const created = await carol.request('POST', path, owner);
+  assert.equal(created.status, 201);
+  const { identity } = await created.json() as { identity: { id: string; kind: string; config: Record<string, string>; status: string } };
+  assert.deepEqual([identity.kind, identity.config, identity.status], ['owner-account', {}, 'ready']);
+  const replaced = await carol.request('POST', path, { provider: 'github', kind: 'host-credentials', config: {} });
+  assert.equal(replaced.status, 201);
+  assert.deepEqual((await replaced.json() as { identity: { id: string; kind: string } }).identity.id, identity.id, 'replacing keeps the identity');
+  // Every provider offers both, scoped like its app or bot identities.
+  assert.deepEqual(await errorCode(await carol.request('POST', path, { provider: 'azure-devops', kind: 'owner-account', config: {} })), { status: 400, code: 'invalid_push_identity' });
+  for (const [provider, extra] of [['azure-devops', { scope: 'Contoso' }], ['bitbucket', { scope: 'team' }], ['gitlab', {}], ['gitea', { host: 'git.example.org' }], ['github-enterprise', { host: 'ghe.example.com' }]] as const) {
+    for (const kind of ['owner-account', 'host-credentials']) {
+      assert.equal((await carol.request('POST', path, { provider, ...extra, kind, config: {} })).status, 201, `${provider} ${kind}`);
+    }
+  }
 });
 
 test('OAuth authorization binds a single-use PKCE state to the starting admin and stores the bot refresh token', async t => {

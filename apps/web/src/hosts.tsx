@@ -72,6 +72,7 @@ export function HostCapabilities({ connector }: { connector: ConnectorInfo }) {
       <div className="stack small muted">
         <span>Platform: {capabilities.platform || "Unknown"}.{!connector.online && " Offline: it must reconnect before work can run."}</span>
         <span>Sandbox: {capabilities.unsandboxed ? "disabled by the host owner." : !capabilities.sandbox ? "unverified (not necessarily unavailable); the runner checks isolation when preparing each session." : "reported by the host; not a security attestation."} Production shell limits: {capabilities.productionShell ? "reported; still verified per session." : "not confirmed."}</span>
+        {capabilities.gitCredentials && <span>Git credentials: offered by the host owner for pushes in their own sessions, where a workspace's push access uses the host's Git credentials.</span>}
         <span>The runner verifies prerequisites for every session and stops work that fails. Production shell needs verified CPU, memory, process and storage limits. Without them, only the host's owner can let a command run unlimited, in their own sessions and still inside the sandbox.</span>
         <span>Native Windows is unsupported: use Linux or WSL2 with Pi configured there, or macOS without isolation.</span>
       </div>

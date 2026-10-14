@@ -16,8 +16,9 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
 import { Sandbox, type SandboxAuthorize } from "../apps/runner/src/sandbox.js";
 import { performPush, PushError, type PushWorkspace } from "../apps/runner/src/push.js";
+import { hostGitAuthorization, HostCredentialError } from "../apps/runner/src/git-credentials.js";
 import { RunnerService } from "../apps/runner/src/server.js";
-import type { RunnerSession } from "../apps/runner/src/session.js";
+import type { RunnerConfig, RunnerSession } from "../apps/runner/src/session.js";
 import type { SessionRepository } from "../packages/shared/src/repositories.js";
 import type { AuthorizationRequest, GitPushOperation, Permission, PushCompleteRequest, PushCredential, PushCredentialRequest, RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
 import { sha256 } from "../packages/shared/src/crypto.js";
@@ -58,8 +59,8 @@ function tarGz(entries: { name: string; body?: string; type?: "0" | "2" | "5"; l
   return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
 }
 
-/** A bare upstream with an export-ignored file and a symlink, served over smart HTTP. */
-async function upstream(t: TestContext) {
+/** A bare upstream with an export-ignored file and a symlink, served over smart HTTP to requests with `authorization`. */
+async function upstream(t: TestContext, authorization = AUTHORIZATION) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-push-")));
   const source = join(directory, "source");
   await mkdir(join(source, "src"), { recursive: true });
@@ -82,7 +83,7 @@ async function upstream(t: TestContext) {
   git(["--git-dir", bare, "config", "uploadpack.allowFilter", "true"]);
   git(["--git-dir", bare, "config", "uploadpack.allowReachableSHA1InWant", "true"]);
   git(["--git-dir", bare, "config", "uploadpack.allowAnySHA1InWant", "true"]);
-  const server = await startGitHttpServer(project, { authorization: AUTHORIZATION });
+  const server = await startGitHttpServer(project, { authorization });
   t.after(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
   const pin: SessionRepository = { bindingId: "binding-alpha", repositoryId: 101, fullName: "acme/alpha", path: "acme/alpha", ref: "main", commit: pinned };
   // The snapshot omits the export-ignored file and materializes the symlink as a regular file copy.
@@ -92,7 +93,7 @@ async function upstream(t: TestContext) {
     { name: "alpha-main/src/", type: "5" }, { name: "alpha-main/src/a.txt", body: "a\n" },
     { name: "alpha-main/link", type: "2", link: "README.md" },
   ]);
-  const credential: PushCredential = { credentialId: "credential-1", remote: server.url("acme/alpha.git"), authorization: AUTHORIZATION, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+  const credential: PushCredential = { credentialId: "credential-1", remote: server.url("acme/alpha.git"), authorization, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
   return { directory, bare, pin, pinned, archive, credential };
 }
 
@@ -372,4 +373,85 @@ test("close() during an automatic push aborts it, awaits settlement and reports 
   closed = true;
   assert.deepEqual(completions, [{ sessionId: id, approvalId: credentialRequests[0]!.approvalId, credentialId: credential.credentialId, outcome: "unknown" }],
     "close() waits for the aborted push, which reports an ambiguous outcome");
+});
+
+/** A Git configuration whose only credential helper runs `helper` for `get` (none when null); a prompt would run an askpass that leaves a marker. */
+async function credentialConfig(directory: string, helper: string | null): Promise<NodeJS.ProcessEnv> {
+  const askpass = join(directory, "askpass.sh");
+  await writeFile(askpass, `#!/bin/sh\ntouch '${join(directory, "prompted")}'\necho prompted\n`, { mode: 0o755 });
+  await writeFile(join(directory, "gitconfig"), `[core]\n\taskPass = ${askpass}\n${helper ? `[credential]\n\thelper = "!f() { test \\"$1\\" = get && ${helper}; }; f"\n` : ""}`);
+  return { PATH: process.env.PATH, HOME: directory, GIT_CONFIG_GLOBAL: join(directory, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1", GIT_ASKPASS: askpass, SSH_ASKPASS: askpass };
+}
+
+test("the host's Git credentials come from its credential helpers, never from a prompt", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-credentials-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // Without a helper Git would ask for a user name; prompts are off, so the read fails at once and no askpass runs.
+  const none = await credentialConfig(directory, null);
+  await assert.rejects(hostGitAuthorization("https://forge.example/acme/alpha.git", { env: none }),
+    (error: unknown) => error instanceof HostCredentialError && /No Git credentials for forge\.example are set up/.test(error.message));
+  const env = await credentialConfig(directory, "echo username=alice && echo password=s3cret:token");
+  assert.equal(await hostGitAuthorization("https://forge.example/acme/alpha.git", { env }), `Basic ${Buffer.from("alice:s3cret:token").toString("base64")}`);
+  const userOnly = await credentialConfig(directory, "echo username=alice");
+  await assert.rejects(hostGitAuthorization("https://forge.example/acme/alpha.git", { env: userOnly }), HostCredentialError);
+  assert.equal(existsSync(join(directory, "prompted")), false, "no askpass program ever ran");
+  // Credentials go only to HTTPS remotes (plain HTTP only on loopback, for local forges).
+  await assert.rejects(hostGitAuthorization("http://forge.example/acme/alpha.git", { env }), /Git remote URL is invalid/);
+});
+
+test("pushes with the host's Git credentials run only in its owner's sessions while the owner opts in", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-push-host-credentials-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await mkdir(join(directory, "git"));
+  const env = await credentialConfig(join(directory, "git"), "echo username=host-user && echo password=host-secret");
+  const { bare, pin, archive, credential } = await upstream(t, `Basic ${Buffer.from("host-user:host-secret").toString("base64")}`);
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  const push = (branch: string) => [
+    fauxAssistantMessage([fauxToolCall("write_file", { path: "acme/alpha/README.md", content: `${branch} change\n` })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("git_commit", { message: `${branch} change` })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("git_push", { repository: "acme/alpha", branch })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Done."),
+  ];
+  faux.setResponses([...push("own"), ...push("shared"), ...push("off")]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const completions: PushCompleteRequest[] = [];
+  const connectorId = "connector-1";
+  const config: RunnerConfig = {
+    dataDir: join(directory, "runner"), sharedSecret: SECRET, controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true, connectorId,
+    authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    readRepository: async () => archive,
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    pushCredential: async request => ({ credentialId: request.approvalId, remote: credential.remote, hostCredentials: true, expiresAt: credential.expiresAt }),
+    pushComplete: async request => { completions.push(request); return {}; },
+    hostGitCredential: (remote, signal) => hostGitAuthorization(remote, { env, signal }),
+  };
+  const service = new RunnerService(config);
+  await service.initialize();
+  t.after(() => service.close());
+  const run = async (id: string, hostOwner: string) => {
+    const value = binding(id, [pin], "faux");
+    value.session.connectorId = value.model.connectorId = connectorId;
+    value.session.connectorOwnerId = value.model.connectorOwnerId = hostOwner;
+    const session = await service.provision(value, { ...await ticket(id, "create"), connectorId });
+    await session.submit({ ...await ticket(id, "submit"), connectorId }, { content: "Change and push.", requestId: id, admissionId: await sha256(id), options: { access: "auto" } }, "write");
+    await idle(session);
+    return (await session.view()).approvals.find(approval => approval.operation.kind === "git.push")!;
+  };
+
+  const own = await run("host-own", "test:alice");
+  assert.equal(own.status, "executed");
+  assert.match(own.result ?? "", /Pushed 1 commit to own/);
+  assert.equal(git(["--git-dir", bare, "show", "refs/heads/own:README.md"]), "own change\n");
+  // A teammate's session on alice's host never pushes with alice's credentials.
+  const shared = await run("host-shared", "test:bob");
+  assert.equal(shared.status, "failed");
+  assert.match(shared.result ?? "", /Only the host's owner can push with its Git credentials\. Nothing was pushed/);
+  // The owner restarted the connector without --git-credentials.
+  delete config.hostGitCredential;
+  const off = await run("host-off", "test:alice");
+  assert.equal(off.status, "failed");
+  assert.match(off.result ?? "", /restart the connector with --git-credentials/);
+  assert.deepEqual(completions.map(item => [item.approvalId, item.outcome]), [[own.id, "pushed"], [shared.id, "failed"], [off.id, "failed"]]);
+  for (const branch of ["shared", "off"]) assert.equal(spawnSync("git", ["--git-dir", bare, "rev-parse", "--verify", "-q", `refs/heads/${branch}`]).status, 1);
 });

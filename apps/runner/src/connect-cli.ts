@@ -36,6 +36,9 @@ Options:
   --allow-test-shell       Fixture shell opt-in; requires --allow-faux
   --unsafe-no-sandbox      Run agent work directly on this machine without isolation
                            (macOS or Linux without bubblewrap); asks for confirmation
+  --git-credentials        Let approved pushes in your own sessions use this machine's Git
+                           credentials (its git credential helpers) where the workspace's
+                           push access chooses the host's Git credentials
   --help                  Show this help without reading Pi configuration
 
 Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required for the
@@ -45,9 +48,13 @@ user with access to your files, credentials and network, and no resource limits.
 Session repositories are pinned into private session caches, not your current folder.
 GitLab, Azure DevOps, Bitbucket, Gitea/Forgejo and GitHub Enterprise repositories are
 connected in the web app (Settings > Profile > Git accounts) with personal access tokens;
-the connector receives pinned snapshots only, never those tokens. Approved git_push
-operations use a short-lived token minted for that push, held only in connector memory
-and sent only to the repository's Git host; the sandbox never sees it.
+the connector receives pinned snapshots, not those tokens. Each approved git_push gets a
+credential for that push only, held in connector memory and sent only to the repository's
+Git host; the sandbox never sees it. It is a short-lived token minted from a workspace app
+or bot or, where the workspace's push access chooses the session owner's account, your
+own account's token, sent only to your own hosts for your own sessions. With
+--git-credentials, your own sessions can push with the credentials git on this machine
+would use instead, read through its credential helpers without prompting.
 Production bash additionally requires verified per-session aggregate cgroups and a
 bounded private filesystem;
 --resources does not provision these. Missing resource limits never enable host shell.
@@ -158,6 +165,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     "state-dir": { type: "string" }, "pi-agent-dir": { type: "string" }, model: { type: "string", multiple: true },
     resources: { type: "string" }, "allow-insecure-loopback": { type: "boolean" },
     "allow-faux": { type: "boolean" }, "allow-test-shell": { type: "boolean" }, "unsafe-no-sandbox": { type: "boolean" },
+    "git-credentials": { type: "boolean" },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   const unsandboxed = values["unsafe-no-sandbox"] === true;
@@ -225,9 +233,10 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   const code = pairingId ? await promptPairingCode() : "";
   if (pairingId && !code) throw new ConnectorSetupError("No pairing code was entered. Paste the single-use code shown in Pistead at the hidden prompt.");
   const pairing = pairingId ? { id: pairingId, code } : undefined;
+  const gitCredentials = values["git-credentials"] === true;
   const connector = createConnector({
     dataDir,
-    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed,
+    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed, gitCredentials,
     allowInsecureLoopback: values["allow-insecure-loopback"], allowFaux: values["allow-faux"], allowTestShell: values["allow-test-shell"],
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
@@ -238,6 +247,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   process.stderr.write(unsandboxed
     ? "Running unsandboxed: approved commands execute directly on this machine.\n"
     : "Sandbox capability is verified per session; production shell stays disabled without provisioned, verified limits.\n");
+  if (gitCredentials) process.stderr.write("Git credentials: approved pushes in your own sessions may use this machine's Git credential helpers.\n");
   const stopped = Promise.withResolvers<void>();
   const stop = () => { void connector.stop().then(() => stopped.resolve(), () => stopped.reject(new Error("Connector shutdown failed"))); };
   process.once("SIGINT", stop);

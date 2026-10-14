@@ -1,20 +1,27 @@
+import type { ConnectorCapabilities } from '../../../../packages/shared/src/connector.js';
 import type { GitProvider } from '../../../../packages/shared/src/repositories.js';
 import { gitProviderNames } from '../../../../packages/shared/src/repositories.js';
 import type { PushIdentityKind } from '../../../../packages/shared/src/types.js';
 import type { Env, PushIdentityRow } from '../types.js';
 import { appOrigin, fail, now } from '../http.js';
 import { decryptToken, encryptToken } from '../vault.js';
+import type { RepositoryAccess } from '../repositories.js';
 import { importRsaPrivateKey, signJwt } from './jwt.js';
 import { issuerAssertion, workspaceSubject } from './oidc.js';
+import { ownerPushAuthorization } from './targets.js';
 
 export interface MintTarget {
   workspaceId: string; sessionId: string;
   provider: GitProvider; host: string; fullName: string; repositoryId: string; branch: string;
+  /** The session owner, and the host running the session with its owner; both null on the control plane's own runner. */
+  ownerId: string; connectorId: string | null; hostOwnerId: string | null;
+  /** The session owner's own account for the repository, already checked for push permission. */
+  owner: RepositoryAccess;
 }
 export interface MintedToken {
   kind: PushIdentityKind;            // 'github-app' for the operator app too
   identityId: string | null;         // null = operator GitHub App
-  authorization: string;             // full Authorization header value for git smart HTTP
+  authorization: string | null;      // full Authorization header value for git smart HTTP; null = the host's own Git credentials
   expiresAt: number;                 // unix seconds
   revocation?: { kind: 'github-installation'; apiBase: string; token: string };
 }
@@ -132,7 +139,15 @@ async function upstream(purpose: Purpose, url: string, init: { method?: string; 
 
 function identityRequired(target: MintTarget, scope: string): never {
   return fail(409, 'push_identity_required', `No push identity is configured for ${gitProviderNames[target.provider]} (${target.host}${scope ? `, ${scope}` : ''}). ` +
-    'A workspace owner or admin can add one in Settings → Workspaces.');
+    'A workspace owner or admin can add one in Settings → Workspaces → Push access: an app or bot identity, the session owner\'s account, or the host\'s Git credentials.');
+}
+/** The owner's account and the host's Git credentials only serve sessions on the session owner's own host. */
+function requireOwnHost(target: MintTarget, kind: 'owner-account' | 'host-credentials'): void {
+  if (target.connectorId && target.hostOwnerId === target.ownerId) return;
+  fail(409, 'push_identity_own_host_required', `Pushes to ${gitProviderNames[target.provider]} (${target.host}) use ${kind === 'owner-account'
+    ? 'the session owner\'s account, so they run only in sessions on the owner\'s own hosts'
+    : 'the host\'s Git credentials, so they run only in sessions the host\'s owner starts on it'}. ` +
+    'Start the session on one of your hosts, or ask a workspace owner or admin to change the push identity in Settings → Workspaces.');
 }
 function reauthorize(provider: GitProvider, host: string): never {
   return fail(409, 'push_identity_reauthorize', `The ${gitProviderNames[provider]} (${host}) push identity must be authorized again in Settings → Workspaces.`);
@@ -259,7 +274,10 @@ async function mintOAuth(env: Env, row: PushIdentityRow): Promise<MintedToken> {
   }
 }
 
-/** Finds the identity (or operator app) for the target and mints a token; fails with fixed messages. */
+/**
+ * Finds the identity (or operator app) for the target and issues its push credential: a minted token, the owner's own
+ * token, or none when the host pushes with its own Git credentials. Fails with fixed messages.
+ */
 export async function mintPushToken(env: Env, target: MintTarget): Promise<MintedToken> {
   // Azure DevOps identities are per organization and Bitbucket identities per workspace; others cover the host.
   const scope = target.provider === 'azure-devops' || target.provider === 'bitbucket' ? target.fullName.split('/')[0]!.toLowerCase() : '';
@@ -291,6 +309,20 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
       const jwt = await issuerAssertion(env, { subject: workspaceSubject(target.workspaceId), audience: config.audience!, ttlSeconds: 600,
         claims: { repository: target.fullName, ref: `refs/heads/${target.branch}`, session: target.sessionId } });
       return { kind: row.kind, identityId: row.id, authorization: `Bearer ${jwt}`, expiresAt: expiry };
+    }
+    case 'owner-account':
+      // The owner's token goes only to the owner's own host, for this one push.
+      requireOwnHost(target, row.kind);
+      return { kind: row.kind, identityId: row.id, authorization: ownerPushAuthorization(target.owner), expiresAt: expiresAt(undefined, 3600) };
+    case 'host-credentials': {
+      requireOwnHost(target, row.kind);
+      const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ? AND owner_id = ?')
+        .bind(target.connectorId, target.ownerId).first();
+      if ((JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).gitCredentials !== true) {
+        fail(409, 'host_git_credentials_disabled', `Pushes to ${gitProviderNames[target.provider]} (${target.host}) use the host's Git credentials, which this host doesn't offer. ` +
+          'Restart its connector with --git-credentials (npx pistead@latest connect --git-credentials) to let your sessions on it push with them.');
+      }
+      return { kind: row.kind, identityId: row.id, authorization: null, expiresAt: expiresAt(undefined, 3600) };
     }
   }
 }
@@ -324,6 +356,10 @@ export async function verifyIdentity(env: Env, input: {
       return config;
     case 'oauth-refresh':
       // Verified when the bot account authorizes the OAuth app.
+      return config;
+    case 'owner-account':
+    case 'host-credentials':
+      // Nothing to verify: each push checks the owner's account, or the host, when it runs.
       return config;
     case 'forgejo-integration': {
       const jwt = await issuerAssertion(env, { subject: workspaceSubject(input.workspaceId), audience: config.audience!, ttlSeconds: 600 });

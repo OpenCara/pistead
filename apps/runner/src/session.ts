@@ -5,7 +5,7 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -16,6 +16,7 @@ import { HostWorkspace } from "./host-workspace.js";
 import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.js";
 import { prepareImage } from "./images.js";
 import { performPush, PushError, pushSummary, type PushResult } from "./push.js";
+import { HostCredentialError } from "./git-credentials.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
@@ -57,10 +58,12 @@ export type RunnerConfig = {
   connectorId?: string;
   authorize?: (request: AuthorizationRequest) => Promise<AuthorizationResult>;
   githubComment?: (request: { sessionId: string; actorId: string; approvalId: string; capability: string; repository: string; issue: number; body: string }) => Promise<{ id: number; url: string }>;
-  /** Mints the short-lived credential for one approved push; held only in this process's memory. */
-  pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential>;
+  /** Issues the credential for one approved push; a token is held only in this process's memory. */
+  pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
   pushComplete?: (request: PushCompleteRequest) => Promise<PushCompletionResult>;
+  /** Reads this host's own Git credential for a push remote as an Authorization header; set only when its owner opted in (connect --git-credentials). */
+  hostGitCredential?: (remote: string, signal?: AbortSignal) => Promise<string>;
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
@@ -1042,11 +1045,12 @@ export class RunnerSession {
     if (!repository) return { status: "failed", result: "Push failed: the repository is not pinned in this session. Nothing was pushed." };
     const request: PushCredentialRequest = { sessionId: this.binding.session.id, approvalId: id, actorId: auth.actorId, operation,
       ...(auth.capability !== undefined ? { capability: auth.capability } : {}), ...(auth.admissionId !== undefined ? { admissionId: auth.admissionId } : {}) };
-    let credential: PushCredential;
+    let credential: PushCredential | HostPushCredential;
     try {
       await recheck();
-      credential = this.config.pushCredential ? await this.config.pushCredential(request) : await this.controlPlane<PushCredential>("/api/internal/git/push/credential", request);
-      if (!credential || typeof credential.credentialId !== "string" || typeof credential.remote !== "string" || typeof credential.authorization !== "string")
+      credential = this.config.pushCredential ? await this.config.pushCredential(request) : await this.controlPlane<PushCredential | HostPushCredential>("/api/internal/git/push/credential", request);
+      if (!credential || typeof credential.credentialId !== "string" || typeof credential.remote !== "string"
+        || ("hostCredentials" in credential ? credential.hostCredentials !== true : typeof credential.authorization !== "string"))
         throw new RunnerError(502, "Invalid push credential");
     } catch (error) {
       const reason = error instanceof RunnerError ? `: ${error.message}` : "";
@@ -1055,7 +1059,8 @@ export class RunnerSession {
     let pushed: PushResult | undefined;
     let failure: { status: "failed" | "interrupted"; result: string } | undefined;
     try {
-      pushed = await performPush({ workspace: this.sandbox, operation, repository, credential, authorize: recheck, signal });
+      const authorization = "hostCredentials" in credential ? await this.hostAuthorization(credential.remote, signal) : credential.authorization;
+      pushed = await performPush({ workspace: this.sandbox, operation, repository, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
     } catch (error) {
       failure = error instanceof PushError && !signal?.aborted
         ? { status: "failed", result: `Push failed: ${error.message}. Nothing was pushed.` }
@@ -1075,6 +1080,17 @@ export class RunnerSession {
       ? `\nThe pull request was not opened${completionFailure || "; the control plane did not confirm completion"}.`
       : "\nThe control plane did not confirm completion.";
     return { status: "executed", result: pushSummary(pushed, completion?.pullRequest) + confirmation };
+  }
+
+  /** This host's own Git credential for `remote`: only its owner's sessions use it, and only after the owner opted in on the host. */
+  private async hostAuthorization(remote: string, signal?: AbortSignal): Promise<string> {
+    if (!this.config.hostGitCredential) throw new PushError("This host does not push with its Git credentials; its owner can restart the connector with --git-credentials");
+    if (this.binding.session.connectorOwnerId !== this.binding.owner.id) throw new PushError("Only the host's owner can push with its Git credentials");
+    try {
+      return await this.config.hostGitCredential(remote, signal);
+    } catch (error) {
+      throw new PushError(error instanceof HostCredentialError ? error.message : "The host's Git credentials could not be read");
+    }
   }
 
   /** Shared-secret internal control-plane call; Worker errors carry fixed, credential-free messages. */

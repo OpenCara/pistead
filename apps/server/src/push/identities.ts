@@ -22,14 +22,17 @@ const printable = /^[\x21-\x7e]{1,255}$/;
 const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Owner/admin authority, re-checked inside every write (binds workspace id, user id). */
 const adminSql = `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))`;
-// Public settings per kind: [field, pattern, lowercase?].
+// Public settings per kind: [field, pattern, lowercase?]. The owner's account and the host's credentials need none.
 const configFields: Record<PushIdentityKind, readonly (readonly [string, RegExp, boolean])[]> = {
   'github-app': [['appId', /^[1-9]\d{0,15}$/, false], ['slug', /^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$/, false]],
   'entra-federation': [['tenantId', guid, true], ['clientId', guid, true]],
   'bitbucket-client-credentials': [['key', /^[A-Za-z0-9]{1,100}$/, false]],
   'oauth-refresh': [['clientId', printable, false]],
   'forgejo-integration': [['audience', printable, false]],
+  'owner-account': [],
+  'host-credentials': [],
 };
+const secretless: readonly PushIdentityKind[] = ['entra-federation', 'forgejo-integration', 'owner-account', 'host-credentials'];
 
 function invalid(message: string): never {
   return fail(400, 'invalid_push_identity', message);
@@ -65,7 +68,7 @@ function identityInput(input: Record<string, unknown>): IdentityInput {
     invalid('Choose an audience other than api://AzureADTokenExchange.');
   }
   let secret: string | null = null;
-  if (kind === 'entra-federation' || kind === 'forgejo-integration') {
+  if (secretless.includes(kind)) {
     if (input.secret !== undefined && input.secret !== null) invalid('This identity kind has no secret.');
   } else if (kind === 'github-app') {
     if (typeof input.secret !== 'string' || !input.secret || input.secret.length > 16_384 || input.secret.includes('\0')) invalid('The GitHub App private key is required.');

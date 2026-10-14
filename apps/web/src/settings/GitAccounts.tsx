@@ -9,11 +9,11 @@ import { Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState,
 const tokenProviders = gitProviders.filter((provider): provider is TokenGitProvider => provider !== "github");
 
 const tokenScopes: Record<TokenGitProvider, string> = {
-  "github-enterprise": "Fine-grained: Contents and Metadata read (or classic repo); opening pull requests needs Pull requests write (or classic repo)",
-  gitlab: "read_api and read_repository; opening merge requests needs api",
-  bitbucket: "API token with read:repository:bitbucket and read:user:bitbucket, connected with your Atlassian account email above; agent pushes need this API token (workspace or repository access tokens can browse but cannot pass the push owner check); opening pull requests needs write:pullrequest:bitbucket",
-  "azure-devops": "Code (Read); opening pull requests needs Code (Read & write)",
-  gitea: "read:repository and read:user; opening pull requests needs write:repository",
+  "github-enterprise": "Fine-grained: Contents and Metadata read (or classic repo); opening pull requests needs Pull requests write, and pushing with your account Contents write (or classic repo)",
+  gitlab: "read_api and read_repository; opening merge requests needs api, and pushing with your account write_repository (or api)",
+  bitbucket: "API token with read:repository:bitbucket and read:user:bitbucket, connected with your Atlassian account email above; agent pushes need this API token (workspace or repository access tokens can browse but cannot pass the push owner check); opening pull requests needs write:pullrequest:bitbucket, and pushing with your account write:repository:bitbucket",
+  "azure-devops": "Code (Read); opening pull requests or pushing with your account needs Code (Read & write)",
+  gitea: "read:repository and read:user; opening pull requests or pushing with your account needs write:repository",
 };
 
 /** Profile section listing the GitHub sign-in account and personal-access-token accounts for other Git providers. */
@@ -37,7 +37,7 @@ export function GitAccountsSection() {
     }, "Git account removed.");
   }
   return <Section title="Git accounts"
-    info="Repositories you bind or pin are read with these accounts. Tokens are encrypted on the server, used only to read repositories you bind or pin, and never sent to hosts. Your sign-in stays GitHub; viewing a session, sharing a host or publishing an agent never grants access to your accounts."
+    info="Repositories you bind or pin are read with these accounts, and the pull requests your agents ask for are opened with them. Tokens are encrypted on the server and never sent to other people's hosts. Where a workspace's push access uses the session owner's account, your own host receives yours in memory for each push in your sessions. Your sign-in stays GitHub; viewing a session, sharing a host or publishing an agent never grants access to your accounts."
     action={<Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add account</Button>}>
     <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`} hint={user.githubLogin ? `@${user.githubLogin}` : undefined}
       trailing={<>

@@ -358,8 +358,10 @@ type FixtureOptions = {
   manifest?: (generation: number) => Response | Promise<Response>;
   authorize?: () => Response | Promise<Response>;
   repository?: (request: Request) => Response | Promise<Response>;
+  pushCredential?: (request: Request) => Response | Promise<Response>;
   execute?: (request: Request, generation: number) => Response | Promise<Response>;
   unblock?: () => void;
+  gitCredentials?: boolean;
 };
 
 async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
@@ -376,7 +378,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
   let manifests = 0;
   const connector = createConnector({
     dataDir, server: origin, localModels: localModels([{ ...summary, ...{ apiKey: providerSecret } }]),
-    capabilities: publicCapabilities, reconnectDelayMs: 1,
+    capabilities: publicCapabilities, reconnectDelayMs: 1, gitCredentials: options.gitCredentials,
     acquireLease: path => {
       assert.equal(path, dataDir);
       leases.acquired++;
@@ -415,6 +417,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
       if (request.url === `${origin}/api/connectors/self/repositories/${repository.bindingId}/download`) {
         return options.repository?.(request) ?? repositoryResponse();
       }
+      if (request.url === `${origin}/api/connectors/self/git/push/credential` && options.pushCredential) return options.pushCredential(request);
       assert.fail(`Unexpected fixture Worker request: ${request.url}`);
     },
     onStatus: status => { statuses.push(status); if (status === 'connected') connected.push(); },
@@ -516,6 +519,7 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   const config = fixture.runtimes[0]!.config;
   assert.equal(config.dataDir, join(fixture.dataDir, 'runner'));
   assert.equal(config.connectorId, credentials.connectorId);
+  assert.equal(config.hostGitCredential, undefined, 'the host\'s Git credentials stay unused without the owner\'s opt-in');
   assert.equal(config.allowFaux, false);
   assert.equal(config.allowTestShell, false);
   assert.ok(config.sharedSecret.length >= 32);
@@ -527,6 +531,24 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   assert.equal(fixture.runtimes[0]!.closed, true);
   assert.deepEqual(fixture.leases, { acquired: 1, released: 1 });
   assert.deepEqual(fixture.statuses, ['connecting', 'connected', 'stopped']);
+});
+
+test('the owner\'s --git-credentials opt-in is advertised and lets push credentials name the host\'s own Git credentials', { timeout: 10000 }, async t => {
+  let issued: unknown;
+  const fixture = await connectorFixture(t, { gitCredentials: true, pushCredential: () => Response.json(issued) });
+  await startFixture(fixture);
+  const manifest = fixture.allCalls.find(call => call.request.url === `${origin}/api/connectors/self/manifest`)!;
+  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, gitCredentials: true });
+  const config = fixture.runtimes[0]!.config;
+  assert.equal(typeof config.hostGitCredential, 'function');
+  const request = { sessionId: 'session', approvalId: 'tool-push', actorId: 'owner', admissionId: 'admission',
+    operation: { kind: 'git.push', repository: 'acme/alpha', branch: 'feature', commit: 'a'.repeat(40) } } as const;
+  const host = { credentialId: 'credential-1', remote: 'https://github.com/acme/alpha.git', hostCredentials: true, expiresAt: new Date().toISOString() };
+  issued = host;
+  assert.deepEqual(await config.pushCredential!(request), host);
+  // A credential is either a token or the host's own: never both.
+  issued = { ...host, authorization: 'Basic eDp5' };
+  await assert.rejects(config.pushCredential!(request));
 });
 
 test('malformed welcome never creates a runtime or advertises readiness', { timeout: 10000 }, async t => {

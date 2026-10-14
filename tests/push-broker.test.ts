@@ -25,8 +25,12 @@ const azurePin = { bindingId: 'binding-az', commit: pinnedCommit, fullName: 'con
 
 type Route = (url: URL, init: RequestInit) => Response | undefined;
 interface Call { method: string; url: string; authorization: string | null; redirect?: RequestRedirect; body?: unknown }
+/** The session runs on a connected host owned by `owner`, shared with the workspace when that is not the session owner. */
+interface Host { owner: string; gitCredentials?: boolean }
+const connectorToken = 'connector-token'.padEnd(43, 'x');
+const connectionToken = 'connection-token'.padEnd(43, 'y');
 
-async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbucketWrite?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbucketWrite?: boolean; host?: Host } = {}) {
   const { db, sqlite } = await testDatabase();
   t.after(() => db.close());
   const env: Env = { DB: db, APP_ORIGIN: 'http://localhost:8787', TEST_AUTH_ENABLED: 'true',
@@ -42,7 +46,16 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
   for (const [userId, role] of [[owner, 'owner'], [approver, 'member'], [viewer, 'member']]) {
     sqlite.prepare('INSERT INTO workspace_members (workspace_id,user_id,role,created_at) VALUES (?,?,?,?)').run('workspace', userId, role, createdAt);
   }
-  sqlite.prepare('INSERT INTO models (id,workspace_id,name,provider,model_id,created_at) VALUES (?,?,?,?,?,?)').run('model', 'workspace', 'model', 'faux', 'faux-1', createdAt);
+  const { host } = options;
+  if (host) {
+    sqlite.prepare('INSERT INTO connectors (id,owner_id,name,credential_hash,created_at,connection_hash,models_json,capabilities_json) VALUES (?,?,?,?,?,?,?,?)')
+      .run('connector', host.owner, 'Host', await sha256(connectorToken), createdAt, await sha256(connectionToken), JSON.stringify([{ provider: 'faux', modelId: 'faux-1', name: 'faux' }]),
+        JSON.stringify({ platform: 'linux', sandbox: true, productionShell: false, chatOptions: true, gitProviders: true, gitPush: true, ...(host.gitCredentials ? { gitCredentials: true } : {}) }));
+    sqlite.prepare('INSERT INTO connector_workspaces (connector_id,workspace_id,created_at) VALUES (?,?,?)').run('connector', 'workspace', createdAt);
+    if (host.owner !== owner) sqlite.prepare('INSERT INTO connector_shares (connector_id,workspace_id,created_at) VALUES (?,?,?)').run('connector', 'workspace', createdAt);
+  }
+  sqlite.prepare('INSERT INTO models (id,workspace_id,name,provider,model_id,created_at,connector_id,connector_owner_id) VALUES (?,?,?,?,?,?,?,?)')
+    .run('model', 'workspace', 'model', 'faux', 'faux-1', createdAt, host ? 'connector' : null, host?.owner ?? null);
   sqlite.prepare('INSERT INTO agents (id,author_id,created_at) VALUES (?,?,?)').run('agent', owner, createdAt);
   sqlite.prepare('INSERT INTO agent_versions (id,agent_id,author_id,version,name,description,instructions,tools_json,model_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
     .run('version', 'agent', owner, 1, 'agent', '', '', '["git_push"]', 'model', createdAt);
@@ -54,8 +67,9 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
     sqlite.prepare('INSERT INTO workspace_repositories (id,workspace_id,provider,host,repository_id,full_name,ref,private,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
       .run(bindingId, 'workspace', provider, host, repositoryId, fullName, 'main', 1, createdAt);
   }
-  sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,repositories_json) VALUES (?,?,?,?,?,?,?,?)')
-    .run('session', 'workspace', owner, 'version', 'session', 'ready', createdAt, JSON.stringify([githubPin, bitbucketPin, gitlabPin, giteaPin, azurePin]));
+  sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,repositories_json,connector_id,connector_owner_id) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run('session', 'workspace', owner, 'version', 'session', 'ready', createdAt, JSON.stringify([githubPin, bitbucketPin, gitlabPin, giteaPin, azurePin]),
+      host ? 'connector' : null, host?.owner ?? null);
   // The approver may approve but not write; the viewer may only read.
   sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)').run('session', approver, '["read","approve"]', createdAt);
   sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)').run('session', viewer, '["read"]', createdAt);
@@ -149,9 +163,18 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
   };
   t.after(() => { globalThis.fetch = previousFetch; });
 
-  const post = (path: string, body: unknown) => app.request(path, {
-    method: 'POST', headers: { Authorization: `Bearer ${internalSecret}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  // Sessions on a connected host call back through the connector-scoped routes with its credentials.
+  const post = (path: string, body: unknown) => app.request(host ? path.replace('/api/internal/', '/api/connectors/self/') : path, {
+    method: 'POST', body: JSON.stringify(body), headers: host
+      ? { Authorization: `Bearer ${connectorToken}`, 'x-connection-token': connectionToken, 'Content-Type': 'application/json' }
+      : { Authorization: `Bearer ${internalSecret}`, 'Content-Type': 'application/json' },
   }, env);
+  /** Sets the workspace push identity for one provider, host and scope. */
+  function pushIdentity(provider: string, gitHost: string, scope: string, kind: string): void {
+    sqlite.prepare(`INSERT INTO push_identities (id,workspace_id,provider,host,scope,kind,config_json,secret_ciphertext,status,created_by,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,'{}',NULL,'ready',?,?,?) ON CONFLICT (workspace_id, provider, host, scope) DO UPDATE SET kind = excluded.kind, config_json = '{}', secret_ciphertext = NULL`)
+      .run(`identity-${provider}-${scope}`, 'workspace', provider, gitHost, scope, kind, owner, createdAt, createdAt);
+  }
   const operation = (extra: Record<string, unknown> = {}, repository = githubPin.path) =>
     ({ kind: 'git.push', repository, branch: 'feature', commit: sessionCommit, ...extra });
   /** A human-approved request: the review row plus the capability minted at approval time. */
@@ -173,7 +196,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
   }
   const ledger = () => sqlite.prepare('SELECT * FROM push_credentials ORDER BY created_at').all() as Record<string, unknown>[];
   const audits = (action: string) => sqlite.prepare('SELECT * FROM audit WHERE action = ?').all(action);
-  return { sqlite, env, calls, state, post, operation, approve, admit, ledger, audits };
+  return { sqlite, env, calls, state, post, operation, approve, admit, ledger, audits, pushIdentity };
 }
 
 const credential = '/api/internal/git/push/credential';
@@ -493,4 +516,72 @@ test('an unknown outcome revokes the credential and opens no pull request', asyn
   const [row] = f.ledger();
   assert.equal(row!.outcome, 'unknown');
   assert.equal(row!.revocation_ciphertext, null);
+});
+
+const basic = (user: string, secret: string) => `Basic ${Buffer.from(`${user}:${secret}`).toString('base64')}`;
+
+test('push access with the session owner\'s account hands the owner\'s own token to their host, minting nothing', async t => {
+  const f = await fixture(t, { host: { owner } });
+  const pushes: [{ path: string }, string, string, string, string][] = [
+    [githubPin, 'github', 'github.com', '', basic('x-access-token', 'owner-oauth-token')],
+    [gitlabPin, 'gitlab', 'gitlab.com', '', basic('oauth2', 'owner-gitlab-token')],
+    [giteaPin, 'gitea', 'git.acme.dev', '', basic('oauth2', 'owner-gitea-token')],
+    [azurePin, 'azure-devops', 'dev.azure.com', 'contoso', basic('', 'owner-azure-devops-token')],
+    // An Atlassian API token connected with the account email pushes as Bitbucket's fixed API-token user.
+    [bitbucketPin, 'bitbucket', 'bitbucket.org', 'team', basic('x-bitbucket-api-token-auth', 'owner-bitbucket-token')],
+  ];
+  let next = 0;
+  for (const [pin, provider, gitHost, scope, authorization] of pushes) {
+    f.pushIdentity(provider, gitHost, scope, 'owner-account');
+    const response = await f.post(credential, { sessionId: 'session', approvalId: `tool-owner-${++next}`, actorId: owner,
+      operation: f.operation({ pullRequest: { title: 'Owner push', body: 'Body' } }, pin.path), admissionId: f.admit('auto') });
+    assert.equal(response.status, 200, pin.path);
+    assert.equal((await response.json() as { authorization: string }).authorization, authorization, pin.path);
+  }
+  assert.ok(!f.calls.some(call => call.method === 'POST'), 'no token is minted from an app or bot');
+  assert.deepEqual(f.ledger().map(row => [row.kind, row.revocation_ciphertext]), pushes.map(() => ['owner-account', null]));
+  const github = f.ledger().find(row => row.binding_id === 'binding-gh')!;
+  const done = await f.post(complete, { sessionId: 'session', approvalId: github.approval_id, credentialId: github.id, outcome: 'pushed', tip });
+  assert.deepEqual(await done.json(), { pullRequest: { url: 'https://github.com/owner/repo/pull/5', number: 5, created: true } });
+  assert.equal(f.calls.find(call => call.method === 'POST' && call.url.endsWith('/pulls'))!.authorization, 'Bearer owner-oauth-token');
+  assert.ok(!f.calls.some(call => call.method === 'DELETE'), 'the owner\'s token is never revoked');
+});
+
+test('the owner\'s account and the host\'s Git credentials push only from the session owner\'s own host', async t => {
+  // A teammate's host shared with the workspace, offering its Git credentials.
+  const shared = await fixture(t, { host: { owner: approver, gitCredentials: true } });
+  for (const kind of ['owner-account', 'host-credentials']) {
+    shared.pushIdentity('github', 'github.com', '', kind);
+    const response = await shared.post(credential, { sessionId: 'session', approvalId: `tool-shared-${kind}`, actorId: owner, operation: shared.operation(), admissionId: shared.admit('auto') });
+    const text = await response.text();
+    assert.equal(response.status, 409, kind);
+    assert.equal(JSON.parse(text).code, 'push_identity_own_host_required');
+    assert.ok(!text.includes('owner-oauth-token'));
+  }
+  assert.deepEqual(shared.ledger().map(row => row.outcome), ['failed', 'failed']);
+  // Sessions on the control plane's own runner have no host owner at all.
+  const internal = await fixture(t);
+  internal.pushIdentity('github', 'github.com', '', 'owner-account');
+  const response = await internal.post(credential, { sessionId: 'session', approvalId: 'tool-internal', actorId: owner, operation: internal.operation(), admissionId: internal.admit('auto') });
+  assert.equal(await code(response), 'push_identity_own_host_required');
+});
+
+test('push access with the host\'s Git credentials needs its owner\'s opt-in, then issues no token', async t => {
+  const f = await fixture(t, { host: { owner } });
+  f.pushIdentity('github', 'github.com', '', 'host-credentials');
+  const op = f.operation({ pullRequest: { title: 'Add feature', body: 'Details' } });
+  const refused = await f.post(credential, { sessionId: 'session', approvalId: 'tool-host-1', actorId: owner, operation: op, admissionId: f.admit('auto') });
+  assert.equal(refused.status, 409);
+  assert.equal(await code(refused), 'host_git_credentials_disabled');
+  f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_set(capabilities_json, '$.gitCredentials', json('true')) WHERE id = 'connector'").run();
+  const response = await f.post(credential, { sessionId: 'session', approvalId: 'tool-host-2', actorId: owner, operation: op, admissionId: f.admit('auto') });
+  assert.equal(response.status, 200);
+  const issued = await response.json() as Record<string, unknown>;
+  assert.deepEqual({ ...issued, credentialId: undefined, expiresAt: undefined },
+    { credentialId: undefined, remote: 'https://github.com/owner/repo.git', hostCredentials: true, expiresAt: undefined });
+  const row = f.ledger().find(item => item.id === issued.credentialId)!;
+  assert.deepEqual([row.kind, row.identity_id, row.revocation_ciphertext], ['host-credentials', 'identity-github-', null]);
+  const done = await f.post(complete, { sessionId: 'session', approvalId: 'tool-host-2', credentialId: issued.credentialId, outcome: 'pushed', tip });
+  assert.deepEqual(await done.json(), { pullRequest: { url: 'https://github.com/owner/repo/pull/5', number: 5, created: true } });
+  assert.equal(f.calls.find(call => call.method === 'POST' && call.url.endsWith('/pulls'))!.authorization, 'Bearer owner-oauth-token', 'pull requests are still opened as the owner');
 });

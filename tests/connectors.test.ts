@@ -357,6 +357,7 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'unknown starting level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevel: 'extreme' }] }, code: 'invalid_manifest' },
     { name: 'non-boolean chat options', value: { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: 'true' } }, code: 'invalid_manifest' },
     { name: 'non-boolean git providers', value: { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: 1 } }, code: 'invalid_manifest' },
+    { name: 'git credentials without pushes', value: { ...manifest, capabilities: { ...manifest.capabilities, gitCredentials: true } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -370,10 +371,10 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
   }
   await json(await claim(f, pending), 201);
   await json(await self(f, connector, 'manifest', manifest));
-  const unsandboxed = { platform: 'darwin', sandbox: false, productionShell: false, unsandboxed: true };
+  const unsandboxed = { platform: 'darwin', sandbox: false, productionShell: false, unsandboxed: true, gitPush: true, gitCredentials: true };
   await json(await self(f, connector, 'manifest', { ...manifest, capabilities: unsandboxed }));
   assert.deepEqual(JSON.parse(String(f.sqlite.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').get(connector.connectorId)!.capabilities_json)), unsandboxed,
-    'an owner-disabled sandbox must stay disclosed in stored host metadata');
+    'an owner-disabled sandbox and owner-offered Git credentials must stay disclosed in stored host metadata');
   for (const table of ['connectors', 'connector_pairings', 'models', 'audit']) {
     assert.ok(!JSON.stringify(f.sqlite.prepare(`SELECT * FROM ${table}`).all()).includes(secret));
   }
