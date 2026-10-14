@@ -52,9 +52,10 @@ the connector receives pinned snapshots, not those tokens. Each approved git_pus
 credential for that push only, held in connector memory and sent only to the repository's
 Git host; the sandbox never sees it. It is a short-lived token minted from a workspace app
 or bot or, where the workspace's push access chooses the session owner's account, your
-own account's token, sent only to your own hosts for your own sessions. With
---git-credentials, your own sessions can push with the credentials git on this machine
-would use instead, read through its credential helpers without prompting.
+own account's token, sent only to your own hosts for your own sessions (a GitHub token
+is reset when the push ends). With --git-credentials, your own sessions can push with
+the credentials git on this machine would use instead, read through its credential
+helpers without prompting.
 Production bash additionally requires verified per-session aggregate cgroups and a
 bounded private filesystem;
 --resources does not provision these. Missing resource limits never enable host shell.

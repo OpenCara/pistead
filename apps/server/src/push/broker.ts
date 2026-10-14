@@ -4,7 +4,7 @@ import { repositoryLimits } from '../../../../packages/shared/src/repositories.j
 import type { GitPushOperation, HostPushCredential, PushCompletionResult, PushCredential, PushOutcome } from '../../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../../packages/shared/src/policy.js';
-import type { AppContext, PushCredentialRow, SessionAccess, SessionRow } from '../types.js';
+import type { AppContext, Env, PushCredentialRow, SessionAccess, SessionRow } from '../types.js';
 import { auditStatement, sessionAccess } from '../db.js';
 import { fail, id, identifier, jsonObject, now, text, userIdentifier } from '../http.js';
 import { parseOperation } from '../operations.js';
@@ -12,7 +12,7 @@ import { decryptToken, encryptToken } from '../vault.js';
 import { authenticateConnector, requireConnectorSession } from '../connectors.js';
 import { requireBrokerReview, requireOperationTool } from '../approval-reviews.js';
 import { recheckAccess, repositoryAccess, validPin } from '../repositories.js';
-import { mintPushToken, revokePushToken, type MintedToken } from './mint.js';
+import { mintPushToken, revokePushToken, type MintedToken, type PushRevocation } from './mint.js';
 import { branchTip, openPullRequest, pushTarget } from './targets.js';
 
 const outcomes: readonly PushOutcome[] = ['pushed', 'up-to-date', 'failed', 'unknown'];
@@ -55,14 +55,42 @@ async function requireBinding(c: AppContext, workspaceId: string, pin: SessionRe
   if (!binding) fail(403, 'repository_binding_removed', 'This repository is no longer configured for the workspace.');
   return binding;
 }
-/** Best effort: the stored token is revoked and forgotten; decryption failures leave only expiry. */
-async function revokeStored(c: AppContext, credentialId: string, ciphertext: string | null): Promise<void> {
+/**
+ * Undoes a finished push's credential and forgets it, also when the record can't be read (only expiry is left then).
+ * An owner's token that could not be reset yet keeps its record, for settlePushCredentials to retry.
+ */
+async function revokeStored(env: Env, credentialId: string, ciphertext: string | null): Promise<void> {
   if (!ciphertext) return;
+  let settled = true;
   try {
-    const revocation = JSON.parse(await decryptToken(c.env, `push-credential:${credentialId}`, ciphertext)) as NonNullable<MintedToken['revocation']>;
-    await revokePushToken(revocation);
-  } catch { /* the token still expires on its own */ }
-  await c.env.DB.query('UPDATE push_credentials SET revocation_ciphertext = NULL WHERE id = ?').bind(credentialId).run();
+    settled = await revokePushToken(env, JSON.parse(await decryptToken(env, `push-credential:${credentialId}`, ciphertext)) as PushRevocation);
+  } catch { /* an unreadable record can't be retried */ }
+  if (settled) await env.DB.query('UPDATE push_credentials SET revocation_ciphertext = NULL WHERE id = ? AND revocation_ciphertext = ?').bind(credentialId, ciphertext).run();
+}
+
+/**
+ * Settles the push credentials no completion settled: closes those that expired unreported, since their host never said
+ * whether it pushed, and retries owner-token resets that failed. Run periodically, it stops an owner's GitHub token from
+ * working within about an hour of a push even when the host never reports back.
+ */
+export async function settlePushCredentials(env: Env): Promise<void> {
+  const rows = await env.DB.query<{ id: string; revocation_ciphertext: string; completed_at: string | null; session_id: string; approval_id: string;
+    requested_by: string; workspace_id: string }>(`SELECT c.id, c.revocation_ciphertext, c.completed_at, c.session_id, c.approval_id, c.requested_by, s.workspace_id
+    FROM push_credentials c JOIN sessions s ON s.id = c.session_id
+    WHERE c.revocation_ciphertext IS NOT NULL AND (c.completed_at IS NOT NULL OR c.expires_at <= ?) ORDER BY c.created_at LIMIT 100`)
+    .bind(Math.floor(Date.now() / 1000)).all();
+  for (const row of rows) {
+    if (!row.completed_at) {
+      const closed = await env.DB.query(`UPDATE push_credentials SET completed_at = ?, outcome = 'unknown' WHERE id = ? AND completed_at IS NULL RETURNING id`)
+        .bind(now(), row.id).first();
+      // A completion that arrived meanwhile revokes the credential itself.
+      if (!closed) continue;
+      await auditStatement(env, row.requested_by, 'git.push.completed', row.workspace_id, row.session_id, {
+        approvalId: row.approval_id, credentialId: row.id, outcome: 'unknown',
+      }).run();
+    }
+    await revokeStored(env, row.id, row.revocation_ciphertext);
+  }
 }
 
 export async function pushCredential(c: AppContext, connectorId: string | null): Promise<Response> {
@@ -199,10 +227,11 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
     await requireBinding(c, row.workspace_id, pin);
     await recheckAccess(c.env, access);
   } catch (error) {
-    // Never hand out a credential whose ledger, audit or authority step failed: close the row and revoke the token directly.
+    // Never hand out a credential whose ledger, audit or authority step failed: close the row and revoke an installation
+    // token directly. The owner's token never left the server, so it needs no reset.
     try { await closeFailed(); } catch { /* the token is still revoked below */ }
     if (minted.revocation) {
-      try { await revokePushToken(minted.revocation); } catch { /* the token still expires on its own */ }
+      if (minted.revocation.kind === 'github-installation') await revokePushToken(c.env, minted.revocation);
       try { await c.env.DB.query('UPDATE push_credentials SET revocation_ciphertext = NULL WHERE id = ?').bind(credentialId).run(); } catch { /* expiry bounds it */ }
     }
     throw error;
@@ -240,7 +269,7 @@ export async function pushComplete(c: AppContext, connectorId: string | null): P
     const closed = await c.env.DB.query<{ revocation_ciphertext: string | null }>(`UPDATE push_credentials SET completed_at = ?, outcome = 'failed', tip = NULL
       WHERE id = ? AND completed_at IS NULL RETURNING revocation_ciphertext`).bind(now(), credentialId).first();
     if (closed) {
-      await revokeStored(c, credentialId, closed.revocation_ciphertext);
+      await revokeStored(c.env, credentialId, closed.revocation_ciphertext);
       await auditStatement(c.env, ledger.requested_by, 'git.push.completed', session.workspace_id, sessionId, {
         approvalId, credentialId, outcome: 'failed',
       }).run();
@@ -251,7 +280,7 @@ export async function pushComplete(c: AppContext, connectorId: string | null): P
     WHERE id = ? AND completed_at IS NULL RETURNING revocation_ciphertext`)
     .bind(now(), outcome, tip ?? null, credentialId).first();
   if (!claimed) fail(409, 'push_already_completed', 'This push was already completed.');
-  await revokeStored(c, credentialId, claimed.revocation_ciphertext);
+  await revokeStored(c.env, credentialId, claimed.revocation_ciphertext);
   await auditStatement(c.env, ledger.requested_by, 'git.push.completed', session.workspace_id, sessionId, {
     approvalId, credentialId, outcome, ...(tip ? { tip } : {}),
   }).run();
