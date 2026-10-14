@@ -9,6 +9,7 @@ import { openDatabase } from './db/index.js';
 import type { Database } from './db/types.js';
 import { app } from './index.js';
 import { createStaticHandler } from './static.js';
+import { settlePushCredentials } from './push/broker.js';
 
 /** The request URL as the client sees it: forwarded scheme/host only when the operator trusts the proxy. */
 function requestUrl(request: IncomingMessage, trustProxy: boolean): URL {
@@ -68,6 +69,10 @@ const { env, host, port, trustProxy, staticDir } = config;
 const hub = env.CONNECTOR_HUB!;
 await migrateWhenReachable(env.DB);
 
+// Push credentials no completion settled: pushes their host never reported, and owner-token resets to retry.
+const settling = setInterval(() => { void settlePushCredentials(env).catch(() => {}); }, 5 * 60_000);
+settling.unref();
+
 const serveStatic = createStaticHandler(staticDir);
 app.notFound(async c => {
   if ((c.req.method !== 'GET' && c.req.method !== 'HEAD') || c.req.path.startsWith('/api/')) {
@@ -116,6 +121,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   console.log(`pistead: ${signal} received, shutting down`);
   const forced = setTimeout(() => process.exit(1), 10_000);
   forced.unref();
+  clearInterval(settling);
   server.close();
   await hub.close();
   await env.DB.close();

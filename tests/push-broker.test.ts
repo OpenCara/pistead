@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { app } from '../apps/server/src/index.js';
+import { settlePushCredentials } from '../apps/server/src/push/broker.js';
 import type { Env } from '../apps/server/src/types.js';
-import { encryptToken } from '../apps/server/src/vault.js';
+import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { testDatabase } from './helpers/control-plane.js';
 
@@ -36,7 +38,8 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
   const env: Env = { DB: db, APP_ORIGIN: 'http://localhost:8787', TEST_AUTH_ENABLED: 'true',
     TEST_AUTH_SECRET: 'push-broker-test-secret-not-for-deployment', TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
     RUNNER_SHARED_SECRET: internalSecret, VAULT_KEY: Buffer.alloc(32, 7).toString('base64url'),
-    GITHUB_APP_ID: '4242', GITHUB_APP_SLUG: 'pistead-test', GITHUB_APP_PRIVATE_KEY: privateKey } as Env;
+    GITHUB_APP_ID: '4242', GITHUB_APP_SLUG: 'pistead-test', GITHUB_APP_PRIVATE_KEY: privateKey,
+    GITHUB_CLIENT_ID: 'oauth-client', GITHUB_CLIENT_SECRET: 'oauth-secret' } as Env;
   const createdAt = new Date().toISOString();
   for (const [userId, index] of [[owner, 7], [approver, 8], [viewer, 9]] as const) {
     sqlite.prepare('INSERT INTO users (id,github_id,github_login,display_name,git_name,git_email,auth_kind,created_at) VALUES (?,?,?,?,?,?,?,?)')
@@ -89,7 +92,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
   const calls: Call[] = [];
   const state = { canPush: options.canPush ?? true, bitbucketWrite: options.bitbucketWrite ?? true, githubTip: tip, githubPullExists: false, bitbucketPullExists: false,
     githubBranch: null as Record<string, unknown> | null, gitlabBranch: null as Record<string, unknown> | null,
-    giteaBranch: null as Record<string, unknown> | null, azureAllow: true };
+    giteaBranch: null as Record<string, unknown> | null, azureAllow: true, resetStatus: 200, resetToken: 'owner-oauth-token-2' };
   const routes: Route[] = [
     (url, init) => {
       if (url.origin !== 'https://api.github.com') return undefined;
@@ -105,6 +108,11 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
         return Response.json({ token: 'ghs_installation_token', expires_at: new Date(Date.now() + 3600000).toISOString() }, { status: 201 });
       }
       if (method === 'DELETE' && url.pathname === '/installation/token') return new Response(null, { status: 204 });
+      // Pistead's OAuth app resets (PATCH) and deletes (DELETE) the owner's sign-in token.
+      if (method === 'PATCH' && url.pathname === '/applications/oauth-client/token') {
+        return state.resetStatus === 200 ? Response.json({ token: state.resetToken }) : Response.json({ message: 'unavailable' }, { status: state.resetStatus });
+      }
+      if (method === 'DELETE' && url.pathname === '/applications/oauth-client/token') return new Response(null, { status: 204 });
       if (method === 'GET' && url.pathname.startsWith('/repos/owner/repo/commits/')) return Response.json({ sha: state.githubTip });
       if (method === 'POST' && url.pathname === '/repos/owner/repo/pulls') {
         return state.githubPullExists ? Response.json({ message: 'exists' }, { status: 422 })
@@ -519,8 +527,14 @@ test('an unknown outcome revokes the credential and opens no pull request', asyn
 });
 
 const basic = (user: string, secret: string) => `Basic ${Buffer.from(`${user}:${secret}`).toString('base64')}`;
+/** The owner's GitHub sign-in token as the vault holds it now. */
+async function vaultToken(f: { sqlite: DatabaseSync; env: Env }): Promise<string> {
+  const vault = f.sqlite.prepare('SELECT ciphertext FROM github_tokens WHERE user_id = ?').get(owner);
+  assert.ok(vault && typeof vault.ciphertext === 'string');
+  return decryptToken(f.env, owner, vault.ciphertext);
+}
 
-test('push access with the session owner\'s account hands the owner\'s own token to their host, minting nothing', async t => {
+test('push access with the session owner\'s account hands the owner\'s own token to their host, and resets a GitHub token after the push', async t => {
   const f = await fixture(t, { host: { owner } });
   const pushes: [{ path: string }, string, string, string, string][] = [
     [githubPin, 'github', 'github.com', '', basic('x-access-token', 'owner-oauth-token')],
@@ -539,12 +553,71 @@ test('push access with the session owner\'s account hands the owner\'s own token
     assert.equal((await response.json() as { authorization: string }).authorization, authorization, pin.path);
   }
   assert.ok(!f.calls.some(call => call.method === 'POST'), 'no token is minted from an app or bot');
-  assert.deepEqual(f.ledger().map(row => [row.kind, row.revocation_ciphertext]), pushes.map(() => ['owner-account', null]));
+  // Only the GitHub sign-in token can be reset; the record holds it vault-encrypted until the push ends.
+  assert.ok(f.ledger().every(row => row.kind === 'owner-account'));
+  assert.deepEqual(Object.fromEntries(f.ledger().map(row => [row.binding_id, row.revocation_ciphertext !== null])),
+    { 'binding-gh': true, 'binding-gl': false, 'binding-gt': false, 'binding-az': false, 'binding-bb': false });
   const github = f.ledger().find(row => row.binding_id === 'binding-gh')!;
+  assert.ok(!String(github.revocation_ciphertext).includes('owner-oauth-token'));
   const done = await f.post(complete, { sessionId: 'session', approvalId: github.approval_id, credentialId: github.id, outcome: 'pushed', tip });
   assert.deepEqual(await done.json(), { pullRequest: { url: 'https://github.com/owner/repo/pull/5', number: 5, created: true } });
-  assert.equal(f.calls.find(call => call.method === 'POST' && call.url.endsWith('/pulls'))!.authorization, 'Bearer owner-oauth-token');
-  assert.ok(!f.calls.some(call => call.method === 'DELETE'), 'the owner\'s token is never revoked');
+  // The host's copy stops working when the push ends; the vault keeps the replacement, which opens the pull request.
+  const reset = f.calls.find(call => call.method === 'PATCH')!;
+  assert.deepEqual([reset.url, reset.authorization, reset.body], ['https://api.github.com/applications/oauth-client/token',
+    basic('oauth-client', 'oauth-secret'), { access_token: 'owner-oauth-token' }]);
+  assert.equal(await vaultToken(f), 'owner-oauth-token-2');
+  assert.equal(f.calls.find(call => call.method === 'POST' && call.url.endsWith('/pulls'))!.authorization, 'Bearer owner-oauth-token-2');
+  assert.equal(f.ledger().find(row => row.id === github.id)!.revocation_ciphertext, null);
+  assert.ok(!f.calls.some(call => call.method === 'DELETE'), 'the replacement is kept and nothing else is revoked');
+});
+
+test('owner-token resets that fail or whose push goes unreported are settled later; a newer sign-in keeps its token', async t => {
+  const f = await fixture(t, { host: { owner } });
+  f.pushIdentity('github', 'github.com', '', 'owner-account');
+  const issue = async (approvalId: string) => (await (await f.post(credential, { sessionId: 'session', approvalId, actorId: owner,
+    operation: f.operation(), admissionId: f.admit('auto') })).json()) as { credentialId: string };
+  const stored = () => vaultToken(f);
+  const row = (credentialId: string) => f.ledger().find(item => item.id === credentialId)!;
+  const resets = () => f.calls.filter(call => call.method === 'PATCH').map(call => call.body);
+
+  // GitHub can't reset the token when the push ends: the record stays until the settlement sweep succeeds.
+  f.state.resetStatus = 503;
+  const first = await issue('tool-reset-1');
+  assert.equal((await f.post(complete, { sessionId: 'session', approvalId: 'tool-reset-1', credentialId: first.credentialId, outcome: 'pushed', tip })).status, 200);
+  assert.notEqual(row(first.credentialId).revocation_ciphertext, null);
+  assert.equal(await stored(), 'owner-oauth-token');
+  f.state.resetStatus = 200;
+  await settlePushCredentials(f.env);
+  assert.equal(await stored(), 'owner-oauth-token-2');
+  assert.equal(row(first.credentialId).revocation_ciphertext, null);
+  assert.deepEqual(resets(), [{ access_token: 'owner-oauth-token' }, { access_token: 'owner-oauth-token' }]);
+
+  // A push its host never reports keeps its token while it may still run, then is closed and its token reset.
+  f.state.resetToken = 'owner-oauth-token-3';
+  const unreported = await issue('tool-reset-2');
+  await settlePushCredentials(f.env);
+  assert.equal(row(unreported.credentialId).completed_at, null);
+  f.sqlite.prepare('UPDATE push_credentials SET expires_at = 0 WHERE id = ?').run(unreported.credentialId);
+  await settlePushCredentials(f.env);
+  assert.deepEqual([row(unreported.credentialId).outcome, row(unreported.credentialId).revocation_ciphertext], ['unknown', null]);
+  assert.deepEqual(resets().at(-1), { access_token: 'owner-oauth-token-2' });
+  assert.equal(await stored(), 'owner-oauth-token-3');
+
+  // The owner signed in again during the push: the vault keeps that token, and the unused replacement is deleted.
+  f.state.resetToken = 'owner-oauth-token-4';
+  const third = await issue('tool-reset-3');
+  f.sqlite.prepare('UPDATE github_tokens SET ciphertext = ? WHERE user_id = ?').run(await encryptToken(f.env, owner, 'owner-signed-in-again'), owner);
+  assert.equal((await f.post(complete, { sessionId: 'session', approvalId: 'tool-reset-3', credentialId: third.credentialId, outcome: 'failed' })).status, 200);
+  assert.deepEqual(resets().at(-1), { access_token: 'owner-oauth-token-3' });
+  assert.equal(await stored(), 'owner-signed-in-again');
+  assert.deepEqual(f.calls.filter(call => call.method === 'DELETE').map(call => [call.url, call.body]),
+    [['https://api.github.com/applications/oauth-client/token', { access_token: 'owner-oauth-token-4' }]]);
+
+  // A GitHub token is never handed out without the OAuth app that resets it.
+  delete f.env.GITHUB_CLIENT_SECRET;
+  const refused = await f.post(credential, { sessionId: 'session', approvalId: 'tool-reset-4', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') });
+  assert.equal(refused.status, 409);
+  assert.equal(await code(refused), 'owner_token_reset_unavailable');
 });
 
 test('the owner\'s account and the host\'s Git credentials push only from the session owner\'s own host', async t => {

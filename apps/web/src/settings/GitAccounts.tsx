@@ -37,7 +37,7 @@ export function GitAccountsSection() {
     }, "Git account removed.");
   }
   return <Section title="Git accounts"
-    info="Repositories you bind or pin are read with these accounts, and the pull requests your agents ask for are opened with them. Tokens are encrypted on the server and never sent to other people's hosts. Where a workspace's push access uses the session owner's account, your own host receives yours in memory for each push in your sessions. Your sign-in stays GitHub; viewing a session, sharing a host or publishing an agent never grants access to your accounts."
+    info="Repositories you bind or pin are read with these accounts, and the pull requests your agents ask for are opened with them. Tokens are encrypted on the server and never sent to other people's hosts. Where a workspace's push access uses the session owner's account, your own host receives yours in memory for each push in your sessions; Pistead resets your GitHub token when the push ends, so that copy stops working. Your sign-in stays GitHub; viewing a session, sharing a host or publishing an agent never grants access to your accounts."
     action={<Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add account</Button>}>
     <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`} hint={user.githubLogin ? `@${user.githubLogin}` : undefined}
       trailing={<>

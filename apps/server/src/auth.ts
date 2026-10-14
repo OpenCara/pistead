@@ -152,31 +152,73 @@ function githubConfig(env: Env) {
   return { clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET, redirectUri: origin + CALLBACK_PATH };
 }
 
-// Never follow redirects with a client secret or bearer token, or expose upstream error bodies.
+/** One bounded GitHub JSON exchange that never follows redirects. Non-2xx answers carry no body; transport, size and JSON failures throw. */
+async function githubRequest(url: string, init: RequestInit): Promise<{ status: number; body: unknown }> {
+  const response = await fetch(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(15_000) });
+  if (!response.ok || !response.body) {
+    await response.body?.cancel();
+    return { status: response.status, body: undefined };
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    size += part.value.byteLength;
+    if (size > 131_072) {
+      await reader.cancel();
+      throw new Error('GitHub response too large.');
+    }
+    chunks.push(part.value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return { status: response.status, body: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown };
+}
+
+// Upstream error bodies are never exposed.
 async function githubJson(url: string, init: RequestInit): Promise<unknown> {
   try {
-    const response = await fetch(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(15_000) });
-    if (!response.ok || !response.body) throw new Error('GitHub request failed.');
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    while (true) {
-      const part = await reader.read();
-      if (part.done) break;
-      size += part.value.byteLength;
-      if (size > 131_072) {
-        await reader.cancel();
-        throw new Error('GitHub response too large.');
-      }
-      chunks.push(part.value);
-    }
-    const bytes = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown;
+    const result = await githubRequest(url, init);
+    if (result.body === undefined) throw new Error('GitHub request failed.');
+    return result.body;
   } catch {
     fail(502, 'github_error', 'GitHub authentication could not be completed.');
   }
+}
+
+/**
+ * Resets a GitHub sign-in token through Pistead's OAuth app: the token stops working at once, and the replacement GitHub
+ * issues with the same scopes takes its place in the vault while the vault still holds it (`ciphertext`), so the owner
+ * stays connected. Returns false only when the reset could not be completed and should be retried.
+ */
+export async function resetGitHubToken(env: Env, userId: string, token: string, ciphertext: string): Promise<boolean> {
+  const { GITHUB_CLIENT_ID: clientId, GITHUB_CLIENT_SECRET: clientSecret } = env;
+  if (!clientId || !clientSecret) return false;
+  // The OAuth app API authenticates as the app and names the user's token in the body.
+  const request = (method: 'PATCH' | 'DELETE', accessToken: string) => githubRequest(`https://api.github.com/applications/${encodeURIComponent(clientId)}/token`, {
+    method, body: JSON.stringify({ access_token: accessToken }),
+    headers: { Accept: 'application/vnd.github+json', Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`, 'Content-Type': 'application/json',
+      'User-Agent': 'pistead', 'X-GitHub-Api-Version': '2022-11-28' },
+  });
+  let replacement: string;
+  try {
+    const reset = await request('PATCH', token);
+    // A token GitHub no longer knows was reset or revoked already.
+    if (reset.status === 404) return true;
+    const issued = record(reset.body) ? reset.body.token : undefined;
+    if (reset.status !== 200 || typeof issued !== 'string' || !issued || issued.length > 16_384 || /[^\x21-\x7e]/.test(issued)) return false;
+    replacement = issued;
+  } catch {
+    return false;
+  }
+  const stored = await env.DB.query('UPDATE github_tokens SET ciphertext = ?, updated_at = ? WHERE user_id = ? AND ciphertext = ? RETURNING user_id')
+    .bind(await encryptToken(env, userId, replacement), now(), userId, ciphertext).first();
+  // The owner signed in again meanwhile, so the vault holds a newer token and the replacement is not needed.
+  if (!stored) await request('DELETE', replacement).catch(() => undefined);
+  return true;
 }
 
 function record(value: unknown): value is Record<string, unknown> {

@@ -140,7 +140,7 @@ test('GitHub App identities mint repository-scoped installation tokens and repor
     assert.equal(claims.iss, '42');
     assert.equal(Number(claims.exp) - Number(claims.iat), 600);
   }
-  await revokePushToken(minted.revocation!);
+  assert.equal(await revokePushToken(f.env, minted.revocation!), true);
   assert.equal(calls[2]!.headers.authorization, 'Bearer ghs_install');
 
   installed = false;
@@ -149,7 +149,7 @@ test('GitHub App identities mint repository-scoped installation tokens and repor
   assert.equal(missing.status, 409);
   assert.match(missing.message, /https:\/\/git\.example\.com\/github-apps\/pistead\/installations\/new/);
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('offline'); });
-  await revokePushToken(minted.revocation!);
+  assert.equal(await revokePushToken(f.env, minted.revocation!), true, 'installation tokens expire on their own, so a failed revoke is not retried');
 });
 
 test('github.com falls back to the operator GitHub App only when it is configured', async t => {
@@ -171,7 +171,7 @@ test('github.com falls back to the operator GitHub App only when it is configure
   assert.equal(minted.identityId, null);
   assert.equal(minted.kind, 'github-app');
   assert.equal(minted.authorization, basicHeader('x-access-token', 'ghs_operator'));
-  assert.equal(minted.revocation?.apiBase, 'https://api.github.com');
+  assert.deepEqual(minted.revocation, { kind: 'github-installation', apiBase: 'https://api.github.com', token: 'ghs_operator' });
   assert.equal(decodeJwt(calls[0]!.headers.authorization!.replace(/^Bearer /, ''), appKey.publicKey).claims.iss, '9');
   const listed = await (await bob.request('GET', `/api/workspaces/${workspaceId}/push-identities`)).json() as Record<string, unknown>;
   assert.deepEqual(listed, { identities: [], oidc: null, redirectUri: `${origin}/api/push-identities/oauth/callback`,

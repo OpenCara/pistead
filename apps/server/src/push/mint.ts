@@ -5,6 +5,7 @@ import type { PushIdentityKind } from '../../../../packages/shared/src/types.js'
 import type { Env, PushIdentityRow } from '../types.js';
 import { appOrigin, fail, now } from '../http.js';
 import { decryptToken, encryptToken } from '../vault.js';
+import { resetGitHubToken } from '../auth.js';
 import type { RepositoryAccess } from '../repositories.js';
 import { importRsaPrivateKey, signJwt } from './jwt.js';
 import { issuerAssertion, workspaceSubject } from './oidc.js';
@@ -23,8 +24,14 @@ export interface MintedToken {
   identityId: string | null;         // null = operator GitHub App
   authorization: string | null;      // full Authorization header value for git smart HTTP; null = the host's own Git credentials
   expiresAt: number;                 // unix seconds
-  revocation?: { kind: 'github-installation'; apiBase: string; token: string };
+  revocation?: PushRevocation;
 }
+/**
+ * Undoing a credential once its push is over: an installation token is revoked; the owner's GitHub sign-in token is
+ * reset, so the host's copy stops working while the vault (which held it as `ciphertext`) gets the replacement.
+ */
+export type PushRevocation = { kind: 'github-installation'; apiBase: string; token: string }
+  | { kind: 'github-owner'; userId: string; token: string; ciphertext: string };
 /** Vault-encrypted oauth-refresh secret; the current access token is cached so concurrent pushes reuse it (GitLab revokes it on refresh). */
 export interface OAuthSecret { clientSecret: string; refreshToken?: string; accessToken?: string; accessExpiresAt?: number }
 interface GitHubApp { appId: string; slug: string; privateKey: string }
@@ -310,10 +317,18 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
         claims: { repository: target.fullName, ref: `refs/heads/${target.branch}`, session: target.sessionId } });
       return { kind: row.kind, identityId: row.id, authorization: `Bearer ${jwt}`, expiresAt: expiry };
     }
-    case 'owner-account':
+    case 'owner-account': {
       // The owner's token goes only to the owner's own host, for this one push.
       requireOwnHost(target, row.kind);
-      return { kind: row.kind, identityId: row.id, authorization: ownerPushAuthorization(target.owner), expiresAt: expiresAt(undefined, 3600) };
+      const minted = { kind: row.kind, identityId: row.id, authorization: ownerPushAuthorization(target.owner), expiresAt: expiresAt(undefined, 3600) };
+      if (target.owner.provider !== 'github') return minted;
+      // The GitHub sign-in token is reset after the push, which needs Pistead's OAuth app.
+      if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+        fail(409, 'owner_token_reset_unavailable', 'Pushes with the session owner\'s GitHub account need Pistead\'s GitHub sign-in app to reset the token afterwards, and it is not configured.');
+      }
+      const { userId, token, ciphertext } = target.owner.github;
+      return { ...minted, revocation: { kind: 'github-owner', userId, token, ciphertext } };
+    }
     case 'host-credentials': {
       requireOwnHost(target, row.kind);
       const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ? AND owner_id = ?')
@@ -327,13 +342,20 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
   }
 }
 
-/** Best effort; never throws. */
-export async function revokePushToken(revocation: NonNullable<MintedToken['revocation']>): Promise<void> {
+/**
+ * Never throws. Returns false only when the owner's token could not be reset yet and the revocation should be retried;
+ * installation tokens are revoked best effort, as they expire within an hour anyway.
+ */
+export async function revokePushToken(env: Env, revocation: PushRevocation): Promise<boolean> {
   try {
+    if (revocation.kind === 'github-owner') return await resetGitHubToken(env, revocation.userId, revocation.token, revocation.ciphertext);
     const response = await fetch(`${revocation.apiBase}/installation/token`, { method: 'DELETE', headers: { ...githubHeaders(revocation.token), 'User-Agent': userAgent },
       redirect: 'manual', signal: AbortSignal.timeout(remoteTimeout) });
     await response.body?.cancel().catch(() => {});
-  } catch { /* Installation tokens also expire within an hour. */ }
+    return true;
+  } catch {
+    return revocation.kind !== 'github-owner';
+  }
 }
 
 /** Live check of new identity settings before they are stored; returns the config to store (with the bot login when known). */
