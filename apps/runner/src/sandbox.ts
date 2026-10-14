@@ -121,8 +121,12 @@ def limits(kind):
     size = (16 if push else 1 / 16) * 1024 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_FSIZE, (int(size), int(size)))
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-    memory = (4096 if push else 512) * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+    # Shell commands inherit these limits, so they get no address-space cap: Go and Node reserve far
+    # more address space than they use, and gh and node abort at start-up under 512 MiB. Session
+    # memory is the cgroup's memory.max, which the host's owner can waive for their own commands.
+    if kind != 'bash':
+        memory = (4096 if push else 512) * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
 
 
 HOME = os.environ['HOME']
