@@ -123,14 +123,17 @@ export function validPushBranch(value: unknown): value is string {
     && !value.endsWith("/") && !value.split("/").some(part => !part || part.startsWith(".") || part.endsWith(".lock"));
 }
 
-/** Push identity kinds each provider supports. Gitea/Forgejo hosts use an OAuth app, or a Forgejo Authorized Integration. */
+/**
+ * Push identity kinds each provider supports, its app or bot identity first. Gitea/Forgejo hosts use an OAuth app, or a
+ * Forgejo Authorized Integration. Every provider can also push with the session owner's account or the host's Git credentials.
+ */
 export const pushIdentityKindsByProvider: Record<GitProvider, readonly PushIdentityKind[]> = {
-  github: ["github-app"],
-  "github-enterprise": ["github-app"],
-  gitlab: ["oauth-refresh"],
-  bitbucket: ["bitbucket-client-credentials"],
-  "azure-devops": ["entra-federation"],
-  gitea: ["oauth-refresh", "forgejo-integration"],
+  github: ["github-app", "owner-account", "host-credentials"],
+  "github-enterprise": ["github-app", "owner-account", "host-credentials"],
+  gitlab: ["oauth-refresh", "owner-account", "host-credentials"],
+  bitbucket: ["bitbucket-client-credentials", "owner-account", "host-credentials"],
+  "azure-devops": ["entra-federation", "owner-account", "host-credentials"],
+  gitea: ["oauth-refresh", "forgejo-integration", "owner-account", "host-credentials"],
 };
 
 /**

@@ -42,7 +42,7 @@ function workspaceReason(error: unknown): string {
  * Throws PushError for definite failures; any other error happened during or after upload and is ambiguous.
  */
 export async function performPush(options: {
-  workspace: PushWorkspace; operation: GitPushOperation; repository: SessionRepository; credential: PushCredential;
+  workspace: PushWorkspace; operation: GitPushOperation; repository: SessionRepository; credential: Pick<PushCredential, "remote" | "authorization">;
   authorize: SandboxAuthorize; fetch?: typeof fetch; signal?: AbortSignal;
 }): Promise<PushResult> {
   const { workspace, operation, repository, credential, authorize } = options;

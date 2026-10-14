@@ -22,6 +22,8 @@ export interface ConnectorCapabilities {
   gitProviders?: boolean;
   /** The connector pushes session commits with control-plane minted credentials (git_push). Absent on older connectors. */
   gitPush?: boolean;
+  /** The host's owner lets pushes in their own sessions use this host's Git credentials (connect --git-credentials). Absent means false. */
+  gitCredentials?: boolean;
 }
 
 export interface ConnectorInfo {

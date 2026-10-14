@@ -56,6 +56,22 @@ function api(access: RepositoryAccess, pin: SessionRepository): Api {
   }
 }
 
+/**
+ * The owner's own credential as a git smart-HTTP Authorization header, for push access that uses the owner's account.
+ * Forges ignore the user name for tokens except Bitbucket, whose API tokens (connected with the account email) and
+ * access tokens each have a fixed Git user name.
+ */
+export function ownerPushAuthorization(access: RepositoryAccess): string {
+  if (access.provider === 'github') return basic('x-access-token', access.github.token);
+  const { token, username } = access.account.credential;
+  switch (access.provider) {
+    case 'github-enterprise': return basic('x-access-token', token);
+    case 'gitlab': case 'gitea': return basic('oauth2', token);
+    case 'bitbucket': return basic(username ? 'x-bitbucket-api-token-auth' : 'x-token-auth', token);
+    case 'azure-devops': return basic('', token);
+  }
+}
+
 /** One bounded JSON exchange: manual redirects, fixed timeout, no upstream text in errors. */
 async function call(target: Api, url: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: unknown }> {
   let response: Response;
