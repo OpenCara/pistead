@@ -11,7 +11,7 @@ import type { ModelDefinition } from '../packages/shared/src/types.js';
 import type { LocalPiOptions, LocalPiRuntime } from '../apps/runner/src/local-pi.js';
 import { connectorLimits } from '../packages/shared/src/connector.js';
 import { connectorManifest } from '../apps/runner/src/connector.js';
-import { createFauxLocalModels, loadLocalPiModels, modelSummary, readPiEnabledModels } from '../apps/runner/src/local-pi.js';
+import { createFauxLocalModels, loadLocalPiModels, modelSummary, readPiSettings } from '../apps/runner/src/local-pi.js';
 import { runnerModels } from '../apps/runner/src/provider.js';
 
 const secret = 'fixture-only-provider-credential-never-publish';
@@ -21,7 +21,7 @@ const nativeModel = {
   headers: { authorization: `Bearer ${secret}` }, baseUrl: `https://model.invalid/${secret}`,
 };
 
-type CatalogEntry = { provider: string; id: string; name: string };
+type CatalogEntry = { provider: string; id: string; name: string; reasoning?: boolean; thinkingLevelMap?: Record<string, string | null> };
 
 function definition(provider = nativeModel.provider, modelId = nativeModel.id): ModelDefinition {
   return { id: 'model', workspaceId: 'workspace', name: 'Workspace label', provider, modelId, connectorId: 'connector' };
@@ -75,7 +75,7 @@ test('native Pi chat resolution preserves the exact injected Models runtime with
   const local = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory });
   assert.deepEqual(fixture.configurations, [{ refreshOnCreate: false, allowModelNetwork: false }]);
   const manifest = await local.manifest();
-  assert.deepEqual(manifest, [{ provider: nativeModel.provider, modelId: nativeModel.id, name: nativeModel.name, thinkingLevels: ['off'] }]);
+  assert.deepEqual(manifest, [{ provider: nativeModel.provider, modelId: nativeModel.id, name: nativeModel.name, thinkingLevels: ['off'], thinkingLevel: 'off' }]);
   assert.equal(JSON.stringify(manifest).includes(secret), false);
   assert.deepEqual(await connectorManifest(local), manifest);
 
@@ -83,7 +83,8 @@ test('native Pi chat resolution preserves the exact injected Models runtime with
   assert.strictEqual(resolved.models, fixture.runtime);
   assert.equal(resolved.provider, nativeModel.provider);
   assert.equal(resolved.modelId, nativeModel.id);
-  assert.deepEqual(Object.keys(resolved).sort(), ['modelId', 'models', 'provider']);
+  assert.equal(resolved.thinkingLevel, 'off');
+  assert.deepEqual(Object.keys(resolved).sort(), ['modelId', 'models', 'provider', 'thinkingLevel']);
   assert.deepEqual(fixture.lookups, [[nativeModel.provider, nativeModel.id]]);
   assert.deepEqual(fixture.forbidden, []);
   assert.equal(fixture.configurations.length, 1);
@@ -139,9 +140,9 @@ test('catalog filters unauthenticated providers, deduplicates and sorts without 
   fixture.state.configured.delete('no-auth');
   const local = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory });
   assert.deepEqual(await local.manifest(), [
-    { provider: 'a-native', modelId: 'first', name: 'A first', thinkingLevels: ['off'] },
-    { provider: 'a-native', modelId: 'second', name: 'A second', thinkingLevels: ['off'] },
-    { provider: 'z-native', modelId: 'second', name: 'Z', thinkingLevels: ['off'] },
+    { provider: 'a-native', modelId: 'first', name: 'A first', thinkingLevels: ['off'], thinkingLevel: 'off' },
+    { provider: 'a-native', modelId: 'second', name: 'A second', thinkingLevels: ['off'], thinkingLevel: 'off' },
+    { provider: 'z-native', modelId: 'second', name: 'Z', thinkingLevels: ['off'], thinkingLevel: 'off' },
   ]);
   assert.deepEqual(entries, before);
   await assert.rejects(local.resolve(definition('no-auth', 'hidden')), /unavailable/);
@@ -192,7 +193,7 @@ test('oversized native catalogs require a subset rather than silently truncating
   const local = await loadLocalPiModels({
     runtimeFactory: fixture.runtimeFactory, models: [{ provider: 'native.fixture', modelId: 'model-200' }],
   });
-  assert.deepEqual(await local.manifest(), [{ provider: 'native.fixture', modelId: 'model-200', name: 'Model 200', thinkingLevels: ['off'] }]);
+  assert.deepEqual(await local.manifest(), [{ provider: 'native.fixture', modelId: 'model-200', name: 'Model 200', thinkingLevels: ['off'], thinkingLevel: 'off' }]);
   await assert.rejects(local.resolve(definition('native.fixture', 'model-0')), /unavailable/);
   assert.strictEqual((await local.resolve(definition('native.fixture', 'model-200'))).models, fixture.runtime);
 });
@@ -214,17 +215,45 @@ test('Pi enabledModels picks the advertised subset like Pi model cycling; explic
   assert.deepEqual((await explicit.manifest()).map(model => model.modelId), ['claude-haiku-4-5']);
 });
 
-test('Pi enabledModels is read from the global settings file and rejects malformed lists', async t => {
+test('each model starts at the reasoning level Pi gives it: pattern, then per-model setting, then default, within its levels', async () => {
+  const fixture = runtimeFixture([
+    { provider: 'native.fixture', id: 'thinker', name: 'Thinker', reasoning: true, thinkingLevelMap: { off: null, minimal: null, xhigh: 'xhigh', max: 'max' } },
+    { provider: 'native.fixture', id: 'plain', name: 'Plain' },
+  ]);
+  const levels = async (options: Omit<LocalPiOptions, 'runtimeFactory'>) => Object.fromEntries((await (await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory, ...options }))
+    .manifest()).map(model => [model.modelId, `${model.thinkingLevel} of ${model.thinkingLevels?.join(',')}`]));
+  // Pi's own default is medium; a model without reasoning stays off.
+  assert.deepEqual(await levels({}), { plain: 'off of off', thinker: 'medium of low,medium,high,xhigh,max' });
+  // A level the model lacks moves to the nearest one it has, upwards first.
+  assert.deepEqual(await levels({ defaultThinkingLevel: 'off' }), { plain: 'off of off', thinker: 'low of low,medium,high,xhigh,max' });
+  // The model's own setting beats the default, and a level in an enabledModels pattern beats both.
+  const modelThinkingLevels = new Map([['native.fixture/thinker', 'max' as const]]);
+  assert.deepEqual(await levels({ defaultThinkingLevel: 'low', modelThinkingLevels }), { plain: 'off of off', thinker: 'max of low,medium,high,xhigh,max' });
+  assert.deepEqual(await levels({ defaultThinkingLevel: 'low', modelThinkingLevels, enabledModels: ['native.fixture/thinker:high', 'native.fixture/plain'] }),
+    { plain: 'off of off', thinker: 'high of low,medium,high,xhigh,max' });
+  // A session on the model starts at the same level.
+  const local = await loadLocalPiModels({ runtimeFactory: fixture.runtimeFactory, modelThinkingLevels });
+  assert.equal((await local.resolve(definition('native.fixture', 'thinker'))).thinkingLevel, 'max');
+});
+
+test('Pi settings are read from the global settings file and reject malformed values', async t => {
   const agentDir = await mkdtemp(join(tmpdir(), 'local-pi-settings-fixture-'));
   t.after(() => rm(agentDir, { recursive: true, force: true }));
-  assert.equal(await readPiEnabledModels(agentDir), undefined);
-  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ defaultThinkingLevel: 'high' }));
-  assert.equal(await readPiEnabledModels(agentDir), undefined);
-  await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ enabledModels: ['relay/*', '*/claude-opus-5-5*'] }));
-  assert.deepEqual(await readPiEnabledModels(agentDir), ['relay/*', '*/claude-opus-5-5*']);
+  const write = (settings: unknown) => writeFile(join(agentDir, 'settings.json'), JSON.stringify(settings));
+  assert.deepEqual(await readPiSettings(agentDir), {});
+  await write({ enabledModels: ['relay/*', '*/claude-opus-5-5*'], defaultThinkingLevel: 'high', modelThinkingLevels: { 'relay/gpt-6-sol': 'max' }, theme: 'dark' });
+  assert.deepEqual(await readPiSettings(agentDir), {
+    enabledModels: ['relay/*', '*/claude-opus-5-5*'], defaultThinkingLevel: 'high', modelThinkingLevels: new Map([['relay/gpt-6-sol', 'max']]),
+  });
   for (const enabledModels of ['relay/*', [42], ['']]) {
-    await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ enabledModels }));
-    await assert.rejects(readPiEnabledModels(agentDir), /enabledModels must be a list/);
+    await write({ enabledModels });
+    await assert.rejects(readPiSettings(agentDir), /enabledModels must be a list/);
+  }
+  await write({ defaultThinkingLevel: 'extreme' });
+  await assert.rejects(readPiSettings(agentDir), /defaultThinkingLevel must be one of/);
+  for (const modelThinkingLevels of [['high'], { 'relay/gpt-6-sol': 'extreme' }]) {
+    await write({ modelThinkingLevels });
+    await assert.rejects(readPiSettings(agentDir), /modelThinkingLevels must map/);
   }
 });
 
@@ -280,8 +309,8 @@ test('pinned ModelRuntime discovers selected configured models without catalog n
     agentDir, models: [{ provider, modelId }, { provider: keyless, modelId }],
   });
   assert.deepEqual(await local.manifest(), [
-    { provider, modelId, name: 'Fixture configured chat', thinkingLevels: ['off'] },
-    { provider: keyless, modelId, name: 'Fixture configured chat', thinkingLevels: ['off'] },
+    { provider, modelId, name: 'Fixture configured chat', thinkingLevels: ['off'], thinkingLevel: 'off' },
+    { provider: keyless, modelId, name: 'Fixture configured chat', thinkingLevels: ['off'], thinkingLevel: 'off' },
   ]);
   const resolved = await local.resolve(definition(provider, modelId));
   assert.ok(resolved.models instanceof ModelRuntime);

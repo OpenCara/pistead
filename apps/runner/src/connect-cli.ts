@@ -6,7 +6,7 @@ import { createInterface } from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createConnector, controlPlaneOrigin, readConnectorState } from "./connector.js";
-import { createFauxLocalModels, loadLocalPiModels, readPiEnabledModels } from "./local-pi.js";
+import { createFauxLocalModels, loadLocalPiModels, readPiSettings } from "./local-pi.js";
 import { ConnectorSetupError } from "./protocol.js";
 import type { ResourceConfig } from "./resources.js";
 
@@ -201,10 +201,12 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     return { provider: reference.slice(0, slash), modelId: reference.slice(slash + 1) };
   });
   if (values["allow-faux"] && (values["pi-agent-dir"] || models)) throw new ConnectorSetupError("Fixture mode cannot select personal Pi models.");
-  const enabledModels = values["allow-faux"] || models ? undefined : await readPiEnabledModels(values["pi-agent-dir"]).catch(error => {
+  const settings = values["allow-faux"] ? {} : await readPiSettings(values["pi-agent-dir"]).catch(error => {
     throw new ConnectorSetupError(`Pi settings could not be read: ${error instanceof SyntaxError ? "settings.json is not valid JSON" : error instanceof Error ? error.message : "unknown error"}.`);
   });
-  const localModels = values["allow-faux"] ? createFauxLocalModels() : await loadLocalPiModels({ agentDir: values["pi-agent-dir"], models, enabledModels });
+  const enabledModels = models ? undefined : settings.enabledModels;
+  const localModels = values["allow-faux"] ? createFauxLocalModels() : await loadLocalPiModels({ agentDir: values["pi-agent-dir"], models, enabledModels,
+    defaultThinkingLevel: settings.defaultThinkingLevel, modelThinkingLevels: settings.modelThinkingLevels });
   if (!(await localModels.manifest()).length) throw new ConnectorSetupError(enabledModels
     ? "None of the models enabled in Pi's settings.json (enabledModels) are authenticated on this machine."
     : "No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");

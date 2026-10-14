@@ -5,7 +5,7 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, Type, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitPushOperation, ModelDefinition, Operation, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel } from "../../../packages/shared/src/types.js";
 import { accessModes, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -18,6 +18,7 @@ import { prepareImage } from "./images.js";
 import { performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
+import { applyEdits } from "./edits.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -50,7 +51,8 @@ export type RunnerConfig = {
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
   pushComplete?: (request: PushCompleteRequest) => Promise<PushCompletionResult>;
-  resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string }>;
+  /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
+  resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
   readRepository?: (repository: SessionRepository, sessionId: string) => Promise<Uint8Array>;
   resources?: ResourceConfig;
@@ -273,7 +275,8 @@ export class RunnerSession {
     const harness = this.harness;
     void harness.closed.then(end => { if (end.reason === "failed" && harness === this.harness) this.#failed = true; });
     this.root = await this.harness.root(context, { agent: {
-      model: this.modelRef, extensions: [extension],
+      // A new conversation starts at the level the host's Pi gives this model, not pi-durable's "off".
+      model: this.modelRef, ...(resolved.thinkingLevel ? { thinkingLevel: resolved.thinkingLevel } : {}), extensions: [extension],
       tools: this.tools.filter(tool => this.binding.agent.tools.includes(tool.name as never)), instructions: this.agentInstructions("write"),
     } });
     await this.root.commit(async tx => {
@@ -467,6 +470,8 @@ export class RunnerSession {
         const resolved = await this.config.resolveModels({ ...binding, provider: requested.provider, modelId: requested.modelId })
           .catch(() => { throw invalid("Model is not available on this host"); });
         if (resolved.provider !== requested.provider || resolved.modelId !== requested.modelId) throw invalid("Model is not available on this host");
+        // Switching models without naming a level starts at that model's own level on this host.
+        if (value.thinkingLevel === undefined && resolved.thinkingLevel) options.thinkingLevel = resolved.thinkingLevel;
       } else if (requested.provider !== binding.provider || requested.modelId !== binding.modelId) throw invalid("This runner serves only the session's pinned model");
       options.model = requested;
     }
@@ -587,9 +592,19 @@ export class RunnerSession {
       defineTool({ name: "list_files", description: "List confined worktree files.", parameters: Type.Object({ path: Type.Optional(Type.String()) }), execute: async (args, api) => {
         const attribution = await this.toolActor(api, false); return text({ ...attribution, files: await this.sandbox.listFiles(args.path, () => this.recheckTool(attribution)) });
       } }),
-      defineTool({ name: "write_file", description: "Write a confined worktree file. Unavailable in read-only asks.", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute: async (args, api) => {
+      // Writes run one at a time: a round with a write is sequential, so an edit never reads a file another call changes.
+      defineTool({ name: "write_file", description: "Write a confined worktree file. Unavailable in read-only asks.", executionMode: "sequential", parameters: Type.Object({ path: Type.String(), content: Type.String() }), execute: async (args, api) => {
         const attribution = await this.toolActor(api, true); await this.sandbox.writeFile(args.path, args.content, () => this.recheckTool(attribution)); return text({ ...attribution, written: args.path });
       } }),
+      defineTool({ name: "edit_file", executionMode: "sequential",
+        description: "Edit a confined worktree text file by exact replacement, without rewriting it. Each edits[].oldText must occur exactly once in the file, including whitespace and line breaks; edits are matched against the file as it was, must not overlap, and apply together. Unavailable in read-only asks.",
+        parameters: Type.Object({ path: Type.String(), edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1 }) }),
+        execute: async (args, api) => {
+          const attribution = await this.toolActor(api, true);
+          const recheck = () => this.recheckTool(attribution);
+          await this.sandbox.writeFile(args.path, applyEdits(await this.sandbox.readFile(args.path, recheck), args.edits, args.path), recheck);
+          return text({ ...attribution, edited: args.path, edits: args.edits.length });
+        } }),
       defineTool({ name: "git_status", description: "Read local git status without mutation or network.", parameters: Type.Object({}), execute: async (_args, api) => {
         const attribution = await this.toolActor(api, false); return text({ ...attribution, status: await this.sandbox.gitStatus(() => this.recheckTool(attribution)) });
       } }),

@@ -111,7 +111,9 @@ export class HostWorkspace {
       const parts = await this.#parts(value, false);
       if (!parts.length) throw hostError("a file path is required");
       const parent = await directoryAt(this.worktree, parts.slice(0, -1));
-      return new TextDecoder().decode((await readAt(parent, parts.at(-1)!, MAX_FILE_BYTES)).data);
+      const data = (await readAt(parent, parts.at(-1)!, MAX_FILE_BYTES)).data;
+      // Strict, like the Linux helper: edit_file writes the text back, so a lossy decode would corrupt the file.
+      try { return new TextDecoder("utf-8", { fatal: true }).decode(data); } catch { throw hostError("the file is not UTF-8 text"); }
     });
   }
 

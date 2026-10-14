@@ -3,7 +3,7 @@ import type { GitProvider, SessionRepository } from "./repositories.js";
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "git_status", "git_commit", "bash", "github_comment", "git_push"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_comment", "git_push"] as const;
 export type ToolName = (typeof toolNames)[number];
 export interface UserProfile {
   id: string;

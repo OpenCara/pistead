@@ -112,7 +112,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
   // started on this host, else the host's first model.
   const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
   const initialModel = version ? agentModel : hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
-  const selection: ChatSelection = chat?.key === startKey ? chat.value : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, access: "approval" };
+  // The level the host's Pi starts that model at, as the session itself will.
+  const initialLevel = initialModel && host?.models.find(item => sameModel(item, initialModel))?.thinkingLevel;
+  const selection: ChatSelection = chat?.key === startKey ? chat.value
+    : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "approval" };
   // An agent pins its own model; without one, the session starts on the model picked here.
   const model = version ? agentModel : hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);

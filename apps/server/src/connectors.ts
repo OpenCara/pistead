@@ -25,7 +25,7 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const seen = new Set<string>();
   const models = input.models.map(value => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Invalid model metadata.');
-    onlyFields(value, ['provider', 'modelId', 'name', 'thinkingLevels']);
+    onlyFields(value, ['provider', 'modelId', 'name', 'thinkingLevels', 'thinkingLevel']);
     const provider = text(value.provider, 'provider', 80);
     const modelId = text(value.modelId, 'modelId', 200);
     const name = text(value.name, 'name', 120);
@@ -37,7 +37,10 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
     const levels = value.thinkingLevels;
     if (levels !== undefined && (!Array.isArray(levels) || !levels.length || levels.some(level => !thinkingLevels.includes(level))
       || new Set(levels).size !== levels.length)) fail(400, 'invalid_manifest', 'Invalid reasoning levels.');
-    return { provider, modelId, name, ...(levels ? { thinkingLevels: [...levels] as ThinkingLevel[] } : {}) };
+    // The level the host's Pi starts the model at must be one the model offers.
+    const level = value.thinkingLevel;
+    if (level !== undefined && (!thinkingLevels.includes(level as ThinkingLevel) || (levels && !levels.includes(level)))) fail(400, 'invalid_manifest', 'Invalid reasoning levels.');
+    return { provider, modelId, name, ...(levels ? { thinkingLevels: [...levels] as ThinkingLevel[] } : {}), ...(level ? { thinkingLevel: level as ThinkingLevel } : {}) };
   });
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');

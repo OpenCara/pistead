@@ -6,6 +6,8 @@ export interface LocalModelSummary {
   name: string;
   /** Reasoning levels the host's Pi supports for this model; absent from connectors older than chat options. */
   thinkingLevels?: ThinkingLevel[];
+  /** The level Pi on the host starts this model at, one of `thinkingLevels`; absent from connectors older than 0.5.1. */
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface ConnectorCapabilities {

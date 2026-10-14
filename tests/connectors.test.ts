@@ -353,6 +353,8 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'unknown thinking level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['off', 'extreme'] }] }, code: 'invalid_manifest' },
     { name: 'duplicate thinking level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['off', 'off'] }] }, code: 'invalid_manifest' },
     { name: 'empty thinking levels', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: [] }] }, code: 'invalid_manifest' },
+    { name: 'starting level the model lacks', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['low', 'high'], thinkingLevel: 'medium' }] }, code: 'invalid_manifest' },
+    { name: 'unknown starting level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevel: 'extreme' }] }, code: 'invalid_manifest' },
     { name: 'non-boolean chat options', value: { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: 'true' } }, code: 'invalid_manifest' },
     { name: 'non-boolean git providers', value: { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: 1 } }, code: 'invalid_manifest' },
   ];
