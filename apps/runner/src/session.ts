@@ -8,7 +8,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
-import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { repositoryLimits, repositoryRemote, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
@@ -17,6 +17,8 @@ import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.j
 import { prepareImage } from "./images.js";
 import { performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
+import { GitRemoteError } from "./git-remote.js";
+import { RepositoryCacheError, checkoutBudget, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCache } from "./repo-cache.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
@@ -72,12 +74,30 @@ export type RunnerConfig = {
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
   readRepository?: (repository: SessionRepository, sessionId: string) => Promise<Uint8Array>;
+  /**
+   * This host's repository cache (connect --repo-cache): pinned repositories are fetched with the host's own Git
+   * credentials and checked out of it, in the background, instead of being downloaded as archives.
+   */
+  repositoryCache?: RepositoryCache;
+  /** The control plane re-checks the session owner's own access to one pinned repository; it never returns a credential. */
+  authorizeRepository?: (repository: SessionRepository, sessionId: string) => Promise<RepositoryAuthorization>;
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
   /** Opens a session's Pi storage; defaults to the SQLite file in its directory. */
   openStorage?: (path: string) => Promise<Storage>;
 };
+
+/** Runner callbacks without a connector go to the control plane's internal routes, over HTTPS or local HTTP only. */
+function internalOrigin(controlPlaneUrl: string): string {
+  const origin = new URL(controlPlaneUrl);
+  if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/"
+    || (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))))
+    throw new RunnerError(503, "Invalid repository control-plane origin");
+  return origin.origin;
+}
+
+type RepositoryPreparation = { status: "ready" } | { status: "preparing"; done: Promise<void>; controller: AbortController } | { status: "failed"; reason: string };
 
 export class RunnerSession {
   readonly sandbox: Sandbox | HostWorkspace;
@@ -99,14 +119,26 @@ export class RunnerSession {
   #recovery: Promise<void> | undefined;
   /** Tool calls waiting on the owner's decision about a permission request, by request id. */
   #permissionWaiters = new Map<string, PromiseWithResolvers<ApprovalRecord>>();
+  /**
+   * Preparing repositories from the host repository cache can mean a first clone that takes minutes, far longer than
+   * the control plane waits for `create`. It runs in the background; runs are held until it is done (see drainQueue).
+   */
+  #repositories: RepositoryPreparation = { status: "ready" };
+  /** How this session's repositories are checked out, for the agent's instructions. */
+  #repositorySource: "archive" | "cache" = "archive";
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
       throw new RunnerError(403, "Session connector mismatch");
     this.sqlitePath = join(directory, "session.sqlite");
+    const cache = config.repositoryCache;
+    const pins = binding.session.repositories ?? [];
+    // Every session on a cache host gets the read-only cache mounts; archive-backed sessions simply never use them.
+    const options = cache && pins.length
+      ? { repositoryObjects: Object.fromEntries(pins.map(pin => [pin.path, cache.objects(pin, binding.owner.id)])) } : {};
     this.sandbox = config.unsandboxed
-      ? new HostWorkspace(binding, join(directory, "sandbox"))
-      : new Sandbox(binding, join(directory, "sandbox"), config.resources);
+      ? new HostWorkspace(binding, join(directory, "sandbox"), options)
+      : new Sandbox(binding, join(directory, "sandbox"), config.resources, options);
   }
 
   private assertTicket(ticket: RunnerTicket): void {
@@ -188,12 +220,9 @@ export class RunnerSession {
   private async pullRepository(repository: SessionRepository): Promise<Uint8Array> {
     if (this.config.readRepository) return this.config.readRepository({ ...repository }, this.binding.session.id);
     if (this.config.connectorId) throw new RunnerError(503, "Connected repository download requires its scoped callback");
-    const origin = new URL(this.config.controlPlaneUrl);
-    if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/"
-      || (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))))
-      throw new RunnerError(503, "Invalid repository control-plane origin");
+    const origin = internalOrigin(this.config.controlPlaneUrl);
     const signal = AbortSignal.timeout(30_000);
-    const response = await (this.config.fetch ?? fetch)(`${origin.origin}/api/internal/repositories/${assertId(repository.bindingId)}/download`, {
+    const response = await (this.config.fetch ?? fetch)(`${origin}/api/internal/repositories/${assertId(repository.bindingId)}/download`, {
       method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
       body: JSON.stringify({ sessionId: this.binding.session.id, commit: repository.commit }), signal, redirect: "error",
     });
@@ -237,9 +266,20 @@ export class RunnerSession {
     if (repositories.length) await authorize();
     await this.sandbox.initialize();
     if (!repositories.length) return;
-    if (await this.sandbox.repositoryCachesReady(repositories, authorize)) return;
+    const state = await this.sandbox.repositoryCacheState(repositories, authorize);
+    this.#repositorySource = state === "cache" || (state === "absent" && this.config.repositoryCache) ? "cache" : "archive";
+    if (state === "archive") return;
+    if (state === "cache") {
+      // Checked out already. The cache may still need the pinned history (cleaned up, or another host after a restore).
+      if (!restoring) this.prepareRepositories(repositories, false);
+      return;
+    }
     // A restored cache is authoritative: never replace its files with a fresh download.
     if (restoring) throw new RunnerError(409, "Restored repository cache is not ready");
+    if (this.config.repositoryCache) {
+      this.prepareRepositories(repositories, true);
+      return;
+    }
     const archives: Uint8Array[] = [];
     for (const repository of repositories) {
       await authorize();
@@ -260,6 +300,84 @@ export class RunnerSession {
     if (!await this.sandbox.repositoryCachesReady(repositories, authorize)) throw new RunnerError(409, "Repository cache initialization did not complete");
   }
 
+  /**
+   * Prepares the session's repositories from the host repository cache in the background: for each pin, the control
+   * plane re-checks the owner's access, the cache fetches it if needed (with the host's own Git credentials) and its
+   * tree is checked; then everything is checked out at once. A later preparation, or close(), supersedes this one.
+   */
+  private prepareRepositories(repositories: SessionRepository[], checkout: boolean): void {
+    const controller = new AbortController();
+    const authorize = async () => { controller.signal.throwIfAborted(); await this.authorize(this.binding.owner.id, "write"); };
+    const done = (async () => {
+      await this.fetchRepositories(repositories, authorize, checkout, controller.signal);
+      if (checkout) {
+        try { await this.sandbox.materializeFromCache(repositories, authorize); }
+        catch (error) {
+          if (error instanceof RunnerError) throw error;
+          // Helper reasons are fixed "sandbox: ..." phrases; anything carrying paths or other detail stays local.
+          const reason = error instanceof Error ? /sandbox: ([a-z0-9 ,.'()-]{1,160})$/i.exec(error.message.trim())?.[1] : undefined;
+          throw new RunnerError(422, `Repository checkout could not be prepared${reason ? `: ${reason}` : ""}`);
+        }
+      }
+      if ((await this.sandbox.repositoryCacheState(repositories, authorize)) !== "cache") throw new RunnerError(409, "Repository cache initialization did not complete");
+    })();
+    const preparing: RepositoryPreparation = { status: "preparing", done, controller };
+    this.#repositories = preparing;
+    done.then(() => {
+      if (this.#repositories !== preparing) return;
+      this.#repositories = { status: "ready" };
+      if (!this.closing) this.drainQueue();
+    }, (error: unknown) => {
+      if (this.#repositories !== preparing) return;
+      this.#repositories = { status: "failed", reason: error instanceof RunnerError ? error.message : "Repositories could not be prepared on this host" };
+    });
+  }
+
+  private async fetchRepositories(repositories: SessionRepository[], authorize: () => Promise<void>, inspect: boolean, signal: AbortSignal): Promise<void> {
+    const cache = this.config.repositoryCache;
+    if (!cache) throw new RunnerError(503, "This host has no repository cache");
+    const budget = checkoutBudget();
+    for (const repository of repositories) {
+      await authorize();
+      const answer = await this.authorizeRepository(repository, signal);
+      // The remote is derived from the pin on both sides: a control plane cannot point this host's credentials elsewhere.
+      if (answer.bindingId !== repository.bindingId || answer.commit !== repository.commit || answer.remote !== repositoryRemote(repository)) {
+        throw new RunnerError(403, "Repository authorization does not match the pinned repository");
+      }
+      await authorize();
+      try {
+        await cache.ensure({ pin: repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: answer.remote }, { signal });
+        if (inspect) {
+          const summary = await cache.inspect(repository, this.binding.owner.id, budget, signal);
+          budget.entries -= summary.entries;
+          budget.bytes -= summary.bytes;
+        }
+      } catch (error) {
+        if (signal.aborted) throw new RunnerError(503, "Repository preparation was cancelled");
+        // Only these errors carry fixed, credential-free messages; anything else stays local.
+        const reason = error instanceof RepositoryCacheError || error instanceof GitRemoteError || error instanceof HostCredentialError
+          ? error.message : "this host could not fetch it";
+        throw new RunnerError(502, `${repository.fullName} could not be prepared on this host: ${reason}`);
+      }
+    }
+    await authorize();
+  }
+
+  private async authorizeRepository(repository: SessionRepository, signal: AbortSignal): Promise<RepositoryAuthorization> {
+    if (this.config.authorizeRepository) return this.config.authorizeRepository({ ...repository }, this.binding.session.id);
+    if (this.config.connectorId) throw new RunnerError(503, "Connected repository authorization requires its scoped callback");
+    const response = await (this.config.fetch ?? fetch)(`${internalOrigin(this.config.controlPlaneUrl)}/api/internal/repositories/${assertId(repository.bindingId)}/authorize`, {
+      method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: this.binding.session.id, commit: repository.commit }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]), redirect: "error",
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new RunnerError(403, "Repository authorization denied");
+    }
+    return repositoryAuthorization(await response.json());
+  }
+
   private agentInstructions(mode: "write" | "ask" | "read"): string {
     let instructions = this.binding.agent.instructions;
     const repositories = this.binding.session.repositories ?? [];
@@ -267,7 +385,11 @@ export class RunnerSession {
       instructions += "\n\nTrusted runtime repository context:\n"
         + "The execution root is the isolated session worktree. File-tool paths are relative to that worktree, not to a repository root.\n"
         + repositories.map(repository => `- Source snapshot: worktree/${repository.path}; file-tool path prefix: ${repository.path}/; pinned commit: ${repository.commit}.`).join("\n")
-        + "\nOperate only on isolated session files. These are pinned source snapshots, not full upstream Git histories.";
+        + (this.#repositorySource === "cache"
+          ? "\nOperate only on isolated session files. Each repository's full history up to its pinned commit is available read-only: "
+            + "refs/remotes/<path>/pinned names the pinned commit (for example git log <path>/pinned), and inside that commit file paths "
+            + "are relative to the repository (git blame <pinned commit> -- <file>). Upstream branches and tags are not available."
+          : "\nOperate only on isolated session files. These are pinned source snapshots, not full upstream Git histories.");
       if (this.binding.agent.tools.includes("git_push"))
         instructions += "\ngit_push publishes one repository's committed session changes to a branch on its Git provider: commit first with git_commit; "
           + "the session commits that touch that repository path are replayed onto its pinned commit, so the branch contains only your changes. "
@@ -424,7 +546,8 @@ export class RunnerSession {
   }
 
   private drainQueue(): void {
-    if (this.draining || this.closing) return;
+    // Runs wait for repositories prepared in the background; their preparation drains the queue when it is done.
+    if (this.draining || this.closing || this.#repositories.status !== "ready") return;
     this.draining = true;
     void this.exclusive(async () => {
       while (!this.closing) {
@@ -527,6 +650,9 @@ export class RunnerSession {
       throw new RunnerError(400, "Invalid or missing Worker write admission");
     return this.exclusive(async () => {
       if (this.closing) throw new RunnerError(503, "Session is closing");
+      // Messages queue while repositories are prepared; once that failed, say why instead of queueing forever.
+      const preparation = this.#repositories;
+      if (preparation.status === "failed") throw new RunnerError(502, `${preparation.reason.replace(/\.$/, "")}. Restart the session to try again.`);
       await this.authorize(ticket.actorId, mode === "ask" ? "ask" : "write", ticket.policyVersion);
       const options = await this.chatOptions(input.options, mode, ticket.actorId);
       const key = await requestKey(ticket.actorId, mode, input.requestId);
@@ -1077,6 +1203,10 @@ export class RunnerSession {
 
   async close({ abortPushes = true }: { abortPushes?: boolean } = {}): Promise<void> {
     this.closing = true;
+    // A long fetch stops at once; a checkout already under way finishes in the sandbox and the next open finds it ready.
+    const preparation = this.#repositories;
+    if (preparation.status === "preparing") preparation.controller.abort();
+    this.#repositories = { status: "ready" };
     if (abortPushes) {
       // Aborted pushes still settle their approval (interrupted) and report completion before the harness closes.
       for (const push of this.pushes) push.controller.abort();

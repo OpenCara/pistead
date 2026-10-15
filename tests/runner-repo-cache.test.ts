@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseGitProgress } from "../apps/runner/src/git-remote.js";
-import { RepositoryCache, type RepositoryCacheProgress } from "../apps/runner/src/repo-cache.js";
+import { RepositoryCache, repositoryAuthorization, type RepositoryCacheProgress } from "../apps/runner/src/repo-cache.js";
 import type { GitHubSessionRepository } from "../packages/shared/src/repositories.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
 
@@ -202,4 +202,19 @@ test("progress parsing keeps Git's numbers and drops any other remote text", () 
   assert.deepEqual(parseGitProgress("Enumerating objects: 1234, done."), { phase: "enumerating", percent: null, done: 1234, total: null });
   assert.equal(parseGitProgress("Visit https://evil.example to continue"), null);
   assert.equal(parseGitProgress("Counting objects: \u001b[31m"), null);
+});
+
+test("the control plane's cache authorization must be exactly the pin and its remote, never anything more", () => {
+  const repository = { bindingId: "binding-alpha", commit: "a".repeat(40), remote: "https://github.com/acme/alpha.git" };
+  assert.deepEqual(repositoryAuthorization({ repository }), repository);
+  for (const value of [
+    null, [], repository, { repository: null }, { repository, extra: true },
+    { repository: { ...repository, authorization: "Bearer secret" } },
+    { repository: { bindingId: repository.bindingId, commit: repository.commit } },
+    { repository: { ...repository, commit: "A".repeat(40) } },
+    { repository: { ...repository, commit: "a".repeat(39) } },
+    { repository: { ...repository, remote: 7 } },
+    { repository: { ...repository, remote: `https://${"x".repeat(2048)}` } },
+    { repository: { ...repository, bindingId: 7 } },
+  ]) assert.throws(() => repositoryAuthorization(value), /Invalid repository authorization/, JSON.stringify(value)?.slice(0, 80));
 });

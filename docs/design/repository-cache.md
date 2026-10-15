@@ -1,8 +1,21 @@
 # Design: host repository cache with per-session Git object stores
 
-Status: phase 1 in progress. Done: the host cache and full-history fetch (`repo-cache.ts`, `git-remote.ts`), the
-server's per-session authorization (`repositoryAuthorize`), and checking pinned trees out of the cache in the sandbox
-and in host mode. Not yet done: wiring into session start, push, progress in the UI, backups, and cache cleanup.
+Status: phase 1 in progress, behind the connector flag `--repo-cache` (preview). Done: the host cache and
+full-history fetch (`repo-cache.ts`, `git-remote.ts`), the server's per-session authorization (`repositoryAuthorize`),
+checking pinned trees out of the cache in the sandbox and in host mode, and session start. Not yet done: push without
+re-fetching, progress in the UI, backups and restores of cache-backed sessions, and cache cleanup.
+
+### Session start (implemented)
+
+The control plane waits 30 seconds for a session's `create` and disconnects the connector when it times out, so a
+first clone cannot run inside `create`. On a cache host, `RunnerSession.open()` returns at once and prepares the
+repositories in the background: for each pin, `authorizeRepository` (the server re-checks the owner's access; the
+answer must name exactly the pin and `repositoryRemote(pin)`), `RepositoryCache.ensure` and `inspect`; then one
+`materializeFromCache`. `drainQueue` holds runs until it is done, so messages sent meanwhile queue. If it fails, new
+messages are refused with the reason (for example "No Git credentials for github.com are set up on this host"), queued
+ones stay queued, and restarting the session tries again. `close()` aborts a fetch in progress. Already checked-out
+sessions re-run the authorization and `ensure` on every open (cheap when cached), so a host that lost the pin fetches
+it again. Sessions checked out from archives keep working on a cache host and never use the mounts.
 
 ## How sessions get their code today
 
@@ -205,7 +218,8 @@ I'd ship phase 1 first. It delivers the speed and size gains with a small, conta
 | `apps/runner/src/git-credentials.ts` | Reused as-is for fetches (`hostGitAuthorization`). |
 | `packages/shared` protocol, `apps/server/src/connector-hub.ts`, `apps/web` | `repository-progress` message, relay, and progress rows in the session view. |
 | `apps/runner/src/` (new `repo-cache.ts`) | Cache layout (per host or per owner), locks, pin refs, gc, eviction. Runs outside the sandbox. |
-| `apps/runner/src/connect-cli.ts` | `--repo-cache-scope=host\|owner` and `--repo-cache-max-bytes`. |
+| `apps/runner/src/connect-cli.ts`, `connector.ts` | Done: `--repo-cache` (opt-in while in preview) and `--repo-cache-scope host\|owner`; the connector creates the cache in its private state directory, advertises `repositoryCache`, and calls the scoped authorize route. To do: `--repo-cache-max-bytes`. |
+| `apps/runner/src/session.ts` | Done: background preparation, held runs, refusal with the reason, agent instructions that mention the history. |
 | `apps/runner/src/sandbox.ts` | Done: read-only `--ro-bind-try` mounts of the cache object directories (by path: the resource supervisor passes only fds 3-6 to bwrap), `materializeFromCache` (`repository-checkout` in the helper), `repositoryCacheState`, version 2 markers. To do: in `push_prepare`, skip the upstream pack; in `snapshot`, the diff-only format and symlinks. |
 | `apps/runner/src/host-workspace.ts` | Done: the same checkout for host mode. To do: a fsck check of cached pins. |
 | `apps/runner/src/repo-cache.ts` | Done: `inspect`, the tree check before checkout. |

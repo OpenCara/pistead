@@ -6,6 +6,7 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { GitRemote, ProgressLines, parseGitProgress, type GitProgressPhase } from "./git-remote.js";
+import { RunnerError } from "./protocol.js";
 
 /**
  * Host repository cache (docs/design/repository-cache.md). One bare repository per provider repository
@@ -53,6 +54,22 @@ export interface RepositoryCacheOptions {
 
 export class RepositoryCacheError extends Error {
   constructor(message: string) { super(message); this.name = "RepositoryCacheError"; }
+}
+
+/**
+ * The control plane's answer to a repository cache authorization (`repositoryAuthorize` on the server): the pin it
+ * re-checked and its credential-free remote. Never a credential, never content.
+ */
+export interface RepositoryAuthorization { bindingId: string; commit: string; remote: string }
+
+export function repositoryAuthorization(value: unknown): RepositoryAuthorization {
+  const outer = value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).join() === "repository" ? (value as { repository: unknown }).repository : undefined;
+  if (!outer || typeof outer !== "object" || Array.isArray(outer) || Object.keys(outer).sort().join() !== "bindingId,commit,remote") throw new RunnerError(502, "Invalid repository authorization");
+  const { bindingId, commit, remote } = outer as Record<string, unknown>;
+  if (typeof bindingId !== "string" || typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit) || typeof remote !== "string" || remote.length > 2048) {
+    throw new RunnerError(502, "Invalid repository authorization");
+  }
+  return { bindingId, commit, remote };
 }
 
 /** What checking out one pinned tree writes; `inspect` subtracts it from the session's remaining budget. */

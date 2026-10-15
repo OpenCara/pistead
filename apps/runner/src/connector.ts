@@ -17,6 +17,7 @@ import { modelSummary } from "./local-pi.js";
 import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { recoverResourceOrphans } from "./resources.js";
+import { RepositoryCache, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCacheScope } from "./repo-cache.js";
 import { RunnerService, createRunnerApp } from "./server.js";
 import type { RunnerConfig } from "./session.js";
 
@@ -165,7 +166,7 @@ export async function connectorManifest(localModels: LocalModels, allowFaux = fa
   return models;
 }
 
-function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boolean; gitCredentials?: boolean } = {}): ConnectorCapabilities {
+function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boolean; gitCredentials?: boolean; repositoryCache?: object } = {}): ConnectorCapabilities {
   const result = value ?? { platform: process.platform, sandbox: false, productionShell: false };
   if (typeof result.platform !== "string" || !/^[A-Za-z0-9_-]{1,40}$/.test(result.platform)
     || typeof result.sandbox !== "boolean" || typeof result.productionShell !== "boolean"
@@ -173,7 +174,8 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
   // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, pushes, and
   // reads and merges on GitHub through the control plane.
-  const credentials = mode.gitCredentials ? { gitCredentials: true } : {};
+  // So does the owner's choice to check repositories out of this host's cache, fetched with its own Git credentials.
+  const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
 }
@@ -263,6 +265,11 @@ export interface ConnectorOptions {
   unsandboxed?: boolean;
   /** Let pushes in the owner's own sessions use this host's Git credentials (connect --git-credentials). */
   gitCredentials?: boolean;
+  /**
+   * Check pinned repositories out of a cache on this host, fetched with this host's own Git credentials after the control
+   * plane re-checks each session owner's access (connect --repo-cache). One cache per host, or one per session owner.
+   */
+  repositoryCache?: { scope?: RepositoryCacheScope };
   fetch?: typeof fetch;
   createSocket?: (url: string, protocols: string[]) => ConnectorSocket;
   runtimeFactory?: (config: RunnerConfig) => Promise<ConnectorRuntime>;
@@ -300,6 +307,7 @@ export class LocalConnector {
   private releaseLease?: () => Promise<void>;
   private state?: ConnectorCredentials;
   private directory = "";
+  private repositoryCache?: RepositoryCache;
 
   constructor(private readonly options: ConnectorOptions) {
     this.ready = this.readiness.promise;
@@ -326,6 +334,10 @@ export class LocalConnector {
   private async initialize(): Promise<void> {
     if (process.platform !== "linux" && !this.options.runtimeFactory && !(this.options.unsandboxed && process.platform === "darwin")) throw new Error("Connected runner requires a Linux sandbox and kernel lease; no host-shell fallback");
     this.directory = await privateDirectory(this.options.dataDir);
+    if (this.options.repositoryCache) {
+      // Beside the runner's session storage, in the same private state directory; the cache keeps its own locks.
+      this.repositoryCache = new RepositoryCache({ root: join(this.directory, "repo-cache"), scope: this.options.repositoryCache.scope ?? "host" });
+    }
     this.releaseLease = await (this.options.acquireLease ?? acquireRunnerLease)(this.directory, () => {
       this.lifetime.abort();
       this.disconnect(this.generation);
@@ -476,6 +488,10 @@ export class LocalConnector {
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
         readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
+        ...(this.repositoryCache ? {
+          repositoryCache: this.repositoryCache,
+          authorizeRepository: (repository: SessionRepository, sessionId: string) => this.authorizeRepository(generation, repository, sessionId),
+        } : {}),
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
@@ -577,6 +593,16 @@ export class LocalConnector {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     if (bytes.length !== restore.size || response.headers.get("x-backup-sha256") !== restore.sha256 || await sha256(text) !== restore.sha256) throw new Error("Backup integrity mismatch");
     return bytes;
+  }
+
+  /** The control plane re-checks the session owner's own access to one pinned repository; no credential comes back. */
+  private async authorizeRepository(generation: Generation, repository: SessionRepository, sessionId: string): Promise<RepositoryAuthorization> {
+    const { bindingId, commit } = repository;
+    if (typeof bindingId !== "string" || !IDENTIFIER.test(bindingId)
+      || typeof sessionId !== "string" || !IDENTIFIER.test(sessionId)
+      || typeof commit !== "string" || !/^[a-f0-9]{40}$/.test(commit)) throw new Error("Invalid repository descriptor");
+    // Its refusals (owner lost access, commit gone) are fixed, credential-free messages the session shows as they are.
+    return repositoryAuthorization(await this.brokerCallback(generation, `/api/connectors/self/repositories/${bindingId}/authorize`, { sessionId, commit }));
   }
 
   private async readRepository(generation: Generation, repository: SessionRepository, sessionId: string): Promise<Uint8Array> {

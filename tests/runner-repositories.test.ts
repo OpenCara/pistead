@@ -1,14 +1,17 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { Harness } from "@earendil-works/pi-durable";
 import { sha256 } from "../packages/shared/src/crypto.js";
-import { repositoryLimits, repositoryPath, type GitHubSessionRepository, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { repositoryLimits, repositoryPath, repositoryRemote, type GitHubSessionRepository, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { RepositoryCache } from "../apps/runner/src/repo-cache.js";
+import { startGitHttpServer } from "./helpers/git-http.js";
 import { repositoryPins } from "../apps/runner/src/sandbox.js";
 import type { RestoreDescriptor } from "../packages/shared/src/connector.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
@@ -656,4 +659,91 @@ test("repository protocol rejects malformed or duplicate provider pins", async t
   });
   assert.equal(validateRepositories([pin, providerPin({ bindingId: "other", host: "gitlab.com", fullName: "group/other" })]).length, 2, "same id on another host is distinct");
   assert.equal(validateRepositories([repository(), providerPin({ repositoryId: String(repository().repositoryId) })]).length, 2, "GitHub and provider ids never collide");
+});
+
+// Cache hosts in host mode: no bwrap needed, only Git.
+const cacheHost = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0, timeout: 60_000 };
+const UPSTREAM_AUTH = "Basic cGlzdGVhZDp0b2tlbg==";
+
+function upstreamGit(cwd: string, args: string[]): string {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Upstream", GIT_AUTHOR_EMAIL: "upstream@example.test",
+    GIT_COMMITTER_NAME: "Upstream", GIT_COMMITTER_EMAIL: "upstream@example.test", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+test("cache hosts return from create at once, hold runs until the pins are fetched and checked out, and expose history", cacheHost, async t => {
+  const root = await directory(t);
+  const work = join(root, "upstream");
+  upstreamGit(root, ["init", "-q", "-b", "main", work]);
+  await writeFile(join(work, "README.md"), "hello from upstream\n");
+  upstreamGit(work, ["add", "."]);
+  upstreamGit(work, ["commit", "-q", "-m", "first"]);
+  await writeFile(join(work, "NOTES.md"), "notes\n");
+  upstreamGit(work, ["add", "."]);
+  upstreamGit(work, ["commit", "-q", "-m", "second"]);
+  const served = join(root, "served");
+  upstreamGit(root, ["clone", "-q", "--bare", work, join(served, "acme", "project-1.git")]);
+  const server = await startGitHttpServer(served, { authorization: UPSTREAM_AUTH });
+  t.after(() => server.close());
+  // github.com remotes go to the local server; the second upload-pack POST (the pack itself) waits for the gate.
+  const gate = Promise.withResolvers<void>();
+  const packRequested = Promise.withResolvers<void>();
+  let posts = 0;
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => UPSTREAM_AUTH, fetch: async (input, init) => {
+    if (init?.method === "POST" && ++posts === 2) { packRequested.resolve(); await gate.promise; }
+    return fetch(String(input).replace(/^https:\/\/github\.com\//, server.url("")), init);
+  } });
+  const pin: GitHubSessionRepository = { ...repository(), commit: upstreamGit(work, ["rev-parse", "HEAD"]) };
+  const input = binding("cache-host", [pin]);
+  let authorizations = 0;
+  const service = new RunnerService(config(root, {
+    unsandboxed: true, repositoryCache: cache,
+    authorizeRepository: async (repository, sessionId) => {
+      authorizations++;
+      assert.equal(sessionId, input.session.id);
+      return { bindingId: repository.bindingId, commit: repository.commit, remote: repositoryRemote(repository) };
+    },
+    readRepository: async () => assert.fail("cache hosts never download archives"),
+  }));
+  t.after(async () => { gate.resolve(); await service.close(); });
+  await service.initialize();
+  const session = await service.provision(input, await ticket(input.session.id, "create"));
+  // create returned while the clone is still waiting for its pack.
+  await packRequested.promise;
+  assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "absent");
+  const receipt = await session.submit(await ticket(input.session.id, "submit"), { content: "TEST_READ acme/project-1/README.md", requestId: "read-from-cache" }, "write");
+  assert.equal(receipt.status, "queued");
+  gate.resolve();
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.queue?.find(run => run.submissionId === receipt.submissionId)?.status, "settled");
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("hello from upstream")), "the held run reads the checked-out file");
+  assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "cache");
+  assert.equal(authorizations, 1);
+  assert.equal((await session.sandbox.execute({ kind: "bash", command: "git rev-list --count acme/project-1/pinned" }, false, allow)).trim(), "2");
+});
+
+test("a cache host that cannot prepare a repository refuses new messages with the reason until the session restarts", cacheHost, async t => {
+  const root = await directory(t);
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched without authorization") });
+  const input = binding("cache-denied");
+  const service = new RunnerService(config(root, {
+    unsandboxed: true, repositoryCache: cache,
+    authorizeRepository: async () => { throw new RunnerError(403, "The pinned commit is no longer readable in this GitHub repository."); },
+    readRepository: async () => assert.fail("cache hosts never download archives"),
+  }));
+  t.after(() => service.close());
+  await service.initialize();
+  const session = await service.provision(input, await ticket(input.session.id, "create"));
+  let refusal: unknown;
+  for (let attempt = 0; attempt < 100 && !refusal; attempt++) {
+    await delay(20);
+    await session.submit(await ticket(input.session.id, "submit"), { content: "TEST_IDENTITY", requestId: `attempt-${attempt}` }, "write")
+      .catch((error: unknown) => { refusal = error; });
+  }
+  assert.ok(refusal instanceof RunnerError);
+  assert.equal(refusal.status, 502);
+  assert.equal(refusal.message, "The pinned commit is no longer readable in this GitHub repository. Restart the session to try again.");
+  assert.equal(await session.sandbox.repositoryCacheState(input.session.repositories!, allow), "absent");
 });
