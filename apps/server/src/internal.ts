@@ -9,7 +9,7 @@ import { fail, identifier, jsonObject, userIdentifier } from './http.js';
 import { requireCallbackScope } from './connectors.js';
 import { githubComment, githubMerge, githubRead } from './github-broker.js';
 import { legacyRestoreDownload } from './restore-routes.js';
-import { repositoryDownload } from './repositories.js';
+import { repositoryAuthorize, repositoryDownload } from './repositories.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
@@ -32,6 +32,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/git/push/complete', c => pushComplete(c, null));
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
   app.post('/api/internal/repositories/:bindingId/download', c => repositoryDownload(c, null));
+  app.post('/api/internal/repositories/:bindingId/authorize', c => repositoryAuthorize(c, null));
 }
 
 export async function authorizeSession(c: AppContext, connectorId: string | null): Promise<Response> {

@@ -1,6 +1,8 @@
 # Design: host repository cache with per-session Git object stores
 
-Status: draft for discussion. Nothing here is implemented.
+Status: phase 1 in progress. Done: the host cache and full-history fetch (`repo-cache.ts`, `git-remote.ts`) and
+the server's per-session authorization (`repositoryAuthorize`). Not yet done: wiring into session start, the sandbox,
+push, progress in the UI, backups, and cache cleanup.
 
 ## How sessions get their code today
 
@@ -36,9 +38,10 @@ default there is one cache per host. A connector option (`--repo-cache-scope=own
 session owner, at `repo-cache/owners/<ownerId>/…`. It holds one bare repository per repository identity:
 
 ```
-repo-cache/<provider>/<host>/<repositoryId>.git     # bare repository; full history, no partial-clone filter
-repo-cache/<…>.git/refs/pistead/pins/<sessionId>    # keeps each live session's pinned commit reachable
-repo-cache/<…>.git/pistead.lock                     # flock: one writer (fetch, gc) at a time
+repo-cache/<provider>/<host>/<repositoryId>.git              # bare repository; full history, no partial-clone filter
+repo-cache/<…>.git/refs/pistead/pins/<hash of session id>    # keeps each live session's pinned commit reachable
+repo-cache/<…>.git/refs/upstream/{heads,tags}/…              # the remote's branches and tags, as last fetched
+repo-cache/<provider>/<host>/<repositoryId>.git.pistead.lock # holder's pid: one writer (fetch, gc) at a time
 ```
 
 - **Cache key:** the cache is keyed by the provider's stable repository id, not its name, because renames
@@ -63,7 +66,9 @@ The cache changes this, and access must still fail closed:
    already used by the `host-credentials` push identity. The server never sends a read credential to a host,
    so no repository token leaves the control plane for reads. The runner keeps the resulting header in memory
    for one `GitRemote` fetch, and never writes it to disk, to the cache's Git config, or into a sandbox.
-   - The server sends only the non-secret remote URL with each pin, built from provider, host and name.
+   - The remote URL is not secret. Both sides derive it from the pin with the shared `repositoryRemote(pin)`
+     (the same function pushes use), the server returns it from the authorization call, and the runner refuses
+     to fetch if the two differ.
    - If the host has no credential for that remote, or it cannot read the repository, session start fails with
      the existing message ("No Git credentials for <host> are set up on this host (for example with gh auth
      setup-git or a credential helper)") or a "this host cannot read <repo>" error. There is no fallback to a
@@ -72,10 +77,19 @@ The cache changes this, and access must still fail closed:
      owner's account, so a host credential that sees a different repository under the same URL fails closed.
 2. **The owner's access is still checked by the server, for every session:** the host's credential decides what
    the host can fetch, not what the session owner may read. The server already verifies the owner's own access
-   when it pins a commit (`resolveWorkspaceRepositories`), and it re-checks it with a new "authorize pin" call
-   before the runner uses the cache, whether the commit was just fetched or already cached. The answer carries
-   no credential. Otherwise a second user on a shared host could read a private repository that only the host
-   account (or another owner) can see.
+   when it pins a commit (`resolveWorkspaceRepositories`), and it re-checks it with
+   `POST /api/connectors/self/repositories/:bindingId/authorize` (or `/api/internal/…` for runners without a
+   connector) before the runner uses the cache, whether the commit was just fetched or already cached.
+   - **Checks:** the same session and connector authority as the archive download (current connection, session
+     not archived, unchanged policy version, pins and owner); the owner's own account still reads the repository
+     under the same identity (`verifyRepository`, before and after); the owner's account still reads the exact
+     pinned commit (GitHub `commits/<sha>` with the sha media type, or the provider adapter's `commit()`); and
+     the owner's provider connection did not change during the call (`recheckAccess`).
+   - **Answer:** `{ repository: { bindingId, commit, remote } }`, `Cache-Control: private, no-store`. No
+     credential and no repository content. The request accepts only `sessionId` and `commit`, so a host cannot
+     name its own remote, owner or ref.
+   - Without this check a second user on a shared host could read a private repository that only the host
+     account (or another owner) can see.
 3. **Shared cache across owners:** one cache per host is safe under bubblewrap, because authorization happens
    for each session and not per cache. Owners who don't want to share a store, or hosts that run without
    bubblewrap, can use the per-owner scope.
@@ -170,8 +184,9 @@ I'd ship phase 1 first. It delivers the speed and size gains with a small, conta
 
 | Area | Change |
 |---|---|
-| `packages/shared/src/repositories.ts` | Limits for checkout, separate from archive limits. Protocol flag for whether the connector supports the cache. |
-| `apps/server/src/repositories.ts` | New "authorize pin" endpoint: re-checks the owner's access and returns the non-secret remote URL, never a credential. `repositoryDownload` stays only for older connectors. |
+| `packages/shared/src/repositories.ts` | Done: `repositoryRemote(pin)`, moved from `push/targets.ts`. To do: limits for checkout, separate from archive limits. |
+| `packages/shared/src/connector.ts`, `apps/server/src/connectors.ts` | Done: the `repositoryCache` connector capability. |
+| `apps/server/src/repositories.ts`, `internal.ts` | Done: `repositoryAuthorize` (connector and internal routes), sharing its session and connector checks with `repositoryDownload`, which stays only for older connectors. |
 | `apps/runner/src/git-remote.ts` | A full-history fetch into the bare cache repository (want the pin plus branches and tags, `have` what the cache already holds, no depth or filter), with structured progress. |
 | `apps/runner/src/git-credentials.ts` | Reused as-is for fetches (`hostGitAuthorization`). |
 | `packages/shared` protocol, `apps/server/src/connector-hub.ts`, `apps/web` | `repository-progress` message, relay, and progress rows in the session view. |
@@ -191,6 +206,8 @@ I'd ship phase 1 first. It delivers the speed and size gains with a small, conta
 4. **Fetching:** always done by the runner on the host, never by the server, and always with the host's own
    Git credentials. The server never sends a read credential to a host; it only authorizes the owner's access.
 5. **First session on a host:** it waits for the clone, and the UI shows the clone's progress.
+6. **Push identity:** unchanged. Reads always use the host's credentials, but pushes keep using the identity
+   configured for the repository (GitHub App, the owner's account, or host credentials when chosen), as today.
 
 ## Clone progress
 
@@ -199,7 +216,7 @@ The first session on a host waits while the runner clones; later sessions only w
 - **Source:** `GitRemote` currently sends `no-progress` and drops side-band 2. For cache fetches it stops
   sending `no-progress` and parses band 2 lines ("Counting objects", "Compressing objects", "Receiving objects:
   N% (a/b)", "Resolving deltas"). It also counts the pack bytes it receives, so it can show bytes and rate
-  even when the remote sends no progress. `index-pack` runs with `--progress` locally for the delta phase.
+  even when the remote sends no progress. `index-pack -v` reports the local receiving and delta phases.
 - **Sanitizing:** progress lines come from the remote, so the runner reduces them to structured fields (phase,
   percent, done, total, bytes) and never forwards raw text.
 - **Transport:** a new connector message, e.g. `repository-progress { sessionId, path, phase, percent, done,
@@ -212,5 +229,13 @@ The first session on a host waits while the runner clones; later sessions only w
 - **Timeouts:** cache fetches get a long deadline like pushes (`PUSH_TIMEOUT_MS`, one hour) instead of
   `TIMEOUT_MS`, and can be cancelled when the session is closed.
 
-6. **Push identity:** unchanged. Reads always use the host's credentials, but pushes keep using the identity
-   configured for the repository (GitHub App, the owner's account, or host credentials when chosen), as today.
+## Open questions
+
+1. **Shared hosts.** When a host is shared with a workspace, other members' sessions on it fetch with the host
+   owner's Git credentials. The server checks each member's own access first, and the URL comes from the pin,
+   so a member only ever gets repositories they can read themselves. But the host owner's account is what the
+   forge sees for those reads (audit logs, rate limits). Pushes with host credentials are stricter today: the
+   owner must opt in with `--git-credentials`, and they only run in the host owner's own sessions
+   (`requireOwnHost`). Options: (a) allow cache reads for every session on the host, which is how it works now;
+   (b) require an opt-in flag for reads in other members' sessions, and fail those sessions with a clear error
+   without it; (c) restrict cache reads to the host owner's own sessions.

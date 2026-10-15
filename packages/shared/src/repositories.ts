@@ -165,6 +165,23 @@ export function sessionRepositoryProvider(repository: SessionRepository): GitPro
 }
 
 /**
+ * Credential-free https clone URL of a pinned repository. Pushes use it, and hosts that fetch into their repository
+ * cache derive it themselves and require the control plane's answer to match, so neither side can be pointed elsewhere.
+ */
+export function repositoryRemote(pin: SessionRepository): string {
+  const name = pin.fullName;
+  switch (sessionRepositoryProvider(pin)) {
+    case "github": return `https://github.com/${name}.git`;
+    case "bitbucket": return `https://bitbucket.org/${name}.git`;
+    case "azure-devops": {
+      const [organization, project, repository] = name.split("/") as [string, string, string];
+      return `https://dev.azure.com/${organization}/${encodeURIComponent(project)}/_git/${encodeURIComponent(repository)}`;
+    }
+    default: return `https://${"provider" in pin ? pin.host : "github.com"}/${name}.git`;
+  }
+}
+
+/**
  * Worktree directory of a pinned repository. GitHub keeps owner/name; other providers live under their host so names
  * from different providers never collide, with characters outside [A-Za-z0-9._-] replaced by "-".
  */

@@ -7,6 +7,7 @@ import { HTTPException } from 'hono/http-exception';
 import { app } from '../apps/server/src/index.js';
 import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import { archiveRedirect, boundedRepositoryBody } from '../apps/server/src/repositories.js';
+import { parseManifest } from '../apps/server/src/connectors.js';
 import { gitProviderAdapters } from '../apps/server/src/git/providers.js';
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
@@ -141,9 +142,11 @@ function provisionHub(f: Fixture) {
 }
 
 function github(t: TestContext) {
-  const calls: { url: string; authorization: string | null; redirect: RequestRedirect | undefined }[] = [];
+  const calls: { url: string; authorization: string | null; accept: string | null; redirect: RequestRedirect | undefined }[] = [];
   const unexpected: string[] = [];
   const state = {
+    // The sha media type answer for one exact commit id.
+    pinned: async (url: string): Promise<Response> => new Response(url.slice(-40), { headers: { 'Content-Type': 'application/vnd.github.sha' } }),
     commit: commitA,
     ref: repositoryInput.ref,
     metadata: async (): Promise<Response> => Response.json(metadata),
@@ -155,10 +158,12 @@ function github(t: TestContext) {
   };
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    calls.push({ url, authorization: new Headers(init?.headers).get('authorization'), redirect: init?.redirect });
+    calls.push({ url, authorization: new Headers(init?.headers).get('authorization'), accept: new Headers(init?.headers).get('accept'), redirect: init?.redirect });
     if (url === `https://api.github.com/repos/${metadata.full_name}`) return state.metadata();
     if (url === `https://api.github.com/repos/${metadata.full_name}/commits/${encodeURIComponent(state.ref)}` ||
         url === `https://api.github.com/repos/${metadata.full_name}/commits/main`) return state.resolve();
+    if (url === `https://api.github.com/repos/${metadata.full_name}/commits/${commitA}` ||
+        url === `https://api.github.com/repos/${metadata.full_name}/commits/${commitB}`) return state.pinned(url);
     if (/^https:\/\/api\.github\.com\/user\/repos\?per_page=100&page=\d+&sort=full_name&direction=asc$/.test(url)) return state.picker(url);
     if (url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitA}` ||
         url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitB}`) return state.redirect();
@@ -199,6 +204,10 @@ async function connectedSetup(t: TestContext) {
 }
 function download(f: Fixture, session: SessionRecord, pin: SessionRepository, connector?: Connected, body: unknown = { sessionId: session.id, commit: pin.commit }) {
   return f.request('POST', connector ? `/api/connectors/self/repositories/${pin.bindingId}/download` : `/api/internal/repositories/${pin.bindingId}/download`,
+    body, connector ? { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken } : { Authorization: `Bearer ${internalSecret}` });
+}
+function authorizeCache(f: Fixture, session: SessionRecord, pin: SessionRepository, connector?: Connected, body: unknown = { sessionId: session.id, commit: pin.commit }) {
+  return f.request('POST', connector ? `/api/connectors/self/repositories/${pin.bindingId}/authorize` : `/api/internal/repositories/${pin.bindingId}/authorize`,
     body, connector ? { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken } : { Authorization: `Bearer ${internalSecret}` });
 }
 
@@ -908,6 +917,7 @@ const giteaInput = { provider: 'gitea', host: giteaHost, repositoryId: '42', ful
 const giteaRepository = `${giteaApi}/repositories/42`;
 const giteaCommit = `${giteaApi}/repos/acme/tools/commits?sha=main&limit=1&stat=false&verification=false&files=false`;
 const giteaArchive = `${giteaApi}/repos/acme/tools/archive/${commitA}.tar.gz`;
+const giteaPinnedCommit = `${giteaApi}/repos/acme/tools/commits?sha=${commitA}&limit=1&stat=false&verification=false&files=false`;
 const providerManifest = { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: true } };
 const giteaToken = (client: Client) => `gitea-secret-for-${client.user.id}`;
 
@@ -919,6 +929,7 @@ function gitea(t: TestContext) {
     picker: async (): Promise<Response> => Response.json([giteaMetadata]),
     metadata: async (): Promise<Response> => Response.json(giteaMetadata),
     resolve: async (): Promise<Response> => Response.json([{ sha: commitA }]),
+    pinned: async (): Promise<Response> => Response.json([{ sha: commitA }]),
     archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
   };
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -928,6 +939,7 @@ function gitea(t: TestContext) {
     if (url === `${giteaApi}/user/repos?page=1&limit=30`) return state.picker();
     if (url === giteaRepository) return state.metadata();
     if (url === giteaCommit) return state.resolve();
+    if (url === giteaPinnedCommit) return state.pinned();
     if (url === giteaArchive) return state.archive();
     unexpected.push(url);
     throw new Error('Unexpected outbound repository request');
@@ -1188,4 +1200,92 @@ test('zip snapshots are converted to a single-directory tar.gz before checksummi
   assert.deepEqual(s.remote.calls.map(call => call.url), [giteaRepository, giteaRepository]);
   archive = new Uint8Array(new TextEncoder().encode('PK not really a zip'));
   await denied(await download(s.f, session, pin, s.connector), 502, 'invalid_repository_archive');
+});
+
+test('connector manifests may advertise the repository cache, as a boolean only', () => {
+  const capabilities = { platform: 'linux', sandbox: true, productionShell: false };
+  assert.equal(parseManifest({ models: [], capabilities: { ...capabilities, repositoryCache: true } }, {} as Env).capabilities.repositoryCache, true);
+  assert.ok(!('repositoryCache' in parseManifest({ models: [], capabilities: { ...capabilities, repositoryCache: false } }, {} as Env).capabilities));
+  assert.throws(() => parseManifest({ models: [], capabilities: { ...capabilities, repositoryCache: 'yes' } }, {} as Env), HTTPException);
+});
+
+test('repository cache authorization requires the exact credential, generation, session binding and commit', async t => {
+  const s = await connectedSetup(t); const session = await s.start(); const pin = session.repositories![0];
+  const other = await connect(s.f, s.host, s.team.id);
+  s.remote.calls.length = 0;
+  const path = `/api/connectors/self/repositories/${pin.bindingId}/authorize`; const body = { sessionId: session.id, commit: pin.commit };
+  await denied(await s.owner.request('POST', path, body), 401, 'connector_authentication_required');
+  await denied(await s.f.request('POST', path, body, { Authorization: `Bearer ${s.connector.token}` }), 401, 'stale_connection');
+  await denied(await authorizeCache(s.f, session, pin, { ...s.connector, connectionToken: token() }), 401, 'stale_connection');
+  await denied(await authorizeCache(s.f, session, pin, other), 403, 'connector_binding_mismatch');
+  await denied(await authorizeCache(s.f, session, pin), 403, 'connector_scope_required');
+  await denied(await authorizeCache(s.f, session, pin, s.connector, { ...body, commit: commitB }), 403, 'repository_binding_mismatch');
+  await denied(await authorizeCache(s.f, session, { ...pin, bindingId: 'unbound-repository' }, s.connector), 403, 'repository_binding_mismatch');
+  // A host may not name its own remote, owner or ref: everything comes from the session pin.
+  for (const extra of [{ remote: 'https://evil.example/repo.git' }, { ownerId: s.host.user.id }, { repositoryId: metadata.id }, { ref: 'main' }]) {
+    await denied(await authorizeCache(s.f, session, pin, s.connector, { ...body, ...extra }), 400, 'invalid_repository_authorization');
+  }
+  assert.equal(s.remote.calls.length, 0);
+});
+
+for (const transport of ['connector', 'legacy'] as const) {
+  test(`${transport} repository cache authorization checks the owner's own access to the exact commit and returns only the credential-free remote`, async t => {
+    const s = transport === 'connector' ? await connectedSetup(t) : await legacySetup(t);
+    const session = 'start' in s ? await s.start() : s.session;
+    const pin = session.repositories![0]; const connector = 'connector' in s ? s.connector : undefined;
+    s.remote.calls.length = 0;
+    const response = await authorizeCache(s.f, session, pin, connector);
+    assert.equal(response.headers.get('cache-control'), 'private, no-store');
+    const text = await response.clone().text();
+    assert.deepEqual(await json(response), { repository: { bindingId: pin.bindingId, commit: pin.commit, remote: `https://github.com/${pin.fullName}.git` } });
+    assert.ok(!text.includes(s.owner.githubToken), 'No credential ever reaches the host');
+    // No archive is downloaded: the host fetches the repository itself.
+    assert.deepEqual(s.remote.calls.map(call => call.url), [
+      `https://api.github.com/repos/${pin.fullName}`,
+      `https://api.github.com/repos/${pin.fullName}/commits/${pin.commit}`,
+      `https://api.github.com/repos/${pin.fullName}`,
+    ]);
+    for (const call of s.remote.calls) assert.equal(call.authorization, `Bearer ${s.owner.githubToken}`);
+    assert.equal(s.remote.calls[1]!.accept, 'application/vnd.github.sha');
+  });
+}
+
+test('repository cache authorization fails closed when owner access, the binding identity or the pinned commit changes', async t => {
+  const s = await connectedSetup(t); const session = await s.start(); const pin = session.repositories![0];
+  const original = { metadata: s.remote.state.metadata, pinned: s.remote.state.pinned };
+  const missing = async (): Promise<Response> => new Response(null, { status: 404 });
+  const changes: [() => void, number, string][] = [
+    [() => { s.remote.state.metadata = missing; }, 403, 'github_repository_unavailable'],
+    [() => { s.remote.state.metadata = async () => Response.json({ ...metadata, full_name: 'acme/renamed' }); }, 409, 'repository_identity_changed'],
+    [() => { s.remote.state.pinned = missing; }, 403, 'repository_commit_unavailable'],
+    [() => { s.remote.state.pinned = async () => new Response(commitB); }, 403, 'repository_commit_unavailable'],
+    [() => { s.remote.state.pinned = async () => new Response('busy', { status: 500 }); }, 502, 'github_unavailable'],
+  ];
+  for (const [change, status, code] of changes) {
+    Object.assign(s.remote.state, original);
+    change();
+    await denied(await authorizeCache(s.f, session, pin, s.connector), status, code);
+  }
+  Object.assign(s.remote.state, original);
+  assert.equal((await authorizeCache(s.f, session, pin, s.connector)).status, 200);
+  // The owner's GitHub connection changes while the commit is being checked.
+  const rotated = await encryptToken(s.f.env, s.owner.user.id, 'rotated-github-token');
+  s.remote.state.pinned = async (url: string) => {
+    s.f.sqlite.prepare('UPDATE github_tokens SET ciphertext = ? WHERE user_id = ?').run(rotated, s.owner.user.id);
+    return new Response(url.slice(-40));
+  };
+  await denied(await authorizeCache(s.f, session, pin, s.connector), 403, 'github_access_changed');
+  s.f.sqlite.prepare('DELETE FROM github_tokens WHERE user_id = ?').run(s.owner.user.id);
+  await denied(await authorizeCache(s.f, session, pin, s.connector), 409, 'github_not_connected');
+});
+
+test('token-provider cache authorization checks the pinned commit with the owner\'s own account', async t => {
+  const s = await providerSetup(t); const session = await s.start(); const pin = session.repositories![0];
+  s.remote.calls.length = 0;
+  const response = await authorizeCache(s.f, session, pin, s.connector);
+  assert.deepEqual(await json(response), { repository: { bindingId: pin.bindingId, commit: commitA, remote: `https://${giteaHost}/acme/tools.git` } });
+  assert.deepEqual(s.remote.calls.map(call => call.url), [giteaRepository, giteaPinnedCommit, giteaRepository]);
+  for (const call of s.remote.calls) assert.equal(call.authorization, `token ${giteaToken(s.owner)}`);
+  s.remote.state.pinned = async () => Response.json([]);
+  await denied(await authorizeCache(s.f, session, pin, s.connector), 403, 'git_repository_unavailable');
 });

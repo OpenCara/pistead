@@ -1,6 +1,6 @@
 import { HTTPException } from 'hono/http-exception';
 import type { GitProvider, SessionRepository } from '../../../../packages/shared/src/repositories.js';
-import { gitProviderNames } from '../../../../packages/shared/src/repositories.js';
+import { gitProviderNames, repositoryRemote } from '../../../../packages/shared/src/repositories.js';
 import { fail } from '../http.js';
 import { boundedRepositoryBody, verifyRepository, type RepositoryAccess } from '../repositories.js';
 import { basic, gitProviderAdapters } from '../git/providers.js';
@@ -105,19 +105,6 @@ async function read(target: Api, url: string): Promise<Record<string, unknown>> 
   return unavailable(target.provider);
 }
 
-function remote(pin: SessionRepository): string {
-  const name = pin.fullName;
-  switch (provider(pin)) {
-    case 'github': return `https://github.com/${name}.git`;
-    case 'bitbucket': return `https://bitbucket.org/${name}.git`;
-    case 'azure-devops': {
-      const [organization, project, repository] = name.split('/') as [string, string, string];
-      return `https://dev.azure.com/${organization}/${encodeURIComponent(project)}/_git/${encodeURIComponent(repository)}`;
-    }
-    default: return `https://${host(pin)}/${name}.git`;
-  }
-}
-
 /** Azure DevOps Git security token segment: the UTF-16LE bytes of one branch segment as lowercase hex. */
 function azureSegment(segment: string): string {
   let hex = '';
@@ -199,7 +186,7 @@ export async function pushTarget(access: RepositoryAccess, pin: SessionRepositor
   const target = api(access, pin);
   const metadata = await verifyRepository(access, { repositoryId: String(pin.repositoryId), fullName: pin.fullName });
   const permission = await ownerCanPush(target, pin, branch);
-  return { canPush: permission.canPush, defaultBranch: metadata.defaultBranch, remote: remote(pin),
+  return { canPush: permission.canPush, defaultBranch: metadata.defaultBranch, remote: repositoryRemote(pin),
     ...(permission.azureProjectId ? { azureProjectId: permission.azureProjectId } : {}) };
 }
 
