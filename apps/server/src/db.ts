@@ -78,6 +78,17 @@ export async function listSessionAccess(env: Env, actorId: string): Promise<Sess
     return access ? [access] : [];
   });
 }
+/** Every session of one workspace the actor can read, newest first, on the same policy snapshot as `listSessionAccess`. */
+export async function workspaceSessionAccess(env: Env, workspaceId: string, actorId: string): Promise<SessionAccess[]> {
+  const snapshots = await env.DB.query<SessionPolicyRow>(`${SESSION_ACCESS_SQL}
+    AND s.workspace_id = ? AND (s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL)
+    ORDER BY s.created_at DESC, s.id DESC`)
+    .bind(actorId, testMode(env) ? 1 : 0, workspaceId, actorId).all();
+  return snapshots.flatMap(snapshot => {
+    const access = accessFromSnapshot(snapshot, actorId);
+    return access ? [access] : [];
+  });
+}
 export async function requireSession(c: AppContext, sessionId: string, permission: Permission): Promise<SessionAccess> {
   const access = await sessionAccess(c.env, sessionId, c.get('auth').userId);
   if (!access) fail(404, 'not_found', 'Session not found.');

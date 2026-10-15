@@ -1,7 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
-import { BackupList, backupDownloadHref, type Backup } from "./backups";
+import { BackupList, backupDatabaseLabel, backupDownloadHref, backupLocationLabel, type Backup, type BackupDatabase } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
 import { Icon } from "./icons";
 import { Username, usePeople } from "./people";
@@ -54,11 +54,26 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       ? "Session is workspace-visible. Workspace members can view prompts and output."
       : "Session is private. Existing explicit grants still apply.");
   }
-  function createBackup() {
+  async function createBackup() {
     if (!session || !isOwner || backupBlocked || action.busy) return;
     setBackup(null);
-    void action.run(async () => {
-      const result = await api<{ backup: Backup }>(`/api/sessions/${segment(session.id)}/backup`, { method: "POST" });
+    const base = `/api/sessions/${segment(session.id)}`;
+    let trustedDatabaseId: string | undefined;
+    try {
+      // A backup saved where someone else can read it waits for the owner's explicit confirmation of that database.
+      const { workspaceDatabase } = await api<{ workspaceDatabase?: BackupDatabase }>(`${base}/backups`);
+      if (workspaceDatabase?.confirm) {
+        const confirmed = await confirmDialog({
+          title: "Save to the workspace database?",
+          message: `This backup is saved in ${backupDatabaseLabel(workspaceDatabase)}, the database the workspace owner connected. Whoever can read it can read this session: its prompts, output and files, and your personal environment values.`,
+          confirmLabel: "Save backup",
+        });
+        if (!confirmed) return;
+        trustedDatabaseId = workspaceDatabase.id;
+      }
+    } catch { /* The backup request repeats the check and explains a refusal. */ }
+    await action.run(async () => {
+      const result = await api<{ backup: Backup }>(`${base}/backup`, { method: "POST", ...(trustedDatabaseId ? { body: { trustedDatabaseId } } : {}) });
       setBackup(result.backup);
       onChange();
     }, "Backup created");
@@ -95,7 +110,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       onChange();
     }, "Session unarchived");
   }
-  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup, rename,
+  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup: () => void createBackup(), rename,
     archive: () => void archive(), unarchive };
 }
 
@@ -238,6 +253,7 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
     {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
+    {isOwner && <ExportSection session={session} />}
     <AccessSection session={session} view={view} user={user} />
   </div>;
 }
@@ -401,7 +417,7 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
   const { backup } = actions;
   return <Section
     title="Backups"
-    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p></>}
+    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p><p>When the workspace owner connected a database of their own, backups are saved there instead of in the server's storage.</p></>}
     action={<div className="inline">
       <Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh backups" title="Refresh backups" onClick={() => setRefreshKey(value => value + 1)} />
       <Button variant="outline" size="sm" disabled={actions.backupBlocked || actions.action.busy} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
@@ -411,10 +427,17 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
     {backup && <Row
       leading={<Icon name="check" size={16} />}
       title={<>Backup created <Timestamp value={backup.createdAt} /></>}
-      hint={<>{backup.size} bytes · ID <code>{backup.id}</code> · SHA-256 <code>{backup.sha256}</code></>}
+      hint={<>{backup.size} bytes{backupLocationLabel(backup)} · ID <code>{backup.id}</code> · SHA-256 <code>{backup.sha256}</code></>}
       trailing={<LinkButton variant="outline" size="sm" href={backupDownloadHref(session.id, backup.id)}>Download</LinkButton>}
     />}
     <BackupList sourceId={session.id} ownerId={session.ownerId} latestBackup={backup} refreshKey={refreshKey} openSession={openSession} />
+  </Section>;
+}
+
+/** The owner's export of what the control plane keeps about the session; available while archived too. */
+function ExportSection({ session }: { session: SessionRecord }) {
+  return <Section title="Export" info={<p>Downloads this session's details, people, approvals, pushes, backup list and activity as JSON, without secrets. The conversation itself is in the session's backups. Only the session owner can export it.</p>}>
+    <Row leading={<Icon name="archive" size={16} />} title="Session data" hint="JSON, without secrets" trailing={<LinkButton variant="outline" size="sm" href={`/api/sessions/${segment(session.id)}/export`} download>Export</LinkButton>} />
   </Section>;
 }
 

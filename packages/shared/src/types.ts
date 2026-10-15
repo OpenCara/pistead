@@ -323,6 +323,32 @@ export interface PushIdentity {
   createdAt: string;
   updatedAt: string;
 }
+/**
+ * How the server connects to a workspace database: TLS that verifies the server certificate against the public roots or
+ * the owner's CA (`verify-full`), TLS without verifying it (`require`), or no TLS (`disable`, private networks only).
+ */
+export const workspaceDatabaseTlsModes = ["verify-full", "require", "disable"] as const;
+export type WorkspaceDatabaseTls = (typeof workspaceDatabaseTlsModes)[number];
+/**
+ * Public view of the Postgres database a workspace owner connected: session backups of the workspace are saved there
+ * instead of the server's backup storage. The password never leaves the control plane.
+ */
+export interface WorkspaceDatabase {
+  id: string;
+  workspaceId: string;
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  tls: WorkspaceDatabaseTls;
+  /** The server certificate is verified against the owner's CA certificate instead of the public roots. */
+  customCa: boolean;
+  connectedBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+/** Where a backup's snapshot is kept: the server's backup storage, or the workspace owner's own database. */
+export type BackupLocation = "server" | "workspace-database";
 export interface ApprovalRecord {
   id: string;
   sessionId: string;

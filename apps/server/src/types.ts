@@ -4,12 +4,15 @@ import type { GitProvider, TokenGitProvider } from '../../../packages/shared/src
 import type { ConnectorHub } from './connector-hub-types.js';
 import type { Database } from './db/types.js';
 import type { ObjectStorage } from './storage/types.js';
+import type { WorkspaceDatabaseProvider } from './workspace-databases/types.js';
 
 /** Everything a request handler can reach: providers plus configuration. Built once in `apps/server/src/config.ts`. */
 export interface Env {
   DB: Database;
   CONNECTOR_HUB?: ConnectorHub;
   BUCKET?: ObjectStorage;
+  /** Reaches the databases workspace owners connect for their session backups; absent unless the operator enabled them. */
+  WORKSPACE_DATABASES?: WorkspaceDatabaseProvider;
   APP_ORIGIN: string;
   RUNNER_URL?: string;
   RUNNER_EVENT_TRANSPORT?: string;

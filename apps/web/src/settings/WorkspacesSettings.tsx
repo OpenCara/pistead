@@ -11,6 +11,7 @@ import { href } from "../router";
 import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../usernames";
 import { PushAccess } from "./PushAccess";
+import { WorkspaceDatabaseSection } from "./WorkspaceDatabase";
 
 const roleLabel: Record<WorkspaceRole, string> = { owner: "Owner", admin: "Admin", member: "Member" };
 
@@ -65,8 +66,20 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
     <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />
     <Repositories workspace={workspace} admin={admin} {...repositories} />
     <PushAccess workspace={workspace} admin={admin} />
+    <WorkspaceDatabaseSection workspace={workspace} owner={role === "owner"} />
     <Members workspace={workspace} admin={admin} />
+    {admin && <DataExport workspace={workspace} />}
   </>;
+}
+
+function DataExport({ workspace }: { workspace: Workspace }) {
+  return <Section title="Data export" info={<div className="stack">
+    <p>Downloads this workspace as JSON: its settings, members, models, published agents, repositories, push access, session database connection and activity, with your own sessions in full and the records of the other sessions you can view.</p>
+    <p>Other members' private sessions are left out; their owners can export them. Secrets are never included, and a session's conversation is in its backups.</p>
+    <p>The workspace owner can import exports into the workspace's session database.</p>
+  </div>}>
+    <Row title="Workspace data" hint="JSON, without secrets" trailing={<LinkButton variant="outline" size="sm" href={`/api/workspaces/${segment(workspace.id)}/export`} download>Export</LinkButton>} />
+  </Section>;
 }
 
 function Setup({ user, workspace, admin, repositoryCount }: { user: UserProfile; workspace: Workspace; admin: boolean; repositoryCount: number | null }) {
