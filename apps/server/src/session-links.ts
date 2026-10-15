@@ -84,12 +84,15 @@ function sharedEntry(entry: EntryView): EntryView {
  * Only the shared conversation, as the session screen shows it: no side asks, approvals or queue, no record of who sent
  * each message, none of the owner's identity beyond their display name, and secrets redacted as in every view. Entries
  * keep only the fields a transcript shows, so nothing a newer runner adds reaches a link without a decision here.
+ * It fails closed: an entry shows only when it names a conversation the view lists as the shared one, so a view that
+ * drops or mislabels its conversations shows less, never a side ask.
  */
 export function sharedView(view: SessionView): SharedSessionView {
   const conversations = Array.isArray(view.conversations) ? view.conversations : [];
-  const sideAsks = new Set(conversations.filter(conversation => conversation?.mode === 'ask').map(conversation => conversation.id));
+  const shared = new Set(conversations.filter(conversation => !!conversation && typeof conversation === 'object' && conversation.mode === 'write')
+    .map(conversation => conversation.id));
   const entries = (Array.isArray(view.entries) ? view.entries : [])
-    .filter(entry => !!entry && typeof entry === 'object' && !(entry.conversationId !== undefined && sideAsks.has(entry.conversationId)))
+    .filter(entry => !!entry && typeof entry === 'object' && typeof entry.conversationId === 'string' && shared.has(entry.conversationId))
     .map(sharedEntry);
   return { entries, busy: view.busy === true };
 }

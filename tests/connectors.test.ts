@@ -10,7 +10,8 @@ import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionLink, SessionRecord, SessionView, SharedSession, SharedSessionView } from '../packages/shared/src/types.js';
+import type { AgentVersion, ApprovalRecord, EntryView, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionLink, SessionRecord, SessionView, SharedSession, SharedSessionView } from '../packages/shared/src/types.js';
+import { sharedView } from '../apps/server/src/session-links.js';
 import { toolNames } from '../packages/shared/src/types.js';
 import { REDACTED } from '../packages/shared/src/redaction.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
@@ -2180,6 +2181,20 @@ test('share links show anyone who has one the shared conversation, and nothing e
   const actions = (f.sqlite.prepare("SELECT action FROM audit WHERE session_id = ? AND action LIKE 'session.link.%' ORDER BY created_at, rowid")
     .all(s.session.id) as { action: string }[]).map(row => row.action);
   assert.deepEqual(actions, ['session.link.created', 'session.link.created', 'session.link.revoked']);
+});
+
+test('a share link shows only entries of a conversation the view lists as shared, and nothing when it lists none', () => {
+  const entry = (id: string, conversationId?: string): EntryView =>
+    ({ id, kind: 'message', role: 'user', text: id, ...(conversationId === undefined ? {} : { conversationId }) });
+  const base = { sessionId: 'session', owner: { id: 'owner', displayName: 'Owner', gitName: 'Owner', gitEmail: 'owner@example.test', githubLogin: null },
+    approvals: [], busy: false };
+  const entries = [entry('shared', '0'), entry('side-ask', '1'), entry('unlisted', '2'), entry('unlabelled', '3'), entry('no-conversation')];
+  const conversations = [{ id: '0', mode: 'write' }, { id: '1', mode: 'ask' }, { id: '3' }];
+  assert.deepEqual(sharedView({ ...base, entries, conversations } as unknown as SessionView).entries.map(item => item.id), ['shared']);
+  // A view that drops or garbles its conversations shows nothing rather than everything.
+  for (const broken of [undefined, null, 'write', [null, 5, { mode: 'write' }]]) {
+    assert.deepEqual(sharedView({ ...base, entries, conversations: broken } as unknown as SessionView).entries, [], JSON.stringify(broken));
+  }
 });
 
 test('turning link sharing on answers a concurrent request with the same link and refuses an owner who just lost access', async t => {

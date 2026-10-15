@@ -36,6 +36,13 @@ test('values of secret-named settings and credentials in URLs, headers, curl and
     ['password: hunter22', 'password: [redacted]'],
     ['the password is hunter22, it said', 'the password is [redacted], it said'],
     ['the password is hunter22.', 'the password is [redacted].'],
+    ['password: swordfish', 'password: [redacted]'],
+    ['db:\n  password: swordfish # prod\n  host: db', 'db:\n  password: [redacted] # prod\n  host: db'],
+    ['the password is swordfish', 'the password is [redacted]'],
+    ['The password was correct-horse-battery.', 'The password was [redacted].'],
+    ['the password is Swordfish, I think', 'the password is [redacted], I think'],
+    ['api_key: deadbeefcafebabe', 'api_key: [redacted]'],
+    ['the token is deadbeefcafebabedeadbeef.', 'the token is [redacted].'],
     ['aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'aws_secret_access_key = [redacted]'],
     ['clientSecret: "abc"', 'clientSecret: "[redacted]"'],
     ['X-Api-Key: abc123def456', 'X-Api-Key: [redacted]'],
@@ -82,6 +89,11 @@ test('code, identifiers, types, numbers, references and prose stay exactly as th
     'http://localhost:5173/@fs/src/main.tsx', 'https://example.com:8443/path@v2', 'Password: <your password>', 'api_key: "your-api-key"',
     'token: xxxxxxxx', 'password: "********"', 'the token is valid until tomorrow', '| password | hunter22 |', 'task-sk-learn-pipeline-name-here',
     `a long base64 blob ${'QUJD'.repeat(40)}`, 'echo $SECRET_KEY', '--token-file ~/.token', 'gh auth login --with-token < token.txt',
+    // Plain words after a password key that are code or prose, not the password.
+    'password: string', '  password: Password', 'password: SecretStr', 'password: userPassword', 'password: user_password',
+    'password: password', 'password: hash', '    password: Optional[str]', 'password: required', 'the password is incorrect.',
+    'The password is required', 'the password is stored in the vault', 'Your password is too short.', 'token: expired',
+    'sha: deadbeefcafebabe',
   ]) assert.equal(redactSecrets(text), text, text);
 });
 

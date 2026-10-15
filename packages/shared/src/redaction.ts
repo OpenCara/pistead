@@ -32,7 +32,31 @@ function hideable(value: string, options: RedactOptions): boolean {
 
 /** An unquoted value that reads as a secret rather than a word, identifier or number of something. */
 function literal(value: string): boolean {
-  return value.length >= 6 && (/^\d+$/.test(value) || (/\d/.test(value) && /[A-Za-z]/.test(value)) || /[!@#%^*~]/.test(value));
+  return value.length >= 6 && (/^\d+$/.test(value) || (/\d/.test(value) && /[A-Za-z]/.test(value)) || /[!@#%^*~]/.test(value)
+    || /^[0-9a-f]{16,}$/i.test(value));
+}
+
+/** Words that follow a password key in code and prose without being the password: types, states, variable names. */
+const notPasswords = new Set([
+  "string", "text", "number", "integer", "float", "double", "boolean", "bytes", "buffer", "object", "unknown", "never", "char", "varchar",
+  "null", "none", "undefined", "true", "false", "enabled", "disabled",
+  "required", "optional", "invalid", "valid", "incorrect", "correct", "wrong", "missing", "empty", "blank", "expired", "hidden",
+  "masked", "redacted", "sensitive", "case-sensitive", "stored", "saved", "encrypted", "hashed", "salted", "protected", "changed",
+  "reset", "needed", "necessary", "mandatory", "unset", "weak", "strong", "long", "short", "ready", "same", "different", "given",
+  "provided", "supplied", "generated", "random", "unique", "default", "allowed", "accepted", "rejected", "denied", "locked",
+  "unlocked", "visible", "shown", "cleared", "removed", "deleted", "updated", "unchanged", "secure", "insecure", "safe", "unsafe",
+  "known", "special", "important", "plain", "plaintext", "ciphertext", "encoded", "decoded",
+  "password", "passwords", "passwd", "passphrase", "pass", "secret", "token", "value", "values", "credential", "credentials",
+  "hash", "input", "data", "body", "form", "user", "args", "params", "options", "config", "field", "entry", "item", "result",
+  "response", "request", "payload", "answer", "prompt", "match",
+]);
+
+/**
+ * A plain word that is the password when it follows a password key and ends its line or sentence: `password: swordfish`,
+ * `the password is swordfish.` Identifiers (`SecretStr`, `userPassword`, `user_password`) and the words above are code.
+ */
+function plainPassword(value: string): boolean {
+  return /^[A-Za-z][A-Za-z-]{3,63}$/.test(value) && !/^[a-z]+[A-Z]|^[A-Z][a-z]+[A-Z]/.test(value) && !notPasswords.has(value.toLowerCase());
 }
 
 /** The next character on the same line after `index`, past spaces and tabs; empty at the end of the line or text. */
@@ -105,7 +129,8 @@ const prose = /^[ \t]+(?:is|was)[ \t]+$/i;
 
 /**
  * `KEY=value` as in .env files, shells, flags and URLs hides any value; other separators (`key: value`, `key = value`,
- * `password is value`) hide an unquoted value only when it reads as a secret and isn't code (`token: Uint8Array;`).
+ * `password is value`) hide an unquoted value only when it reads as a secret (digits with letters, a symbol, a long hex
+ * run, or for a password a plain word that ends its line or sentence) and isn't code (`token: Uint8Array;`).
  */
 function assignments(text: string, options: RedactOptions): string {
   return text.replace(assignment, (match: string, key: string, keyQuote: string, separator: string,
@@ -122,9 +147,13 @@ function assignments(text: string, options: RedactOptions): string {
       if (separator === "=") {
         // Any value, unless it's an argument in code: f(token=token).
         if (/[),}\]]/.test(next) ? !literal(value) : /^\d{1,5}$/.test(value)) return match;
-      } else if (!literal(value) || (!prose.test(separator) && /[;,)}\]|<>({[=?:&]/.test(next))) {
+      } else {
+        const sentence = prose.test(separator);
         // Code goes on after a value it assigns (`token: Uint8Array;`); prose doesn't assign with `is`.
-        return match;
+        if (!sentence && /[;,)}\]|<>({[=?:&]/.test(next)) return match;
+        // A password's plain word must end its line (a YAML comment may follow) or its sentence.
+        const ends = next === "" || (sentence ? /[.!?,;)"']/.test(next) : next === "#");
+        if (!literal(value) && !(/^pass/i.test(key) && ends && plainPassword(value))) return match;
       }
     }
     if (!hideable(value, options)) return match;
