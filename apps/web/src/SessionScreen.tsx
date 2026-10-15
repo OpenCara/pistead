@@ -8,6 +8,8 @@ import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
 import { Markdown } from "./markdown";
+import { RepositoryPreparationCard } from "./repository-preparation";
+import { preparingRepositories } from "./repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "./transcript";
@@ -212,6 +214,8 @@ function SessionPane({ id }: { id: string }) {
         : <div className="session-transcript" />) : session && <Conversation
         id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
         pinned={<>
+          {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
+            canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={refreshAll} />}
           {session.hostUnsandboxed && (canWrite || canApprove) && <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
@@ -337,7 +341,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
-  const queueLabel = view.busy
+  const queueLabel = preparingRepositories(view)
+    ? <><Spinner />Preparing repositories...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    : view.busy
     ? <><Spinner />Working...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
     : <>Idle</>;

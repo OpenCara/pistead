@@ -19,6 +19,7 @@ import { performPush, PushError, pushSummary, type PushResult } from "./push.js"
 import { HostCredentialError } from "./git-credentials.js";
 import { GitRemoteError } from "./git-remote.js";
 import { RepositoryCacheError, checkoutBudget, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCache } from "./repo-cache.js";
+import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
@@ -97,7 +98,10 @@ function internalOrigin(controlPlaneUrl: string): string {
   return origin.origin;
 }
 
-type RepositoryPreparation = { status: "ready" } | { status: "preparing"; done: Promise<void>; controller: AbortController } | { status: "failed"; reason: string };
+type RepositoryPreparation = { status: "ready" }
+  | { status: "preparing"; done: Promise<void>; controller: AbortController; items: RepositoryPreparationItem[] }
+  | { status: "failed"; reason: string; items: RepositoryPreparationItem[] };
+type ProgressUpdate = (path: string, change: Partial<Omit<RepositoryPreparationItem, "path">>) => void;
 
 export class RunnerSession {
   readonly sandbox: Sandbox | HostWorkspace;
@@ -308,9 +312,13 @@ export class RunnerSession {
   private prepareRepositories(repositories: SessionRepository[], checkout: boolean): void {
     const controller = new AbortController();
     const authorize = async () => { controller.signal.throwIfAborted(); await this.authorize(this.binding.owner.id, "write"); };
+    // What the session view shows, one row per pin; only structured progress, never Git's or a remote's text.
+    const items: RepositoryPreparationItem[] = repositories.map(({ path }) => ({ path, phase: "queued", percent: null, done: null, total: null, bytes: 0 }));
+    const update: ProgressUpdate = (path, change) => { const item = items.find(each => each.path === path); if (item) Object.assign(item, change); };
     const done = (async () => {
-      await this.fetchRepositories(repositories, authorize, checkout, controller.signal);
+      await this.fetchRepositories(repositories, authorize, checkout, controller.signal, update);
       if (checkout) {
+        for (const { path } of repositories) update(path, { phase: "checking-out", percent: null, done: null, total: null });
         try { await this.sandbox.materializeFromCache(repositories, authorize); }
         catch (error) {
           if (error instanceof RunnerError) throw error;
@@ -321,7 +329,7 @@ export class RunnerSession {
       }
       if ((await this.sandbox.repositoryCacheState(repositories, authorize)) !== "cache") throw new RunnerError(409, "Repository cache initialization did not complete");
     })();
-    const preparing: RepositoryPreparation = { status: "preparing", done, controller };
+    const preparing: RepositoryPreparation = { status: "preparing", done, controller, items };
     this.#repositories = preparing;
     done.then(() => {
       if (this.#repositories !== preparing) return;
@@ -329,15 +337,23 @@ export class RunnerSession {
       if (!this.closing) this.drainQueue();
     }, (error: unknown) => {
       if (this.#repositories !== preparing) return;
-      this.#repositories = { status: "failed", reason: error instanceof RunnerError ? error.message : "Repositories could not be prepared on this host" };
+      this.#repositories = { status: "failed", reason: error instanceof RunnerError ? error.message : "Repositories could not be prepared on this host", items };
     });
   }
 
-  private async fetchRepositories(repositories: SessionRepository[], authorize: () => Promise<void>, inspect: boolean, signal: AbortSignal): Promise<void> {
+  /** Repository preparation for the session view; absent once it is done, as on hosts without a cache. */
+  private repositoryView(): RepositoryPreparationView | undefined {
+    const preparation = this.#repositories;
+    if (preparation.status === "ready") return undefined;
+    return { status: preparation.status, items: preparation.items.map(item => ({ ...item })), ...(preparation.status === "failed" ? { error: preparation.reason } : {}) };
+  }
+
+  private async fetchRepositories(repositories: SessionRepository[], authorize: () => Promise<void>, inspect: boolean, signal: AbortSignal, update: ProgressUpdate): Promise<void> {
     const cache = this.config.repositoryCache;
     if (!cache) throw new RunnerError(503, "This host has no repository cache");
     const budget = checkoutBudget();
     for (const repository of repositories) {
+      update(repository.path, { phase: "authorizing" });
       await authorize();
       const answer = await this.authorizeRepository(repository, signal);
       // The remote is derived from the pin on both sides: a control plane cannot point this host's credentials elsewhere.
@@ -346,12 +362,16 @@ export class RunnerSession {
       }
       await authorize();
       try {
-        await cache.ensure({ pin: repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: answer.remote }, { signal });
+        await cache.ensure({ pin: repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: answer.remote }, {
+          signal, onProgress: ({ phase, percent, done, total, bytes }) => update(repository.path, { phase, percent, done, total, bytes }),
+        });
         if (inspect) {
+          update(repository.path, { phase: "checking", percent: null, done: null, total: null });
           const summary = await cache.inspect(repository, this.binding.owner.id, budget, signal);
           budget.entries -= summary.entries;
           budget.bytes -= summary.bytes;
         }
+        update(repository.path, { phase: "done", percent: null, done: null, total: null });
       } catch (error) {
         if (signal.aborted) throw new RunnerError(503, "Repository preparation was cancelled");
         // Only these errors carry fixed, credential-free messages; anything else stays local.
@@ -1144,14 +1164,17 @@ export class RunnerSession {
     const agent = await this.root.agent(context);
     const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
     const access = latestWrite?.options?.access;
+    const repositories = this.repositoryView();
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
       approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
-      busy: Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing"),
+      busy: Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing")
+        || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
         .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.status })),
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),
+      ...(repositories ? { repositories } : {}),
     };
   }
 

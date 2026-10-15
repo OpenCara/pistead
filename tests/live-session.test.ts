@@ -150,3 +150,20 @@ test("losing access clears the session and stops every request", async t => {
   await live.advance(60 * 60_000);
   assert.equal(live.since(revokedAt + 1), 0);
 });
+
+test("a host preparing repositories reopens the stream quickly before any message, then slows down once ready", async t => {
+  // Not busy and nothing queued: only the preparation itself keeps the pace up.
+  const preparing = { ...idleView, repositories: { status: "preparing", items: [] } } as unknown as SessionView;
+  const backend: Backend = { session: record, view: preparing, stream: [preparing] };
+  const live = await liveSession(t, backend);
+  await live.advance(liveTiming.activeReopenMs);
+  assert.deepEqual(live.opens(), [0, liveTiming.activeReopenMs]);
+  assert.equal(live.state.view?.repositories?.status, "preparing");
+  backend.stream = [idleView];
+  await live.advance(liveTiming.activeReopenMs);
+  assert.deepEqual(live.opens(), [0, liveTiming.activeReopenMs, 2 * liveTiming.activeReopenMs]);
+  await live.advance(liveTiming.idleReopenMs - 250);
+  assert.equal(live.opens().length, 3);
+  await live.advance(250);
+  assert.equal(live.opens().length, 4);
+});

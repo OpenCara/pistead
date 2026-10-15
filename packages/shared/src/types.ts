@@ -343,6 +343,32 @@ export interface EntryView {
   /** How long the model took to write this reply, or the tool to run; absent for entries recorded before Pi 1.1.0. */
   durationMs?: number;
 }
+/**
+ * Phases of preparing one pinned repository on a host with a repository cache (connect --repo-cache): its turn, the
+ * control plane re-checking the owner's access, the host's Git fetch (the remote's phases, then its own), the check of
+ * the pinned tree, and the checkout. Only these structured values leave the host, never Git's or a remote's text.
+ */
+export const repositoryPreparationPhases = ["queued", "authorizing", "waiting", "connecting", "enumerating", "counting", "compressing",
+  "receiving", "resolving", "verifying", "checking", "checking-out", "done"] as const;
+export type RepositoryPreparationPhase = (typeof repositoryPreparationPhases)[number];
+export interface RepositoryPreparationItem {
+  path: string;
+  phase: RepositoryPreparationPhase;
+  /** Git's own progress in this phase, when it reports one. */
+  percent: number | null;
+  done: number | null;
+  total: number | null;
+  /** Pack bytes this host's fetch has received so far. */
+  bytes: number;
+}
+/** Present while a cache host prepares the session's repositories, and after that failed until the session restarts. */
+export interface RepositoryPreparationView {
+  status: "preparing" | "failed";
+  /** One per pinned repository, in pin order. */
+  items: RepositoryPreparationItem[];
+  /** Why it failed, in fixed and credential-free words. Restarting the session tries again. */
+  error?: string;
+}
 export interface SessionView {
   sessionId: string;
   owner: Pick<UserProfile, "id" | "displayName" | "gitName" | "gitEmail" | "githubLogin">;
@@ -355,6 +381,8 @@ export interface SessionView {
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
   /** Access mode of the latest shared-conversation submission; absent means "approval". */
   access?: AccessMode;
+  /** Repository preparation on a cache host; absent once the repositories are ready, and on every other host. */
+  repositories?: RepositoryPreparationView;
 }
 export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof thinkingLevels)[number];

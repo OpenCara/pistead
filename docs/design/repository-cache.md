@@ -2,8 +2,8 @@
 
 Status: phase 1 in progress, behind the connector flag `--repo-cache` (preview). Done: the host cache and
 full-history fetch (`repo-cache.ts`, `git-remote.ts`), the server's per-session authorization (`repositoryAuthorize`),
-checking pinned trees out of the cache in the sandbox and in host mode, and session start. Not yet done: push without
-re-fetching, progress in the UI, backups and restores of cache-backed sessions, and cache cleanup.
+checking pinned trees out of the cache in the sandbox and in host mode, session start, and progress in the UI. Not yet
+done: push without re-fetching, backups and restores of cache-backed sessions, and cache cleanup.
 
 ### Session start (implemented)
 
@@ -216,7 +216,7 @@ I'd ship phase 1 first. It delivers the speed and size gains with a small, conta
 | `apps/server/src/repositories.ts`, `internal.ts` | Done: `repositoryAuthorize` (connector and internal routes), sharing its session and connector checks with `repositoryDownload`, which stays only for older connectors. |
 | `apps/runner/src/git-remote.ts` | A full-history fetch into the bare cache repository (want the pin plus branches and tags, `have` what the cache already holds, no depth or filter), with structured progress. |
 | `apps/runner/src/git-credentials.ts` | Reused as-is for fetches (`hostGitAuthorization`). |
-| `packages/shared` protocol, `apps/server/src/connector-hub.ts`, `apps/web` | `repository-progress` message, relay, and progress rows in the session view. |
+| `packages/shared/src/types.ts`, `apps/web` | Done: `SessionView.repositories` (no new connector message or relay), the progress card, the failure alert with restart, and the refresh pace. |
 | `apps/runner/src/` (new `repo-cache.ts`) | Cache layout (per host or per owner), locks, pin refs, gc, eviction. Runs outside the sandbox. |
 | `apps/runner/src/connect-cli.ts`, `connector.ts` | Done: `--repo-cache` (opt-in while in preview) and `--repo-cache-scope host\|owner`; the connector creates the cache in its private state directory, advertises `repositoryCache`, and calls the scoped authorize route. To do: `--repo-cache-max-bytes`. |
 | `apps/runner/src/session.ts` | Done: background preparation, held runs, refusal with the reason, agent instructions that mention the history. |
@@ -248,11 +248,17 @@ The first session on a host waits while the runner clones; later sessions only w
   even when the remote sends no progress. `index-pack -v` reports the local receiving and delta phases.
 - **Sanitizing:** progress lines come from the remote, so the runner reduces them to structured fields (phase,
   percent, done, total, bytes) and never forwards raw text.
-- **Transport:** a new connector message, e.g. `repository-progress { sessionId, path, phase, percent, done,
-  total, bytes }`, throttled to a few updates per second, relayed by `connector-hub.ts` to the session's
-  watchers.
-- **UI:** the session view shows one progress row per repository while the session is "preparing", and a
-  clear error if the fetch fails (no host credential, no access, network).
+- **Transport (implemented):** no new connector message. The browser already streams session view snapshots
+  (`/api/sessions/:id/events`, about one a second while the session is active), so the runner adds
+  `repositories: { status: "preparing" | "failed", items, error? }` to `SessionView` while it prepares, and after
+  a failure until the session restarts. Each item is `{ path, phase, percent, done, total, bytes }`, with phases
+  from `repositoryPreparationPhases` (queued, authorizing, the fetch phases, checking, checking-out, done). The
+  server passes it through. Preparation counts as `busy`, and the client also keeps its fast refresh pace while a
+  view says preparing, so progress updates every second even before the first message.
+- **UI (implemented):** a card above pending approvals with one bar per repository: determinate when Git reports a
+  percentage, otherwise a moving highlight (none with reduced motion), and a line such as "Receiving objects · 45%
+  · 4,500 of 10,000 · 5.1 MiB". The queue line reads "Preparing repositories...". If preparation failed, an error
+  with the reason and, for the session owner, a Restart session button (`POST /api/sessions/:id/restart`).
 - **Concurrency:** if two sessions need the same repository, the second waits on the cache lock and shows the
   first fetch's progress instead of starting another.
 - **Timeouts:** cache fetches get a long deadline like pushes (`PUSH_TIMEOUT_MS`, one hour) instead of

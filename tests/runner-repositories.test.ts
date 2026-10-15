@@ -712,6 +712,9 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   // create returned while the clone is still waiting for its pack.
   await packRequested.promise;
   assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "absent");
+  const preparing = await session.view();
+  assert.equal(preparing.busy, true, "preparation keeps the session busy");
+  assert.deepEqual(preparing.repositories, { status: "preparing", items: [{ path: pin.path, phase: "connecting", percent: null, done: null, total: null, bytes: 0 }] });
   const receipt = await session.submit(await ticket(input.session.id, "submit"), { content: "TEST_READ acme/project-1/README.md", requestId: "read-from-cache" }, "write");
   assert.equal(receipt.status, "queued");
   gate.resolve();
@@ -720,6 +723,7 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   assert.equal(view.queue?.find(run => run.submissionId === receipt.submissionId)?.status, "settled");
   assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("hello from upstream")), "the held run reads the checked-out file");
   assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "cache");
+  assert.equal(view.repositories, undefined, "a ready session reports no preparation");
   assert.equal(authorizations, 1);
   assert.equal((await session.sandbox.execute({ kind: "bash", command: "git rev-list --count acme/project-1/pinned" }, false, allow)).trim(), "2");
 });
@@ -746,4 +750,7 @@ test("a cache host that cannot prepare a repository refuses new messages with th
   assert.equal(refusal.status, 502);
   assert.equal(refusal.message, "The pinned commit is no longer readable in this GitHub repository. Restart the session to try again.");
   assert.equal(await session.sandbox.repositoryCacheState(input.session.repositories!, allow), "absent");
+  const view = await session.view();
+  assert.deepEqual(view.repositories, { status: "failed", error: "The pinned commit is no longer readable in this GitHub repository.",
+    items: [{ path: input.session.repositories![0]!.path, phase: "authorizing", percent: null, done: null, total: null, bytes: 0 }] });
 });

@@ -66,7 +66,7 @@ npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate 
 
 - The host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead never sends a read credential.
 - Before a session uses the cache, Pistead checks that the session's owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
-- The first session on a host waits while the repository is cloned; later sessions fetch only what is new. Messages sent meanwhile wait in the queue. If the host can't fetch a repository, new messages are refused with the reason; restart the session after fixing it.
+- The first session on a host waits while the repository is cloned, and the session shows the clone's progress; later sessions fetch only what is new. Messages sent meanwhile wait in the queue. If the host can't fetch a repository, the session shows why and new messages are refused; restart the session after fixing it.
 - Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
 - Preview: backups of sessions that use the cache, and cleaning up the cache, are not supported yet. It needs a Pistead server that supports the repository cache; older servers refuse the connector's manifest.
 

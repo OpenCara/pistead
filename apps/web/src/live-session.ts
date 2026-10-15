@@ -71,7 +71,8 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
   const running = () => !revoked && !controller.signal.aborted;
 
   function showView(view: SessionView) {
-    active = view.busy || (view.queue ?? []).some(item => activeStatuses.includes(item.status));
+    // A cache host preparing repositories reports progress worth showing every second, even before any message.
+    active = view.busy || (view.queue ?? []).some(item => activeStatuses.includes(item.status)) || view.repositories?.status === "preparing";
     handlers.view(view);
     handlers.error("");
   }
