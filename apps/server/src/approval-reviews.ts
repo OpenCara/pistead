@@ -44,13 +44,23 @@ export async function requireOperationTool(env: Env, row: SessionRow, operation:
 }
 /**
  * Whether a tool call that reaches the control plane without an approval (github_read) may use `tool`: the pinned
- * agent's, or one the owner allowed for the session or for that call.
+ * agent's, one the owner allowed for the session, or one the owner allowed for this call. A one-call grant covers only
+ * the call its permission card showed: the same requester, message (write admission) and target, so the call id can't
+ * be reused for another target or a later message.
  */
-export async function requireSessionTool(env: Env, row: SessionRow, tool: ToolName, call: string): Promise<void> {
+export async function requireToolCall(env: Env, row: SessionRow, tool: ToolName,
+  call: { id: string; requestedBy: string; admissionId: string; target: string }): Promise<void> {
   if ((await toolsFor(env, row)).includes(tool)) return;
-  const grant = await env.DB.query('SELECT 1 FROM session_tool_grants WHERE session_id = ? AND tool = ? AND (call_id = ? OR call_id = ?)')
-    .bind(row.id, tool, '', call).first();
-  if (!grant) fail(403, 'tool_not_allowed', 'The pinned agent does not include this tool and the session owner has not allowed it.');
+  const grants = await env.DB.query<{ call_id: string; approval_id: string }>(`SELECT call_id, approval_id FROM session_tool_grants
+    WHERE session_id = ? AND tool = ? AND (call_id = '' OR call_id = ?)`).bind(row.id, tool, call.id).all();
+  if (grants.some(grant => grant.call_id === '')) return;
+  const review = grants[0] && await env.DB.query<ReviewRow>('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?')
+    .bind(row.id, grants[0].approval_id).first();
+  const request = review ? parseOperation(JSON.parse(review.operation_json)) : undefined;
+  if (!review || request?.kind !== 'permission' || request.tool !== tool || request.target !== call.target
+    || review.requested_by !== call.requestedBy || review.admission_id !== call.admissionId) {
+    fail(403, 'tool_not_allowed', 'The pinned agent does not include this tool and the session owner has not allowed this call.');
+  }
 }
 export async function reviewCommitment(sessionId: string, approvalId: string, requestedBy: string, operation: Operation): Promise<string> {
   return sha256(JSON.stringify({ sessionId, approvalId, requestedBy, operation }));

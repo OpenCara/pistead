@@ -222,12 +222,12 @@ export interface GitHubPullRequestView {
   base: { ref: string; sha: string };
   reviews: GitHubReviewView[];
   reviewComments: GitHubReviewCommentView[];
-  /** Check runs and commit statuses of the head commit. */
+  /** Check runs and commit statuses of the head commit, failing and pending ones first. */
   checks: { name: string; status: string; conclusion: string | null }[];
 }
 /**
- * An issue or pull request as github_read returns it. Each list keeps its newest items; long bodies end in a note of
- * how much was cut.
+ * An issue or pull request as github_read returns it, within 96 KiB of JSON. Each thread list keeps its newest items;
+ * long bodies end in a note of how much was cut.
  */
 export interface GitHubIssueView {
   repository: string;
@@ -241,8 +241,8 @@ export interface GitHubIssueView {
   labels: string[];
   comments: GitHubCommentView[];
   pullRequest?: GitHubPullRequestView;
-  /** How many older items of each list were left out to keep the result within its bound. */
-  omitted?: { comments?: number; reviews?: number; reviewComments?: number };
+  /** How many items of each list were left out to keep the result within its bound: the oldest thread items, and checks after the kept ones. */
+  omitted?: { comments?: number; reviews?: number; reviewComments?: number; checks?: number };
 }
 /**
  * The credential the control plane issued for exactly one approved push: a short-lived token minted from a workspace app

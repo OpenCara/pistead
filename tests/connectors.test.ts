@@ -1332,10 +1332,20 @@ test('github reads need the requester\'s live write admission, the github_read t
   grant.run(s.session.id, 'github_read', 'call-2', 'permission-call-2', owner, new Date().toISOString());
   await denied(await read(admissionId), 403, 'tool_not_allowed');
   grant.run(s.session.id, 'github_read', 'call-1', 'permission-call-1', owner, new Date().toISOString());
+  // A one-call grant without the reviewed card it came from allows nothing.
+  await denied(await read(admissionId), 403, 'tool_not_allowed');
+  f.sqlite.prepare(`INSERT INTO approval_reviews (session_id,approval_id,requested_by,source,admission_id,operation_json,review_hash,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`).run(s.session.id, 'permission-call-1', owner, 'model', admissionId,
+    JSON.stringify({ kind: 'permission', tool: 'github_read', target: 'owner/other#5', needs: ['tool'] }), token(), new Date().toISOString());
   await denied(await read(admissionId), 403, 'repository_not_pinned');
+  // It covers only the read the card showed: not another number or repository, nor the same call id in a later message.
+  for (const [admission, body] of [[admissionId, { issue: 6 }], [admissionId, { repository: 'owner/repo' }], [admit(f, s.session.id, owner), {}]] as const) {
+    await denied(await read(admission, body), 403, 'tool_not_allowed');
+  }
   await denied(await read(admissionId, { callId: 'call-3' }), 403, 'tool_not_allowed');
+  // A grant for the rest of the session covers any call.
   grant.run(s.session.id, 'github_read', '', 'permission-call-4', owner, new Date().toISOString());
-  await denied(await read(admissionId, { callId: 'call-3' }), 403, 'repository_not_pinned');
+  await denied(await read(admissionId, { callId: 'call-3', issue: 6 }), 403, 'repository_not_pinned');
   assert.equal(fetch.mock.callCount(), 0);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'github.read'").get()!.n, 0);
 });
@@ -1365,11 +1375,22 @@ test('a github read returns the owner\'s view of a pull request with its reviews
     [`${api}/pulls/5/comments?per_page=100&page=1`]: () => Response.json([{ id: 21, user: { login: 'reviewer' }, created_at: createdAt,
       path: 'src/a.ts', line: 12, original_line: 10, commit_id: headSha, body: 'Off by one', diff_hunk: hunk,
       html_url: 'https://github.com/owner/repo/pull/5#discussion_r21' }]),
-    [`${api}/commits/${headSha}/check-runs?per_page=100`]: () => Response.json({ check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure' }] }),
-    [`${api}/commits/${headSha}/status?per_page=100`]: () => Response.json({ statuses: [
+    // A failing check on the second page of check runs is still reported, ahead of the passing ones.
+    [`${api}/commits/${headSha}/check-runs?per_page=100&page=1`]: () => Response.json({ total_count: 101,
+      check_runs: Array.from({ length: 100 }, (_, index) => ({ name: `run-${index + 1}`, status: 'completed', conclusion: 'success' })) }),
+    [`${api}/commits/${headSha}/check-runs?per_page=100&page=2`]: () => Response.json({ total_count: 101,
+      check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure' }] }),
+    [`${api}/commits/${headSha}/status?per_page=100&page=1`]: () => Response.json({ state: 'pending', total_count: 2, statuses: [
       { context: 'ci/legacy', state: 'pending' }, { context: 'ci/lint', state: 'success' },
     ] }),
     [`${api}/issues/6`]: () => Response.json({ message: 'Not Found' }, { status: 404 }),
+    // Multi-byte and escaped text: the bound is on the JSON's bytes, not on characters.
+    [`${api}/issues/8`]: () => Response.json({ html_url: 'https://github.com/owner/repo/issues/8', title: 'Long thread', state: 'open', user: { login: 'author' },
+      created_at: createdAt, body: '€'.repeat(16000), labels: [] }),
+    [`${api}/issues/8/comments?per_page=100&page=1`]: () => Response.json(comments(1, 100).map(item => ({ ...item, body: 'é'.repeat(1000) }))),
+    [`${api}/issues/9`]: () => Response.json({ html_url: 'https://github.com/owner/repo/issues/9', title: '\u0001'.repeat(1000), state: 'open', user: { login: 'author' },
+      created_at: createdAt, body: '\u0001'.repeat(16000), labels: [] }),
+    [`${api}/issues/9/comments?per_page=100&page=1`]: () => Response.json([]),
   };
   const calls: string[] = [];
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1395,7 +1416,7 @@ test('a github read returns the owner\'s view of a pull request with its reviews
   assert.equal(view.comments.length, 100);
   assert.deepEqual([view.comments[0].id, view.comments.at(-1)!.id], [131, 230]);
   assert.deepEqual(view.comments[0], { id: 131, author: 'commenter', createdAt, body: 'comment 131', url: 'https://github.com/owner/repo/pull/5#issuecomment-131' });
-  assert.deepEqual(view.omitted, { comments: 130 });
+  assert.deepEqual(view.omitted, { comments: 130, checks: 3 });
   assert.deepEqual(view.pullRequest, {
     draft: false, merged: false, mergeable: true, mergeableState: 'clean',
     head: { ref: 'feature', sha: headSha, repository: 'owner/repo' }, base: { ref: 'main', sha: 'a'.repeat(40) },
@@ -1405,16 +1426,29 @@ test('a github read returns the owner\'s view of a pull request with its reviews
       body: 'Off by one', diffHunk: `… 10 earlier characters\n${hunk.slice(-1500)}`, url: 'https://github.com/owner/repo/pull/5#discussion_r21' }],
     checks: [
       { name: 'test', status: 'completed', conclusion: 'failure' }, { name: 'ci/legacy', status: 'pending', conclusion: null },
-      { name: 'ci/lint', status: 'completed', conclusion: 'success' },
+      ...Array.from({ length: 98 }, (_, index) => ({ name: `run-${index + 1}`, status: 'completed', conclusion: 'success' })),
     ],
   });
   assert.equal(calls[0], api, 'the pin identity is checked before any read');
-  assert.equal(calls.length, Object.keys(routes).length - 1);
+  const pullRoutes = Object.keys(routes).filter(url => !/\/issues\/[689]/.test(url));
+  assert.deepEqual(calls.toSorted(), pullRoutes.toSorted());
   assert.ok(!JSON.stringify(view).includes(githubToken));
   assert.deepEqual(audits(), [{ repository: 'owner/repo', issue: 5, actingAs: s.session.ownerId }]);
 
   await denied(await read(6), 404, 'github_not_found');
   assert.equal(audits().length, 1);
+
+  const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+  // A long thread gives way oldest first until the JSON fits, counting what it left out.
+  const thread = await json<GitHubIssueView>(await read(8));
+  assert.ok(bytes(thread) <= 96 * 1024, String(bytes(thread)));
+  assert.equal(thread.body, '€'.repeat(16000));
+  assert.equal(thread.omitted!.comments! + thread.comments.length, 100);
+  assert.ok(thread.comments.length > 0 && thread.comments.at(-1)!.id === 100);
+  // When even the description alone is too large, it is cut to fit, with a note.
+  const escaped = await json<GitHubIssueView>(await read(9));
+  assert.ok(bytes(escaped) <= 96 * 1024, String(bytes(escaped)));
+  assert.equal(escaped.body, `${'\u0001'.repeat(8000)}\n… cut to fit the read limit`);
 });
 
 test('write admission quota follows an actor across sessions without blocking another owner or losing ambiguous receipts', async t => {

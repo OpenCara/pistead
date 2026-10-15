@@ -11,7 +11,7 @@ import { fail, identifier, jsonObject, now, text, userIdentifier } from './http.
 import { githubRepositoryName, issueNumber, parseOperation } from './operations.js';
 import { decryptToken } from './vault.js';
 import { requireCallbackScope } from './connectors.js';
-import { requireBrokerReview, requireSessionTool } from './approval-reviews.js';
+import { requireBrokerReview, requireToolCall } from './approval-reviews.js';
 import { recheckAccess, validPin, verifyRepository, type GitHubAccess } from './repositories.js';
 import { requireBinding, requireNoRestore } from './push/broker.js';
 
@@ -22,12 +22,14 @@ import { requireBinding, requireNoRestore } from './push/broker.js';
 
 const githubApi = 'https://api.github.com';
 const remoteTimeout = 20000;
-/** A github_read result stays within this many bytes of JSON; the oldest comments, reviews and review comments give way first. */
+/** A github_read result stays within this many bytes of JSON (see `fit`). */
 const readBytes = 96 * 1024;
 /** One GitHub API response github_read reads. */
 const pageBytes = 4 * 1024 * 1024;
-/** Each list keeps its newest items. */
+/** Each list keeps its newest items; the check list its failing and pending checks first. */
 const listItems = 100;
+/** Check listings are read up to this many pages each, so a failing check on a later page still shows. */
+const checkPages = 10;
 const bodyCharacters = 16000;
 const hunkCharacters = 1500;
 const encoder = new TextEncoder();
@@ -278,24 +280,46 @@ function clip(value: unknown): string {
   return body.length <= bodyCharacters ? body : `${body.slice(0, bodyCharacters)}\n… ${body.length - bodyCharacters} more characters`;
 }
 
-/** Check runs and commit statuses of one commit. */
-async function checks(github: GitHubAccess, base: string, sha: string): Promise<GitHubPullRequestView['checks']> {
-  const [runs, combined] = await Promise.all([
-    githubGet(github, `${base}/commits/${sha}/check-runs?per_page=100`), githubGet(github, `${base}/commits/${sha}/status?per_page=100`),
-  ]);
-  const checkRuns = record(runs.value).check_runs;
-  const statuses = record(combined.value).statuses;
-  if (!Array.isArray(checkRuns) || !Array.isArray(statuses)) fail(502, 'invalid_github_response', 'GitHub returned an unexpected response.');
-  return [
-    ...checkRuns.map(record).map(run => ({ name: string(run.name), status: string(run.status), conclusion: nullableString(run.conclusion) })),
-    ...statuses.map(record).map(status => {
-      const state = string(status.state);
-      return { name: string(status.context), status: state === 'pending' ? 'pending' : 'completed', conclusion: state === 'pending' ? null : state };
-    }),
-  ];
+/** Whether a check passed, so it may give way to ones that need attention. */
+const passed = (check: GitHubPullRequestView['checks'][number]) => check.status === 'completed' && ['success', 'neutral', 'skipped'].includes(check.conclusion ?? '');
+
+/** Every item of a paged check listing (an object with `total_count` and the list under `key`), up to `checkPages` pages. */
+async function checkListing(github: GitHubAccess, path: string, key: string): Promise<{ items: Record<string, unknown>[]; total: number }> {
+  const page = async (number: number) => {
+    const value = record((await githubGet(github, `${path}?per_page=${listItems}&page=${number}`)).value);
+    const items = value[key];
+    if (!Array.isArray(items)) fail(502, 'invalid_github_response', 'GitHub returned an unexpected response.');
+    return { items: items.map(record), total: integer(value.total_count) ?? items.length };
+  };
+  const first = await page(1);
+  const pages = Math.min(Math.ceil(first.total / listItems), checkPages);
+  const rest = await Promise.all(Array.from({ length: Math.max(pages - 1, 0) }, (_, index) => page(index + 2)));
+  return { items: [first, ...rest].flatMap(result => result.items), total: Math.max(first.total, first.items.length) };
 }
 
-/** Leaves out the oldest comments, reviews and review comments until the view's JSON fits within `readBytes`. */
+/**
+ * Check runs and commit statuses of one commit: failing and pending ones first, so none hides behind passing ones, then
+ * the rest up to `listItems`; `omitted` counts the ones left out.
+ */
+async function checks(github: GitHubAccess, base: string, sha: string): Promise<{ checks: GitHubPullRequestView['checks']; omitted: number }> {
+  const [runs, statuses] = await Promise.all([
+    checkListing(github, `${base}/commits/${sha}/check-runs`, 'check_runs'), checkListing(github, `${base}/commits/${sha}/status`, 'statuses'),
+  ]);
+  const all = [
+    ...runs.items.map(run => ({ name: string(run.name).slice(0, 200), status: string(run.status), conclusion: nullableString(run.conclusion) })),
+    ...statuses.items.map(status => {
+      const state = string(status.state);
+      return { name: string(status.context).slice(0, 200), status: state === 'pending' ? 'pending' : 'completed', conclusion: state === 'pending' ? null : state };
+    }),
+  ];
+  const kept = [...all.filter(check => !passed(check)), ...all.filter(passed)].slice(0, listItems);
+  return { checks: kept, omitted: runs.total + statuses.total - kept.length };
+}
+
+/**
+ * The view within `readBytes` of JSON: the oldest comments, reviews and review comments give way first, then the
+ * description and the passing end of the check list. A view that still doesn't fit is refused rather than sent whole.
+ */
 function fit(view: GitHubIssueView): GitHubIssueView {
   const size = (value: unknown) => encoder.encode(JSON.stringify(value)).length;
   let total = size(view);
@@ -308,15 +332,34 @@ function fit(view: GitHubIssueView): GitHubIssueView {
   ].sort((a, b) => a.at.localeCompare(b.at));
   const dropped = new Set<object>();
   const omitted = { ...view.omitted };
-  for (const entry of entries) {
-    if (total <= readBytes) break;
+  const drop = (entry: (typeof entries)[number]) => {
     dropped.add(entry.item);
     omitted[entry.list] = (omitted[entry.list] ?? 0) + 1;
-    total -= size(entry.item) + 1;
-  }
-  return { ...view, comments: view.comments.filter(item => !dropped.has(item)),
+  };
+  const build = (): GitHubIssueView => ({ ...view, comments: view.comments.filter(item => !dropped.has(item)),
     ...(pull ? { pullRequest: { ...pull, reviews: pull.reviews.filter(item => !dropped.has(item)), reviewComments: pull.reviewComments.filter(item => !dropped.has(item)) } } : {}),
-    omitted };
+    omitted });
+  // Estimate by item sizes first, then measure what is actually returned.
+  let next = 0;
+  for (; next < entries.length && total > readBytes; next++) {
+    drop(entries[next]!);
+    total -= size(entries[next]!.item) + 1;
+  }
+  let result = build();
+  for (; next < entries.length && size(result) > readBytes; next++) {
+    drop(entries[next]!);
+    result = build();
+  }
+  for (let length = view.body.length; size(result) > readBytes && length > 0;) {
+    length = Math.floor(length / 2);
+    result.body = length ? `${view.body.slice(0, length)}\n… cut to fit the read limit` : '';
+  }
+  while (size(result) > readBytes && result.pullRequest?.checks.length) {
+    result.pullRequest.checks = result.pullRequest.checks.slice(0, -1);
+    omitted.checks = (omitted.checks ?? 0) + 1;
+  }
+  if (size(result) > readBytes) fail(502, 'github_response_too_large', 'This issue or pull request is too large to read.');
+  return result;
 }
 
 async function readIssue(github: GitHubAccess, fullName: string, number: number): Promise<GitHubIssueView> {
@@ -330,12 +373,15 @@ async function readIssue(github: GitHubAccess, fullName: string, number: number)
     isPull ? newest(github, `${base}/pulls/${number}/comments`) : undefined,
   ]);
   let pullRequest: GitHubPullRequestView | undefined;
+  let checksOmitted = 0;
   if (details && reviews && reviewComments) {
     const head = record(details.head);
     const target = record(details.base);
     const sha = string(head.sha);
     if (!/^[0-9a-f]{40}$/.test(sha)) fail(502, 'invalid_github_response', 'GitHub returned an unexpected pull request.');
     const headRepository = head.repo && typeof head.repo === 'object' ? nullableString((head.repo as Record<string, unknown>).full_name) : null;
+    const found = await checks(github, base, sha);
+    checksOmitted = found.omitted;
     pullRequest = {
       draft: details.draft === true, merged: details.merged === true, mergeable: typeof details.mergeable === 'boolean' ? details.mergeable : null,
       mergeableState: string(details.mergeable_state),
@@ -350,11 +396,11 @@ async function readIssue(github: GitHubAccess, fullName: string, number: number)
           diffHunk: hunk.length <= hunkCharacters ? hunk : `… ${hunk.length - hunkCharacters} earlier characters\n${hunk.slice(-hunkCharacters)}`,
           url: string(item.html_url) };
       }),
-      checks: await checks(github, base, sha),
+      checks: found.checks,
     };
   }
   const omitted = { ...(comments.omitted ? { comments: comments.omitted } : {}), ...(reviews?.omitted ? { reviews: reviews.omitted } : {}),
-    ...(reviewComments?.omitted ? { reviewComments: reviewComments.omitted } : {}) };
+    ...(reviewComments?.omitted ? { reviewComments: reviewComments.omitted } : {}), ...(checksOmitted ? { checks: checksOmitted } : {}) };
   const labels = Array.isArray(issue.labels) ? issue.labels.map(label => typeof label === 'string' ? label : string(record(label).name)) : [];
   return fit({
     repository: fullName, number, url: string(issue.html_url), title: string(issue.title), state: string(issue.state), author: login(issue.user),
@@ -394,7 +440,8 @@ export async function githubRead(c: AppContext, connectorId: string | null): Pro
       || admission.expires_at <= Math.floor(Date.now() / 1000)) {
       fail(403, 'github_read_not_admitted', 'GitHub reads need a write message from the requester sent within the last hour.');
     }
-    await requireSessionTool(c.env, access.row, 'github_read', callId);
+    // A one-call grant covers only the read its owner saw: this requester, message, repository and number.
+    await requireToolCall(c.env, access.row, 'github_read', { id: callId, requestedBy: actorId, admissionId, target: `${repository}#${number}` });
     return access.row;
   };
   const row = await authorize();
