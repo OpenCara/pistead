@@ -41,6 +41,8 @@ test('values of secret-named settings and credentials in URLs, headers, curl and
     ['the password is swordfish', 'the password is [redacted]'],
     ['The password was correct-horse-battery.', 'The password was [redacted].'],
     ['the password is Swordfish, I think', 'the password is [redacted], I think'],
+    ["the password is swordfish. Don't share it.", "the password is [redacted]. Don't share it."],
+    ['Password: swordfish. Then sign in.', 'Password: [redacted]. Then sign in.'],
     ['api_key: deadbeefcafebabe', 'api_key: [redacted]'],
     ['the token is deadbeefcafebabedeadbeef.', 'the token is [redacted].'],
     ['aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'aws_secret_access_key = [redacted]'],

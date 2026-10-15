@@ -151,8 +151,9 @@ function assignments(text: string, options: RedactOptions): string {
         const sentence = prose.test(separator);
         // Code goes on after a value it assigns (`token: Uint8Array;`); prose doesn't assign with `is`.
         if (!sentence && /[;,)}\]|<>({[=?:&]/.test(next)) return match;
-        // A password's plain word must end its line (a YAML comment may follow) or its sentence.
-        const ends = next === "" || (sentence ? /[.!?,;)"']/.test(next) : next === "#");
+        // A password's plain word must end its line (a YAML comment may follow) or its sentence; a full stop taken off
+        // the value ends one, whatever follows it.
+        const ends = suffix !== "" || next === "" || (sentence ? /[.!?,;)"']/.test(next) : next === "#");
         if (!literal(value) && !(/^pass/i.test(key) && ends && plainPassword(value))) return match;
       }
     }
