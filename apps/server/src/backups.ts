@@ -67,12 +67,14 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
     const record: BackupRow = { id: backupId, session_id: row.id, owner_id: row.owner_id,
       object_key: `sessions/${row.owner_id}/${row.id}/${backupId}.json`, sha256: await sha256(bytes),
       size: encoded.byteLength, created_at: now() };
-    if (destination === 'workspace-database') {
+    // The owner may have connected, replaced or disconnected the workspace database while the host prepared the snapshot;
+    // then it would not be stored where it was meant to go. The same database with rotated credentials keeps its id.
+    const database = await workspaceDatabaseRow(c.env, row.workspace_id);
+    if ((database?.id ?? null) !== (chosen?.id ?? null)) {
+      fail(409, 'workspace_database_changed', 'The workspace database changed while the backup was prepared. Try again.');
+    }
+    if (database) {
       if (!provider) workspaceDatabasesDisabled();
-      // The owner may have pointed the connection at another database, or disconnected it, while the host prepared the
-      // snapshot. The same database with rotated credentials keeps its id.
-      const database = await workspaceDatabaseRow(c.env, row.workspace_id);
-      if (!database || database.id !== chosen?.id) fail(409, 'workspace_database_changed', 'The workspace database changed while the backup was prepared. Try again.');
       const target = await workspaceDatabaseTarget(c.env, database);
       try {
         await provider.save(target, {

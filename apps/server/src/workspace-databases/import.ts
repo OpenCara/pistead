@@ -9,8 +9,10 @@ import type { ImportedAuditEntry, ImportedSession, WorkspaceDatabaseProvider, Wo
 
 /*
  * Imports a session or workspace dump (data-export.ts) into the database a workspace's owner connected. A dump is
- * untrusted input: it must belong to that workspace and is checked field by field before anything is written. Only the
- * workspace database changes; the control plane records the import in the workspace's activity.
+ * untrusted input, checked before anything is written: it must belong to that workspace, its session records and
+ * activity entries are checked field by field, and the workspace's settings (members, models, agents, repositories, push
+ * identities, database connection) must be lists of objects, kept as JSON for the owner's reference. Only the workspace
+ * database changes; the control plane records the import in the workspace's activity.
  */
 
 /** The largest dump the web app uploads; the command line (`--import-dump`) takes larger ones. */
@@ -70,6 +72,13 @@ function list(value: unknown, what: string): unknown[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) invalid(`The dump's ${what} is not a list.`);
   return value;
+}
+
+/** Workspace settings a dump carries: kept as they are, but only as a list of objects. */
+function objects(value: unknown, what: string): unknown[] {
+  const items = list(value, what);
+  if (items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) invalid(`The dump's ${what} are not all objects.`);
+  return items;
 }
 
 function text(value: unknown, what: string, max: number): string {
@@ -145,9 +154,9 @@ export function importFromDump(document: unknown, workspace: { id: string; name:
   let workspaceData: Record<string, unknown> | null = null;
   if (dump.format === sessionExportFormat) addFull(dump);
   else {
-    workspaceData = { members: list(dump.members, 'members'), models: list(dump.models, 'models'), agents: list(dump.agents, 'agents'),
-      repositories: list(dump.repositories, 'repositories'), pushIdentities: list(dump.pushIdentities, 'push identities'),
-      database: dump.database === undefined ? null : dump.database };
+    workspaceData = { members: objects(dump.members, 'members'), models: objects(dump.models, 'models'), agents: objects(dump.agents, 'agents'),
+      repositories: objects(dump.repositories, 'repositories'), pushIdentities: objects(dump.pushIdentities, 'push identities'),
+      database: dump.database === undefined || dump.database === null ? null : object(dump.database, 'database connection') };
     for (const entry of list(dump.sessions, 'sessions')) addFull(entry);
     // Sessions the exporter could only view come as records.
     for (const entry of list(dump.otherSessions, 'other sessions')) sessions.push({ ...sessionOf(entry, workspace.id), data: null });

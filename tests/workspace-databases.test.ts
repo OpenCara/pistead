@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { EventEmitter, once } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test, { type TestContext } from 'node:test';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -12,7 +14,7 @@ import { exportSession, exportWorkspace } from '../apps/server/src/data-export.j
 import { decryptToken } from '../apps/server/src/vault.js';
 import type { ImportSummary } from '../apps/server/src/workspace-databases/import.js';
 import { publicAddress, resolveDatabaseHost } from '../apps/server/src/workspace-databases/hosts.js';
-import { PostgresWorkspaceDatabases } from '../apps/server/src/workspace-databases/postgres.js';
+import { classify, limitResponses, PostgresWorkspaceDatabases } from '../apps/server/src/workspace-databases/postgres.js';
 import { registerWorkspaceDatabases } from '../apps/server/src/workspace-databases/routes.js';
 import { databaseSettings } from '../apps/server/src/workspace-databases/settings.js';
 import { databaseSecretContext } from '../apps/server/src/workspace-databases/store.js';
@@ -306,6 +308,21 @@ test('a backup is not saved when the workspace database changes while the host p
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
 });
 
+test('a backup meant for server storage is not saved there once a workspace database was connected meanwhile', async t => {
+  const f = await fixture(t);
+  f.runner(() => {
+    f.sqlite.exec(`INSERT INTO workspace_databases (id,workspace_id,host,port,database_name,username,tls,ca_certificate,password_ciphertext,
+      created_by,created_at,updated_at) VALUES ('connected-meanwhile','workspace','db.example.com',5432,'pistead','pistead_app','verify-full',NULL,
+      'ciphertext','test:owner','2026-01-01','2026-01-01')`);
+  });
+  const response = await f.request('POST', '/api/sessions/owner-session/backup', 'test:owner', {});
+  assert.equal(response.status, 409);
+  assert.equal(await code(response), 'workspace_database_changed');
+  assert.equal(f.storage.objects.size, 0);
+  assert.equal(f.databases.saved.size, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
+});
+
 test('backups of a workspace with its own database are saved and read back there, with the recorded digest', async t => {
   const f = await fixture(t);
   const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
@@ -495,6 +512,33 @@ test('the Postgres provider refuses private hosts and unencrypted public connect
     backup: { id: 'b', format: 'pi-runner-backup-v1', sha256: 'x', size: 1, createdAt: '2026-01-01' }, snapshot: new Uint8Array([1]),
   }), failed('host_not_allowed'));
   assert.equal(lookups, 2);
+});
+
+test('a server sending more than the response limit is cut off, and that is the failure whatever pg reports next', async () => {
+  // pg's Connection reads its `stream`: the socket, then the TLS socket once the upgrade emits 'sslconnect'.
+  const plain = new PassThrough();
+  const connection = Object.assign(new EventEmitter(), { stream: plain });
+  const client = { connection } as unknown as pg.Client;
+  limitResponses(client, 10);
+  plain.write(Buffer.alloc(6));
+  await new Promise(resolve => setImmediate(resolve));
+  const secure = new PassThrough();
+  connection.stream = secure;
+  connection.emit('sslconnect');
+  // pg no longer reads the raw socket after the upgrade, so its bytes don't count twice.
+  plain.write(Buffer.alloc(100));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(plain.destroyed, false);
+  const cutOff = once(secure, 'error');
+  secure.write(Buffer.alloc(5));
+  const [error] = await cutOff as [unknown];
+  assert.ok(error instanceof WorkspaceDatabaseError);
+  assert.equal(error.failure, 'response_too_large');
+  // pg reports the dropped connection with an error of its own, without a cause.
+  assert.equal(classify(new Error('Connection terminated unexpectedly'), client).failure, 'response_too_large');
+  assert.equal(classify(new Error('Connection terminated unexpectedly')).failure, 'unreachable');
+  // A failure of ours wrapped in another error keeps its meaning.
+  assert.equal(classify(new Error('wrapped', { cause: new WorkspaceDatabaseError('pistead_database') })).failure, 'pistead_database');
 });
 
 const postgresUrl = process.env.TEST_DATABASE_URL;

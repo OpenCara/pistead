@@ -83,6 +83,11 @@ test('dumps are checked before anything is written', () => {
   }
   assert.throws(() => importFromDump(sessionDump({ exportedAt: 'later' }), workspace), refused(/invalid export time/));
   assert.throws(() => importFromDump(sessionDump({ grants: {} }), workspace), refused(/not a list/));
+  // Workspace settings are kept as they are, but only as lists of objects.
+  assert.throws(() => importFromDump(workspaceDump({ members: ['test:owner'] }), workspace), refused(/members are not all objects/));
+  assert.throws(() => importFromDump(workspaceDump({ pushIdentities: [[]] }), workspace), refused(/push identities are not all objects/));
+  assert.throws(() => importFromDump(workspaceDump({ database: 'db.example.com' }), workspace), refused(/database connection is not an object/));
+  assert.equal(importFromDump(workspaceDump({ database: null }), workspace).workspaceData?.database, null);
   assert.throws(() => importFromDump(sessionDump({ audit: [{ id: 'a', action: 'x', createdAt: 'never' }] }), workspace), refused(/invalid activity time/));
   let deep: unknown = 'bottom';
   for (let level = 0; level < 100; level++) deep = [deep];

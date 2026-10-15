@@ -85,19 +85,25 @@ function wire(client: pg.Client): Wire | undefined {
   return (client as unknown as { connection?: Wire }).connection;
 }
 
+/** Clients cut off for sending more than their limit: whatever error pg reports for the dropped connection, this is why. */
+const oversized = new WeakSet<object>();
+
 /**
  * pg keeps each server message in memory until it is complete, so a hostile server could send one of gigabytes. Count the
  * bytes pg reads (after TLS) and drop the connection past `limit`; the operation then fails with `response_too_large`.
  * This hooks pg's Connection: its `stream` is the socket until the TLS upgrade emits 'sslconnect', then the TLS socket.
+ * Exported for tests.
  */
-function limitResponses(client: pg.Client, limit: number): void {
+export function limitResponses(client: pg.Client, limit: number): void {
   const connection = wire(client);
   const plain = connection?.stream;
   if (!connection || !plain) return;
   let received = 0;
   const counter = (stream: Duplex) => (chunk: Buffer) => {
     received += chunk.byteLength;
-    if (received > limit) stream.destroy(new WorkspaceDatabaseError('response_too_large'));
+    if (received <= limit) return;
+    oversized.add(client);
+    stream.destroy(new WorkspaceDatabaseError('response_too_large'));
   };
   const countPlain = counter(plain);
   plain.on('data', countPlain);
@@ -127,9 +133,22 @@ function errorCode(error: unknown, depth = 0): string | undefined {
 
 const unreachableCodes = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'EADDRNOTAVAIL', '57P03'];
 
-/** Maps a driver, network or TLS error to a fixed failure; the original stays only as `cause`. */
-function classify(error: unknown): WorkspaceDatabaseError {
+/** A failure this module raised, also when it arrives wrapped as another error's cause. */
+function ownFailure(error: unknown, depth = 0): WorkspaceDatabaseError | undefined {
   if (error instanceof WorkspaceDatabaseError) return error;
+  if (!error || typeof error !== 'object' || depth > 2 || !('cause' in error)) return undefined;
+  return ownFailure(error.cause, depth + 1);
+}
+
+/**
+ * Maps a driver, network or TLS error to a fixed failure; the original stays only as `cause`. For a client cut off for
+ * its response size that is the failure, whichever error pg reported for the dropped connection (often its own
+ * "Connection terminated unexpectedly", with no cause). Exported for tests.
+ */
+export function classify(error: unknown, client?: pg.Client): WorkspaceDatabaseError {
+  if (client && oversized.has(client)) return new WorkspaceDatabaseError('response_too_large', { cause: error });
+  const own = ownFailure(error);
+  if (own) return own;
   const code = errorCode(error) ?? '';
   const message = error instanceof Error ? error.message : '';
   let failure: WorkspaceDatabaseFailure = 'unavailable';
@@ -233,7 +252,7 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
       await client.connect();
     } catch (error) {
       wire(client)?.stream?.destroy();
-      throw classify(error);
+      throw classify(error, client);
     }
     return client;
   }
@@ -252,7 +271,7 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
         AS allowed`);
       if (rows[0]?.allowed !== true) throw new WorkspaceDatabaseError('permission_denied');
     } catch (error) {
-      throw classify(error);
+      throw classify(error, client);
     } finally {
       await dispose(client);
     }
@@ -282,7 +301,7 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
           Buffer.from(save.snapshot.buffer, save.snapshot.byteOffset, save.snapshot.byteLength), backup.createdAt]);
       });
     } catch (error) {
-      throw classify(error);
+      throw classify(error, client);
     } finally {
       await dispose(client);
     }
@@ -301,7 +320,7 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
     } catch (error) {
       // The owner dropped the table: the snapshot is simply gone.
       if (errorCode(error) === '42P01') return null;
-      throw classify(error);
+      throw classify(error, client);
     } finally {
       await dispose(client);
     }
@@ -349,7 +368,7 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
         }
       });
     } catch (error) {
-      throw classify(error);
+      throw classify(error, client);
     } finally {
       await dispose(client);
     }
