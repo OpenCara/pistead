@@ -84,7 +84,9 @@ export function Sidebar({ route, onNavigate }: { route: Route; onNavigate: () =>
           <button type="button" className="btn secondary xs" onClick={() => setCreating(true)}>New workspace</button>
         </div>
         : workspaces.map(workspace => <WorkspaceGroup key={workspace.id} workspace={workspace} route={route} onNavigate={onNavigate}
-          sessions={sessions.filter(session => session.workspaceId === workspace.id)}
+          // Archived sessions live on the Sessions screen; the one being viewed stays listed so the sidebar keeps its place.
+          sessions={sessions.filter(session => session.workspaceId === workspace.id
+            && (session.status !== "archived" || (route.name === "session" && route.sessionId === session.id)))}
           collapsed={collapsed.includes(workspace.id)} toggle={() => toggle(workspace.id)} />)}
       {sessionsLoading && workspaces.length > 0 && <div style={{ padding: 8 }}><Loading>Loading sessions...</Loading></div>}
       {!workspacesLoading && workspaces.length > 0 && <button type="button" className="nav-item" style={{ marginTop: 12 }} onClick={() => setCreating(true)}><Icon name="plus" size={14} /><span className="label">New workspace</span></button>}

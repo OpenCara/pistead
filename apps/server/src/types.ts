@@ -63,6 +63,8 @@ export interface SessionRow {
   connector_id?: string | null; connector_owner_id?: string | null;
   repositories_json?: string;
   visibility?: 'private' | 'workspace';
+  /** The status before archiving, restored on unarchive. */
+  archived_status?: 'provisioning' | 'ready' | 'error' | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;

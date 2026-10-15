@@ -259,9 +259,24 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   app.patch('/api/sessions/:id', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
     const ownerId = c.get('auth').userId;
-    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change its visibility.');
     const input = await jsonObject(c, 4096);
-    if (Object.keys(input).some(key => key !== 'visibility')) fail(400, 'invalid_input', 'Only session visibility can be changed.');
+    const keys = Object.keys(input);
+    // A rename is cosmetic and a visibility change is policy; each is its own request, never mixed.
+    if (keys.length === 1 && keys[0] === 'title') {
+      if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can rename it.');
+      const title = text(input.title, 'title', 200).trim();
+      if (!title || /[\r\n]/.test(title)) fail(400, 'invalid_title', 'The title must be a single non-empty line.');
+      // The title is not part of the runner binding or policy, so it does not bump the policy version.
+      const renamed = await c.env.DB.query<SessionRow>(`UPDATE sessions SET title = ?
+        WHERE id = ? AND owner_id = ? AND status <> 'archived'
+          AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = sessions.workspace_id AND user_id = ?)
+        RETURNING *`).bind(title, row.id, ownerId, ownerId).first();
+      if (!renamed) fail(409, 'policy_changed', 'Session membership or status changed; reload and retry.');
+      await auditStatement(c.env, ownerId, 'session.renamed', row.workspace_id, row.id).run();
+      return c.json({ session: sessionRecord(renamed, [...permissions]) });
+    }
+    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change its visibility.');
+    if (keys.some(key => key !== 'visibility')) fail(400, 'invalid_input', 'Change either the session title or its visibility.');
     const visibility = sessionVisibility(input.visibility);
     const updated = await c.env.DB.query<SessionRow>(`UPDATE sessions SET visibility = ?, policy_version = policy_version + 1
       WHERE id = ? AND owner_id = ? AND policy_version = ?
@@ -273,6 +288,34 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (!updated) fail(409, 'policy_changed', 'Session membership or permissions changed; reload and retry.');
     await auditStatement(c.env, ownerId, 'session.visibility.updated', row.workspace_id, row.id, { visibility }).run();
     return c.json({ session: sessionRecord(updated, [...permissions]) });
+  });
+  // Archiving makes a session read-only for everyone (see requireSession and runnerRequest) and hides it from default
+  // lists. It never contacts the host or deletes anything, so the owner can unarchive it to its exact previous status.
+  app.post('/api/sessions/:id/archive', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    const ownerId = c.get('auth').userId;
+    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can archive it.');
+    // A policy version bump invalidates runner tickets and broker capabilities issued before archiving.
+    const archived = await c.env.DB.query<SessionRow>(`UPDATE sessions SET archived_status = status, status = 'archived', policy_version = policy_version + 1
+      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived'
+      RETURNING *`).bind(row.id, ownerId, row.policy_version).first();
+    if (!archived) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
+    await auditStatement(c.env, ownerId, 'session.archived', row.workspace_id, row.id, { previousStatus: row.status }).run();
+    return c.json({ session: sessionRecord(archived, [...permissions]) });
+  });
+  app.post('/api/sessions/:id/unarchive', async c => {
+    // Archived sessions only admit read access; ownership is what authorizes bringing one back.
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
+    const ownerId = c.get('auth').userId;
+    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can unarchive it.');
+    if (row.status !== 'archived') fail(409, 'session_not_archived', 'Session is not archived.');
+    const restored = await c.env.DB.query<SessionRow>(`UPDATE sessions SET status = COALESCE(archived_status, 'ready'), archived_status = NULL,
+        policy_version = policy_version + 1
+      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status = 'archived'
+      RETURNING *`).bind(row.id, ownerId, row.policy_version).first();
+    if (!restored) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
+    await auditStatement(c.env, ownerId, 'session.unarchived', row.workspace_id, row.id, { status: restored.status }).run();
+    return c.json({ session: sessionRecord(restored, [...permissions]) });
   });
   app.get('/api/sessions/:id/view', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');

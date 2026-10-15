@@ -12,8 +12,8 @@ import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "./transcript";
 import {
-  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
-  Spinner, StatusBadge, useAction, useResource, type MenuItem,
+  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
+  Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
 
@@ -117,8 +117,11 @@ function SessionPane({ id }: { id: string }) {
   const permissions = session?.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
-  const canApprove = permissions.includes("approve");
+  // Archived sessions are read-only on the server; don't offer decisions that would be refused.
+  const archived = session?.status === "archived";
+  const canApprove = permissions.includes("approve") && !archived;
   const isOwner = session?.ownerId === user.id;
+  const [renaming, setRenaming] = useState(false);
   const hosts = useConnections(session?.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null);
   const host = hosts.data?.connectors.find(item => item.id === session?.connectorId);
   const hostOnline = host?.online;
@@ -132,7 +135,7 @@ function SessionPane({ id }: { id: string }) {
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({
     session, user,
-    backupBlocked: !view || Boolean(live.error) || view.busy || activeQueue.length > 0,
+    backupBlocked: archived || !view || Boolean(live.error) || view.busy || activeQueue.length > 0,
     onChange: refreshAll,
   });
   const openSession = useCallback((target: string) => { refreshSessions(); navigate({ name: "session", sessionId: target }); }, [refreshSessions]);
@@ -147,9 +150,14 @@ function SessionPane({ id }: { id: string }) {
     : <StatusBadge tone="neutral" dot>Connecting</StatusBadge>;
 
   const menu: (MenuItem | "separator")[] = [{ label: "Copy session ID", icon: "copy", onSelect: () => void navigator.clipboard.writeText(id) }];
-  if (session && isOwner) {
+  if (session && isOwner && !archived) {
+    menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
     menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupBlocked || actions.action.busy, hint: actions.backupBlocked ? "Session busy" : undefined, onSelect: actions.createBackup });
+    menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
+  }
+  if (session && isOwner && archived) {
+    menu.push({ label: "Unarchive", icon: "archive", disabled: actions.action.busy, onSelect: actions.unarchive });
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
 
@@ -187,12 +195,15 @@ function SessionPane({ id }: { id: string }) {
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
-          {session && <span className="session-badges">{badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
+          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}
       />
-      {((live.error && !startFailed) || actions.action.error || actions.action.notice) && <div className="session-alerts">
+      {(archived || (live.error && !startFailed) || actions.action.error || actions.action.notice) && <div className="session-alerts">
+        {archived && <Alert title="Archived" actions={isOwner && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unarchive}>Unarchive</Button>}>
+          This session is read-only. {isOwner ? "Unarchive it to continue the work." : "Only its owner can unarchive it."}
+        </Alert>}
         {live.error && !startFailed && <Alert variant="error" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button variant="outline" size="sm" onClick={live.reconnect}>Reconnect and check access</Button>}>{live.error}</Alert>}
         <Feedback {...actions.action} />
       </div>}
@@ -230,7 +241,30 @@ function SessionPane({ id }: { id: string }) {
       <button type="button" className="session-scrim" aria-label="Close session panel" onClick={() => setPanelOpen(false)} />
       <SessionPanel session={session} view={view} user={user} hosts={hosts} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
     </>}
+    {session && isOwner && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
+      onSave={async title => { if (await actions.rename(title)) setRenaming(false); }} />}
   </div>;
+}
+
+function RenameSheet({ open, title, busy, onClose, onSave }: { open: boolean; title: string; busy: boolean; onClose: () => void; onSave: (title: string) => void }) {
+  const [value, setValue] = useState(title);
+  // Start from the current title each time the sheet opens.
+  useEffect(() => { if (open) setValue(title); }, [open, title]);
+  const next = value.trim();
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    if (next && !busy) onSave(next);
+  }
+  return <Sheet open={open} title="Rename session" onClose={onClose} footer={<>
+    <Button variant="ghost" onClick={onClose}>Cancel</Button>
+    <Button type="submit" form="rename-session-form" variant="default" disabled={busy || !next}>{busy ? "Saving..." : "Rename"}</Button>
+  </>}>
+    <form id="rename-session-form" className="stack" onSubmit={submit}>
+      <Field label="Title">
+        <input className="input" required autoFocus maxLength={200} value={value} onChange={event => setValue(event.target.value)} autoComplete="off" />
+      </Field>
+    </form>
+  </Sheet>;
 }
 
 function Conversation({ id, user, session, view, host, stale, refresh, pinned }: { id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode }) {
@@ -255,7 +289,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
   const actualMode = mode === "ask" && !canAsk ? "write" : mode;
-  const permitted = actualMode === "write" ? canWrite : canAsk;
+  const archived = session.status === "archived";
+  const permitted = !archived && (actualMode === "write" ? canWrite : canAsk);
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
@@ -346,7 +381,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
           placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
           sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
-          hint={!permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
+          hint={archived ? "Read-only · this session is archived" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
             : actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks"
             : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}
           tools={<>

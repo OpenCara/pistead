@@ -15,12 +15,15 @@ export function SessionsScreen() {
   const [query, setQuery] = useState("");
   const [limits, setLimits] = useState<Record<string, number>>({});
   const [joinOpen, setJoinOpen] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const archivedCount = useMemo(() => sessions.filter(session => session.status === "archived").length, [sessions]);
 
   // Newest-first sessions grouped by workspace: the current workspace first, then the sidebar order.
   const groups = useMemo(() => {
     const needle = query.trim().toLowerCase();
     const byWorkspace = new Map<string, SessionRecord[]>();
     for (const session of sessions) {
+      if (session.status === "archived" && !showArchived) continue;
       if (needle && !session.title.toLowerCase().includes(needle)) continue;
       const list = byWorkspace.get(session.workspaceId);
       if (list) list.push(session);
@@ -29,7 +32,7 @@ export function SessionsScreen() {
     const order = [currentWorkspace?.id, ...workspaces.map(workspace => workspace.id)];
     const rank = (id: string) => { const index = order.indexOf(id); return index < 0 ? order.length : index; };
     return [...byWorkspace.entries()].sort(([a], [b]) => rank(a) - rank(b)).map(([id, list]) => ({ id, name: workspaces.find(workspace => workspace.id === id)?.name ?? "Other workspace", sessions: list }));
-  }, [sessions, query, workspaces, currentWorkspace?.id]);
+  }, [sessions, query, showArchived, workspaces, currentWorkspace?.id]);
 
   const header = <ScreenHeader title="Sessions" actions={<>
     <InfoTip label="Who can see a session">
@@ -39,6 +42,9 @@ export function SessionsScreen() {
         <p>Only the owner can change visibility, which is separate from sharing a host or publishing an agent.</p>
       </div>
     </InfoTip>
+    {archivedCount > 0 && <Button variant="ghost" size="sm" icon="archive" aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}>
+      {showArchived ? "Hide archived" : `Show archived (${archivedCount})`}
+    </Button>}
     <Button variant="outline" size="sm" onClick={() => setJoinOpen(true)}>Open by ID</Button>
   </>} />;
   const sheet = <OpenSessionSheet open={joinOpen} onClose={() => setJoinOpen(false)} />;
@@ -50,7 +56,7 @@ export function SessionsScreen() {
     {header}
     <div className="content-column">
       <input className="input sessions-search" type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Search sessions" aria-label="Search sessions by title" />
-      {!groups.length ? <EmptyState title="No matching sessions" /> : groups.map(group => {
+      {!groups.length ? <EmptyState title={!query.trim() && !showArchived ? "All sessions are archived" : "No matching sessions"} /> : groups.map(group => {
         const limit = limits[group.id] ?? PAGE_SIZE;
         return <Section key={group.id} title={<span className="inline"><IdentityBadge name={group.name} id={group.id} />{group.name}</span>}>
           {group.sessions.slice(0, limit).map(session => {
@@ -59,7 +65,7 @@ export function SessionsScreen() {
             return <Row key={session.id} href={href({ name: "session", sessionId: session.id })} chevron
               leading={<StatusDot tone={statusTone[session.status]} label={session.status} />}
               title={<span className="truncate">{session.title}</span>}
-              hint={<>{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
+              hint={<>{session.status === "archived" ? "Archived · " : ""}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
           })}
           {group.sessions.length > limit && <div className="sessions-more"><Button variant="ghost" size="sm" block onClick={() => setLimits(current => ({ ...current, [group.id]: limit + PAGE_SIZE }))}>Load more</Button></div>}
         </Section>;
