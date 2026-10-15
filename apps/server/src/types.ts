@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import type { Permission, PushIdentityKind, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
+import type { Permission, PushIdentityKind, SessionActivity, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
 import type { GitProvider, TokenGitProvider } from '../../../packages/shared/src/repositories';
 import type { ConnectorHub } from './connector-hub-types.js';
 import type { Database } from './db/types.js';
@@ -65,6 +65,8 @@ export interface SessionRow {
   visibility?: 'private' | 'workspace';
   /** The status before archiving, restored on unarchive. */
   archived_status?: 'provisioning' | 'ready' | 'error' | null;
+  /** What its agent is doing, as its host last reported it; display state only, never part of the runner binding. */
+  activity?: SessionActivity | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;

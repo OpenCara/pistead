@@ -108,7 +108,7 @@ export function SessionScreen({ sessionId }: { sessionId: string }) {
 }
 
 function SessionPane({ id }: { id: string }) {
-  const { user, workspaces, sessions, refreshSessions } = useApp();
+  const { user, workspaces, sessions, refreshSessions, setLiveActivity } = useApp();
   const live = useLiveSession(id);
   const session = live.session;
   const view = live.view;
@@ -132,6 +132,10 @@ function SessionPane({ id }: { id: string }) {
     if (previousHostOnline.current === false && hostOnline) live.refresh();
     previousHostOnline.current = hostOnline;
   }, [hostOnline, live.refresh]);
+  // Session lists show this view's activity while the session is on screen, then a refreshed list takes over again.
+  const viewActivity = view?.activity;
+  useEffect(() => { setLiveActivity(viewActivity ? { sessionId: id, activity: viewActivity } : null); }, [id, viewActivity, setLiveActivity]);
+  useEffect(() => () => { setLiveActivity(null); refreshSessions(); }, [setLiveActivity, refreshSessions]);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({

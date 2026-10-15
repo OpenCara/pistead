@@ -433,7 +433,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
     '/api/internal/restores/unknown/download']) {
     await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
   }
-  for (const path of ['manifest', 'authorize', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
     await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
     await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
     await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
@@ -444,7 +444,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const oldConnection = connector.connectionToken;
   connector.connectionToken = token();
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
-  for (const path of ['manifest', 'authorize', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
     await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
   }
   await json(await self(f, connector, 'manifest', manifest));
@@ -1858,6 +1858,41 @@ test('owners rename and archive sessions; archived sessions are read-only and un
   const actions = (f.sqlite.prepare('SELECT action FROM audit WHERE session_id = ? ORDER BY created_at, rowid').all(s.session.id) as { action: string }[]).map(row => row.action);
   for (const action of ['session.renamed', 'session.archived', 'session.unarchived']) assert.ok(actions.includes(action), action);
   assert.equal(s.hub.requests.length, 1, 'Renaming and archiving must not contact the host');
+});
+
+test('hosts report what the agent of each session they serve is doing; lists show it and the runner binding never carries it', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  const report = (activity: unknown, sessionId: unknown = s.session.id, connector = s.connector) => self(f, connector, 'activity', { sessionId, activity });
+  const listed = async (client = s.owner) => (await json<{ sessions: SessionRecord[] }>(await client.request('GET', '/api/sessions'))).sessions
+    .find(session => session.id === s.session.id)!;
+  const audits = () => f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE session_id = ?').get(s.session.id)!.n;
+  const audited = audits();
+  assert.equal((await listed()).activity, undefined, 'unknown until the host reports it');
+  assert.deepEqual(await json(await report('working')), { ok: true });
+  assert.equal((await listed()).activity, 'working');
+  assert.equal((await listed(s.member)).activity, 'working', 'readers see what the owner sees');
+  assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', path))).session.activity, 'working');
+  for (const activity of ['busy', '', null, 3, ['done']]) await denied(await report(activity), 400, 'invalid_activity');
+  await denied(await self(f, s.connector, 'activity', { sessionId: s.session.id, activity: 'done', status: 'ready' }), 400, 'invalid_activity');
+  await denied(await report('done', 'missing-session'), 404, 'not_found');
+  // Only the host serving the session reports for it.
+  const other = await connect(f, s.owner, s.team.id);
+  await denied(await report('done', s.session.id, other), 403, 'connector_binding_mismatch');
+  assert.equal((await listed()).activity, 'working');
+
+  // Display state only: no policy version, no audit entry, and never part of the binding the host is sent.
+  await json(await report('failed'));
+  assert.deepEqual({ ...f.sqlite.prepare('SELECT activity, policy_version FROM sessions WHERE id = ?').get(s.session.id) },
+    { activity: 'failed', policy_version: s.session.policyVersion });
+  assert.equal(audits(), audited);
+  f.sqlite.prepare("UPDATE sessions SET status = 'error' WHERE id = ?").run(s.session.id);
+  await json(await s.owner.request('POST', `${path}/restart`));
+  const binding = JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding;
+  assert.equal(binding.session.id, s.session.id);
+  assert.equal('activity' in binding.session, false);
+  assert.equal((await listed()).activity, 'failed', 'restarting leaves the activity to the host to report');
+  assert.deepEqual(s.hub.unexpected, []);
 });
 
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {

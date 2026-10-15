@@ -320,6 +320,10 @@
   .dot.warning { background: var(--dot-warning); }
   .dot.danger { background: var(--dot-danger); }
   .dot.running { background: var(--dot-running); animation: pulse 1.6s ease-in-out infinite; }
+  /* A session's status label beside its dot: colored only while under way or needing attention. */
+  .session-status.running, .session-status.info { color: var(--status-info); }
+  .session-status.warning { color: var(--status-warning); }
+  .session-status.danger { color: var(--status-danger); }
 
   /* Page-level alert: quiet tinted border, transparent fill. */
   .alert {
