@@ -9,7 +9,9 @@ type ReviewRow = {
   source: 'explicit' | 'model'; admission_id: string | null; review_hash: string; created_at: string;
 };
 type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: string; expires_at: number };
-const operationTools: Record<Exclude<Operation['kind'], 'permission'>, ToolName> = { 'github.comment': 'github_comment', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push' };
+const operationTools: Record<Exclude<Operation['kind'], 'permission'>, ToolName> = {
+  'github.comment': 'github_comment', 'github.merge': 'github_merge', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push',
+};
 const statuses: readonly string[] = ['pending', 'approved', 'denied', 'executing', 'executed', 'interrupted', 'failed'];
 
 async function toolsFor(env: Env, row: SessionRow): Promise<string[]> {
@@ -39,6 +41,26 @@ async function sessionTools(env: Env, row: SessionRow): Promise<(operation: Oper
 }
 export async function requireOperationTool(env: Env, row: SessionRow, operation: Operation, approvalId = ''): Promise<void> {
   if (!(await sessionTools(env, row))(operation, approvalId)) fail(403, 'tool_not_allowed', 'The pinned agent does not allow this operation.');
+}
+/**
+ * Whether a tool call that reaches the control plane without an approval (github_read) may use `tool`: the pinned
+ * agent's, one the owner allowed for the session, or one the owner allowed for this call. A one-call grant covers only
+ * the call its permission card showed: the same requester, message (write admission) and target, so the call id can't
+ * be reused for another target or a later message.
+ */
+export async function requireToolCall(env: Env, row: SessionRow, tool: ToolName,
+  call: { id: string; requestedBy: string; admissionId: string; target: string }): Promise<void> {
+  if ((await toolsFor(env, row)).includes(tool)) return;
+  const grants = await env.DB.query<{ call_id: string; approval_id: string }>(`SELECT call_id, approval_id FROM session_tool_grants
+    WHERE session_id = ? AND tool = ? AND (call_id = '' OR call_id = ?)`).bind(row.id, tool, call.id).all();
+  if (grants.some(grant => grant.call_id === '')) return;
+  const review = grants[0] && await env.DB.query<ReviewRow>('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?')
+    .bind(row.id, grants[0].approval_id).first();
+  const request = review ? parseOperation(JSON.parse(review.operation_json)) : undefined;
+  if (!review || request?.kind !== 'permission' || request.tool !== tool || request.target !== call.target
+    || review.requested_by !== call.requestedBy || review.admission_id !== call.admissionId) {
+    fail(403, 'tool_not_allowed', 'The pinned agent does not include this tool and the session owner has not allowed this call.');
+  }
 }
 export async function reviewCommitment(sessionId: string, approvalId: string, requestedBy: string, operation: Operation): Promise<string> {
   return sha256(JSON.stringify({ sessionId, approvalId, requestedBy, operation }));
@@ -77,10 +99,10 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       createdAt: text(raw.createdAt, 'createdAt', 64),
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
       ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
-    // Only the owner's own commands, commits and pushes may run without a human decision, and never a GitHub comment.
+    // Only the owner's own commands, commits and pushes may run without a human decision, and never a GitHub comment or merge.
     if (raw.automatic !== undefined) {
-      if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id
-        || approval.status === 'pending' || operation.kind === 'github.comment' || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
+      if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id || approval.status === 'pending'
+        || operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
       approval.automatic = true;
     }
     // An allowed permission request says how far it reaches; only a command can run without resource limits.

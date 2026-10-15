@@ -53,7 +53,7 @@ This needs only Git on your `PATH` (on macOS: `xcode-select --install` or `brew 
 - File tools are confined to each session folder by path checks only.
 - Anyone you share the Pi with, and anyone granted approve permission on a session that runs on it, can cause approved commands to run on your machine.
 
-Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands, commits and pushes run immediately (GitHub comments still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
+Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands, commits and pushes run immediately (GitHub comments and merges still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
 
 ## Pushing commits
 
@@ -84,6 +84,14 @@ Instead of an app or bot, a provider's push identity can be one of these. Both p
 
 Pull requests are still opened as the session owner, with the owner's connected account.
 
+## GitHub issues and pull requests
+
+The sandbox has no network, so `gh` and `curl` inside it can't reach GitHub. Agents read and act on GitHub through Pistead instead, as the session owner and with the owner's GitHub sign-in, which stays on the Pistead server: the host and the sandbox never see it. These tools need connector 0.7.0 or newer; an agent whose tools predate them asks the session owner the first time, with the permission card described below. GitHub Enterprise and other providers are not covered.
+
+- `github_read` reads an issue or pull request of a github.com repository pinned in the session and still configured in the workspace: its description and comments, and for a pull request its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. Long threads keep their newest items. Like any repository content, what it returns is untrusted input. A read needs no approval, but only runs during a write message (until an hour after it was sent), and each read is recorded in the session's audit log.
+- `github_merge` merges a pull request of a pinned repository at the exact head commit the agent read, with a merge commit, squash or rebase. It always waits for a human approval, also under **Auto-approve**. If the head moved or GitHub refuses (failing checks, missing reviews, conflicts, a method the repository doesn't allow), nothing is merged and the agent gets GitHub's reason.
+- `github_comment` still posts comments after their approval.
+
 ## Chat options
 
 In a session's chat box you can pick any model this host's Pi offers, its reasoning level, and the access mode for each message: **Read only**, **Ask before acting** (the default) or **Auto-approve** (session owner only). Hosts running a connector older than 0.3.0 keep each session's pinned model; restart the connector with `npx pistead@latest connect` to enable the options.
@@ -94,7 +102,7 @@ Agents change files with `edit_file`, which replaces exact text in place, or wit
 
 A new session needs no agent: pick a host and one of its models, and the session gets every tool that host supports with no extra instructions. The access mode still decides what runs without asking. Agents remain for reusable instructions and tool sets, and for sharing them with a workspace.
 
-When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes and GitHub comments still need their own approval unless the message auto-approves. Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
+When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes, GitHub comments and merges still need their own approval unless the message auto-approves (GitHub comments and merges even then). Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
 
 ## License
 

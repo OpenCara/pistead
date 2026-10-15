@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
 import { defaultAgentName, toolNames } from '../../../packages/shared/src/types.js';
-import type { Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import type { ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import { agentVersion, auditStatement, modelDefinition, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
@@ -174,15 +175,22 @@ async function versionBatch(env: Env, statements: Query<AgentRow>[], versionInde
   }
 }
 
+/** Whether a host's connector carries a tool: pushes and GitHub reads and merges need connectors that report them. */
+function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
+  if (tool === 'git_push') return capabilities.gitPush === true;
+  if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
+  return true;
+}
+
 /**
  * The agent of a session started from a model instead of a chosen agent: every tool the host can carry, since the
  * message's access mode still gates writes, commands and pushes, and no instructions beyond the runner's own context.
  * Each such session gets its own chat agent, which stays out of the author's catalog.
  */
-export async function chatAgentVersion(env: Env, ownerId: string, model: ModelRow, gitPush: boolean): Promise<AgentRow> {
+export async function chatAgentVersion(env: Env, ownerId: string, model: ModelRow, capabilities: ConnectorCapabilities): Promise<AgentRow> {
   const agentId = id();
   const createdAt = now();
-  const tools = toolNames.filter(tool => gitPush || tool !== 'git_push');
+  const tools = toolNames.filter(tool => carries(capabilities, tool));
   const input: AgentInput = { name: model.name, description: '', instructions: '', toolsJson: JSON.stringify(tools), modelId: model.id };
   return versionBatch(env, [
     env.DB.query<never>(`INSERT INTO agents (id, author_id, created_at, chat)

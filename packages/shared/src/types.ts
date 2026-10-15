@@ -3,7 +3,7 @@ import type { GitProvider, SessionRepository } from "./repositories.js";
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_comment", "git_push"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push"] as const;
 export type ToolName = (typeof toolNames)[number];
 export interface UserProfile {
   id: string;
@@ -130,12 +130,120 @@ export interface PermissionRequest {
   /** In `permissionNeeds` order. */
   needs: PermissionNeed[];
 }
+export const githubMergeMethods = ["merge", "squash", "rebase"] as const;
+export type GitHubMergeMethod = (typeof githubMergeMethods)[number];
+/**
+ * Merges pull request `pull` of a pinned github.com repository (`owner/name`) as the session owner, only while its head
+ * is still `sha`. Key order is canonical: kind, repository, pull, sha, method.
+ */
+export interface GitHubMergeOperation {
+  kind: "github.merge";
+  repository: string;
+  pull: number;
+  sha: string;
+  method: GitHubMergeMethod;
+}
 export type Operation =
   | { kind: "git.commit"; message: string }
   | { kind: "bash"; command: string }
   | { kind: "github.comment"; repository: string; issue: number; body: string }
+  | GitHubMergeOperation
   | GitPushOperation
   | PermissionRequest;
+/** Runner -> control plane: read an issue or pull request of a pinned github.com repository as the session owner. */
+export interface GitHubReadRequest {
+  sessionId: string;
+  /** Who sent the message whose tool call reads; `admissionId` is that message's write admission. */
+  actorId: string;
+  admissionId: string;
+  /** The reading tool call, so a one-call permission for github_read covers it. */
+  callId: string;
+  repository: string;
+  issue: number;
+}
+/** Runner -> control plane: perform one human-approved merge with the capability minted when it was approved. */
+export interface GitHubMergeRequest {
+  sessionId: string;
+  actorId: string;
+  approvalId: string;
+  capability: string;
+  repository: string;
+  pull: number;
+  sha: string;
+  method: GitHubMergeMethod;
+}
+/** `sha` is the commit the merge created on the base branch; `url` the pull request. */
+export interface GitHubMergeResult {
+  sha: string;
+  url: string;
+}
+export interface GitHubCommentView {
+  id: number;
+  author: string | null;
+  createdAt: string;
+  body: string;
+  url: string;
+}
+export interface GitHubReviewView {
+  id: number;
+  author: string | null;
+  /** APPROVED, CHANGES_REQUESTED, COMMENTED or DISMISSED. */
+  state: string;
+  submittedAt: string | null;
+  /** The head commit the review was submitted on. */
+  commit: string | null;
+  body: string;
+  url: string;
+}
+export interface GitHubReviewCommentView {
+  id: number;
+  /** The comment this one replies to in its thread. */
+  inReplyTo: number | null;
+  author: string | null;
+  createdAt: string;
+  path: string;
+  /** Line in the file at the pull request's head; null when the comment is outdated (see originalLine). */
+  line: number | null;
+  originalLine: number | null;
+  commit: string;
+  body: string;
+  /** The end of the diff hunk the comment is on. */
+  diffHunk: string;
+  url: string;
+}
+export interface GitHubPullRequestView {
+  draft: boolean;
+  merged: boolean;
+  /** null while GitHub is still computing it. */
+  mergeable: boolean | null;
+  /** GitHub's mergeable_state, e.g. clean, blocked, behind, dirty, unstable. */
+  mergeableState: string;
+  head: { ref: string; sha: string; repository: string | null };
+  base: { ref: string; sha: string };
+  reviews: GitHubReviewView[];
+  reviewComments: GitHubReviewCommentView[];
+  /** Check runs and commit statuses of the head commit, failing and pending ones first. */
+  checks: { name: string; status: string; conclusion: string | null }[];
+}
+/**
+ * An issue or pull request as github_read returns it, within 96 KiB of JSON. Each thread list keeps its newest items;
+ * long bodies end in a note of how much was cut.
+ */
+export interface GitHubIssueView {
+  repository: string;
+  number: number;
+  url: string;
+  title: string;
+  state: string;
+  author: string | null;
+  createdAt: string;
+  body: string;
+  labels: string[];
+  comments: GitHubCommentView[];
+  pullRequest?: GitHubPullRequestView;
+  /** How many items of each list were left out to keep the result within its bound: the oldest thread items, and checks after the kept ones. */
+  omitted?: { comments?: number; reviews?: number; reviewComments?: number; checks?: number };
+}
 /**
  * The credential the control plane issued for exactly one approved push: a short-lived token minted from a workspace app
  * or bot identity, or the session owner's own token when push access uses their account. Never persisted by the runner.

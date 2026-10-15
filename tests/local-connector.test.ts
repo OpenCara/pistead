@@ -170,7 +170,7 @@ test('pairing posts only to the fixed origin and strips extra model/capability s
   assert.equal(request.redirect, 'error');
   assert.equal(request.credentials, 'omit');
   assert.equal(request.headers.get('authorization'), null);
-  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true } });
+  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, github: true } });
   for (const secret of [providerSecret, credentials.token, 'fixture_pairing_code']) assert.equal(request.url.includes(secret), false);
 });
 
@@ -359,6 +359,7 @@ type FixtureOptions = {
   authorize?: () => Response | Promise<Response>;
   repository?: (request: Request) => Response | Promise<Response>;
   pushCredential?: (request: Request) => Response | Promise<Response>;
+  github?: (request: Request) => Response | Promise<Response>;
   execute?: (request: Request, generation: number) => Response | Promise<Response>;
   unblock?: () => void;
   gitCredentials?: boolean;
@@ -418,6 +419,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
         return options.repository?.(request) ?? repositoryResponse();
       }
       if (request.url === `${origin}/api/connectors/self/git/push/credential` && options.pushCredential) return options.pushCredential(request);
+      if (request.url.startsWith(`${origin}/api/connectors/self/github/`) && options.github) return options.github(request);
       assert.fail(`Unexpected fixture Worker request: ${request.url}`);
     },
     onStatus: status => { statuses.push(status); if (status === 'connected') connected.push(); },
@@ -508,7 +510,7 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   socket.welcome();
   const call = await fixture.workerCalls.next();
   assert.equal(call.request.url, `${origin}/api/connectors/self/manifest`);
-  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true } });
+  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, github: true } });
   assert.equal(call.request.headers.get('x-connection-token'), connectionToken);
   assert.equal(fixture.runtimes.length, 1);
   assert.equal(ready, false);
@@ -538,7 +540,7 @@ test('the owner\'s --git-credentials opt-in is advertised and lets push credenti
   const fixture = await connectorFixture(t, { gitCredentials: true, pushCredential: () => Response.json(issued) });
   await startFixture(fixture);
   const manifest = fixture.allCalls.find(call => call.request.url === `${origin}/api/connectors/self/manifest`)!;
-  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, gitCredentials: true });
+  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, github: true, gitCredentials: true });
   const config = fixture.runtimes[0]!.config;
   assert.equal(typeof config.hostGitCredential, 'function');
   const request = { sessionId: 'session', approvalId: 'tool-push', actorId: 'owner', admissionId: 'admission',
@@ -549,6 +551,42 @@ test('the owner\'s --git-credentials opt-in is advertised and lets push credenti
   // A credential is either a token or the host's own: never both.
   issued = { ...host, authorization: 'Basic eDp5' };
   await assert.rejects(config.pushCredential!(request));
+});
+
+test('github reads and merges reach the control plane over the connection, pass its refusals on, and allow read results above the callback limit', { timeout: 10000 }, async t => {
+  let answer = (_request: Request): Response => Response.json({});
+  const fixture = await connectorFixture(t, { github: request => answer(request) });
+  await startFixture(fixture);
+  const config = fixture.runtimes[0]!.config;
+  const read = { sessionId: 'session', actorId: 'owner', admissionId: 'admission', callId: 'call-1', repository: 'acme/alpha', issue: 7 };
+  // A long pull request thread stays readable: the view is bounded by the control plane at 96 KiB, above other callbacks' 64 KiB.
+  const view = { repository: 'acme/alpha', number: 7, url: 'https://github.com/acme/alpha/pull/7', title: 'Fix', state: 'open', author: 'a',
+    createdAt: '2026-10-01T00:00:00Z', body: 'x'.repeat(90 * 1024), labels: [], comments: [] };
+  answer = request => {
+    assert.equal(request.url, `${origin}/api/connectors/self/github/read`);
+    assert.equal(request.headers.get('x-connection-token'), connectionToken);
+    return Response.json(view);
+  };
+  assert.deepEqual(await config.githubRead!(read), view);
+  assert.deepEqual(JSON.parse(fixture.allCalls.at(-1)!.body), read);
+  answer = () => Response.json({ error: 'acme/beta is not a github.com repository pinned in this session.', code: 'repository_not_pinned' }, { status: 403 });
+  await assert.rejects(config.githubRead!({ ...read, repository: 'acme/beta' }), (error: Error & { status?: number }) =>
+    error.status === 403 && error.message === 'acme/beta is not a github.com repository pinned in this session.');
+
+  const merge = { sessionId: 'session', actorId: 'owner', approvalId: 'tool-merge', capability: 'capability', repository: 'acme/alpha', pull: 7, sha: 'a'.repeat(40), method: 'squash' } as const;
+  answer = request => {
+    assert.equal(request.url, `${origin}/api/connectors/self/github/merge`);
+    return Response.json({ sha: 'b'.repeat(40), url: 'https://github.com/acme/alpha/pull/7' });
+  };
+  assert.deepEqual(await config.githubMerge!(merge), { sha: 'b'.repeat(40), url: 'https://github.com/acme/alpha/pull/7' });
+  assert.deepEqual(JSON.parse(fixture.allCalls.at(-1)!.body), merge);
+  // GitHub's reason not to merge reaches the session as a definite 422.
+  answer = () => Response.json({ error: 'GitHub did not merge acme/alpha#7: Head branch was modified.', code: 'github_merge_refused' }, { status: 422 });
+  await assert.rejects(config.githubMerge!(merge), (error: Error & { status?: number }) =>
+    error.status === 422 && error.message === 'GitHub did not merge acme/alpha#7: Head branch was modified.');
+  // A merge result that doesn't name a commit on github.com is refused.
+  answer = () => Response.json({ sha: 'b'.repeat(40), url: 'https://evil.example/acme/alpha/pull/7' });
+  await assert.rejects(config.githubMerge!(merge));
 });
 
 test('malformed welcome never creates a runtime or advertises readiness', { timeout: 10000 }, async t => {

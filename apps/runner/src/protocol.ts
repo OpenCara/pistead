@@ -1,7 +1,7 @@
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
-import { permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
+import { githubMergeMethods, permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
 import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
@@ -106,8 +106,12 @@ export function validateOperation(value: unknown): Operation {
   const text = (v: unknown, max: number) => typeof v === "string" && v.trim().length > 0 && v.length <= max && !v.includes("\0");
   if (op.kind === "git.commit" && text(op.message, 4000) && Object.keys(op).length === 2) return op;
   if (op.kind === "bash" && text(op.command, 8192) && Object.keys(op).length === 2) return op;
-  if (op.kind === "github.comment" && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(op.repository) && !op.repository.endsWith("/.") && !op.repository.endsWith("/..")
+  const githubRepository = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(value) && !value.endsWith("/.") && !value.endsWith("/..");
+  if (op.kind === "github.comment" && githubRepository(op.repository)
     && Number.isSafeInteger(op.issue) && op.issue > 0 && text(op.body, 60000) && Object.keys(op).length === 4) return op;
+  if (op.kind === "github.merge" && githubRepository(op.repository) && Number.isSafeInteger(op.pull) && op.pull > 0
+    && typeof op.sha === "string" && /^[0-9a-f]{40}$/.test(op.sha) && githubMergeMethods.includes(op.method)
+    && Object.keys(op).length === 5) return op;
   if (op.kind === "git.push") {
     const keys = Object.keys(op);
     const request = op.pullRequest as Record<string, unknown> | undefined;

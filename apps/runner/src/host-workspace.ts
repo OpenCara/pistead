@@ -181,6 +181,7 @@ export class HostWorkspace {
         });
       }
       case "github.comment":
+      case "github.merge":
         throw new Error("GitHub operations require the control-plane credential broker, not the sandbox");
       default:
         throw new Error("Unsupported sandbox operation");

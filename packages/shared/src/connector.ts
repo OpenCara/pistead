@@ -24,6 +24,8 @@ export interface ConnectorCapabilities {
   gitPush?: boolean;
   /** The host's owner lets pushes in their own sessions use this host's Git credentials (connect --git-credentials). Absent means false. */
   gitCredentials?: boolean;
+  /** The connector reads GitHub issues and pull requests and merges pull requests through the control plane (github_read, github_merge). Absent on older connectors. */
+  github?: boolean;
 }
 
 export interface ConnectorInfo {
