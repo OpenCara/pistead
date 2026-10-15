@@ -201,4 +201,9 @@ export const repositoryLimits = {
   entries: 10000,
   // One repository picker listing; larger accounts list their first repositories in provider order.
   pickerRepositories: 3000,
+  // Checkouts from a host repository cache (docs/design/repository-cache.md), aggregate across one session's
+  // repositories. No archive is involved, so these bound only what is written into the session worktree.
+  checkoutEntries: 250_000,
+  checkoutBytes: 8 * 1024 * 1024 * 1024,
+  checkoutFileBytes: 1024 * 1024 * 1024,
 } as const;

@@ -8,8 +8,8 @@ import { repositoryLimits, type SessionRepository } from "../../../packages/shar
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import type { PushPreparation } from "./push.js";
 import {
-  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, drained, ownerGitConfig, pinOwnerConfig, repositoryPins, sessionEnvironment, text,
-  type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
+  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, drained, ownerGitConfig, pinOwnerConfig, repositoryObjectPaths, repositoryPins, sessionEnvironment, text,
+  type RepositoryCacheState, type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SandboxOptions, type SnapshotFile,
 } from "./sandbox.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 
@@ -20,12 +20,16 @@ const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBL
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const queues = new Map<string, Promise<void>>();
 const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
+/** Cache checkouts write whole repositories; like pushes, they get far longer than single commands. */
+const CHECKOUT_TIMEOUT_MS = 60 * 60 * 1000;
 const PUSH_CAPTURE_BYTES = 64 * 1024 * 1024;
 const PUSH_ID = /^[0-9a-f]{32}$/;
 const OID = /^[0-9a-f]{40}$/;
 const ZERO = "0".repeat(40);
 
 type Captured = { code: number | null; stdout: string; stderr: string };
+type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number };
+type TreeNode = Map<string, string | TreeNode>;
 type ArchiveNode = "file" | "directory";
 type ArchiveFile = { path: string[]; body: Buffer; mode: number };
 type PushProcess = { stdout: AsyncIterable<Buffer>; done: Promise<{ code: number | null; stdout: Buffer }>; kill: () => void };
@@ -44,13 +48,14 @@ export class HostWorkspace {
   readonly #environment: Readonly<Record<string, string>>;
   readonly #testProvider: boolean;
   readonly #repositories: readonly SessionRepository[];
+  readonly #cacheObjects: readonly string[];
   #initialization: Promise<void> | undefined;
   #ready = false;
   #closed = false;
   #cancelActive: (() => void) | undefined;
   readonly #pushStreams = new Map<string, () => void>();
 
-  constructor(binding: RunnerBinding, root: string) {
+  constructor(binding: RunnerBinding, root: string, options: SandboxOptions = {}) {
     if (!["linux", "darwin"].includes(process.platform) || !isAbsolute(root) || resolve(root) === sep) {
       throw new Error("Host workspace requires Linux or macOS and an absolute, non-root private storage path");
     }
@@ -64,6 +69,8 @@ export class HostWorkspace {
     this.#root = resolve(root);
     this.#testProvider = binding.model.provider === "faux";
     this.#repositories = repositoryPins(binding.session.repositories ?? []);
+    // Nothing can be mounted read-only here: alternates name the cache's host paths directly.
+    this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
     this.#identity = Object.freeze({
       ownerId, githubLogin, gitName, gitEmail, home: join(this.#root, "home"), worktree: join(this.#root, "worktree"),
       env: Object.freeze({ ...binding.owner.env }),
@@ -223,8 +230,20 @@ export class HostWorkspace {
 
   /** False only for pristine storage; mismatched or interrupted caches fail closed. */
   async repositoryCachesReady(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<boolean> {
+    return (await this.repositoryCacheState(repositories, authorize)) !== "absent";
+  }
+
+  /** How the session's repositories were prepared; a cache-backed session also needs its cache paths to match. */
+  async repositoryCacheState(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<RepositoryCacheState> {
     this.#assertRepositories(repositories);
-    return this.#operation(authorize, () => this.#cacheReady());
+    return this.#operation(authorize, () => this.#cacheState());
+  }
+
+  /** Like `Sandbox.materializeFromCache`: the runner has ensured and inspected every pinned tree. */
+  async materializeFromCache(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<void> {
+    this.#assertRepositories(repositories);
+    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    await this.#operation(authorize, () => this.#checkout());
   }
 
   /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
@@ -464,7 +483,7 @@ export class HostWorkspace {
   }
 
   async #requireCache(): Promise<void> {
-    if (this.#repositories.length && !await this.#cacheReady()) throw hostError("repository cache is not prepared");
+    if (this.#repositories.length && (await this.#cacheState()) === "absent") throw hostError("repository cache is not prepared");
   }
 
   /** Lexical checks, then symlink resolution: the resolved path must stay inside the worktree. */
@@ -492,41 +511,109 @@ export class HostWorkspace {
     return parts;
   }
 
-  async #cacheReady(): Promise<boolean> {
+  async #alternates(): Promise<string> {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode((await readAt(join(this.worktree, ".git", "objects", "info"), "alternates", 65536)).data);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return "";
+      throw error;
+    }
+  }
+
+  async #cacheState(): Promise<RepositoryCacheState> {
     const git = join(this.worktree, ".git");
     let raw: Buffer;
     try {
       raw = (await readAt(git, CACHE_MARKER, 65536)).data;
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
-      if (!this.#repositories.length) return true;
+      if (!this.#repositories.length) return "archive";
       const names = await readdir(this.worktree);
       if (names.length !== 1 || names[0] !== ".git" || (await this.#capture(["rev-parse", "--verify", "HEAD"])).code === 0) {
         throw hostError("repository cache is unmarked and nonempty; refusing to overwrite");
       }
       if ((await this.#git(["ls-files", "--stage"])).stdout) throw hostError("repository cache has an existing Git index");
-      return false;
+      return "absent";
     }
     const marker: unknown = JSON.parse(new TextDecoder().decode(raw));
-    if (!marker || typeof marker !== "object" || !("version" in marker) || marker.version !== 1 || !("repositories" in marker)
+    const source = !marker || typeof marker !== "object" || !("version" in marker) ? undefined
+      : marker.version === 1 ? "archive" : marker.version === 2 && "source" in marker && marker.source === "cache" ? "cache" : undefined;
+    if (!source || !marker || typeof marker !== "object" || !("repositories" in marker)
       || canonicalJson(marker.repositories) !== canonicalJson(this.#repositories)) {
       throw hostError("repository cache binding does not match immutable pins");
     }
+    const expected = source === "cache" ? this.#cacheObjects.map(path => `${path}\n`).join("") : "";
+    if (await this.#alternates() !== expected) throw hostError("repository cache mounts do not match this session");
     if (!("status" in marker) || marker.status !== "ready") throw hostError("repository cache preparation is incomplete; refusing to overwrite");
     const baseline = "baseline" in marker ? marker.baseline : undefined;
     if (typeof baseline !== "string" || !/^[0-9a-f]{40}$/.test(baseline)) throw hostError("invalid repository cache baseline");
     if ((await this.#git(["cat-file", "-t", baseline])).stdout.trim() !== "commit") throw hostError("repository cache baseline is missing");
     await this.#git(["merge-base", "--is-ancestor", baseline, "HEAD"]);
-    return true;
+    return source;
   }
 
-  async #marker(status: "preparing" | "ready", baseline?: string): Promise<void> {
-    const value = { version: 1, repositories: this.#repositories, status, ...(baseline ? { baseline } : {}) };
+  async #marker(status: "preparing" | "ready", baseline?: string, source: "archive" | "cache" = "archive"): Promise<void> {
+    // Version 2 (cache checkouts): older runners refuse such sessions instead of using them without the cache.
+    const value = source === "cache"
+      ? { version: 2, source, repositories: this.#repositories, status, ...(baseline ? { baseline } : {}) }
+      : { version: 1, repositories: this.#repositories, status, ...(baseline ? { baseline } : {}) };
     await writeAt(join(this.worktree, ".git"), [CACHE_MARKER], JSON.stringify(value));
   }
 
+  /** Mirrors the sandbox helper's materialize_from_cache; see the comments there. */
+  async #checkout(): Promise<void> {
+    if ((await this.#cacheState()) !== "absent") return;
+    const env = { GIT_ALTERNATE_OBJECT_DIRECTORIES: this.#cacheObjects.join(":") };
+    const root: TreeNode = new Map();
+    for (const repository of this.#repositories) {
+      const type = await this.#capture(["cat-file", "-t", repository.commit], undefined, { env });
+      const tree = await this.#capture(["rev-parse", "--verify", "--quiet", `${repository.commit}^{tree}`], undefined, { env });
+      if (type.code !== 0 || type.stdout.trim() !== "commit" || tree.code !== 0 || !OID.test(tree.stdout.trim())) {
+        throw hostError("pinned commit is missing from the repository cache");
+      }
+      const parts = repository.path.split("/");
+      let node = root;
+      for (const part of parts.slice(0, -1)) {
+        const next = node.get(part) ?? new Map();
+        if (typeof next === "string") throw hostError("repository paths overlap");
+        node.set(part, next);
+        node = next;
+      }
+      if (node.has(parts.at(-1)!)) throw hostError("repository paths overlap");
+      node.set(parts.at(-1)!, tree.stdout.trim());
+    }
+    await this.#marker("preparing", undefined, "cache");
+    await writeAt(join(this.worktree, ".git"), ["objects", "info", "alternates"], this.#cacheObjects.map(path => `${path}\n`).join(""));
+    const baselineTree = await this.#composeTree(root);
+    const long = { timeoutMs: CHECKOUT_TIMEOUT_MS };
+    await this.#git(["read-tree", baselineTree], undefined, long);
+    await this.#git(["checkout-index", "--all", "--index"], undefined, long);
+    for (const name of (await readdir(this.worktree)).sort()) {
+      if (name !== ".git") await syncTree(join(this.worktree, name), repositoryLimits.checkoutEntries + 1024, repositoryLimits.checkoutBytes, true);
+    }
+    await syncPath(this.worktree);
+    const baseline = (await this.#git(["commit-tree", baselineTree, "-m", "Initialize pinned repository snapshots"])).stdout.trim();
+    await this.#git(["update-ref", "HEAD", baseline]);
+    for (const repository of this.#repositories) {
+      const ref = pinnedRef(repository.path);
+      if (ref) await this.#git(["update-ref", ref, repository.commit]);
+    }
+    await syncTree(join(this.worktree, ".git"), 4096, 256 * repositoryLimits.checkoutEntries + 64 * 1024 * 1024);
+    await this.#marker("ready", baseline, "cache");
+  }
+
+  async #composeTree(node: TreeNode): Promise<string> {
+    const lines: string[] = [];
+    for (const [name, value] of [...node].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
+      lines.push(`040000 tree ${typeof value === "string" ? value : await this.#composeTree(value)}\t${name}\n`);
+    }
+    const tree = (await this.#git(["mktree"], lines.join(""))).stdout.trim();
+    if (!OID.test(tree)) throw hostError("repository baseline tree could not be written");
+    return tree;
+  }
+
   async #materialize(archives: readonly Buffer[]): Promise<void> {
-    if (await this.#cacheReady()) return;
+    if ((await this.#cacheState()) !== "absent") return;
     const prepared: { destination: string[]; files: ArchiveFile[]; nodes: Map<string, ArchiveNode> }[] = [];
     let expanded = 0;
     let entries = 0;
@@ -588,18 +675,19 @@ export class HostWorkspace {
       ...args];
   }
 
-  #capture(args: string[], input?: string): Promise<Captured> {
+  #capture(args: string[], input?: string, options: SpawnOptions = {}): Promise<Captured> {
     // Host mode uses the owner's Git from PATH (Xcode tools or Homebrew on macOS).
-    return this.#spawn("git", this.#gitArgs(args), input);
+    return this.#spawn("git", this.#gitArgs(args), input, options);
   }
 
-  async #git(args: string[], input?: string): Promise<Captured> {
-    return checked(await this.#capture(args, input));
+  async #git(args: string[], input?: string, options: SpawnOptions = {}): Promise<Captured> {
+    return checked(await this.#capture(args, input, options));
   }
 
-  #spawn(command: string, args: string[], input?: string): Promise<Captured> {
+  #spawn(command: string, args: string[], input?: string, options: SpawnOptions = {}): Promise<Captured> {
     const { promise, resolve: resolveResult, reject } = Promise.withResolvers<Captured>();
-    const child = spawn(command, args, { cwd: this.worktree, env: { ...this.#environment }, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd: this.worktree, env: { ...this.#environment, ...options.env }, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let bytes = 0;
@@ -610,7 +698,7 @@ export class HostWorkspace {
     };
     const cancel = () => { failure ??= "Sandbox closed"; kill(); };
     this.#cancelActive = cancel;
-    const timer = setTimeout(() => { failure ??= `Command exceeded ${TIMEOUT_MS}ms time limit`; kill(); }, TIMEOUT_MS);
+    const timer = setTimeout(() => { failure ??= `Command exceeded ${timeoutMs}ms time limit`; kill(); }, timeoutMs);
     const capture = (target: Buffer[], chunk: Buffer) => {
       const remaining = Math.max(0, MAX_OUTPUT_BYTES - bytes);
       if (remaining) target.push(chunk.subarray(0, remaining));
@@ -761,8 +849,17 @@ async function syncPath(path: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
-/** Flushes every regular file and directory beneath root, refusing links and filesystem crossings. */
-async function syncTree(root: string, entryLimit: number, byteLimit: number): Promise<void> {
+/** `refs/remotes/<path>/pinned` names a pinned commit for the agent, when `<path>` is also a valid ref name. */
+function pinnedRef(path: string): string | null {
+  return path.split("/").every(part => /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(part) && !part.endsWith(".") && !part.endsWith(".lock") && !part.includes(".."))
+    ? `refs/remotes/${path}/pinned` : null;
+}
+
+/**
+ * Flushes every regular file and directory beneath root, refusing filesystem crossings and, unless `links` is set,
+ * symlinks. Allowed symlinks are never followed; their parent directory's flush makes them durable.
+ */
+async function syncTree(root: string, entryLimit: number, byteLimit: number, links = false): Promise<void> {
   const device = (await lstat(root)).dev;
   let entries = 0;
   let size = 0;
@@ -777,6 +874,7 @@ async function syncTree(root: string, entryLimit: number, byteLimit: number): Pr
         await visit(path, depth + 1);
         continue;
       }
+      if (links && info.isSymbolicLink()) continue;
       regular(info);
       size += info.size;
       if (size > byteLimit) throw hostError("repository durability byte limit exceeded");

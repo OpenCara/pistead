@@ -1,8 +1,8 @@
 # Design: host repository cache with per-session Git object stores
 
-Status: phase 1 in progress. Done: the host cache and full-history fetch (`repo-cache.ts`, `git-remote.ts`) and
-the server's per-session authorization (`repositoryAuthorize`). Not yet done: wiring into session start, the sandbox,
-push, progress in the UI, backups, and cache cleanup.
+Status: phase 1 in progress. Done: the host cache and full-history fetch (`repo-cache.ts`, `git-remote.ts`), the
+server's per-session authorization (`repositoryAuthorize`), and checking pinned trees out of the cache in the sandbox
+and in host mode. Not yet done: wiring into session start, push, progress in the UI, backups, and cache cleanup.
 
 ## How sessions get their code today
 
@@ -102,24 +102,38 @@ Keep today's model of one Git repository for the session, with repositories unde
 `git_status`, `git_commit`, the cache marker, restore and push validation keep working as they are.
 
 - **Create the session repository:** `git init`, as today. Then write
-  `.git/objects/info/alternates` with one line per pinned repository's cache `objects` directory.
-- **Build the baseline commit without archives:** create the baseline tree straight from the cached trees, with
-  `git read-tree --prefix=<path>/ <commit>^{tree}` for each pin, then `write-tree` and `commit-tree`. Then
-  `checkout-index -a`. No archive needs parsing, and the session stores no copy of the blobs.
+  `.git/objects/info/alternates` with one line per pinned repository's cache `objects` directory: the read-only
+  mount `/repository-cache/<n>` (pin order) in the sandbox, or the cache's host path in host mode.
+- **Build the baseline commit without archives:** only the directories above the pinned paths are new, so they
+  are written with `git mktree`, each referencing its pinned tree by id. Then one `read-tree <root>` (which also
+  fills Git's cached tree index), `checkout-index --all --index` into the empty worktree, and `commit-tree`.
+  No archive is parsed and no cached object is copied: Git duplicates any object it "writes" that exists only in a
+  read-only alternate, so a `write-tree` over the prefixed trees would have copied every tree of every repository.
+  A session holds three new objects after checkout (two directory trees and the baseline commit), and owner
+  commits add only the blobs and trees they change. These counts are tested.
+- **Marker:** version 2 (`source: "cache"`), so older runners refuse cache-backed sessions instead of using them
+  without their mounts. Readiness also requires the alternates file to match the configured mounts exactly.
 - **Hardening:** the existing `GIT_HARDENED` flags already disable hooks, fsmonitor, protocols and similar risks.
-  With archives, the checks happened in `parse_archive`. Now they move to a check of the tree (`ls-tree -r -z`)
-  before checkout. That check refuses `.git` path components, gitlinks (submodules) and paths over the limits.
-- **Symlinks:** they are checked out as real symlinks (mode `120000`). Each target must be relative and must
-  resolve lexically inside its own repository's `path/`, as `link_target` checks today. File tools already
+  With archives, the checks happened in `parse_archive`. Now the runner checks each pinned tree in the cache
+  before checkout (`RepositoryCache.inspect`, which streams `ls-tree -r -z -l`), with the same path rules: no
+  traversal, control characters, backslashes or `:`, no `.git` component in any spelling Git treats as one
+  (`.GIT`, `.git.`, `git~1`), bounded depth, length and size (`repositoryLimits.checkout*`), UTF-8 names. A
+  commit's tree never changes, so checking it once, outside the sandbox, is enough.
+- **Submodules:** kept in the index and checked out as empty directories, as archives left them, so pushes never
+  delete them.
+- **Symlinks:** they are checked out as real symlinks (mode `120000`). Each target must be relative, must
+  resolve lexically inside its own repository's `path/`, and must not point into Git metadata. File tools already
   resolve paths and refuse anything that leaves the worktree, and `snapshot()` must learn to store symlinks as
-  links instead of refusing them.
+  links instead of refusing them (backups of sessions with symlinks fail until then).
 - **Push gets simpler:** `pushPrepare` no longer needs to fetch the pinned commit from the remote, because
   `base` is already in the alternate object store. The rewrite loop stays as it is. The remote is still contacted
   for the receive-pack advertisement, which is the fast-forward check.
 - **What the agent sees:** the session repository still has one synthetic baseline commit. But the full history
-  of each repository is in the alternate object store, and the runner writes `refs/upstream/<path>/…` refs for
-  each pinned commit and the cached branches into the session repository. So `git log upstream/<path>/main`,
-  `git blame <commit> -- file` and `git diff <pinned commit> …` work. Phase 2 is still the better experience.
+  of each repository is in the alternate object store, and `refs/remotes/<path>/pinned` names each pinned commit
+  (when `<path>` is a valid ref name), so `git log acme/alpha/pinned`, `git blame <pinned commit> -- file` and
+  `git diff <pinned commit> …` work. Branches and tags are not mirrored into sessions yet: a session ref to an
+  upstream tip the cache later prunes would break, so that waits for cache garbage collection. Phase 2 is still
+  the better experience.
 
 ### Session layout: phase 2 (a real repository for each pin, optional)
 
@@ -192,8 +206,9 @@ I'd ship phase 1 first. It delivers the speed and size gains with a small, conta
 | `packages/shared` protocol, `apps/server/src/connector-hub.ts`, `apps/web` | `repository-progress` message, relay, and progress rows in the session view. |
 | `apps/runner/src/` (new `repo-cache.ts`) | Cache layout (per host or per owner), locks, pin refs, gc, eviction. Runs outside the sandbox. |
 | `apps/runner/src/connect-cli.ts` | `--repo-cache-scope=host\|owner` and `--repo-cache-max-bytes`. |
-| `apps/runner/src/sandbox.ts` | Read-only bind mounts of the cache object directories. In the helper: `materialize_from_cache` (read-tree --prefix, tree check, checkout-index) in place of archive extraction. In `push_prepare`: skip the upstream pack. In `snapshot`: the diff-only format. |
-| `apps/runner/src/host-workspace.ts` | The same changes for host mode, plus a fsck check of cached pins. |
+| `apps/runner/src/sandbox.ts` | Done: read-only `--ro-bind-try` mounts of the cache object directories (by path: the resource supervisor passes only fds 3-6 to bwrap), `materializeFromCache` (`repository-checkout` in the helper), `repositoryCacheState`, version 2 markers. To do: in `push_prepare`, skip the upstream pack; in `snapshot`, the diff-only format and symlinks. |
+| `apps/runner/src/host-workspace.ts` | Done: the same checkout for host mode. To do: a fsck check of cached pins. |
+| `apps/runner/src/repo-cache.ts` | Done: `inspect`, the tree check before checkout. |
 | `apps/runner/src/push.ts` | Skip `fetchCommit` when the base is in the cache. |
 | `apps/runner/src/restore.ts` | v2 backups: rebuild from the cache, then apply the changed files. |
 | `tests/` | Connected suite: cache hit and miss, revoked access on a cache hit, two owners on one host, gc while a session is live, restore from v2. |
