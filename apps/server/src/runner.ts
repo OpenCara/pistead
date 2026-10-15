@@ -12,7 +12,18 @@ const actionPermissions: Record<RunnerAction, Permission> = {
 };
 
 export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
-  const actorId = c.get('auth').userId;
+  return actorRequest(c, c.get('auth').userId, row, action, suffix, body);
+}
+
+/**
+ * The committed view as the session owner sees it, for a share link the caller has just checked. This read is the only
+ * request ever made as the owner on someone else's behalf; the owner's own access is still checked here and on the host.
+ */
+export function ownerViewRequest(c: AppContext, row: SessionRow): Promise<Response> {
+  return actorRequest(c, row.owner_id, row, 'view');
+}
+
+async function actorRequest(c: AppContext, actorId: string, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
   const access = await sessionAccess(c.env, row.id, actorId);
   if (!access || !hasPermission(access.permissions, actionPermissions[action]) || access.row.owner_id !== row.owner_id) {
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
@@ -22,7 +33,7 @@ export async function runnerRequest(c: AppContext, row: SessionRow, action: Runn
   if (action !== 'restore' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
-  if (access.row.connector_id) return connectorRequest(c, access.row, action, suffix, body);
+  if (access.row.connector_id) return connectorRequest(c, access.row, action, suffix, body, actorId);
   const secret = c.env.RUNNER_SHARED_SECRET;
   if (!secret || secret.length < 32 || !c.env.RUNNER_URL) fail(503, 'runner_unavailable', 'The external runner is not configured.');
   let base: URL;

@@ -91,12 +91,13 @@ export async function validateConnectorRpc(envelope: ConnectorRelayEnvelope): Pr
       await sha256(request.body) !== ticket.bodyHash) fail(400, 'invalid_rpc', 'Invalid connector request.');
 }
 
-export async function connectorRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
+export async function connectorRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown,
+  actorId: string = c.get('auth').userId): Promise<Response> {
   if (!row.connector_id || !c.env.CONNECTOR_HUB) fail(503, 'connector_unavailable', 'The connector transport is unavailable.');
   const serialized = body === undefined ? '' : JSON.stringify(body);
   if (typeof serialized !== 'string' || connectorUtf8Bytes(serialized) > connectorLimits.requestBytes) fail(413, 'body_too_large', 'The connector request is too large.');
   const issuedAt = Math.floor(Date.now() / 1000);
-  const ticket: RunnerTicket = { aud: 'runner', sessionId: row.id, actorId: c.get('auth').userId,
+  const ticket: RunnerTicket = { aud: 'runner', sessionId: row.id, actorId,
     ownerId: row.owner_id, connectorId: row.connector_id, action, policyVersion: row.policy_version,
     iat: issuedAt, exp: issuedAt + 60, jti: id(), bodyHash: await sha256(serialized) };
   await authorizeConnectorTicket(c.env, ticket);

@@ -14,6 +14,7 @@ import { registerRepositories } from './repositories.js';
 import { registerGitAccounts } from './git/accounts.js';
 import { registerOidc } from './push/oidc.js';
 import { registerPushIdentities } from './push/identities.js';
+import { registerSessionLinks, registerSharedSessions } from './session-links.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -50,6 +51,8 @@ registerAuth(app);
 registerInternal(app);
 registerConnectorCredentials(app);
 registerOidc(app);
+// Share links are their own read-only credential: anyone who has one can view without signing in.
+registerSharedSessions(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
 registerRepositories(app);
@@ -57,6 +60,7 @@ registerPushIdentities(app);
 registerGitAccounts(app);
 registerConnectors(app);
 registerSessions(app);
+registerSessionLinks(app);
 registerBackups(app);
 registerRestoreRoutes(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));

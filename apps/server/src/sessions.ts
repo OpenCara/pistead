@@ -15,6 +15,7 @@ import { permissionCall, presentApprovals, requireOperationTool, reviewedApprova
 import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
+import { isLinkShared } from './session-links.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host advertises; auto-approve is the
@@ -254,7 +255,9 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       : null;
     const capabilities: unknown = host ? JSON.parse(host.capabilities_json) : null;
     const hostUnsandboxed = typeof capabilities === 'object' && capabilities !== null && 'unsandboxed' in capabilities && capabilities.unsandboxed === true;
-    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}) } });
+    // Everyone who can view the session learns that its shared conversation is also visible to anyone with its link.
+    const linkShared = await isLinkShared(c.env, access.row.id);
+    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}), ...(linkShared ? { linkShared } : {}) } });
   });
   app.patch('/api/sessions/:id', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');

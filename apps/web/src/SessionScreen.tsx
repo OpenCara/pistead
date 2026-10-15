@@ -70,7 +70,7 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 }
 
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
-function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
+export function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
@@ -153,11 +153,22 @@ function SessionPane({ id }: { id: string }) {
   if (session && isOwner && !archived) {
     menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
+    if (actions.link) {
+      menu.push({ label: "Copy share link", icon: "link", disabled: actions.action.busy, onSelect: actions.copyLink });
+      menu.push({ label: "Turn off share link", icon: "x", disabled: actions.action.busy, onSelect: actions.unshareLink });
+    } else {
+      // The new link shows in the panel, ready to copy.
+      menu.push({ label: "Create share link", icon: "link", disabled: actions.action.busy || actions.linkLoading, onSelect: () => void actions.shareLink().then(shared => {
+        if (shared) { setTab("details"); setPanelOpen(true); }
+      }) });
+    }
     menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupBlocked || actions.action.busy, hint: actions.backupBlocked ? "Session busy" : undefined, onSelect: actions.createBackup });
     menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
   }
   if (session && isOwner && archived) {
     menu.push({ label: "Unarchive", icon: "archive", disabled: actions.action.busy, onSelect: actions.unarchive });
+    // Turning a link off only takes access away, so it stays possible while archived.
+    if (actions.link) menu.push({ label: "Turn off share link", icon: "x", disabled: actions.action.busy, onSelect: actions.unshareLink });
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
 
@@ -195,7 +206,7 @@ function SessionPane({ id }: { id: string }) {
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
-          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
+          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge>{session.linkShared && <StatusBadge tone="info">Link shared</StatusBadge>}</span>}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}

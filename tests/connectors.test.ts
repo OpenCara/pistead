@@ -10,7 +10,7 @@ import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionLink, SessionRecord, SessionView, SharedSession, SharedSessionView } from '../packages/shared/src/types.js';
 import { toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
@@ -2054,3 +2054,165 @@ for (const mutation of ['owner-membership', 'policy-version'] as const) {
     if (mutation === 'owner-membership') await denied(await s.creator.request('GET', path), 404, 'not_found');
   });
 }
+
+test('share links show anyone who has one the shared conversation, and nothing else, until the owner turns them off', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  const shared = (token: string | null, route = '/api/shared') =>
+    f.request('GET', route, undefined, token === null ? {} : { 'X-Share-Token': token });
+  const sideAsk = 'A side ask that only people who can view the session may see';
+  const view: SessionView = {
+    ...s.view,
+    owner: { ...s.view.owner, gitEmail: 'owner-private@example.test' },
+    entries: [
+      { id: '0:1', kind: 'message', role: 'user', text: 'Shared prompt', actorId: s.member.user.id, conversationId: '0' },
+      { id: '0:2', kind: 'message', role: 'assistant', text: 'Shared answer', actorId: s.member.user.id, conversationId: '0', durationMs: 1200 },
+      { id: '0:3', kind: 'workspace.run-failure', role: 'assistant', text: '', conversationId: '0', error: { provider: 'local-native', status: 429 } },
+      { id: '1:1', kind: 'message', role: 'user', text: sideAsk, actorId: s.member.user.id, conversationId: '1' },
+    ],
+    conversations: [{ id: '0', mode: 'write' }, { id: '1', mode: 'ask', actorId: s.member.user.id }],
+    approvals: [{ id: 'approval', sessionId: s.session.id, requestedBy: s.member.user.id, operation: { kind: 'bash', command: 'cat approval-only-command' },
+      status: 'pending', createdAt: new Date().toISOString() }],
+    queue: [{ submissionId: 'queue-only-receipt', actorId: s.member.user.id, mode: 'write', status: 'queued' }],
+    busy: true,
+  };
+  const requests = rpcHub(f, s.connector, envelope => {
+    // The control plane reads as the owner once it has checked the link: a link holder is never an actor on the host.
+    assert.equal(envelope.request.ticket.action, 'view');
+    assert.equal(envelope.request.ticket.actorId, s.owner.user.id);
+    return Response.json({ view });
+  });
+
+  // Only the owner can see, create or turn off a link: manage is not ownership, and outsiders don't learn the session exists.
+  await denied(await s.member.request('PUT', `${path}/link`), 403, 'forbidden');
+  await json(await s.owner.request('POST', `${path}/grants`, { userId: s.member.user.id, permissions: ['manage'] }));
+  for (const method of ['GET', 'PUT', 'DELETE']) {
+    await denied(await s.member.request(method, `${path}/link`), 403, 'owner_required');
+    await denied(await s.outsider.request(method, `${path}/link`), 404, 'not_found');
+  }
+  assert.deepEqual(await json(await s.owner.request('GET', `${path}/link`)), { link: null });
+  assert.equal((await s.owner.request('PUT', `${path}/link`, undefined, { 'X-CSRF-Token': '' })).status, 403);
+  assert.equal((await s.owner.request('PUT', `${path}/link`, undefined, { Origin: 'https://hostile.example' })).status, 403);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_links').get()!.n, 0);
+  const { link } = await json<{ link: SessionLink }>(await s.owner.request('PUT', `${path}/link`), 201);
+  const prefix = `${origin}/#/shared/`;
+  assert.ok(link.url.startsWith(prefix), link.url);
+  const token = link.url.slice(prefix.length);
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/);
+  // Turning it on again, or reading it, gives the same link while it exists.
+  assert.deepEqual(await json(await s.owner.request('PUT', `${path}/link`)), { link });
+  assert.deepEqual(await json(await s.owner.request('GET', `${path}/link`)), { link });
+  const stored = f.sqlite.prepare('SELECT * FROM session_links WHERE session_id = ?').get(s.session.id)!;
+  assert.equal(stored.token_hash, await sha256(token));
+  assert.ok(!String(stored.token_ciphertext).includes(token), 'The token is stored only hashed and vault-encrypted');
+  for (const client of [s.owner, s.member]) {
+    assert.equal((await json<{ session: SessionRecord }>(await client.request('GET', path))).session.linkShared, true, 'Everyone who can view learns that a link exists');
+  }
+
+  // Anyone with the link, signed in or not, reads the title and the shared conversation: no side asks, approvals, queue or attribution.
+  const metadata = await json<{ session: SharedSession }>(await shared(token));
+  assert.deepEqual(metadata, { session: { title: s.session.title, status: 'ready', createdAt: s.session.createdAt, ownerName: 'private-owner' } });
+  assert.deepEqual(await json(await f.request('GET', '/api/shared', undefined, { 'X-Share-Token': token, Cookie: s.outsider.cookie })), metadata);
+  const seen = await json<{ view: SharedSessionView }>(await shared(token, '/api/shared/view'));
+  assert.deepEqual(seen, { view: { busy: true, entries: [
+    { id: '0:1', kind: 'message', role: 'user', text: 'Shared prompt' },
+    { id: '0:2', kind: 'message', role: 'assistant', text: 'Shared answer', durationMs: 1200 },
+    { id: '0:3', kind: 'workspace.run-failure', role: 'assistant', text: '', error: { provider: 'local-native', status: 429 } },
+  ] } });
+  assert.equal(requests.length, 1);
+  const serialized = JSON.stringify([metadata, seen]);
+  for (const hidden of [sideAsk, 'approval-only-command', 'queue-only-receipt', 'owner-private@example.test', s.member.user.id, s.owner.user.id,
+    s.session.id, s.team.id, s.connector.connectorId, s.agent.id, s.model.id]) {
+    assert.ok(!serialized.includes(hidden), `A share link must not reveal ${hidden}`);
+  }
+
+  // A link is no credential anywhere else, can't change anything, and unknown or malformed links reach no host.
+  for (const route of [path, `${path}/view`, `${path}/audit`, `${path}/link`, '/api/sessions', '/api/me']) {
+    assert.equal((await f.request('GET', route, undefined, { 'X-Share-Token': token })).status, 401, route);
+  }
+  await denied(await s.outsider.request('GET', path, undefined, { 'X-Share-Token': token }), 404, 'not_found');
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    for (const route of ['/api/shared', '/api/shared/view']) {
+      assert.equal((await f.request(method, route, {}, { 'X-Share-Token': token })).status, 401, `${method} ${route}`);
+    }
+  }
+  for (const wrong of [null, '', 'short', `${token.slice(0, 42)}!`, changedToken(token), await sha256(token)]) {
+    for (const route of ['/api/shared', '/api/shared/view']) await denied(await shared(wrong, route), 404, 'not_found');
+  }
+  assert.equal(requests.length, 1);
+
+  // A link shows only what its owner can see: it stops while they're out of the workspace and works again on their return.
+  const membership = f.sqlite.prepare('SELECT * FROM workspace_members WHERE workspace_id = ? AND user_id = ?').get(s.team.id, s.owner.user.id)!;
+  f.sqlite.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(s.team.id, s.owner.user.id);
+  for (const route of ['/api/shared', '/api/shared/view']) await denied(await shared(token, route), 404, 'not_found');
+  f.sqlite.prepare('INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)')
+    .run(membership.workspace_id, membership.user_id, membership.role, membership.created_at);
+  assert.deepEqual(await json(await shared(token)), metadata);
+  assert.equal(requests.length, 1);
+
+  // A view fetched while the link was being turned off is never answered.
+  rpcHub(f, s.connector, () => {
+    f.sqlite.prepare('DELETE FROM session_links WHERE session_id = ?').run(s.session.id);
+    return Response.json({ view });
+  });
+  await denied(await shared(token, '/api/shared/view'), 404, 'not_found');
+  assert.deepEqual(await json(await s.owner.request('GET', `${path}/link`)), { link: null });
+  assert.equal((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.linkShared, undefined);
+
+  // Turning link sharing on again issues a new link; the old one stays dead.
+  rpcHub(f, s.connector, () => Response.json({ view }));
+  const { link: renewed } = await json<{ link: SessionLink }>(await s.owner.request('PUT', `${path}/link`), 201);
+  assert.notEqual(renewed.url, link.url);
+  await denied(await shared(token), 404, 'not_found');
+  const renewedToken = renewed.url.slice(prefix.length);
+  await json(await shared(renewedToken, '/api/shared/view'));
+
+  // An archived session stays readable by link and can't get a new one, but its link can always be turned off.
+  await json(await s.owner.request('POST', `${path}/archive`));
+  assert.equal((await json<{ session: SharedSession }>(await shared(renewedToken))).session.status, 'archived');
+  await json(await shared(renewedToken, '/api/shared/view'));
+  await denied(await s.owner.request('PUT', `${path}/link`), 409, 'session_archived');
+  await denied(await s.member.request('DELETE', `${path}/link`), 403, 'owner_required');
+  assert.deepEqual(await json(await s.owner.request('DELETE', `${path}/link`)), { ok: true });
+  assert.deepEqual(await json(await s.owner.request('DELETE', `${path}/link`)), { ok: true });
+  for (const route of ['/api/shared', '/api/shared/view']) await denied(await shared(renewedToken, route), 404, 'not_found');
+  const actions = (f.sqlite.prepare("SELECT action FROM audit WHERE session_id = ? AND action LIKE 'session.link.%' ORDER BY created_at, rowid")
+    .all(s.session.id) as { action: string }[]).map(row => row.action);
+  assert.deepEqual(actions, ['session.link.created', 'session.link.created', 'session.link.revoked']);
+});
+
+test('turning link sharing on answers a concurrent request with the same link and refuses an owner who just lost access', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}/link`;
+  // Another request turns link sharing on between this one's check and its insert.
+  const winner = token();
+  const ciphertext = await encryptToken(f.env, `session-link:${s.session.id}`, winner);
+  const winnerHash = await sha256(winner);
+  let raced = false;
+  f.setBeforeQuery(sql => {
+    if (raced || !sql.startsWith('INSERT INTO session_links')) return;
+    raced = true;
+    f.sqlite.prepare('INSERT INTO session_links (session_id, token_hash, token_ciphertext, created_at) VALUES (?, ?, ?, ?)')
+      .run(s.session.id, winnerHash, ciphertext, new Date().toISOString());
+  });
+  const { link } = await json<{ link: SessionLink }>(await s.owner.request('PUT', path));
+  f.setBeforeQuery();
+  assert.equal(raced, true);
+  assert.equal(link.url, `${origin}/#/shared/${winner}`, 'The request that lost the race answers with the winning link');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_links').get()!.n, 1);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'session.link.created'").get()!.n, 0);
+
+  // The owner leaves the workspace between the check and the insert: no link is created.
+  f.sqlite.prepare('DELETE FROM session_links').run();
+  let removed = false;
+  f.setBeforeQuery(sql => {
+    if (removed || !sql.startsWith('INSERT INTO session_links')) return;
+    removed = true;
+    f.sqlite.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(s.team.id, s.owner.user.id);
+  });
+  await denied(await s.owner.request('PUT', path), 409, 'policy_changed');
+  f.setBeforeQuery();
+  assert.equal(removed, true);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_links').get()!.n, 0);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'session.link.created'").get()!.n, 0);
+});

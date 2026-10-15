@@ -1,5 +1,5 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionLink, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
@@ -26,12 +26,23 @@ export interface SessionActions {
   rename: (title: string) => Promise<boolean>;
   archive: () => void;
   unarchive: () => void;
+  /** The owner's share link: undefined until it has loaded (and for everyone else), null while link sharing is off. */
+  link: SessionLink | null | undefined;
+  linkLoading: boolean;
+  linkError: string;
+  /** Turns link sharing on once the owner confirms; resolves true when the session has a link. */
+  shareLink: () => Promise<boolean>;
+  copyLink: () => void;
+  unshareLink: () => void;
 }
 
 export function useSessionActions({ session, user, backupBlocked, onChange }: { session: SessionRecord | null; user: UserProfile; backupBlocked: boolean; onChange: () => void }): SessionActions {
   const action = useAction();
   const [backup, setBackup] = useState<Backup | null>(null);
   const isOwner = session?.ownerId === user.id;
+  // Only the owner can see a session's link; everyone else learns from session.linkShared that one exists.
+  const linkResource = useResource<{ link: SessionLink | null }>(session && isOwner ? `/api/sessions/${segment(session.id)}/link` : null);
+  const link = linkResource.data ? linkResource.data.link : undefined;
   async function changeVisibility() {
     if (!session || !isOwner || action.busy) return;
     const nextVisibility = (session.visibility ?? "private") === "workspace" ? "private" : "workspace";
@@ -93,8 +104,46 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       onChange();
     }, "Session unarchived");
   }
+  async function shareLink(): Promise<boolean> {
+    if (!session || !isOwner || action.busy || session.status === "archived") return false;
+    if (link) return true;
+    const confirmed = await confirmDialog({
+      title: "Share with anyone who has the link?",
+      message: "Anyone with the link will be able to view existing and future prompts and output of the shared conversation, including tool output and repository content shown in it, without signing in. They can't send messages, or see side asks, approvals, who sent each message, or the host. The session title and your display name are shown with it. Anyone who has the link can pass it on, so check the transcript for secrets first. You can turn the link off at any time.",
+      confirmLabel: "Create link",
+    });
+    if (!confirmed) return false;
+    let created = false;
+    await action.run(async () => {
+      const result = await api<{ link: SessionLink }>(`/api/sessions/${segment(session.id)}/link`, { method: "PUT" });
+      linkResource.setData({ link: result.link });
+      created = true;
+      onChange();
+    }, "Share link created. Anyone who has it can view the shared conversation.");
+    return created;
+  }
+  function copyLink() {
+    if (!link || action.busy) return;
+    void action.run(() => navigator.clipboard.writeText(link.url), "Share link copied");
+  }
+  async function unshareLink() {
+    if (!session || !isOwner || action.busy) return;
+    const confirmed = await confirmDialog({
+      title: "Turn off the share link?",
+      message: "The link stops working at once, for everyone who has it. Content already viewed or copied can't be recalled. Turning link sharing on again creates a new link.",
+      confirmLabel: "Turn off link",
+      destructive: true,
+    });
+    if (!confirmed) return;
+    await action.run(async () => {
+      await api(`/api/sessions/${segment(session.id)}/link`, { method: "DELETE" });
+      linkResource.setData({ link: null });
+      onChange();
+    }, "Share link turned off. It no longer opens this session.");
+  }
   return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup, rename,
-    archive: () => void archive(), unarchive };
+    archive: () => void archive(), unarchive,
+    link, linkLoading: linkResource.loading, linkError: linkResource.error, shareLink, copyLink, unshareLink: () => void unshareLink() };
 }
 
 const approvalTone: Record<ApprovalRecord["status"], Tone> = {
@@ -334,7 +383,11 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     }, visibility === "workspace" ? "Explicit grant revoked. Workspace members can still view this session until the owner makes it private." : "Session grant revoked");
   }
 
-  return <Section title="People" info={<p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p>}>
+  const link = actions.link;
+  // The owner's loaded link is current; until it loads, and for everyone else, the session says whether one exists.
+  const linkShared = isOwner && link !== undefined ? link !== null : Boolean(session.linkShared);
+
+  return <Section title="People" info={<><p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else.</p></>}>
     <Row
       leading={<Icon name="user" size={16} />}
       title={isOwner ? "Owner" : viewerOnly ? "Viewer" : "Collaborator"}
@@ -350,6 +403,19 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
         : "Only the session owner can change visibility"}</>}
       trailing={isOwner && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
+    {(isOwner || linkShared) && <Row
+      leading={<Icon name="link" size={16} />}
+      title={linkShared ? "Anyone with the link can view" : "Link sharing off"}
+      hint={!isOwner ? "The owner shared this session by link: anyone who has it can view the shared conversation without signing in, including messages you send to it. Side asks stay hidden"
+        : linkShared ? "Without signing in, they can follow the shared conversation, but not side asks, approvals, who sent each message, or the host. Turning the link off stops it at once"
+        : archived ? "Archived sessions can't get a new share link"
+        : "Create a link that lets anyone who has it view the shared conversation, read-only, without signing in"}
+      trailing={isOwner && (linkShared
+        ? <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unshareLink}>Turn off</Button>
+        : !archived && <Button variant="outline" size="sm" disabled={actions.action.busy || actions.linkLoading} onClick={() => void actions.shareLink()}>Create link</Button>)}
+    />}
+    {isOwner && link && <CardBody><Field label="Share link" hint={<>Created <RelativeTime value={link.createdAt} /></>}><CopyField value={link.url} label="Copy share link" /></Field></CardBody>}
+    {isOwner && actions.linkError && <CardBody><Feedback error={actions.linkError} /></CardBody>}
     {canManage && !archived ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
       <ResourceState {...grants} retry={grants.refresh}>
         {grants.data && <form onSubmit={saveGrant}>
@@ -465,7 +531,7 @@ function AccessSection({ session, view, user }: { session: SessionRecord; view: 
   const visibility = session.visibility ?? "private";
   return <Section title="Access" info={<p>{visibility === "workspace"
     ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
-    : "Private: only the owner and members with a session grant can view prompts and output."} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
+    : "Private: only the owner and members with a session grant can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
     {view ? <>
       <Row leading={<Icon name="user" size={16} />} title={<>Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""}</>} hint={view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} />
       <Row leading={<Icon name="git-branch" size={16} />} title="Commits as" hint={<>{view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</>} />
