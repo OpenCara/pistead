@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
-import { containsRedaction, redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
+import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
@@ -179,12 +179,11 @@ function SessionPane({ id }: { id: string }) {
     // A permission card is itself the owner's prompt; an operation confirms its exact effect first.
     if (decision === "approve" && approval.operation.kind !== "permission" && !await confirmDialog({
       title: "Approve this exact operation?",
-      message: (session?.hostUnsandboxed
+      message: session?.hostUnsandboxed
         ? "It will run as the session owner on an UNSANDBOXED host: directly on the host owner's machine, with their full user permissions and network access, and no resource limits."
         : approval.unbounded
           ? "It will run as the session owner, in the sandbox but without resource limits: no cap on CPU, memory, processes or disk."
-          : "It will run as the session owner.") + (containsRedaction(approval.operation)
-        ? ` Anything shown as ${REDACTED} is a hidden secret: it runs with the real value.` : ""),
+          : "It will run as the session owner.",
       confirmLabel: "Approve",
     })) return;
     const notice = approval.operation.kind === "permission"
