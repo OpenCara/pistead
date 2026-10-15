@@ -9,9 +9,8 @@ import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
 import { gitAccountLabel, gitProviderLabel, RepositorySnapshotPolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
 import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
+import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../usernames";
 import { PushAccess } from "./PushAccess";
-
-interface Member { userId: string; role: WorkspaceRole; displayName?: string; githubLogin?: string | null }
 
 const roleLabel: Record<WorkspaceRole, string> = { owner: "Owner", admin: "Admin", member: "Member" };
 
@@ -205,11 +204,11 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
 
 function Members({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
   const path = `/api/workspaces/${segment(workspace.id)}/members`;
-  const resource = useResource<{ members: Member[] }>(path);
+  const resource = useResource<{ members: WorkspaceMember[] }>(path);
   const [adding, setAdding] = useState(false);
   const action = useAction();
-  async function remove(member: Member) {
-    const confirmed = await confirmDialog({ title: "Remove member", message: `Remove ${member.displayName || member.userId} from this workspace?`, confirmLabel: "Remove", destructive: true });
+  async function remove(member: WorkspaceMember) {
+    const confirmed = await confirmDialog({ title: "Remove member", message: `Remove ${usernameWithId(memberPerson(member))} from this workspace?`, confirmLabel: "Remove", destructive: true });
     if (!confirmed) return;
     void action.run(async () => {
       await api(`${path}/${segment(member.userId)}`, { method: "DELETE" });
@@ -225,10 +224,14 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
       <ResourceState {...resource} retry={resource.refresh}>
         {!resource.data?.members.length
           ? <CardBody><span className="muted">No members to display</span></CardBody>
-          : resource.data.members.map(member => <Row key={member.userId} leading={<IdentityBadge name={member.displayName || member.githubLogin || member.userId} id={member.userId} />} title={member.displayName || member.githubLogin || member.userId} trailing={<>
-            <StatusBadge tone={member.role === "member" ? "neutral" : "success"}>{roleLabel[member.role]}</StatusBadge>
-            {admin && member.userId !== workspace.ownerId && <DropdownMenu label={`Actions for ${member.displayName || member.userId}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
-          </>} />)}
+          : resource.data.members.map(member => {
+            const person = memberPerson(member);
+            const name = member.displayName || username(person);
+            return <Row key={member.userId} leading={<IdentityBadge name={name} id={member.userId} />} title={name} hint={usernameWithId(person)} trailing={<>
+              <StatusBadge tone={member.role === "member" ? "neutral" : "success"}>{roleLabel[member.role]}</StatusBadge>
+              {admin && member.userId !== workspace.ownerId && <DropdownMenu label={`Actions for ${name}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
+            </>} />;
+          })}
         {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
       </ResourceState>
     </Section>
@@ -244,7 +247,8 @@ function AddMember({ open, path, close, saved }: { open: boolean; path: string; 
     event.preventDefault();
     if (action.busy || !userId.trim()) return;
     void action.run(async () => {
-      await api(path, { method: "POST", body: { userId: userId.trim(), role } });
+      // Profiles show the ID as "username(id)", so a pasted label names its ID.
+      await api(path, { method: "POST", body: { userId: userIdFromInput(userId), role } });
       setUserId("");
       saved();
       close();

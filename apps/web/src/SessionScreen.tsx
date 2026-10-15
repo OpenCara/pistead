@@ -8,6 +8,7 @@ import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
 import { Markdown } from "./markdown";
+import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "./transcript";
@@ -71,7 +72,7 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
 function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
-  const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
+  const actor = entry.actorId && <Username id={entry.actorId} you />;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
@@ -142,6 +143,8 @@ function SessionPane({ id }: { id: string }) {
   const approvalAction = useAction();
 
   const known = session ?? sessions.find(item => item.id === id);
+  // Everyone a session names (owner, host owner, grantees, writers) is or was a member of its workspace.
+  const people = useWorkspacePeople(known?.workspaceId ?? null);
   const workspaceName = known && workspaces.find(workspace => workspace.id === known.workspaceId)?.name;
   const visibility = session?.visibility ?? "private";
   const streamBadge = live.status === "online" ? <StatusBadge tone="success" dot>Live</StatusBadge>
@@ -189,7 +192,7 @@ function SessionPane({ id }: { id: string }) {
   const badge = startFailed ? <StatusBadge tone={session?.status === "error" ? "danger" : "running"} dot>{session?.status === "error" ? "Not started" : "Starting"}</StatusBadge>
     : !view && live.error ? <StatusBadge tone="warning" dot>Unavailable</StatusBadge>
     : streamBadge;
-  return <div className={panelOpen && session ? "session-screen panel-open" : "session-screen"}>
+  return <PeopleProvider people={people}><div className={panelOpen && session ? "session-screen panel-open" : "session-screen"}>
     <div className="session-pane">
       <ScreenHeader
         title={known?.title ?? "Session"}
@@ -243,7 +246,7 @@ function SessionPane({ id }: { id: string }) {
     </>}
     {session && isOwner && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
       onSave={async title => { if (await actions.rename(title)) setRenaming(false); }} />}
-  </div>;
+  </div></PeopleProvider>;
 }
 
 function RenameSheet({ open, title, busy, onClose, onSave }: { open: boolean; title: string; busy: boolean; onClose: () => void; onSave: (title: string) => void }) {
@@ -363,11 +366,11 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             {receipt && <p className="small">Last receipt <code>{receipt.submissionId}</code> · {receipt.status}{receipt.queuePosition !== undefined ? ` · queue position ${receipt.queuePosition}` : ""}</p>}
             {activeQueue.length > 0 && <ol className="queue-items">{activeQueue.map((item, index) => <li key={item.submissionId}>
               <span>{index + 1}. {item.mode === "ask" ? "Read-only side ask" : "Shared submission"} · {item.status}</span>
-              <span className="muted small">By {item.actorId === user.id ? "you" : item.actorId} · Receipt <code>{item.submissionId}</code></span>
+              <span className="muted small">By <Username id={item.actorId} you /> · Receipt <code>{item.submissionId}</code></span>
             </li>)}</ol>}
             {recentSubmissions.length > 0 && <ul className="queue-items">{recentSubmissions.map(item => <li key={item.submissionId}>
               <span>{item.status} · {item.mode === "ask" ? "Side ask" : "Shared submission"}</span>
-              <span className="muted small">By {item.actorId === user.id ? "you" : item.actorId} · Receipt <code>{item.submissionId}</code></span>
+              <span className="muted small">By <Username id={item.actorId} you /> · Receipt <code>{item.submissionId}</code></span>
             </li>)}</ul>}
             <div className="inline"><Button variant="outline" size="sm" icon="refresh" onClick={refresh}>Refresh queue</Button></div>
           </div>
