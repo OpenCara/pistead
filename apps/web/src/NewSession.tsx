@@ -5,9 +5,11 @@ import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, type ChatSelection } from "./chat-options";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
+import { useWorkspacePeople } from "./people";
 import { RepositorySnapshotPolicy, useWorkspaceRepositories } from "./repositories";
 import { href, navigate } from "./router";
 import { Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, IdentityBadge, InfoTip, LinkButton, Loading, PageLoading, useAction, useResource } from "./ui";
+import { usernameWithId } from "./usernames";
 import "./new-session.css";
 
 /** Set by the agent settings "Start a session" action; consumed once. Holds an agent version id or agent id. */
@@ -42,6 +44,12 @@ function deriveTitle(content: string, fallback: string): string {
 }
 
 const sameModel = (a: { provider: string; modelId: string }, b: { provider: string; modelId: string }) => a.provider === b.provider && a.modelId === b.modelId;
+
+/** A host owner's "username(id)". Rendered in the host details tip, so the workspace's members load only once it opens. */
+function HostOwner({ workspaceId, ownerId }: { workspaceId: string; ownerId: string }) {
+  const people = useWorkspacePeople(workspaceId);
+  return <>{usernameWithId(people.person(ownerId))}</>;
+}
 
 export function NewSession({ workspaceId }: { workspaceId: string }) {
   const { workspaces, workspacesLoading, workspacesError, refreshWorkspaces, currentWorkspace, selectWorkspace } = useApp();
@@ -245,7 +253,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
             <InfoTip label="Host and model details">
               <div className="stack">
                 <p>Model: {model?.name} <span className="muted">{model?.provider} / {model?.modelId}</span></p>
-                <p className="muted small">Host owner ID: {host.ownerId}<br />Connection ID: {host.id}</p>
+                <p className="muted small">Host owner: <HostOwner workspaceId={workspace.id} ownerId={host.ownerId} /><br />Connection ID: {host.id}</p>
                 <p>This creates a new session, not access to the host's personal Pi history or old sessions. Publishing an agent does not grant use of its host. Your Git account credentials are not sent to the host; model credentials stay on it.</p>
               </div>
             </InfoTip>

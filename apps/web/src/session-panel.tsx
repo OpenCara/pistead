@@ -4,12 +4,14 @@ import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
 import { Icon } from "./icons";
+import { Username, usePeople } from "./people";
 import { RepositorySnapshotPolicy } from "./repositories";
 import { href } from "./router";
 import {
   Alert, Button, CardBody, Collapsible, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, RelativeTime,
   ResourceState, Row, Section, SegmentedControl, StatusBadge, Timestamp, useAction, useResource, type ActionState, type Tone,
 } from "./ui";
+import { userIdFromInput, usernameWithId, withUsernames, type Person } from "./usernames";
 
 export type AuditEvent = { id: string; actorId: string; action: string; detail: unknown; createdAt: string };
 export type PanelTab = "details" | "approvals" | "activity";
@@ -108,12 +110,14 @@ export function ApprovalStatus({ approval }: { approval: ApprovalRecord }) {
   </>;
 }
 
-function detailText(detail: unknown): string {
+/** An audit detail as indented JSON, with the user IDs in it written as "username(id)". */
+function detailText(detail: unknown, person: (id: string) => Person): string {
+  let value = detail;
   if (typeof detail === "string") {
-    try { return JSON.stringify(JSON.parse(detail), null, 2); }
+    try { value = JSON.parse(detail); }
     catch { return detail; }
   }
-  return JSON.stringify(detail, null, 2) ?? "";
+  return JSON.stringify(withUsernames(value, person), null, 2) ?? "";
 }
 
 type PanelProps = {
@@ -133,6 +137,7 @@ type PanelProps = {
 
 export function SessionPanel(props: PanelProps) {
   const { tab, setTab, onClose, view, audit } = props;
+  const people = usePeople();
   const approvals = view?.approvals ?? [];
   const pendingCount = approvals.filter(approval => approval.status === "pending").length;
   return <aside className="session-panel" aria-label="Session panel">
@@ -153,8 +158,8 @@ export function SessionPanel(props: PanelProps) {
       {tab === "activity" && <Section title="Audit log" action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh activity" title="Refresh" disabled={audit.loading} onClick={audit.refresh} />} bare>
         <ResourceState {...audit} retry={audit.refresh}>
           {!audit.data?.events.length ? <EmptyState title="No activity" /> : <div className="card">
-            {audit.data.events.map(event => <Collapsible key={event.id} title={event.action} hint={<>{event.actorId} · <RelativeTime value={event.createdAt} /></>}>
-              <pre>{detailText(event.detail)}</pre>
+            {audit.data.events.map(event => <Collapsible key={event.id} title={event.action} hint={<>{usernameWithId(people.person(event.actorId))} · <RelativeTime value={event.createdAt} /></>}>
+              <pre>{detailText(event.detail, people.person)}</pre>
             </Collapsible>)}
           </div>}
         </ResourceState>
@@ -167,8 +172,8 @@ export function SessionPanel(props: PanelProps) {
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   const { operation } = approval;
   const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
-    ? <> · Allowed by {approval.decidedBy} {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
-    : approval.decidedBy && <> · Decision by {approval.decidedBy}</>;
+    ? <> · Allowed by <Username id={approval.decidedBy} /> {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
+    : approval.decidedBy && <> · Decision by <Username id={approval.decidedBy} /></>;
   return <article className="approval-card card">
     <div className="approval-head">
       <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />
@@ -180,7 +185,7 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
       <pre>{JSON.stringify(operation, null, 2)}</pre>
     </>}
-    <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
+    <p className="muted small">Requested by <Username id={approval.requestedBy} /> · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
   </article>;
@@ -239,12 +244,12 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
 
 function HostSection({ session, user, hosts }: { session: SessionRecord; user: UserProfile; hosts: ConnectionsResource }) {
   const host = hosts.data?.connectors.find(item => item.id === session.connectorId);
-  return <Section title="Host" info={<p>Work runs as the session owner ({session.ownerId === user.id ? "you" : session.ownerId}), not the host owner. The host operator can access prompts and files processed on it. Sharing a host doesn't change who can view or control this session, and doesn't expose its owner's local history.</p>}>
+  return <Section title="Host" info={<p>Work runs as the session owner (<Username id={session.ownerId} you />), not the host owner. The host operator can access prompts and files processed on it. Sharing a host doesn't change who can view or control this session, and doesn't expose its owner's local history.</p>}>
     {!session.connectorId ? <Row leading={<Icon name="server" size={16} />} title="Operator-managed session" hint="No local host is pinned" /> : <>
       <Row
         leading={<Icon name="server" size={16} />}
         title={host?.name ?? "Pinned host"}
-        hint={<>Hosted by {host?.ownerName ?? session.connectorOwnerId ?? "unknown"}{session.connectorOwnerId === user.id ? " (you)" : ""}</>}
+        hint={<>Hosted by {host?.ownerName ?? (session.connectorOwnerId ? <Username id={session.connectorOwnerId} /> : "unknown")}{session.connectorOwnerId === user.id ? " (you)" : ""}</>}
         trailing={hosts.loading ? <Loading>Checking</Loading> : host ? <ConnectionStatus connector={host} /> : session.hostUnsandboxed && <StatusBadge tone="danger">Unsandboxed</StatusBadge>}
       />
       {host && <HostCapabilities connector={host} />}
@@ -282,6 +287,7 @@ function RepositoriesSection({ session, refresh }: { session: SessionRecord; ref
 
 function PeopleSection({ session, user, actions, changed }: { session: SessionRecord; user: UserProfile; actions: SessionActions; changed: () => void }) {
   const form = useAction();
+  const people = usePeople();
   const ownPermissions = session.permissions ?? [];
   const isOwner = session.ownerId === user.id;
   const visibility = session.visibility ?? "private";
@@ -292,17 +298,20 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
   const archived = session.status === "archived";
   const base = `/api/sessions/${segment(session.id)}`;
   const grants = useResource<{ grants: SessionGrant[] }>(canManage && !archived ? `${base}/grants` : null);
-  const [userId, setUserId] = useState("");
+  // The member field takes a username, "username(id)" or a user ID; `target` is the user ID it names.
+  const [member, setMember] = useState("");
   const [selected, setSelected] = useState<Permission[]>([]);
-  const target = userId.trim();
+  const target = userIdFromInput(member, people.list);
+  const targetName = usernameWithId(people.person(target));
   const ownerSelected = target === session.ownerId;
   const existing = grants.data?.grants.find(grant => grant.userId === target);
   const grantReady = canManage && !ownerSelected && Boolean(target) && selected.length > 0
     && selected.every(permission => grantable.includes(permission));
 
   function chooseGrant(value: string) {
-    setUserId(value);
-    setSelected([...(grants.data?.grants.find(grant => grant.userId === value.trim())?.permissions ?? [])]);
+    setMember(value);
+    const userId = userIdFromInput(value, people.list);
+    setSelected([...(grants.data?.grants.find(grant => grant.userId === userId)?.permissions ?? [])]);
   }
 
   function saveGrant(event: FormEvent) {
@@ -320,8 +329,8 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     const confirmed = await confirmDialog({
       title: "Revoke session grant?",
       message: visibility === "workspace"
-        ? `Revoke the explicit grant for ${target}? They can still view prompts and output as a workspace member while this session is workspace-visible. Only the owner can make it private to remove workspace viewing.`
-        : `Revoke the explicit session grant for ${target}?`,
+        ? `Revoke the explicit grant for ${targetName}? They can still view prompts and output as a workspace member while this session is workspace-visible. Only the owner can make it private to remove workspace viewing.`
+        : `Revoke the explicit session grant for ${targetName}?`,
       confirmLabel: "Revoke grant",
       destructive: true,
     });
@@ -355,15 +364,16 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
         {grants.data && <form onSubmit={saveGrant}>
           <fieldset disabled={form.busy} className="stack">
             <Field label="Existing member grant" hint={grants.data.grants.length ? undefined : "No explicit member grants"}>
-              <select className="select" value={existing ? target : ""} onChange={event => chooseGrant(event.target.value)}>
+              <select className="select" value={existing ? target : ""} onChange={event => chooseGrant(event.target.value && usernameWithId(people.person(event.target.value)))}>
                 <option value="">New grant</option>
                 {grants.data.grants.map(grant => <option key={grant.userId} value={grant.userId}>
-                  {grant.userId}{grant.userId === session.ownerId ? " (owner, immutable)" : ""}: {grant.permissions.join(", ") || "None"}
+                  {usernameWithId(people.person(grant.userId))}{grant.userId === session.ownerId ? " (owner, immutable)" : ""}: {grant.permissions.join(", ") || "None"}
                 </option>)}
               </select>
             </Field>
-            <Field label="Workspace member user ID" hint={ownerSelected ? "The owner's grant is immutable" : undefined}>
-              <input className="input" required autoComplete="off" value={userId} onChange={event => chooseGrant(event.target.value)} />
+            {/* Shows who a typed username or user ID names before anything is granted. */}
+            <Field label="Workspace member" hint={ownerSelected ? "The owner's grant is immutable" : targetName !== target && member.trim() !== targetName ? targetName : undefined}>
+              <input className="input" required autoComplete="off" spellCheck={false} placeholder="Username or user ID" value={member} onChange={event => chooseGrant(event.target.value)} />
             </Field>
             <fieldset disabled={ownerSelected} className="stack session-permissions">
               <legend className="small muted">Grant permissions</legend>
