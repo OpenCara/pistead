@@ -12,7 +12,7 @@ import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "./transcript";
 import {
-  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
+  Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
@@ -164,16 +164,7 @@ function SessionPane({ id }: { id: string }) {
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
     if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
-    // A permission card is itself the owner's prompt; an operation confirms its exact effect first.
-    if (decision === "approve" && approval.operation.kind !== "permission" && !await confirmDialog({
-      title: "Approve this exact operation?",
-      message: session?.hostUnsandboxed
-        ? "It will run as the session owner on an UNSANDBOXED host: directly on the host owner's machine, with their full user permissions and network access, and no resource limits."
-        : approval.unbounded
-          ? "It will run as the session owner, in the sandbox but without resource limits: no cap on CPU, memory, processes or disk."
-          : "It will run as the session owner.",
-      confirmLabel: "Approve",
-    })) return;
+    // The card is the prompt: it shows the exact operation, its resource limits and any unsandboxed-host warning, so a click decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
       : decision === "approve" ? "Approval decision recorded" : "Operation denied";
