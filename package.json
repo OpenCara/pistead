@@ -20,7 +20,8 @@
     "test:integration": "node --import tsx tests/integration.ts",
     "test:connected": "node --import tsx tests/run-connected-integration.ts",
     "start": "node --env-file-if-exists=apps/server/.env --import tsx apps/server/src/main.ts",
-    "db:migrate": "node --env-file-if-exists=apps/server/.env --import tsx apps/server/src/main.ts --migrate-only"
+    "db:migrate": "node --env-file-if-exists=apps/server/.env --import tsx apps/server/src/main.ts --migrate-only",
+    "db:dump": "node --env-file-if-exists=apps/server/.env --import tsx apps/server/src/main.ts --dump"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1147.0",

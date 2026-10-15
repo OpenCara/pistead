@@ -3,6 +3,7 @@ import { ConnectorHubRegistry } from './connector-hub.js';
 import { openDatabase } from './db/index.js';
 import { openStorage } from './storage/index.js';
 import type { Env } from './types.js';
+import { PostgresWorkspaceDatabases } from './workspace-databases/postgres.js';
 
 export interface ServerConfig {
   env: Env;
@@ -17,6 +18,12 @@ export interface ServerConfig {
 }
 
 export class ConfigurationError extends Error {}
+
+function flag(processEnv: NodeJS.ProcessEnv, name: string): boolean {
+  const value = processEnv[name] || 'false';
+  if (value !== 'true' && value !== 'false') throw new ConfigurationError(`${name} must be "true" or "false".`);
+  return value === 'true';
+}
 
 export const defaultDatabaseUrl = 'sqlite:///data/pistead.sqlite';
 const defaultStorageUrl = 'file:///data/backups';
@@ -52,10 +59,15 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new ConfigurationError('PORT must be a TCP port number.');
   const trustProxyValue = processEnv.TRUST_PROXY ?? 'false';
   if (!['true', 'false'].includes(trustProxyValue)) throw new ConfigurationError('TRUST_PROXY must be "true" or "false".');
+  // Workspace owners may connect their own Postgres for session backups only when the operator opts in: the server then
+  // opens connections to hosts they choose, public ones unless private hosts are allowed as well.
+  const workspaceDatabases = flag(processEnv, 'WORKSPACE_DATABASES');
+  const workspaceDatabasePrivateHosts = flag(processEnv, 'WORKSPACE_DATABASE_PRIVATE_HOSTS');
   const databaseUrl = processEnv.DATABASE_URL || defaultDatabaseUrl;
   const storageUrl = processEnv.STORAGE_URL || defaultStorageUrl;
   env.BUCKET = openStorage(storageUrl, processEnv);
   env.DB = await openDatabase(databaseUrl);
+  if (workspaceDatabases) env.WORKSPACE_DATABASES = new PostgresWorkspaceDatabases({ privateHosts: workspaceDatabasePrivateHosts });
   env.CONNECTOR_HUB = new ConnectorHubRegistry(env);
   return {
     env, port, databaseUrl, storageUrl,

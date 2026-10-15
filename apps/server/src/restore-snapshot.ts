@@ -2,6 +2,7 @@ import { sha256 } from '../../../packages/shared/src/crypto.js';
 import type { RunnerBinding } from '../../../packages/shared/src/types.js';
 import type { Env } from './types.js';
 import { fail } from './http.js';
+import { loadWorkspaceBackup } from './workspace-databases/store.js';
 
 export const MAX_BACKUP_BYTES = 24 * 1024 * 1024;
 export interface BackupRow {
@@ -72,15 +73,29 @@ export function validateSnapshot(raw: string, source: RunnerBinding): void {
   } catch { fail(502, 'invalid_backup', 'The backup does not match the immutable session binding.'); }
 }
 
+/**
+ * The stored snapshot: in the workspace's own database when the backup was saved there, else in the server's storage.
+ * Either way it is untrusted until `loadBackupSnapshot` has checked its size, digest and binding.
+ */
+async function readBackupObject(env: Env, record: BackupRow, workspaceId: string): Promise<{ body: Uint8Array; size: number } | null> {
+  const location = await env.DB.query<{ workspace_id: string }>('SELECT workspace_id FROM workspace_database_backups WHERE backup_id = ?')
+    .bind(record.id).first();
+  if (!location) {
+    if (!env.BUCKET) fail(503, 'backup_unavailable', 'Durable backup storage is not configured.');
+    return env.BUCKET.get(record.object_key);
+  }
+  if (location.workspace_id !== workspaceId) fail(409, 'invalid_backup', 'The backup record does not match its session.');
+  return loadWorkspaceBackup(env, workspaceId, { id: record.id, sessionId: record.session_id, size: record.size });
+}
+
 export async function loadBackupSnapshot(env: Env, record: BackupRow, source: RunnerBinding): Promise<string> {
-  if (!env.BUCKET) fail(503, 'backup_unavailable', 'Durable backup storage is not configured.');
   if (!Number.isSafeInteger(record.size) || record.size < 1 || record.size > MAX_BACKUP_BYTES ||
       !/^[A-Za-z0-9_-]{43}$/.test(record.sha256) ||
       record.session_id !== source.session.id || record.owner_id !== source.session.ownerId ||
       record.object_key !== `sessions/${record.owner_id}/${record.session_id}/${record.id}.json`) {
     fail(409, 'invalid_backup', 'The backup record does not match its session.');
   }
-  const object = await env.BUCKET.get(record.object_key);
+  const object = await readBackupObject(env, record, source.session.workspaceId);
   if (!object) fail(404, 'not_found', 'Backup object is unavailable.');
   if (object.size !== record.size || object.body.byteLength !== record.size || object.size > MAX_BACKUP_BYTES) {
     fail(502, 'invalid_backup', 'The backup size does not match.');

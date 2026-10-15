@@ -14,6 +14,8 @@ import { registerRepositories } from './repositories.js';
 import { registerGitAccounts } from './git/accounts.js';
 import { registerOidc } from './push/oidc.js';
 import { registerPushIdentities } from './push/identities.js';
+import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
+import { registerDataExports } from './data-export.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -43,6 +45,7 @@ app.get('/api/health', async c => {
     runnerConfigured: !!c.env.RUNNER_URL && !!c.env.RUNNER_SHARED_SECRET && c.env.RUNNER_SHARED_SECRET.length >= 32,
     databaseConfigured: true, databaseProvider: c.env.DB.provider,
     backupsConfigured: !!c.env.BUCKET, storageProvider: c.env.BUCKET?.provider ?? null,
+    workspaceDatabasesConfigured: !!c.env.WORKSPACE_DATABASES,
     connectorsConfigured: !!c.env.CONNECTOR_HUB, testMode: testMode(c.env),
   });
 });
@@ -59,6 +62,8 @@ registerConnectors(app);
 registerSessions(app);
 registerBackups(app);
 registerRestoreRoutes(app);
+registerWorkspaceDatabases(app);
+registerDataExports(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));
 
 export default app;

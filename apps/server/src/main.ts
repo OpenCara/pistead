@@ -5,6 +5,7 @@ import { ConfigurationError, defaultDatabaseUrl, loadConfig } from './config.js'
 import { rejectUpgrade } from './connector-hub.js';
 import { connectorError } from './connector-transport.js';
 import { authenticateConnectorSocket } from './connectors.js';
+import { exportSession, exportWorkspace } from './data-export.js';
 import { openDatabase } from './db/index.js';
 import type { Database } from './db/types.js';
 import { app } from './index.js';
@@ -54,6 +55,51 @@ if (process.argv.includes('--migrate-only')) {
   const db = await openDatabase(process.env.DATABASE_URL || defaultDatabaseUrl);
   try { await migrateWhenReachable(db); } finally { await db.close(); }
   console.log(`pistead: migrations applied (${db.provider})`);
+  process.exit(0);
+}
+
+/**
+ * `--dump-session ID` or `--dump-workspace ID` (also `--dump-session=ID`): the export to write to stdout, or null.
+ * `--dump` alone (as `pnpm db:dump` passes it) never starts the server.
+ */
+function dumpRequest(argv: readonly string[]): { kind: 'session' | 'workspace'; id: string } | null {
+  const requests: { kind: 'session' | 'workspace'; id: string | undefined }[] = [];
+  argv.forEach((argument, index) => {
+    for (const kind of ['session', 'workspace'] as const) {
+      const flag = `--dump-${kind}`;
+      if (argument === flag) requests.push({ kind, id: argv[index + 1] });
+      else if (argument.startsWith(`${flag}=`)) requests.push({ kind, id: argument.slice(flag.length + 1) });
+    }
+  });
+  const [request] = requests;
+  if (!request && !argv.includes('--dump')) return null;
+  if (!request || requests.length > 1 || !request.id || !/^[A-Za-z0-9_-]{1,128}$/.test(request.id)) {
+    console.error('pistead: dump one session or workspace at a time: --dump-session SESSION_ID or --dump-workspace WORKSPACE_ID');
+    process.exit(2);
+  }
+  return { kind: request.kind, id: request.id };
+}
+
+// The operator's dump of one session or workspace from the database, as JSON on stdout: every session in full, without
+// secrets (see data-export.ts). Pending migrations are applied first, as at start-up, so the current schema is read.
+const dump = dumpRequest(process.argv.slice(2));
+if (dump) {
+  const db = await openDatabase(process.env.DATABASE_URL || defaultDatabaseUrl);
+  let output: string | null = null;
+  try {
+    await migrateWhenReachable(db);
+    const document = dump.kind === 'session' ? await exportSession(db, dump.id, null) : await exportWorkspace(db, dump.id, null);
+    if (document) output = `${JSON.stringify(document, null, 2)}\n`;
+  } finally {
+    await db.close();
+  }
+  if (output === null) {
+    console.error(`pistead: ${dump.kind} ${dump.id} not found`);
+    process.exit(1);
+  }
+  const text = output;
+  // stdout is asynchronous on pipes: exit only once the whole dump is written.
+  await new Promise<void>((resolve, reject) => { process.stdout.write(text, error => (error ? reject(error) : resolve())); });
   process.exit(0);
 }
 
@@ -133,5 +179,5 @@ process.on('SIGINT', signal => { void shutdown(signal); });
 server.listen(port, host, () => {
   const address = server.address();
   const listening = address && typeof address === 'object' ? `${address.address}:${address.port}` : String(address);
-  console.log(`pistead: listening on http://${listening} (database=${env.DB.provider}, storage=${env.BUCKET?.provider ?? 'none'}, static=${staticDir}, trustProxy=${trustProxy})`);
+  console.log(`pistead: listening on http://${listening} (database=${env.DB.provider}, storage=${env.BUCKET?.provider ?? 'none'}, workspaceDatabases=${env.WORKSPACE_DATABASES ? (env.WORKSPACE_DATABASES.privateHosts ? 'public+private' : 'public') : 'off'}, static=${staticDir}, trustProxy=${trustProxy})`);
 });
