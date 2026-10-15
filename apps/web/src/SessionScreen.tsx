@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
+import { containsRedaction, redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
@@ -178,11 +179,12 @@ function SessionPane({ id }: { id: string }) {
     // A permission card is itself the owner's prompt; an operation confirms its exact effect first.
     if (decision === "approve" && approval.operation.kind !== "permission" && !await confirmDialog({
       title: "Approve this exact operation?",
-      message: session?.hostUnsandboxed
+      message: (session?.hostUnsandboxed
         ? "It will run as the session owner on an UNSANDBOXED host: directly on the host owner's machine, with their full user permissions and network access, and no resource limits."
         : approval.unbounded
           ? "It will run as the session owner, in the sandbox but without resource limits: no cap on CPU, memory, processes or disk."
-          : "It will run as the session owner.",
+          : "It will run as the session owner.") + (containsRedaction(approval.operation)
+        ? ` Anything shown as ${REDACTED} is a hidden secret: it runs with the real value.` : ""),
       confirmLabel: "Approve",
     })) return;
     const notice = approval.operation.kind === "permission"
@@ -348,6 +350,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
+  // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
+  const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
+
   const queueLabel = view.busy
     ? <><Spinner />Working...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
@@ -404,6 +409,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
           </>}
         />
+        {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
         <Feedback error={submission.error} />
       </div>
     </div>

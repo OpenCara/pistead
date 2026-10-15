@@ -1,5 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionLink, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
@@ -109,7 +110,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
     if (link) return true;
     const confirmed = await confirmDialog({
       title: "Share with anyone who has the link?",
-      message: "Anyone with the link will be able to view existing and future prompts and output of the shared conversation, including tool output and repository content shown in it, without signing in. They can't send messages, or see side asks, approvals, who sent each message, or the host. The session title and your display name are shown with it. Anyone who has the link can pass it on, so check the transcript for secrets first. You can turn the link off at any time.",
+      message: "Anyone with the link will be able to view existing and future prompts and output of the shared conversation, including tool output and repository content shown in it, without signing in. They can't send messages, or see side asks, approvals, who sent each message, or the host. The session title and your display name are shown with it. Values that look like passwords, tokens or keys are hidden, but anyone who has the link can pass it on, so check the transcript for other sensitive content first. You can turn the link off at any time.",
       confirmLabel: "Create link",
     });
     if (!confirmed) return false;
@@ -215,6 +216,8 @@ export function SessionPanel(props: PanelProps) {
 /** One approval record; decision controls, when allowed, come in as children. */
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   const { operation } = approval;
+  // The server hides secrets from everyone; an operation that holds one still runs with the real value.
+  const hidden = containsRedaction(operation);
   const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
     ? <> · Allowed by {approval.decidedBy} {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
     : approval.decidedBy && <> · Decision by {approval.decidedBy}</>;
@@ -222,6 +225,7 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
     <div className="approval-head">
       <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />
       {approval.unbounded && <StatusBadge tone="warning">No resource limits</StatusBadge>}
+      {hidden && <StatusBadge tone="warning">Secret hidden</StatusBadge>}
       <ApprovalStatus approval={approval} />
     </div>
     {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
@@ -229,6 +233,7 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
       <pre>{JSON.stringify(operation, null, 2)}</pre>
     </>}
+    {hidden && approval.status === "pending" && <p className="small">Something that looks like a secret is shown as <code>{REDACTED}</code>. Approving uses the real value, so make sure it belongs in this operation.</p>}
     <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
@@ -529,9 +534,10 @@ function OperationSection({ session, changed }: { session: SessionRecord; change
 
 function AccessSection({ session, view, user }: { session: SessionRecord; view: SessionView | null; user: UserProfile }) {
   const visibility = session.visibility ?? "private";
-  return <Section title="Access" info={<p>{visibility === "workspace"
+  return <Section title="Access" info={<><p>{visibility === "workspace"
     ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
-    : "Private: only the owner and members with a session grant can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
+    : "Private: only the owner and members with a session grant can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>
+    <p>Values that look like passwords, tokens or keys are shown as {REDACTED} to everyone, in the transcript, approvals and share links. The agent and the host still see the real values.</p></>}>
     {view ? <>
       <Row leading={<Icon name="user" size={16} />} title={<>Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""}</>} hint={view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} />
       <Row leading={<Icon name="git-branch" size={16} />} title="Commits as" hint={<>{view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</>} />

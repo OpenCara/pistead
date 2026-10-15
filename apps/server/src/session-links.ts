@@ -2,6 +2,7 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { EntryView, SessionLink, SessionView, SharedSession, SharedSessionView } from '../../../packages/shared/src/types.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
+import { redactSecrets } from '../../../packages/shared/src/redaction.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import { auditStatement, getUser, requireSession, sessionAccess } from './db.js';
 import { appOrigin, fail, identifier, now, randomToken } from './http.js';
@@ -70,7 +71,7 @@ async function requireLinkedSession(c: AppContext, token: string | undefined): P
 
 function sharedEntry(entry: EntryView): EntryView {
   const { id, kind, role, text, error, durationMs } = entry;
-  return { id, kind, role, text,
+  return { id, kind, role, text: redactSecrets(text),
     ...(error ? { error: {
       ...(error.provider !== undefined ? { provider: error.provider } : {}),
       ...(error.modelId !== undefined ? { modelId: error.modelId } : {}),
@@ -81,8 +82,8 @@ function sharedEntry(entry: EntryView): EntryView {
 
 /**
  * Only the shared conversation, as the session screen shows it: no side asks, approvals or queue, no record of who sent
- * each message, and none of the owner's identity beyond their display name. Entries keep only the fields a transcript
- * shows, so nothing a newer runner adds reaches a link without a decision here.
+ * each message, none of the owner's identity beyond their display name, and secrets redacted as in every view. Entries
+ * keep only the fields a transcript shows, so nothing a newer runner adds reaches a link without a decision here.
  */
 export function sharedView(view: SessionView): SharedSessionView {
   const conversations = Array.isArray(view.conversations) ? view.conversations : [];

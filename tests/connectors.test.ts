@@ -12,6 +12,7 @@ import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js'
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionLink, SessionRecord, SessionView, SharedSession, SharedSessionView } from '../packages/shared/src/types.js';
 import { toolNames } from '../packages/shared/src/types.js';
+import { REDACTED } from '../packages/shared/src/redaction.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
 const origin = 'http://localhost:8787';
@@ -2215,4 +2216,83 @@ test('turning link sharing on answers a concurrent request with the same link an
   assert.equal(removed, true);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_links').get()!.n, 0);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'session.link.created'").get()!.n, 0);
+});
+
+test('no viewer ever receives a secret, while approvals still review, decide and run the exact operation', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'bash']);
+  const path = `/api/sessions/${s.session.id}`;
+  await json(await s.creator.request('POST', `${path}/grants`, { userId: s.admin.user.id, permissions: ['read'] }));
+  const secret = `ghp_${'a1B2'.repeat(9)}`;
+  const operation = { kind: 'bash' as const, command: `curl -H "Authorization: Bearer ${secret}" https://api.github.com/user` };
+  const shownCommand = 'curl -H "Authorization: Bearer [redacted]" https://api.github.com/user';
+  const pending: ApprovalRecord = { id: 'secret-approval', sessionId: s.session.id, requestedBy: s.creator.user.id, operation,
+    status: 'pending', createdAt: new Date().toISOString() };
+  const view: SessionView = {
+    sessionId: s.session.id,
+    owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+    entries: [{ id: '0:1', kind: 'message', role: 'user', text: `Use ${secret} with DB_PASSWORD=hunter2hunter2`, actorId: s.creator.user.id, conversationId: '0' }],
+    approvals: [pending], conversations: [{ id: '0', mode: 'write' }], busy: false,
+  };
+  const leaks = (body: string) => body.includes(secret) || body.includes('hunter2hunter2');
+  let approveBody: { operation?: unknown } = {};
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'operations') return Response.json({ approval: pending }, { status: 201 });
+    if (action === 'view') return Response.json({ view });
+    assert.equal(action, 'approve');
+    approveBody = JSON.parse(envelope.request.body);
+    return Response.json({ approval: { ...pending, status: 'executed', decidedBy: s.creator.user.id, result: `{"login":"creator","token":"${secret}"}` } });
+  });
+
+  // Requesting the operation answers with it redacted, and a review hash that commits to the real operation.
+  const reviewHash = await sha256(JSON.stringify({ sessionId: s.session.id, approvalId: pending.id, requestedBy: s.creator.user.id, operation }));
+  const created = await s.creator.request('POST', `${path}/operations`, operation);
+  const createdBody = await created.text();
+  assert.equal(created.status, 201, createdBody);
+  assert.ok(!leaks(createdBody));
+  const { approval: requested } = JSON.parse(createdBody) as { approval: ApprovalRecord };
+  assert.deepEqual(requested.operation, { kind: 'bash', command: shownCommand });
+  assert.equal(requested.reviewHash, reviewHash);
+  assert.deepEqual(JSON.parse(String(f.sqlite.prepare('SELECT operation_json FROM approval_reviews WHERE approval_id = ?').get(pending.id)!.operation_json)), operation,
+    'The review keeps the real operation');
+
+  // Every viewer, the owner included, gets the same redacted view.
+  for (const client of [s.creator, s.admin]) {
+    const response = await client.request('GET', `${path}/view`);
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    assert.ok(!leaks(body), 'No viewer receives a secret');
+    const { view: seen } = JSON.parse(body) as { view: SessionView };
+    assert.equal(seen.entries[0]!.text, 'Use ghp_[redacted] with DB_PASSWORD=[redacted]');
+    assert.deepEqual(seen.approvals[0]!.operation, { kind: 'bash', command: shownCommand });
+    assert.equal(seen.approvals[0]!.reviewHash, reviewHash);
+  }
+  // So are live updates.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const stream = await s.admin.request('GET', `${path}/events`);
+  assert.equal(stream.status, 200);
+  const reader = stream.body!.getReader();
+  const snapshot = new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
+  t.mock.timers.reset();
+  assert.match(snapshot, /event: view/);
+  assert.ok(snapshot.includes(REDACTED) && !leaks(snapshot));
+
+  // Approving with the hash of what was shown runs the real command on the host; its output comes back redacted.
+  const approved = await s.creator.request('POST', `${path}/approvals/${pending.id}`, { decision: 'approve', reviewHash });
+  const approvedBody = await approved.text();
+  assert.equal(approved.status, 200, approvedBody);
+  assert.deepEqual(approveBody.operation, operation, 'The host receives the real operation');
+  assert.ok(!leaks(approvedBody));
+  const { approval: decided } = JSON.parse(approvedBody) as { approval: ApprovalRecord };
+  assert.equal(decided.result, '{"login":"creator","token":"[redacted]"}');
+  assert.deepEqual(decided.operation, { kind: 'bash', command: shownCommand });
+
+  // A share link shows the same redacted transcript.
+  const { link } = await json<{ link: SessionLink }>(await s.creator.request('PUT', `${path}/link`), 201);
+  const shared = await f.request('GET', '/api/shared/view', undefined, { 'X-Share-Token': link.url.split('/').at(-1)! });
+  const sharedBody = await shared.text();
+  assert.equal(shared.status, 200, sharedBody);
+  assert.ok(!leaks(sharedBody));
+  assert.equal((JSON.parse(sharedBody) as { view: SharedSessionView }).view.entries[0]!.text, 'Use ghp_[redacted] with DB_PASSWORD=[redacted]');
 });
