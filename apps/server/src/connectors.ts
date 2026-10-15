@@ -6,7 +6,8 @@ import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import type { Query } from './db/types.js';
 import { requireMember } from './db.js';
 import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
-import { authorizeSession, githubComment } from './internal.js';
+import { authorizeSession } from './internal.js';
+import { githubComment, githubMerge, githubRead } from './github-broker.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
 import { legacyRepositoryFixture, repositoryDownload, requireConfiguredWorkspace } from './repositories.js';
@@ -45,15 +46,17 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');
   const cap = value as Record<string, unknown>;
-  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials']);
+  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials', 'github']);
   const platform = text(cap.platform, 'platform', 40);
   if (!/^[a-zA-Z0-9._-]+$/.test(platform) || typeof cap.sandbox !== 'boolean' || typeof cap.productionShell !== 'boolean' || (cap.productionShell && !cap.sandbox)
     || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)
     || (cap.chatOptions !== undefined && typeof cap.chatOptions !== 'boolean') || (cap.gitProviders !== undefined && typeof cap.gitProviders !== 'boolean')
     || (cap.gitPush !== undefined && typeof cap.gitPush !== 'boolean')
-    || (cap.gitCredentials !== undefined && typeof cap.gitCredentials !== 'boolean') || (cap.gitCredentials && !cap.gitPush)) fail(400, 'invalid_manifest', 'Invalid capabilities.');
+    || (cap.gitCredentials !== undefined && typeof cap.gitCredentials !== 'boolean') || (cap.gitCredentials && !cap.gitPush)
+    || (cap.github !== undefined && typeof cap.github !== 'boolean')) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
-    ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}) } };
+    ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
+    ...(cap.github ? { github: true } : {}) } };
 }
 
 function requireConnectorTLS(env: Env, url: URL): void {
@@ -121,6 +124,18 @@ export async function requireConnectorSession(env: Env, connectorId: string, row
     .bind(row.workspace_id, row.owner_id, row.agent_version_id, connectorId, row.connector_owner_id, testMode(env) ? 1 : 0,
       expectedConnectionHash ?? null, expectedConnectionHash ?? null, row.id, row.policy_version).first();
   if (!allowed) fail(403, 'connector_unavailable', 'The connector or its workspace sharing is no longer authorized.');
+}
+
+/**
+ * A runner callback about `row` comes from the connector serving it over its current connection, or, for sessions
+ * without a connector, through the shared-secret internal route.
+ */
+export async function requireCallbackScope(c: AppContext, row: SessionRow, connectorId: string | null): Promise<void> {
+  if (connectorId) {
+    const connector = await authenticateConnector(c);
+    if (connector.id !== connectorId) fail(403, 'connector_binding_mismatch', 'Connector scope changed.');
+    await requireConnectorSession(c.env, connectorId, row, connector.connection_hash!);
+  } else if (row.connector_id) fail(403, 'connector_scope_required', 'Use the connector-scoped callback.');
 }
 
 async function ownedConnector(c: AppContext): Promise<ConnectorRow> {
@@ -259,6 +274,8 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   });
   app.post('/api/connectors/self/authorize', async c => authorizeSession(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/comment', async c => githubComment(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/github/read', async c => githubRead(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/github/merge', async c => githubMerge(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/push/credential', async c => pushCredential(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/push/complete', async c => pushComplete(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));

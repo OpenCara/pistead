@@ -9,7 +9,7 @@ import { auditStatement, sessionAccess } from '../db.js';
 import { fail, id, identifier, jsonObject, now, text, userIdentifier } from '../http.js';
 import { parseOperation } from '../operations.js';
 import { decryptToken, encryptToken } from '../vault.js';
-import { authenticateConnector, requireConnectorSession } from '../connectors.js';
+import { requireCallbackScope } from '../connectors.js';
 import { requireBrokerReview, requireOperationTool } from '../approval-reviews.js';
 import { recheckAccess, repositoryAccess, validPin } from '../repositories.js';
 import { mintPushToken, revokePushToken, type MintedToken, type PushRevocation } from './mint.js';
@@ -19,15 +19,7 @@ const outcomes: readonly PushOutcome[] = ['pushed', 'up-to-date', 'failed', 'unk
 /** Automatic credentials one auto-approve admission may mint. */
 const automaticPushesPerAdmission = 20;
 
-async function callbackScope(c: AppContext, row: SessionRow, connectorId: string | null): Promise<void> {
-  if (connectorId) {
-    const connector = await authenticateConnector(c);
-    if (connector.id !== connectorId) fail(403, 'connector_binding_mismatch', 'Connector scope changed.');
-    await requireConnectorSession(c.env, connectorId, row, connector.connection_hash!);
-  } else if (row.connector_id) fail(403, 'connector_scope_required', 'Use the connector-scoped callback.');
-}
-
-async function requireNoRestore(c: AppContext, sessionId: string): Promise<void> {
+export async function requireNoRestore(c: AppContext, sessionId: string): Promise<void> {
   if (await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
@@ -45,8 +37,8 @@ function pushPin(row: SessionRow, path: string): SessionRepository {
 function pinProvider(pin: SessionRepository): { provider: GitProvider; host: string } {
   return 'provider' in pin ? { provider: pin.provider, host: pin.host } : { provider: 'github', host: 'github.com' };
 }
-/** The workspace binding still configured for the pin, with its default-branch policy; removed bindings stop pushes. */
-async function requireBinding(c: AppContext, workspaceId: string, pin: SessionRepository): Promise<{ forbid_default_branch: number | null }> {
+/** The workspace binding still configured for the pin, with its default-branch policy; removed bindings stop pushes and GitHub merges. */
+export async function requireBinding(c: AppContext, workspaceId: string, pin: SessionRepository): Promise<{ forbid_default_branch: number | null }> {
   const { provider, host } = pinProvider(pin);
   const binding = await c.env.DB.query<{ forbid_default_branch: number | null }>(`SELECT policy.forbid_default_branch FROM workspace_repositories binding
     LEFT JOIN repository_push_policies policy ON policy.binding_id = binding.id AND policy.workspace_id = binding.workspace_id
@@ -134,7 +126,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
           approver.row.status === 'archived' || !hasPermission(approver.permissions, 'approve') || !hasPermission(writer.permissions, 'write')) {
         fail(403, 'permission_revoked', 'The push requester or approver is no longer authorized.');
       }
-      await callbackScope(c, approver.row, connectorId);
+      await requireCallbackScope(c, approver.row, connectorId);
       await requireBrokerReview(c.env, approver.row, approvalId, stored.requested_by, operation);
       return approver;
     }
@@ -148,7 +140,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
         admission.access !== 'auto' || admission.expires_at <= Math.floor(Date.now() / 1000)) {
       fail(403, 'automatic_push_not_admitted', 'Automatic pushes require an unexpired auto-approve write admission from the session owner.');
     }
-    await callbackScope(c, owner.row, connectorId);
+    await requireCallbackScope(c, owner.row, connectorId);
     await requireOperationTool(c.env, owner.row, operation, approvalId);
     // This request's own ledger row does not count against it on the post-mint recheck.
     const used = await c.env.DB.query<{ count: number }>('SELECT COUNT(*) AS count FROM push_credentials WHERE admission_id = ? AND id <> ?')
@@ -263,7 +255,7 @@ export async function pushComplete(c: AppContext, connectorId: string | null): P
   const session = await c.env.DB.query<SessionRow>('SELECT * FROM sessions WHERE id = ?').bind(sessionId).first();
   if (!session) fail(404, 'not_found', 'Session not found.');
   try {
-    await callbackScope(c, session, connectorId);
+    await requireCallbackScope(c, session, connectorId);
   } catch (error) {
     // The connector lost its scope: the credential is closed and revoked anyway; only the pull request needs the scope.
     const closed = await c.env.DB.query<{ revocation_ciphertext: string | null }>(`UPDATE push_credentials SET completed_at = ?, outcome = 'failed', tip = NULL
@@ -296,7 +288,7 @@ export async function pushComplete(c: AppContext, connectorId: string | null): P
         owner.row.repositories_json !== session.repositories_json || !hasPermission(owner.permissions, 'write')) {
       fail(403, 'permission_revoked', 'Session authority changed; the pull request was not opened.');
     }
-    await callbackScope(c, owner.row, connectorId);
+    await requireCallbackScope(c, owner.row, connectorId);
     return owner.row;
   };
   try {

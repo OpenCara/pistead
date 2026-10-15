@@ -10,7 +10,7 @@ import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
 import type { SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryLimits } from "../../../packages/shared/src/repositories.js";
-import type { AuthorizationRequest, AuthorizationResult, RunnerAction, RunnerBinding } from "../../../packages/shared/src/types.js";
+import type { AuthorizationRequest, AuthorizationResult, GitHubIssueView, RunnerAction, RunnerBinding } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
@@ -22,6 +22,8 @@ import type { RunnerConfig } from "./session.js";
 
 const STATE_FILE = "connector.json";
 const CALLBACK_LIMIT = 64 * 1024;
+/** A github_read result; the control plane keeps its view within 96 KiB of JSON. */
+const GITHUB_READ_LIMIT = 128 * 1024;
 const RPC_TIMEOUT = 30_000;
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -169,10 +171,11 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
     || typeof result.sandbox !== "boolean" || typeof result.productionShell !== "boolean"
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
   // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
-  // pushes may use this host's Git credentials. Every connector of this version applies per-message choices and pushes.
+  // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, pushes, and
+  // reads and merges on GitHub through the control plane.
   const credentials = mode.gitCredentials ? { gitCredentials: true } : {};
-  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, ...credentials };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, ...credentials };
+  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {
@@ -427,6 +430,22 @@ export class LocalConnector {
             id: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
           }).strict().parse(await this.callback(generation, "/api/connectors/self/github/comment", payload));
         },
+        // Reads and merges pass the control plane's refusal on (a repository not pinned, GitHub's reason not to merge).
+        githubRead: async request => {
+          const payload = { sessionId: request.sessionId, actorId: request.actorId, admissionId: request.admissionId, callId: request.callId, repository: request.repository, issue: request.issue };
+          const view = await this.brokerCallback(generation, "/api/connectors/self/github/read", payload, GITHUB_READ_LIMIT);
+          z.looseObject({ repository: z.string(), number: z.number().int().positive(), title: z.string(), comments: z.array(z.unknown()) }).parse(view);
+          return view as GitHubIssueView;
+        },
+        githubMerge: async request => {
+          const payload = {
+            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, capability: request.capability,
+            repository: request.repository, pull: request.pull, sha: request.sha, method: request.method,
+          };
+          return z.object({
+            sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
+          }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/merge", payload));
+        },
         // Minting can take several upstream calls, so push callbacks get the full RPC budget.
         pushCredential: async request => {
           const payload = {
@@ -441,7 +460,7 @@ export class LocalConnector {
             z.object({ ...issued, authorization: z.string().regex(/^(Basic|Bearer) [A-Za-z0-9+/=._~-]{1,8000}$/) }).strict(),
             // Push access with the host's own Git credentials: the session reads them here, so none comes from the control plane.
             z.object({ ...issued, hostCredentials: z.literal(true) }).strict(),
-          ]).parse(await this.pushCallback(generation, "/api/connectors/self/git/push/credential", payload));
+          ]).parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/credential", payload));
         },
         ...(this.options.gitCredentials ? { hostGitCredential: (remote: string, signal?: AbortSignal) => hostGitAuthorization(remote, { signal }) } : {}),
         pushComplete: async request => {
@@ -453,7 +472,7 @@ export class LocalConnector {
             pullRequest: z.object({
               url: z.string().max(2048).regex(/^https:\/\/\S+$/), number: z.number().int().positive(), created: z.boolean(),
             }).strict().optional(),
-          }).strict().parse(await this.pushCallback(generation, "/api/connectors/self/git/push/complete", payload));
+          }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/complete", payload));
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
         readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
@@ -513,10 +532,11 @@ export class LocalConnector {
   }
 
   /**
-   * Push callbacks pass the control plane's refusal on: its messages are fixed, credential-free and actionable
-   * (e.g. which push identity to set up). Minting can take several upstream calls, so they get the full RPC budget.
+   * Push and GitHub broker callbacks pass the control plane's refusal on: its messages are fixed, credential-free and
+   * actionable (e.g. which push identity to set up, why GitHub didn't merge). Minting and GitHub reads can take several
+   * upstream calls, so they get the full RPC budget.
    */
-  private async pushCallback(generation: Generation, path: string, body: unknown): Promise<unknown> {
+  private async brokerCallback(generation: Generation, path: string, body: unknown, limit = CALLBACK_LIMIT): Promise<unknown> {
     this.requireGeneration(generation);
     const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(RPC_TIMEOUT)]);
     const response = await (this.options.fetch ?? fetch)(`${this.state!.controlPlaneUrl}${path}`, {
@@ -524,7 +544,7 @@ export class LocalConnector {
       headers: { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken!, "content-type": "application/json" },
       body: JSON.stringify(body), signal,
     });
-    const bytes = await boundedBody(response, CALLBACK_LIMIT, signal);
+    const bytes = await boundedBody(response, limit, signal);
     this.requireGeneration(generation);
     const value = bytes.length ? decodeJson(bytes) : undefined;
     if (!response.ok) {

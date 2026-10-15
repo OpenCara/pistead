@@ -1,5 +1,5 @@
-import type { Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
-import { permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
+import type { GitHubMergeMethod, Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
+import { githubMergeMethods, permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
 import { validPushBranch } from '../../../packages/shared/src/repositories.js';
 import { fail, text } from './http.js';
 
@@ -20,19 +20,34 @@ function pullRequest(value: unknown): PullRequestRequest {
   return { title, body, ...(input.base === undefined ? {} : { base: input.base as string }) };
 }
 
+/** A github.com repository as owner/name, never a URL or a path. */
+export function githubRepositoryName(value: unknown): string {
+  const repository = text(value, 'repository', 200);
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) {
+    fail(400, 'invalid_operation', 'Expected a GitHub owner/repository, not a URL.');
+  }
+  return repository;
+}
+export function issueNumber(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1) fail(400, 'invalid_operation', 'Invalid issue number.');
+  return Number(value);
+}
+
 export function parseOperation(input: unknown): Operation {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail(400, 'invalid_operation', 'Expected an operation.');
   const value = input as Record<string, unknown>;
   switch (value.kind) {
     case 'git.commit': return { kind: value.kind, message: text(value.message, 'commit message', 4000) };
     case 'bash': return { kind: value.kind, command: text(value.command, 'command', 8192) };
-    case 'github.comment': {
-      const repository = text(value.repository, 'repository', 200);
-      if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(repository) || repository.endsWith('/.') || repository.endsWith('/..')) {
-        fail(400, 'invalid_operation', 'Expected a GitHub owner/repository, not a URL.');
-      }
-      if (!Number.isSafeInteger(value.issue) || Number(value.issue) < 1) fail(400, 'invalid_operation', 'Invalid issue number.');
-      return { kind: value.kind, repository, issue: Number(value.issue), body: text(value.body, 'comment body', 60000) };
+    case 'github.comment':
+      return { kind: value.kind, repository: githubRepositoryName(value.repository), issue: issueNumber(value.issue), body: text(value.body, 'comment body', 60000) };
+    case 'github.merge': {
+      const repository = githubRepositoryName(value.repository);
+      if (!Number.isSafeInteger(value.pull) || Number(value.pull) < 1) fail(400, 'invalid_operation', 'Invalid pull request number.');
+      if (typeof value.sha !== 'string' || !/^[0-9a-f]{40}$/.test(value.sha)) fail(400, 'invalid_operation', 'Expected the 40-character head commit to merge.');
+      if (!githubMergeMethods.includes(value.method as GitHubMergeMethod)) fail(400, 'invalid_operation', 'Expected the merge, squash or rebase method.');
+      // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
+      return { kind: value.kind, repository, pull: Number(value.pull), sha: value.sha, method: value.method as GitHubMergeMethod };
     }
     case 'git.push': {
       if (!validRepositoryPath(value.repository)) fail(400, 'invalid_operation', 'Expected a pinned repository path.');

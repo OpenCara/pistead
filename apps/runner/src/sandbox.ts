@@ -1317,6 +1317,7 @@ export class Sandbox {
         return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize, false, bounded);
       }
       case "github.comment":
+      case "github.merge":
         throw new Error("GitHub operations require the control-plane credential broker, not the sandbox");
       default:
         throw new Error("Unsupported sandbox operation");

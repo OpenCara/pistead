@@ -17,7 +17,7 @@ const levelLabels: Record<ThinkingLevel, string> = {
 
 const accessInfo: Record<AccessMode, { label: string; icon: IconName; hint: string }> = {
   read: { label: "Read only", icon: "eye", hint: "Inspect files; edits, commands and commits ask the session owner first" },
-  approval: { label: "Ask before acting", icon: "shield", hint: "Edits are automatic; commands, commits and GitHub comments need approval" },
+  approval: { label: "Ask before acting", icon: "shield", hint: "Edits are automatic; commands, commits, GitHub comments and merges need approval" },
   auto: { label: "Auto-approve", icon: "alert", hint: "Commands and commits run immediately as the owner" },
 };
 
@@ -109,8 +109,8 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
     if (access === "auto" && value.access !== "auto" && !await confirmDialog({
       title: "Auto-approve commands?",
       message: unsandboxed
-        ? `Commands the agent writes will run immediately on ${host!.name}, an UNSANDBOXED host: directly on the owner's machine with their full user permissions and network access, and no resource limits. GitHub comments still need approval.`
-        : "Commands and commits the agent writes will run immediately as you, without asking. GitHub comments still need approval.",
+        ? `Commands the agent writes will run immediately on ${host!.name}, an UNSANDBOXED host: directly on the owner's machine with their full user permissions and network access, and no resource limits. GitHub comments and merges still need approval.`
+        : "Commands and commits the agent writes will run immediately as you, without asking. GitHub comments and merges still need approval.",
       confirmLabel: "Enable auto-approve",
       destructive: true,
     })) return;

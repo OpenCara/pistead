@@ -10,7 +10,7 @@ import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ApprovalRecord, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
@@ -229,9 +229,9 @@ function authorization(session: SessionRecord, actorId = session.ownerId) {
   return { sessionId: session.id, actorId, ownerId: session.ownerId, permission: 'write' };
 }
 
-async function brokerPayload(f: Fixture, session: SessionRecord, actorId = session.ownerId, requestedBy = session.ownerId) {
+/** A reviewed explicit approval of `operation` and its unconsumed broker capability, as a human approval mints them. */
+async function approvedOperation(f: Fixture, session: SessionRecord, operation: Operation, actorId: string, requestedBy: string) {
   const capability = token(); const approvalId = Buffer.from(randomBytes(16)).toString('hex');
-  const operation = { kind: 'github.comment', repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
   const reviewHash = await sha256(JSON.stringify({ sessionId: session.id, approvalId, requestedBy, operation }));
   f.sqlite.prepare(`INSERT INTO approval_reviews
     (session_id,approval_id,requested_by,source,admission_id,operation_json,review_hash,created_at) VALUES (?,?,?,?,?,?,?,?)`)
@@ -239,7 +239,51 @@ async function brokerPayload(f: Fixture, session: SessionRecord, actorId = sessi
   f.sqlite.prepare('INSERT INTO broker_capabilities (token_hash,session_id,approval_id,actor_id,requested_by,operation_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)')
     .run(await sha256(capability), session.id, approvalId, actorId, requestedBy, await sha256(JSON.stringify(operation)),
       Math.floor(Date.now() / 1000) + 600, new Date().toISOString());
-  return { sessionId: session.id, actorId, approvalId, capability, repository: operation.repository, issue: operation.issue, body: operation.body };
+  return { sessionId: session.id, actorId, approvalId, capability };
+}
+
+async function brokerPayload(f: Fixture, session: SessionRecord, actorId = session.ownerId, requestedBy = session.ownerId) {
+  const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+  return { ...await approvedOperation(f, session, operation, actorId, requestedBy), repository: operation.repository, issue: operation.issue, body: operation.body };
+}
+
+const headSha = 'c'.repeat(40);
+const mergedSha = 'd'.repeat(40);
+
+async function mergePayload(f: Fixture, session: SessionRecord, repository = 'owner/repo') {
+  // Canonical key order, as parseOperation returns it.
+  const operation = { kind: 'github.merge' as const, repository, pull: 5, sha: headSha, method: 'squash' as const };
+  return { ...await approvedOperation(f, session, operation, session.ownerId, session.ownerId),
+    repository, pull: operation.pull, sha: operation.sha, method: operation.method };
+}
+
+/** A merge as the session owner: the pin's identity check, then the merge PUT, answered by `merge`. Records each call. */
+function mergeFetch(t: TestContext, merge: () => Response) {
+  const calls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    assert.equal(init?.redirect, 'manual');
+    assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${githubToken}`);
+    if (url === 'https://api.github.com/repos/owner/repo') {
+      assert.equal(init?.method ?? 'GET', 'GET');
+      return Response.json({ id: 7, full_name: 'owner/repo', default_branch: 'main', private: true });
+    }
+    assert.equal(url, 'https://api.github.com/repos/owner/repo/pulls/5/merge');
+    assert.equal(init?.method, 'PUT');
+    assert.deepEqual(JSON.parse(String(init?.body)), { sha: headSha, merge_method: 'squash' });
+    return merge();
+  });
+  return calls;
+}
+
+/** A run admission of `actorId` in the session, as a write (or ask) message mints it. */
+function admit(f: Fixture, sessionId: string, actorId: string, options: { expiresAt?: number; mode?: 'write' | 'ask' } = {}) {
+  const id = token();
+  f.sqlite.prepare(`INSERT INTO run_admissions (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)`)
+    .run(id, sessionId, actorId, options.mode ?? 'write', `request-${id}`, 'h'.repeat(43),
+      options.expiresAt ?? Math.floor(Date.now() / 1000) + 3600, new Date().toISOString());
+  return id;
 }
 
 function githubFetch(t: TestContext) {
@@ -385,10 +429,11 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
   await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
-  for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/restores/unknown/download']) {
+  for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/github/read', '/api/internal/github/merge',
+    '/api/internal/restores/unknown/download']) {
     await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
   }
-  for (const path of ['manifest', 'authorize', 'github/comment', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
     await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
     await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
     await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
@@ -399,7 +444,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const oldConnection = connector.connectionToken;
   connector.connectionToken = token();
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
-  for (const path of ['manifest', 'authorize', 'github/comment', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
     await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
   }
   await json(await self(f, connector, 'manifest', manifest));
@@ -1221,6 +1266,157 @@ test('broker callbacks require github_comment in the immutable pinned agent even
   assert.equal(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(payload.capability))!.consumed_at, null);
 });
 
+test('github merges need a pinned repository, consume their capability once, and tell GitHub refusals apart from unknown outcomes', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_merge']);
+  let answer = () => Response.json({ merged: true, sha: mergedSha, message: 'Pull Request successfully merged' });
+  const calls = mergeFetch(t, () => answer());
+  const consumed = async (capability: string) =>
+    f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(capability))!.consumed_at;
+  const audits = (action: string) => Number(f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE action = ?').get(action)!.n);
+
+  // An approved merge of a repository this session never pinned stops before GitHub and keeps its capability.
+  const unpinned = await mergePayload(f, s.session, 'owner/other');
+  await denied(await self(f, s.connector, 'github/merge', unpinned), 403, 'repository_not_pinned');
+  assert.deepEqual(calls, []);
+  assert.equal(await consumed(unpinned.capability), null);
+
+  const payload = await mergePayload(f, s.session);
+  assert.deepEqual(await json(await self(f, s.connector, 'github/merge', payload)), { sha: mergedSha, url: 'https://github.com/owner/repo/pull/5' });
+  assert.deepEqual(calls, ['GET https://api.github.com/repos/owner/repo', 'PUT https://api.github.com/repos/owner/repo/pulls/5/merge']);
+  assert.ok(await consumed(payload.capability));
+  assert.equal(audits('github.merge.attempted'), 1);
+  assert.equal(audits('github.merge.completed'), 1);
+  await denied(await self(f, s.connector, 'github/merge', payload), 409, 'capability_consumed');
+  assert.equal(calls.length, 2);
+
+  // GitHub's refusal is definite and carries its reason; the capability stays consumed.
+  answer = () => Response.json({ message: 'Pull Request is not mergeable' }, { status: 405 });
+  const refused = await mergePayload(f, s.session);
+  const refusal = await json<{ code: string; error: string }>(await self(f, s.connector, 'github/merge', refused), 422);
+  assert.equal(refusal.code, 'github_merge_refused');
+  assert.ok(refusal.error.includes('Pull Request is not mergeable'), refusal.error);
+  assert.ok(refusal.error.includes('owner/repo#5'), refusal.error);
+  assert.ok(await consumed(refused.capability));
+  assert.equal(audits('github.merge.failed'), 1);
+  assert.equal(calls.length, 4);
+
+  // A server error leaves the outcome unknown, never a refusal.
+  answer = () => Response.json({ message: 'Server Error' }, { status: 502 });
+  const unknown = await mergePayload(f, s.session);
+  await denied(await self(f, s.connector, 'github/merge', unknown), 502, 'github_outcome_unknown');
+  assert.ok(await consumed(unknown.capability));
+  assert.equal(audits('github.merge.ambiguous'), 1);
+  assert.equal(calls.length, 6);
+  assert.ok(!JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all()).includes(githubToken));
+});
+
+test('github reads need the requester\'s live write admission, the github_read tool or the owner\'s grant, and a pinned repository before any GitHub call', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']);
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('GitHub must not be called'); });
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['write'] }));
+  const owner = s.session.ownerId;
+  const read = (admissionId: string, body: Record<string, unknown> = {}) => self(f, s.connector, 'github/read', {
+    sessionId: s.session.id, actorId: owner, admissionId, callId: 'call-1', repository: 'owner/other', issue: 5, ...body,
+  });
+  for (const admissionId of [
+    token(), admit(f, s.session.id, owner, { expiresAt: Math.floor(Date.now() / 1000) - 1 }),
+    admit(f, s.session.id, owner, { mode: 'ask' }), admit(f, s.session.id, s.admin.user.id),
+  ]) {
+    await denied(await read(admissionId), 403, 'github_read_not_admitted');
+  }
+  const admissionId = admit(f, s.session.id, owner);
+  await denied(await read(admissionId), 403, 'tool_not_allowed');
+  const grant = f.sqlite.prepare('INSERT INTO session_tool_grants (session_id,tool,call_id,approval_id,granted_by,created_at) VALUES (?,?,?,?,?,?)');
+  // A grant of another tool, or for another call, does not allow this read.
+  grant.run(s.session.id, 'github_comment', '', 'permission-any', owner, new Date().toISOString());
+  grant.run(s.session.id, 'github_read', 'call-2', 'permission-call-2', owner, new Date().toISOString());
+  await denied(await read(admissionId), 403, 'tool_not_allowed');
+  grant.run(s.session.id, 'github_read', 'call-1', 'permission-call-1', owner, new Date().toISOString());
+  await denied(await read(admissionId), 403, 'repository_not_pinned');
+  await denied(await read(admissionId, { callId: 'call-3' }), 403, 'tool_not_allowed');
+  grant.run(s.session.id, 'github_read', '', 'permission-call-4', owner, new Date().toISOString());
+  await denied(await read(admissionId, { callId: 'call-3' }), 403, 'repository_not_pinned');
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'github.read'").get()!.n, 0);
+});
+
+test('a github read returns the owner\'s view of a pull request with its reviews, review comments and checks, bounded and audited', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_read']);
+  const api = 'https://api.github.com/repos/owner/repo';
+  const createdAt = '2026-10-01T00:00:00Z';
+  const hunk = `${'h'.repeat(10)}${'line\n'.repeat(300)}`;
+  const comments = (from: number, count: number) => Array.from({ length: count }, (_, index) => ({
+    id: from + index, user: { login: 'commenter' }, created_at: createdAt, body: `comment ${from + index}`, html_url: `https://github.com/owner/repo/pull/5#issuecomment-${from + index}`,
+  }));
+  const routes: Record<string, () => Response> = {
+    [api]: () => Response.json({ id: 7, full_name: 'owner/repo', default_branch: 'main', private: true }),
+    [`${api}/issues/5`]: () => Response.json({ html_url: 'https://github.com/owner/repo/pull/5', title: 'Fix it', state: 'open', user: { login: 'author' },
+      created_at: createdAt, body: 'b'.repeat(16005), labels: [{ name: 'bug' }, 'plain'], pull_request: { url: `${api}/pulls/5` } }),
+    // Three pages of comments: only the newest hundred stay.
+    [`${api}/issues/5/comments?per_page=100&page=1`]: () => Response.json(comments(1, 100), { headers: {
+      Link: `<https://api.github.com/repositories/7/issues/5/comments?per_page=100&page=2>; rel="next", <https://api.github.com/repositories/7/issues/5/comments?per_page=100&page=3>; rel="last"`,
+    } }),
+    [`${api}/issues/5/comments?per_page=100&page=2`]: () => Response.json(comments(101, 100)),
+    [`${api}/issues/5/comments?per_page=100&page=3`]: () => Response.json(comments(201, 30)),
+    [`${api}/pulls/5`]: () => Response.json({ draft: false, merged: false, mergeable: true, mergeable_state: 'clean',
+      head: { ref: 'feature', sha: headSha, repo: { full_name: 'owner/repo' } }, base: { ref: 'main', sha: 'a'.repeat(40) } }),
+    [`${api}/pulls/5/reviews?per_page=100&page=1`]: () => Response.json([{ id: 11, user: { login: 'reviewer' }, state: 'CHANGES_REQUESTED',
+      submitted_at: createdAt, commit_id: headSha, body: 'Please fix', html_url: 'https://github.com/owner/repo/pull/5#pullrequestreview-11' }]),
+    [`${api}/pulls/5/comments?per_page=100&page=1`]: () => Response.json([{ id: 21, user: { login: 'reviewer' }, created_at: createdAt,
+      path: 'src/a.ts', line: 12, original_line: 10, commit_id: headSha, body: 'Off by one', diff_hunk: hunk,
+      html_url: 'https://github.com/owner/repo/pull/5#discussion_r21' }]),
+    [`${api}/commits/${headSha}/check-runs?per_page=100`]: () => Response.json({ check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure' }] }),
+    [`${api}/commits/${headSha}/status?per_page=100`]: () => Response.json({ statuses: [
+      { context: 'ci/legacy', state: 'pending' }, { context: 'ci/lint', state: 'success' },
+    ] }),
+    [`${api}/issues/6`]: () => Response.json({ message: 'Not Found' }, { status: 404 }),
+  };
+  const calls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push(url);
+    assert.equal(init?.method ?? 'GET', 'GET');
+    assert.equal(init?.redirect, 'manual');
+    assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${githubToken}`);
+    const route = routes[url];
+    assert.ok(route, `unexpected GitHub call ${url}`);
+    return route();
+  });
+  const audits = () => f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'github.read'").all().map(row => JSON.parse(String(row.detail_json)));
+  const admissionId = admit(f, s.session.id, s.session.ownerId);
+  const read = (issue: number) => self(f, s.connector, 'github/read', {
+    sessionId: s.session.id, actorId: s.session.ownerId, admissionId, callId: 'call-1', repository: 'OWNER/Repo', issue,
+  });
+
+  const view = await json<GitHubIssueView>(await read(5));
+  assert.deepEqual([view.repository, view.number, view.url, view.title, view.state, view.author, view.createdAt, view.labels],
+    ['owner/repo', 5, 'https://github.com/owner/repo/pull/5', 'Fix it', 'open', 'author', createdAt, ['bug', 'plain']]);
+  assert.equal(view.body, `${'b'.repeat(16000)}\n… 5 more characters`);
+  assert.equal(view.comments.length, 100);
+  assert.deepEqual([view.comments[0].id, view.comments.at(-1)!.id], [131, 230]);
+  assert.deepEqual(view.comments[0], { id: 131, author: 'commenter', createdAt, body: 'comment 131', url: 'https://github.com/owner/repo/pull/5#issuecomment-131' });
+  assert.deepEqual(view.omitted, { comments: 130 });
+  assert.deepEqual(view.pullRequest, {
+    draft: false, merged: false, mergeable: true, mergeableState: 'clean',
+    head: { ref: 'feature', sha: headSha, repository: 'owner/repo' }, base: { ref: 'main', sha: 'a'.repeat(40) },
+    reviews: [{ id: 11, author: 'reviewer', state: 'CHANGES_REQUESTED', submittedAt: createdAt, commit: headSha, body: 'Please fix',
+      url: 'https://github.com/owner/repo/pull/5#pullrequestreview-11' }],
+    reviewComments: [{ id: 21, inReplyTo: null, author: 'reviewer', createdAt, path: 'src/a.ts', line: 12, originalLine: 10, commit: headSha,
+      body: 'Off by one', diffHunk: `… 10 earlier characters\n${hunk.slice(-1500)}`, url: 'https://github.com/owner/repo/pull/5#discussion_r21' }],
+    checks: [
+      { name: 'test', status: 'completed', conclusion: 'failure' }, { name: 'ci/legacy', status: 'pending', conclusion: null },
+      { name: 'ci/lint', status: 'completed', conclusion: 'success' },
+    ],
+  });
+  assert.equal(calls[0], api, 'the pin identity is checked before any read');
+  assert.equal(calls.length, Object.keys(routes).length - 1);
+  assert.ok(!JSON.stringify(view).includes(githubToken));
+  assert.deepEqual(audits(), [{ repository: 'owner/repo', issue: 5, actingAs: s.session.ownerId }]);
+
+  await denied(await read(6), 404, 'github_not_found');
+  assert.equal(audits().length, 1);
+});
+
 test('write admission quota follows an actor across sessions without blocking another owner or losing ambiguous receipts', async t => {
   const f = await fixture(t); const s = await sharedSession(f);
   const cloneSession = f.sqlite.prepare(`INSERT INTO sessions
@@ -1413,12 +1609,12 @@ test('a session started from a model gets its own chat agent with every tool its
   await denied(await start(s.member, { modelId: s.model.id, trustedConnectorId: s.connector.connectorId }), 404, 'not_found');
   assert.equal(s.hub.requests.length, 0);
 
-  // This host cannot carry pushes, so the chat agent leaves git_push out instead of refusing the start.
+  // This host carries neither pushes nor GitHub reads and merges, so the chat agent leaves those tools out instead of refusing the start.
   const { session } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, toolNames.filter(tool => tool !== 'git_push'));
+  assert.deepEqual(agent.tools, toolNames.filter(tool => !['git_push', 'github_read', 'github_merge'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // Chat agents stay out of their author's catalog and cannot be revised or published.
@@ -1426,10 +1622,16 @@ test('a session started from a model gets its own chat agent with every tool its
   await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/versions`, s.agentInput), 404, 'not_found');
   await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/publish`, { workspaceId: s.team.id }), 404, 'not_found');
 
-  // Once the host carries pushes, the next session's own chat agent offers git_push too.
+  // Once the host carries pushes, the next session's own chat agent offers git_push, but GitHub tools still need the host's github capability.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
+  assert.deepEqual(startedAgent().tools, toolNames.filter(tool => tool !== 'github_read' && tool !== 'github_merge'));
+
+  // A host that also carries GitHub reads and merges gets every tool.
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true } }));
+  const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
+  assert.notEqual(third.agentVersionId, second.agentVersionId);
   assert.deepEqual(startedAgent().tools, [...toolNames]);
 });
 
