@@ -25,11 +25,13 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
-    ...(grants ? { permissions: grants } : {}) };
+    ...(grants ? { permissions: grants } : {}),
+    ...(row.activity ? { activity: row.activity } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions'> {
-  // Visibility is live control-plane policy, never part of the immutable runner binding.
-  const { visibility: _visibility, permissions: _permissions, ...record } = sessionRecord(row);
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity'> {
+  // Visibility is live control-plane policy and activity is what the host reports, so neither is part of the
+  // immutable runner binding.
+  const { visibility: _visibility, permissions: _permissions, activity: _activity, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {

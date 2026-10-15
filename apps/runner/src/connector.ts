@@ -10,7 +10,8 @@ import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
 import type { SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryLimits } from "../../../packages/shared/src/repositories.js";
-import type { AuthorizationRequest, AuthorizationResult, GitHubIssueView, RunnerAction, RunnerBinding } from "../../../packages/shared/src/types.js";
+import type { AuthorizationRequest, AuthorizationResult, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
+import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
@@ -421,6 +422,7 @@ export class LocalConnector {
         resources: this.options.resources, unsandboxed: this.options.unsandboxed === true,
         resolveModels: model => { this.requireGeneration(generation); return this.options.localModels.resolve(model); },
         authorize: request => this.authorize(generation, request),
+        reportActivity: (sessionId, activity) => this.reportActivity(generation, sessionId, activity),
         githubComment: async request => {
           const payload = {
             sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId,
@@ -561,6 +563,25 @@ export class LocalConnector {
     }).strict().parse(await this.callback(generation, "/api/connectors/self/authorize", payload));
     if (result.ownerId !== request.ownerId) throw new Error("Invalid authorization response");
     return result;
+  }
+
+  /**
+   * Tells the control plane what a session's agent is doing. A refusal is final for that report: a control plane that
+   * predates activity reports refuses them all, and one that no longer lets this host serve the session refuses its own.
+   * Anything else throws, so the session retries it.
+   */
+  private async reportActivity(generation: Generation, sessionId: string, activity: SessionActivity): Promise<void> {
+    if (!IDENTIFIER.test(sessionId) || !sessionActivities.includes(activity)) throw new Error("Invalid activity report");
+    this.requireGeneration(generation);
+    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)]);
+    const response = await (this.options.fetch ?? fetch)(`${this.state!.controlPlaneUrl}/api/connectors/self/activity`, {
+      method: "POST", redirect: "error", credentials: "omit",
+      headers: { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken!, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId, activity }), signal,
+    });
+    await response.body?.cancel();
+    this.requireGeneration(generation);
+    if (!response.ok && (response.status >= 500 || response.status === 408 || response.status === 429)) throw new Error("Activity report unavailable");
   }
 
   private async readBackup(generation: Generation, restore: RestoreDescriptor, targetSessionId: string): Promise<Uint8Array> {

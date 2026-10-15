@@ -45,6 +45,14 @@ export interface AgentVersion {
 }
 /** Stored when an agent version is saved without a name; name, description and instructions are optional. */
 export const defaultAgentName = "Untitled agent";
+/**
+ * What a session's agent is doing. `working`: a message is queued or running, or an approved operation runs.
+ * `waiting`: a permission request holds a running message, or, once the queue is idle, an approval awaits a decision.
+ * `done` and `failed`: how the latest shared message ended; `failed` when its model request failed, Pi ended it without
+ * an answer, or it was stopped before it ran. `idle`: no shared message yet.
+ */
+export const sessionActivities = ["idle", "working", "waiting", "done", "failed"] as const;
+export type SessionActivity = (typeof sessionActivities)[number];
 export interface SessionRecord {
   id: string;
   workspaceId: string;
@@ -62,6 +70,8 @@ export interface SessionRecord {
   visibility?: "private" | "workspace";
   // Present only on single-session reads: the pinned host explicitly runs without isolation.
   hostUnsandboxed?: boolean;
+  /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
+  activity?: SessionActivity;
 }
 export interface SessionGrant {
   userId: string;
@@ -355,6 +365,8 @@ export interface SessionView {
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
   /** Access mode of the latest shared-conversation submission; absent means "approval". */
   access?: AccessMode;
+  /** What the agent is doing now; absent from runners that predate activity reports. */
+  activity?: SessionActivity;
 }
 export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof thinkingLevels)[number];

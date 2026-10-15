@@ -9,7 +9,7 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createRegistry, defineDoc, Harness, type ConversationId } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { sha256 } from "../packages/shared/src/crypto.js";
-import type { AuthorizationRequest, Permission, RunnerAction, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult } from "../packages/shared/src/types.js";
+import type { AuthorizationRequest, Permission, RunnerAction, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult } from "../packages/shared/src/types.js";
 import { requestKey, RunnerError } from "../apps/runner/src/protocol.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 import { RunnerService } from "../apps/runner/src/server.js";
@@ -110,7 +110,7 @@ async function pauseQueue(session: RunnerSession): Promise<() => void> {
   return () => { scheduler.drainQueue = drain; drain.call(session); };
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, { reportActivity = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "runner-queue-"));
   const input = binding();
   const grants: Record<string, Permission[]> = {
@@ -119,8 +119,11 @@ async function fixture(t: TestContext) {
   };
   const calls: AuthorizationRequest[] = [];
   const gates: { actorId: string; permission: Permission; remaining: number; entered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> }[] = [];
+  const reports: [string, SessionActivity][] = [];
   const config: RunnerConfig = {
     dataDir: directory, sharedSecret: SECRET, controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true,
+    // As a connected runner reports to the control plane.
+    ...(reportActivity ? { reportActivity: async (sessionId: string, activity: SessionActivity) => { reports.push([sessionId, activity]); } } : {}),
     authorize: async request => {
       calls.push({ ...request });
       for (const gate of gates) {
@@ -142,7 +145,12 @@ async function fixture(t: TestContext) {
   await service.initialize();
   const session = await service.provision(input, await ticket(input.session.id, "create"));
   return {
-    session, grants, calls,
+    session, grants, calls, reports,
+    /** Waits for the runner to report `activity`; reports follow each change once it settles. */
+    async reported(activity: SessionActivity) {
+      for (let count = 0; count < 250 && reports.at(-1)?.[1] !== activity; count++) await delay(20);
+      assert.deepEqual(reports.at(-1), [input.session.id, activity], `reports so far: ${JSON.stringify(reports)}`);
+    },
     gateTool(actorId: string, mode: Mode) {
       // A fresh submit authorizes admission, activation, then its first tool. Blocking
       // the third call leaves the runner lock free, so other jobs can be durably queued.
@@ -407,6 +415,35 @@ test("revoking the original queued actor interrupts its job before pi activation
   sameReceipt(retry, forbidden);
   assert.equal(retry.status, "interrupted", "regranting must not replay an interrupted receipt");
   assert.deepEqual(await f.session.view(), view);
+});
+
+test("connected runners report what the agent is doing as it changes, as their views show it", options, async t => {
+  const f = await fixture(t, { reportActivity: true });
+  await f.reported("idle");
+  assert.equal((await f.session.view()).activity, "idle");
+  const gate = f.gateTool(OWNER, "write");
+  await submit(f.session, OWNER, "write", { content: "TEST_IDENTITY", requestId: "activity" });
+  await gate.entered();
+  assert.equal((await f.session.view()).activity, "working");
+  await f.reported("working");
+  gate.release();
+  assert.equal((await idle(f.session)).activity, "done");
+  await f.reported("done");
+  assert.deepEqual(f.reports.map(([, activity]) => activity), ["idle", "working", "done"], "one report per change");
+});
+
+test("a shared message stopped before it ran leaves the session failed", options, async t => {
+  const f = await fixture(t, { reportActivity: true });
+  const gate = f.gateTool(OWNER, "write");
+  await submit(f.session, OWNER, "write", { content: "TEST_IDENTITY", requestId: "active" });
+  await gate.entered();
+  await submit(f.session, WRITER, "write", { content: "TEST_IDENTITY", requestId: "revoked" });
+  f.grants[WRITER] = ["read"];
+  gate.release();
+  const view = await idle(f.session);
+  assert.deepEqual(queue(view).map(run => run.status), ["settled", "interrupted"]);
+  assert.equal(view.activity, "failed");
+  await f.reported("failed");
 });
 
 test("backup refuses a queued-only session, not just an active pi generation", options, async t => {

@@ -3,12 +3,11 @@ import type { SessionRecord } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { href, navigate } from "./router";
-import { Button, EmptyState, Feedback, Field, IdentityBadge, InfoTip, LinkButton, PageLoading, RelativeTime, Row, ScreenHeader, Section, Sheet, StatusDot, useAction, type Tone } from "./ui";
+import { sessionStatus } from "./session-status";
+import { Button, EmptyState, Feedback, Field, IdentityBadge, InfoTip, LinkButton, PageLoading, RelativeTime, Row, ScreenHeader, Section, Sheet, StatusDot, useAction } from "./ui";
 import "./new-session.css";
 
 const PAGE_SIZE = 50;
-
-const statusTone: Record<SessionRecord["status"], Tone> = { ready: "success", provisioning: "running", error: "danger", archived: "neutral" };
 
 export function SessionsScreen() {
   const { user, sessions, sessionsLoading, workspaces, currentWorkspace } = useApp();
@@ -62,10 +61,11 @@ export function SessionsScreen() {
           {group.sessions.slice(0, limit).map(session => {
             const isOwner = session.ownerId === user.id;
             const viewerOnly = !isOwner && session.permissions?.includes("read") && session.permissions.every(permission => permission === "read");
+            const status = sessionStatus(session);
             return <Row key={session.id} href={href({ name: "session", sessionId: session.id })} chevron
-              leading={<StatusDot tone={statusTone[session.status]} label={session.status} />}
+              leading={<StatusDot tone={status.tone} label={status.label ? undefined : session.status} />}
               title={<span className="truncate">{session.title}</span>}
-              hint={<>{session.status === "archived" ? "Archived · " : ""}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
+              hint={<>{status.label && <><span className={`session-status ${status.tone}`}>{status.label}</span> · </>}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
           })}
           {group.sessions.length > limit && <div className="sessions-more"><Button variant="ghost" size="sm" block onClick={() => setLimits(current => ({ ...current, [group.id]: limit + PAGE_SIZE }))}>Load more</Button></div>}
         </Section>;
