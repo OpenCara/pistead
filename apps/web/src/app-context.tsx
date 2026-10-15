@@ -49,9 +49,11 @@ export function AppProvider({ user, setUser, signOut, children }: { user: UserPr
     setWorkspaceId(id);
     try { localStorage.setItem(WORKSPACE_KEY, id); } catch { /* Private mode keeps the in-memory choice. */ }
   }, []);
-  // Keep the sidebar current without a manual refresh, sooner while an agent is at work; paused while the tab is hidden.
+  // Keep the sidebar current without a manual refresh, sooner while an agent is at work, here or as last listed; paused
+  // while the tab is hidden. Waiting lasts as long as an undecided approval card, so it keeps the slower pace.
   const refreshSessions = sessions.refresh;
-  const working = (sessions.data?.sessions ?? []).some(session => session.status !== "archived" && session.activity === "working");
+  const working = liveActivity?.activity === "working"
+    || (sessions.data?.sessions ?? []).some(session => session.status !== "archived" && session.activity === "working");
   useEffect(() => {
     const timer = window.setInterval(() => { if (!document.hidden) refreshSessions(); }, working ? 10_000 : 30_000);
     return () => window.clearInterval(timer);
