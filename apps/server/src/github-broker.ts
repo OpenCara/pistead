@@ -434,14 +434,15 @@ export async function githubRead(c: AppContext, connectorId: string | null): Pro
       fail(403, 'permission_revoked', 'The requester can no longer write to this session.');
     }
     await requireCallbackScope(c, access.row, connectorId);
-    const admission = await c.env.DB.query<{ session_id: string; actor_id: string; mode: string; expires_at: number }>(
-      'SELECT session_id, actor_id, mode, expires_at FROM run_admissions WHERE id = ?').bind(admissionId).first();
+    const admission = await c.env.DB.query<{ id: string; session_id: string; actor_id: string; mode: string; access: string | null; expires_at: number }>(
+      'SELECT id, session_id, actor_id, mode, access, expires_at FROM run_admissions WHERE id = ?').bind(admissionId).first();
     if (!admission || admission.session_id !== sessionId || admission.actor_id !== actorId || admission.mode !== 'write'
       || admission.expires_at <= Math.floor(Date.now() / 1000)) {
       fail(403, 'github_read_not_admitted', 'GitHub reads need a write message from the requester sent within the last hour.');
     }
-    // A one-call grant covers only the read its owner saw: this requester, message, repository and number.
-    await requireToolCall(c.env, access.row, 'github_read', { id: callId, requestedBy: actorId, admissionId, target: `${repository}#${number}` });
+    // A one-call grant covers only the read its owner saw: this requester, message, repository and number. The owner's
+    // Auto-approve message needs no grant.
+    await requireToolCall(c.env, access.row, 'github_read', { id: callId, requestedBy: actorId, admission, target: `${repository}#${number}` });
     return access.row;
   };
   const row = await authorize();

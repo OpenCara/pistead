@@ -408,6 +408,20 @@ test("only the host's owner lets a command run without the resource limits the h
   const ran = await own.decide({ ...await ticket("limitless-own", "approve"), connectorId }, command.id, { decision: "approve", operation: command.operation });
   assert.equal(ran.status, "executed");
   assert.match(ran.result ?? "", /unlimited-marker/);
+
+  // The host's owner auto-approving their own message runs the command at once, without either card.
+  const auto = await start("limitless-auto", "test:alice", "echo auto-unlimited-marker");
+  await auto.submit({ ...await ticket("limitless-auto", "submit"), connectorId }, { content: "TEST_BASH echo auto-unlimited-marker", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
+  const first = await permissionRequest(auto);
+  await auto.decide({ ...await ticket("limitless-auto", "approve"), connectorId }, first.id, { decision: "deny", operation: first.operation });
+  await idle(auto);
+  const autoView = await auto.view();
+  assert.equal(autoView.approvals.filter(approval => approval.operation.kind === "permission").length, 1, "only the default-access message asked");
+  const automatic = autoView.approvals.find(approval => approval.operation.kind === "bash");
+  assert.equal(automatic?.status, "executed");
+  assert.equal(automatic!.automatic, true);
+  assert.equal(automatic!.unbounded, true);
+  assert.match(automatic!.result ?? "", /auto-unlimited-marker/);
 });
 
 test("shell commands may reserve address space they never touch, as gh and node do when they start", { skip: process.platform !== "linux" }, async t => {
@@ -515,6 +529,27 @@ test("a tool outside the agent waits for its owner, who allows it once or for th
   assert.deepEqual(pending.map(approval => approval.operation), ["echo once", "echo again", "echo granted"].map(command => ({ kind: "bash", command })));
   assert.equal((await session.createApproval("test:alice", { kind: "bash", command: "echo explicit" })).status, "pending");
   await assert.rejects(session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation }), rejectedWith(409, /already been decided/));
+});
+
+test("auto access runs a tool outside the agent without a permission card", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const id = "permission-auto";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: ["identity", "read_file"] } }, await ticket(id, "create"));
+  await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo auto-tool-marker", requestId: "auto", options: { access: "auto" } }, "write");
+  await idle(session);
+  const view = await session.view();
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission"), [], "auto-approve asks nothing");
+  const command = view.approvals.find(approval => approval.operation.kind === "bash");
+  assert.equal(command?.status, "executed");
+  assert.equal(command!.automatic, true);
+  assert.match(command!.result ?? "", /auto-tool-marker/);
+  // Auto-approve covers its own message only: the next one asks again.
+  await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo after", requestId: "after" }, "write");
+  const request = await permissionRequest(session);
+  assert.deepEqual(request.operation, { kind: "permission", tool: "bash", target: "echo after", needs: ["tool"] });
+  await session.decide(await ticket(id, "approve"), request.id, { decision: "deny", operation: request.operation });
+  await idle(session);
 });
 
 test("allowing a tool for the session lets the round's other waiting calls of it go ahead", hostMode, async t => {
