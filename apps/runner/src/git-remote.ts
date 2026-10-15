@@ -4,6 +4,44 @@ const OID = /^[0-9a-f]{40}$/;
 const MAX_PKT = 65520;
 const MAX_ADVERTISEMENT = 8 * 1024 * 1024;
 const MAX_REPORT = 1024 * 1024;
+/** Bounds for one full-history cache fetch; the request body stays well under typical forge limits. */
+const MAX_WANTS = 50_000;
+const MAX_HAVES = 4096;
+
+/** Structured progress, parsed from Git's own progress lines; raw remote text is never forwarded. */
+export type GitProgressPhase = "enumerating" | "counting" | "compressing" | "receiving" | "resolving";
+export interface GitProgress { phase: GitProgressPhase; percent: number | null; done: number | null; total: number | null }
+
+const PROGRESS = /^(?:remote: )?(Enumerating|Counting|Compressing|Receiving|Resolving) (?:objects|deltas):\s+(?:(\d{1,3})% \((\d{1,12})\/(\d{1,12})\)|(\d{1,12}))/;
+
+/** Parses one Git progress line ("Counting objects:  45% (450/1000)" or "Enumerating objects: 1000, done."). */
+export function parseGitProgress(line: string): GitProgress | null {
+  const match = PROGRESS.exec(line);
+  if (!match) return null;
+  const phase = match[1]!.toLowerCase() as GitProgressPhase;
+  if (match[5] !== undefined) return { phase, percent: null, done: Number(match[5]), total: null };
+  return { phase, percent: Math.min(100, Number(match[2])), done: Number(match[3]), total: Number(match[4]) };
+}
+
+/** Splits a byte stream of progress output into lines at CR or LF, bounding any single line. */
+export class ProgressLines {
+  private pending = "";
+  private readonly onLine: (line: string) => void;
+  constructor(onLine: (line: string) => void) { this.onLine = onLine; }
+  push(chunk: Uint8Array): void {
+    const parts = (this.pending + new TextDecoder("latin1").decode(chunk)).split(/[\r\n]/);
+    this.pending = parts.pop()!.slice(-1024);
+    for (const part of parts) if (part) this.onLine(part.slice(0, 1024));
+  }
+  end(): void { if (this.pending) this.onLine(this.pending); this.pending = ""; }
+}
+
+/** Branch and tag names a cache may mirror; anything Git itself would refuse to store is skipped. */
+function mirrorableRef(ref: string): boolean {
+  return /^refs\/(?:heads|tags)\/./.test(ref) && ref.length <= 1024 && !/[\x00-\x20\x7f~^:?*[\\]/.test(ref)
+    && !ref.includes("..") && !ref.includes("@{") && !ref.endsWith("/") && !ref.endsWith(".")
+    && !ref.split("/").some(part => !part || part.startsWith(".") || part.endsWith(".lock"));
+}
 
 export class GitRemoteError extends Error {
   constructor(message: string, readonly status?: number) { super(message); this.name = "GitRemoteError"; }
@@ -107,16 +145,17 @@ class PktReader {
     }
   }
 
-  /** Side-band-64k payload of band 1 until flush; progress dropped, band 3 is fatal. */
-  async *sideband(): AsyncGenerator<Uint8Array> {
+  /** Side-band-64k payload of band 1 until flush; band 2 goes to `progress` (or is dropped), band 3 is fatal. */
+  async *sideband(progress?: ProgressLines): AsyncGenerator<Uint8Array> {
     for (;;) {
       const next = await this.read();
-      if (!next || next.kind === "flush") return;
+      if (!next || next.kind === "flush") { progress?.end(); return; }
       if (next.kind !== "data" || next.data.length < 1) throw new GitRemoteError("Git remote sent a malformed side-band packet");
       const band = next.data[0];
       if (band === 1) yield next.data.subarray(1);
       else if (band === 3) throw new GitRemoteError("Git remote reported an error");
-      else if (band !== 2) throw new GitRemoteError("Git remote sent a malformed side-band packet");
+      else if (band === 2) progress?.push(next.data.subarray(1));
+      else throw new GitRemoteError("Git remote sent a malformed side-band packet");
     }
   }
 
@@ -261,6 +300,110 @@ export class GitRemote {
   async receivePackAdvertisement(): Promise<{ refs: Map<string, string>; capabilities: Set<string> }> {
     const { refs, capabilities } = await this.advertisement("git-receive-pack", false);
     return { refs, capabilities };
+  }
+
+  /** Branch and tag tips (unpeeled) the remote advertises for upload-pack; names Git could not store are skipped. */
+  async listRefs(): Promise<Map<string, string>> {
+    const advertised = await this.advertisement("git-upload-pack", true);
+    const refs = new Map<string, string>();
+    if (advertised.version === 0) {
+      for (const [ref, id] of advertised.refs) if (mirrorableRef(ref)) refs.set(ref, id);
+      return refs;
+    }
+    if (![...advertised.capabilities].some(cap => cap === "ls-refs" || cap.startsWith("ls-refs="))) throw new GitRemoteError("Git remote does not support ls-refs");
+    const lines = [pkt("command=ls-refs\n"), pkt(`agent=${this.agent}\n`)];
+    if (advertised.capabilities.has("object-format=sha1")) lines.push(pkt("object-format=sha1\n"));
+    lines.push(DELIM, pkt("ref-prefix refs/heads/\n"), pkt("ref-prefix refs/tags/\n"), FLUSH);
+    const response = await this.request("/git-upload-pack", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-git-upload-pack-request", Accept: "application/x-git-upload-pack-result", "Git-Protocol": "version=2" },
+      body: streamOf([concat(lines)]),
+    }, "application/x-git-upload-pack-result");
+    const reader = bodyReader(response, MAX_ADVERTISEMENT);
+    try {
+      for (let next = await reader.expect(); next.kind !== "flush"; next = await reader.expect()) {
+        const line = text(next);
+        if (line === undefined) throw new GitRemoteError("Git remote sent a malformed ref listing");
+        const [id, ref] = line.split(" ");
+        if (id === undefined || ref === undefined) throw new GitRemoteError("Git remote sent a malformed ref listing");
+        if (mirrorableRef(ref)) refs.set(ref, oid(id));
+      }
+    } finally {
+      await reader.close();
+    }
+    return refs;
+  }
+
+  /**
+   * Full-history pack of `wants` minus what `haves` already reach: no depth, no filter, no thin pack, so a
+   * repository that holds the haves can index it with no further remote access. Band 2 progress lines go to
+   * `onProgress`; the remote must allow wanting non-tip commits when a want is not an advertised tip.
+   */
+  async fetchHistory(input: { wants: readonly string[]; haves: readonly string[]; onProgress?: (line: string) => void }): Promise<AsyncIterable<Uint8Array>> {
+    const wants = [...new Set(input.wants.map(oid))];
+    const haves = [...new Set(input.haves.map(oid))].slice(0, MAX_HAVES);
+    if (!wants.length || wants.length > MAX_WANTS) throw new GitRemoteError("Git fetch needs between one and 50000 wanted commits");
+    const progress = input.onProgress ? new ProgressLines(input.onProgress) : undefined;
+    const advertised = await this.advertisement("git-upload-pack", true);
+    if (advertised.version === 2) {
+      const fetchLine = [...advertised.capabilities].find((cap) => cap === "fetch" || cap.startsWith("fetch="));
+      if (!fetchLine) throw new GitRemoteError("Git remote does not support fetch");
+      const lines = [pkt("command=fetch\n"), pkt(`agent=${this.agent}\n`)];
+      if (advertised.capabilities.has("object-format=sha1")) lines.push(pkt("object-format=sha1\n"));
+      lines.push(DELIM, pkt("ofs-delta\n"), ...(progress ? [] : [pkt("no-progress\n")]));
+      for (const id of wants) lines.push(pkt(`want ${id}\n`));
+      for (const id of haves) lines.push(pkt(`have ${id}\n`));
+      lines.push(pkt("done\n"), FLUSH);
+      const response = await this.request("/git-upload-pack", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-git-upload-pack-request", Accept: "application/x-git-upload-pack-result", "Git-Protocol": "version=2" },
+        body: streamOf([concat(lines)]),
+      }, "application/x-git-upload-pack-result");
+      const reader = bodyReader(response);
+      try {
+        for (;;) {
+          const header = text(await reader.expect());
+          if (header === "packfile") break;
+          if (header !== "acknowledgments" && header !== "shallow-info") throw new GitRemoteError("Git remote sent a malformed fetch response");
+          for (let next = await reader.expect(); next.kind !== "delim"; next = await reader.expect()) {
+            if (text(next) === undefined) throw new GitRemoteError("Git remote sent a malformed fetch response");
+          }
+        }
+      } catch (error) {
+        await reader.close();
+        throw error;
+      }
+      return guarded(reader, reader.sideband(progress));
+    }
+    const caps = advertised.capabilities;
+    const tips = new Set(advertised.refs.values());
+    if (wants.some(id => !tips.has(id)) && !caps.has("allow-reachable-sha1-in-want") && !caps.has("allow-tip-sha1-in-want")) {
+      throw new GitRemoteError("Git remote does not allow fetching this commit");
+    }
+    const sideband = caps.has("side-band-64k");
+    const first = ["want", wants[0]!];
+    if (sideband) first.push("side-band-64k");
+    if (caps.has("ofs-delta")) first.push("ofs-delta");
+    if (caps.has("no-progress") && !progress) first.push("no-progress");
+    first.push(`agent=${this.agent}`);
+    const lines = [pkt(`${first.join(" ")}\n`), ...wants.slice(1).map(id => pkt(`want ${id}\n`)), FLUSH];
+    for (const id of haves) lines.push(pkt(`have ${id}\n`));
+    lines.push(pkt("done\n"));
+    const response = await this.request("/git-upload-pack", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-git-upload-pack-request", Accept: "application/x-git-upload-pack-result" },
+      body: streamOf([concat(lines)]),
+    }, "application/x-git-upload-pack-result");
+    const reader = bodyReader(response);
+    try {
+      // Without multi_ack the server answers with one ACK for the first common object, or NAK if there is none.
+      const answer = text(await reader.expect());
+      if (answer !== "NAK" && !(answer?.startsWith("ACK ") && OID.test(answer.slice(4, 44)))) throw new GitRemoteError("Git remote sent a malformed fetch response");
+    } catch (error) {
+      await reader.close();
+      throw error;
+    }
+    return guarded(reader, sideband ? reader.sideband(progress) : reader.rest());
   }
 
   async fetchCommit(commit: string): Promise<{ pack: AsyncIterable<Uint8Array>; shallow: string[]; filtered: boolean }> {
