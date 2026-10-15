@@ -32,7 +32,7 @@ interface Host { owner: string; gitCredentials?: boolean }
 const connectorToken = 'connector-token'.padEnd(43, 'x');
 const connectionToken = 'connection-token'.padEnd(43, 'y');
 
-async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbucketWrite?: boolean; host?: Host } = {}) {
+async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbucketWrite?: boolean; host?: Host; tools?: string[] } = {}) {
   const { db, sqlite } = await testDatabase();
   t.after(() => db.close());
   const env: Env = { DB: db, APP_ORIGIN: 'http://localhost:8787', TEST_AUTH_ENABLED: 'true',
@@ -61,7 +61,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
     .run('model', 'workspace', 'model', 'faux', 'faux-1', createdAt, host ? 'connector' : null, host?.owner ?? null);
   sqlite.prepare('INSERT INTO agents (id,author_id,created_at) VALUES (?,?,?)').run('agent', owner, createdAt);
   sqlite.prepare('INSERT INTO agent_versions (id,agent_id,author_id,version,name,description,instructions,tools_json,model_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
-    .run('version', 'agent', owner, 1, 'agent', '', '', '["git_push"]', 'model', createdAt);
+    .run('version', 'agent', owner, 1, 'agent', '', '', JSON.stringify(options.tools ?? ['git_push']), 'model', createdAt);
   for (const [bindingId, provider, host, repositoryId, fullName] of [
     ['binding-gh', 'github', 'github.com', '101', 'owner/repo'], ['binding-bb', 'bitbucket', 'bitbucket.org', bitbucketPin.repositoryId, 'team/repo'],
     ['binding-gl', 'gitlab', 'gitlab.com', '301', 'group/project'], ['binding-gt', 'gitea', 'git.acme.dev', '42', 'acme/tools'],
@@ -271,6 +271,18 @@ test('automatic pushes require an unexpired auto-approve admission from the owne
   const duplicate = await f.post(credential, { sessionId: 'session', approvalId: 'tool-auto-4', actorId: owner, operation: op, admissionId });
   assert.equal(duplicate.status, 409);
   assert.equal(await code(duplicate), 'push_attempt_exists');
+  assert.equal(f.ledger().length, 1);
+});
+
+test('the owner\'s auto-approve admission covers git_push even when the agent lacks it; an explicit push still needs the tool', async t => {
+  const f = await fixture(t, { tools: [] });
+  const op = f.operation();
+  const issued = await f.post(credential, { sessionId: 'session', approvalId: 'tool-auto', actorId: owner, operation: op, admissionId: f.admit('auto') });
+  assert.equal(issued.status, 200);
+  assert.equal(f.ledger()[0]!.automatic, 1);
+  const explicit = await f.post(credential, { sessionId: 'session', approvalId: 'explicit', actorId: owner, operation: op, capability: await f.approve('explicit', op) });
+  assert.equal(explicit.status, 403);
+  assert.equal(await code(explicit), 'tool_not_allowed');
   assert.equal(f.ledger().length, 1);
 });
 

@@ -109,8 +109,8 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
     if (access === "auto" && value.access !== "auto" && !await confirmDialog({
       title: "Auto-approve commands?",
       message: unsandboxed
-        ? `Commands the agent writes will run immediately on ${host!.name}, an UNSANDBOXED host: directly on the owner's machine with their full user permissions and network access, and no resource limits. GitHub comments and merges still need approval.`
-        : "Commands and commits the agent writes will run immediately as you, without asking. GitHub comments and merges still need approval.",
+        ? `Commands, commits and pushes the agent writes will run immediately on ${host!.name}, an UNSANDBOXED host: commands run directly on the owner's machine with their full user permissions and network access, and no resource limits. Tools outside the agent won't ask either. GitHub comments and merges still need approval.`
+        : "Commands, commits and pushes the agent writes will run immediately as you, without asking, as will tools outside the agent and commands on a host without resource limits. GitHub comments and merges still need approval.",
       confirmLabel: "Enable auto-approve",
       destructive: true,
     })) return;

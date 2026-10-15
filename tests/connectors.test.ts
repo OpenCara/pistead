@@ -1266,6 +1266,56 @@ test('broker callbacks require github_comment in the immutable pinned agent even
   assert.equal(f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(payload.capability))!.consumed_at, null);
 });
 
+test('the owner\'s Auto-approve message lets its tool calls use tools the agent lacks, and no other message does', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']); const fetch = githubFetch(t);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['write', 'approve'] }));
+  const owner = s.creator.user.id;
+  const admission = (actorId: string, access: string | null) => {
+    const id = token();
+    f.sqlite.prepare(`INSERT INTO run_admissions (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at,access) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(id, s.session.id, actorId, 'write', `request-${id}`, 'h'.repeat(43), Math.floor(Date.now() / 1000) + 600, new Date().toISOString(), access);
+    return id;
+  };
+  const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
+  const approval = (id: string, requestedBy: string, admissionId: string): ApprovalRecord =>
+    ({ id, sessionId: s.session.id, requestedBy, operation, admissionId, status: 'pending', createdAt: new Date().toISOString() });
+  // The agent has neither github_comment nor any grant for it.
+  const approvals = [
+    approval('tool-auto', owner, admission(owner, 'auto')),
+    approval('tool-asking', owner, admission(owner, 'approval')),
+    approval('tool-teammate', s.admin.user.id, admission(s.admin.user.id, 'auto')),
+  ];
+  let capability = '';
+  rpcHub(f, s.connector, envelope => {
+    if (envelope.request.ticket.action === 'view') return Response.json({ view: {
+      sessionId: s.session.id, owner: { id: owner, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: false,
+    } });
+    const input: unknown = JSON.parse(envelope.request.body);
+    assert.ok(input && typeof input === 'object' && 'brokerCapability' in input && typeof input.brokerCapability === 'string');
+    capability = input.brokerCapability;
+    return Response.json({ approval: { ...approvals[0], status: 'approved' } });
+  });
+  const path = `/api/sessions/${s.session.id}`;
+  const { view } = await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`));
+  const presented = Object.fromEntries(view.approvals.map(item => [item.id, item]));
+  // Only the owner's Auto-approve call is reviewable; a call of an asking message, or a teammate's, still needed a card.
+  assert.equal(presented['tool-auto'].status, 'pending');
+  assert.ok(presented['tool-auto'].reviewHash);
+  for (const id of ['tool-asking', 'tool-teammate']) {
+    assert.equal(presented[id].status, 'interrupted');
+    assert.equal(presented[id].reviewHash, undefined);
+  }
+  // The comment itself still waits for a human, and that approval and the broker accept the tool.
+  await json(await s.admin.request('POST', `${path}/approvals/tool-auto`, { decision: 'approve', reviewHash: presented['tool-auto'].reviewHash }));
+  assert.match(capability, /^[A-Za-z0-9_-]{43}$/);
+  await json(await self(f, s.connector, 'github/comment', {
+    sessionId: s.session.id, actorId: s.admin.user.id, approvalId: 'tool-auto', capability,
+    repository: operation.repository, issue: operation.issue, body: operation.body,
+  }));
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
 test('github merges need a pinned repository, consume their capability once, and tell GitHub refusals apart from unknown outcomes', async t => {
   const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_merge']);
   let answer = () => Response.json({ merged: true, sha: mergedSha, message: 'Pull Request successfully merged' });
