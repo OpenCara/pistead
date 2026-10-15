@@ -164,7 +164,7 @@ function SessionPane({ id }: { id: string }) {
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
     if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
-    // The card is the prompt: it shows the exact operation, its resource limits and any unsandboxed-host warning, so a click decides at once.
+    // The card is the prompt: it shows the exact operation, who it runs as, its resource limits and any unsandboxed-host warning, so a click decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
       : decision === "approve" ? "Approval decision recorded" : "Operation denied";
@@ -219,7 +219,7 @@ function SessionPane({ id }: { id: string }) {
                 </div> : <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve")}>Approve</Button>
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
-                  <span className="muted small">Each approval covers one exact operation and its arguments</span>
+                  <span className="muted small">Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""} · each approval covers one exact operation and its arguments</span>
                 </div>}
               </> : <p className="muted small">{permission ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
