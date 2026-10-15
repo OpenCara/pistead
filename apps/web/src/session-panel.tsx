@@ -231,7 +231,7 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <HostSection session={session} user={user} hosts={hosts} />
     <RepositoriesSection session={session} refresh={refresh} />
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
-    {isOwner && <BackupsSection session={session} actions={actions} openSession={openSession} />}
+    {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
     {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
     <AccessSection session={session} view={view} user={user} />
   </div>;
@@ -288,8 +288,10 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
   const viewerOnly = !isOwner && !ownPermissions.some(permission => permission !== "read");
   const grantable = permissions.filter(permission => ownPermissions.includes(permission) || (permission === "read" && ownPermissions.length > 0));
   const canManage = ownPermissions.includes("manage");
+  // An archived session admits only read requests, so its grants can't be loaded or changed until it is unarchived.
+  const archived = session.status === "archived";
   const base = `/api/sessions/${segment(session.id)}`;
-  const grants = useResource<{ grants: SessionGrant[] }>(canManage ? `${base}/grants` : null);
+  const grants = useResource<{ grants: SessionGrant[] }>(canManage && !archived ? `${base}/grants` : null);
   const [userId, setUserId] = useState("");
   const [selected, setSelected] = useState<Permission[]>([]);
   const target = userId.trim();
@@ -346,9 +348,9 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
         : "Only the owner and people with a grant can view prompts and output"}. {isOwner
         ? visibility === "workspace" ? "Making it private keeps explicit grants and can't recall content already viewed or copied" : "Before sharing, check existing prompts, tool output and side asks for secrets"
         : "Only the session owner can change visibility"}</>}
-      trailing={isOwner && session.status !== "archived" && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
+      trailing={isOwner && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
-    {canManage ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
+    {canManage && !archived ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
       <ResourceState {...grants} retry={grants.refresh}>
         {grants.data && <form onSubmit={saveGrant}>
           <fieldset disabled={form.busy} className="stack">
@@ -379,7 +381,7 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
           </fieldset>
         </form>}
       </ResourceState>
-    </Collapsible> : <Row leading={<Icon name="users" size={16} />} title="Grants" hint="Managing grants requires manage permission" />}
+    </Collapsible> : <Row leading={<Icon name="users" size={16} />} title="Grants" hint={canManage ? "Unarchive the session to manage grants" : "Managing grants requires manage permission"} />}
     {(form.error || form.notice) && <CardBody><Feedback {...form} /></CardBody>}
   </Section>;
 }
@@ -395,7 +397,7 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
       <Button variant="outline" size="sm" disabled={actions.backupBlocked || actions.action.busy} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
     </div>}
   >
-    {actions.backupBlocked && <Row title="Backup unavailable right now" hint={session.status === "archived" ? "Unarchive the session to create a backup" : "Unavailable while work is queued or running, or the live state can't be confirmed"} />}
+    {actions.backupBlocked && <Row title="Backup unavailable right now" hint="Unavailable while work is queued or running, or the live state can't be confirmed" />}
     {backup && <Row
       leading={<Icon name="check" size={16} />}
       title={<>Backup created <Timestamp value={backup.createdAt} /></>}
