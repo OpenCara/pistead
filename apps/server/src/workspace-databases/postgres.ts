@@ -5,7 +5,7 @@ import pg from 'pg';
 import { resolveDatabaseHost, type HostLookup } from './hosts.js';
 import {
   WorkspaceDatabaseError, type WorkspaceBackupRef, type WorkspaceBackupSave, type WorkspaceDatabaseFailure,
-  type WorkspaceDatabaseProvider, type WorkspaceDatabaseTarget,
+  type WorkspaceDatabaseProvider, type WorkspaceDatabaseTarget, type WorkspaceImport,
 } from './types.js';
 
 const { Client } = pg;
@@ -15,19 +15,26 @@ const queryTimeoutMs = 30_000;
 const endTimeoutMs = 2_000;
 /** What a workspace database may send for anything but a snapshot: every other answer is a few small rows. */
 const controlResponseBytes = 1024 * 1024;
+/** Rows per statement when a dump is imported. */
+const importChunk = 500;
 
 /**
- * Pistead's tables in a workspace database, created when missing (in the first schema of the user's search_path).
- * Snapshots keep the exact backup bytes, canonical JSON: `convert_from(snapshot, 'UTF8')::jsonb` reads one.
+ * Pistead's tables in a workspace database, created when missing (in the first schema of the user's search_path); tables
+ * created beforehand need these columns. Snapshots keep the exact backup bytes, canonical JSON:
+ * `convert_from(snapshot, 'UTF8')::jsonb` reads one. `data` holds what an imported dump adds: a workspace's settings, or a
+ * session's grants, approvals, pushes, backups and restores, as of `data_exported_at`.
  */
-const tables: readonly { name: string; create: string }[] = [
-  { name: 'pistead_workspaces', create: `CREATE TABLE pistead_workspaces (
+const tables: readonly { name: string; columns: readonly string[]; create: string }[] = [
+  { name: 'pistead_workspaces', columns: ['id', 'name', 'owner_id', 'saved_at', 'data', 'data_exported_at'], create: `CREATE TABLE pistead_workspaces (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     owner_id TEXT NOT NULL,
-    saved_at TIMESTAMPTZ NOT NULL
+    saved_at TIMESTAMPTZ NOT NULL,
+    data JSONB,
+    data_exported_at TIMESTAMPTZ
   )` },
-  { name: 'pistead_sessions', create: `CREATE TABLE pistead_sessions (
+  { name: 'pistead_sessions', columns: ['id', 'workspace_id', 'owner_id', 'title', 'status', 'visibility', 'created_at', 'record', 'saved_at',
+    'data', 'data_exported_at'], create: `CREATE TABLE pistead_sessions (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
     owner_id TEXT NOT NULL,
@@ -36,9 +43,12 @@ const tables: readonly { name: string; create: string }[] = [
     visibility TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     record JSONB NOT NULL,
-    saved_at TIMESTAMPTZ NOT NULL
+    saved_at TIMESTAMPTZ NOT NULL,
+    data JSONB,
+    data_exported_at TIMESTAMPTZ
   )` },
-  { name: 'pistead_session_backups', create: `CREATE TABLE pistead_session_backups (
+  { name: 'pistead_session_backups', columns: ['id', 'session_id', 'workspace_id', 'owner_id', 'format', 'sha256', 'size', 'snapshot', 'created_at'],
+    create: `CREATE TABLE pistead_session_backups (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
@@ -50,6 +60,17 @@ const tables: readonly { name: string; create: string }[] = [
     created_at TIMESTAMPTZ NOT NULL
   );
   CREATE INDEX pistead_session_backups_session ON pistead_session_backups (session_id, created_at)` },
+  { name: 'pistead_audit', columns: ['id', 'workspace_id', 'session_id', 'actor_id', 'action', 'detail', 'created_at'], create: `CREATE TABLE pistead_audit (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    session_id TEXT,
+    actor_id TEXT,
+    action TEXT NOT NULL,
+    detail JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+  );
+  CREATE INDEX pistead_audit_session ON pistead_audit (session_id, created_at);
+  CREATE INDEX pistead_audit_workspace ON pistead_audit (workspace_id, created_at)` },
 ];
 /** Tables only a Pistead control plane has: such a database is never used as a workspace database. */
 const controlPlaneTables = ['workspace_databases', 'schema_migrations', 'auth_sessions'];
@@ -115,6 +136,7 @@ function classify(error: unknown): WorkspaceDatabaseError {
   if (code === '28P01' || code === '28000') failure = 'authentication_failed';
   else if (code === '3D000') failure = 'database_not_found';
   else if (code === '42501') failure = 'permission_denied';
+  else if (code === '42703' || code === '42P01') failure = 'schema_mismatch';
   else if (/^(?:ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|HOSTNAME_MISMATCH)/.test(code) || /\bSSL\b/.test(message)) failure = 'tls_failed';
   else if (unreachableCodes.includes(code) || /timeout|timed out|Connection terminated/i.test(message)) failure = 'unreachable';
   return new WorkspaceDatabaseError(failure, { cause: error });
@@ -131,11 +153,26 @@ async function transaction(client: pg.Client, work: () => Promise<void>): Promis
   }
 }
 
-/** Which of `names` are tables the session sees through its search_path. */
-async function visibleTables(client: pg.Client, names: readonly string[]): Promise<Set<string>> {
-  const { rows } = await client.query<{ name: unknown }>(`SELECT c.relname AS name FROM pg_catalog.pg_class c
+/** The columns of those of `names` that are tables the session sees through its search_path. */
+async function visibleTables(client: pg.Client, names: readonly string[]): Promise<Map<string, Set<string>>> {
+  const { rows } = await client.query<{ table_name: unknown; column_name: unknown }>(`SELECT c.relname AS table_name, a.attname AS column_name
+    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
     WHERE c.relname = ANY($1::text[]) AND c.relkind IN ('r', 'p') AND pg_catalog.pg_table_is_visible(c.oid)`, [names]);
-  return new Set(rows.map(row => row.name).filter((name): name is string => typeof name === 'string'));
+  const present = new Map<string, Set<string>>();
+  for (const { table_name: table, column_name: column } of rows) {
+    if (typeof table !== 'string' || typeof column !== 'string') continue;
+    const columns = present.get(table) ?? new Set<string>();
+    present.set(table, columns.add(column));
+  }
+  return present;
+}
+
+/** Tables an owner created beforehand must have every column Pistead writes. */
+function requireColumns(present: Map<string, Set<string>>): void {
+  for (const table of tables) {
+    const columns = present.get(table.name);
+    if (columns && table.columns.some(column => !columns.has(column))) throw new WorkspaceDatabaseError('schema_mismatch');
+  }
 }
 
 /**
@@ -145,13 +182,21 @@ async function visibleTables(client: pg.Client, names: readonly string[]): Promi
 async function provision(client: pg.Client): Promise<void> {
   const present = await visibleTables(client, [...controlPlaneTables, ...tables.map(table => table.name)]);
   if (controlPlaneTables.every(name => present.has(name))) throw new WorkspaceDatabaseError('pistead_database');
+  requireColumns(present);
   if (tables.every(table => present.has(table.name))) return;
   await transaction(client, async () => {
     // Concurrent first saves serialize here instead of racing on CREATE TABLE.
     await client.query("SELECT pg_advisory_xact_lock(hashtext('pistead.workspace-database'))");
     const current = await visibleTables(client, tables.map(table => table.name));
+    requireColumns(current);
     for (const table of tables) if (!current.has(table.name)) await client.query(table.create);
   });
+}
+
+function chunks<T>(items: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let start = 0; start < items.length; start += size) result.push(items.slice(start, start + size));
+  return result;
 }
 
 /** Postgres databases that workspace owners connect, reached over TLS and pinned to an address checked against the host policy. */
@@ -203,6 +248,7 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
         AND has_table_privilege('pistead_sessions', 'SELECT') AND has_table_privilege('pistead_sessions', 'INSERT')
           AND has_table_privilege('pistead_sessions', 'UPDATE')
         AND has_table_privilege('pistead_session_backups', 'SELECT') AND has_table_privilege('pistead_session_backups', 'INSERT')
+        AND has_table_privilege('pistead_audit', 'SELECT') AND has_table_privilege('pistead_audit', 'INSERT')
         AS allowed`);
       if (rows[0]?.allowed !== true) throw new WorkspaceDatabaseError('permission_denied');
     } catch (error) {
@@ -218,13 +264,16 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
     try {
       await provision(client);
       await transaction(client, async () => {
+        // Records are as of their save or export: a newer one is never replaced by an older one.
         await client.query(`INSERT INTO pistead_workspaces (id, name, owner_id, saved_at) VALUES ($1, $2, $3, $4)
-          ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, owner_id = EXCLUDED.owner_id, saved_at = EXCLUDED.saved_at`,
+          ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, owner_id = EXCLUDED.owner_id, saved_at = EXCLUDED.saved_at
+            WHERE pistead_workspaces.saved_at <= EXCLUDED.saved_at`,
         [workspace.id, workspace.name, workspace.ownerId, backup.createdAt]);
         await client.query(`INSERT INTO pistead_sessions (id, workspace_id, owner_id, title, status, visibility, created_at, record, saved_at)
           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
           ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, status = EXCLUDED.status, visibility = EXCLUDED.visibility,
-            record = EXCLUDED.record, saved_at = EXCLUDED.saved_at`,
+            record = EXCLUDED.record, saved_at = EXCLUDED.saved_at
+            WHERE pistead_sessions.saved_at <= EXCLUDED.saved_at`,
         [session.id, session.workspaceId, session.ownerId, session.title, session.status, session.visibility, session.createdAt,
           JSON.stringify(session.record), backup.createdAt]);
         await client.query(`INSERT INTO pistead_session_backups (id, session_id, workspace_id, owner_id, format, sha256, size, snapshot, created_at)
@@ -252,6 +301,54 @@ export class PostgresWorkspaceDatabases implements WorkspaceDatabaseProvider {
     } catch (error) {
       // The owner dropped the table: the snapshot is simply gone.
       if (errorCode(error) === '42P01') return null;
+      throw classify(error);
+    } finally {
+      await dispose(client);
+    }
+  }
+
+  async import(target: WorkspaceDatabaseTarget, data: WorkspaceImport): Promise<void> {
+    const client = await this.connect(target, controlResponseBytes);
+    const { workspace, exportedAt } = data;
+    try {
+      await provision(client);
+      await transaction(client, async () => {
+        // The workspace's name and owner come from the control plane now; its settings from the dump, as of its export.
+        await client.query(`INSERT INTO pistead_workspaces (id, name, owner_id, saved_at) VALUES ($1, $2, $3, $4)
+          ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, owner_id = EXCLUDED.owner_id, saved_at = EXCLUDED.saved_at
+            WHERE pistead_workspaces.saved_at <= EXCLUDED.saved_at`,
+        [workspace.id, workspace.name, workspace.ownerId, new Date().toISOString()]);
+        if (data.workspaceData) {
+          await client.query(`UPDATE pistead_workspaces SET data = $2::jsonb, data_exported_at = $3
+            WHERE id = $1 AND (data_exported_at IS NULL OR data_exported_at <= $3)`, [workspace.id, JSON.stringify(data.workspaceData), exportedAt]);
+        }
+        // Records and details as of the export replace older ones only; activity entries never change, so they are added once.
+        for (const sessions of chunks(data.sessions, importChunk)) {
+          await client.query(`INSERT INTO pistead_sessions (id, workspace_id, owner_id, title, status, visibility, created_at, record, saved_at)
+            SELECT s.id, $1, s.owner_id, s.title, s.status, s.visibility, s.created_at, s.record, $2
+            FROM jsonb_to_recordset($3::jsonb) AS s(id text, owner_id text, title text, status text, visibility text, created_at timestamptz, record jsonb)
+            ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, status = EXCLUDED.status, visibility = EXCLUDED.visibility,
+              record = EXCLUDED.record, saved_at = EXCLUDED.saved_at
+              WHERE pistead_sessions.saved_at <= EXCLUDED.saved_at`,
+          [workspace.id, exportedAt, JSON.stringify(sessions.map(session => ({ id: session.id, owner_id: session.ownerId, title: session.title,
+            status: session.status, visibility: session.visibility, created_at: session.createdAt, record: session.record })))]);
+          const details = sessions.flatMap(session => session.data === null ? [] : [{ id: session.id, data: session.data }]);
+          if (details.length) {
+            await client.query(`UPDATE pistead_sessions AS s SET data = d.data, data_exported_at = $2
+              FROM jsonb_to_recordset($1::jsonb) AS d(id text, data jsonb)
+              WHERE s.id = d.id AND (s.data_exported_at IS NULL OR s.data_exported_at <= $2)`, [JSON.stringify(details), exportedAt]);
+          }
+        }
+        for (const entries of chunks(data.audit, importChunk)) {
+          await client.query(`INSERT INTO pistead_audit (id, workspace_id, session_id, actor_id, action, detail, created_at)
+            SELECT a.id, $1, a.session_id, a.actor_id, a.action, a.detail, a.created_at
+            FROM jsonb_to_recordset($2::jsonb) AS a(id text, session_id text, actor_id text, action text, detail jsonb, created_at timestamptz)
+            ON CONFLICT (id) DO NOTHING`,
+          [workspace.id, JSON.stringify(entries.map(entry => ({ id: entry.id, session_id: entry.sessionId, actor_id: entry.actorId,
+            action: entry.action, detail: entry.detail, created_at: entry.createdAt })))]);
+        }
+      });
+    } catch (error) {
       throw classify(error);
     } finally {
       await dispose(client);

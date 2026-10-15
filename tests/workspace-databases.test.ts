@@ -8,7 +8,9 @@ import type { Env, WorkerEnv } from '../apps/server/src/types.js';
 import type { RunnerBinding, WorkspaceDatabase } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { registerBackups } from '../apps/server/src/backups.js';
+import { exportSession, exportWorkspace } from '../apps/server/src/data-export.js';
 import { decryptToken } from '../apps/server/src/vault.js';
+import type { ImportSummary } from '../apps/server/src/workspace-databases/import.js';
 import { publicAddress, resolveDatabaseHost } from '../apps/server/src/workspace-databases/hosts.js';
 import { PostgresWorkspaceDatabases } from '../apps/server/src/workspace-databases/postgres.js';
 import { registerWorkspaceDatabases } from '../apps/server/src/workspace-databases/routes.js';
@@ -16,7 +18,7 @@ import { databaseSettings } from '../apps/server/src/workspace-databases/setting
 import { databaseSecretContext } from '../apps/server/src/workspace-databases/store.js';
 import {
   WorkspaceDatabaseError, type WorkspaceBackupRef, type WorkspaceBackupSave, type WorkspaceDatabaseFailure,
-  type WorkspaceDatabaseProvider, type WorkspaceDatabaseTarget,
+  type WorkspaceDatabaseProvider, type WorkspaceDatabaseTarget, type WorkspaceImport,
 } from '../apps/server/src/workspace-databases/types.js';
 import { memoryStorage, testDatabase } from './helpers/control-plane.js';
 
@@ -41,12 +43,18 @@ interface FakeDatabases extends WorkspaceDatabaseProvider {
   targets: WorkspaceDatabaseTarget[];
   saved: Map<string, WorkspaceBackupSave>;
   loads: WorkspaceBackupRef[];
+  imports: WorkspaceImport[];
   failure: WorkspaceDatabaseError | null;
 }
 
 function fakeDatabases(): FakeDatabases {
   const databases: FakeDatabases = {
-    privateHosts: false, targets: [], saved: new Map(), loads: [], failure: null,
+    privateHosts: false, targets: [], saved: new Map(), loads: [], imports: [], failure: null,
+    async import(target, data) {
+      databases.targets.push(target);
+      if (databases.failure) throw databases.failure;
+      databases.imports.push(structuredClone(data));
+    },
     async verify(target) {
       databases.targets.push(target);
       if (databases.failure) throw databases.failure;
@@ -379,6 +387,71 @@ test('a failed save records no backup, and backups saved earlier stay in the ser
   assert.equal(listing.destination, 'workspace-database');
 });
 
+test('the workspace owner imports dumps of this workspace into its database; nobody else does', async t => {
+  const f = await fixture(t);
+  const importPath = '/api/workspaces/workspace/database/import';
+  const early = await f.request('POST', importPath, 'test:owner', await exportWorkspace(f.env.DB, 'workspace', null));
+  assert.equal(early.status, 409);
+  assert.equal(await code(early), 'workspace_database_required');
+  const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
+  const dump = await exportWorkspace(f.env.DB, 'workspace', null);
+  assert.ok(dump);
+  assert.equal((await f.request('POST', importPath, 'test:outsider', dump)).status, 404);
+  for (const user of ['test:admin', 'test:member']) {
+    const refused = await f.request('POST', importPath, user, dump);
+    assert.equal(refused.status, 403);
+    assert.equal(await code(refused), 'owner_required');
+  }
+  assert.equal(f.databases.imports.length, 0);
+  const response = await f.request('POST', importPath, 'test:owner', dump);
+  assert.equal(response.status, 200);
+  const auditEntries = dump.audit.length + dump.sessions.reduce((total, session) => total + session.audit.length, 0);
+  assert.ok(auditEntries > 0, 'Connecting the database is workspace activity');
+  const expected: ImportSummary = { format: 'workspace', exportedAt: dump.exportedAt, sessions: 2, sessionDetails: 2, auditEntries, workspaceSettings: true };
+  assert.deepEqual((await response.json() as { imported: ImportSummary }).imported, expected);
+  assert.equal(f.databases.targets.at(-1)?.password, password);
+  const [data] = f.databases.imports;
+  assert.ok(data);
+  assert.deepEqual(data.workspace, { id: 'workspace', name: 'Workspace', ownerId: 'test:owner' });
+  assert.deepEqual(data.sessions.map(session => [session.id, session.ownerId, session.data === null]), [['session', 'test:member', false], ['owner-session', 'test:owner', false]]);
+  assert.deepEqual(Object.keys(data.workspaceData ?? {}).sort(), ['agents', 'database', 'members', 'models', 'pushIdentities', 'repositories']);
+  assert.equal((data.workspaceData?.database as { id: string }).id, database.id);
+  const audit = f.sqlite.prepare("SELECT actor_id, workspace_id, detail_json FROM audit WHERE action = 'workspace.database.imported'").get()!;
+  assert.equal(audit.actor_id, 'test:owner');
+  assert.deepEqual(JSON.parse(String(audit.detail_json)), { databaseId: database.id, ...expected });
+
+  // A session export of this workspace imports too.
+  const session = await f.request('POST', importPath, 'test:owner', await exportSession(f.env.DB, 'session', 'test:member'));
+  assert.equal(session.status, 200);
+  assert.deepEqual(((await session.json()) as { imported: ImportSummary }).imported.format, 'session');
+  assert.deepEqual(f.databases.imports[1]?.sessions.map(entry => entry.id), ['session']);
+
+  // Other files, other workspaces' dumps and dumps holding another workspace's session are refused before connecting.
+  const other = structuredClone(dump);
+  other.workspace.id = 'other-workspace';
+  const foreign = structuredClone(dump);
+  foreign.sessions[0]!.session.workspaceId = 'other-workspace';
+  for (const body of [{ format: 'pistead-backup' }, other, foreign, { ...dump, exportedAt: 'yesterday' }]) {
+    const refused = await f.request('POST', importPath, 'test:owner', body);
+    assert.equal(refused.status, 400);
+    assert.equal(await code(refused), 'invalid_dump');
+  }
+  assert.equal(f.databases.imports.length, 2);
+
+  f.databases.failure = new WorkspaceDatabaseError('schema_mismatch', { cause: new Error('column "data" of relation "pistead_sessions" does not exist at 10.0.0.7') });
+  const failed = await f.request('POST', importPath, 'test:owner', dump);
+  assert.equal(failed.status, 503);
+  const failure = await failed.json() as { code: string; error: string };
+  assert.equal(failure.code, 'workspace_database_unavailable');
+  assert.match(failure.error, /README/);
+  assert.ok(!failure.error.includes('10.0.0.7'));
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.database.imported'").get()!.n, 2);
+  delete f.env.WORKSPACE_DATABASES;
+  const disabled = await f.request('POST', importPath, 'test:owner', dump);
+  assert.equal(disabled.status, 503);
+  assert.equal(await code(disabled), 'workspace_databases_disabled');
+});
+
 test('database settings are explicit fields, and hosts are checked once resolved', async () => {
   assert.deepEqual(databaseSettings({ host: ' DB.Example.COM ', database: 'pistead', user: 'app', password: 'p w' }), {
     host: 'db.example.com', port: 5432, database: 'pistead', user: 'app', password: 'p w', tls: 'verify-full', caCertificate: null,
@@ -452,8 +525,8 @@ test('the Postgres provider provisions, saves and reads back snapshots in a real
   await provider.verify(target);
   await provider.verify(target);
   const tables = await inspect.query<{ table_name: string }>(`SELECT table_name FROM information_schema.tables
-    WHERE table_schema = 'public' AND table_name LIKE 'pistead_%' ORDER BY table_name`);
-  assert.deepEqual(tables.rows.map(row => row.table_name), ['pistead_session_backups', 'pistead_sessions', 'pistead_workspaces']);
+    WHERE table_schema = 'public' AND table_name LIKE 'pistead_%'`);
+  assert.deepEqual(tables.rows.map(row => row.table_name).sort(), ['pistead_audit', 'pistead_session_backups', 'pistead_sessions', 'pistead_workspaces']);
 
   const snapshot = new TextEncoder().encode(JSON.stringify({ format: 'pi-runner-backup-v1', note: 'héllo ✓' }));
   const save: WorkspaceBackupSave = {
@@ -477,15 +550,63 @@ test('the Postgres provider provisions, saves and reads back snapshots in a real
   const backups = await inspect.query("SELECT id, (convert_from(snapshot, 'UTF8')::jsonb ->> 'note') AS note FROM pistead_session_backups ORDER BY id");
   assert.deepEqual(backups.rows, [{ id: 'backup', note: 'héllo ✓' }, { id: 'second', note: 'héllo ✓' }]);
 
+  // Imports: a record or detail replaces only an older one; activity entries are added once.
+  const imported: WorkspaceImport = {
+    workspace: { id: 'workspace', name: 'Workspace', ownerId: 'owner' },
+    exportedAt: '2026-01-05T00:00:00.000Z',
+    workspaceData: { members: [{ userId: 'owner', role: 'owner' }] },
+    sessions: [
+      { id: 'session', ownerId: 'member', title: 'Imported title', status: 'ready', visibility: 'private', createdAt: '2026-01-01T00:00:00.000Z',
+        record: { id: 'session', title: 'Imported title' }, data: { grants: [{ userId: 'owner', permissions: ['read'] }] } },
+      { id: 'viewed', ownerId: 'member', title: 'Viewed', status: 'archived', visibility: 'workspace', createdAt: '2026-01-04T00:00:00.000Z',
+        record: { id: 'viewed' }, data: null },
+    ],
+    audit: [
+      { id: 'audit-session', sessionId: 'session', actorId: 'owner', action: 'session.created', detail: { note: 'héllo ✓' }, createdAt: '2026-01-01T00:00:00.000Z' },
+      { id: 'audit-workspace', sessionId: null, actorId: null, action: 'workspace.create', detail: {}, createdAt: '2026-01-01T00:00:00.000Z' },
+    ],
+  };
+  await provider.import(target, imported);
+  await provider.import(target, imported);
+  const stale = structuredClone(imported);
+  stale.exportedAt = '2026-01-02T00:00:00.000Z';
+  stale.sessions[0]!.title = 'Stale title';
+  stale.sessions[0]!.data = { grants: [] };
+  stale.workspaceData = { members: [] };
+  await provider.import(target, stale);
+  const sessionsAfterImport = await inspect.query<{ id: string; title: string; data: unknown; data_exported_at: Date | null }>(
+    'SELECT id, title, data, data_exported_at FROM pistead_sessions ORDER BY id');
+  assert.deepEqual(sessionsAfterImport.rows.map(row => [row.id, row.title, row.data, row.data_exported_at?.toISOString() ?? null]), [
+    ['session', 'Imported title', { grants: [{ userId: 'owner', permissions: ['read'] }] }, '2026-01-05T00:00:00.000Z'],
+    ['viewed', 'Viewed', null, null],
+  ]);
+  const activity = await inspect.query('SELECT id, workspace_id, session_id, actor_id, detail FROM pistead_audit ORDER BY id');
+  assert.deepEqual(activity.rows, [
+    { id: 'audit-session', workspace_id: 'workspace', session_id: 'session', actor_id: 'owner', detail: { note: 'héllo ✓' } },
+    { id: 'audit-workspace', workspace_id: 'workspace', session_id: null, actor_id: null, detail: {} },
+  ]);
+  const workspaceRows = await inspect.query('SELECT name, owner_id, data FROM pistead_workspaces');
+  assert.deepEqual(workspaceRows.rows, [{ name: 'Workspace', owner_id: 'owner', data: { members: [{ userId: 'owner', role: 'owner' }] } }]);
+  // A later save updates the record and keeps the imported details.
+  await provider.save(target, { ...save, session: { ...save.session, title: 'Saved later', record: { id: 'session', title: 'Saved later' } },
+    backup: { ...save.backup, id: 'third', createdAt: '2026-01-06T00:00:00.000Z' } });
+  const saved = await inspect.query<{ title: string; data: unknown }>("SELECT title, data FROM pistead_sessions WHERE id = 'session'");
+  assert.deepEqual(saved.rows, [{ title: 'Saved later', data: { grants: [{ userId: 'owner', permissions: ['read'] }] } }]);
+
   // A user that may connect but was granted nothing on the tables is refused until the owner grants what saving needs.
   await admin.query(`CREATE ROLE ${role} LOGIN PASSWORD 'limited-password'`);
   const limited = { ...target, user: role, password: 'limited-password' };
   await assert.rejects(provider.verify(limited), failed('permission_denied'));
-  await inspect.query(`GRANT SELECT, INSERT, UPDATE ON pistead_workspaces, pistead_sessions, pistead_session_backups TO ${role}`);
+  await inspect.query(`GRANT SELECT, INSERT, UPDATE ON pistead_workspaces, pistead_sessions, pistead_session_backups, pistead_audit TO ${role}`);
   await provider.verify(limited);
+  await provider.import(limited, imported);
 
   await assert.rejects(provider.verify({ ...target, database: `${name}_missing` }), failed('database_not_found'));
   await assert.rejects(new PostgresWorkspaceDatabases({ privateHosts: false }).verify(target), failed('host_not_allowed'));
+  // Tables created beforehand must have every column Pistead writes.
+  await inspect.query('ALTER TABLE pistead_audit DROP COLUMN detail');
+  await assert.rejects(provider.verify(target), failed('schema_mismatch'));
+  await assert.rejects(provider.import(target, imported), failed('schema_mismatch'));
   // A Pistead control plane's own database is never used as a workspace database.
   await inspect.query('CREATE TABLE workspace_databases (id TEXT); CREATE TABLE schema_migrations (name TEXT); CREATE TABLE auth_sessions (token_hash TEXT)');
   await assert.rejects(provider.verify(target), failed('pistead_database'));

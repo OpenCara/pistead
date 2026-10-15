@@ -1,8 +1,9 @@
 import type { Hono } from 'hono';
-import type { Env, WorkerEnv } from '../types.js';
+import type { Env, WorkerEnv, WorkspaceRow } from '../types.js';
 import { auditStatement, requireMember } from '../db.js';
 import { fail, id, identifier, jsonObject, now } from '../http.js';
 import { assertVaultConfigured, encryptToken } from '../vault.js';
+import { DumpImportError, importDump, maxUploadedDumpBytes, type ImportSummary } from './import.js';
 import { databaseSettings, maxCaCertificateLength } from './settings.js';
 import {
   databaseSecretContext, publicWorkspaceDatabase, workspaceDatabaseFailure, workspaceDatabaseRow, type WorkspaceDatabaseRow,
@@ -21,7 +22,7 @@ async function requireWorkspaceOwner(env: Env, workspaceId: string, actorId: str
   const member = await requireMember(env, workspaceId, actorId);
   const workspace = await env.DB.query<{ owner_id: string }>('SELECT owner_id FROM workspaces WHERE id = ?').bind(workspaceId).first();
   if (member.role !== 'owner' || workspace?.owner_id !== actorId) {
-    fail(403, 'owner_required', 'Only the workspace owner can connect or disconnect its database.');
+    fail(403, 'owner_required', "Only the workspace owner manages the workspace's database.");
   }
 }
 
@@ -75,6 +76,29 @@ export function registerWorkspaceDatabases(app: Hono<WorkerEnv>): void {
     await auditStatement(c.env, actor, 'workspace.database.connected', workspaceId, null,
       { databaseId: row.id, host: row.host, port: row.port, database: row.database_name, tls: row.tls }).run();
     return c.json({ database: publicWorkspaceDatabase(row) }, 201);
+  });
+
+  // The owner imports a session or workspace dump of this workspace into its database: its sessions' records and details,
+  // their activity and the workspace's settings. Nothing changes in the control plane but the activity entry recording it.
+  app.post('/api/workspaces/:id/database/import', async c => {
+    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
+    const actor = c.get('auth').userId;
+    await requireWorkspaceOwner(c.env, workspaceId, actor);
+    const provider = c.env.WORKSPACE_DATABASES;
+    if (!provider) fail(503, 'workspace_databases_disabled', 'This server does not connect to workspace databases.');
+    const database = await workspaceDatabaseRow(c.env, workspaceId);
+    if (!database) fail(409, 'workspace_database_required', 'Connect a database to this workspace before importing a dump into it.');
+    const document = await jsonObject(c, maxUploadedDumpBytes);
+    const workspace = await c.env.DB.query<WorkspaceRow>('SELECT * FROM workspaces WHERE id = ?').bind(workspaceId).first();
+    if (!workspace) fail(404, 'not_found', 'Workspace not found.');
+    let imported: ImportSummary;
+    try {
+      imported = await importDump(c.env, provider, workspace, database, document, actor);
+    } catch (error) {
+      if (error instanceof DumpImportError) fail(400, 'invalid_dump', error.message);
+      workspaceDatabaseFailure(error, 'use');
+    }
+    return c.json({ imported });
   });
 
   // Works even when the operator turned workspace databases off, so the owner can return to the server's backup storage.

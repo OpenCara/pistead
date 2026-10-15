@@ -77,6 +77,7 @@ function DataExport({ workspace }: { workspace: Workspace }) {
   return <Section title="Data export" info={<div className="stack">
     <p>Downloads this workspace as JSON: its settings, members, models, published agents, repositories, push access, session database connection and activity, with your own sessions in full and the records of the other sessions you can view.</p>
     <p>Other members' private sessions are left out; their owners can export them. Secrets are never included, and a session's conversation is in its backups.</p>
+    <p>The workspace owner can import exports into the workspace's session database.</p>
   </div>}>
     <Row title="Workspace data" hint="JSON, without secrets" trailing={<LinkButton variant="outline" size="sm" href={`/api/workspaces/${segment(workspace.id)}/export`} download>Export</LinkButton>} />
   </Section>;

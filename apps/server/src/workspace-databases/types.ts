@@ -33,9 +33,41 @@ export interface WorkspaceBackupRef {
   size: number;
 }
 
+/** A session as a dump describes it: its record, and with a full export its details (grants, approvals, pushes, backups). */
+export interface ImportedSession {
+  id: string; ownerId: string; title: string; status: string; visibility: string; createdAt: string;
+  record: Record<string, unknown>;
+  /** null for sessions a dump lists as records only. */
+  data: Record<string, unknown> | null;
+}
+
+export interface ImportedAuditEntry {
+  id: string;
+  /** null for workspace activity. */
+  sessionId: string | null;
+  actorId: string | null;
+  action: string;
+  detail: unknown;
+  createdAt: string;
+}
+
+/**
+ * A session or workspace dump, checked and normalized for one workspace's database (see import.ts). Records and details
+ * carry the dump's export time: newer ones replace older ones, whichever is imported (or saved) first.
+ */
+export interface WorkspaceImport {
+  /** From the control plane, not the dump. */
+  workspace: { id: string; name: string; ownerId: string };
+  exportedAt: string;
+  /** A workspace dump's settings: members, models, agents, repositories, push access and database connection. */
+  workspaceData: Record<string, unknown> | null;
+  sessions: ImportedSession[];
+  audit: ImportedAuditEntry[];
+}
+
 export const workspaceDatabaseFailures = [
   'host_not_allowed', 'host_not_found', 'tls_not_allowed', 'unreachable', 'tls_failed', 'authentication_failed',
-  'database_not_found', 'permission_denied', 'pistead_database', 'response_too_large', 'unavailable',
+  'database_not_found', 'permission_denied', 'pistead_database', 'schema_mismatch', 'response_too_large', 'unavailable',
 ] as const;
 export type WorkspaceDatabaseFailure = (typeof workspaceDatabaseFailures)[number];
 
@@ -65,4 +97,6 @@ export interface WorkspaceDatabaseProvider {
   save(target: WorkspaceDatabaseTarget, save: WorkspaceBackupSave): Promise<void>;
   /** The snapshot of `backup`, or null when the database has no backup with that id, session and exact size. */
   load(target: WorkspaceDatabaseTarget, backup: WorkspaceBackupRef): Promise<Uint8Array | null>;
+  /** Writes a dump's sessions, details, activity and workspace settings in one transaction. */
+  import(target: WorkspaceDatabaseTarget, data: WorkspaceImport): Promise<void>;
 }

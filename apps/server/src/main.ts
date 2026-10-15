@@ -1,3 +1,4 @@
+import { createReadStream } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
 import type { TLSSocket } from 'node:tls';
 import { createAdaptorServer } from '@hono/node-server';
@@ -11,6 +12,9 @@ import type { Database } from './db/types.js';
 import { app } from './index.js';
 import { createStaticHandler } from './static.js';
 import { settlePushCredentials } from './push/broker.js';
+import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
+import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
+import { WorkspaceDatabaseError } from './workspace-databases/types.js';
 
 /** The request URL as the client sees it: forwarded scheme/host only when the operator trusts the proxy. */
 function requestUrl(request: IncomingMessage, trustProxy: boolean): URL {
@@ -80,9 +84,48 @@ function dumpRequest(argv: readonly string[]): { kind: 'session' | 'workspace'; 
   return { kind: request.kind, id: request.id };
 }
 
+/** `--import-dump FILE` (also `--import-dump=FILE`; `-` reads standard input): the dump to import, or null. */
+function importRequest(argv: readonly string[]): string | null {
+  const positions = argv.flatMap((argument, index) => argument === '--import-dump' || argument.startsWith('--import-dump=') ? [index] : []);
+  if (!positions.length) return null;
+  const index = positions[0]!;
+  const file = argv[index] === '--import-dump' ? argv[index + 1] : argv[index]!.slice('--import-dump='.length);
+  if (positions.length > 1 || !file) {
+    console.error('pistead: import one dump at a time: --import-dump FILE (- reads standard input)');
+    process.exit(2);
+  }
+  return file;
+}
+
+/** A dump from a file or standard input, bounded: the command line takes larger dumps than the web app uploads. */
+async function readDump(file: string): Promise<string> {
+  const limit = 256 * 1024 * 1024;
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of file === '-' ? process.stdin : createReadStream(file)) {
+    const bytes = chunk as Buffer;
+    size += bytes.byteLength;
+    if (size > limit) throw new DumpImportError('The dump is larger than 256 MiB.');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/** stdout is asynchronous on pipes: resolves once `text` is written, so exiting next loses nothing. */
+function writeOut(text: string): Promise<void> {
+  return new Promise((resolve, reject) => { process.stdout.write(text, error => (error ? reject(error) : resolve())); });
+}
+
+const commandLine = process.argv.slice(2);
+const dump = dumpRequest(commandLine);
+const importFile = importRequest(commandLine);
+if (dump && importFile) {
+  console.error('pistead: dump or import, one at a time');
+  process.exit(2);
+}
+
 // The operator's dump of one session or workspace from the database, as JSON on stdout: every session in full, without
 // secrets (see data-export.ts). Pending migrations are applied first, as at start-up, so the current schema is read.
-const dump = dumpRequest(process.argv.slice(2));
 if (dump) {
   const db = await openDatabase(process.env.DATABASE_URL || defaultDatabaseUrl);
   let output: string | null = null;
@@ -97,9 +140,41 @@ if (dump) {
     console.error(`pistead: ${dump.kind} ${dump.id} not found`);
     process.exit(1);
   }
-  const text = output;
-  // stdout is asynchronous on pipes: exit only once the whole dump is written.
-  await new Promise<void>((resolve, reject) => { process.stdout.write(text, error => (error ? reject(error) : resolve())); });
+  await writeOut(output);
+  process.exit(0);
+}
+
+// The operator's import of a dump into the database its workspace's owner connected (see workspace-databases/import.ts),
+// with this server's WORKSPACE_DATABASES, WORKSPACE_DATABASE_PRIVATE_HOSTS and VAULT_KEY. Migrations are applied first.
+if (importFile) {
+  let document: unknown;
+  try {
+    document = JSON.parse(await readDump(importFile));
+  } catch (error) {
+    console.error(`pistead: ${error instanceof DumpImportError ? error.message : `no JSON dump could be read from ${importFile}`}`);
+    process.exit(1);
+  }
+  const db = await openDatabase(process.env.DATABASE_URL || defaultDatabaseUrl);
+  let failure: string | null = null;
+  let outcome = '';
+  try {
+    await migrateWhenReachable(db);
+    const { summary, database } = await importDumpFromCommandLine(db, process.env, document);
+    outcome = `pistead: imported ${summary.sessions} session record${summary.sessions === 1 ? '' : 's'} (${summary.sessionDetails} with details) and `
+      + `${summary.auditEntries} activity entr${summary.auditEntries === 1 ? 'y' : 'ies'}${summary.workspaceSettings ? ', with the workspace settings,' : ''} `
+      + `into ${database.host}/${database.database_name}\n`;
+  } catch (error) {
+    if (error instanceof DumpImportError) failure = error.message;
+    else if (error instanceof WorkspaceDatabaseError) failure = `the workspace database could not be used. ${workspaceDatabaseExplanation(error.failure)}`;
+    else throw error;
+  } finally {
+    await db.close();
+  }
+  if (failure !== null) {
+    console.error(`pistead: ${failure}`);
+    process.exit(1);
+  }
+  await writeOut(outcome);
   process.exit(0);
 }
 

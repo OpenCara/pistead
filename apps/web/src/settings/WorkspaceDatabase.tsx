@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import type { Workspace, WorkspaceDatabase, WorkspaceDatabaseTls } from "../../../../packages/shared/src/types";
 import { api, segment } from "../api";
-import { Alert, Button, CardBody, DropdownMenu, Feedback, Field, ResourceState, Row, Section, Sheet, StatusBadge, confirmDialog, useAction, useResource, type MenuItem } from "../ui";
+import { Alert, Button, CardBody, DropdownMenu, Feedback, Field, ResourceState, Row, Section, Sheet, StatusBadge, Timestamp, confirmDialog, useAction, useResource, type MenuItem } from "../ui";
 
 interface WorkspaceDatabaseResponse {
   /** The operator lets workspaces connect databases of their own. */
@@ -10,6 +10,19 @@ interface WorkspaceDatabaseResponse {
   privateHosts: boolean;
   database: WorkspaceDatabase | null;
 }
+
+/** What the server reports after importing a dump into the workspace database. */
+interface ImportSummary {
+  format: "session" | "workspace";
+  exportedAt: string;
+  sessions: number;
+  sessionDetails: number;
+  auditEntries: number;
+  workspaceSettings: boolean;
+}
+
+/** The largest dump the server takes from the web app; the operator imports larger ones with --import-dump. */
+const maxUploadBytes = 32 * 1024 * 1024;
 
 const tlsLabel: Record<WorkspaceDatabaseTls, string> = {
   "verify-full": "TLS, server certificate verified",
@@ -41,6 +54,7 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
   const resource = useResource<WorkspaceDatabaseResponse>(path);
   const action = useAction();
   const [editing, setEditing] = useState(false);
+  const [importing, setImporting] = useState(false);
   const data = resource.data;
   const database = data?.database ?? null;
   async function disconnect() {
@@ -58,7 +72,10 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
     }, "Database disconnected. New session backups go to the server's backup storage.");
   }
   const items: MenuItem[] = [
-    ...(data?.available ? [{ label: "Replace", icon: "refresh" as const, disabled: action.busy, onSelect: () => setEditing(true) }] : []),
+    ...(data?.available ? [
+      { label: "Import dump", icon: "folder" as const, hint: "A session or workspace export", disabled: action.busy, onSelect: () => setImporting(true) },
+      { label: "Replace", icon: "refresh" as const, disabled: action.busy, onSelect: () => setEditing(true) },
+    ] : []),
     { label: "Disconnect", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void disconnect() },
   ];
   const empty = !data?.available ? "This server doesn't connect to workspace databases, so session backups are kept in its backup storage"
@@ -67,7 +84,7 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
   return <Section title="Session database" info={<div className="stack">
     <p>The workspace owner can connect a Postgres database of their own. Backups of this workspace's sessions are then saved there, with each session's details, instead of in the server's backup storage, and downloads and restores read them back from it.</p>
     <p>Whoever can read that database can read the sessions saved there, private ones and their owners' personal environment values included. Other members confirm the database before each of their backups goes there, and again after it is pointed at another database.</p>
-    <p>Pistead creates the tables <code>pistead_workspaces</code>, <code>pistead_sessions</code> and <code>pistead_session_backups</code> when they are missing. The password is write-only: it is never shown again after saving.</p>
+    <p>The owner can also import a session or workspace export into it, adding session details and activity. Pistead creates the tables <code>pistead_workspaces</code>, <code>pistead_sessions</code>, <code>pistead_session_backups</code> and <code>pistead_audit</code> when they are missing. The password is write-only: it is never shown again after saving.</p>
   </div>} action={owner && data?.available && !database && <Button variant="outline" size="sm" icon="plus" onClick={() => setEditing(true)}>Connect database</Button>}>
     <ResourceState {...resource} retry={resource.refresh}>
       {database
@@ -82,7 +99,47 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
       {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
     </ResourceState>
     {owner && editing && data?.available && <DatabaseSheet path={path} privateHosts={data.privateHosts} existing={database} close={() => setEditing(false)} saved={resource.refresh} />}
+    {owner && importing && data?.available && database && <ImportSheet path={path} database={database} close={() => setImporting(false)} />}
   </Section>;
+}
+
+/** Imports an export of this workspace, or of one of its sessions, into the connected database. */
+function ImportSheet({ path, database, close }: { path: string; database: WorkspaceDatabase; close: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [imported, setImported] = useState<ImportSummary | null>(null);
+  const action = useAction();
+  function dismiss() { if (!action.busy) close(); }
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!file || action.busy) return;
+    setImported(null);
+    void action.run(async () => {
+      if (file.size > maxUploadBytes) throw new Error("This dump is larger than 32 MiB. The server's operator can import it with the --import-dump option.");
+      let document: unknown;
+      try {
+        document = JSON.parse(await file.text());
+      } catch {
+        throw new Error("This file is not a JSON dump.");
+      }
+      const result = await api<{ imported: ImportSummary }>(`${path}/import`, { method: "POST", body: document });
+      setImported(result.imported);
+    });
+  }
+  return <Sheet open title="Import a dump" onClose={dismiss} footer={<>
+    <Button disabled={action.busy} onClick={dismiss}>{imported ? "Done" : "Cancel"}</Button>
+    {!imported && <Button variant="default" type="submit" form="workspace-import-form" disabled={!file || action.busy}>{action.busy ? "Importing..." : "Import"}</Button>}
+  </>}>
+    <form id="workspace-import-form" className="stack" onSubmit={submit}>
+      <p className="muted small">Adds an export of this workspace, or of one of its sessions, to {databaseLabel(database)}: session records and details (grants, approvals, pushes, backups and restores), their activity and the workspace's settings. A record replaces an older one of the same session; activity is added once, so importing a dump again changes nothing. Pistead itself is unchanged.</p>
+      <Field label="Dump file" hint="A JSON export from Pistead, up to 32 MiB">
+        <input className="input" type="file" accept="application/json,.json" disabled={action.busy} onChange={event => { setFile(event.target.files?.[0] ?? null); setImported(null); }} />
+      </Field>
+      {imported && <Alert variant="success" title="Imported" role="status">
+        {imported.sessions} session record{imported.sessions === 1 ? "" : "s"} ({imported.sessionDetails} with details) and {imported.auditEntries} activity entr{imported.auditEntries === 1 ? "y" : "ies"}{imported.workspaceSettings ? ", with the workspace's settings," : ""} from the {imported.format} export of <Timestamp value={imported.exportedAt} />.
+      </Alert>}
+      <Feedback error={action.error} />
+    </form>
+  </Sheet>;
 }
 
 function DatabaseSheet({ path, privateHosts, existing, close, saved }: { path: string; privateHosts: boolean; existing: WorkspaceDatabase | null; close: () => void; saved: () => void }) {
