@@ -134,7 +134,8 @@ test("cache object paths must match the pins and stay outside the session's stor
   assert.deepEqual(repositoryObjectPaths([alpha, beta], undefined, storage), []);
   assert.deepEqual(repositoryObjectPaths([alpha, beta], { "acme/beta": "/cache/b/objects", "acme/alpha": "/cache/a/objects" }, storage),
     ["/cache/a/objects", "/cache/b/objects"]);
-  for (const objects of [
+  // Annotated: inferred from these literals, the missing keys would become optional undefined, which no Record accepts.
+  const invalid: Readonly<Record<string, string>>[] = [
     { "acme/alpha": "/cache/a/objects" },
     { "acme/alpha": "/cache/a/objects", "acme/beta": "/cache/b/objects", "acme/gamma": "/cache/c/objects" },
     { "acme/alpha": "cache/a/objects", "acme/beta": "/cache/b/objects" },
@@ -144,7 +145,8 @@ test("cache object paths must match the pins and stay outside the session's stor
     { "acme/alpha": `${storage}/worktree`, "acme/beta": "/cache/b/objects" },
     { "acme/alpha": "/data/sessions", "acme/beta": "/cache/b/objects" },
     { "acme/alpha": "/", "acme/beta": "/cache/b/objects" },
-  ]) assert.throws(() => repositoryObjectPaths([alpha, beta], objects, storage), JSON.stringify(objects));
+  ];
+  for (const objects of invalid) assert.throws(() => repositoryObjectPaths([alpha, beta], objects, storage), JSON.stringify(objects));
 });
 
 test("host mode checks pinned trees out of the cache with real symlinks and full history, copying no cached object", hostMode, async t => {
