@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
+import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
@@ -195,7 +196,7 @@ function SessionPane({ id }: { id: string }) {
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
-          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
+          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge>{session.linkShared && <StatusBadge tone="info">Link shared</StatusBadge>}</span>}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}
@@ -337,6 +338,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
+  // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
+  const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
+
   const queueLabel = view.busy
     ? <><Spinner />Working...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
@@ -393,6 +397,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
           </>}
         />
+        {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
         <Feedback error={submission.error} />
       </div>
     </div>

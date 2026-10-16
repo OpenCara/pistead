@@ -4,6 +4,7 @@ import type { WorkerEnv } from './types.js';
 import { authenticate, csrfGuard, registerAuth } from './auth.js';
 import { registerCatalog } from './catalog.js';
 import { registerSessions } from './sessions.js';
+import { registerSessionLinks, registerSharedSessions } from './session-links.js';
 import { registerBackups } from './backups.js';
 import { registerInternal } from './internal.js';
 import { assertVaultConfigured } from './vault.js';
@@ -14,7 +15,6 @@ import { registerRepositories } from './repositories.js';
 import { registerGitAccounts } from './git/accounts.js';
 import { registerOidc } from './push/oidc.js';
 import { registerPushIdentities } from './push/identities.js';
-import { registerSessionLinks, registerSharedSessions } from './session-links.js';
 
 export const app = new Hono<WorkerEnv>();
 

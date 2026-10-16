@@ -178,7 +178,7 @@
     }
   }
   @media (max-width: 600px) {
-    .session-badges > .badge:last-child { display: none; }
+    .session-badges > .badge:not(:first-child) { display: none; }
     .chat-column { padding: 0 var(--space-3); }
   }
 }
