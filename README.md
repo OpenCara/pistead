@@ -37,7 +37,7 @@ See [`packages/cli/README.md`](packages/cli/README.md) for the connector's requi
 
 ### Sharing a session by link
 
-Besides workspace visibility and per-member grants, a session's owner can turn on a share link (session panel → **People**, or the session menu). Anyone who has the link can follow the session's shared conversation read-only, without signing in, through `GET /api/shared` and `GET /api/shared/view`. They see nothing else: no side asks, approvals, collaborators, workspace, host or repositories. The token is carried only in the URL fragment and an `X-Share-Token` header, never in a request path. Turning the link off stops it at once, and turning it on again issues a new one.
+Besides workspace visibility and per-member grants, a session's owner can turn on a share link (session panel → **People**). Anyone who has the link can follow the session's shared conversation read-only, without signing in, through `GET /api/shared` and `GET /api/shared/view`. They see nothing else: no side asks, approvals, collaborators, workspace, host or repositories. The token is carried only in the URL fragment and an `X-Share-Token` header, never in a request path. Turning the link off stops it at once, and turning it on again issues a new one.
 
 ### Hidden secrets
 

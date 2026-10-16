@@ -7,6 +7,7 @@ import { Markdown } from "./markdown";
 import { splitToolCalls } from "./transcript";
 import { Alert, EmptyState, formatDuration, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
 import "./session.css";
+import "./shared-session.css";
 
 /**
  * A share link reads the committed view with plain requests, never a stream: again soon while work runs, slowly while

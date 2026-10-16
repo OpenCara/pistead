@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
-import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
@@ -154,22 +153,11 @@ function SessionPane({ id }: { id: string }) {
   if (session && isOwner && !archived) {
     menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
-    if (actions.link) {
-      menu.push({ label: "Copy share link", icon: "link", disabled: actions.action.busy, onSelect: actions.copyLink });
-      menu.push({ label: "Turn off share link", icon: "x", disabled: actions.action.busy, onSelect: actions.unshareLink });
-    } else {
-      // The new link shows in the panel, ready to copy.
-      menu.push({ label: "Create share link", icon: "link", disabled: actions.action.busy || actions.linkLoading, onSelect: () => void actions.shareLink().then(shared => {
-        if (shared) { setTab("details"); setPanelOpen(true); }
-      }) });
-    }
     menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupBlocked || actions.action.busy, hint: actions.backupBlocked ? "Session busy" : undefined, onSelect: actions.createBackup });
     menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
   }
   if (session && isOwner && archived) {
     menu.push({ label: "Unarchive", icon: "archive", disabled: actions.action.busy, onSelect: actions.unarchive });
-    // Turning a link off only takes access away, so it stays possible while archived.
-    if (actions.link) menu.push({ label: "Turn off share link", icon: "x", disabled: actions.action.busy, onSelect: actions.unshareLink });
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
 
@@ -207,7 +195,7 @@ function SessionPane({ id }: { id: string }) {
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
-          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge>{session.linkShared && <StatusBadge tone="info">Link shared</StatusBadge>}</span>}
+          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}
@@ -349,9 +337,6 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
-  // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
-  const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
-
   const queueLabel = view.busy
     ? <><Spinner />Working...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
@@ -408,7 +393,6 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
           </>}
         />
-        {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
         <Feedback error={submission.error} />
       </div>
     </div>

@@ -138,12 +138,6 @@
   .composer-hint { flex: 1 1 160px; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
   .composer-send.btn { width: var(--control-sm); margin-left: auto; padding: 0; border-radius: var(--radius-full); }
 
-  /* A share link's read-only page: no sidebar or composer, just the header, the transcript and a status line. */
-  .shared-screen { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
-  .shared-screen > .screen-header > .logo { flex: 0 0 auto; }
-  .shared-status { flex: 0 0 auto; padding: var(--space-2) 0 var(--space-3); border-top: 1px solid var(--border); }
-  .shared-status > .chat-column { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); color: var(--foreground-muted); font-size: var(--font-xs); }
-
   /* Right panel: pinned column on wide screens, overlay below. */
   .session-panel {
     display: grid;
@@ -184,7 +178,7 @@
     }
   }
   @media (max-width: 600px) {
-    .session-badges > .badge:not(:first-child) { display: none; }
+    .session-badges > .badge:last-child { display: none; }
     .chat-column { padding: 0 var(--space-3); }
   }
 }

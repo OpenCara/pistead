@@ -34,7 +34,6 @@ export interface SessionActions {
   linkError: string;
   /** Turns link sharing on once the owner confirms; resolves true when the session has a link. */
   shareLink: () => Promise<boolean>;
-  copyLink: () => void;
   unshareLink: () => void;
 }
 
@@ -124,10 +123,6 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
     }, "Share link created. Anyone who has it can view the shared conversation.");
     return created;
   }
-  function copyLink() {
-    if (!link || action.busy) return;
-    void action.run(() => navigator.clipboard.writeText(link.url), "Share link copied");
-  }
   async function unshareLink() {
     if (!session || !isOwner || action.busy) return;
     const confirmed = await confirmDialog({
@@ -145,7 +140,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
   }
   return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup, rename,
     archive: () => void archive(), unarchive,
-    link, linkLoading: linkResource.loading, linkError: linkResource.error, shareLink, copyLink, unshareLink: () => void unshareLink() };
+    link, linkLoading: linkResource.loading, linkError: linkResource.error, shareLink, unshareLink: () => void unshareLink() };
 }
 
 const approvalTone: Record<ApprovalRecord["status"], Tone> = {
@@ -414,7 +409,7 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
       trailing={isOwner && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
     {(isOwner || linkShared) && <Row
-      leading={<Icon name="link" size={16} />}
+      leading={<Icon name="eye" size={16} />}
       title={linkShared ? "Anyone with the link can view" : "Link sharing off"}
       hint={!isOwner ? "The owner shared this session by link: anyone who has it can view the shared conversation without signing in, including messages you send to it. Side asks stay hidden"
         : linkShared ? "Without signing in, they can follow the shared conversation, but not side asks, approvals, who sent each message, or the host. Turning the link off stops it at once"
