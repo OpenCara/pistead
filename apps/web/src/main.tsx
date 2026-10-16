@@ -12,6 +12,7 @@ import { navigate, useRoute, type Route } from "./router";
 import { SessionScreen } from "./SessionScreen";
 import { SessionsScreen } from "./SessionsScreen";
 import { SettingsScreen } from "./SettingsScreen";
+import { SharedSessionScreen } from "./SharedSessionScreen";
 import { Sidebar } from "./Sidebar";
 import { applyTheme, useTheme } from "./theme";
 import { Alert, Button, PageLoading, useResource } from "./ui";
@@ -27,6 +28,7 @@ function title(route: Route): string {
     case "new": return "New session · Pistead";
     case "session": return "Session · Pistead";
     case "settings": return "Settings · Pistead";
+    case "shared": return "Shared session · Pistead";
   }
 }
 
@@ -91,7 +93,6 @@ function Shell() {
 }
 
 function App() {
-  useTheme();
   const [user, setUser] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -119,6 +120,13 @@ function App() {
   return <AppProvider key={user.id} user={user} setUser={setUser} signOut={() => void signOut()}><Shell /></AppProvider>;
 }
 
+function Root() {
+  useTheme();
+  const route = useRoute();
+  // A share link opens its read-only view for anyone who has it, signed in or not, without loading the app.
+  return route.name === "shared" ? <SharedSessionScreen key={route.token} token={route.token} /> : <App />;
+}
+
 const root = document.getElementById("root");
 if (!root) throw new Error("Application root is missing.");
-createRoot(root).render(<StrictMode><App /></StrictMode>);
+createRoot(root).render(<StrictMode><Root /></StrictMode>);

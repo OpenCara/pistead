@@ -78,6 +78,14 @@ npx pistead@latest connect --server https://pistead.example.com --pairing-id PAI
 
 See [`packages/cli/README.md`](packages/cli/README.md) for the connector's requirements and options.
 
+### Sharing a session by link
+
+Besides workspace visibility and per-member grants, a session's owner can turn on a share link (session panel → **People**). Anyone who has the link can follow the session's shared conversation read-only, without signing in, through `GET /api/shared` and `GET /api/shared/view`. They see nothing else: no side asks, approvals, collaborators, workspace, host or repositories. The token is carried only in the URL fragment and an `X-Share-Token` header, never in a request path. Turning the link off stops it at once, and turning it on again issues a new one.
+
+### Hidden secrets
+
+Everything the control plane shows people (transcripts, approvals and their output, in every session view and share link) has values that look like secrets replaced by `[redacted]`, for everyone including the session's owner. That covers well-known token formats, private keys, the values of password-, secret-, token- and key-named settings, and credentials in URLs, Authorization headers, `curl -u` and `.netrc`. The agent and the host still see the real values, and an approved operation runs with them. In shell commands only single words are ever hidden, so an approver always sees what a command does, and an approval that holds a hidden value says so. Detection is pattern-based, so other sensitive text can still show; backups keep the real transcript.
+
 ## Development
 
 Requires Node 24 and pnpm.

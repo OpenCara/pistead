@@ -1,5 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
+import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
 import { BackupList, backupDatabaseLabel, backupDownloadHref, backupLocationLabel, type Backup, type BackupDatabase } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
@@ -193,12 +195,14 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
     <div className="approval-head">
       <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />
       {approval.unbounded && <StatusBadge tone="warning">No resource limits</StatusBadge>}
+      {containsRedaction(operation) && <StatusBadge tone="warning">Secret hidden</StatusBadge>}
       <ApprovalStatus approval={approval} />
     </div>
     {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
       {operation.kind === "git.push" && <GitPushSummary operation={operation} />}
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
       <pre>{JSON.stringify(operation, null, 2)}</pre>
+      {approval.status === "pending" && containsRedaction(operation) && <HiddenSecretNote />}
     </>}
     <p className="muted small">Requested by <Username id={approval.requestedBy} /> · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
@@ -219,8 +223,14 @@ function PermissionSummary({ request, pending }: { request: PermissionRequest; p
     <p><code>{request.tool}</code> {pending ? "needs the session owner's permission for:" : "asked the session owner's permission for:"}</p>
     <ul className="permission-needs small">{request.needs.map(need => <li key={need}>{permissionNeedText[need]}</li>)}</ul>
     {request.target && <pre>{request.target}</pre>}
+    {pending && containsRedaction(request.target) && <HiddenSecretNote />}
     {pending && approvedTools.includes(request.tool) && <p className="muted small">Allowing it doesn't run anything yet: the operation still gets its own approval, unless the message auto-approves.</p>}
   </>;
+}
+
+/** The server hides what looks like a secret from everyone; a decision still uses the real value. */
+function HiddenSecretNote() {
+  return <p className="small">Something that looks like a secret is shown as <code>{REDACTED}</code>. Allowing or approving this uses the real value, so make sure it belongs here.</p>;
 }
 
 function GitPushSummary({ operation }: { operation: GitPushOperation }) {
@@ -359,7 +369,12 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     }, visibility === "workspace" ? "Explicit grant revoked. Workspace members can still view this session until the owner makes it private." : "Session grant revoked");
   }
 
-  return <Section title="People" info={<p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p>}>
+  const sharing = useSessionLink({ session, user, action: actions.action, onChange: changed });
+  const link = sharing.link;
+  // The owner's loaded link is current; until it loads, and for everyone else, the session says whether one exists.
+  const linkShared = isOwner && link !== undefined ? link !== null : Boolean(session.linkShared);
+
+  return <Section title="People" info={<><p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else.</p></>}>
     <Row
       leading={<Icon name="user" size={16} />}
       title={isOwner ? "Owner" : viewerOnly ? "Viewer" : "Collaborator"}
@@ -375,6 +390,19 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
         : "Only the session owner can change visibility"}</>}
       trailing={isOwner && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
+    {(isOwner || linkShared) && <Row
+      leading={<Icon name="link" size={16} />}
+      title={linkShared ? "Anyone with the link can view" : "Link sharing off"}
+      hint={!isOwner ? "The owner shared this session by link: anyone who has it can view the shared conversation without signing in, including messages you send to it. Side asks stay hidden"
+        : linkShared ? "Without signing in, they can follow the shared conversation, but not side asks, approvals, who sent each message, or the host. Turning the link off stops it at once"
+        : archived ? "Archived sessions can't get a new share link"
+        : "Create a link that lets anyone who has it view the shared conversation, read-only, without signing in"}
+      trailing={isOwner && (linkShared
+        ? <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={sharing.unshareLink}>Turn off</Button>
+        : !archived && <Button variant="outline" size="sm" disabled={actions.action.busy || sharing.linkLoading} onClick={() => void sharing.shareLink()}>Create link</Button>)}
+    />}
+    {isOwner && link && <CardBody><Field label="Share link" hint={<>Created <RelativeTime value={link.createdAt} /></>}><CopyField value={link.url} label="Copy share link" /></Field></CardBody>}
+    {isOwner && sharing.linkError && <CardBody><Feedback error={sharing.linkError} /></CardBody>}
     {canManage && !archived ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
       <ResourceState {...grants} retry={grants.refresh}>
         {grants.data && <form onSubmit={saveGrant}>
@@ -496,9 +524,10 @@ function OperationSection({ session, changed }: { session: SessionRecord; change
 
 function AccessSection({ session, view, user }: { session: SessionRecord; view: SessionView | null; user: UserProfile }) {
   const visibility = session.visibility ?? "private";
-  return <Section title="Access" info={<p>{visibility === "workspace"
+  return <Section title="Access" info={<><p>{visibility === "workspace"
     ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
-    : "Private: only the owner and members with a session grant can view prompts and output."} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
+    : "Private: only the owner and members with a session grant can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>
+    <p>Values that look like passwords, tokens or keys are shown as {REDACTED} to everyone, in the transcript, approvals and share links. The agent and the host still see the real values.</p></>}>
     {view ? <>
       <Row leading={<Icon name="user" size={16} />} title={<>Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""}</>} hint={view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} />
       <Row leading={<Icon name="git-branch" size={16} />} title="Commits as" hint={<>{view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</>} />
