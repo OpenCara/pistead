@@ -49,6 +49,8 @@ export class HostWorkspace {
   readonly #testProvider: boolean;
   readonly #repositories: readonly SessionRepository[];
   readonly #cacheObjects: readonly string[];
+  /** Like the sandbox's cache mounts: only cache-backed sessions, after their owner's access was re-checked. */
+  #cacheEnabled = false;
   #initialization: Promise<void> | undefined;
   #ready = false;
   #closed = false;
@@ -198,6 +200,10 @@ export class HostWorkspace {
   snapshot(authorize: SandboxAuthorize): Promise<SnapshotFile[]> {
     return this.#operation(authorize, async () => {
       await this.#requireCache();
+      // Its objects live in the host cache, not in the session: a backup would not restore.
+      if (this.#repositories.length && (await this.#cacheState()) === "cache") {
+        throw hostError("backups of sessions checked out from the host repository cache are not supported yet");
+      }
       const files: SnapshotFile[] = [];
       let total = 0;
       const add = async (parent: string, name: string, archivePath: string) => {
@@ -243,7 +249,17 @@ export class HostWorkspace {
   async materializeFromCache(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<void> {
     this.#assertRepositories(repositories);
     if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    if (!this.#cacheEnabled) throw new Error("The repository cache is not mounted for this session");
     await this.#operation(authorize, () => this.#checkout());
+  }
+
+  /**
+   * Mirrors `Sandbox.enableRepositoryCache`. Nothing is mounted here: an approved command on an unsandboxed host already
+   * runs as the connector user, who can read the cache. This only keeps checkouts behind the same re-check.
+   */
+  enableRepositoryCache(): void {
+    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    this.#cacheEnabled = true;
   }
 
   /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
@@ -542,6 +558,7 @@ export class HostWorkspace {
       || canonicalJson(marker.repositories) !== canonicalJson(this.#repositories)) {
       throw hostError("repository cache binding does not match immutable pins");
     }
+    if (source === "cache" && !this.#cacheObjects.length) throw hostError("this session needs the host repository cache; its connector must run with --repo-cache");
     const expected = source === "cache" ? this.#cacheObjects.map(path => `${path}\n`).join("") : "";
     if (await this.#alternates() !== expected) throw hostError("repository cache mounts do not match this session");
     if (!("status" in marker) || marker.status !== "ready") throw hostError("repository cache preparation is incomplete; refusing to overwrite");

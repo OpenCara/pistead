@@ -11,11 +11,17 @@ The control plane waits 30 seconds for a session's `create` and disconnects the 
 first clone cannot run inside `create`. On a cache host, `RunnerSession.open()` returns at once and prepares the
 repositories in the background: for each pin, `authorizeRepository` (the server re-checks the owner's access; the
 answer must name exactly the pin and `repositoryRemote(pin)`), `RepositoryCache.ensure` and `inspect`; then one
-`materializeFromCache`. `drainQueue` holds runs until it is done, so messages sent meanwhile queue. If it fails, new
-messages are refused with the reason (for example "No Git credentials for github.com are set up on this host"), queued
-ones stay queued, and restarting the session tries again. `close()` aborts a fetch in progress. Already checked-out
-sessions re-run the authorization and `ensure` on every open (cheap when cached), so a host that lost the pin fetches
-it again. Sessions checked out from archives keep working on a cache host and never use the mounts.
+`materializeFromCache`. Until it is done nothing runs: the harness stays paused, so messages sent meanwhile queue, runs
+recovered after a restart are not resubmitted, and approved operations are refused with "still being prepared". If it
+fails, all of that stays suspended and new messages are refused with the reason (for example "No Git credentials for
+github.com are set up on this host"); restarting the session tries again. `close()` aborts a fetch in progress.
+Already checked-out sessions re-run the authorization and `ensure` on every open (cheap when cached), so a host that
+lost the pin fetches it again.
+
+The sandbox mounts the cache only for a session checked out (or about to be) from it, and only once this open has
+re-authorized every pin (`enableRepositoryCache`). Sessions checked out from archives keep working on a cache host and
+never see the cache, which other owners' fetches fill. Backups and restores of cache-backed sessions are refused until
+snapshots are self-contained: their objects live in the cache, so such a backup could not be restored.
 
 ## How sessions get their code today
 

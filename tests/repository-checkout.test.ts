@@ -155,6 +155,8 @@ test("host mode checks pinned trees out of the cache with real symlinks and full
   t.after(() => workspace.close());
   await workspace.initialize();
   assert.equal(await workspace.repositoryCacheState([f.pin], authorize), "absent");
+  await assert.rejects(workspace.materializeFromCache([f.pin], authorize), /not mounted/, "the cache is used only once the session enables it");
+  workspace.enableRepositoryCache();
   await workspace.materializeFromCache([f.pin], authorize);
   assert.equal(await workspace.repositoryCacheState([f.pin], authorize), "cache");
   assert.equal(await workspace.gitStatus(authorize), "");
@@ -188,6 +190,8 @@ test("host mode checks pinned trees out of the cache with real symlinks and full
   // Running the checkout again never touches a ready session.
   await workspace.materializeFromCache([f.pin], authorize);
   assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "changed\n");
+  // Its objects live in the cache, so a snapshot of it would not restore.
+  await assert.rejects(workspace.snapshot(authorize), /backups of sessions checked out from the host repository cache are not supported yet/);
 });
 
 test("a cache-backed session refuses cache paths other than the ones it was checked out with", hostMode, async t => {
@@ -195,14 +199,18 @@ test("a cache-backed session refuses cache paths other than the ones it was chec
   const root = join(f.root, "session");
   const first = new HostWorkspace(binding("cache-session", [f.pin]), root, { repositoryObjects: { [f.pin.path]: f.objects } });
   await first.initialize();
+  first.enableRepositoryCache();
   await first.materializeFromCache([f.pin], authorize);
   await first.close();
-  for (const options of [{ repositoryObjects: { [f.pin.path]: join(f.root, "elsewhere", "objects") } }, {}]) {
+  for (const [options, reason] of [
+    [{ repositoryObjects: { [f.pin.path]: join(f.root, "elsewhere", "objects") } }, /mounts do not match this session/],
+    [{}, /needs the host repository cache; its connector must run with --repo-cache/],
+  ] as const) {
     const reopened = new HostWorkspace(binding("cache-session", [f.pin]), root, options);
     t.after(() => reopened.close());
     await reopened.initialize();
-    await assert.rejects(reopened.repositoryCacheState([f.pin], authorize), /mounts do not match this session/);
-    await assert.rejects(reopened.readFile("acme/alpha/README.md", authorize), /mounts do not match this session/);
+    await assert.rejects(reopened.repositoryCacheState([f.pin], authorize), reason);
+    await assert.rejects(reopened.readFile("acme/alpha/README.md", authorize), reason);
   }
   const unconfigured = new HostWorkspace(binding("other-session", [f.pin]), join(f.root, "other"));
   t.after(() => unconfigured.close());
@@ -217,6 +225,7 @@ test("a pinned commit missing from the cache fails before anything is written", 
   const workspace = new HostWorkspace(binding("missing", [pin]), root, { repositoryObjects: { [pin.path]: f.objects } });
   t.after(() => workspace.close());
   await workspace.initialize();
+  workspace.enableRepositoryCache();
   await assert.rejects(workspace.materializeFromCache([pin], authorize), /missing from the repository cache/);
   assert.deepEqual(await readdir(join(root, "worktree")), [".git"]);
   await assert.rejects(lstat(join(root, "worktree", ".git", "repository-cache.json")), { code: "ENOENT" });
@@ -268,7 +277,8 @@ test("the sandbox helper checks pinned trees out of read-only cache mounts with 
   const root = join(f.root, "helper");
   const result = await helper(t, root, checkoutScript, { repositories: [f.pin], alternates: [f.objects] });
   assert.deepEqual({ state: result.state, moved: result.moved, unmounted: result.unmounted, error: result.error },
-    { state: "cache", moved: "repository cache mounts do not match this session", unmounted: "repository cache mounts do not match this session", error: undefined });
+    { state: "cache", moved: "repository cache mounts do not match this session",
+      unmounted: "this session needs the host repository cache; its connector must run with --repo-cache", error: undefined });
   const work = join(root, "worktree");
   assert.equal(await readlink(join(work, "acme", "alpha", "link")), "README.md");
   assert.equal(await readFile(join(work, "acme", "alpha", "README.md"), "utf8"), README);
@@ -298,11 +308,15 @@ test("the Linux sandbox mounts the cache read-only for every process and checks 
   const sandbox = new Sandbox(binding("sandbox-cache", [f.pin], "faux"), join(f.root, "sandbox"), undefined, { repositoryObjects: { [f.pin.path]: f.objects } });
   t.after(() => sandbox.close());
   await sandbox.initialize();
+  const shell = (command: string, readOnly = true) => sandbox.execute({ kind: "bash", command }, readOnly, authorize, { allowTestShell: true });
+  // Configured but not enabled, as for an archive-backed session on a cache host: the cache is not there at all.
+  assert.equal((await shell("test -e /repository-cache/0 && echo visible || echo hidden")).trim(), "hidden");
+  await assert.rejects(sandbox.materializeFromCache([f.pin], authorize), /not mounted/);
+  sandbox.enableRepositoryCache();
   await sandbox.materializeFromCache([f.pin], authorize);
   assert.equal(await sandbox.repositoryCacheState([f.pin], authorize), "cache");
   assert.equal(await sandbox.gitStatus(authorize), "");
   assert.equal(await sandbox.readFile("acme/alpha/docs/up", authorize), README);
-  const shell = (command: string, readOnly = true) => sandbox.execute({ kind: "bash", command }, readOnly, authorize, { allowTestShell: true });
   assert.equal((await shell("git rev-list --count acme/alpha/pinned")).trim(), "2");
   assert.equal((await shell("cat .git/objects/info/alternates")).trim(), "/repository-cache/0");
   await assert.rejects(shell("touch /repository-cache/0/written", false));
@@ -310,4 +324,19 @@ test("the Linux sandbox mounts the cache read-only for every process and checks 
   await sandbox.execute({ kind: "git.commit", message: "Owner change" }, false, authorize);
   assert.equal(await sandbox.gitStatus(authorize), "");
   assert.equal((await shell("git rev-list --count HEAD")).trim(), "2");
+  await assert.rejects(sandbox.snapshot(authorize), /not supported yet/);
+});
+
+test("the sandbox helper refuses to snapshot a session checked out from the cache", { skip: process.platform !== "linux" || hostMode.skip }, async t => {
+  const f = await fixture(t);
+  const root = join(f.root, "helper");
+  assert.equal((await helper(t, root, checkoutScript, { repositories: [f.pin], alternates: [f.objects] })).state, "cache");
+  const handled = await helper(t, root, String.raw`
+try:
+    main()
+    print(json.dumps({'error': None}))
+except ValueError as error:
+    print(json.dumps({'error': str(error)}))
+`, { kind: "snapshot", expectedRepositories: [f.pin], repositoryAlternates: [f.objects] });
+  assert.equal(handled.error, "backups of sessions checked out from the host repository cache are not supported yet");
 });

@@ -445,3 +445,21 @@ test("completed metadata still binds every run and approval to the source owner 
     assert.deepEqual(manifest.approvals["approval-1"], approval);
   });
 });
+
+test("backups of sessions checked out from the host repository cache are refused before anything is staged", linux, async t => {
+  const f = await fixture(t);
+  const prepare = t.mock.fn(async () => {});
+  const marker = { version: 2, source: "cache", repositories: [], status: "ready", baseline: "a".repeat(40) };
+  for (const extra of [
+    { path: "git/objects/info/alternates", data: Buffer.from("/repository-cache/0\n").toString("base64"), mode: 0o600 },
+    { path: "git/repository-cache.json", data: Buffer.from(JSON.stringify(marker)).toString("base64"), mode: 0o600 },
+  ]) {
+    const value = archive();
+    value.files.push(extra);
+    const saved = envelope(value);
+    await assert.rejects(restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, prepare),
+      /host repository cache cannot be restored yet/);
+  }
+  assert.equal(prepare.mock.callCount(), 0);
+  await absent(join(f.directory, "sessions", "target"));
+});

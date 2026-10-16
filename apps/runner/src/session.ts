@@ -98,6 +98,10 @@ function internalOrigin(controlPlaneUrl: string): string {
   return origin.origin;
 }
 
+function preparationFailure(reason: string): string {
+  return `${reason.replace(/\.$/, "")}. Restart the session to try again.`;
+}
+
 type RepositoryPreparation = { status: "ready" }
   | { status: "preparing"; done: Promise<void>; controller: AbortController; items: RepositoryPreparationItem[] }
   | { status: "failed"; reason: string; items: RepositoryPreparationItem[] };
@@ -128,8 +132,13 @@ export class RunnerSession {
    * the control plane waits for `create`. It runs in the background; runs are held until it is done (see drainQueue).
    */
   #repositories: RepositoryPreparation = { status: "ready" };
-  /** How this session's repositories are checked out, for the agent's instructions. */
+  /** How this session's repositories are checked out, for the agent's instructions and backups. */
   #repositorySource: "archive" | "cache" = "archive";
+  /** Bumped by every preparation and by close(), so a superseded preparation never changes what came after it. */
+  #preparations = 0;
+  /** open() has finished; with #resumed, recovered and queued work resumes exactly once per open, and only when ready. */
+  #opened = false;
+  #resumed = false;
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -270,20 +279,22 @@ export class RunnerSession {
     if (repositories.length) await authorize();
     await this.sandbox.initialize();
     if (!repositories.length) return;
-    const state = await this.sandbox.repositoryCacheState(repositories, authorize);
-    this.#repositorySource = state === "cache" || (state === "absent" && this.config.repositoryCache) ? "cache" : "archive";
-    if (state === "archive") return;
-    if (state === "cache") {
-      // Checked out already. The cache may still need the pinned history (cleaned up, or another host after a restore).
-      if (!restoring) this.prepareRepositories(repositories, false);
+    if (this.config.repositoryCache) {
+      const state = await this.sandbox.repositoryCacheState(repositories, authorize);
+      this.#repositorySource = state === "archive" ? "archive" : "cache";
+      // Archive-backed sessions keep working on a cache host, and never see the cache.
+      if (state === "archive") return;
+      // A restored cache is authoritative: never replace its files with a fresh download.
+      if (restoring && state === "absent") throw new RunnerError(409, "Restored repository cache is not ready");
+      // Their snapshots are refused, and their objects would be missing from one anyway.
+      if (restoring) throw new RunnerError(409, "Sessions checked out from the host repository cache cannot be restored yet");
+      // Every open re-checks the owner's access to each pin before the sandbox sees the cache (prepareRepositories).
+      this.prepareRepositories(repositories, state === "absent");
       return;
     }
+    if (await this.sandbox.repositoryCachesReady(repositories, authorize)) return;
     // A restored cache is authoritative: never replace its files with a fresh download.
     if (restoring) throw new RunnerError(409, "Restored repository cache is not ready");
-    if (this.config.repositoryCache) {
-      this.prepareRepositories(repositories, true);
-      return;
-    }
     const archives: Uint8Array[] = [];
     for (const repository of repositories) {
       await authorize();
@@ -310,6 +321,7 @@ export class RunnerSession {
    * tree is checked; then everything is checked out at once. A later preparation, or close(), supersedes this one.
    */
   private prepareRepositories(repositories: SessionRepository[], checkout: boolean): void {
+    const epoch = ++this.#preparations;
     const controller = new AbortController();
     const authorize = async () => { controller.signal.throwIfAborted(); await this.authorize(this.binding.owner.id, "write"); };
     // What the session view shows, one row per pin; only structured progress, never Git's or a remote's text.
@@ -317,6 +329,8 @@ export class RunnerSession {
     const update: ProgressUpdate = (path, change) => { const item = items.find(each => each.path === path); if (item) Object.assign(item, change); };
     const done = (async () => {
       await this.fetchRepositories(repositories, authorize, checkout, controller.signal, update);
+      // Only now, with every pin re-authorized for this owner, does the sandbox see the cache at all.
+      this.sandbox.enableRepositoryCache();
       if (checkout) {
         for (const { path } of repositories) update(path, { phase: "checking-out", percent: null, done: null, total: null });
         try { await this.sandbox.materializeFromCache(repositories, authorize); }
@@ -334,11 +348,25 @@ export class RunnerSession {
     done.then(() => {
       if (this.#repositories !== preparing) return;
       this.#repositories = { status: "ready" };
-      if (!this.closing) this.drainQueue();
+      // If open() is still running it resumes the work itself; otherwise resume it now, in turn with other requests.
+      void this.exclusive(async () => {
+        if (epoch !== this.#preparations || !this.#opened || this.closing || this.#resumed || this.#repositories.status !== "ready") return;
+        await this.resumeWork();
+      }).catch(() => {
+        // As for a failed open: nothing more runs, and restarting the session tries again.
+        if (epoch === this.#preparations) this.#repositories = { status: "failed", reason: "This session could not resume its work after preparing its repositories", items };
+      });
     }, (error: unknown) => {
       if (this.#repositories !== preparing) return;
       this.#repositories = { status: "failed", reason: error instanceof RunnerError ? error.message : "Repositories could not be prepared on this host", items };
     });
+  }
+
+  /** Sandbox work outside runs (approved operations, backups) waits for prepared repositories, and never runs after a failure. */
+  private requireRepositoriesReady(): void {
+    const preparation = this.#repositories;
+    if (preparation.status === "preparing") throw new RunnerError(409, "This session's repositories are still being prepared on its host. Try again once they are ready.");
+    if (preparation.status === "failed") throw new RunnerError(502, preparationFailure(preparation.reason));
   }
 
   /** Repository preparation for the session view; absent once it is done, as on hosts without a cache. */
@@ -462,6 +490,15 @@ export class RunnerSession {
       doc.json = JSON.stringify(state);
     }, context);
     this.closing = false;
+    this.#opened = true;
+    // Recovered and queued work waits for repositories prepared in the background: their preparation resumes it once
+    // they are ready, and a failure leaves it all suspended, harness included, until the session restarts.
+    if (this.#repositories.status === "ready") await this.resumeWork();
+  }
+
+  /** Recovered runs, then the harness and the queue: at most once per open, and only once the repositories are ready. */
+  private async resumeWork(): Promise<void> {
+    this.#resumed = true;
     const state = await this.metadata();
     for (const run of Object.values(state.runs)) {
       if (run.status !== "running" && run.status !== "admitting") continue;
@@ -672,7 +709,7 @@ export class RunnerSession {
       if (this.closing) throw new RunnerError(503, "Session is closing");
       // Messages queue while repositories are prepared; once that failed, say why instead of queueing forever.
       const preparation = this.#repositories;
-      if (preparation.status === "failed") throw new RunnerError(502, `${preparation.reason.replace(/\.$/, "")}. Restart the session to try again.`);
+      if (preparation.status === "failed") throw new RunnerError(502, preparationFailure(preparation.reason));
       await this.authorize(ticket.actorId, mode === "ask" ? "ask" : "write", ticket.policyVersion);
       const options = await this.chatOptions(input.options, mode, ticket.actorId);
       const key = await requestKey(ticket.actorId, mode, input.requestId);
@@ -1066,6 +1103,8 @@ export class RunnerSession {
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "denied", decidedBy: ticket.actorId }); });
         return (await this.metadata()).approvals[id]!;
       }
+      // Approved operations run in the sandbox, so they wait for the repositories like runs do.
+      this.requireRepositoriesReady();
       this.requireShellCapability(approval.operation, approval.unbounded === true);
       await this.authorize(approval.requestedBy, "write");
       if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status))) throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
@@ -1215,6 +1254,9 @@ export class RunnerSession {
       await this.authorize(ticket.actorId, "manage");
       const state = await this.metadata();
       if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
+      this.requireRepositoriesReady();
+      // Their objects live in the host cache, not in the snapshot, so the backup could not be restored.
+      if (this.#repositorySource === "cache") throw new RunnerError(409, "Backups of sessions checked out from the host repository cache are not supported yet");
       await this.close();
       try {
         const sqlite = await readFile(this.sqlitePath, "base64");
@@ -1230,6 +1272,9 @@ export class RunnerSession {
     const preparation = this.#repositories;
     if (preparation.status === "preparing") preparation.controller.abort();
     this.#repositories = { status: "ready" };
+    this.#preparations++;
+    this.#opened = false;
+    this.#resumed = false;
     if (abortPushes) {
       // Aborted pushes still settle their approval (interrupted) and report completion before the harness closes.
       for (const push of this.pushes) push.controller.abort();

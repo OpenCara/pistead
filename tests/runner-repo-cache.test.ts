@@ -5,7 +5,8 @@ import { chmod, mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseGitProgress } from "../apps/runner/src/git-remote.js";
-import { RepositoryCache, repositoryAuthorization, type RepositoryCacheProgress } from "../apps/runner/src/repo-cache.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { RepositoryCache, checkoutBudget, repositoryAuthorization, type RepositoryCacheProgress } from "../apps/runner/src/repo-cache.js";
 import type { GitHubSessionRepository } from "../packages/shared/src/repositories.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
 
@@ -217,4 +218,83 @@ test("the control plane's cache authorization must be exactly the pin and its re
     { repository: { ...repository, remote: `https://${"x".repeat(2048)}` } },
     { repository: { ...repository, bindingId: 7 } },
   ]) assert.throws(() => repositoryAuthorization(value), /Invalid repository authorization/, JSON.stringify(value)?.slice(0, 80));
+});
+
+test("branches renamed into or out of a directory on the remote update the mirror in either direction", gitAvailable, async (t) => {
+  const f = await fixture(t);
+  const cache = f.open();
+  const directory = cache.directory(f.pin(f.commits[2]!), "test:alice");
+  await cache.ensure({ pin: f.pin(f.commits[2]!), ownerId: "test:alice", sessionId: "s1", remote: f.remote });
+  const upstreamRefs = () => git(f.root, [`--git-dir=${directory}`, "for-each-ref", "--format=%(refname)", "refs/upstream/heads/"]).split("\n");
+  // feature becomes feature/login, then feature again; each step pins a new commit, so the cache fetches.
+  for (const [from, to, step] of [["feature", "feature/login", 1], ["feature/login", "feature", 2]] as const) {
+    const next = git(f.work, ["commit-tree", `${f.commits[2]}^{tree}`, "-p", f.commits[2]!, "-m", `rename ${step}`]);
+    git(f.work, ["push", "-q", f.upstream, `:refs/heads/${from}`]);
+    git(f.work, ["push", "-q", f.upstream, `${next}:refs/heads/${to}`]);
+    await cache.ensure({ pin: f.pin(next), ownerId: "test:alice", sessionId: `s${step + 1}`, remote: f.remote });
+    assert.ok(upstreamRefs().includes(`refs/upstream/heads/${to}`), to);
+    assert.ok(!upstreamRefs().includes(`refs/upstream/heads/${from}`), from);
+  }
+});
+
+test("an already-aborted signal stops cache work before Git starts", gitAvailable, async (t) => {
+  const f = await fixture(t);
+  const cache = f.open();
+  await cache.ensure({ pin: f.pin(f.commits[2]!), ownerId: "test:alice", sessionId: "s1", remote: f.remote });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(cache.inspect(f.pin(f.commits[2]!), "test:alice", checkoutBudget(), controller.signal), /cancelled/);
+});
+
+test("a live holder's lock is waited for, and a lock without a pid is replaced only after it stays that way", gitAvailable, async (t) => {
+  const f = await fixture(t);
+  const cache = f.open();
+  const directory = cache.directory(f.pin(f.commits[2]!), "test:alice");
+  await mkdir(join(directory, ".."), { recursive: true, mode: 0o700 });
+  const lock = `${directory}.pistead.lock`;
+  // The test runner's parent process is alive and is not this process.
+  await writeFile(lock, `${process.ppid}\n`, { mode: 0o600 });
+  let finished = false;
+  const pending = cache.ensure({ pin: f.pin(f.commits[2]!), ownerId: "test:alice", sessionId: "s1", remote: f.remote }).finally(() => { finished = true; });
+  await delay(600);
+  assert.equal(finished, false, "a live holder's lock is respected");
+  await rm(lock);
+  assert.equal((await pending).fetched, true);
+  await writeFile(lock, "", { mode: 0o600 });
+  const started = Date.now();
+  await cache.ensure({ pin: f.pin(f.commits[1]!), ownerId: "test:alice", sessionId: "s2", remote: f.remote });
+  assert.ok(Date.now() - started >= 250, "an empty lock gets one poll interval to receive its pid");
+});
+
+function pkt(body: string | Buffer): Buffer {
+  const bytes = Buffer.from(body);
+  return Buffer.concat([Buffer.from((bytes.length + 4).toString(16).padStart(4, "0")), bytes]);
+}
+
+test("a corrupt pack fails the fetch and closes the download instead of leaving it streaming", gitAvailable, async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pistead-repo-cache-corrupt-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const id = "a".repeat(40);
+  let cancelled = false;
+  let posts = 0;
+  const result = (body: BodyInit) => new Response(body, { headers: { "Content-Type": "application/x-git-upload-pack-result" } });
+  const fakeFetch: typeof fetch = async (input) => {
+    if (String(input).includes("/info/refs")) {
+      return new Response(Buffer.concat([pkt("# service=git-upload-pack\n"), Buffer.from("0000"), pkt("version 2\n"), pkt("ls-refs\n"), pkt("fetch\n"), Buffer.from("0000")]),
+        { headers: { "Content-Type": "application/x-git-upload-pack-advertisement" } });
+    }
+    if (++posts === 1) return result(Buffer.concat([pkt(`${id} refs/heads/main\n`), Buffer.from("0000")]));
+    // A pack section whose side-band data is not a pack, without end.
+    const garbage = pkt(Buffer.concat([Buffer.from([1]), Buffer.alloc(60_000, 0x41)]));
+    let first = true;
+    return result(new ReadableStream<Uint8Array>({
+      pull(controller) { controller.enqueue(first ? Buffer.concat([pkt("packfile\n"), garbage]) : garbage); first = false; },
+      cancel() { cancelled = true; },
+    }));
+  };
+  const cache = new RepositoryCache({ root: join(root, "cache"), authorization: async () => "Basic eDp5", fetch: fakeFetch });
+  const pin = { bindingId: "binding", repositoryId: 1, fullName: "acme/alpha", path: "acme/alpha", ref: "main", commit: id };
+  await assert.rejects(cache.ensure({ pin, ownerId: "test:alice", sessionId: "s1", remote: "https://github.com/acme/alpha.git" }), /index-pack failed/);
+  for (let attempt = 0; attempt < 50 && !cancelled; attempt++) await delay(20);
+  assert.equal(cancelled, true, "the download is closed once Git gives up on the pack");
 });

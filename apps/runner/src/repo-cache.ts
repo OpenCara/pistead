@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { link, lstat, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { GitRemote, ProgressLines, parseGitProgress, type GitProgressPhase } from "./git-remote.js";
@@ -221,7 +220,10 @@ export class RepositoryCache {
       if (current.get(local) !== id && after.get(id)) updates.push(`update ${local} ${id}`);
       current.delete(local);
     }
-    for (const ref of current.keys()) updates.push(`delete ${ref}`);
+    const deletes = [...current.keys()].map(ref => `delete ${ref}`);
+    // Deletes commit first, on their own: a branch renamed from feature/login to feature (or back) is a file/directory
+    // conflict that Git refuses inside one transaction, in either order.
+    if (deletes.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${deletes.join("\n")}\n`);
     updates.push(`update ${pinRef(sessionId)} ${pin.commit}`);
     await git.run(["update-ref", "--no-deref", "--stdin"], `${updates.join("\n")}\n`);
     emit({ phase: "done", percent: 100, done: null, total: null, bytes });
@@ -318,27 +320,48 @@ function throttle(listener: Listener | undefined, interval: number): Listener | 
   };
 }
 
+/**
+ * One lock file per cache repository holding its owner's pid. The connector's lease already keeps a second runner off
+ * the same state directory, so this guards custom roots and tests. The lock appears atomically with its pid (written to
+ * a private file, then hard-linked into place), so it is never seen empty. A dead or own pid is stale; content that is
+ * not a pid is stale only if the very same file still holds it one poll later.
+ */
 async function acquireLock(directory: string, signal?: AbortSignal): Promise<() => Promise<void>> {
   const parent = resolve(directory, "..");
   await mkdir(parent, { recursive: true, mode: 0o700 });
-  const path = join(parent, `${directory.slice(parent.length + 1)}.${LOCK_NAME}`);
+  const name = `${basename(directory)}.${LOCK_NAME}`;
+  const path = join(parent, name);
   const deadline = Date.now() + FETCH_TIMEOUT_MS;
+  let suspect: { ino: number; content: string } | undefined;
   for (;;) {
     signal?.throwIfAborted();
+    const claim = join(parent, `.${name}.${randomBytes(8).toString("hex")}`);
+    await writeFile(claim, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
     try {
-      const handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      try { await handle.writeFile(`${process.pid}\n`); } finally { await handle.close(); }
+      await link(claim, path);
       return async () => { await unlink(path).catch(() => undefined); };
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
+    } finally {
+      await unlink(claim).catch(() => undefined);
     }
-    let holder = 0;
-    try { holder = Number((await readFile(path, "utf8")).trim()); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; continue; }
+    let held: { ino: number; content: string };
+    try {
+      const info = await lstat(path);
+      held = { ino: info.ino, content: await readFile(path, "utf8") };
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") continue;
+      throw error;
+    }
+    const holder = /^[1-9][0-9]{0,9}\n$/.test(held.content) ? Number(held.content) : 0;
     // In-process callers are already serialized, so our own pid here can only be a lock left by a crash.
-    if (!Number.isSafeInteger(holder) || holder <= 0 || holder === process.pid || !alive(holder)) {
+    const stale = holder ? holder === process.pid || !alive(holder) : suspect?.ino === held.ino && suspect.content === held.content;
+    if (stale) {
       await unlink(path).catch(() => undefined);
+      suspect = undefined;
       continue;
     }
+    suspect = holder ? undefined : held;
     if (Date.now() > deadline) throw new RepositoryCacheError("Timed out waiting for another process to finish fetching this repository");
     await new Promise(resolveWait => setTimeout(resolveWait, LOCK_POLL_MS));
   }
@@ -394,6 +417,8 @@ function runGit(directory: string, args: string[], options: {
   input?: string | AsyncIterable<Uint8Array>; onProgress?: (line: string) => void; onStdout?: (chunk: Buffer) => void;
   signal?: AbortSignal; allowFailure?: boolean; cwd?: string;
 }): Promise<{ code: number | null; stdout: Buffer }> {
+  // A signal can be aborted before it is ever listened to; then Git must not start at all.
+  if (options.signal?.aborted) return Promise.reject(new RepositoryCacheError("Repository cache operation was cancelled"));
   const child = spawn("git", ["--no-pager",
     "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
     "-c", "core.attributesFile=/dev/null", "-c", "core.sshCommand=/usr/bin/false",
@@ -443,12 +468,26 @@ function runGit(directory: string, args: string[], options: {
   if (options.input === undefined || typeof options.input === "string") child.stdin.end(options.input ?? "");
   else {
     const input = options.input;
+    let exited = false;
+    child.once("close", () => { exited = true; });
+    // Resolves on drain, or when Git exits or its stdin closes or fails: a full pipe to a dead process never drains.
+    const writable = () => new Promise<void>(resolveWritable => {
+      const settle = () => {
+        child.stdin.off("drain", settle).off("close", settle).off("error", settle);
+        child.off("close", settle);
+        resolveWritable();
+      };
+      child.stdin.once("drain", settle).once("close", settle).once("error", settle);
+      child.once("close", settle);
+    });
     void (async () => {
+      // Leaving the loop early returns the source, which closes the download behind it.
       for await (const chunk of input) {
-        if (child.stdin.destroyed) break;
-        if (!child.stdin.write(chunk)) await new Promise<void>(resolveDrain => child.stdin.once("drain", resolveDrain));
+        if (exited || child.stdin.destroyed) break;
+        if (!child.stdin.write(chunk)) await writable();
+        if (exited || child.stdin.destroyed) break;
       }
-      child.stdin.end();
+      if (!child.stdin.destroyed) child.stdin.end();
     })().catch(error => kill(error instanceof Error ? error : new RepositoryCacheError("Repository fetch failed")));
   }
   return promise;

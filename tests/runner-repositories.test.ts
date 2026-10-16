@@ -697,6 +697,8 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   const pin: GitHubSessionRepository = { ...repository(), commit: upstreamGit(work, ["rev-parse", "HEAD"]) };
   const input = binding("cache-host", [pin]);
   let authorizations = 0;
+  const events: string[] = [];
+  observeHarness(t, events, () => {});
   const service = new RunnerService(config(root, {
     unsandboxed: true, repositoryCache: cache,
     authorizeRepository: async (repository, sessionId) => {
@@ -712,6 +714,7 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   // create returned while the clone is still waiting for its pack.
   await packRequested.promise;
   assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "absent");
+  assert.ok(events.includes("harness") && !events.includes("resume"), "the harness stays paused while repositories are prepared");
   const preparing = await session.view();
   assert.equal(preparing.busy, true, "preparation keeps the session busy");
   assert.deepEqual(preparing.repositories, { status: "preparing", items: [{ path: pin.path, phase: "connecting", percent: null, done: null, total: null, bytes: 0 }] });
@@ -724,7 +727,9 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("hello from upstream")), "the held run reads the checked-out file");
   assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "cache");
   assert.equal(view.repositories, undefined, "a ready session reports no preparation");
+  assert.equal(events.filter(event => event === "resume").length, 1, "work resumes once, when the repositories are ready");
   assert.equal(authorizations, 1);
+  await assert.rejects(session.backup(await ticket(input.session.id, "backup")), /host repository cache are not supported yet/);
   assert.equal((await session.sandbox.execute({ kind: "bash", command: "git rev-list --count acme/project-1/pinned" }, false, allow)).trim(), "2");
 });
 
@@ -753,4 +758,45 @@ test("a cache host that cannot prepare a repository refuses new messages with th
   const view = await session.view();
   assert.deepEqual(view.repositories, { status: "failed", error: "The pinned commit is no longer readable in this GitHub repository.",
     items: [{ path: input.session.repositories![0]!.path, phase: "authorizing", percent: null, done: null, total: null, bytes: 0 }] });
+});
+
+test("archive-backed sessions on a cache host are not re-authorized against the cache and never see it", linux, async t => {
+  const root = await directory(t);
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched") });
+  const session = new RunnerSession(binding("archive-on-cache"), root, config(root, {
+    repositoryCache: cache,
+    authorizeRepository: async () => assert.fail("archive sessions are not re-authorized for the cache"),
+    readRepository: async () => assert.fail("a ready archive session downloads nothing"),
+    resolveModels: async () => { throw MODEL_BOUNDARY; },
+  }));
+  t.mock.method(session.sandbox, "initialize", async () => {});
+  t.mock.method(session.sandbox, "repositoryCacheState", async () => "archive");
+  const enable = t.mock.method(session.sandbox, "enableRepositoryCache", () => {});
+  t.after(() => session.sandbox.close());
+  await assert.rejects(session.open(), error => error === MODEL_BOUNDARY);
+  assert.equal(enable.mock.callCount(), 0);
+});
+
+test("a cache-backed session sees the cache only after this open re-authorized and ensured every pin", linux, async t => {
+  const root = await directory(t);
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched") });
+  const order: string[] = [];
+  const session = new RunnerSession(binding("cache-reopen", [repository(), repository(2)]), root, config(root, {
+    repositoryCache: cache,
+    authorizeRepository: async pin => {
+      order.push(`authorize ${pin.path}`);
+      return { bindingId: pin.bindingId, commit: pin.commit, remote: repositoryRemote(pin) };
+    },
+    resolveModels: async () => { throw MODEL_BOUNDARY; },
+  }));
+  t.mock.method(session.sandbox, "initialize", async () => {});
+  t.mock.method(session.sandbox, "repositoryCacheState", async () => "cache");
+  t.mock.method(cache, "ensure", async (target: { pin: SessionRepository }) => { order.push(`ensure ${target.pin.path}`); return { objects: "", fetched: false }; });
+  const enabled = Promise.withResolvers<void>();
+  t.mock.method(session.sandbox, "enableRepositoryCache", () => { order.push("enable"); enabled.resolve(); });
+  t.after(() => session.sandbox.close());
+  // open() stops at the model sentinel; the preparation it started continues in the background.
+  await assert.rejects(session.open(), error => error === MODEL_BOUNDARY);
+  await enabled.promise;
+  assert.deepEqual(order, ["authorize acme/project-1", "ensure acme/project-1", "authorize acme/project-2", "ensure acme/project-2", "enable"]);
 });

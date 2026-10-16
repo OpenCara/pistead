@@ -438,6 +438,8 @@ def cache_ready(work, git, repositories, alternates=()):
         raise ValueError('repository cache binding does not match immutable pins')
     if json.dumps(marker.get('repositories'), sort_keys=True) != json.dumps(repositories, sort_keys=True):
         raise ValueError('repository cache binding does not match immutable pins')
+    if source == 'cache' and not alternates:
+        raise ValueError('this session needs the host repository cache; its connector must run with --repo-cache')
     expected = ''.join(path + '\n' for path in alternates) if source == 'cache' else ''
     if read_alternates(git) != expected:
         raise ValueError('repository cache mounts do not match this session')
@@ -1074,6 +1076,9 @@ def main():
                 return
             if not ready:
                 raise ValueError('repository cache is not prepared')
+            if kind == 'snapshot' and ready == 'cache':
+                # Its objects live in the host cache, not in the session: a backup would not restore.
+                raise ValueError('backups of sessions checked out from the host repository cache are not supported yet')
         if kind == 'push-prepare':
             print(json.dumps(push_prepare(request, git), ensure_ascii=True))
             return
@@ -1345,6 +1350,8 @@ export class Sandbox {
   readonly #testProvider: boolean;
   readonly #repositories: readonly SessionRepository[];
   readonly #cacheObjects: readonly string[];
+  /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
+  #cacheMounted = false;
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
   #closed = false;
@@ -1530,7 +1537,18 @@ export class Sandbox {
   async materializeFromCache(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<void> {
     this.#assertRepositories(repositories);
     if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    if (!this.#cacheMounted) throw new Error("The repository cache is not mounted for this session");
     await this.#operation({ kind: "repository-checkout" }, false, authorize, true);
+  }
+
+  /**
+   * Mounts the cache's object directories, read-only, into every later process of this sandbox. Only for a session
+   * checked out (or about to be) from the cache, once the control plane has re-checked its owner's access to every
+   * pinned repository: archive-backed sessions on a cache host never see the cache, which other owners' fetches fill.
+   */
+  enableRepositoryCache(): void {
+    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    this.#cacheMounted = true;
   }
 
   /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
@@ -1651,7 +1669,7 @@ export class Sandbox {
       // By path, not descriptor: the resource supervisor passes only fds 3-6 to bwrap. Only the runner writes below
       // the private cache root, so nothing a session controls can redirect these. A missing directory is skipped;
       // Git then reports the missing objects instead of reading anything else.
-      ...this.#cacheObjects.flatMap((source, index) => ["--ro-bind-try", source, `${CACHE_MOUNT}/${index}`]),
+      ...(this.#cacheMounted ? this.#cacheObjects.flatMap((source, index) => ["--ro-bind-try", source, `${CACHE_MOUNT}/${index}`]) : []),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];

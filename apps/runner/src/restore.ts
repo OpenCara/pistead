@@ -183,6 +183,15 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
     const parts = path.split("/");
     for (let i = 1; i < parts.length; i++) if (paths.has(parts.slice(0, i).join("/"))) invalid("Snapshot file is also a parent directory");
   }
+  // Sessions checked out from the host repository cache keep their objects there, not in the snapshot. Their backups
+  // are refused when taken; one that exists anyway must not restore into a session missing its history.
+  const marker = files.find(file => file.path === "git/repository-cache.json");
+  let markerVersion: unknown;
+  try { markerVersion = marker ? (JSON.parse(marker.bytes.toString("utf8")) as { version?: unknown } | null)?.version : undefined; }
+  catch { markerVersion = undefined; }
+  if (paths.has("git/objects/info/alternates") || (markerVersion !== undefined && markerVersion !== 1)) {
+    invalid("Backups of sessions checked out from the host repository cache cannot be restored yet");
+  }
   return { manifest: manifest as unknown as RestoreManifest, sqlite, files };
 }
 
