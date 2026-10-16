@@ -71,7 +71,7 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 }
 
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
-export function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
+function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;

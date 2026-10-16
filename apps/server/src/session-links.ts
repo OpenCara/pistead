@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
-import type { EntryView, SessionLink, SessionView, SharedSession, SharedSessionView } from '../../../packages/shared/src/types.js';
+import type { EntryView, SessionView } from '../../../packages/shared/src/types.js';
+import type { SessionLink, SharedSession, SharedSessionView } from '../../../packages/shared/src/sharing.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { redactSecrets } from '../../../packages/shared/src/redaction.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';

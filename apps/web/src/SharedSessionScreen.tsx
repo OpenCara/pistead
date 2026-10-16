@@ -1,9 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { SharedSession, SharedSessionView } from "../../../packages/shared/src/types";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import type { SharedSession, SharedSessionView } from "../../../packages/shared/src/sharing";
+import type { EntryView } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage } from "./api";
-import { Logo } from "./icons";
-import { TranscriptEntry } from "./SessionScreen";
-import { Alert, EmptyState, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
+import { Icon, Logo, type IconName } from "./icons";
+import { Markdown } from "./markdown";
+import { splitToolCalls } from "./transcript";
+import { Alert, EmptyState, formatDuration, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
 import "./session.css";
 
 /**
@@ -83,6 +85,49 @@ function useSharedSession(token: string): SharedState {
   return state;
 }
 
+/** Why a model request failed, from the only details that cross the host boundary: provider, model and HTTP status. */
+function modelFailure({ provider, modelId, status }: NonNullable<EntryView["error"]>): string {
+  const name = provider ?? "the provider";
+  if (status === 401 || status === 403) return `The host's Pi credentials for ${name} were rejected.`;
+  if (status === 429) return `Rate limited by ${name}.`;
+  if (status !== undefined && status >= 500 && status < 600) return `${name} was unavailable.`;
+  return `The request to ${[provider, modelId].filter(Boolean).join("/") || "the model"} failed${status ? ` (HTTP ${status})` : ""}`;
+}
+
+/** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
+function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconName; label: ReactNode; text: string }) {
+  return <details className="entry-tool" data-role={role}>
+    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span><Icon name="chevron-right" size={14} /></summary>
+    <pre>{text}</pre>
+  </details>;
+}
+
+/**
+ * One entry, drawn as the session screen draws it but without saying who sent it: a share link's entries carry no
+ * attribution, and its viewers have no workspace whose members could be named.
+ */
+function SharedEntry({ entry }: { entry: EntryView }) {
+  const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
+  const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
+  if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
+    const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
+    // A tool call row would show the model's time, not the tool's, so only results carry a duration.
+    const took = entry.role === "toolResult" && entry.durationMs !== undefined
+      && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}</>} text={entry.text} />;
+  }
+  if (entry.error) {
+    return <div className="entry-error" title={entry.kind}><Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert></div>;
+  }
+  if (entry.role === "user") return <div className="entry-user" title={entry.kind}><div className="entry-bubble">{entry.text}</div></div>;
+  const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
+  return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
+    <Markdown text={prose} />
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
+    {took && <div className="entry-actor">{took}</div>}
+  </div>;
+}
+
 /** What anyone with a session's share link sees, signed in or not: its shared conversation, read-only. */
 export function SharedSessionScreen({ token }: { token: string }) {
   const { session, view, error, invalid } = useSharedSession(token);
@@ -127,7 +172,7 @@ export function SharedSessionScreen({ token }: { token: string }) {
     }}>
       <div className="chat-column">
         {!view ? (error ? <EmptyState title="The conversation isn't available right now">The session's host may be offline. This page keeps trying.</EmptyState> : <PageLoading />)
-          : entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId="" key={entry.id} />)
+          : entries.length ? entries.map(entry => <SharedEntry entry={entry} key={entry.id} />)
           : <EmptyState title="The conversation begins here">Messages and tool results appear here as the work goes on</EmptyState>}
       </div>
     </main>

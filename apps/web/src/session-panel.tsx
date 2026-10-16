@@ -1,6 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionLink, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
+import type { SessionLink } from "../../../packages/shared/src/sharing";
 import { api, segment } from "./api";
 import { BackupList, backupDownloadHref, type Backup } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
@@ -216,8 +217,6 @@ export function SessionPanel(props: PanelProps) {
 /** One approval record; decision controls, when allowed, come in as children. */
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   const { operation } = approval;
-  // The server hides secrets from everyone; an operation that holds one still runs with the real value.
-  const hidden = containsRedaction(operation);
   const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
     ? <> · Allowed by {approval.decidedBy} {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
     : approval.decidedBy && <> · Decision by {approval.decidedBy}</>;
@@ -225,15 +224,15 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
     <div className="approval-head">
       <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />
       {approval.unbounded && <StatusBadge tone="warning">No resource limits</StatusBadge>}
-      {hidden && <StatusBadge tone="warning">Secret hidden</StatusBadge>}
+      {containsRedaction(operation) && <StatusBadge tone="warning">Secret hidden</StatusBadge>}
       <ApprovalStatus approval={approval} />
     </div>
     {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
       {operation.kind === "git.push" && <GitPushSummary operation={operation} />}
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
       <pre>{JSON.stringify(operation, null, 2)}</pre>
+      {approval.status === "pending" && containsRedaction(operation) && <HiddenSecretNote />}
     </>}
-    {hidden && approval.status === "pending" && <p className="small">Something that looks like a secret is shown as <code>{REDACTED}</code>. Approving uses the real value, so make sure it belongs in this operation.</p>}
     <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
@@ -253,8 +252,14 @@ function PermissionSummary({ request, pending }: { request: PermissionRequest; p
     <p><code>{request.tool}</code> {pending ? "needs the session owner's permission for:" : "asked the session owner's permission for:"}</p>
     <ul className="permission-needs small">{request.needs.map(need => <li key={need}>{permissionNeedText[need]}</li>)}</ul>
     {request.target && <pre>{request.target}</pre>}
+    {pending && containsRedaction(request.target) && <HiddenSecretNote />}
     {pending && approvedTools.includes(request.tool) && <p className="muted small">Allowing it doesn't run anything yet: the operation still gets its own approval, unless the message auto-approves.</p>}
   </>;
+}
+
+/** The server hides what looks like a secret from everyone; a decision still uses the real value. */
+function HiddenSecretNote() {
+  return <p className="small">Something that looks like a secret is shown as <code>{REDACTED}</code>. Allowing or approving this uses the real value, so make sure it belongs here.</p>;
 }
 
 function GitPushSummary({ operation }: { operation: GitPushOperation }) {

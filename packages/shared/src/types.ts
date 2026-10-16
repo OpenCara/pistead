@@ -62,25 +62,6 @@ export interface SessionRecord {
   visibility?: "private" | "workspace";
   // Present only on single-session reads: the pinned host explicitly runs without isolation.
   hostUnsandboxed?: boolean;
-  // Present only on single-session reads: anyone with the session's share link can view its shared conversation.
-  linkShared?: boolean;
-}
-/** The owner's share link: anyone who has it can view the session's shared conversation, read-only, without signing in. */
-export interface SessionLink {
-  url: string;
-  createdAt: string;
-}
-/** What a share link shows about its session: nothing that names its workspace, host, repositories or collaborators. */
-export interface SharedSession {
-  title: string;
-  status: SessionRecord["status"];
-  createdAt: string;
-  ownerName: string;
-}
-/** What a share link shows of the work: the shared conversation's entries, without side asks or who sent each message. */
-export interface SharedSessionView {
-  entries: EntryView[];
-  busy: boolean;
 }
 export interface SessionGrant {
   userId: string;
