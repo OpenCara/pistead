@@ -1,5 +1,15 @@
 import type { GitRepinOperation, HostCommandOperation } from "./types.js";
 
+// Declared next to their operations, by interface merging, so the base capability list stays as it was.
+declare module "./connector.js" {
+  interface ConnectorCapabilities {
+    /** The connector runs host_bash commands outside the sandbox, each approved by the host's owner. Absent on older connectors. */
+    hostCommands?: boolean;
+    /** The connector asks the control plane for repinned successor sessions (git_repin). Absent on older connectors. */
+    gitRepin?: boolean;
+  }
+}
+
 export function validRepinRef(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 255
     && !/[\s\x00-\x1f\x7f\\~^:?*\[]/.test(value) && !/[\uD800-\uDFFF]/u.test(value)

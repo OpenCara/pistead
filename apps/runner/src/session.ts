@@ -815,7 +815,7 @@ export class RunnerSession {
         execute: async (args, api, call) => {
           const attribution = await this.toolActor(api, true);
           await this.permit(api, call, "git_repin", `${args.repository} -> ${args.ref}`, { write: true });
-          return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.repin", ...args }, String(api.taskId), { permitted: true }));
+          return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.repin", repository: args.repository, ref: args.ref }, String(api.taskId), { permitted: true }));
         } }),
       defineTool({ name: "git_push", description: "Push the committed session changes of one pinned repository (its worktree path) to a branch on its Git provider, fast-forward only, optionally opening a pull request as the owner. Commit first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
         repository: Type.String(), branch: Type.String(),

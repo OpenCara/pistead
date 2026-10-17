@@ -45,13 +45,15 @@ Ask the agent to use `host_bash` when you need a host-installed SDK or network a
 
 **Host commands run outside the sandbox as the connector's OS user.** They can read or change host files and credentials, access the network, and launch other processes. They have no CPU, memory, process-count or disk quotas. Pistead passes the host's `PATH` and `HOME`, not the connector's entire environment, and starts Bash without shell profiles, in the session worktree. Use an absolute SDK path or configure the connector's `PATH` if a tool is only available in your interactive shell.
 
+Commands run in the session's worktree, whose files and Git configuration the agent can change: builds, package scripts, Git hooks and settings such as `core.fsmonitor` there can run the agent's code on the host, even for a command that looks harmless like `git status`. Approve a host command only if you would run it yourself in that directory.
+
 Each exact command and timeout needs the **host owner's** approval in the session. On a shared host, that owner must also have approve access to the session. The session owner's **Auto-approve** skips this decision only when they own the host too; it never authorizes commands on someone else's host. Commands default to a five-minute timeout (`timeout_seconds`, 1-3600); timeout, cancellation and output limits terminate the process group, but cannot contain an unrestricted command that deliberately detaches processes.
 
 ## Repinning from chat
 
 Ask the agent to use `git_repin` with the pinned repository's worktree path and a branch, tag or commit, for example `{ "repository": "OpenCara/pistead", "ref": "feature/next" }`. Update the connector to a version advertising `gitRepin` to expose this tool.
 
-A repin creates a **new private session** with the selected repository resolved to that ref and the other repository commits unchanged. Open it from the completed approval card. The source session is untouched: its local changes, commits, conversation, sharing grants and backups are **not** copied. The successor uses the same agent and host, and downloads fresh source snapshots when opened. It does not change the workspace's default repository refs or add newly configured repositories.
+A repin creates a **new private session** with the selected repository resolved to that ref and the other repository commits unchanged. Open it from the completed approval card and send a message to start it. The source session is untouched: its local changes, commits, conversation, sharing grants and backups are **not** copied. The successor uses the same agent and host, and downloads its source snapshots when it starts. It does not change the workspace's default repository refs or add newly configured repositories, and it needs every source repository to still be configured in the workspace.
 
 Only the session owner can approve a repin; their **Auto-approve** can skip that decision (at most five new sessions per message). Resolution uses their connected Git accounts, not another member's credentials. Existing sessions can request these tools through the usual missing-tool permission flow; published agents can include `host_bash` and `git_repin` explicitly.
 

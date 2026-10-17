@@ -26,10 +26,6 @@ export interface ConnectorCapabilities {
   gitCredentials?: boolean;
   /** The connector reads GitHub issues and pull requests and merges pull requests through the control plane (github_read, github_merge). Absent on older connectors. */
   github?: boolean;
-  /** Explicit host commands with host-owner approval, never a sandbox fallback. */
-  hostCommands?: boolean;
-  /** Creates a repinned successor session from chat. */
-  gitRepin?: boolean;
 }
 
 export interface ConnectorInfo {

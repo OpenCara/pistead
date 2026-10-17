@@ -31,7 +31,12 @@ export async function repinSession(c: AppContext, connectorId: string | null): P
   const admissionId = input.admissionId === undefined ? null : text(input.admissionId, 'admissionId', 128);
   const tokenHash = admissionId === null ? await sha256(text(input.capability, 'capability', 128)) : null;
   if (admissionId && !approvalId.startsWith('tool-')) fail(400, 'invalid_repin', 'Automatic repins must name a tool call.');
-  let consumedHere = false;
+  const readReceipt = () => c.env.DB.query<Receipt>('SELECT target_session_id, operation_json, admission_id FROM session_repins WHERE session_id = ? AND approval_id = ?')
+    .bind(sessionId, approvalId).first();
+  // A retry of a call that already created its successor returns that session, so its capability must be the one
+  // that call consumed; only a first attempt consumes an unused, unexpired capability.
+  const existing = await readReceipt();
+  let consumed = existing !== null;
   const authorize = async (): Promise<SessionRow> => {
     const owner = await sessionAccess(c.env, sessionId, actorId);
     if (!owner || owner.row.owner_id !== actorId || owner.row.status !== 'ready' || !hasPermission(owner.permissions, 'write')) {
@@ -43,7 +48,7 @@ export async function repinSession(c: AppContext, connectorId: string | null): P
       const cap = await c.env.DB.query<{ session_id: string; approval_id: string; actor_id: string; requested_by: string;
         operation_hash: string; expires_at: number; consumed_at: string | null }>('SELECT * FROM broker_capabilities WHERE token_hash = ?').bind(tokenHash).first();
       if (!cap || cap.session_id !== sessionId || cap.approval_id !== approvalId || cap.actor_id !== actorId || cap.operation_hash !== operationHash
-        || (consumedHere ? !cap.consumed_at : !!cap.consumed_at) || (!consumedHere && cap.expires_at <= Math.floor(Date.now() / 1000))) {
+        || (consumed ? !cap.consumed_at : !!cap.consumed_at) || (!consumed && cap.expires_at <= Math.floor(Date.now() / 1000))) {
         fail(403, 'invalid_capability', 'Repin approval is expired, consumed, or does not match.');
       }
       const writer = await sessionAccess(c.env, sessionId, cap.requested_by);
@@ -63,8 +68,6 @@ export async function repinSession(c: AppContext, connectorId: string | null): P
     return owner.row;
   };
   const source = await authorize();
-  const readReceipt = () => c.env.DB.query<Receipt>('SELECT target_session_id, operation_json, admission_id FROM session_repins WHERE session_id = ? AND approval_id = ?')
-    .bind(sessionId, approvalId).first();
   const result = async (receipt: Receipt): Promise<Response> => {
     if (receipt.operation_json !== operationJSON || receipt.admission_id !== admissionId) fail(409, 'repin_conflict', 'This call already names a different repin.');
     const target = await c.env.DB.query<SessionRow>('SELECT * FROM sessions WHERE id = ? AND owner_id = ?').bind(receipt.target_session_id, actorId).first();
@@ -72,14 +75,14 @@ export async function repinSession(c: AppContext, connectorId: string | null): P
     const value: RepinResult = { sessionId: target.id, path: `/#/s/${target.id}`, repositories: JSON.parse(target.repositories_json ?? '[]') };
     return c.json(value);
   };
-  const existing = await readReceipt();
   if (existing) return result(existing);
   const pins = JSON.parse(source.repositories_json ?? '[]') as SessionRepository[];
   if (!pins.some(pin => pin.path === operation.repository)) fail(403, 'repository_not_pinned', 'Repin must name a pinned repository path.');
   const resolved = await resolveWorkspaceRepositories(c.env, source.workspace_id, source.owner_id, {
     gitProviders: true, repin: { pins, repository: operation.repository, ref: operation.ref },
   });
-  // The successor uses the same owner/agent/host. The ordinary start path hydrates these exact pins on its first message.
+  // The successor keeps the owner, agent and host. Like a restored session, the owner's first message starts it through
+  // the restart route, which provisions exactly these pins.
   await bindingForSession(c, source);
   const fresh = await authorize();
   if (fresh.policy_version !== source.policy_version || fresh.repositories_json !== source.repositories_json) fail(409, 'repin_changed', 'Session authority changed while resolving the ref.');
@@ -87,7 +90,7 @@ export async function repinSession(c: AppContext, connectorId: string | null): P
     const used = await c.env.DB.query(`UPDATE broker_capabilities SET consumed_at = ? WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ? RETURNING token_hash`)
       .bind(now(), tokenHash, Math.floor(Date.now() / 1000)).first();
     if (!used) fail(409, 'capability_consumed', 'This repin was already attempted.');
-    consumedHere = true;
+    consumed = true;
   }
   await authorize();
   const targetId = id();

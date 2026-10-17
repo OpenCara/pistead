@@ -1,4 +1,5 @@
 import { repinSession } from './repin.js';
+import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { sessionActivities, thinkingLevels, type SessionActivity, type ThinkingLevel } from '../../../packages/shared/src/types.js';
@@ -47,19 +48,17 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');
   const cap = value as Record<string, unknown>;
-  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials', 'github', 'hostCommands', 'gitRepin']);
+  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials', 'github']);
   const platform = text(cap.platform, 'platform', 40);
   if (!/^[a-zA-Z0-9._-]+$/.test(platform) || typeof cap.sandbox !== 'boolean' || typeof cap.productionShell !== 'boolean' || (cap.productionShell && !cap.sandbox)
     || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)
     || (cap.chatOptions !== undefined && typeof cap.chatOptions !== 'boolean') || (cap.gitProviders !== undefined && typeof cap.gitProviders !== 'boolean')
     || (cap.gitPush !== undefined && typeof cap.gitPush !== 'boolean')
     || (cap.gitCredentials !== undefined && typeof cap.gitCredentials !== 'boolean') || (cap.gitCredentials && !cap.gitPush)
-    || (cap.hostCommands !== undefined && typeof cap.hostCommands !== 'boolean')
-    || (cap.gitRepin !== undefined && typeof cap.gitRepin !== 'boolean')
     || (cap.github !== undefined && typeof cap.github !== 'boolean')) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
     ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
-    ...(cap.github ? { github: true } : {}), ...(cap.hostCommands ? { hostCommands: true } : {}), ...(cap.gitRepin ? { gitRepin: true } : {}) } };
+    ...(cap.github ? { github: true } : {}) } };
 }
 
 function requireConnectorTLS(env: Env, url: URL): void {
@@ -227,7 +226,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     requireOrigin(c);
     const input = await jsonObject(c, 128 * 1024);
     onlyFields(input, ['code', 'models', 'capabilities']);
-    const manifest = parseManifest(input, c.env);
+    const manifest = withHostToolCapabilities(input, base => parseManifest(base, c.env));
     const pairingId = identifier(c.req.param('id'));
     const code = text(input.code, 'code', 128);
     const controlPlaneUrl = appOrigin(c.env);
@@ -286,7 +285,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     const row = await authenticateConnector(c);
     const input = await jsonObject(c, 128 * 1024);
     onlyFields(input, ['models', 'capabilities']);
-    const manifest = parseManifest(input, c.env);
+    const manifest = withHostToolCapabilities(input, base => parseManifest(base, c.env));
     const updated = await c.env.DB.query<ConnectorRow>(`UPDATE connectors SET models_json = ?, capabilities_json = ? WHERE id = ?
       AND revoked_at IS NULL AND connection_hash = ? RETURNING *`)
       .bind(JSON.stringify(manifest.models), JSON.stringify(manifest.capabilities), row.id, row.connection_hash).first();

@@ -21,7 +21,7 @@ async function fixture(t: TestContext) {
   const { db, sqlite } = await testDatabase();
   t.after(() => db.close());
   const env: Env = { DB: db, APP_ORIGIN: 'http://localhost:8787', RUNNER_SHARED_SECRET: secret,
-    TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: 'repin-test-auth-secret', TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
+    TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: 'repin-test-auth-secret-not-for-deployment', TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
     VAULT_KEY: Buffer.alloc(32, 9).toString('base64url') };
   const created = new Date().toISOString();
   for (const [id, githubId] of [[owner, '7'], ['github:8', '8']]) sqlite.prepare(
@@ -109,7 +109,24 @@ test('repin requires owner authority and a current auto admission; one message h
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 6);
 });
 
-test('human-approved repins use only the exact owner-bound, single-use capability', async t => {
+test('repin callbacks require the runner secret or a current connector connection', async t => {
+  const f = await fixture(t);
+  const call = (path: string, authorization?: string) => app.request(`http://localhost:8787${path}`, {
+    method: 'POST', headers: { ...(authorization ? { authorization } : {}), 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: 'source', approvalId: 'tool-repin', actorId: owner, operation, admissionId: f.admissionId }),
+  }, f.env);
+  for (const authorization of [undefined, 'Bearer wrong-runner-secret-not-for-deployment-at-all']) {
+    assert.equal((await call('/api/internal/git/repin', authorization)).status, 401);
+  }
+  // The runner secret is not a connector credential.
+  for (const authorization of [undefined, `Bearer ${secret}`]) {
+    assert.equal((await call('/api/connectors/self/git/repin', authorization)).status, 401);
+  }
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
+});
+
+test('a human-approved repin consumes its exact owner-bound capability once, and a retry returns its successor', async t => {
   const f = await fixture(t);
   const capability = 'repin-test-human-capability';
   const approvalId = 'human-repin';
@@ -119,8 +136,16 @@ test('human-approved repins use only the exact owner-bound, single-use capabilit
     .run(await sha256(capability), 'source', approvalId, owner, owner, await sha256(JSON.stringify(operation)), Math.floor(Date.now() / 1000) + 90, f.created);
   const input = { approvalId, admissionId: undefined, capability };
   assert.equal((await f.post({ ...input, operation: { ...operation, ref: 'other' } })).status, 403);
-  assert.equal((await f.post(input)).status, 200);
-  assert.equal((await f.post(input)).status, 403);
+  const first = await f.post(input);
+  assert.equal(first.status, 200, await first.clone().text());
+  const created = await first.json() as RepinResult;
+  const count = f.requests.length;
+  // A retry, as after a lost response, gets the same successor without resolving or consuming anything again.
+  assert.deepEqual(await (await f.post(input)).json(), created);
+  assert.equal(f.requests.length, count);
+  // The consumed capability still proves only its own call and operation.
+  assert.equal((await f.post({ ...input, operation: { ...operation, ref: 'other' } })).status, 403);
+  assert.equal((await f.post({ ...input, approvalId: 'human-repin-other' })).status, 403);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 2);
 });
 

@@ -188,7 +188,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (agent && session.connector_id) {
       const tools = JSON.parse(agent.tools_json) as string[];
       if ((tools.includes('host_bash') && !capabilities.hostCommands) || (tools.includes('git_repin') && !capabilities.gitRepin)) {
-        fail(409, 'connector_update_required', 'Update the host connector to use host_bash or git_repin.');
+        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use host_bash and git_repin.');
       }
     }
     const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
