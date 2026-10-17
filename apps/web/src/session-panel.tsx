@@ -3,7 +3,7 @@ import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMe
 import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
 import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
-import { BackupList, backupDatabaseLabel, backupDownloadHref, backupLocationLabel, type Backup, type BackupDatabase } from "./backups";
+import { BackupList, backupDatabaseLabel, backupDownloadHref, backupLocationLabel, type Backup, type BackupDatabase, type BackupListing, type BackupListingResource } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
 import { Icon } from "./icons";
 import { Username, usePeople } from "./people";
@@ -22,6 +22,10 @@ export type PanelTab = "details" | "approvals" | "activity";
 export interface SessionActions {
   action: ActionState;
   backup: Backup | null;
+  /** The session's backups and where a new one goes, loaded for its owner; the header menu and the panel share it. */
+  backups: BackupListingResource;
+  /** No new backup can be saved: the server has no backup storage, or the workspace's own database is turned off. */
+  backupsOff: boolean;
   /** Backups need an idle session whose live state is confirmed. */
   backupBlocked: boolean;
   changeVisibility: () => void;
@@ -36,6 +40,9 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
   const action = useAction();
   const [backup, setBackup] = useState<Backup | null>(null);
   const isOwner = session?.ownerId === user.id;
+  // Only the owner lists backups, and an archived session admits read requests only.
+  const backups = useResource<BackupListing>(session && isOwner && session.status !== "archived" ? `/api/sessions/${segment(session.id)}/backups` : null);
+  const backupsOff = backups.data?.enabled === false;
   async function changeVisibility() {
     if (!session || !isOwner || action.busy) return;
     const nextVisibility = (session.visibility ?? "private") === "workspace" ? "private" : "workspace";
@@ -57,7 +64,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       : "Session is private. Existing explicit grants still apply.");
   }
   async function createBackup() {
-    if (!session || !isOwner || backupBlocked || action.busy) return;
+    if (!session || !isOwner || backupBlocked || backupsOff || action.busy) return;
     setBackup(null);
     const base = `/api/sessions/${segment(session.id)}`;
     let trustedDatabaseId: string | undefined;
@@ -112,7 +119,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       onChange();
     }, "Session unarchived");
   }
-  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup: () => void createBackup(), rename,
+  return { action, backup, backups, backupsOff, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup: () => void createBackup(), rename,
     archive: () => void archive(), unarchive };
 }
 
@@ -445,20 +452,20 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
   const { backup } = actions;
   return <Section
     title="Backups"
-    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p><p>When the workspace owner connected a database of their own, backups are saved there instead of in the server's storage.</p></>}
+    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p><p>Backups are saved in the database the workspace owner connected, if there is one, and otherwise in the server's backup storage. A server without backup storage keeps no backups.</p></>}
     action={<div className="inline">
       <Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh backups" title="Refresh backups" onClick={() => setRefreshKey(value => value + 1)} />
-      <Button variant="outline" size="sm" disabled={actions.backupBlocked || actions.action.busy} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
+      <Button variant="outline" size="sm" disabled={actions.backupsOff || actions.backupBlocked || actions.action.busy} title={actions.backupsOff ? "Backups are off" : undefined} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
     </div>}
   >
-    {actions.backupBlocked && <Row title="Backup unavailable right now" hint="Unavailable while work is queued or running, or the live state can't be confirmed" />}
+    {actions.backupBlocked && !actions.backupsOff && <Row title="Backup unavailable right now" hint="Unavailable while work is queued or running, or the live state can't be confirmed" />}
     {backup && <Row
       leading={<Icon name="check" size={16} />}
       title={<>Backup created <Timestamp value={backup.createdAt} /></>}
       hint={<>{backup.size} bytes{backupLocationLabel(backup)} · ID <code>{backup.id}</code> · SHA-256 <code>{backup.sha256}</code></>}
       trailing={<LinkButton variant="outline" size="sm" href={backupDownloadHref(session.id, backup.id)}>Download</LinkButton>}
     />}
-    <BackupList sourceId={session.id} ownerId={session.ownerId} latestBackup={backup} refreshKey={refreshKey} openSession={openSession} />
+    <BackupList sourceId={session.id} ownerId={session.ownerId} backups={actions.backups} latestBackup={backup} refreshKey={refreshKey} openSession={openSession} />
   </Section>;
 }
 

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { BackupLocation, SessionRecord } from "../../../packages/shared/src/types";
 import { api, errorMessage, segment } from "./api";
-import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert, useResource } from "./ui";
+import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert } from "./ui";
 import { Icon } from "./icons";
 
 export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation };
@@ -16,6 +16,18 @@ export type BackupDatabase = { id: string; host: string; port: number; database:
 
 export function backupDatabaseLabel(database: BackupDatabase): string {
   return `${database.host.includes(":") ? `[${database.host}]` : database.host}:${database.port}/${database.database}`;
+}
+
+/** What `GET /api/sessions/:id/backups` returns: the session's backups, where a new one goes and whether it can be saved. */
+export type BackupListing = { backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase; enabled?: boolean };
+/** The owner's backup listing, loaded once per session screen and shared by its header menu and panel. */
+export type BackupListingResource = { data: BackupListing | null; loading: boolean; error: string; refresh: () => void };
+
+/** Why no new backup can be saved, by where it would have gone. */
+export function backupsOffHint(destination: BackupLocation | undefined): string {
+  return destination === "workspace-database"
+    ? "This workspace keeps its backups in its own database, which this server no longer connects to. The workspace owner can disconnect it in the workspace settings"
+    : "This server keeps no session backups: its operator hasn't set up backup storage (STORAGE_URL)";
 }
 type Attempt = { requestId: string; title?: string; targetSessionId?: string };
 type RestoreResponse = {
@@ -51,9 +63,10 @@ export function backupDownloadHref(sessionId: string, backupId: string) {
 }
 
 /** Backup rows inside the Backups card; selecting one reveals download and restore-into-new-session. */
-export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSession }: { sourceId: string; ownerId: string; latestBackup: Backup | null; refreshKey: number; openSession: (id: string) => void }) {
+export function BackupList({ sourceId, ownerId, backups, latestBackup, refreshKey, openSession }: {
+  sourceId: string; ownerId: string; backups: BackupListingResource; latestBackup: Backup | null; refreshKey: number; openSession: (id: string) => void;
+}) {
   const base = `/api/sessions/${segment(sourceId)}`;
-  const backups = useResource<{ backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase }>(`${base}/backups`);
   const [selectedId, setSelectedId] = useState("");
   const [title, setTitle] = useState("");
   const [attempt, setAttempt] = useState<Attempt | undefined>();
@@ -133,16 +146,18 @@ export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSe
   if (backups.loading) return <Row title={<Loading>Loading backups...</Loading>} />;
   if (backups.error) return <Row title="Unable to load backups" hint={backups.error} trailing={<Button variant="outline" size="sm" onClick={backups.refresh}>Try again</Button>} />;
   const list = backups.data?.backups ?? [];
+  const enabled = backups.data?.enabled !== false;
   // Shown before the next backup: whoever can read the workspace owner's database can read what is saved there.
   const target = backups.data?.workspaceDatabase;
-  const destination = target && <Row
+  const destination = !enabled ? <Row leading={<Icon name="info" size={16} />} title="Backups are off" hint={backupsOffHint(backups.data?.destination)} />
+    : target && <Row
     leading={<Icon name="server" size={16} />}
     title="Saved to the workspace database"
     hint={target.confirm
       ? `New backups of this session go to ${backupDatabaseLabel(target)}, which the workspace owner connected. Whoever can read it can read them, including your personal environment values; you confirm before each backup`
       : `New backups of this session go to ${backupDatabaseLabel(target)}, the database you connected for this workspace`}
   />;
-  if (!list.length) return <>{destination}<Row title="No backups yet" hint="Listing and downloading work while the host is offline" /></>;
+  if (!list.length) return <>{destination}{enabled && <Row title="No backups yet" hint="Listing and downloading work while the host is offline" />}</>;
   return <>
     {destination}
     {list.map(backup => <div key={backup.id} className="backup-item">

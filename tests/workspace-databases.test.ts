@@ -255,6 +255,8 @@ test('with workspace databases turned off, connecting is refused, disconnecting 
   assert.equal(view.available, false);
   assert.equal(view.database?.host, 'db.example.com');
   const runner = f.runner();
+  const listing = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as { destination: string; enabled: boolean };
+  assert.deepEqual([listing.destination, listing.enabled], ['workspace-database', false]);
   const refused = await f.request('POST', '/api/sessions/session/backup', 'test:member', {});
   assert.equal(refused.status, 503);
   assert.equal(await code(refused), 'workspace_databases_disabled');
@@ -323,12 +325,37 @@ test('a backup meant for server storage is not saved there once a workspace data
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
 });
 
+test('without backup storage the server saves no backup, and its listings say so', async t => {
+  const f = await fixture(t);
+  delete f.env.BUCKET;
+  const runner = f.runner();
+  assert.deepEqual(await (await f.request('GET', '/api/sessions/owner-session/backups', 'test:owner')).json(),
+    { backups: [], destination: 'server', enabled: false });
+  const refused = await f.request('POST', '/api/sessions/owner-session/backup', 'test:owner', {});
+  assert.equal(refused.status, 503);
+  assert.equal(await code(refused), 'backup_unavailable');
+  assert.equal(runner.calls, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
+});
+
+test('without backup storage a workspace database still takes the backups of its sessions', async t => {
+  const f = await fixture(t);
+  delete f.env.BUCKET;
+  const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
+  f.runner();
+  const listing = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as { destination: string; enabled: boolean };
+  assert.deepEqual([listing.destination, listing.enabled], ['workspace-database', true]);
+  const created = await f.request('POST', '/api/sessions/session/backup', 'test:member', { trustedDatabaseId: database.id });
+  assert.equal(created.status, 201);
+  assert.equal(f.databases.saved.size, 1);
+});
+
 test('backups of a workspace with its own database are saved and read back there, with the recorded digest', async t => {
   const f = await fixture(t);
   const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
   f.runner();
   assert.deepEqual(await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json(), { backups: [], destination: 'workspace-database',
-    workspaceDatabase: { id: database.id, host: 'db.example.com', port: 5432, database: 'pistead', confirm: true } });
+    enabled: true, workspaceDatabase: { id: database.id, host: 'db.example.com', port: 5432, database: 'pistead', confirm: true } });
   const created = await f.request('POST', '/api/sessions/session/backup', 'test:member', { trustedDatabaseId: database.id });
   assert.equal(created.status, 201);
   const { backup } = await created.json() as { backup: { id: string; sha256: string; size: number; location: string } };
