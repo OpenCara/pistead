@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ApprovalRecord, SessionActivity } from "../packages/shared/src/types.js";
 import { ActivityReporter, sessionActivity, type ActivityRun } from "../apps/runner/src/activity.js";
-import { sessionStatus } from "../apps/web/src/session-status.js";
+import { sessionStatus } from "../packages/client/src/session-status.js";
 
 const run = (status: ActivityRun["status"], sequence: number, extra: Partial<ActivityRun> = {}): ActivityRun =>
   ({ mode: "write", status, sequence, startEntry: sequence * 10, ...extra });

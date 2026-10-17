@@ -88,6 +88,13 @@ Besides workspace visibility and per-member grants, a session's owner can turn o
 
 Everything the control plane shows people (transcripts, approvals and their output, in every session view and share link) has values that look like secrets replaced by `[redacted]`, for everyone including the session's owner. That covers well-known token formats, private keys, the values of password-, secret-, token- and key-named settings, and credentials in URLs, Authorization headers, `curl -u` and `.netrc`. The agent and the host still see the real values, and an approved operation runs with them. In shell commands only single words are ever hidden, so an approver always sees what a command does, and an approval that holds a hidden value says so. Detection is pattern-based, so other sensitive text can still show; backups keep the real transcript.
 
+## Apps
+
+- **iPhone and iPad** ([`apps/mobile`](apps/mobile/README.md), Expo): follow sessions live, send messages, and approve or deny operations from your phone.
+- **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal.
+
+The apps sign in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. Each app sign-in lasts 30 days and appears under **Settings > Profile > Signed-in apps**, where it can be signed out.
+
 ## Development
 
 Requires Node 24 and pnpm.
@@ -99,12 +106,14 @@ pnpm dev:server                                 # API on :8787 (SQLite in ./data
 pnpm dev                                        # web UI on :5173, proxying /api to :8787
 ```
 
-- `pnpm typecheck`, `pnpm test` (set `TEST_DATABASE_URL=postgres://…` to also run the provider suite against Postgres), `pnpm build` (web), `pnpm build:server` (bundled server in `dist/server`).
+- `pnpm typecheck` (also typechecks the apps), `pnpm test` (set `TEST_DATABASE_URL=postgres://…` to also run the provider suite against Postgres), `pnpm build` (web), `pnpm build:server` (bundled server in `dist/server`).
 - `pnpm test:connected` runs the end-to-end suite against a real server and connector (Linux with bubblewrap).
+- `pnpm dev:native [--port 8787] [--no-host] [--pairing]` runs a local test-mode server for developing the apps: a test user with an app token, a workspace and, unless `--no-host`, this machine as a host offering the deterministic fixture model (not an LLM) with one session. `--pairing` adds a pairing code for the desktop app. It writes what the apps need to `.local/dev-native.json`; Ctrl-C stops it and deletes its data.
 
 ## Layout
 
 - `apps/server`: the control plane (Hono on Node). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/data-export.ts` the session and workspace exports; `src/connector-hub.ts` the WebSocket relay to connected hosts.
 - `apps/web`: the React UI.
-- `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli`.
-- `packages/shared`: types and policy shared by all of the above.
+- `apps/mobile`: the iPhone and iPad app (Expo; Android later). `apps/desktop`: the macOS app (Electron; Linux and Windows later).
+- `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` and bundled into the desktop app.
+- `packages/shared`: types and policy shared by all of the above. `packages/client`: the API client, live session updates and chat-option rules shared by the web and the apps.

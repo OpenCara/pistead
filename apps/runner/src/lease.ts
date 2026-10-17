@@ -5,6 +5,11 @@ import { ConnectorSetupError } from "./protocol.js";
 // The guardian reports LOCKED, then holds the kernel lock until its stdin reaches EOF.
 const GUARDIAN = ["/bin/sh", "-c", "echo LOCKED; exec /bin/cat >/dev/null"];
 
+/** The lease is held elsewhere: another connector or runner (a terminal `pistead connect`, an app) uses this directory. */
+export class RunnerLeaseBusyError extends ConnectorSetupError {
+  override name = "RunnerLeaseBusyError";
+}
+
 /** Kernel flock survives stale lock files; pipe EOF releases it even after Node is SIGKILLed. */
 export async function acquireRunnerLease(directory: string, onLost: () => void): Promise<() => Promise<void>> {
   if (process.platform !== "linux" && process.platform !== "darwin") throw new Error("Runner lease requires Linux flock or macOS lockf; no PID-file fallback");
@@ -31,7 +36,7 @@ export async function acquireRunnerLease(directory: string, onLost: () => void):
   child.once("error", () => ready.reject(new Error("Cannot start mandatory flock guardian")));
   child.once("close", () => {
     exited.resolve();
-    if (!acquired) ready.reject(new ConnectorSetupError("Another connector or runner is already using this state directory (or flock/lockf is unavailable)"));
+    if (!acquired) ready.reject(new RunnerLeaseBusyError("Another connector or runner is already using this state directory (or flock/lockf is unavailable)"));
     else if (!releasing) onLost();
   });
   const timeout = setTimeout(() => {

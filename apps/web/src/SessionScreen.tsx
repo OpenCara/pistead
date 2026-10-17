@@ -14,7 +14,7 @@ import { RepositoryPreparationCard } from "./repository-preparation";
 import { preparingRepositories } from "./repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
-import { splitToolCalls } from "./transcript";
+import { splitToolCalls } from "../../../packages/client/src/transcript";
 import {
   Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,

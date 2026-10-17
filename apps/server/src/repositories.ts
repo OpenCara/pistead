@@ -1,5 +1,5 @@
 import type { Hono } from 'hono';
-import type { GitProvider, ProviderRepository, ProviderRepositoryList, SessionRepository, TokenGitProvider, WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
+import type { GitProvider, ProviderRepository, ProviderRepositoryList, SessionRepository, TokenGitProvider, WorkspaceRepository, WorkspaceRepositoryList } from '../../../packages/shared/src/repositories.js';
 import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, repositoryRemote, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
 import type { AppContext, Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
 import { getUser, requireMember, sessionAccess } from './db.js';
@@ -240,9 +240,9 @@ export async function resolveWorkspaceRepositories(env: Env, workspaceId: string
 
 export function registerRepositories(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/repositories', async c => {
-    const workspaceId = identifier(c.req.param('id'));
-    await requireMember(c.env, workspaceId, c.get('auth').userId);
-    return c.json({ repositories: await workspaceRepositories(c.env, workspaceId) });
+    const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
+    await requireMember(c.env, workspaceId, actor);
+    return c.json({ repositories: await workspaceRepositories(c.env, workspaceId), required: !await legacyRepositoryFixture(c.env, actor) } satisfies WorkspaceRepositoryList);
   });
   app.post('/api/workspaces/:id/repositories', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { memberPerson, peopleDirectory, userIdFromInput, username, usernameWithId, withUsernames } from "../apps/web/src/usernames.js";
+import { memberPerson, peopleDirectory, userIdFromInput, username, usernameWithId, withUsernames } from "../packages/client/src/usernames.js";
 
 const alice = { id: "github:1", githubLogin: "alice" };
 const bob = { id: "github:2", githubLogin: "Bob" };

@@ -1,6 +1,10 @@
 packages:
   - .
   - packages/cli
+  - packages/client
+  - apps/mobile
+  - apps/desktop
 onlyBuiltDependencies:
+  - electron
   - esbuild
   - workerd

@@ -4,7 +4,7 @@ import { useApp } from "./app-context";
 import { Icon, Logo } from "./icons";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { href, type Route } from "./router";
-import { sessionStatus } from "./session-status";
+import { sessionStatus } from "../../../packages/client/src/session-status";
 import { DropdownMenu, IdentityBadge, Loading, RelativeTime, StatusDot } from "./ui";
 
 const SESSIONS_PER_WORKSPACE = 6;

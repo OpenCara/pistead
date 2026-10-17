@@ -9,6 +9,8 @@ dist
 coverage
 tests
 apps/runner
+apps/mobile
+apps/desktop
 packages/cli/dist
 packages/cli/src
 packages/cli/scripts

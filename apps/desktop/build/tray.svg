@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="5 5 22 22">
+  <!-- The mark's glyph alone, black on transparent: macOS tints "Template" images for the menu bar. -->
+  <g fill="none" stroke="#000" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M7 15.5 L16 8 L25 15.5"/>
+    <path d="M10.5 17 L21.5 17"/>
+    <path d="M13.75 17 L13.75 24"/>
+    <path d="M18.5 17 L18.5 22.5 C18.5 23.5 19.1 24 20.1 24"/>
+  </g>
+</svg>

@@ -1,0 +1,25 @@
+{
+  "name": "@pistead/desktop",
+  "productName": "Pistead",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pistead for the desktop: the Pistead app, and this computer as a host.",
+  "license": "MIT",
+  "author": "OpenCara",
+  "homepage": "https://pistead.com",
+  "main": "dist/app/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "pnpm run build && electron .",
+    "dist": "pnpm run build && node scripts/stage-connector.mjs && electron-builder --mac --publish never",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@pistead/client": "workspace:*",
+    "@types/node": "^24.0.0",
+    "electron": "44.8.0",
+    "electron-builder": "26.15.3",
+    "esbuild": "0.28.2",
+    "typescript": "^5.9.0"
+  }
+}

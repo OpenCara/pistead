@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { ConnectorInfo, ConnectorPairing } from "../../../../packages/shared/src/connector";
 import type { Workspace } from "../../../../packages/shared/src/types";
-import type { WorkspaceRepository } from "../../../../packages/shared/src/repositories";
+import type { WorkspaceRepositoryList } from "../../../../packages/shared/src/repositories";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { ConnectionStatus, HostCapabilities, hostTone, useConnections, type ConnectionsResource } from "../hosts";
@@ -20,10 +20,11 @@ function count(value: number, singular: string, plural: string) {
   return `${value} ${value === 1 ? singular : plural}`;
 }
 
-/** Repository gate shared by pairing and sharing: work needs at least one bound repository. */
+/** Repository gate shared by pairing and sharing: work needs a bound repository wherever the server requires one. */
 function useRepositoryGate(workspace: Workspace | null) {
-  const repositories = useResource<{ repositories: WorkspaceRepository[] }>(workspace ? `/api/workspaces/${segment(workspace.id)}/repositories` : null);
-  const configured = Boolean(workspace && !repositories.loading && !repositories.error && repositories.data?.repositories.length);
+  const repositories = useResource<WorkspaceRepositoryList>(workspace ? `/api/workspaces/${segment(workspace.id)}/repositories` : null);
+  const listed = !repositories.loading && !repositories.error ? repositories.data : null;
+  const configured = Boolean(workspace && listed && (listed.repositories.length || !listed.required));
   return { ...repositories, configured };
 }
 
@@ -125,9 +126,9 @@ function PairHostSheet({ onClose, refresh }: { onClose: () => void; refresh: () 
       {!workspaces.length ? <Alert variant="warning" title="No workspaces yet" actions={<LinkButton variant="outline" size="sm" href={workspacesHref()}>Set up a workspace</LinkButton>}>Create or join a workspace with at least one bound repository before pairing.</Alert> : <>
         <div className="field"><span className="field-label">Workspace</span><Combobox label="Workspace" placeholder="Choose a workspace" value={workspace?.id ?? ""} options={workspaces.map(item => ({ value: item.id, label: item.name }))} onChange={chooseWorkspace} disabled={action.busy} /></div>
         {workspace && <ResourceState {...repositories} retry={repositories.refresh}>
-          {!repositories.data?.repositories.length
+          {!repositories.configured
             ? <Alert variant="warning" title={`No repositories in ${workspace.name}`} actions={<><LinkButton variant="outline" size="sm" href={workspacesHref(workspace.id)}>Set up repositories</LinkButton><Button variant="ghost" size="sm" icon="refresh" disabled={repositories.loading || action.busy} onClick={repositories.refresh}>Refresh</Button></>}>An owner or admin must bind a repository before you can pair.</Alert>
-            : <span className="small muted" role="status">{count(repositories.data.repositories.length, "repository", "repositories")} configured in {workspace.name}</span>}
+            : <span className="small muted" role="status">{count(repositories.data?.repositories.length ?? 0, "repository", "repositories")} configured in {workspace.name}</span>}
         </ResourceState>}
       </>}
       <form onSubmit={create}>

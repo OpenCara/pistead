@@ -1,12 +1,10 @@
-import { access, constants, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { Buffer } from "node:buffer";
-import { homedir, userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
-import { createConnector, controlPlaneOrigin, readConnectorState } from "./connector.js";
-import { createFauxLocalModels, loadLocalPiModels, readPiSettings } from "./local-pi.js";
+import { createConnector, controlPlaneOrigin } from "./connector.js";
+import { assertConnectorPlatform, assertPrerequisites, checkPrerequisites, defaultStateDir, loadConnectorModels, savedPairing, unsandboxedWarning } from "./connect-setup.js";
 import { ConnectorSetupError } from "./protocol.js";
 import type { ResourceConfig } from "./resources.js";
 
@@ -133,25 +131,6 @@ async function resourceConfig(path: string): Promise<ResourceConfig> {
   };
 }
 
-function unsandboxedWarning(): string {
-  return `
-WARNING: running WITHOUT a sandbox (--unsafe-no-sandbox).
-Agent work for sessions on this host runs directly as "${userInfo().username}" on this machine:
-  - Approved shell commands and commits run with your full user permissions. They can read
-    and change anything you can, including ~/.ssh, cloud and Git credentials and Pi's auth.
-  - Commands have unrestricted network access and no CPU, memory or disk limits.
-  - File tools are confined to each session folder by path checks only, not isolation.
-  - Prompts and repository content can try to trick the agent. Read every command in the
-    approval desk before approving it.
-  - Anyone you share this Pi with, and anyone granted approve permission on a session that
-    runs here, can cause approved commands to run on this machine.
-  - A session owner who turns on Auto-approve in the chat box lets their agent run
-    commands and commits here immediately, with no per-command approval.
-Pistead shows this host as "Unsandboxed" to everyone who can see it.
-
-`;
-}
-
 async function confirmUnsandboxed(): Promise<void> {
   process.stderr.write(unsandboxedWarning());
   if (!process.stdin.isTTY || !process.stderr.isTTY) {
@@ -178,12 +157,10 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   const unsandboxed = values["unsafe-no-sandbox"] === true;
-  if (Number(process.versions.node.split(".")[0]) < 24) throw new ConnectorSetupError(`Node.js 24 or newer is required (found ${process.versions.node}).`);
+  assertConnectorPlatform();
   if (process.platform === "darwin" && !unsandboxed) {
     throw new ConnectorSetupError("macOS has no isolated sandbox: it needs Linux or WSL2 with bubblewrap. To run agent work directly on this Mac, re-run with --unsafe-no-sandbox and read its warning.");
   }
-  if (process.platform === "win32") throw new ConnectorSetupError("Native Windows is not supported. Install WSL2 (in PowerShell: wsl --install), open the Ubuntu terminal, install Node.js 24, Pi, bubblewrap, Python 3, Git and util-linux there, then run this same command inside WSL2.");
-  if (process.platform !== "linux" && process.platform !== "darwin") throw new ConnectorSetupError(`Unsupported platform "${process.platform}": use Linux, WSL2 or macOS.`);
   if (unsandboxed && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
   if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorSetupError("--allow-test-shell requires --allow-faux.");
   const cacheScope = values["repo-cache-scope"];
@@ -201,40 +178,18 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     try { controlPlaneOrigin(values.server, values["allow-insecure-loopback"]); }
     catch { throw new ConnectorSetupError("--server must be an HTTPS origin such as https://pistead.com."); }
   }
-  const required: Record<string, string> = unsandboxed
-    ? process.platform === "linux" ? { "/usr/bin/flock": "flock (util-linux)" } : { "/usr/bin/lockf": "lockf" }
-    : { "/usr/bin/bwrap": "bubblewrap", "/usr/bin/python3": "Python 3", "/usr/bin/git": "Git", "/usr/bin/flock": "flock (util-linux)" };
-  const missing: string[] = [];
-  for (const [binary, name] of Object.entries(required)) {
-    try { await access(binary, constants.X_OK); } catch { missing.push(`${name} (${binary})`); }
-  }
-  // Unsandboxed sessions use the owner's Git from PATH, e.g. Xcode tools or Homebrew on macOS.
-  if (unsandboxed && spawnSync("git", ["--version"], { stdio: "ignore", env: { PATH: process.env.PATH ?? "" } }).status !== 0) missing.push("Git on PATH");
-  if (missing.length) {
-    const hint = process.platform === "darwin" ? " Install Git, e.g. xcode-select --install or brew install git."
-      : unsandboxed ? "" : " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first.";
-    throw new ConnectorSetupError(`Missing prerequisites: ${missing.join(", ")}.${hint}`);
-  }
+  assertPrerequisites(await checkPrerequisites(unsandboxed), unsandboxed, " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first.");
   const models = values.model?.map(reference => {
     const slash = reference.indexOf("/");
     if (slash < 1 || slash === reference.length - 1) throw new ConnectorSetupError("--model expects PROVIDER/MODEL.");
     return { provider: reference.slice(0, slash), modelId: reference.slice(slash + 1) };
   });
-  if (values["allow-faux"] && (values["pi-agent-dir"] || models)) throw new ConnectorSetupError("Fixture mode cannot select personal Pi models.");
-  const settings = values["allow-faux"] ? {} : await readPiSettings(values["pi-agent-dir"]).catch(error => {
-    throw new ConnectorSetupError(`Pi settings could not be read: ${error instanceof SyntaxError ? "settings.json is not valid JSON" : error instanceof Error ? error.message : "unknown error"}.`);
-  });
-  const enabledModels = models ? undefined : settings.enabledModels;
-  const localModels = values["allow-faux"] ? createFauxLocalModels() : await loadLocalPiModels({ agentDir: values["pi-agent-dir"], models, enabledModels,
-    defaultThinkingLevel: settings.defaultThinkingLevel, modelThinkingLevels: settings.modelThinkingLevels });
-  if (!(await localModels.manifest()).length) throw new ConnectorSetupError(enabledModels
-    ? "None of the models enabled in Pi's settings.json (enabledModels) are authenticated on this machine."
-    : "No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
+  const localModels = await loadConnectorModels({ allowFaux: values["allow-faux"], piAgentDir: values["pi-agent-dir"], models });
   const resources = values.resources ? await resourceConfig(values.resources) : undefined;
-  const dataDir = values["state-dir"] ?? join(homedir(), ".local", "share", "pistead", "connector");
+  const dataDir = values["state-dir"] ?? defaultStateDir();
   // Checked before any prompt, so no pairing code is typed for nothing; the connector checks again under its lease.
   // --force never reads the saved pairing: it may be revoked, unreadable or bound to another server.
-  const paired = !values.force && await readConnectorState(dataDir, undefined, values["allow-insecure-loopback"]) !== undefined;
+  const paired = !values.force && await savedPairing(dataDir, values["allow-insecure-loopback"]) !== undefined;
   if (!pairingId && !paired) {
     throw new ConnectorSetupError("This machine is not paired yet. In Pistead, open Connections, create a pairing code, then run:\n  npx pistead@latest connect --server https://pistead.com --pairing-id <PAIRING_ID>");
   }
