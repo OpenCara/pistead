@@ -1,4 +1,4 @@
-import { activeStatuses, chatOptionsBody, initialSelection, segment, type ChatSelection } from "@pistead/client";
+import { activeStatuses, chatOptionsBody, initialSelection, preparingRepositories, segment, type ChatSelection } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import { Stack } from "expo-router";
@@ -7,11 +7,14 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
+import { redactSecrets, REDACTED } from "../../../../packages/shared/src/redaction";
+// Brings in `SessionRecord.linkShared`, which link sharing declares there.
+import type {} from "../../../../packages/shared/src/sharing";
 import type { ApprovalRecord, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
 import { saveDraft, takeDraft } from "../lib/drafts";
-import { useKeyboardVisible } from "../lib/layout";
+import { useKeyboardVisible, useOpenSession } from "../lib/layout";
 import { useLiveSession } from "../lib/live-session";
 import { PeopleProvider, useUsername, useWorkspacePeople } from "../lib/people";
 import { useAction, useResource } from "../lib/resource";
@@ -19,6 +22,7 @@ import { usePalette } from "../theme";
 import { ApprovalCard } from "./ApprovalCard";
 import { ChatOptionsBar } from "./ChatOptionsBar";
 import { Composer } from "./Composer";
+import { RepositoryPreparationCard } from "./RepositoryPreparation";
 import { TranscriptEntry } from "./TranscriptEntry";
 import { Badge, Banner, Button, Chip, EmptyState, Feedback, IconButton, Loading, OptionSheet, styles as ui } from "./ui";
 
@@ -51,6 +55,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   }, [hostOnline, live.refresh]);
   const action = useAction();
   const approvalAction = useAction();
+  const openSession = useOpenSession();
 
   const known = session ?? sessions.find(item => item.id === id);
   // Everyone a session names (owner, host owner, writers, approvers) is or was a member of its workspace.
@@ -106,8 +111,10 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
 
   const pendingApprovalCard = (approval: ApprovalRecord) => {
     const permission = approval.operation.kind === "permission";
-    // Only the session owner can let a call do more than the session allows.
-    const decides = permission ? isOwner && canApprove : canApprove;
+    // Only the session owner can let a call do more than the session allows; a host command is the host owner's to run.
+    const hostCommand = approval.operation.kind === "host.bash";
+    const ownerOnly = permission || approval.operation.kind === "git.repin";
+    const decides = canApprove && (hostCommand ? session?.connectorOwnerId === user.id : !ownerOnly || isOwner);
     const disabled = approvalAction.busy || !approval.reviewHash;
     return <ApprovalCard approval={approval} key={approval.id}>
       {decides ? <>
@@ -124,10 +131,12 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
             <Button testID="approval-deny" small label="Deny" disabled={disabled} onPress={() => void decide(approval, "deny")} />
           </View>
           <Text testID="approval-hint" style={[ui.small, { color: palette.muted }]}>
-            Runs as {view?.owner.displayName}{view?.owner.id === user.id ? " (you)" : ""} · each approval covers one exact operation and its arguments
+            Runs as {hostCommand ? "the host OS user (outside the sandbox)" : view?.owner.displayName} · each approval covers one exact operation and its arguments
           </Text>
         </>}
-      </> : <Text style={[ui.small, { color: palette.muted }]}>{permission ? "Waiting for the session owner" : "Waiting for an authorized approver"}</Text>}
+      </> : <Text style={[ui.small, { color: palette.muted }]}>
+        {hostCommand ? "Waiting for the host owner, who needs approve access to this session" : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
+      </Text>}
     </ApprovalCard>;
   };
 
@@ -140,6 +149,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
       {workspaceName && <Text style={[ui.small, { color: palette.muted }]} numberOfLines={1}>{workspaceName}</Text>}
       {badge}
       <Badge>{session.visibility === "workspace" ? "Workspace-visible" : "Private"}</Badge>
+      {session.linkShared && <Badge tone="info">Link shared</Badge>}
       {host && !host.online && <Badge tone="warning" dot>Host offline</Badge>}
       <SessionPeople session={session} host={host} />
     </View>}
@@ -157,13 +167,16 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
       : <View style={ui.flex} />)
       : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
         pinned={<>
+          {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
+            canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
           {session.hostUnsandboxed && (permissions.includes("write") || canApprove) && <Banner tone="danger" title="Unsandboxed host">
             This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.
           </Banner>}
           {approvals.filter(approval => approval.status === "pending").map(pendingApprovalCard)}
           <Feedback error={approvalAction.error} notice={approvalAction.notice} />
         </>} />}
-    <ApprovalsSheet visible={approvalsOpen} approvals={approvals} onClose={() => setApprovalsOpen(false)} />
+    <ApprovalsSheet visible={approvalsOpen} approvals={approvals} onClose={() => setApprovalsOpen(false)}
+      onOpenSession={target => { refreshSessions(); openSession(target); }} />
   </KeyboardAvoidingView></PeopleProvider>;
 }
 
@@ -179,18 +192,32 @@ function SessionPeople({ session, host }: { session: SessionRecord; host: Connec
   </Text>;
 }
 
-/** Every approval of the session, pending first, with what each decided one did. */
-function ApprovalsSheet({ visible, approvals, onClose }: { visible: boolean; approvals: ApprovalRecord[]; onClose: () => void }) {
+/**
+ * Every approval of the session, pending first, with what each decided one did. On iOS a repinned session opens once
+ * the sheet has gone, so the navigation is not hidden behind (or dropped by) the closing modal.
+ */
+function ApprovalsSheet({ visible, approvals, onClose, onOpenSession }: { visible: boolean; approvals: ApprovalRecord[]; onClose: () => void; onOpenSession: (id: string) => void }) {
   const palette = usePalette();
+  const opening = useRef<string | null>(null);
   const sorted = [...approvals].sort((a, b) => Number(b.status === "pending") - Number(a.status === "pending"));
-  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+  function open(target: string) {
+    onClose();
+    if (Platform.OS === "ios") opening.current = target;
+    else onOpenSession(target);
+  }
+  function dismissed() {
+    const target = opening.current;
+    opening.current = null;
+    if (target) onOpenSession(target);
+  }
+  return <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose} onDismiss={dismissed}>
     <View style={[ui.flex, { backgroundColor: palette.background }]}>
       <View style={[styles.paneHeader, { borderColor: palette.border, backgroundColor: palette.surface }]}>
         <Text style={[styles.paneTitle, { color: palette.text }]}>Approvals</Text>
         <Button small variant="ghost" label="Done" onPress={onClose} />
       </View>
       {sorted.length ? <ScrollView contentContainerStyle={styles.sheetList}>
-        {sorted.map(approval => <ApprovalCard key={approval.id} approval={approval} />)}
+        {sorted.map(approval => <ApprovalCard key={approval.id} approval={approval} onOpenSession={open} />)}
       </ScrollView> : <EmptyState title="No approvals">Commands, commits, pushes and GitHub actions that need a decision appear here.</EmptyState>}
     </View>
   </Modal>;
@@ -273,7 +300,12 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
-  const queueLabel = view.busy ? `Working...${activeQueue.length > 0 ? ` · ${activeQueue.length} queued` : ""}`
+  // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
+  const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
+
+  const queued = activeQueue.length > 0 ? ` · ${activeQueue.length} queued` : "";
+  const queueLabel = preparingRepositories(view) ? `Preparing repositories...${queued}`
+    : view.busy ? `Working...${queued}`
     : activeQueue.length ? `${activeQueue.length} queued` : "Idle";
   const name = useUsername();
   const sideIndex = sideConversations.findIndex(item => item.id === conversationId);
@@ -325,6 +357,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           {actualMode === "ask" && sideConversations.length > 0 && <Chip label={sideIndex < 0 ? "All my side asks" : `Side ask ${sideIndex + 1}`} onPress={() => setPickingConversation(true)} />}
           {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
         </>} />
+      {draftHasSecret && <Text testID="draft-secret" style={[ui.small, { color: palette.muted }]} accessibilityLiveRegion="polite">
+        This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.
+      </Text>}
       <Feedback error={submission.error} />
     </View>
     <OptionSheet<string> visible={pickingConversation} title="Side conversation" value={conversationId} onClose={() => setPickingConversation(false)} onSelect={setConversationId}

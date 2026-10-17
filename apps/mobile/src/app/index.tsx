@@ -4,7 +4,7 @@ import { StyleSheet, View } from "react-native";
 import { SessionList } from "../components/SessionList";
 import { SessionView } from "../components/SessionView";
 import { EmptyState, IconButton, styles as ui } from "../components/ui";
-import { useWideLayout } from "../lib/layout";
+import { useOpenSession, useWideLayout } from "../lib/layout";
 import { usePalette } from "../theme";
 
 /** The session list; in the wide layout, with the session chosen by the `session` parameter beside it. */
@@ -21,7 +21,7 @@ export default function SessionsScreen() {
     router.push({ pathname: "/session/[id]", params: { id: selected } });
   }, [wide, selected, router]);
 
-  const open = (id: string) => wide ? router.setParams({ session: id }) : router.push({ pathname: "/session/[id]", params: { id } });
+  const open = useOpenSession();
   const header = <Stack.Screen options={{
     headerLeft: () => <IconButton testID="open-settings" icon="person-circle-outline" label="Settings" onPress={() => router.push("/settings")} />,
     headerRight: () => <View style={styles.actions}>

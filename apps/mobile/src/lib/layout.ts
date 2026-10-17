@@ -19,6 +19,16 @@ export function useKeyboardVisible(): boolean {
   return visible;
 }
 
+/** Opens a session from the list or another session: beside the list in the wide layout, otherwise pushed on the stack. */
+export function useOpenSession(): (id: string) => void {
+  const router = useRouter();
+  const wide = useWideLayout();
+  return useCallback((id: string) => {
+    if (wide) router.setParams({ session: id });
+    else router.push({ pathname: "/session/[id]", params: { id } });
+  }, [router, wide]);
+}
+
 /**
  * Opens a session from a modal screen (new session, open by ID): in the wide layout it closes the modal and shows the
  * session beside the list; otherwise the session replaces the modal in the stack.
