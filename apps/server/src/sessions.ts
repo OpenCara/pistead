@@ -5,6 +5,7 @@ import { accessModes, permissions, thinkingLevels } from '../../../packages/shar
 import type { ConnectorCapabilities, LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
+import { redactApproval, redactView } from '../../../packages/shared/src/redaction.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
 import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
@@ -15,6 +16,7 @@ import { permissionCall, presentApprovals, requireOperationTool, reviewedApprova
 import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
+import { isLinkShared } from './session-links.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host advertises; auto-approve is the
@@ -112,7 +114,8 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
         if (!access || stream.aborted) break;
         if (access.row.connector_id) await requireConnectorSession(c.env, access.row.connector_id, access.row);
         if (stream.aborted) break;
-        await Promise.race([stream.writeSSE({ event: 'view', data: JSON.stringify(result) }), stopped]);
+        // Secrets are hidden from everyone; approvals keep the review hash committed to the real operation.
+        await Promise.race([stream.writeSSE({ event: 'view', data: JSON.stringify({ ...result, view: redactView(result.view) }) }), stopped]);
         if (snapshot < snapshots - 1 && !stream.aborted) {
           await Promise.race([new Promise<void>(resolve => {
             const timer = setTimeout(resolve, 1000);
@@ -254,7 +257,9 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       : null;
     const capabilities: unknown = host ? JSON.parse(host.capabilities_json) : null;
     const hostUnsandboxed = typeof capabilities === 'object' && capabilities !== null && 'unsandboxed' in capabilities && capabilities.unsandboxed === true;
-    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}) } });
+    // Everyone who can view the session learns that its shared conversation is also visible to anyone with its link.
+    const linkShared = await isLinkShared(c.env, access.row.id);
+    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}), ...(linkShared ? { linkShared } : {}) } });
   });
   app.patch('/api/sessions/:id', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
@@ -324,7 +329,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     result.view.approvals = await presentApprovals(c, row, result.view.approvals);
     const fresh = await requireSession(c, row.id, 'read');
     if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-    return c.json(result);
+    return c.json({ ...result, view: redactView(result.view) });
   });
   app.get('/api/sessions/:id/events', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
@@ -359,7 +364,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     await auditStatement(c.env, c.get('auth').userId, 'approval.requested', row.workspace_id, row.id, { approvalId: result.approval.id, kind: operation.kind }).run();
     const fresh = await requireSession(c, row.id, 'write');
     if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-    return c.json(result, 201);
+    return c.json({ ...result, approval: redactApproval(result.approval) }, 201);
   });
 
   app.post('/api/sessions/:id/approvals/:approvalId', async c => {
@@ -415,7 +420,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (!decided?.approval || decided.approval.id !== approvalId || decided.approval.sessionId !== row.id) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval result.');
     [decided.approval] = await presentApprovals(c, row, [decided.approval]);
     await auditStatement(c.env, c.get('auth').userId, `approval.${input.decision}`, row.workspace_id, row.id, { approvalId, kind: operation.kind, status: decided.approval.status, ...(scope ? { scope } : {}) }).run();
-    return c.json(decided);
+    return c.json({ ...decided, approval: redactApproval(decided.approval) });
   });
 
   app.get('/api/sessions/:id/grants', async c => {

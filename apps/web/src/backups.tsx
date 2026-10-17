@@ -1,10 +1,22 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { SessionRecord } from "../../../packages/shared/src/types";
+import type { BackupLocation, SessionRecord } from "../../../packages/shared/src/types";
 import { api, errorMessage, segment } from "./api";
 import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert, useResource } from "./ui";
 import { Icon } from "./icons";
 
-export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string };
+export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation };
+
+/** "Workspace database" for backups saved in the database the workspace owner connected. */
+export function backupLocationLabel(backup: Backup): string {
+  return backup.location === "workspace-database" ? " · Workspace database" : "";
+}
+
+/** The database the workspace's owner connected, where new backups of its sessions go; `confirm`: ask before each backup. */
+export type BackupDatabase = { id: string; host: string; port: number; database: string; confirm: boolean };
+
+export function backupDatabaseLabel(database: BackupDatabase): string {
+  return `${database.host.includes(":") ? `[${database.host}]` : database.host}:${database.port}/${database.database}`;
+}
 type Attempt = { requestId: string; title?: string; targetSessionId?: string };
 type RestoreResponse = {
   session: SessionRecord;
@@ -41,7 +53,7 @@ export function backupDownloadHref(sessionId: string, backupId: string) {
 /** Backup rows inside the Backups card; selecting one reveals download and restore-into-new-session. */
 export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSession }: { sourceId: string; ownerId: string; latestBackup: Backup | null; refreshKey: number; openSession: (id: string) => void }) {
   const base = `/api/sessions/${segment(sourceId)}`;
-  const backups = useResource<{ backups: Backup[] }>(`${base}/backups`);
+  const backups = useResource<{ backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase }>(`${base}/backups`);
   const [selectedId, setSelectedId] = useState("");
   const [title, setTitle] = useState("");
   const [attempt, setAttempt] = useState<Attempt | undefined>();
@@ -121,13 +133,23 @@ export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSe
   if (backups.loading) return <Row title={<Loading>Loading backups...</Loading>} />;
   if (backups.error) return <Row title="Unable to load backups" hint={backups.error} trailing={<Button variant="outline" size="sm" onClick={backups.refresh}>Try again</Button>} />;
   const list = backups.data?.backups ?? [];
-  if (!list.length) return <Row title="No backups yet" hint="Listing and downloading work while the host is offline" />;
+  // Shown before the next backup: whoever can read the workspace owner's database can read what is saved there.
+  const target = backups.data?.workspaceDatabase;
+  const destination = target && <Row
+    leading={<Icon name="server" size={16} />}
+    title="Saved to the workspace database"
+    hint={target.confirm
+      ? `New backups of this session go to ${backupDatabaseLabel(target)}, which the workspace owner connected. Whoever can read it can read them, including your personal environment values; you confirm before each backup`
+      : `New backups of this session go to ${backupDatabaseLabel(target)}, the database you connected for this workspace`}
+  />;
+  if (!list.length) return <>{destination}<Row title="No backups yet" hint="Listing and downloading work while the host is offline" /></>;
   return <>
+    {destination}
     {list.map(backup => <div key={backup.id} className="backup-item">
       <Row
         leading={<Icon name="archive" size={16} />}
         title={<Timestamp value={backup.createdAt} />}
-        hint={`${backup.size} bytes`}
+        hint={`${backup.size} bytes${backupLocationLabel(backup)}`}
         trailing={<Icon name={backup.id === selectedId ? "chevron-down" : "chevron-right"} size={16} />}
         onClick={() => chooseBackup(backup.id === selectedId ? "" : backup.id)}
       />

@@ -4,6 +4,7 @@ import type { WorkerEnv } from './types.js';
 import { authenticate, csrfGuard, registerAuth } from './auth.js';
 import { registerCatalog } from './catalog.js';
 import { registerSessions } from './sessions.js';
+import { registerSessionLinks, registerSharedSessions } from './session-links.js';
 import { registerBackups } from './backups.js';
 import { registerInternal } from './internal.js';
 import { assertVaultConfigured } from './vault.js';
@@ -14,6 +15,8 @@ import { registerRepositories } from './repositories.js';
 import { registerGitAccounts } from './git/accounts.js';
 import { registerOidc } from './push/oidc.js';
 import { registerPushIdentities } from './push/identities.js';
+import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
+import { registerDataExports } from './data-export.js';
 
 export const app = new Hono<WorkerEnv>();
 
@@ -43,6 +46,7 @@ app.get('/api/health', async c => {
     runnerConfigured: !!c.env.RUNNER_URL && !!c.env.RUNNER_SHARED_SECRET && c.env.RUNNER_SHARED_SECRET.length >= 32,
     databaseConfigured: true, databaseProvider: c.env.DB.provider,
     backupsConfigured: !!c.env.BUCKET, storageProvider: c.env.BUCKET?.provider ?? null,
+    workspaceDatabasesConfigured: !!c.env.WORKSPACE_DATABASES,
     connectorsConfigured: !!c.env.CONNECTOR_HUB, testMode: testMode(c.env),
   });
 });
@@ -50,6 +54,8 @@ registerAuth(app);
 registerInternal(app);
 registerConnectorCredentials(app);
 registerOidc(app);
+// Share links are their own read-only credential: anyone who has one can view without signing in.
+registerSharedSessions(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
 registerRepositories(app);
@@ -57,8 +63,11 @@ registerPushIdentities(app);
 registerGitAccounts(app);
 registerConnectors(app);
 registerSessions(app);
+registerSessionLinks(app);
 registerBackups(app);
 registerRestoreRoutes(app);
+registerWorkspaceDatabases(app);
+registerDataExports(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));
 
 export default app;

@@ -80,7 +80,7 @@ function identityInput(input: Record<string, unknown>): IdentityInput {
   return { provider, host, scope, kind, config, secret };
 }
 
-function publicIdentity(row: PushIdentityRow): PushIdentity {
+export function publicIdentity(row: PushIdentityRow): PushIdentity {
   return { id: row.id, workspaceId: row.workspace_id, provider: row.provider, host: row.host, scope: row.scope, kind: row.kind,
     config: JSON.parse(row.config_json) as Record<string, string>, status: row.status, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
 }

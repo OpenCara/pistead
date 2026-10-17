@@ -45,6 +45,14 @@ export interface AgentVersion {
 }
 /** Stored when an agent version is saved without a name; name, description and instructions are optional. */
 export const defaultAgentName = "Untitled agent";
+/**
+ * What a session's agent is doing. `working`: a message is queued or running, or an approved operation runs.
+ * `waiting`: a permission request holds a running message, or, once the queue is idle, an approval awaits a decision.
+ * `done` and `failed`: how the latest shared message ended; `failed` when its model request failed, Pi ended it without
+ * an answer, or it was stopped before it ran. `idle`: no shared message yet.
+ */
+export const sessionActivities = ["idle", "working", "waiting", "done", "failed"] as const;
+export type SessionActivity = (typeof sessionActivities)[number];
 export interface SessionRecord {
   id: string;
   workspaceId: string;
@@ -62,6 +70,8 @@ export interface SessionRecord {
   visibility?: "private" | "workspace";
   // Present only on single-session reads: the pinned host explicitly runs without isolation.
   hostUnsandboxed?: boolean;
+  /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
+  activity?: SessionActivity;
 }
 export interface SessionGrant {
   userId: string;
@@ -313,6 +323,32 @@ export interface PushIdentity {
   createdAt: string;
   updatedAt: string;
 }
+/**
+ * How the server connects to a workspace database: TLS that verifies the server certificate against the public roots or
+ * the owner's CA (`verify-full`), TLS without verifying it (`require`), or no TLS (`disable`, private networks only).
+ */
+export const workspaceDatabaseTlsModes = ["verify-full", "require", "disable"] as const;
+export type WorkspaceDatabaseTls = (typeof workspaceDatabaseTlsModes)[number];
+/**
+ * Public view of the Postgres database a workspace owner connected: session backups of the workspace are saved there
+ * instead of the server's backup storage. The password never leaves the control plane.
+ */
+export interface WorkspaceDatabase {
+  id: string;
+  workspaceId: string;
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  tls: WorkspaceDatabaseTls;
+  /** The server certificate is verified against the owner's CA certificate instead of the public roots. */
+  customCa: boolean;
+  connectedBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+/** Where a backup's snapshot is kept: the server's backup storage, or the workspace owner's own database. */
+export type BackupLocation = "server" | "workspace-database";
 export interface ApprovalRecord {
   id: string;
   sessionId: string;
@@ -383,6 +419,8 @@ export interface SessionView {
   access?: AccessMode;
   /** Repository preparation on a cache host; absent once the repositories are ready, and on every other host. */
   repositories?: RepositoryPreparationView;
+  /** What the agent is doing now; absent from runners that predate activity reports. */
+  activity?: SessionActivity;
 }
 export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof thinkingLevels)[number];

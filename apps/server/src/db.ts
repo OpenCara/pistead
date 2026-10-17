@@ -25,11 +25,13 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
-    ...(grants ? { permissions: grants } : {}) };
+    ...(grants ? { permissions: grants } : {}),
+    ...(row.activity ? { activity: row.activity } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions'> {
-  // Visibility is live control-plane policy, never part of the immutable runner binding.
-  const { visibility: _visibility, permissions: _permissions, ...record } = sessionRecord(row);
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity'> {
+  // Visibility is live control-plane policy and activity is what the host reports, so neither is part of the
+  // immutable runner binding.
+  const { visibility: _visibility, permissions: _permissions, activity: _activity, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {
@@ -71,6 +73,17 @@ export async function listSessionAccess(env: Env, actorId: string): Promise<Sess
     AND (s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL)
     ORDER BY s.created_at DESC, s.id DESC LIMIT 500`)
     .bind(actorId, testMode(env) ? 1 : 0, actorId).all();
+  return snapshots.flatMap(snapshot => {
+    const access = accessFromSnapshot(snapshot, actorId);
+    return access ? [access] : [];
+  });
+}
+/** Every session of one workspace the actor can read, newest first, on the same policy snapshot as `listSessionAccess`. */
+export async function workspaceSessionAccess(env: Env, workspaceId: string, actorId: string): Promise<SessionAccess[]> {
+  const snapshots = await env.DB.query<SessionPolicyRow>(`${SESSION_ACCESS_SQL}
+    AND s.workspace_id = ? AND (s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL)
+    ORDER BY s.created_at DESC, s.id DESC`)
+    .bind(actorId, testMode(env) ? 1 : 0, workspaceId, actorId).all();
   return snapshots.flatMap(snapshot => {
     const access = accessFromSnapshot(snapshot, actorId);
     return access ? [access] : [];

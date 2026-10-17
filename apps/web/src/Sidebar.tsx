@@ -4,21 +4,18 @@ import { useApp } from "./app-context";
 import { Icon, Logo } from "./icons";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { href, type Route } from "./router";
-import { DropdownMenu, IdentityBadge, Loading, RelativeTime, StatusDot, type Tone } from "./ui";
+import { sessionStatus } from "./session-status";
+import { DropdownMenu, IdentityBadge, Loading, RelativeTime, StatusDot } from "./ui";
 
 const SESSIONS_PER_WORKSPACE = 6;
 const COLLAPSED_KEY = "pistead.collapsedWorkspaces";
-
-function statusTone(session: SessionRecord): Tone {
-  return session.status === "ready" ? "success" : session.status === "provisioning" ? "running" : session.status === "error" ? "danger" : "neutral";
-}
 
 function readCollapsed(): string[] {
   try { return JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as string[]; } catch { return []; }
 }
 
 function WorkspaceGroup({ workspace, sessions, route, collapsed, toggle, onNavigate }: { workspace: Workspace; sessions: SessionRecord[]; route: Route; collapsed: boolean; toggle: () => void; onNavigate: () => void }) {
-  const { user, selectWorkspace } = useApp();
+  const { user, selectWorkspace, liveActivity } = useApp();
   const [expanded, setExpanded] = useState(false);
   const visible = expanded ? sessions : sessions.slice(0, SESSIONS_PER_WORKSPACE);
   const newHref = href({ name: "new", workspaceId: workspace.id });
@@ -40,12 +37,17 @@ function WorkspaceGroup({ workspace, sessions, route, collapsed, toggle, onNavig
       {visible.map(session => {
         const current = route.name === "session" && route.sessionId === session.id;
         const relation = session.ownerId === user.id ? null : session.permissions?.every(permission => permission === "read") ? "Viewer" : "Shared";
+        // The session on screen shows what its live view shows, not what the list last fetched.
+        const status = sessionStatus(session, liveActivity?.sessionId === session.id ? liveActivity.activity : undefined);
         return <li key={session.id}>
           <a className="nav-item session-item" href={href({ name: "session", sessionId: session.id })} aria-current={current ? "page" : undefined} onClick={() => { selectWorkspace(workspace.id); onNavigate(); }}>
-            <StatusDot tone={statusTone(session)} label={session.status} />
+            <StatusDot tone={status.tone} label={status.label ? undefined : session.status} />
             <span className="label">
               <span className="title">{session.title}</span>
-              {relation && <span className="sub">{relation}</span>}
+              {(status.label || relation) && <span className="sub">
+                {status.label && <span className={`session-status ${status.tone}`}>{status.label}</span>}
+                {status.label && relation && " · "}{relation}
+              </span>}
             </span>
             <span className="meta"><RelativeTime value={session.createdAt} /></span>
           </a>

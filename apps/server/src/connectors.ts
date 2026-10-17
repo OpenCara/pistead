@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
-import { thinkingLevels, type ThinkingLevel } from '../../../packages/shared/src/types.js';
+import { sessionActivities, thinkingLevels, type SessionActivity, type ThinkingLevel } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import type { Query } from './db/types.js';
@@ -139,6 +139,25 @@ export async function requireCallbackScope(c: AppContext, row: SessionRow, conne
   } else if (row.connector_id) fail(403, 'connector_scope_required', 'Use the connector-scoped callback.');
 }
 
+/**
+ * A connector reports what the agent of a session it serves is doing (see SessionActivity). Activity is display state,
+ * neither binding nor policy: it bumps no policy version and leaves no audit entry.
+ */
+async function reportSessionActivity(c: AppContext, connectorId: string): Promise<Response> {
+  const input = await jsonObject(c, 4096);
+  const activity = input.activity as SessionActivity;
+  if (Object.keys(input).some(key => key !== 'sessionId' && key !== 'activity') || !sessionActivities.includes(activity)) {
+    fail(400, 'invalid_activity', 'Invalid session activity.');
+  }
+  const row = await c.env.DB.query<SessionRow>('SELECT * FROM sessions WHERE id = ?').bind(identifier(input.sessionId, 'sessionId')).first();
+  if (!row) fail(404, 'not_found', 'Session not found.');
+  await requireCallbackScope(c, row, connectorId);
+  if (row.activity !== activity) {
+    await c.env.DB.query('UPDATE sessions SET activity = ? WHERE id = ? AND connector_id = ?').bind(activity, row.id, connectorId).run();
+  }
+  return c.json({ ok: true });
+}
+
 async function ownedConnector(c: AppContext): Promise<ConnectorRow> {
   const row = await c.env.DB.query<ConnectorRow>('SELECT * FROM connectors WHERE id = ? AND owner_id = ?')
     .bind(identifier(c.req.param('id')), c.get('auth').userId).first();
@@ -274,6 +293,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     return c.json({ ok: true });
   });
   app.post('/api/connectors/self/authorize', async c => authorizeSession(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/activity', async c => reportSessionActivity(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/comment', async c => githubComment(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/read', async c => githubRead(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/merge', async c => githubMerge(c, (await authenticateConnector(c)).id));

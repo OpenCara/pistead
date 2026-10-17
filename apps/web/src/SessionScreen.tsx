@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
+import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
@@ -8,13 +9,14 @@ import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
 import { Markdown } from "./markdown";
+import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { RepositoryPreparationCard } from "./repository-preparation";
 import { preparingRepositories } from "./repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "./transcript";
 import {
-  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
+  Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
@@ -73,7 +75,7 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
 function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
-  const actor = entry.actorId && <span title={entry.actorId}>{entry.actorId === userId ? "you" : entry.actorId}</span>;
+  const actor = entry.actorId && <Username id={entry.actorId} you />;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
@@ -109,7 +111,7 @@ export function SessionScreen({ sessionId }: { sessionId: string }) {
 }
 
 function SessionPane({ id }: { id: string }) {
-  const { user, workspaces, sessions, refreshSessions } = useApp();
+  const { user, workspaces, sessions, refreshSessions, setLiveActivity } = useApp();
   const live = useLiveSession(id);
   const session = live.session;
   const view = live.view;
@@ -133,6 +135,10 @@ function SessionPane({ id }: { id: string }) {
     if (previousHostOnline.current === false && hostOnline) live.refresh();
     previousHostOnline.current = hostOnline;
   }, [hostOnline, live.refresh]);
+  // Session lists show this view's activity while the session is on screen, then a refreshed list takes over again.
+  const viewActivity = view?.activity;
+  useEffect(() => { setLiveActivity(viewActivity ? { sessionId: id, activity: viewActivity } : null); }, [id, viewActivity, setLiveActivity]);
+  useEffect(() => () => { setLiveActivity(null); refreshSessions(); }, [setLiveActivity, refreshSessions]);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({
@@ -144,6 +150,8 @@ function SessionPane({ id }: { id: string }) {
   const approvalAction = useAction();
 
   const known = session ?? sessions.find(item => item.id === id);
+  // Everyone a session names (owner, host owner, grantees, writers) is or was a member of its workspace.
+  const people = useWorkspacePeople(known?.workspaceId ?? null);
   const workspaceName = known && workspaces.find(workspace => workspace.id === known.workspaceId)?.name;
   const visibility = session?.visibility ?? "private";
   const streamBadge = live.status === "online" ? <StatusBadge tone="success" dot>Live</StatusBadge>
@@ -166,16 +174,7 @@ function SessionPane({ id }: { id: string }) {
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
     if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
-    // A permission card is itself the owner's prompt; an operation confirms its exact effect first.
-    if (decision === "approve" && approval.operation.kind !== "permission" && !await confirmDialog({
-      title: "Approve this exact operation?",
-      message: session?.hostUnsandboxed
-        ? "It will run as the session owner on an UNSANDBOXED host: directly on the host owner's machine, with their full user permissions and network access, and no resource limits."
-        : approval.unbounded
-          ? "It will run as the session owner, in the sandbox but without resource limits: no cap on CPU, memory, processes or disk."
-          : "It will run as the session owner.",
-      confirmLabel: "Approve",
-    })) return;
+    // The card is the prompt: it shows the exact operation, who it runs as, its resource limits and any unsandboxed-host warning, so a click decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
       : decision === "approve" ? "Approval decision recorded" : "Operation denied";
@@ -191,13 +190,13 @@ function SessionPane({ id }: { id: string }) {
   const badge = startFailed ? <StatusBadge tone={session?.status === "error" ? "danger" : "running"} dot>{session?.status === "error" ? "Not started" : "Starting"}</StatusBadge>
     : !view && live.error ? <StatusBadge tone="warning" dot>Unavailable</StatusBadge>
     : streamBadge;
-  return <div className={panelOpen && session ? "session-screen panel-open" : "session-screen"}>
+  return <PeopleProvider people={people}><div className={panelOpen && session ? "session-screen panel-open" : "session-screen"}>
     <div className="session-pane">
       <ScreenHeader
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
-          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge></span>}
+          {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge>{session.linkShared && <StatusBadge tone="info">Link shared</StatusBadge>}</span>}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}
@@ -232,7 +231,7 @@ function SessionPane({ id }: { id: string }) {
                 </div> : <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve")}>Approve</Button>
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
-                  <span className="muted small">Each approval covers one exact operation and its arguments</span>
+                  <span className="muted small">Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""} · each approval covers one exact operation and its arguments</span>
                 </div>}
               </> : <p className="muted small">{permission ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
@@ -247,7 +246,7 @@ function SessionPane({ id }: { id: string }) {
     </>}
     {session && isOwner && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
       onSave={async title => { if (await actions.rename(title)) setRenaming(false); }} />}
-  </div>;
+  </div></PeopleProvider>;
 }
 
 function RenameSheet({ open, title, busy, onClose, onSave }: { open: boolean; title: string; busy: boolean; onClose: () => void; onSave: (title: string) => void }) {
@@ -341,6 +340,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
+  // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
+  const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
+
   const queueLabel = preparingRepositories(view)
     ? <><Spinner />Preparing repositories...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : view.busy
@@ -369,11 +371,11 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             {receipt && <p className="small">Last receipt <code>{receipt.submissionId}</code> · {receipt.status}{receipt.queuePosition !== undefined ? ` · queue position ${receipt.queuePosition}` : ""}</p>}
             {activeQueue.length > 0 && <ol className="queue-items">{activeQueue.map((item, index) => <li key={item.submissionId}>
               <span>{index + 1}. {item.mode === "ask" ? "Read-only side ask" : "Shared submission"} · {item.status}</span>
-              <span className="muted small">By {item.actorId === user.id ? "you" : item.actorId} · Receipt <code>{item.submissionId}</code></span>
+              <span className="muted small">By <Username id={item.actorId} you /> · Receipt <code>{item.submissionId}</code></span>
             </li>)}</ol>}
             {recentSubmissions.length > 0 && <ul className="queue-items">{recentSubmissions.map(item => <li key={item.submissionId}>
               <span>{item.status} · {item.mode === "ask" ? "Side ask" : "Shared submission"}</span>
-              <span className="muted small">By {item.actorId === user.id ? "you" : item.actorId} · Receipt <code>{item.submissionId}</code></span>
+              <span className="muted small">By <Username id={item.actorId} you /> · Receipt <code>{item.submissionId}</code></span>
             </li>)}</ul>}
             <div className="inline"><Button variant="outline" size="sm" icon="refresh" onClick={refresh}>Refresh queue</Button></div>
           </div>
@@ -399,6 +401,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
           </>}
         />
+        {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
         <Feedback error={submission.error} />
       </div>
     </div>

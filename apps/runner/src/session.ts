@@ -5,7 +5,7 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, StringEnum, Type, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { repositoryLimits, repositoryRemote, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -23,6 +23,7 @@ import type { RepositoryPreparationItem, RepositoryPreparationView } from "../..
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
+import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -87,6 +88,8 @@ export type RunnerConfig = {
   unsandboxed?: boolean;
   /** Opens a session's Pi storage; defaults to the SQLite file in its directory. */
   openStorage?: (path: string) => Promise<Storage>;
+  /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
+  reportActivity?: (sessionId: string, activity: SessionActivity) => Promise<void>;
 };
 
 /** Runner callbacks without a connector go to the control plane's internal routes, over HTTPS or local HTTP only. */
@@ -107,6 +110,15 @@ type RepositoryPreparation = { status: "ready" }
   | { status: "failed"; reason: string; items: RepositoryPreparationItem[] };
 type ProgressUpdate = (path: string, change: Partial<Omit<RepositoryPreparationItem, "path">>) => void;
 
+/** Whether the model request behind a transcript entry failed, which the session view shows as a failed model turn. */
+function modelFailed(entry: EntryRecord): boolean {
+  return (entry.model ?? []).some(message => message.role === "assistant" && message.stopReason === "error");
+}
+
+/** The shared conversation's last entry, as `sessionActivity` reads it. */
+function activityEntry(entry: EntryRecord | undefined): ActivityEntry | undefined {
+  return entry && { id: Number(entry.id), failed: modelFailed(entry) };
+}
 export class RunnerSession {
   readonly sandbox: Sandbox | HostWorkspace;
   readonly sqlitePath: string;
@@ -139,6 +151,8 @@ export class RunnerSession {
   /** open() has finished; with #resumed, recovered and queued work resumes exactly once per open, and only when ready. */
   #opened = false;
   #resumed = false;
+  /** Reports what the agent is doing while the session is open, when the runner has somewhere to report it. */
+  readonly #activity: ActivityReporter | undefined;
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -152,6 +166,8 @@ export class RunnerSession {
     this.sandbox = config.unsandboxed
       ? new HostWorkspace(binding, join(directory, "sandbox"), options)
       : new Sandbox(binding, join(directory, "sandbox"), config.resources, options);
+    const report = config.reportActivity;
+    this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
   }
 
   private assertTicket(ticket: RunnerTicket): void {
@@ -524,6 +540,8 @@ export class RunnerSession {
     }
     this.harness.resume();
     this.drainQueue();
+    // Reopening is also how a report lost with a previous connection or process gets through.
+    this.#activity?.start();
   }
 
   private openStorage(): Promise<Storage> {
@@ -569,6 +587,23 @@ export class RunnerSession {
       change(state);
       doc.json = JSON.stringify(state);
     }, context);
+    // Every run and approval status changes here, so this is where the activity can change.
+    this.#activity?.changed();
+  }
+
+  /** What the agent is doing now (see SessionActivity). */
+  private async activity(): Promise<SessionActivity> {
+    const state = await this.metadata();
+    const runs = Object.values(state.runs);
+    const approvals = Object.values(state.approvals);
+    const activity = sessionActivity(runs, approvals);
+    if (activity !== "done") return activity;
+    // A message that settled can still have failed in its last entry, when its model request did.
+    const watch = await this.root.watch(context);
+    let last: EntryRecord | undefined;
+    try { last = watch.value.entries.at(-1); }
+    finally { await watch.stop(); }
+    return sessionActivity(runs, approvals, activityEntry(last));
   }
 
   exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -1214,6 +1249,8 @@ export class RunnerSession {
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),
       ...(repositories ? { repositories } : {}),
+      activity: sessionActivity(Object.values(state.runs), Object.values(state.approvals),
+        activityEntry(snapshots.find(snapshot => snapshot.branch.mode === "write")?.entries.at(-1))),
     };
   }
 
@@ -1275,6 +1312,7 @@ export class RunnerSession {
     this.#preparations++;
     this.#opened = false;
     this.#resumed = false;
+    this.#activity?.stop();
     if (abortPushes) {
       // Aborted pushes still settle their approval (interrupted) and report completion before the harness closes.
       for (const push of this.pushes) push.controller.abort();

@@ -1,15 +1,18 @@
 import type { Context } from 'hono';
-import type { Permission, PushIdentityKind, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
+import type { Permission, PushIdentityKind, SessionActivity, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types';
 import type { GitProvider, TokenGitProvider } from '../../../packages/shared/src/repositories';
 import type { ConnectorHub } from './connector-hub-types.js';
 import type { Database } from './db/types.js';
 import type { ObjectStorage } from './storage/types.js';
+import type { WorkspaceDatabaseProvider } from './workspace-databases/types.js';
 
 /** Everything a request handler can reach: providers plus configuration. Built once in `apps/server/src/config.ts`. */
 export interface Env {
   DB: Database;
   CONNECTOR_HUB?: ConnectorHub;
   BUCKET?: ObjectStorage;
+  /** Reaches the databases workspace owners connect for their session backups; absent unless the operator enabled them. */
+  WORKSPACE_DATABASES?: WorkspaceDatabaseProvider;
   APP_ORIGIN: string;
   RUNNER_URL?: string;
   RUNNER_EVENT_TRANSPORT?: string;
@@ -65,6 +68,8 @@ export interface SessionRow {
   visibility?: 'private' | 'workspace';
   /** The status before archiving, restored on unarchive. */
   archived_status?: 'provisioning' | 'ready' | 'error' | null;
+  /** What its agent is doing, as its host last reported it; display state only, never part of the runner binding. */
+  activity?: SessionActivity | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;

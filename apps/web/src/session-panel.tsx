@@ -1,15 +1,19 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
+import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
-import { BackupList, backupDownloadHref, type Backup } from "./backups";
+import { BackupList, backupDatabaseLabel, backupDownloadHref, backupLocationLabel, type Backup, type BackupDatabase } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
 import { Icon } from "./icons";
+import { Username, usePeople } from "./people";
 import { RepositorySnapshotPolicy } from "./repositories";
 import { href } from "./router";
 import {
   Alert, Button, CardBody, Collapsible, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, RelativeTime,
   ResourceState, Row, Section, SegmentedControl, StatusBadge, Timestamp, useAction, useResource, type ActionState, type Tone,
 } from "./ui";
+import { userIdFromInput, usernameWithId, withUsernames, type Person } from "./usernames";
 
 export type AuditEvent = { id: string; actorId: string; action: string; detail: unknown; createdAt: string };
 export type PanelTab = "details" | "approvals" | "activity";
@@ -52,11 +56,26 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       ? "Session is workspace-visible. Workspace members can view prompts and output."
       : "Session is private. Existing explicit grants still apply.");
   }
-  function createBackup() {
+  async function createBackup() {
     if (!session || !isOwner || backupBlocked || action.busy) return;
     setBackup(null);
-    void action.run(async () => {
-      const result = await api<{ backup: Backup }>(`/api/sessions/${segment(session.id)}/backup`, { method: "POST" });
+    const base = `/api/sessions/${segment(session.id)}`;
+    let trustedDatabaseId: string | undefined;
+    try {
+      // A backup saved where someone else can read it waits for the owner's explicit confirmation of that database.
+      const { workspaceDatabase } = await api<{ workspaceDatabase?: BackupDatabase }>(`${base}/backups`);
+      if (workspaceDatabase?.confirm) {
+        const confirmed = await confirmDialog({
+          title: "Save to the workspace database?",
+          message: `This backup is saved in ${backupDatabaseLabel(workspaceDatabase)}, the database the workspace owner connected. Whoever can read it can read this session: its prompts, output and files, and your personal environment values.`,
+          confirmLabel: "Save backup",
+        });
+        if (!confirmed) return;
+        trustedDatabaseId = workspaceDatabase.id;
+      }
+    } catch { /* The backup request repeats the check and explains a refusal. */ }
+    await action.run(async () => {
+      const result = await api<{ backup: Backup }>(`${base}/backup`, { method: "POST", ...(trustedDatabaseId ? { body: { trustedDatabaseId } } : {}) });
       setBackup(result.backup);
       onChange();
     }, "Backup created");
@@ -93,7 +112,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       onChange();
     }, "Session unarchived");
   }
-  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup, rename,
+  return { action, backup, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup: () => void createBackup(), rename,
     archive: () => void archive(), unarchive };
 }
 
@@ -108,12 +127,14 @@ export function ApprovalStatus({ approval }: { approval: ApprovalRecord }) {
   </>;
 }
 
-function detailText(detail: unknown): string {
+/** An audit detail as indented JSON, with the user IDs in it written as "username(id)". */
+function detailText(detail: unknown, person: (id: string) => Person): string {
+  let value = detail;
   if (typeof detail === "string") {
-    try { return JSON.stringify(JSON.parse(detail), null, 2); }
+    try { value = JSON.parse(detail); }
     catch { return detail; }
   }
-  return JSON.stringify(detail, null, 2) ?? "";
+  return JSON.stringify(withUsernames(value, person), null, 2) ?? "";
 }
 
 type PanelProps = {
@@ -133,6 +154,7 @@ type PanelProps = {
 
 export function SessionPanel(props: PanelProps) {
   const { tab, setTab, onClose, view, audit } = props;
+  const people = usePeople();
   const approvals = view?.approvals ?? [];
   const pendingCount = approvals.filter(approval => approval.status === "pending").length;
   return <aside className="session-panel" aria-label="Session panel">
@@ -153,8 +175,8 @@ export function SessionPanel(props: PanelProps) {
       {tab === "activity" && <Section title="Audit log" action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh activity" title="Refresh" disabled={audit.loading} onClick={audit.refresh} />} bare>
         <ResourceState {...audit} retry={audit.refresh}>
           {!audit.data?.events.length ? <EmptyState title="No activity" /> : <div className="card">
-            {audit.data.events.map(event => <Collapsible key={event.id} title={event.action} hint={<>{event.actorId} · <RelativeTime value={event.createdAt} /></>}>
-              <pre>{detailText(event.detail)}</pre>
+            {audit.data.events.map(event => <Collapsible key={event.id} title={event.action} hint={<>{usernameWithId(people.person(event.actorId))} · <RelativeTime value={event.createdAt} /></>}>
+              <pre>{detailText(event.detail, people.person)}</pre>
             </Collapsible>)}
           </div>}
         </ResourceState>
@@ -167,20 +189,22 @@ export function SessionPanel(props: PanelProps) {
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   const { operation } = approval;
   const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
-    ? <> · Allowed by {approval.decidedBy} {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
-    : approval.decidedBy && <> · Decision by {approval.decidedBy}</>;
+    ? <> · Allowed by <Username id={approval.decidedBy} /> {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
+    : approval.decidedBy && <> · Decision by <Username id={approval.decidedBy} /></>;
   return <article className="approval-card card">
     <div className="approval-head">
       <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />
       {approval.unbounded && <StatusBadge tone="warning">No resource limits</StatusBadge>}
+      {containsRedaction(operation) && <StatusBadge tone="warning">Secret hidden</StatusBadge>}
       <ApprovalStatus approval={approval} />
     </div>
     {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
       {operation.kind === "git.push" && <GitPushSummary operation={operation} />}
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
       <pre>{JSON.stringify(operation, null, 2)}</pre>
+      {approval.status === "pending" && containsRedaction(operation) && <HiddenSecretNote />}
     </>}
-    <p className="muted small">Requested by {approval.requestedBy} · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
+    <p className="muted small">Requested by <Username id={approval.requestedBy} /> · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
     {children}
   </article>;
@@ -199,8 +223,14 @@ function PermissionSummary({ request, pending }: { request: PermissionRequest; p
     <p><code>{request.tool}</code> {pending ? "needs the session owner's permission for:" : "asked the session owner's permission for:"}</p>
     <ul className="permission-needs small">{request.needs.map(need => <li key={need}>{permissionNeedText[need]}</li>)}</ul>
     {request.target && <pre>{request.target}</pre>}
+    {pending && containsRedaction(request.target) && <HiddenSecretNote />}
     {pending && approvedTools.includes(request.tool) && <p className="muted small">Allowing it doesn't run anything yet: the operation still gets its own approval, unless the message auto-approves.</p>}
   </>;
+}
+
+/** The server hides what looks like a secret from everyone; a decision still uses the real value. */
+function HiddenSecretNote() {
+  return <p className="small">Something that looks like a secret is shown as <code>{REDACTED}</code>. Allowing or approving this uses the real value, so make sure it belongs here.</p>;
 }
 
 function GitPushSummary({ operation }: { operation: GitPushOperation }) {
@@ -233,18 +263,19 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
     {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
+    {isOwner && <ExportSection session={session} />}
     <AccessSection session={session} view={view} user={user} />
   </div>;
 }
 
 function HostSection({ session, user, hosts }: { session: SessionRecord; user: UserProfile; hosts: ConnectionsResource }) {
   const host = hosts.data?.connectors.find(item => item.id === session.connectorId);
-  return <Section title="Host" info={<p>Work runs as the session owner ({session.ownerId === user.id ? "you" : session.ownerId}), not the host owner. The host operator can access prompts and files processed on it. Sharing a host doesn't change who can view or control this session, and doesn't expose its owner's local history.</p>}>
+  return <Section title="Host" info={<p>Work runs as the session owner (<Username id={session.ownerId} you />), not the host owner. The host operator can access prompts and files processed on it. Sharing a host doesn't change who can view or control this session, and doesn't expose its owner's local history.</p>}>
     {!session.connectorId ? <Row leading={<Icon name="server" size={16} />} title="Operator-managed session" hint="No local host is pinned" /> : <>
       <Row
         leading={<Icon name="server" size={16} />}
         title={host?.name ?? "Pinned host"}
-        hint={<>Hosted by {host?.ownerName ?? session.connectorOwnerId ?? "unknown"}{session.connectorOwnerId === user.id ? " (you)" : ""}</>}
+        hint={<>Hosted by {host?.ownerName ?? (session.connectorOwnerId ? <Username id={session.connectorOwnerId} /> : "unknown")}{session.connectorOwnerId === user.id ? " (you)" : ""}</>}
         trailing={hosts.loading ? <Loading>Checking</Loading> : host ? <ConnectionStatus connector={host} /> : session.hostUnsandboxed && <StatusBadge tone="danger">Unsandboxed</StatusBadge>}
       />
       {host && <HostCapabilities connector={host} />}
@@ -282,6 +313,7 @@ function RepositoriesSection({ session, refresh }: { session: SessionRecord; ref
 
 function PeopleSection({ session, user, actions, changed }: { session: SessionRecord; user: UserProfile; actions: SessionActions; changed: () => void }) {
   const form = useAction();
+  const people = usePeople();
   const ownPermissions = session.permissions ?? [];
   const isOwner = session.ownerId === user.id;
   const visibility = session.visibility ?? "private";
@@ -292,17 +324,20 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
   const archived = session.status === "archived";
   const base = `/api/sessions/${segment(session.id)}`;
   const grants = useResource<{ grants: SessionGrant[] }>(canManage && !archived ? `${base}/grants` : null);
-  const [userId, setUserId] = useState("");
+  // The member field takes a username, "username(id)" or a user ID; `target` is the user ID it names.
+  const [member, setMember] = useState("");
   const [selected, setSelected] = useState<Permission[]>([]);
-  const target = userId.trim();
+  const target = userIdFromInput(member, people.list);
+  const targetName = usernameWithId(people.person(target));
   const ownerSelected = target === session.ownerId;
   const existing = grants.data?.grants.find(grant => grant.userId === target);
   const grantReady = canManage && !ownerSelected && Boolean(target) && selected.length > 0
     && selected.every(permission => grantable.includes(permission));
 
   function chooseGrant(value: string) {
-    setUserId(value);
-    setSelected([...(grants.data?.grants.find(grant => grant.userId === value.trim())?.permissions ?? [])]);
+    setMember(value);
+    const userId = userIdFromInput(value, people.list);
+    setSelected([...(grants.data?.grants.find(grant => grant.userId === userId)?.permissions ?? [])]);
   }
 
   function saveGrant(event: FormEvent) {
@@ -320,8 +355,8 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     const confirmed = await confirmDialog({
       title: "Revoke session grant?",
       message: visibility === "workspace"
-        ? `Revoke the explicit grant for ${target}? They can still view prompts and output as a workspace member while this session is workspace-visible. Only the owner can make it private to remove workspace viewing.`
-        : `Revoke the explicit session grant for ${target}?`,
+        ? `Revoke the explicit grant for ${targetName}? They can still view prompts and output as a workspace member while this session is workspace-visible. Only the owner can make it private to remove workspace viewing.`
+        : `Revoke the explicit session grant for ${targetName}?`,
       confirmLabel: "Revoke grant",
       destructive: true,
     });
@@ -334,7 +369,12 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     }, visibility === "workspace" ? "Explicit grant revoked. Workspace members can still view this session until the owner makes it private." : "Session grant revoked");
   }
 
-  return <Section title="People" info={<p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p>}>
+  const sharing = useSessionLink({ session, user, action: actions.action, onChange: changed });
+  const link = sharing.link;
+  // The owner's loaded link is current; until it loads, and for everyone else, the session says whether one exists.
+  const linkShared = isOwner && link !== undefined ? link !== null : Boolean(session.linkShared);
+
+  return <Section title="People" info={<><p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else.</p></>}>
     <Row
       leading={<Icon name="user" size={16} />}
       title={isOwner ? "Owner" : viewerOnly ? "Viewer" : "Collaborator"}
@@ -350,20 +390,34 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
         : "Only the session owner can change visibility"}</>}
       trailing={isOwner && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
+    {(isOwner || linkShared) && <Row
+      leading={<Icon name="link" size={16} />}
+      title={linkShared ? "Anyone with the link can view" : "Link sharing off"}
+      hint={!isOwner ? "The owner shared this session by link: anyone who has it can view the shared conversation without signing in, including messages you send to it. Side asks stay hidden"
+        : linkShared ? "Without signing in, they can follow the shared conversation, but not side asks, approvals, who sent each message, or the host. Turning the link off stops it at once"
+        : archived ? "Archived sessions can't get a new share link"
+        : "Create a link that lets anyone who has it view the shared conversation, read-only, without signing in"}
+      trailing={isOwner && (linkShared
+        ? <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={sharing.unshareLink}>Turn off</Button>
+        : !archived && <Button variant="outline" size="sm" disabled={actions.action.busy || sharing.linkLoading} onClick={() => void sharing.shareLink()}>Create link</Button>)}
+    />}
+    {isOwner && link && <CardBody><Field label="Share link" hint={<>Created <RelativeTime value={link.createdAt} /></>}><CopyField value={link.url} label="Copy share link" /></Field></CardBody>}
+    {isOwner && sharing.linkError && <CardBody><Feedback error={sharing.linkError} /></CardBody>}
     {canManage && !archived ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
       <ResourceState {...grants} retry={grants.refresh}>
         {grants.data && <form onSubmit={saveGrant}>
           <fieldset disabled={form.busy} className="stack">
             <Field label="Existing member grant" hint={grants.data.grants.length ? undefined : "No explicit member grants"}>
-              <select className="select" value={existing ? target : ""} onChange={event => chooseGrant(event.target.value)}>
+              <select className="select" value={existing ? target : ""} onChange={event => chooseGrant(event.target.value && usernameWithId(people.person(event.target.value)))}>
                 <option value="">New grant</option>
                 {grants.data.grants.map(grant => <option key={grant.userId} value={grant.userId}>
-                  {grant.userId}{grant.userId === session.ownerId ? " (owner, immutable)" : ""}: {grant.permissions.join(", ") || "None"}
+                  {usernameWithId(people.person(grant.userId))}{grant.userId === session.ownerId ? " (owner, immutable)" : ""}: {grant.permissions.join(", ") || "None"}
                 </option>)}
               </select>
             </Field>
-            <Field label="Workspace member user ID" hint={ownerSelected ? "The owner's grant is immutable" : undefined}>
-              <input className="input" required autoComplete="off" value={userId} onChange={event => chooseGrant(event.target.value)} />
+            {/* Shows who a typed username or user ID names before anything is granted. */}
+            <Field label="Workspace member" hint={ownerSelected ? "The owner's grant is immutable" : targetName !== target && member.trim() !== targetName ? targetName : undefined}>
+              <input className="input" required autoComplete="off" spellCheck={false} placeholder="Username or user ID" value={member} onChange={event => chooseGrant(event.target.value)} />
             </Field>
             <fieldset disabled={ownerSelected} className="stack session-permissions">
               <legend className="small muted">Grant permissions</legend>
@@ -391,7 +445,7 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
   const { backup } = actions;
   return <Section
     title="Backups"
-    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p></>}
+    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p><p>When the workspace owner connected a database of their own, backups are saved there instead of in the server's storage.</p></>}
     action={<div className="inline">
       <Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh backups" title="Refresh backups" onClick={() => setRefreshKey(value => value + 1)} />
       <Button variant="outline" size="sm" disabled={actions.backupBlocked || actions.action.busy} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
@@ -401,10 +455,17 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
     {backup && <Row
       leading={<Icon name="check" size={16} />}
       title={<>Backup created <Timestamp value={backup.createdAt} /></>}
-      hint={<>{backup.size} bytes · ID <code>{backup.id}</code> · SHA-256 <code>{backup.sha256}</code></>}
+      hint={<>{backup.size} bytes{backupLocationLabel(backup)} · ID <code>{backup.id}</code> · SHA-256 <code>{backup.sha256}</code></>}
       trailing={<LinkButton variant="outline" size="sm" href={backupDownloadHref(session.id, backup.id)}>Download</LinkButton>}
     />}
     <BackupList sourceId={session.id} ownerId={session.ownerId} latestBackup={backup} refreshKey={refreshKey} openSession={openSession} />
+  </Section>;
+}
+
+/** The owner's export of what the control plane keeps about the session; available while archived too. */
+function ExportSection({ session }: { session: SessionRecord }) {
+  return <Section title="Export" info={<p>Downloads this session's details, people, approvals, pushes, backup list and activity as JSON, without secrets. The conversation itself is in the session's backups. Only the session owner can export it.</p>}>
+    <Row leading={<Icon name="archive" size={16} />} title="Session data" hint="JSON, without secrets" trailing={<LinkButton variant="outline" size="sm" href={`/api/sessions/${segment(session.id)}/export`} download>Export</LinkButton>} />
   </Section>;
 }
 
@@ -463,9 +524,10 @@ function OperationSection({ session, changed }: { session: SessionRecord; change
 
 function AccessSection({ session, view, user }: { session: SessionRecord; view: SessionView | null; user: UserProfile }) {
   const visibility = session.visibility ?? "private";
-  return <Section title="Access" info={<p>{visibility === "workspace"
+  return <Section title="Access" info={<><p>{visibility === "workspace"
     ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
-    : "Private: only the owner and members with a session grant can view prompts and output."} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>}>
+    : "Private: only the owner and members with a session grant can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>
+    <p>Values that look like passwords, tokens or keys are shown as {REDACTED} to everyone, in the transcript, approvals and share links. The agent and the host still see the real values.</p></>}>
     {view ? <>
       <Row leading={<Icon name="user" size={16} />} title={<>Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""}</>} hint={view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} />
       <Row leading={<Icon name="git-branch" size={16} />} title="Commits as" hint={<>{view.owner.gitName} &lt;{view.owner.gitEmail}&gt;</>} />

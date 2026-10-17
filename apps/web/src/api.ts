@@ -21,9 +21,9 @@ async function decode(response: Response): Promise<unknown> {
   return body;
 }
 
-export async function api<T>(path: string, options: { method?: string; body?: unknown; signal?: AbortSignal } = {}): Promise<T> {
+export async function api<T>(path: string, options: { method?: string; body?: unknown; signal?: AbortSignal; headers?: Record<string, string> } = {}): Promise<T> {
   const method = options.method ?? "GET";
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { ...options.headers, Accept: "application/json" };
   if (method !== "GET") {
     // Obtain a fresh token so logout/login and another browser tab cannot leave stale CSRF state.
     const token = await decode(await fetch("/api/auth/csrf", { credentials: "same-origin", signal: options.signal })) as { csrfToken: string };

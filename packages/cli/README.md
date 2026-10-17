@@ -119,6 +119,10 @@ A new session needs no agent: pick a host and one of its models, and the session
 
 When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes, GitHub comments and merges still need their own approval unless the message auto-approves (GitHub comments and merges even then). A message the session owner sends with **Auto-approve** asks none of this (connector 0.7.1 or newer): its calls go ahead at once, for that message only, while GitHub comments and merges still wait for their approval. Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
 
+## Session status
+
+The session list shows what each session's agent is doing, as its host reports it: **In progress** while a message is queued or running, **Needs approval** while a permission card holds the work or, once the work stops, an operation awaits its approval, then **Done** or **Failed** for how the latest shared message ended. Side asks don't change done or failed. Hosts report this with connectors newer than 0.7.1; restart an older one with `npx pistead@latest connect` to show it.
+
 ## License
 
 MIT
