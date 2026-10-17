@@ -1,7 +1,7 @@
 import type { Permission, RunnerAction, RunnerTicket } from '../../../packages/shared/src/types.js';
 import { sha256, signToken } from '../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
-import { sessionAccess } from './db.js';
+import { requireNoMigration, sessionAccess } from './db.js';
 import type { AppContext, SessionRow } from './types.js';
 import { fail, id, testMode } from './http.js';
 import { connectorRequest } from './connector-transport.js';
@@ -33,6 +33,8 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
   if (action !== 'restore' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
+  // The move itself restores into the successor; every other request waits for the move to finish or be cancelled.
+  if (action !== 'view' && action !== 'events' && action !== 'restore') await requireNoMigration(c.env, row.id);
   if (access.row.connector_id) return connectorRequest(c, access.row, action, suffix, body, actorId);
   const secret = c.env.RUNNER_SHARED_SECRET;
   if (!secret || secret.length < 32 || !c.env.RUNNER_URL) fail(503, 'runner_unavailable', 'The external runner is not configured.');

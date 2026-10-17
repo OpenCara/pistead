@@ -5,7 +5,7 @@ import type { GitPushOperation, HostPushCredential, PushCompletionResult, PushCr
 import { constantTimeEqual, sha256 } from '../../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../../packages/shared/src/policy.js';
 import type { AppContext, Env, PushCredentialRow, SessionAccess, SessionRow } from '../types.js';
-import { auditStatement, sessionAccess } from '../db.js';
+import { auditStatement, requireNoMigration, sessionAccess } from '../db.js';
 import { fail, id, identifier, jsonObject, now, text, userIdentifier } from '../http.js';
 import { parseOperation } from '../operations.js';
 import { decryptToken, encryptToken } from '../vault.js';
@@ -23,6 +23,7 @@ export async function requireNoRestore(c: AppContext, sessionId: string): Promis
   if (await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
+  await requireNoMigration(c.env, sessionId);
 }
 
 /** The pinned repository whose worktree path the operation names. */

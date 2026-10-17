@@ -80,6 +80,15 @@ npx pistead@latest connect --server https://pistead.example.com --pairing-id PAI
 
 See [`packages/cli/README.md`](packages/cli/README.md) for the connector's requirements and options.
 
+### Moving a session to another host
+
+While both hosts are connected, a session's owner can move it to a model on another host in its workspace (session panel → **Move to another host**, or `POST /api/sessions/:id/migrate` with `requestId` and `modelId`). The source host's live snapshot, the same one a backup takes, goes straight to the new host, so no `STORAGE_URL` is needed:
+
+- The new host restores it into a new session with the same conversation, files, repository pins, visibility and title (or a new title), running that host's model. Its agent keeps the original's name and instructions, with the tools the new host can carry. Session grants, and approvals given for the rest of the session, aren't copied.
+- Once the new host confirms, the original session is archived: its history stays readable and its owner can unarchive it.
+- The session must be idle. Until the move finishes, both sessions only accept reads, so nothing sent after the snapshot is lost. The control plane holds the snapshot until then; retrying with the same `requestId` needs only the new host, and `POST /api/sessions/:id/migrations/:migrationId/cancel` gives up on the move, archiving the unfinished copy.
+- Moving to a host someone else owns needs `trustedConnectorId`, as starting a session there does. The new host must run a current connector on Linux (`hostMigration` capability).
+
 ### Sharing a session by link
 
 Besides workspace visibility and per-member grants, a session's owner can turn on a share link (session panel → **People**). Anyone who has the link can follow the session's shared conversation read-only, without signing in, through `GET /api/shared` and `GET /api/shared/view`. They see nothing else: no side asks, approvals, collaborators, workspace, host or repositories. The token is carried only in the URL fragment and an `X-Share-Token` header, never in a request path. Turning the link off stops it at once, and turning it on again issues a new one.

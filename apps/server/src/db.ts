@@ -97,7 +97,15 @@ export async function requireSession(c: AppContext, sessionId: string, permissio
   if (permission !== 'read' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
+  if (permission !== 'read') await requireNoMigration(c.env, sessionId);
   return access;
+}
+/** A session moving to another host, and its successor until the move completes, accept nothing but reads. */
+export async function requireNoMigration(env: Env, sessionId: string): Promise<void> {
+  if (await env.DB.query("SELECT 1 FROM host_migrations WHERE status = 'pending' AND (source_session_id = ? OR target_session_id = ?)")
+    .bind(sessionId, sessionId).first()) {
+    fail(409, 'migration_pending', 'This session is moving to another host. Finish or cancel the move first.');
+  }
 }
 export function auditStatement(env: Env, actorId: string | null, action: string, workspaceId: string | null = null, sessionId: string | null = null, detail: Record<string, unknown> = {}): Query<never> {
   // Callers supply metadata, never prompts, credentials, environment values, or operation bodies.

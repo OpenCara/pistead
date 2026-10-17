@@ -32,6 +32,11 @@ export interface ConnectorCapabilities {
    * older connectors and on hosts started with the cache turned off.
    */
   repositoryCache?: boolean;
+  /**
+   * The connector accepts sessions moved to it from another host: it restores the source host's live snapshot into a
+   * successor session bound to this host and one of its models. Absent on older connectors.
+   */
+  hostMigration?: boolean;
 }
 
 export interface ConnectorInfo {
@@ -102,6 +107,11 @@ export interface RestoreDescriptor {
   sha256: string;
   size: number;
   downloadToken: string;
+  /**
+   * Present (true) when the snapshot comes from another host: the target then runs its own agent and model on the
+   * same owner, workspace and repository pins, instead of the source's exact binding. `backupId` is the migration id.
+   */
+  migration?: true;
 }
 
 export interface RestoreInput {
