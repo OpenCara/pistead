@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { BackupLocation, SessionRecord } from "../../../packages/shared/src/types";
 import { api, errorMessage, segment } from "./api";
-import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert, useResource } from "./ui";
+import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert } from "./ui";
 import { Icon } from "./icons";
 
-export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation };
+/** `unavailable`: listed, but saved in a store this server can't read now, so it can't be downloaded or restored. */
+export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation; unavailable?: boolean };
 
 /** "Workspace database" for backups saved in the database the workspace owner connected. */
 export function backupLocationLabel(backup: Backup): string {
@@ -16,6 +17,25 @@ export type BackupDatabase = { id: string; host: string; port: number; database:
 
 export function backupDatabaseLabel(database: BackupDatabase): string {
   return `${database.host.includes(":") ? `[${database.host}]` : database.host}:${database.port}/${database.database}`;
+}
+
+/** What `GET /api/sessions/:id/backups` returns: the session's backups, where a new one goes and whether it can be saved. */
+export type BackupListing = { backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase; enabled?: boolean };
+/** The owner's backup listing, loaded once per session screen and shared by its header menu and panel. */
+export type BackupListingResource = { data: BackupListing | null; loading: boolean; error: string; refresh: () => void };
+
+/** Why no new backup can be saved, by where it would have gone. */
+export function backupsOffHint(destination: BackupLocation | undefined): string {
+  return destination === "workspace-database"
+    ? "This workspace keeps its backups in its own database, which this server no longer connects to. The workspace owner can disconnect it in the workspace settings"
+    : "This server keeps no session backups: its operator hasn't set up backup storage (STORAGE_URL)";
+}
+
+/** Why a listed backup can't be downloaded or restored now, by where it was saved. */
+export function backupUnavailableHint(backup: Backup): string {
+  return backup.location === "workspace-database"
+    ? "This backup was saved in the workspace's own database, which this server can't use now, so it can't be downloaded or restored"
+    : "This backup was saved in the server's backup storage, which isn't set up now (STORAGE_URL), so it can't be downloaded or restored";
 }
 type Attempt = { requestId: string; title?: string; targetSessionId?: string };
 type RestoreResponse = {
@@ -51,9 +71,10 @@ export function backupDownloadHref(sessionId: string, backupId: string) {
 }
 
 /** Backup rows inside the Backups card; selecting one reveals download and restore-into-new-session. */
-export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSession }: { sourceId: string; ownerId: string; latestBackup: Backup | null; refreshKey: number; openSession: (id: string) => void }) {
+export function BackupList({ sourceId, ownerId, backups, latestBackup, refreshKey, openSession }: {
+  sourceId: string; ownerId: string; backups: BackupListingResource; latestBackup: Backup | null; refreshKey: number; openSession: (id: string) => void;
+}) {
   const base = `/api/sessions/${segment(sourceId)}`;
-  const backups = useResource<{ backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase }>(`${base}/backups`);
   const [selectedId, setSelectedId] = useState("");
   const [title, setTitle] = useState("");
   const [attempt, setAttempt] = useState<Attempt | undefined>();
@@ -62,6 +83,8 @@ export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSe
   const [pending, setPending] = useState(false);
   const inFlight = useRef(false);
   const selected = backups.data?.backups.find(backup => backup.id === selectedId);
+  // A backup in a store this server can't read now can't be restored; one restored before still opens its session.
+  const unreadable = Boolean(selected?.unavailable) && !attempt?.targetSessionId;
 
   useEffect(() => {
     if (latestBackup || refreshKey) backups.refresh();
@@ -86,7 +109,7 @@ export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSe
 
   async function restore(event: FormEvent) {
     event.preventDefault();
-    if (!selected || inFlight.current || storageError) return;
+    if (!selected || inFlight.current || storageError || unreadable) return;
     inFlight.current = true;
     setPending(true);
     setError("");
@@ -133,36 +156,40 @@ export function BackupList({ sourceId, ownerId, latestBackup, refreshKey, openSe
   if (backups.loading) return <Row title={<Loading>Loading backups...</Loading>} />;
   if (backups.error) return <Row title="Unable to load backups" hint={backups.error} trailing={<Button variant="outline" size="sm" onClick={backups.refresh}>Try again</Button>} />;
   const list = backups.data?.backups ?? [];
+  const enabled = backups.data?.enabled !== false;
   // Shown before the next backup: whoever can read the workspace owner's database can read what is saved there.
   const target = backups.data?.workspaceDatabase;
-  const destination = target && <Row
+  const destination = !enabled ? <Row leading={<Icon name="info" size={16} />} title="Backups are off" hint={backupsOffHint(backups.data?.destination)} />
+    : target && <Row
     leading={<Icon name="server" size={16} />}
     title="Saved to the workspace database"
     hint={target.confirm
       ? `New backups of this session go to ${backupDatabaseLabel(target)}, which the workspace owner connected. Whoever can read it can read them, including your personal environment values; you confirm before each backup`
       : `New backups of this session go to ${backupDatabaseLabel(target)}, the database you connected for this workspace`}
   />;
-  if (!list.length) return <>{destination}<Row title="No backups yet" hint="Listing and downloading work while the host is offline" /></>;
+  if (!list.length) return <>{destination}{enabled && <Row title="No backups yet" hint="Listing and downloading work while the host is offline" />}</>;
   return <>
     {destination}
     {list.map(backup => <div key={backup.id} className="backup-item">
       <Row
         leading={<Icon name="archive" size={16} />}
         title={<Timestamp value={backup.createdAt} />}
-        hint={`${backup.size} bytes${backupLocationLabel(backup)}`}
+        hint={`${backup.size} bytes${backupLocationLabel(backup)}${backup.unavailable ? " · Unavailable" : ""}`}
         trailing={<Icon name={backup.id === selectedId ? "chevron-down" : "chevron-right"} size={16} />}
         onClick={() => chooseBackup(backup.id === selectedId ? "" : backup.id)}
       />
       {selected?.id === backup.id && <form className="backup-detail" onSubmit={restore}>
         <fieldset disabled={pending} className="stack">
           <p className="muted small">ID <code>{selected.id}</code>; SHA-256 <code>{selected.sha256}</code></p>
-          <div className="inline"><LinkButton variant="outline" size="sm" icon="external" href={backupDownloadHref(sourceId, selected.id)}>Download backup</LinkButton></div>
+          {selected.unavailable
+            ? <p className="small">{backupUnavailableHint(selected)}</p>
+            : <div className="inline"><LinkButton variant="outline" size="sm" icon="external" href={backupDownloadHref(sourceId, selected.id)}>Download backup</LinkButton></div>}
           <Field label="New session title" hint="Optional. Restore creates a new private session and never overwrites this one">
-            <input className="input" autoComplete="off" maxLength={200} value={title} disabled={Boolean(attempt) || Boolean(storageError)} onChange={event => setTitle(event.target.value)} />
+            <input className="input" autoComplete="off" maxLength={200} value={title} disabled={Boolean(attempt) || Boolean(storageError) || unreadable} onChange={event => setTitle(event.target.value)} />
           </Field>
           {attempt && <p className="muted small">Restore request <code>{attempt.requestId}</code>. Retrying reuses this request ID and title, so it resolves the same new session instead of creating another.</p>}
           <div className="inline">
-            <Button type="submit" variant="secondary" size="sm" disabled={Boolean(storageError)}>
+            <Button type="submit" variant="secondary" size="sm" disabled={Boolean(storageError) || unreadable}>
               {pending ? "Restoring..." : attempt?.targetSessionId ? "Open restored session" : attempt ? "Retry same restore" : "Restore into new private session"}
             </Button>
             {pending && <Loading>Waiting for the server to confirm the new session...</Loading>}

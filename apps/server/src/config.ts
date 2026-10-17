@@ -14,7 +14,8 @@ export interface ServerConfig {
   /** Directory holding the built web client (`dist/web`). */
   staticDir: string;
   databaseUrl: string;
-  storageUrl: string;
+  /** `STORAGE_URL`, or null when it is unset: the server then stores no session backups. */
+  storageUrl: string | null;
 }
 
 export class ConfigurationError extends Error {}
@@ -26,7 +27,6 @@ function flag(processEnv: NodeJS.ProcessEnv, name: string): boolean {
 }
 
 export const defaultDatabaseUrl = 'sqlite:///data/pistead.sqlite';
-const defaultStorageUrl = 'file:///data/backups';
 const stringVars = [
   'APP_ORIGIN', 'RUNNER_URL', 'RUNNER_EVENT_TRANSPORT', 'RUNNER_SHARED_SECRET', 'SESSION_SECRET', 'VAULT_KEY',
   'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'TEST_AUTH_ENABLED', 'TEST_AUTH_SECRET', 'TEST_AUTH_EXPIRES_AT',
@@ -34,8 +34,8 @@ const stringVars = [
 ] as const;
 
 /**
- * Builds `Env` from process environment variables: opens the database and object storage named by
- * `DATABASE_URL`/`STORAGE_URL`, creates the connector hub and copies the documented string settings.
+ * Builds `Env` from process environment variables: opens the database named by `DATABASE_URL` and, only when it is set,
+ * the backup storage named by `STORAGE_URL`, creates the connector hub and copies the documented string settings.
  * Throws `ConfigurationError` naming the offending variable; values are never included.
  */
 export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): Promise<ServerConfig> {
@@ -64,8 +64,10 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   const workspaceDatabases = flag(processEnv, 'WORKSPACE_DATABASES');
   const workspaceDatabasePrivateHosts = flag(processEnv, 'WORKSPACE_DATABASE_PRIVATE_HOSTS');
   const databaseUrl = processEnv.DATABASE_URL || defaultDatabaseUrl;
-  const storageUrl = processEnv.STORAGE_URL || defaultStorageUrl;
-  env.BUCKET = openStorage(storageUrl, processEnv);
+  // A backup holds a whole session, its owner's personal environment values included, so none is stored anywhere unless
+  // the operator names the store. Without one, only workspaces whose owner connected a database can keep backups.
+  const storageUrl = processEnv.STORAGE_URL || null;
+  if (storageUrl) env.BUCKET = openStorage(storageUrl, processEnv);
   env.DB = await openDatabase(databaseUrl);
   if (workspaceDatabases) env.WORKSPACE_DATABASES = new PostgresWorkspaceDatabases({ privateHosts: workspaceDatabasePrivateHosts });
   env.CONNECTOR_HUB = new ConnectorHubRegistry(env);

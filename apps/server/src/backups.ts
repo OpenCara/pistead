@@ -37,6 +37,22 @@ async function backupDestination(env: Env, row: SessionRow): Promise<BackupDesti
   return { location: database ? 'workspace-database' : 'server', workspace, database, confirm: !!database && row.owner_id !== workspace.owner_id };
 }
 
+/**
+ * Whether this server can save a new backup at `location`: in its own storage only when the operator set STORAGE_URL, and
+ * in a workspace's database only while WORKSPACE_DATABASES is on. Creating a backup refuses the same cases, with reasons.
+ */
+function canSave(env: Env, location: BackupLocation): boolean {
+  return location === 'workspace-database' ? Boolean(env.WORKSPACE_DATABASES) : Boolean(env.BUCKET);
+}
+
+/**
+ * Whether this server can read back a backup saved at `stored`, to download or restore it: from its own storage only with
+ * STORAGE_URL, and from the workspace's database only while workspace databases are on and that database is connected.
+ */
+function canRead(env: Env, stored: BackupLocation, database: WorkspaceDatabaseRow | null): boolean {
+  return canSave(env, stored) && (stored === 'server' || database !== null);
+}
+
 export function registerBackups(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/backup', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
@@ -116,9 +132,15 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
       .bind(row.id, row.owner_id).all();
     const { location, database, confirm } = await backupDestination(c.env, row);
     return c.json({
-      backups: result.map(({ stored_in, ...backup }) => backupInfo(backup, stored_in === null ? 'server' : 'workspace-database')),
+      backups: result.map(({ stored_in, ...backup }) => {
+        const stored: BackupLocation = stored_in === null ? 'server' : 'workspace-database';
+        // Still listed when this server can't read its store now, marked so the web app doesn't offer a refused download.
+        return { ...backupInfo(backup, stored), ...(canRead(c.env, stored, database) ? {} : { unavailable: true }) };
+      }),
       // Shown before the next backup is created: whoever can read a workspace database can read the sessions saved there.
       destination: location,
+      // False when no new backup can be saved, so the web app turns backups off instead of offering one that is refused.
+      enabled: canSave(c.env, location),
       ...(database ? { workspaceDatabase: { id: database.id, host: database.host, port: database.port, database: database.database_name, confirm } } : {}),
     });
   });
