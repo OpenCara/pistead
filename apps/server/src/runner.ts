@@ -34,7 +34,7 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
   // The move itself restores into the successor; every other request waits for the move to finish or be cancelled.
-  if (action !== 'view' && action !== 'events' && action !== 'restore') await requireNoMigration(c.env, row.id);
+  if (action !== 'view' && action !== 'events') await requireNoMigration(c.env, row.id, action === 'restore');
   if (access.row.connector_id) return connectorRequest(c, access.row, action, suffix, body, actorId);
   const secret = c.env.RUNNER_SHARED_SECRET;
   if (!secret || secret.length < 32 || !c.env.RUNNER_URL) fail(503, 'runner_unavailable', 'The external runner is not configured.');

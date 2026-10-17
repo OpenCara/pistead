@@ -12,6 +12,7 @@ import { authenticateConnector, requireConnectorSession } from './connectors.js'
 import { runnerJSON, runnerRequest } from './runner.js';
 import { boundedSnapshotText, MAX_BACKUP_BYTES, repositoryIdentity, validateSnapshot } from './restore-snapshot.js';
 import { migratedAgentVersion, requireModel } from './catalog.js';
+import { ConstraintError } from './db/types.js';
 
 /**
  * Moving a session to another host while both are connected. The source host's live snapshot (the same one a backup
@@ -119,26 +120,33 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   const size = new TextEncoder().encode(snapshot).byteLength;
   if (size > MAX_BACKUP_BYTES) fail(502, 'invalid_backup', 'The snapshot exceeds its size limit.');
   const migrationId = id();
-  // Both inserts see the same conditions, so a losing concurrent request leaves no orphan successor, and a source can
-  // only have one move in flight.
+  // The successor is created only while the move is admissible. The receipt insert is unconditional, so a concurrent move
+  // of the same source (or a racing retry of this requestId) violates its unique indexes and rolls the whole batch back,
+  // even under Postgres READ COMMITTED: there is at most one move in flight and never an orphan successor.
   const admissible = `NOT EXISTS (SELECT 1 FROM host_migrations WHERE owner_id = ? AND request_id = ?)
     AND NOT EXISTS (SELECT 1 FROM host_migrations WHERE status = 'pending' AND (source_session_id = ? OR target_session_id = ?))
     AND EXISTS (SELECT 1 FROM sessions source WHERE source.id = ? AND source.owner_id = ? AND source.policy_version = ? AND source.status <> 'archived')`;
   const admissibleValues = [ownerId, input.requestId, source.id, source.id, source.id, ownerId, source.policy_version];
-  await c.env.DB.batch([
-    c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
-      connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
-      .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
-        target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
-        target.visibility ?? 'private', ...admissibleValues),
-    c.env.DB.query(`INSERT INTO host_migrations (id, request_id, owner_id, workspace_id, source_session_id, source_connector_id,
-      target_session_id, target_connector_id, target_model_id, request_title, sha256, size, snapshot, binding_json, created_at)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible} AND EXISTS (SELECT 1 FROM sessions WHERE id = ?)`)
-      .bind(migrationId, input.requestId, ownerId, source.workspace_id, source.id, source.connector_id ?? null,
-        target.id, model.connector_id, model.id, input.title, digest, size, snapshot, JSON.stringify(binding), target.created_at,
-        ...admissibleValues, target.id),
-  ]);
+  try {
+    await c.env.DB.batch([
+      c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
+        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
+        .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
+          target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
+          target.visibility ?? 'private', ...admissibleValues),
+      c.env.DB.query(`INSERT INTO host_migrations (id, request_id, owner_id, workspace_id, source_session_id, source_connector_id,
+        target_session_id, target_connector_id, target_model_id, request_title, sha256, size, snapshot, binding_json, created_at)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)`)
+        .bind(migrationId, input.requestId, ownerId, source.workspace_id, source.id, source.connector_id ?? null,
+          target.id, model.connector_id, model.id, input.title, digest, size, snapshot, JSON.stringify(binding), target.created_at,
+          target.id),
+    ]);
+  } catch (error) {
+    // SQLite: 'UNIQUE constraint failed: host_migrations.source_session_id'; Postgres: '... "host_migrations_pending_source"'.
+    if (!(error instanceof ConstraintError) || !/host_migrations/.test(error.constraint)) throw error;
+    // Another move of this session, or of this requestId, committed first; a racing retry reads that receipt below.
+  }
   const job = await readJob(c, ownerId, input.requestId);
   if (!job) fail(409, 'migration_changed', 'The session changed or is already moving to another host. Reload and try again.');
   if (job.id === migrationId) {

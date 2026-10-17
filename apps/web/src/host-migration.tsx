@@ -105,7 +105,7 @@ export function MoveHostSection({ session, user, hosts, openSession, changed }: 
         <Button variant="outline" size="sm" disabled={pending} onClick={() => void cancel()}>Cancel move</Button>
         {pending && <Loading>Waiting for the other host...</Loading>}
       </div>
-    </> : models.loading || listing.loading ? <Row title={<Loading>Loading hosts...</Loading>} />
+    </> : models.loading || listing.loading || hosts.loading ? <Row title={<Loading>Loading hosts...</Loading>} />
       : !choices.length ? <Row leading={<Icon name="info" size={16} />} title="No other host available" hint="Another connected host in this workspace, with an up-to-date connector on Linux, must offer a model here" />
       : <form className="stack" onSubmit={event => void move(event)}>
         <Field label="Model on the new host">
@@ -128,6 +128,6 @@ export function MoveHostSection({ session, user, hosts, openSession, changed }: 
           {pending && <Loading>Copying the session to the new host...</Loading>}
         </div>
       </form>}
-    <Feedback error={error || models.error || listing.error} />
+    <Feedback error={error || models.error || listing.error || hosts.error} />
   </Section>;
 }

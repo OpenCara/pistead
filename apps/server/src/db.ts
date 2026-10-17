@@ -100,10 +100,13 @@ export async function requireSession(c: AppContext, sessionId: string, permissio
   if (permission !== 'read') await requireNoMigration(c.env, sessionId);
   return access;
 }
-/** A session moving to another host, and its successor until the move completes, accept nothing but reads. */
-export async function requireNoMigration(env: Env, sessionId: string): Promise<void> {
-  if (await env.DB.query("SELECT 1 FROM host_migrations WHERE status = 'pending' AND (source_session_id = ? OR target_session_id = ?)")
-    .bind(sessionId, sessionId).first()) {
+/**
+ * A session moving to another host, and its successor until the move completes, accept nothing but reads.
+ * `asTarget` admits only the move's own restore into its successor.
+ */
+export async function requireNoMigration(env: Env, sessionId: string, asTarget = false): Promise<void> {
+  if (await env.DB.query("SELECT 1 FROM host_migrations WHERE status = 'pending' AND (source_session_id = ? OR (target_session_id = ? AND ? = 0))")
+    .bind(sessionId, sessionId, asTarget ? 1 : 0).first()) {
     fail(409, 'migration_pending', 'This session is moving to another host. Finish or cancel the move first.');
   }
 }

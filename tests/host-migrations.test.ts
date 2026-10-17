@@ -155,6 +155,14 @@ test('a move that fails on the target locks the source until it is retried or ca
   await assert.rejects(requireNoMigration(f.env, String(job.target_session_id)), moving);
   // A second move of the same session is refused while one is in flight.
   assert.equal((await f.request(migratePath, { requestId: 'again', modelId: 'new-model' })).status, 409);
+  // The schema enforces that too, so concurrent READ COMMITTED transactions can't both commit a move.
+  f.sqlite.exec(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
+    VALUES ('racer','workspace','test:owner','version','Racer',1,'provisioning','2026-01-01','new-host','test:owner')`);
+  assert.throws(() => f.sqlite.prepare(`INSERT INTO host_migrations (id,request_id,owner_id,workspace_id,source_session_id,source_connector_id,
+    target_session_id,target_connector_id,target_model_id,sha256,size,snapshot,binding_json,created_at)
+    VALUES ('racer','racer','test:owner','workspace','source','old-host','racer','new-host','new-model',?,1,'{}','{}','2026-01-01')`)
+    .run('a'.repeat(43)), /UNIQUE/);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 3);
   // The retry reuses the held snapshot: the source host isn't asked again.
   let backups = 0;
   f.hosts();

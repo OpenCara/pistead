@@ -28,6 +28,8 @@ CREATE TABLE host_migrations (
 );
 CREATE INDEX host_migrations_source ON host_migrations(source_session_id, status);
 CREATE INDEX host_migrations_target ON host_migrations(target_session_id, status);
+-- One move in flight per session, also under concurrent READ COMMITTED transactions.
+CREATE UNIQUE INDEX host_migrations_pending_source ON host_migrations(source_session_id) WHERE status = 'pending';
 CREATE TRIGGER host_migrations_binding_immutable
   BEFORE UPDATE OF id, request_id, owner_id, workspace_id, source_session_id, source_connector_id, target_session_id,
     target_connector_id, target_model_id, request_title, sha256, size, binding_json, created_at ON host_migrations
