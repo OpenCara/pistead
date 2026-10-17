@@ -1,4 +1,4 @@
-import type { RepositoryPreparationItem, RepositoryPreparationPhase, SessionView } from "../../../packages/shared/src/types";
+import type { RepositoryPreparationItem, RepositoryPreparationPhase, SessionView } from "../../shared/src/types";
 
 /** Plain words for each phase; the host sends only these structured values, never Git's or a remote's text. */
 const labels: Record<RepositoryPreparationPhase, string> = {

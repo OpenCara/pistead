@@ -1,4 +1,4 @@
-import { gitProviderHosts, gitProviderNames, repositoryLimits, type GitAccount, type GitProvider, type WorkspaceRepository } from "../../../packages/shared/src/repositories";
+import { gitProviderHosts, gitProviderNames, repositoryLimits, type GitAccount, type GitProvider, type WorkspaceRepositoryList } from "../../../packages/shared/src/repositories";
 import { segment } from "./api";
 import { useResource } from "./ui";
 
@@ -13,9 +13,10 @@ export function RepositorySnapshotPolicy() {
   </div>;
 }
 
+/** `required`: the signed-in user's sessions and hosts in this workspace need a repository (until loaded, assume so). */
 export function useWorkspaceRepositories(workspaceId: string | null) {
-  const resource = useResource<{ repositories: WorkspaceRepository[] }>(workspaceId ? `/api/workspaces/${segment(workspaceId)}/repositories` : null);
-  return { repositories: resource.data?.repositories ?? null, loading: resource.loading, error: resource.error, refresh: resource.refresh };
+  const resource = useResource<WorkspaceRepositoryList>(workspaceId ? `/api/workspaces/${segment(workspaceId)}/repositories` : null);
+  return { repositories: resource.data?.repositories ?? null, required: resource.data?.required ?? true, loading: resource.loading, error: resource.error, refresh: resource.refresh };
 }
 
 /** The caller's connected Git accounts: the GitHub sign-in account first (id "github") when connected, then token accounts. */

@@ -10,12 +10,15 @@ RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
 WORKDIR /app
 
 FROM base AS build
+# Only the server, web and connector manifests: the native apps' workspaces (apps/mobile, apps/desktop) stay out of
+# the image, and pnpm installs just the workspaces present.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/cli/package.json packages/cli/
 RUN pnpm install --frozen-lockfile
 COPY apps/server apps/server
 COPY apps/web apps/web
 COPY packages/shared packages/shared
+COPY packages/client packages/client
 COPY tsconfig.json ./
 RUN pnpm build && pnpm build:server
 

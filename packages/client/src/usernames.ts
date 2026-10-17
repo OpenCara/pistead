@@ -1,6 +1,6 @@
-import type { WorkspaceRole } from "../../../packages/shared/src/types";
+import type { WorkspaceRole } from "../../shared/src/types";
 
-/** Someone the web app names: their user ID and, when known, their username (GitHub login). */
+/** Someone an app names: their user ID and, when known, their username (GitHub login). */
 export interface Person {
   id: string;
   githubLogin?: string | null;

@@ -3,8 +3,9 @@ import type { UserProfile } from "../../../../packages/shared/src/types";
 import { api } from "../api";
 import { useApp } from "../app-context";
 import { Button, CardBody, CopyButton, Feedback, Field, Row, Section, useAction } from "../ui";
-import { usernameWithId } from "../usernames";
+import { usernameWithId } from "../../../../packages/client/src/usernames";
 import { GitAccountsSection } from "./GitAccounts";
+import { SignedInAppsSection } from "./SignedInApps";
 import "./settings.css";
 
 type EnvRow = { id: string; key: string; value: string };
@@ -57,6 +58,7 @@ export function ProfileSettings() {
       </div>
     </form>
     <GitAccountsSection />
+    <SignedInAppsSection />
     <Section title="Account">
       <Row title="User ID" hint={<code>{usernameWithId(user)}</code>} trailing={<CopyButton value={user.id} label="Copy user ID" />} />
       <Row title="Sign out" trailing={<Button variant="outline" size="sm" onClick={signOut}>Sign out</Button>} />

@@ -11,10 +11,10 @@ import { activeStatuses, startLiveSession, type StreamStatus } from "./live-sess
 import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { RepositoryPreparationCard } from "./repository-preparation";
-import { preparingRepositories } from "./repository-progress";
+import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
-import { splitToolCalls } from "./transcript";
+import { splitToolCalls } from "../../../packages/client/src/transcript";
 import {
   Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,

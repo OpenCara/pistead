@@ -3,7 +3,7 @@ import type { SessionRecord } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { href, navigate } from "./router";
-import { sessionStatus } from "./session-status";
+import { sessionStatus } from "../../../packages/client/src/session-status";
 import { Button, EmptyState, Feedback, Field, IdentityBadge, InfoTip, LinkButton, PageLoading, RelativeTime, Row, ScreenHeader, Section, Sheet, StatusDot, useAction } from "./ui";
 import "./new-session.css";
 

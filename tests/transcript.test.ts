@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { splitToolCalls } from "../apps/web/src/transcript.js";
+import { splitToolCalls } from "../packages/client/src/transcript.js";
 
 test("tool call lines leave the assistant's prose wherever the model put them", () => {
   const read = 'read_file({"path":"src/__init__.py","note":"*not* emphasis"})';

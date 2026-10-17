@@ -4,7 +4,7 @@ import type { EntryView } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage } from "./api";
 import { Icon, Logo, type IconName } from "./icons";
 import { Markdown } from "./markdown";
-import { splitToolCalls } from "./transcript";
+import { splitToolCalls } from "../../../packages/client/src/transcript";
 import { Alert, EmptyState, formatDuration, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
 import "./session.css";
 import "./shared-session.css";

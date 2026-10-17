@@ -81,7 +81,7 @@ async function fixture(t: TestContext, connected = false, repositories: SessionR
   const app = new Hono<WorkerEnv>();
   // Cookie/CSRF are covered by control-plane tests; this seam supplies an authenticated actor.
   app.use('/api/sessions/*', async (c, next) => {
-    c.set('auth', { userId: c.req.header('x-test-user') ?? 'test:owner', tokenHash: 'test', csrfToken: 'test' });
+    c.set('auth', { userId: c.req.header('x-test-user') ?? 'test:owner', tokenHash: 'test', csrfToken: 'test', client: 'browser' });
     await next();
   });
   registerRestoreRoutes(app);

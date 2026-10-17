@@ -9,7 +9,7 @@ import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
 import { gitAccountLabel, gitProviderLabel, RepositorySnapshotPolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
 import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
-import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../usernames";
+import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
 import { PushAccess } from "./PushAccess";
 import { WorkspaceDatabaseSection } from "./WorkspaceDatabase";
 

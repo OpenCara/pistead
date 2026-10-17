@@ -15,6 +15,22 @@ export interface UserProfile {
   env: Record<string, string>;
   githubConnected: boolean;
 }
+/** A native app (iOS, iPadOS, macOS) signed in as the user, listed so the user can revoke it from the web app. */
+export interface SignedInDevice {
+  id: string;
+  /** The name the app reported when it signed in, e.g. the device's name; null when it sent none. */
+  name: string | null;
+  createdAt: string;
+  expiresAt: string;
+  /** This request came from that app. */
+  current: boolean;
+}
+/** A native app's sign-in: its bearer token, until `expiresAt`. */
+export interface NativeSignIn {
+  token: string;
+  expiresAt: string;
+  user: UserProfile;
+}
 export interface Workspace {
   id: string;
   name: string;
