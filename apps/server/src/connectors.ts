@@ -10,7 +10,7 @@ import { authorizeSession } from './internal.js';
 import { githubComment, githubMerge, githubRead } from './github-broker.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
-import { legacyRepositoryFixture, repositoryDownload, requireConfiguredWorkspace } from './repositories.js';
+import { legacyRepositoryFixture, repositoryAuthorize, repositoryDownload, requireConfiguredWorkspace } from './repositories.js';
 
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
@@ -46,17 +46,18 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');
   const cap = value as Record<string, unknown>;
-  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials', 'github']);
+  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials', 'github', 'repositoryCache']);
   const platform = text(cap.platform, 'platform', 40);
   if (!/^[a-zA-Z0-9._-]+$/.test(platform) || typeof cap.sandbox !== 'boolean' || typeof cap.productionShell !== 'boolean' || (cap.productionShell && !cap.sandbox)
     || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)
     || (cap.chatOptions !== undefined && typeof cap.chatOptions !== 'boolean') || (cap.gitProviders !== undefined && typeof cap.gitProviders !== 'boolean')
     || (cap.gitPush !== undefined && typeof cap.gitPush !== 'boolean')
     || (cap.gitCredentials !== undefined && typeof cap.gitCredentials !== 'boolean') || (cap.gitCredentials && !cap.gitPush)
-    || (cap.github !== undefined && typeof cap.github !== 'boolean')) fail(400, 'invalid_manifest', 'Invalid capabilities.');
+    || (cap.github !== undefined && typeof cap.github !== 'boolean')
+    || (cap.repositoryCache !== undefined && typeof cap.repositoryCache !== 'boolean')) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
     ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
-    ...(cap.github ? { github: true } : {}) } };
+    ...(cap.github ? { github: true } : {}), ...(cap.repositoryCache ? { repositoryCache: true } : {}) } };
 }
 
 function requireConnectorTLS(env: Env, url: URL): void {
@@ -300,6 +301,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/git/push/complete', async c => pushComplete(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/repositories/:bindingId/download', async c => repositoryDownload(c, await authenticateConnector(c)));
+  app.post('/api/connectors/self/repositories/:bindingId/authorize', async c => repositoryAuthorize(c, await authenticateConnector(c)));
 }
 
 export function registerConnectors(app: Hono<WorkerEnv>): void {

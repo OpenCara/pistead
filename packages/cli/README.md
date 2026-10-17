@@ -55,6 +55,21 @@ This needs only Git on your `PATH` (on macOS: `xcode-select --install` or `brew 
 
 Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands, commits and pushes run immediately (GitHub comments and merges still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
 
+## Repository cache (preview)
+
+By default Pistead downloads each pinned repository as an archive (at most 8 MiB compressed), and the session sees a single snapshot commit. With `--repo-cache`, the connector keeps a full clone of each repository on the host instead, and checks sessions out of it:
+
+```sh
+npx pistead@latest connect --repo-cache                            # one cache for every session on this host
+npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
+```
+
+- The host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead never sends a read credential.
+- Before a session uses the cache, Pistead checks that the session's owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
+- The first session on a host waits while the repository is cloned, and the session shows the clone's progress; later sessions fetch only what is new. Messages sent meanwhile wait in the queue. If the host can't fetch a repository, the session shows why and new messages are refused; restart the session after fixing it.
+- Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
+- Preview: backups of sessions that use the cache, and cleaning up the cache, are not supported yet. It needs a Pistead server that supports the repository cache; older servers refuse the connector's manifest.
+
 ## Pushing commits
 
 Agents with the `git_push` tool push their committed session work to a branch of a workspace repository (connector 0.5.0 or newer). A push needs an approval that shows the repository, the branch and the exact session commit, unless the session owner chose **Auto-approve** for that message. Pushes are fast-forward only and never forced: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so files the snapshot left out stay untouched and a later push to the same branch uploads only new objects. The agent can also ask for a pull request; Pistead opens it as the session owner with the owner's connected account (non-GitHub tokens then need write scopes: GitHub Enterprise pull requests write, GitLab `api`, Bitbucket `write:pullrequest:bitbucket`, Azure DevOps Code (Read & write), Gitea `write:repository`).

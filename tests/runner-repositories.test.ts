@@ -1,17 +1,20 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { Harness } from "@earendil-works/pi-durable";
 import { sha256 } from "../packages/shared/src/crypto.js";
-import { repositoryLimits, repositoryPath, type GitHubSessionRepository, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { repositoryLimits, repositoryPath, repositoryRemote, type GitHubSessionRepository, type SessionRepository } from "../packages/shared/src/repositories.js";
+import { RepositoryCache } from "../apps/runner/src/repo-cache.js";
+import { startGitHttpServer } from "./helpers/git-http.js";
 import { repositoryPins } from "../apps/runner/src/sandbox.js";
 import type { RestoreDescriptor } from "../packages/shared/src/connector.js";
-import type { RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
+import type { RunnerAction, RunnerBinding, RunnerTicket, SessionActivity } from "../packages/shared/src/types.js";
 import { RunnerError, validateBinding, validateRepositories } from "../apps/runner/src/protocol.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 import { RunnerService } from "../apps/runner/src/server.js";
@@ -656,4 +659,156 @@ test("repository protocol rejects malformed or duplicate provider pins", async t
   });
   assert.equal(validateRepositories([pin, providerPin({ bindingId: "other", host: "gitlab.com", fullName: "group/other" })]).length, 2, "same id on another host is distinct");
   assert.equal(validateRepositories([repository(), providerPin({ repositoryId: String(repository().repositoryId) })]).length, 2, "GitHub and provider ids never collide");
+});
+
+// Cache hosts in host mode: no bwrap needed, only Git.
+const cacheHost = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0, timeout: 60_000 };
+const UPSTREAM_AUTH = "Basic cGlzdGVhZDp0b2tlbg==";
+
+function upstreamGit(cwd: string, args: string[]): string {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Upstream", GIT_AUTHOR_EMAIL: "upstream@example.test",
+    GIT_COMMITTER_NAME: "Upstream", GIT_COMMITTER_EMAIL: "upstream@example.test", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+test("cache hosts return from create at once, hold runs until the pins are fetched and checked out, and expose history", cacheHost, async t => {
+  const root = await directory(t);
+  const work = join(root, "upstream");
+  upstreamGit(root, ["init", "-q", "-b", "main", work]);
+  await writeFile(join(work, "README.md"), "hello from upstream\n");
+  upstreamGit(work, ["add", "."]);
+  upstreamGit(work, ["commit", "-q", "-m", "first"]);
+  await writeFile(join(work, "NOTES.md"), "notes\n");
+  upstreamGit(work, ["add", "."]);
+  upstreamGit(work, ["commit", "-q", "-m", "second"]);
+  const served = join(root, "served");
+  upstreamGit(root, ["clone", "-q", "--bare", work, join(served, "acme", "project-1.git")]);
+  const server = await startGitHttpServer(served, { authorization: UPSTREAM_AUTH });
+  t.after(() => server.close());
+  // github.com remotes go to the local server; the second upload-pack POST (the pack itself) waits for the gate.
+  const gate = Promise.withResolvers<void>();
+  const packRequested = Promise.withResolvers<void>();
+  let posts = 0;
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => UPSTREAM_AUTH, fetch: async (input, init) => {
+    if (init?.method === "POST" && ++posts === 2) { packRequested.resolve(); await gate.promise; }
+    return fetch(String(input).replace(/^https:\/\/github\.com\//, server.url("")), init);
+  } });
+  const pin: GitHubSessionRepository = { ...repository(), commit: upstreamGit(work, ["rev-parse", "HEAD"]) };
+  const input = binding("cache-host", [pin]);
+  let authorizations = 0;
+  const reported: SessionActivity[] = [];
+  const events: string[] = [];
+  observeHarness(t, events, () => {});
+  const service = new RunnerService(config(root, {
+    unsandboxed: true, repositoryCache: cache,
+    authorizeRepository: async (repository, sessionId) => {
+      authorizations++;
+      assert.equal(sessionId, input.session.id);
+      return { bindingId: repository.bindingId, commit: repository.commit, remote: repositoryRemote(repository) };
+    },
+    reportActivity: async (sessionId, activity) => { assert.equal(sessionId, input.session.id); reported.push(activity); },
+    readRepository: async () => assert.fail("cache hosts never download archives"),
+  }));
+  t.after(async () => { gate.resolve(); await service.close(); });
+  await service.initialize();
+  const session = await service.provision(input, await ticket(input.session.id, "create"));
+  // create returned while the clone is still waiting for its pack.
+  await packRequested.promise;
+  assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "absent");
+  assert.ok(events.includes("harness") && !events.includes("resume"), "the harness stays paused while repositories are prepared");
+  const preparing = await session.view();
+  assert.equal(preparing.busy, true, "preparation keeps the session busy");
+  assert.deepEqual(preparing.repositories, { status: "preparing", items: [{ path: pin.path, phase: "connecting", percent: null, done: null, total: null, bytes: 0 }] });
+  assert.equal(preparing.activity, "working", "session lists show a session preparing its repositories in progress");
+  // Its host reports that too, while the preparation still holds the session's work.
+  for (let attempt = 0; attempt < 100 && !reported.length; attempt++) await delay(20);
+  assert.deepEqual(reported, ["working"]);
+  const receipt = await session.submit(await ticket(input.session.id, "submit"), { content: "TEST_READ acme/project-1/README.md", requestId: "read-from-cache" }, "write");
+  assert.equal(receipt.status, "queued");
+  gate.resolve();
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.queue?.find(run => run.submissionId === receipt.submissionId)?.status, "settled");
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("hello from upstream")), "the held run reads the checked-out file");
+  assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "cache");
+  assert.equal(view.repositories, undefined, "a ready session reports no preparation");
+  assert.equal(view.activity, "done", "once ready, the session's messages say what it is doing");
+  assert.equal(events.filter(event => event === "resume").length, 1, "work resumes once, when the repositories are ready");
+  assert.equal(authorizations, 1);
+  await assert.rejects(session.backup(await ticket(input.session.id, "backup")), /host repository cache are not supported yet/);
+  assert.equal((await session.sandbox.execute({ kind: "bash", command: "git rev-list --count acme/project-1/pinned" }, false, allow)).trim(), "2");
+});
+
+test("a cache host that cannot prepare a repository refuses new messages with the reason until the session restarts", cacheHost, async t => {
+  const root = await directory(t);
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched without authorization") });
+  const input = binding("cache-denied");
+  const reported: SessionActivity[] = [];
+  const service = new RunnerService(config(root, {
+    unsandboxed: true, repositoryCache: cache,
+    authorizeRepository: async () => { throw new RunnerError(403, "The pinned commit is no longer readable in this GitHub repository."); },
+    readRepository: async () => assert.fail("cache hosts never download archives"),
+    reportActivity: async (_sessionId, activity) => { reported.push(activity); },
+  }));
+  t.after(() => service.close());
+  await service.initialize();
+  const session = await service.provision(input, await ticket(input.session.id, "create"));
+  let refusal: unknown;
+  for (let attempt = 0; attempt < 100 && !refusal; attempt++) {
+    await delay(20);
+    await session.submit(await ticket(input.session.id, "submit"), { content: "TEST_IDENTITY", requestId: `attempt-${attempt}` }, "write")
+      .catch((error: unknown) => { refusal = error; });
+  }
+  assert.ok(refusal instanceof RunnerError);
+  assert.equal(refusal.status, 502);
+  assert.equal(refusal.message, "The pinned commit is no longer readable in this GitHub repository. Restart the session to try again.");
+  assert.equal(await session.sandbox.repositoryCacheState(input.session.repositories!, allow), "absent");
+  const view = await session.view();
+  assert.deepEqual(view.repositories, { status: "failed", error: "The pinned commit is no longer readable in this GitHub repository.",
+    items: [{ path: input.session.repositories![0]!.path, phase: "authorizing", percent: null, done: null, total: null, bytes: 0 }] });
+  assert.equal(view.activity, "failed", "session lists show the failure, not a session still in progress");
+  for (let attempt = 0; attempt < 100 && reported.at(-1) !== "failed"; attempt++) await delay(20);
+  assert.equal(reported.at(-1), "failed", "its host reports the failure while the session holds its work");
+});
+
+test("archive-backed sessions on a cache host are not re-authorized against the cache and never see it", linux, async t => {
+  const root = await directory(t);
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched") });
+  const session = new RunnerSession(binding("archive-on-cache"), root, config(root, {
+    repositoryCache: cache,
+    authorizeRepository: async () => assert.fail("archive sessions are not re-authorized for the cache"),
+    readRepository: async () => assert.fail("a ready archive session downloads nothing"),
+    resolveModels: async () => { throw MODEL_BOUNDARY; },
+  }));
+  t.mock.method(session.sandbox, "initialize", async () => {});
+  t.mock.method(session.sandbox, "repositoryCacheState", async () => "archive");
+  const enable = t.mock.method(session.sandbox, "enableRepositoryCache", () => {});
+  t.after(() => session.sandbox.close());
+  await assert.rejects(session.open(), error => error === MODEL_BOUNDARY);
+  assert.equal(enable.mock.callCount(), 0);
+});
+
+test("a cache-backed session sees the cache only after this open re-authorized and ensured every pin", linux, async t => {
+  const root = await directory(t);
+  const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched") });
+  const order: string[] = [];
+  const session = new RunnerSession(binding("cache-reopen", [repository(), repository(2)]), root, config(root, {
+    repositoryCache: cache,
+    authorizeRepository: async pin => {
+      order.push(`authorize ${pin.path}`);
+      return { bindingId: pin.bindingId, commit: pin.commit, remote: repositoryRemote(pin) };
+    },
+    resolveModels: async () => { throw MODEL_BOUNDARY; },
+  }));
+  t.mock.method(session.sandbox, "initialize", async () => {});
+  t.mock.method(session.sandbox, "repositoryCacheState", async () => "cache");
+  t.mock.method(cache, "ensure", async (target: { pin: SessionRepository }) => { order.push(`ensure ${target.pin.path}`); return { objects: "", fetched: false }; });
+  const enabled = Promise.withResolvers<void>();
+  t.mock.method(session.sandbox, "enableRepositoryCache", () => { order.push("enable"); enabled.resolve(); });
+  t.after(() => session.sandbox.close());
+  // open() stops at the model sentinel; the preparation it started continues in the background.
+  await assert.rejects(session.open(), error => error === MODEL_BOUNDARY);
+  await enabled.promise;
+  assert.deepEqual(order, ["authorize acme/project-1", "ensure acme/project-1", "authorize acme/project-2", "ensure acme/project-2", "enable"]);
 });

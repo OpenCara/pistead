@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import type { GitProvider, ProviderRepository, ProviderRepositoryList, SessionRepository, TokenGitProvider, WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
-import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
+import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, repositoryRemote, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
 import type { AppContext, Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
 import { getUser, requireMember, sessionAccess } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode } from './http.js';
@@ -330,9 +330,14 @@ async function providerArchive(access: Extract<RepositoryAccess, { account: Load
   if (bytes.length > repositoryLimits.archiveBytes) fail(502, 'repository_size_limit', 'The repository response exceeds the supported size limit.');
   return bytes;
 }
-export async function repositoryDownload(c: AppContext, connector: ConnectorRow | null): Promise<Response> {
+/**
+ * The pinned repository a runner callback names, and a recheck of the session and connector authority behind it.
+ * Callers run `authorize` before and after every slow provider request.
+ */
+async function pinnedCallback(c: AppContext, connector: ConnectorRow | null, invalidCode: string):
+  Promise<{ original: SessionRow; repository: SessionRepository; authorize: () => Promise<void> }> {
   const input = await jsonObject(c, 4096);
-  if (Object.keys(input).some(key => !['sessionId', 'commit'].includes(key))) fail(400, 'invalid_repository_download', 'Only the session and pinned commit are accepted.');
+  if (Object.keys(input).some(key => !['sessionId', 'commit'].includes(key))) fail(400, invalidCode, 'Only the session and pinned commit are accepted.');
   const sessionId = identifier(input.sessionId, 'sessionId'); const bindingId = identifier(c.req.param('bindingId'));
   const original = await c.env.DB.query<SessionRow>('SELECT * FROM sessions WHERE id = ?').bind(sessionId).first();
   if (!original) fail(404, 'not_found', 'Session not found.');
@@ -347,6 +352,11 @@ export async function repositoryDownload(c: AppContext, connector: ConnectorRow 
       await requireConnectorSession(c.env, connector.id, fresh.row, connector.connection_hash!);
     } else if (fresh.row.connector_id) fail(403, 'connector_scope_required', 'Use the connector-scoped repository callback.');
   };
+  return { original, repository, authorize };
+}
+
+export async function repositoryDownload(c: AppContext, connector: ConnectorRow | null): Promise<Response> {
+  const { original, repository, authorize } = await pinnedCallback(c, connector, 'invalid_repository_download');
   await authorize();
   const provider: GitProvider = 'provider' in repository ? repository.provider : 'github';
   const host = 'provider' in repository ? repository.host : 'github.com';
@@ -363,4 +373,52 @@ export async function repositoryDownload(c: AppContext, connector: ConnectorRow 
   await authorize();
   return new Response(bytes, { headers: { 'Content-Type': 'application/gzip', 'Content-Length': String(bytes.length),
     'Cache-Control': 'private, no-store', 'X-Repository-Commit': repository.commit, 'X-Archive-SHA256': checksum } });
+}
+
+/** The commit id GitHub resolves `commit` to for the owner; the sha media type answers with the bare id, never a file list. */
+async function githubCommitSha(access: GitHubAccess, fullName: string, commit: string): Promise<string> {
+  const response = await remoteFetch(`${apiOrigin}/repos/${fullName}/commits/${commit}`,
+    { headers: { ...headers(access), Accept: 'application/vnd.github.sha' } });
+  if (response.status !== 200) {
+    await response.body?.cancel();
+    if (response.status === 404 || response.status === 422) fail(403, 'repository_commit_unavailable', 'The pinned commit is no longer readable in this GitHub repository.');
+    if (response.status === 401 || response.status === 403) fail(403, 'github_repository_unavailable', 'GitHub repository access could not be verified. Check repository access and try again.');
+    fail(502, 'github_unavailable', 'GitHub could not complete the repository request.');
+  }
+  return new TextDecoder().decode(await boundedRepositoryBody(response, 1024)).trim();
+}
+
+/** The session owner's own account must still read the exact pinned commit in the bound repository. */
+async function requirePinnedCommit(access: RepositoryAccess, repository: SessionRepository): Promise<void> {
+  // Every adapter resolves a full commit id as a ref and fails with git_repository_unavailable when it is unreadable.
+  const sha = access.provider === 'github'
+    ? await githubCommitSha(access.github, repository.fullName, repository.commit)
+    : await gitProviderAdapters[access.provider].commit(access.account.credential, { id: String(repository.repositoryId), fullName: repository.fullName }, repository.commit);
+  if (sha !== repository.commit) {
+    fail(403, 'repository_commit_unavailable', `The pinned commit is no longer readable in this ${gitProviderNames[access.provider]} repository.`);
+  }
+}
+
+/**
+ * Lets a host use its repository cache for one pinned repository (docs/design/repository-cache.md). The session and
+ * connector authority must still hold, and the session OWNER's own account must still read the repository and its exact
+ * pinned commit; the host's credential only decides what the host can fetch, never what an owner may read. The answer
+ * carries no credential and no repository content: the host fetches with its own Git credentials, from the
+ * credential-free remote below, which it also derives from the pin itself and requires to match.
+ */
+export async function repositoryAuthorize(c: AppContext, connector: ConnectorRow | null): Promise<Response> {
+  const { original, repository, authorize } = await pinnedCallback(c, connector, 'invalid_repository_authorization');
+  await authorize();
+  const provider: GitProvider = 'provider' in repository ? repository.provider : 'github';
+  const host = 'provider' in repository ? repository.host : 'github.com';
+  const access = await repositoryAccess(c.env, original.owner_id, provider, host, repository.fullName);
+  const expected = { repositoryId: String(repository.repositoryId), fullName: repository.fullName };
+  await verifyRepository(access, expected);
+  await authorize();
+  await requirePinnedCommit(access, repository);
+  await verifyRepository(access, expected);
+  await recheckAccess(c.env, access);
+  await authorize();
+  return c.json({ repository: { bindingId: repository.bindingId, commit: repository.commit, remote: repositoryRemote(repository) } }, 200,
+    { 'Cache-Control': 'private, no-store' });
 }

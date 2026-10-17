@@ -37,6 +37,45 @@ export interface SandboxExecutionOptions {
   unbounded?: boolean;
 }
 
+export interface SandboxOptions {
+  /**
+   * Host paths of the repository cache's object directories, keyed by pin path (`RepositoryCache.objects`). Each is
+   * mounted read-only for every sandboxed process, at `/repository-cache/<n>` in pin order, which the session's
+   * `objects/info/alternates` names once its repositories are checked out of the cache.
+   */
+  repositoryObjects?: Readonly<Record<string, string>>;
+}
+
+/** "absent": pristine storage. Otherwise how the ready baseline was made: from archives, or from the host repository cache. */
+export type RepositoryCacheState = "absent" | "archive" | "cache";
+
+export function repositoryCacheState(value: unknown): RepositoryCacheState {
+  if (value === false) return "absent";
+  if (value === "cache") return "cache";
+  if (value === true || value === "archive") return "archive";
+  throw new Error("Invalid repository cache state");
+}
+
+const CACHE_MOUNT = "/repository-cache";
+
+/**
+ * Cache object directories in pin order. Only the runner configures them; they must still be canonical absolute
+ * paths outside the session's own storage, and usable as alternates entries (no newline or ":").
+ */
+export function repositoryObjectPaths(repositories: readonly SessionRepository[], objects: Readonly<Record<string, string>> | undefined, root: string): string[] {
+  if (objects === undefined) return [];
+  if (!objects || typeof objects !== "object" || Object.keys(objects).sort().join("\n") !== repositories.map(({ path }) => path).sort().join("\n")) {
+    throw new Error("Repository cache paths do not match pins");
+  }
+  const storage = resolve(root);
+  return repositories.map(({ path }) => {
+    const value = objects[path];
+    if (typeof value !== "string" || !isAbsolute(value) || resolve(value) !== value || /[\0\n:]/.test(value) || value === sep
+      || value === storage || value.startsWith(`${storage}/`) || storage.startsWith(`${value}/`)) throw new Error("Invalid repository cache path");
+    return value;
+  });
+}
+
 export interface SnapshotFile {
   /** Relative to the constructor's sandbox root; data is base64, including binary files. */
   path: string;
@@ -79,6 +118,7 @@ type Request =
   | { kind: "initialize" }
   | { kind: "repository-ready" }
   | { kind: "repository-materialize"; archives: string[] }
+  | { kind: "repository-checkout" }
   | { kind: "read" | "read-content" | "list"; path: string }
   | { kind: "write"; path: string; content: string }
   | { kind: "status" | "snapshot" }
@@ -110,12 +150,14 @@ for fd_name in os.listdir('/proc/self/fd'):
             pass
 os.umask(0o077)
 PUSH_KINDS = ('push-prepare', 'push-pack')
+# Checkouts from the host repository cache write whole repositories, like pushes read them.
+LONG_KINDS = PUSH_KINDS + ('repository-checkout',)
 
 
 def limits(kind):
     # These remain defense in depth for fixed helpers/test fixtures, NOT session quotas.
-    # Push rewrites and packs handle whole repositories, so only they get larger bounds.
-    push = kind in PUSH_KINDS
+    # Push rewrites and packs and cache checkouts handle whole repositories, so only they get larger bounds.
+    push = kind in LONG_KINDS
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600) if push else (25, 25))
     size = (16 if push else 1 / 16) * 1024 * 1024 * 1024
@@ -359,7 +401,22 @@ def git_capture(arguments, success=True):
     return result
 
 
-def cache_ready(work, git, repositories):
+def read_alternates(git):
+    try:
+        info = walk(git, ['objects', 'info'])
+    except FileNotFoundError:
+        return ''
+    try:
+        return read_at(info, 'alternates', 65536)[0].decode('utf-8')
+    except FileNotFoundError:
+        return ''
+    finally:
+        os.close(info)
+
+
+def cache_ready(work, git, repositories, alternates=()):
+    # False for pristine storage; otherwise how the ready baseline was made: 'archive' (version 1 marker, or no
+    # repositories) or 'cache' (version 2: checked out from the host repository cache through read-only mounts).
     try:
         raw, _ = read_at(git, CACHE_MARKER, 65536)
     except FileNotFoundError:
@@ -371,9 +428,21 @@ def cache_ready(work, git, repositories):
             raise ValueError('repository cache has an existing Git index')
         return False
     marker = json.loads(raw)
-    if (not isinstance(marker, dict) or type(marker.get('version')) is not int or marker['version'] != 1
-            or json.dumps(marker.get('repositories'), sort_keys=True) != json.dumps(repositories, sort_keys=True)):
+    if not isinstance(marker, dict) or type(marker.get('version')) is not int:
         raise ValueError('repository cache binding does not match immutable pins')
+    if marker['version'] == 1:
+        source = 'archive'
+    elif marker['version'] == 2 and marker.get('source') == 'cache':
+        source = 'cache'
+    else:
+        raise ValueError('repository cache binding does not match immutable pins')
+    if json.dumps(marker.get('repositories'), sort_keys=True) != json.dumps(repositories, sort_keys=True):
+        raise ValueError('repository cache binding does not match immutable pins')
+    if source == 'cache' and not alternates:
+        raise ValueError('this session needs the host repository cache; its connector must run with --repo-cache')
+    expected = ''.join(path + '\n' for path in alternates) if source == 'cache' else ''
+    if read_alternates(git) != expected:
+        raise ValueError('repository cache mounts do not match this session')
     if marker.get('status') != 'ready':
         raise ValueError('repository cache preparation is incomplete; refusing to overwrite')
     baseline = marker.get('baseline')
@@ -382,11 +451,14 @@ def cache_ready(work, git, repositories):
     if git_capture(['cat-file', '-t', baseline]).stdout.strip() != b'commit':
         raise ValueError('repository cache baseline is missing')
     git_capture(['merge-base', '--is-ancestor', baseline, 'HEAD'])
-    return True
+    return source
 
 
-def cache_marker(git, repositories, status, baseline=None):
+def cache_marker(git, repositories, status, baseline=None, source='archive'):
     value = {'version': 1, 'repositories': repositories, 'status': status}
+    if source == 'cache':
+        # Version 2: older runners refuse these sessions instead of using them without the cache mounts.
+        value = {'version': 2, 'source': 'cache', 'repositories': repositories, 'status': status}
     if baseline is not None:
         value['baseline'] = baseline
     write_at(git, [CACHE_MARKER], json.dumps(value, ensure_ascii=True))
@@ -401,8 +473,10 @@ def rename_new(source, destination, name):
         raise OSError(ctypes.get_errno(), 'repository destination cannot be promoted')
 
 
-def sync_cache(root, entry_limit, byte_limit):
+def sync_cache(root, entry_limit, byte_limit, links=False):
     # Only pinned descendants are flushed, never the shared host filesystem.
+    # With links=True, symlinks are allowed (cache checkouts create real ones); the fsync
+    # of their parent directory makes them durable, and they are never followed.
     # Bound both traversal and outstanding descriptors; concurrent fsync calls
     # let storage coalesce flushes without weakening the ready-marker barrier.
     pending = deque()
@@ -445,6 +519,8 @@ def sync_cache(root, entry_limit, byte_limit):
                     if entries > entry_limit or depth >= 64 or length > 1024:
                         raise ValueError('repository durability traversal limit exceeded')
                     before = child.stat(follow_symlinks=False)
+                    if links and stat.S_ISLNK(before.st_mode):
+                        continue
                     is_directory = stat.S_ISDIR(before.st_mode)
                     if not is_directory:
                         regular(before)
@@ -470,8 +546,8 @@ def sync_cache(root, entry_limit, byte_limit):
             pending.popleft().result()
 
 
-def materialize_repositories(work, git, repositories, archives):
-    if cache_ready(work, git, repositories):
+def materialize_repositories(work, git, repositories, archives, alternates=()):
+    if cache_ready(work, git, repositories, alternates):
         return
     if len(archives) != len(repositories):
         raise ValueError('repository archives do not match pins')
@@ -531,6 +607,97 @@ def materialize_repositories(work, git, repositories, archives):
         cache_marker(git, repositories, 'ready', baseline)
     finally:
         os.close(stage)
+
+
+def cache_mounts(alternates, count):
+    if not isinstance(alternates, list) or not count or len(alternates) != count:
+        raise ValueError('repository cache mounts do not match pins')
+    for path in alternates:
+        if (not isinstance(path, str) or not path.startswith('/') or os.path.normpath(path) != path
+                or any(character in path for character in '\0\n:')
+                or os.path.commonpath((WORK, path)) == WORK or os.path.commonpath((HOME, path)) == HOME):
+            raise ValueError('invalid repository cache mount')
+    return alternates
+
+
+def pinned_ref(path):
+    # refs/remotes/<path>/pinned names each pinned commit for the agent, when <path> is also a valid ref name.
+    if all(re.fullmatch('[A-Za-z0-9_-][A-Za-z0-9._-]*', part) and not part.endswith(('.', '.lock')) and '..' not in part
+           for part in path.split('/')):
+        return 'refs/remotes/' + path + '/pinned'
+    return None
+
+
+def compose_tree(node):
+    # Only the directories above the pinned paths are new; each pinned tree is referenced, never rewritten, so no
+    # object of the read-only cache is copied into the session (Git would duplicate any object it "writes" there).
+    lines = []
+    for name in sorted(node):
+        value = node[name]
+        lines.append('040000 tree ' + (compose_tree(value) if isinstance(value, dict) else value) + '\t' + name + '\n')
+    result = subprocess.run(GIT + ['mktree'], input=''.join(lines).encode('utf-8'), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
+    tree = result.stdout.decode('ascii').strip()
+    if result.returncode or not re.fullmatch('[0-9a-f]{40}', tree):
+        raise ValueError('repository baseline tree could not be written')
+    return tree
+
+
+def materialize_from_cache(work, git, repositories, alternates):
+    # Checks pinned trees out of the host repository cache, which the runner validated (repo-cache.ts inspect) and
+    # mounted read-only; the session's object store borrows its objects through objects/info/alternates.
+    if cache_ready(work, git, repositories, alternates):
+        return
+    cache_mounts(alternates, len(repositories))
+    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=':'.join(alternates))
+    root = {}
+    # Nothing is written until every pinned commit is readable through the mounts.
+    for repository in repositories:
+        commit = repository['commit']
+        if not isinstance(commit, str) or not re.fullmatch('[0-9a-f]{40}', commit):
+            raise ValueError('invalid repository pin')
+        kind = subprocess.run(GIT + ['cat-file', '-t', commit], env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
+        tree = subprocess.run(GIT + ['rev-parse', '--verify', '--quiet', commit + '^{tree}'], env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
+        if kind.returncode or kind.stdout.strip() != b'commit' or tree.returncode:
+            raise ValueError('pinned commit is missing from the repository cache')
+        parts, node = repository['path'].split('/'), root
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ValueError('repository paths overlap')
+        if parts[-1] in node:
+            raise ValueError('repository paths overlap')
+        node[parts[-1]] = tree.stdout.decode('ascii').strip()
+    # Thereafter a durable preparing marker makes interruption fail closed, never reset edits.
+    cache_marker(git, repositories, 'preparing', source='cache')
+    write_at(git, ['objects', 'info', 'alternates'], ''.join(path + '\n' for path in alternates))
+    baseline_tree = compose_tree(root)
+    # One tree, no prefix: read-tree primes the cache tree, so later commits rewrite only what changed.
+    git_capture(['read-tree', baseline_tree])
+    # The worktree holds only .git (cache_ready): checkout-index writes into empty directories, real symlinks
+    # included, and records stat data so the new baseline is clean without hashing every file again.
+    git_capture(['checkout-index', '--all', '--index'])
+    for name in sorted(os.listdir(work)):
+        if name == '.git':
+            continue
+        owner = os.open(name, DIR_FLAGS, dir_fd=work)
+        try:
+            sync_cache(owner, REPOSITORY_LIMITS['checkoutEntries'] + 1024, REPOSITORY_LIMITS['checkoutBytes'], links=True)
+        finally:
+            os.close(owner)
+    os.fsync(work)
+    baseline = git_capture(['commit-tree', baseline_tree, '-m', 'Initialize pinned repository snapshots']).stdout.decode('ascii').strip()
+    git_capture(['update-ref', 'HEAD', baseline])
+    for repository in repositories:
+        ref = pinned_ref(repository['path'])
+        if ref:
+            git_capture(['update-ref', ref, repository['commit']])
+    # The index grows with the checkout; objects are only the few new trees and the baseline commit.
+    sync_cache(git, 4096, 256 * REPOSITORY_LIMITS['checkoutEntries'] + 64 * 1024 * 1024)
+    cache_marker(git, repositories, 'ready', baseline, source='cache')
+
 
 def parts_for(value, writing=False):
     if not isinstance(value, str) or not value or len(value) > 1024:
@@ -867,6 +1034,9 @@ def main():
     kind = request['kind']
     limits(kind)
     repositories = request['expectedRepositories']
+    alternates = request.get('repositoryAlternates', [])
+    if not isinstance(alternates, list) or not all(isinstance(path, str) for path in alternates):
+        raise ValueError('invalid repository cache mounts')
     if kind == 'initialize':
         try:
             os.stat(os.path.join(WORK, '.git', 'HEAD'), follow_symlinks=False)
@@ -890,15 +1060,25 @@ def main():
                            0o600, dir_fd=git)
             regular(os.fstat(lock))
             fcntl.flock(lock, fcntl.LOCK_EX)
-            materialize_repositories(work, git, repositories, request['archives'])
+            materialize_repositories(work, git, repositories, request['archives'], alternates)
+            return
+        if kind == 'repository-checkout':
+            lock = os.open(CACHE_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                           0o600, dir_fd=git)
+            regular(os.fstat(lock))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            materialize_from_cache(work, git, repositories, alternates)
             return
         if kind == 'repository-ready' or repositories:
-            ready = cache_ready(work, git, repositories)
+            ready = cache_ready(work, git, repositories, alternates)
             if kind == 'repository-ready':
                 print(json.dumps(ready))
                 return
             if not ready:
                 raise ValueError('repository cache is not prepared')
+            if kind == 'snapshot' and ready == 'cache':
+                # Its objects live in the host cache, not in the session: a backup would not restore.
+                raise ValueError('backups of sessions checked out from the host repository cache are not supported yet')
         if kind == 'push-prepare':
             print(json.dumps(push_prepare(request, git), ensure_ascii=True))
             return
@@ -1169,13 +1349,16 @@ export class Sandbox {
   readonly #sessionKey: string;
   readonly #testProvider: boolean;
   readonly #repositories: readonly SessionRepository[];
+  readonly #cacheObjects: readonly string[];
+  /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
+  #cacheMounted = false;
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
   #closed = false;
   #cancelActive: (() => void) | undefined;
   readonly #pushStreams = new Map<string, () => void>();
 
-  constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig) {
+  constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig, options: SandboxOptions = {}) {
     if (process.platform !== "linux" || !isAbsolute(root) || resolve(root) === sep) {
       throw new Error("Sandbox requires Linux and an absolute, non-root private storage path");
     }
@@ -1195,6 +1378,7 @@ export class Sandbox {
     this.#resources = resources ? validateResourceConfig(resources) : undefined;
     this.#testProvider = binding.model.provider === "faux";
     this.#repositories = repositoryPins(binding.session.repositories ?? []);
+    this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
@@ -1336,8 +1520,35 @@ export class Sandbox {
 
   /** False only for pristine storage; mismatched or interrupted caches fail closed. */
   async repositoryCachesReady(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<boolean> {
+    return (await this.repositoryCacheState(repositories, authorize)) !== "absent";
+  }
+
+  /** How the session's repositories were prepared; a cache-backed session also needs its cache mounts to match. */
+  async repositoryCacheState(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<RepositoryCacheState> {
     this.#assertRepositories(repositories);
-    return JSON.parse(await this.#operation({ kind: "repository-ready" }, true, authorize)) as boolean;
+    return repositoryCacheState(JSON.parse(await this.#operation({ kind: "repository-ready" }, true, authorize)));
+  }
+
+  /**
+   * Checks the pinned trees out of the host repository cache, mounted read-only. The runner must already have made
+   * each pinned commit available (`RepositoryCache.ensure`) and checked its tree (`RepositoryCache.inspect`). Ready
+   * caches never overwrite edits.
+   */
+  async materializeFromCache(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<void> {
+    this.#assertRepositories(repositories);
+    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    if (!this.#cacheMounted) throw new Error("The repository cache is not mounted for this session");
+    await this.#operation({ kind: "repository-checkout" }, false, authorize, true);
+  }
+
+  /**
+   * Mounts the cache's object directories, read-only, into every later process of this sandbox. Only for a session
+   * checked out (or about to be) from the cache, once the control plane has re-checked its owner's access to every
+   * pinned repository: archive-backed sessions on a cache host never see the cache, which other owners' fetches fill.
+   */
+  enableRepositoryCache(): void {
+    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
+    this.#cacheMounted = true;
   }
 
   /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
@@ -1455,6 +1666,10 @@ export class Sandbox {
       mount, "4", this.worktree,
       gitWritable ? "--bind-fd" : "--ro-bind-fd", "5", `${this.worktree}/.git`,
       "--ro-bind-fd", "6", `${this.home}/.gitconfig`,
+      // By path, not descriptor: the resource supervisor passes only fds 3-6 to bwrap. Only the runner writes below
+      // the private cache root, so nothing a session controls can redirect these. A missing directory is skipped;
+      // Git then reports the missing objects instead of reading anything else.
+      ...(this.#cacheMounted ? this.#cacheObjects.flatMap((source, index) => ["--ro-bind-try", source, `${CACHE_MOUNT}/${index}`]) : []),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];
@@ -1499,7 +1714,7 @@ export class Sandbox {
         kill();
       };
       this.#cancelActive = cancel;
-      const deadline = request.kind === "push-prepare" || request.kind === "push-pack" ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
+      const deadline = request.kind === "push-prepare" || request.kind === "push-pack" || request.kind === "repository-checkout" ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
       const timer = setTimeout(() => {
         failure ??= `Sandbox exceeded ${deadline}ms time limit`;
         kill();
@@ -1552,7 +1767,8 @@ export class Sandbox {
           resolveResult(request.kind === "bash" || request.kind === "commit" || request.kind === "status" ? out + err : out);
         }
       });
-      const line = JSON.stringify({ ...request, expectedRepositories: this.#repositories });
+      const line = JSON.stringify({ ...request, expectedRepositories: this.#repositories,
+        repositoryAlternates: this.#cacheObjects.map((_, index) => `${CACHE_MOUNT}/${index}`) });
       const input = transfer.input;
       if (!input) child.stdin!.end(line);
       else {

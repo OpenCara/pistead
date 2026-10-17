@@ -39,6 +39,14 @@ Options:
   --git-credentials        Let approved pushes in your own sessions use this machine's Git
                            credentials (its git credential helpers) where the workspace's
                            push access chooses the host's Git credentials
+  --repo-cache             Check repositories out of a cache on this machine with their full
+                           history, fetched with this machine's Git credentials (its git
+                           credential helpers) instead of downloaded through Pistead. Pistead
+                           still checks that each session's owner can read every repository
+                           with their own account. Preview: backups of such sessions are not
+                           supported yet
+  --repo-cache-scope SCOPE host (default): one cache for every session on this machine;
+                           owner: a separate cache for each session owner
   --help                  Show this help without reading Pi configuration
 
 Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required for the
@@ -166,7 +174,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     "state-dir": { type: "string" }, "pi-agent-dir": { type: "string" }, model: { type: "string", multiple: true },
     resources: { type: "string" }, "allow-insecure-loopback": { type: "boolean" },
     "allow-faux": { type: "boolean" }, "allow-test-shell": { type: "boolean" }, "unsafe-no-sandbox": { type: "boolean" },
-    "git-credentials": { type: "boolean" },
+    "git-credentials": { type: "boolean" }, "repo-cache": { type: "boolean" }, "repo-cache-scope": { type: "string" },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   const unsandboxed = values["unsafe-no-sandbox"] === true;
@@ -178,6 +186,9 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   if (process.platform !== "linux" && process.platform !== "darwin") throw new ConnectorSetupError(`Unsupported platform "${process.platform}": use Linux, WSL2 or macOS.`);
   if (unsandboxed && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
   if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorSetupError("--allow-test-shell requires --allow-faux.");
+  const cacheScope = values["repo-cache-scope"];
+  if (cacheScope !== undefined && !values["repo-cache"]) throw new ConnectorSetupError("--repo-cache-scope requires --repo-cache.");
+  if (cacheScope !== undefined && cacheScope !== "host" && cacheScope !== "owner") throw new ConnectorSetupError("--repo-cache-scope must be host or owner.");
   const pairingId = values["pairing-id"];
   if (pairingId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pairingId)) {
     throw new ConnectorSetupError(/^[A-Za-z0-9_-]{43}$/.test(pairingId)
@@ -235,9 +246,10 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   if (pairingId && !code) throw new ConnectorSetupError("No pairing code was entered. Paste the single-use code shown in Pistead at the hidden prompt.");
   const pairing = pairingId ? { id: pairingId, code } : undefined;
   const gitCredentials = values["git-credentials"] === true;
+  const repositoryCache = values["repo-cache"] ? { scope: cacheScope === "owner" ? "owner" as const : "host" as const } : undefined;
   const connector = createConnector({
     dataDir,
-    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed, gitCredentials,
+    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed, gitCredentials, repositoryCache,
     allowInsecureLoopback: values["allow-insecure-loopback"], allowFaux: values["allow-faux"], allowTestShell: values["allow-test-shell"],
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
@@ -249,6 +261,10 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     ? "Running unsandboxed: approved commands execute directly on this machine.\n"
     : "Sandbox capability is verified per session; production shell stays disabled without provisioned, verified limits.\n");
   if (gitCredentials) process.stderr.write("Git credentials: approved pushes in your own sessions may use this machine's Git credential helpers.\n");
+  if (repositoryCache) {
+    process.stderr.write(`Repository cache (${repositoryCache.scope === "owner" ? "one per session owner" : "shared by every session on this machine"}): `
+      + "repositories are fetched with this machine's Git credential helpers, for every session on it, after Pistead checks the session owner's access.\n");
+  }
   const stopped = Promise.withResolvers<void>();
   const stop = () => { void connector.stop().then(() => stopped.resolve(), () => stopped.reject(new Error("Connector shutdown failed"))); };
   process.once("SIGINT", stop);

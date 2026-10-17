@@ -26,6 +26,12 @@ export interface ConnectorCapabilities {
   gitCredentials?: boolean;
   /** The connector reads GitHub issues and pull requests and merges pull requests through the control plane (github_read, github_merge). Absent on older connectors. */
   github?: boolean;
+  /**
+   * The connector checks pinned repositories out of its host repository cache, fetched with the host's own Git
+   * credentials after the control plane re-authorizes the session owner, instead of downloading archives. Absent on
+   * older connectors and on hosts started with the cache turned off.
+   */
+  repositoryCache?: boolean;
 }
 
 export interface ConnectorInfo {
