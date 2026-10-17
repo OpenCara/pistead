@@ -160,7 +160,7 @@ export class RunnerSession {
     this.sqlitePath = join(directory, "session.sqlite");
     const cache = config.repositoryCache;
     const pins = binding.session.repositories ?? [];
-    // Every session on a cache host gets the read-only cache mounts; archive-backed sessions simply never use them.
+    // Every session on a cache host knows its cache; only a cache-backed one mounts it, once this open re-authorized its pins.
     const options = cache && pins.length
       ? { repositoryObjects: Object.fromEntries(pins.map(pin => [pin.path, cache.objects(pin, binding.owner.id)])) } : {};
     this.sandbox = config.unsandboxed

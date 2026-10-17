@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
 import { RepositoryCache, checkoutBudget } from "../apps/runner/src/repo-cache.js";
 import { Sandbox, repositoryObjectPaths, type SandboxAuthorize } from "../apps/runner/src/sandbox.js";
@@ -305,27 +306,46 @@ test("the sandbox helper refuses mounts inside the session and missing commits b
   await assert.rejects(lstat(join(f.root, "missing", "worktree", ".git", "repository-cache.json")), { code: "ENOENT" });
 });
 
+/** The pinned tree as the control plane serves it from GitHub: `git archive` output under one top directory, gzipped. */
+function archiveOf(work: string, commit: string): Buffer {
+  const result = spawnSync("git", ["archive", "--format=tar", "--prefix=alpha-main/", commit], { cwd: work, env: ENV });
+  if (result.status !== 0) throw new Error(`git archive failed: ${result.stderr.toString()}`);
+  return gzipSync(result.stdout);
+}
+
 test("the Linux sandbox mounts the cache read-only for every process and checks pinned trees out of it", linux, async t => {
   const f = await fixture(t);
-  const sandbox = new Sandbox(binding("sandbox-cache", [f.pin], "faux"), join(f.root, "sandbox"), undefined, { repositoryObjects: { [f.pin.path]: f.objects } });
+  const cacheHost = { repositoryObjects: { [f.pin.path]: f.objects } };
+  const shell = (sandbox: Sandbox, command: string, readOnly = true) => sandbox.execute({ kind: "bash", command }, readOnly, authorize, { allowTestShell: true });
+  // A session prepared from an archive before its host enabled the cache is configured with the cache on reopening,
+  // but never enables it: none of its processes can see the cache at all.
+  const archiveRoot = join(f.root, "archived");
+  const prepared = new Sandbox(binding("sandbox-archive", [f.pin], "faux"), archiveRoot);
+  t.after(() => prepared.close());
+  await prepared.initialize();
+  await prepared.materializeRepositories([f.pin], [archiveOf(f.work, f.pin.commit)], authorize);
+  await prepared.close();
+  const archived = new Sandbox(binding("sandbox-archive", [f.pin], "faux"), archiveRoot, undefined, cacheHost);
+  t.after(() => archived.close());
+  await archived.initialize();
+  assert.equal(await archived.repositoryCacheState([f.pin], authorize), "archive");
+  assert.equal((await shell(archived, "test -e /repository-cache/0 && echo visible || echo hidden")).trim(), "hidden");
+  const sandbox = new Sandbox(binding("sandbox-cache", [f.pin], "faux"), join(f.root, "sandbox"), undefined, cacheHost);
   t.after(() => sandbox.close());
   await sandbox.initialize();
-  const shell = (command: string, readOnly = true) => sandbox.execute({ kind: "bash", command }, readOnly, authorize, { allowTestShell: true });
-  // Configured but not enabled, as for an archive-backed session on a cache host: the cache is not there at all.
-  assert.equal((await shell("test -e /repository-cache/0 && echo visible || echo hidden")).trim(), "hidden");
   await assert.rejects(sandbox.materializeFromCache([f.pin], authorize), /not mounted/);
   sandbox.enableRepositoryCache();
   await sandbox.materializeFromCache([f.pin], authorize);
   assert.equal(await sandbox.repositoryCacheState([f.pin], authorize), "cache");
   assert.equal(await sandbox.gitStatus(authorize), "");
   assert.equal(await sandbox.readFile("acme/alpha/docs/up", authorize), README);
-  assert.equal((await shell("git rev-list --count acme/alpha/pinned")).trim(), "2");
-  assert.equal((await shell("cat .git/objects/info/alternates")).trim(), "/repository-cache/0");
-  await assert.rejects(shell("touch /repository-cache/0/written", false));
+  assert.equal((await shell(sandbox, "git rev-list --count acme/alpha/pinned")).trim(), "2");
+  assert.equal((await shell(sandbox, "cat .git/objects/info/alternates")).trim(), "/repository-cache/0");
+  await assert.rejects(shell(sandbox, "touch /repository-cache/0/written", false));
   await sandbox.writeFile("acme/alpha/README.md", "changed\n", authorize);
   await sandbox.execute({ kind: "git.commit", message: "Owner change" }, false, authorize);
   assert.equal(await sandbox.gitStatus(authorize), "");
-  assert.equal((await shell("git rev-list --count HEAD")).trim(), "2");
+  assert.equal((await shell(sandbox, "git rev-list --count HEAD")).trim(), "2");
   await assert.rejects(sandbox.snapshot(authorize), /not supported yet/);
 });
 
