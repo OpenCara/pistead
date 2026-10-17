@@ -7,6 +7,7 @@ export {
   activeStatuses, liveTiming, startLiveSession, type EventStream, type LiveSession, type LiveSessionDependencies, type LiveSessionHandlers,
   type StreamStatus,
 } from "./live-session";
+export { formatBytes, preparingRepositories, repositoryPhaseLabel, repositoryProgressText, repositoryProgressValue } from "./repository-progress";
 export { sessionStatus, type SessionStatus, type SessionStatusTone } from "./session-status";
 export { openFetchEventStream, SseParser, type FetchEventStreamOptions } from "./sse";
 export { splitToolCalls, type ToolCallLine } from "./transcript";

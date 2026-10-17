@@ -74,6 +74,11 @@ test("a native app signs in through GitHub with PKCE and gets a bearer session t
   assert.ok(Date.parse(signIn.expiresAt) > Date.now() + 29 * 24 * 3600_000);
   const bearer = { Authorization: `Bearer ${signIn.token}` };
   assert.equal((await f.request("GET", "/api/me", { headers: bearer })).status, 200);
+  // The scheme is case-insensitive and may be followed by several spaces.
+  assert.equal((await f.request("GET", "/api/me", { headers: { Authorization: `bearer  ${signIn.token}` } })).status, 200);
+  // An app that has no device name may send null for it.
+  const unnamed = await f.signInThroughGitHub(challenge);
+  assert.equal((await f.request("POST", "/api/auth/native/token", { body: { code: unnamed.searchParams.get("code"), verifier, deviceName: null } })).status, 200);
   // Changes need no CSRF token: a bearer token is never sent by a browser on its own.
   const created = await f.request("POST", "/api/workspaces", { headers: bearer, body: { name: "From the phone" } });
   assert.equal(created.status, 201);
@@ -107,6 +112,16 @@ test("a code expires after two minutes, and a GitHub failure returns the app to 
   for (const query of [`challenge=${challenge}&state=short`, `challenge=not-a-challenge&state=${appState}`, `state=${appState}`]) {
     assert.equal((await f.request("GET", `/api/auth/native/start?${query}`)).status, 400);
   }
+});
+
+test("storage failing after GitHub answers still returns the app to its callback, with no code and no saved GitHub token", async t => {
+  const f = await fixture(t);
+  f.sqlite.exec("DROP TABLE native_auth_codes");
+  const callback = await f.signInThroughGitHub(await sha256(verifier));
+  assert.equal(callback.searchParams.get("error"), "auth_unavailable");
+  assert.equal(callback.searchParams.get("state"), appState);
+  assert.equal(callback.searchParams.get("code"), null);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM github_tokens").get()!.n, 0);
 });
 
 test("signed-in apps are listed for their user and revoked one by one, and signing out ends only that app", async t => {

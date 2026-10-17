@@ -1,6 +1,6 @@
 import type { RepositoryPreparationView } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
-import { repositoryProgressText, repositoryProgressValue } from "./repository-progress";
+import { repositoryProgressText, repositoryProgressValue } from "../../../packages/client/src/repository-progress";
 import { Alert, Button, Feedback, Spinner, useAction } from "./ui";
 
 /**

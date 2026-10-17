@@ -48,8 +48,10 @@ export const authenticate: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   // A native app sends only its bearer token: a browser cookie never stands in for it, nor a bearer for a browser.
   // Other Authorization schemes (e.g. a reverse proxy's Basic auth) leave the browser's cookie in charge.
   const authorization = c.req.header('authorization');
-  const client = authorization?.startsWith('Bearer ') ? 'native' : 'browser';
-  const token = client === 'native' ? authorization!.slice('Bearer '.length) : getCookie(c, cookies(c.env).auth);
+  // The scheme is case-insensitive, and one or more spaces separate it from the token (RFC 9110).
+  const bearer = authorization === undefined ? undefined : /^Bearer +(.*)$/i.exec(authorization)?.[1];
+  const client = bearer === undefined ? 'browser' : 'native';
+  const token = bearer ?? getCookie(c, cookies(c.env).auth);
   if (!token || !OPAQUE_TOKEN.test(token)) fail(401, 'unauthorized', 'Authentication is required.');
   const tokenHash = await sha256(token);
   const session = await dbResult(c.env.DB.query<{ user_id: string; csrf_token: string; expires_at: number; auth_kind: string; client: string }>(`SELECT s.user_id, s.csrf_token, s.expires_at, s.client, u.auth_kind
@@ -287,6 +289,13 @@ function nativeCallback(params: Record<string, string>): string {
   return `${NATIVE_CALLBACK}?${new URLSearchParams(params).toString()}`;
 }
 
+/** The app's authentication browser closes on its callback, so the app shows a failure, not a JSON page. */
+async function nativeFailure(c: AppContext, error: unknown, state: string): Promise<Response> {
+  if (!(error instanceof HTTPException)) throw error;
+  const body = await error.getResponse().json().catch(() => null) as { code?: unknown } | null;
+  return c.redirect(nativeCallback({ error: typeof body?.code === 'string' ? body.code : 'sign_in_failed', state }));
+}
+
 /** Exchanges GitHub's code, then creates or updates the user it names; the token statement stores their GitHub token. */
 async function githubUser(c: AppContext, config: GitHubConfig, code: string, verifier: string): Promise<GitHubSignIn> {
   const exchange = await githubJson('https://github.com/login/oauth/access_token', {
@@ -359,20 +368,22 @@ async function githubCallback(c: AppContext) {
     }
     signedIn = await githubUser(c, config, code, saved.verifier);
   } catch (error) {
-    // The app's authentication browser closes on its callback, so the app shows the failure, not a JSON page.
-    if (!native || !(error instanceof HTTPException)) throw error;
-    const body = await error.getResponse().json().catch(() => null) as { code?: unknown } | null;
-    return c.redirect(nativeCallback({ error: typeof body?.code === 'string' ? body.code : 'sign_in_failed', state: native.state }));
+    if (!native) throw error;
+    return nativeFailure(c, error, native.state);
   }
   const { user, tokenStatement } = signedIn;
   if (native) {
     const code = randomToken();
-    await dbResult(c.env.DB.batch([
-      tokenStatement,
-      c.env.DB.query('DELETE FROM native_auth_codes WHERE expires_at <= ?').bind(Date.now()),
-      c.env.DB.query('INSERT INTO native_auth_codes (code_hash, user_id, challenge, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
-        .bind(await sha256(code), user.id, native.challenge, Date.now() + NATIVE_CODE_TTL, now()),
-    ]));
+    try {
+      await dbResult(c.env.DB.batch([
+        tokenStatement,
+        c.env.DB.query('DELETE FROM native_auth_codes WHERE expires_at <= ?').bind(Date.now()),
+        c.env.DB.query('INSERT INTO native_auth_codes (code_hash, user_id, challenge, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
+          .bind(await sha256(code), user.id, native.challenge, Date.now() + NATIVE_CODE_TTL, now()),
+      ]));
+    } catch (error) {
+      return nativeFailure(c, error, native.state);
+    }
     return c.redirect(nativeCallback({ code, state: native.state }));
   }
   const session = await newSession(c.env, user.id, 'github');
@@ -392,7 +403,7 @@ async function nativeToken(c: AppContext) {
   if (typeof code !== 'string' || !OPAQUE_TOKEN.test(code) || typeof verifier !== 'string' || !VERIFIER.test(verifier)) {
     fail(400, 'invalid_grant', 'The sign-in has expired or was already used. Sign in again.');
   }
-  const deviceName = body.deviceName === undefined ? null : safeText(body.deviceName, 'deviceName', 100);
+  const deviceName = body.deviceName === undefined || body.deviceName === null ? null : safeText(body.deviceName, 'deviceName', 100);
   const saved = await dbResult(c.env.DB.query<{ user_id: string; challenge: string; expires_at: number }>(
     'DELETE FROM native_auth_codes WHERE code_hash = ? RETURNING user_id, challenge, expires_at').bind(await sha256(code)).first());
   if (!saved || !Number.isSafeInteger(saved.expires_at) || saved.expires_at <= Date.now() || !constantTimeEqual(await sha256(verifier), saved.challenge)) {
@@ -411,8 +422,9 @@ async function testLogin(c: AppContext) {
   const { githubLogin: requestedGithubLogin, client, deviceName, ...profileBody } = body;
   // Development of the native apps: a test-mode bearer session instead of the cookie.
   if (client !== undefined && client !== 'browser' && client !== 'native') fail(400, 'invalid_input', 'Invalid test client.');
-  if (client !== 'native' && deviceName !== undefined) fail(400, 'invalid_input', 'Only native test sessions have a device name.');
-  const native = client === 'native' ? { deviceName: deviceName === undefined ? null : safeText(deviceName, 'deviceName', 100) } : undefined;
+  // An app with no name for its device may send null or leave it out.
+  if (client !== 'native' && deviceName !== undefined && deviceName !== null) fail(400, 'invalid_input', 'Only native test sessions have a device name.');
+  const native = client === 'native' ? { deviceName: deviceName === undefined || deviceName === null ? null : safeText(deviceName, 'deviceName', 100) } : undefined;
   const profile = profileInput(profileBody, true);
   if (requestedGithubLogin !== undefined &&
       (typeof requestedGithubLogin !== 'string' ||
