@@ -260,7 +260,9 @@ The first session on a host waits while the runner clones; later sessions only w
   a failure until the session restarts. Each item is `{ path, phase, percent, done, total, bytes }`, with phases
   from `repositoryPreparationPhases` (queued, authorizing, the fetch phases, checking, checking-out, done). The
   server passes it through. Preparation counts as `busy`, and the client also keeps its fast refresh pace while a
-  view says preparing, so progress updates every second even before the first message.
+  view says preparing, so progress updates every second even before the first message. The session's activity
+  (`SessionView.activity` and the host's activity reports for session lists) is `working` while it prepares and
+  `failed` after a failure.
 - **UI (implemented):** a card above pending approvals with one bar per repository: determinate when Git reports a
   percentage, otherwise a moving highlight (none with reduced motion), and a line such as "Receiving objects · 45%
   · 4,500 of 10,000 · 5.1 MiB". The queue line reads "Preparing repositories...". If preparation failed, an error
