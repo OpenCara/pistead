@@ -238,7 +238,7 @@ async function githubStart(c: AppContext) {
   setCookie(c, cookieConfig.state, state, { ...cookieConfig.options, maxAge: STATE_TTL / 1000, expires: new Date(expiresAt) });
   const authorization = new URL('https://github.com/login/oauth/authorize');
   authorization.search = new URLSearchParams({
-    client_id: config.clientId, redirect_uri: config.redirectUri, scope: 'read:user user:email repo',
+    client_id: config.clientId, redirect_uri: config.redirectUri, scope: 'read:user user:email repo workflow',
     state, code_challenge: await sha256(verifier), code_challenge_method: 'S256',
   }).toString();
   return c.redirect(authorization.toString());
