@@ -350,6 +350,35 @@ test('without backup storage a workspace database still takes the backups of its
   assert.equal(f.databases.saved.size, 1);
 });
 
+test('the listing marks backups saved where this server can no longer read them', async t => {
+  const f = await fixture(t);
+  const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
+  f.runner();
+  const first = await f.request('POST', '/api/sessions/session/backup', 'test:member', { trustedDatabaseId: database.id });
+  assert.equal(first.status, 201);
+  const inDatabase = (await first.json() as { backup: { id: string } }).backup.id;
+  const marks = async () => ((await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json()) as
+    { backups: { location: string; unavailable?: boolean }[] }).backups.map(backup => `${backup.location}:${backup.unavailable ?? false}`).sort();
+  assert.deepEqual(await marks(), ['workspace-database:false']);
+  delete f.env.WORKSPACE_DATABASES;
+  assert.deepEqual(await marks(), ['workspace-database:true']);
+  f.env.WORKSPACE_DATABASES = f.databases;
+  assert.equal((await f.request('DELETE', databasePath, 'test:owner')).status, 204);
+  assert.deepEqual(await marks(), ['workspace-database:true']);
+  // Disconnected, new backups go to the server's storage, readable only while it is configured.
+  const second = await f.request('POST', '/api/sessions/session/backup', 'test:member', {});
+  assert.equal(second.status, 201);
+  const inStorage = (await second.json() as { backup: { id: string } }).backup.id;
+  assert.deepEqual(await marks(), ['server:false', 'workspace-database:true']);
+  delete f.env.BUCKET;
+  assert.deepEqual(await marks(), ['server:true', 'workspace-database:true']);
+  for (const [id, expected] of [[inStorage, 'backup_unavailable'], [inDatabase, 'workspace_database_disconnected']] as const) {
+    const download = await f.request('GET', `/api/sessions/session/backups/${id}/download`, 'test:member');
+    assert.equal(download.status, 503);
+    assert.equal(await code(download), expected);
+  }
+});
+
 test('backups of a workspace with its own database are saved and read back there, with the recorded digest', async t => {
   const f = await fixture(t);
   const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
