@@ -119,6 +119,7 @@ function modelFailed(entry: EntryRecord): boolean {
 function activityEntry(entry: EntryRecord | undefined): ActivityEntry | undefined {
   return entry && { id: Number(entry.id), failed: modelFailed(entry) };
 }
+
 export class RunnerSession {
   readonly sandbox: Sandbox | HostWorkspace;
   readonly sqlitePath: string;
@@ -364,17 +365,22 @@ export class RunnerSession {
     done.then(() => {
       if (this.#repositories !== preparing) return;
       this.#repositories = { status: "ready" };
+      // What the session is doing follows its preparation (see activity()).
+      this.#activity?.changed();
       // If open() is still running it resumes the work itself; otherwise resume it now, in turn with other requests.
       void this.exclusive(async () => {
         if (epoch !== this.#preparations || !this.#opened || this.closing || this.#resumed || this.#repositories.status !== "ready") return;
         await this.resumeWork();
       }).catch(() => {
         // As for a failed open: nothing more runs, and restarting the session tries again.
-        if (epoch === this.#preparations) this.#repositories = { status: "failed", reason: "This session could not resume its work after preparing its repositories", items };
+        if (epoch !== this.#preparations) return;
+        this.#repositories = { status: "failed", reason: "This session could not resume its work after preparing its repositories", items };
+        this.#activity?.changed();
       });
     }, (error: unknown) => {
       if (this.#repositories !== preparing) return;
       this.#repositories = { status: "failed", reason: error instanceof RunnerError ? error.message : "Repositories could not be prepared on this host", items };
+      this.#activity?.changed();
     });
   }
 
@@ -510,6 +516,9 @@ export class RunnerSession {
     // Recovered and queued work waits for repositories prepared in the background: their preparation resumes it once
     // they are ready, and a failure leaves it all suspended, harness included, until the session restarts.
     if (this.#repositories.status === "ready") await this.resumeWork();
+    // Reported while its repositories are still being prepared too; reopening is also how a report lost with a previous
+    // connection or process gets through.
+    this.#activity?.start();
   }
 
   /** Recovered runs, then the harness and the queue: at most once per open, and only once the repositories are ready. */
@@ -540,8 +549,6 @@ export class RunnerSession {
     }
     this.harness.resume();
     this.drainQueue();
-    // Reopening is also how a report lost with a previous connection or process gets through.
-    this.#activity?.start();
   }
 
   private openStorage(): Promise<Storage> {
@@ -593,6 +600,9 @@ export class RunnerSession {
 
   /** What the agent is doing now (see SessionActivity). */
   private async activity(): Promise<SessionActivity> {
+    const preparation = this.#repositories.status;
+    // Held work waits for the repositories, and a failed preparation holds it until the session restarts.
+    if (preparation !== "ready") return preparation === "preparing" ? "working" : "failed";
     const state = await this.metadata();
     const runs = Object.values(state.runs);
     const approvals = Object.values(state.approvals);
@@ -1249,8 +1259,9 @@ export class RunnerSession {
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),
       ...(repositories ? { repositories } : {}),
-      activity: sessionActivity(Object.values(state.runs), Object.values(state.approvals),
-        activityEntry(snapshots.find(snapshot => snapshot.branch.mode === "write")?.entries.at(-1))),
+      activity: repositories ? (repositories.status === "preparing" ? "working" : "failed")
+        : sessionActivity(Object.values(state.runs), Object.values(state.approvals),
+          activityEntry(snapshots.find(snapshot => snapshot.branch.mode === "write")?.entries.at(-1))),
     };
   }
 

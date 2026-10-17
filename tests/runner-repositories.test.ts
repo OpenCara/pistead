@@ -14,7 +14,7 @@ import { RepositoryCache } from "../apps/runner/src/repo-cache.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
 import { repositoryPins } from "../apps/runner/src/sandbox.js";
 import type { RestoreDescriptor } from "../packages/shared/src/connector.js";
-import type { RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
+import type { RunnerAction, RunnerBinding, RunnerTicket, SessionActivity } from "../packages/shared/src/types.js";
 import { RunnerError, validateBinding, validateRepositories } from "../apps/runner/src/protocol.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 import { RunnerService } from "../apps/runner/src/server.js";
@@ -697,6 +697,7 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   const pin: GitHubSessionRepository = { ...repository(), commit: upstreamGit(work, ["rev-parse", "HEAD"]) };
   const input = binding("cache-host", [pin]);
   let authorizations = 0;
+  const reported: SessionActivity[] = [];
   const events: string[] = [];
   observeHarness(t, events, () => {});
   const service = new RunnerService(config(root, {
@@ -706,6 +707,7 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
       assert.equal(sessionId, input.session.id);
       return { bindingId: repository.bindingId, commit: repository.commit, remote: repositoryRemote(repository) };
     },
+    reportActivity: async (sessionId, activity) => { assert.equal(sessionId, input.session.id); reported.push(activity); },
     readRepository: async () => assert.fail("cache hosts never download archives"),
   }));
   t.after(async () => { gate.resolve(); await service.close(); });
@@ -718,6 +720,10 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   const preparing = await session.view();
   assert.equal(preparing.busy, true, "preparation keeps the session busy");
   assert.deepEqual(preparing.repositories, { status: "preparing", items: [{ path: pin.path, phase: "connecting", percent: null, done: null, total: null, bytes: 0 }] });
+  assert.equal(preparing.activity, "working", "session lists show a session preparing its repositories in progress");
+  // Its host reports that too, while the preparation still holds the session's work.
+  for (let attempt = 0; attempt < 100 && !reported.length; attempt++) await delay(20);
+  assert.deepEqual(reported, ["working"]);
   const receipt = await session.submit(await ticket(input.session.id, "submit"), { content: "TEST_READ acme/project-1/README.md", requestId: "read-from-cache" }, "write");
   assert.equal(receipt.status, "queued");
   gate.resolve();
@@ -727,6 +733,7 @@ test("cache hosts return from create at once, hold runs until the pins are fetch
   assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("hello from upstream")), "the held run reads the checked-out file");
   assert.equal(await session.sandbox.repositoryCacheState([pin], allow), "cache");
   assert.equal(view.repositories, undefined, "a ready session reports no preparation");
+  assert.equal(view.activity, "done", "once ready, the session's messages say what it is doing");
   assert.equal(events.filter(event => event === "resume").length, 1, "work resumes once, when the repositories are ready");
   assert.equal(authorizations, 1);
   await assert.rejects(session.backup(await ticket(input.session.id, "backup")), /host repository cache are not supported yet/);
@@ -737,10 +744,12 @@ test("a cache host that cannot prepare a repository refuses new messages with th
   const root = await directory(t);
   const cache = new RepositoryCache({ root: join(root, "repo-cache"), authorization: async () => assert.fail("nothing is fetched without authorization") });
   const input = binding("cache-denied");
+  const reported: SessionActivity[] = [];
   const service = new RunnerService(config(root, {
     unsandboxed: true, repositoryCache: cache,
     authorizeRepository: async () => { throw new RunnerError(403, "The pinned commit is no longer readable in this GitHub repository."); },
     readRepository: async () => assert.fail("cache hosts never download archives"),
+    reportActivity: async (_sessionId, activity) => { reported.push(activity); },
   }));
   t.after(() => service.close());
   await service.initialize();
@@ -758,6 +767,9 @@ test("a cache host that cannot prepare a repository refuses new messages with th
   const view = await session.view();
   assert.deepEqual(view.repositories, { status: "failed", error: "The pinned commit is no longer readable in this GitHub repository.",
     items: [{ path: input.session.repositories![0]!.path, phase: "authorizing", percent: null, done: null, total: null, bytes: 0 }] });
+  assert.equal(view.activity, "failed", "session lists show the failure, not a session still in progress");
+  for (let attempt = 0; attempt < 100 && reported.at(-1) !== "failed"; attempt++) await delay(20);
+  assert.equal(reported.at(-1), "failed", "its host reports the failure while the session holds its work");
 });
 
 test("archive-backed sessions on a cache host are not re-authorized against the cache and never see it", linux, async t => {
