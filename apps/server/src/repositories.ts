@@ -183,11 +183,12 @@ async function repositoryCommit(access: RepositoryAccess, binding: WorkspaceRepo
   if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) fail(502, 'invalid_repository_commit', `${gitProviderNames[access.provider]} did not return an immutable commit.`);
   return sha;
 }
-export async function resolveWorkspaceRepositories(env: Env, workspaceId: string, ownerId: string, options: { gitProviders: boolean }): Promise<RepositoryResolution> {
+export async function resolveWorkspaceRepositories(env: Env, workspaceId: string, ownerId: string, options: { gitProviders: boolean; repin?: { pins: SessionRepository[]; repository: string; ref: string } }): Promise<RepositoryResolution> {
   await requireMember(env, workspaceId, ownerId);
   const configured = await workspaceRepositories(env, workspaceId);
   const bindingIds = JSON.stringify(configured.map(item => item.id));
   if (!configured.length) {
+    if (options.repin) fail(409, 'repository_configuration_changed', 'The source repositories are no longer configured.');
     if (await legacyRepositoryFixture(env, ownerId)) return { repositories: [], bindingIds, githubAuthority: null, credentials: [] };
     fail(409, 'workspace_repositories_required', 'Configure at least one repository before starting a session.');
   }
@@ -197,21 +198,33 @@ export async function resolveWorkspaceRepositories(env: Env, workspaceId: string
     fail(409, 'connector_update_required', `Update the host's connector (npx pistead@latest connect) to use ${gitProviderNames[foreign.provider]} repositories.`);
   }
   if (conflictingPaths(configured.map(repositoryPath))) fail(409, 'repository_path_conflict', 'Two workspace repositories would share a worktree directory. Remove one binding.');
+  const repin = options.repin;
+  if (repin && (!repin.pins.length || !repin.pins.some(pin => pin.path === repin.repository)
+    || repin.pins.some(pin => !validPin(pin) || !configured.some(binding => binding.id === pin.bindingId
+      && binding.repositoryId === String(pin.repositoryId) && binding.fullName === pin.fullName
+      && binding.provider === ('provider' in pin ? pin.provider : 'github')
+      && binding.host === ('provider' in pin ? pin.host : 'github.com'))))) {
+    fail(409, 'repository_configuration_changed', 'A source repository is no longer configured with the same identity.');
+  }
   // Every binding resolves with the SESSION OWNER's own account for its provider; sharing never lends credentials.
   const accounts = new Map<string, RepositoryAccess>();
   const repositories: SessionRepository[] = [];
   for (const binding of configured) {
+    const previous = repin?.pins.find(pin => pin.bindingId === binding.id);
+    if (repin && !previous) continue; // Newly configured repositories are not silently added to a repin.
+    const selected = !!repin && previous?.path === repin.repository;
+    const ref = selected ? repositoryRef(repin!.ref) : previous?.ref ?? binding.ref;
     const key = JSON.stringify([binding.provider, binding.host, credentialOrganization(binding.provider, binding.fullName)]);
     const access = accounts.get(key) ?? await repositoryAccess(env, ownerId, binding.provider, binding.host, binding.fullName);
     accounts.set(key, access);
     await verifyRepository(access, binding);
-    const commit = await repositoryCommit(access, binding);
+    const commit = previous && !selected ? previous.commit : await repositoryCommit(access, { ...binding, ref });
     await verifyRepository(access, binding);
     // GitHub pins keep their original key order and numeric id so persisted bindings stay byte-identical.
     repositories.push(binding.provider === 'github'
-      ? { bindingId: binding.id, repositoryId: Number(binding.repositoryId), fullName: binding.fullName, ref: binding.ref, commit, path: binding.fullName }
+      ? { bindingId: binding.id, repositoryId: Number(binding.repositoryId), fullName: binding.fullName, ref, commit, path: binding.fullName }
       : { bindingId: binding.id, provider: binding.provider, host: binding.host, repositoryId: binding.repositoryId, fullName: binding.fullName,
-        ref: binding.ref, commit, path: repositoryPath(binding) });
+        ref, commit, path: repositoryPath(binding) });
   }
   for (const access of accounts.values()) await recheckAccess(env, access);
   await requireMember(env, workspaceId, ownerId);

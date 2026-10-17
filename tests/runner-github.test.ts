@@ -137,3 +137,88 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   }
   assert.equal(merges.length, 3);
 });
+
+test("host_bash auto-approves only on the session owner's own host; shared hosts require their owner's exact decision", hostMode, async t => {
+  for (const hostOwner of ["test:alice", "test:bob"]) await t.test(hostOwner, async t => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-command-")));
+    const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("host_bash", { command: "printf host-command-marker", timeout_seconds: 10 })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Requested."),
+    ]);
+    const models = createModels(); models.setProvider(faux.provider);
+    const target = binding(`host-command-${hostOwner.split(":")[1]}`);
+    target.agent.tools = ["host_bash"];
+    target.session.connectorId = target.model.connectorId = "host-connector";
+    target.session.connectorOwnerId = target.model.connectorOwnerId = hostOwner;
+    const service = new RunnerService({
+      dataDir: directory, sharedSecret: "host-command-test-secret-not-for-deployment", controlPlaneUrl: "http://127.0.0.1:8787",
+      connectorId: "host-connector", allowFaux: true, unsandboxed: true,
+      authorize: async input => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }), readRepository: async () => archive(),
+      resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    });
+    await service.initialize();
+    t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
+    const claims = async (action: RunnerAction, actorId = "test:alice") => ({ ...await ticket(target.session.id, action), actorId, connectorId: "host-connector" });
+    const session = await service.provision(target, await claims("create"));
+    await session.submit(await claims("submit"), { content: "Run on host", requestId: "host", admissionId: await sha256("host-command-admission"), options: { access: "auto" } }, "write");
+    await idle(session);
+    const approval = (await session.view()).approvals[0]!;
+    if (hostOwner === "test:alice") {
+      assert.equal(approval.status, "executed");
+      assert.equal(approval.automatic, true);
+      assert.match(approval.result!, /host-command-marker/);
+    } else {
+      assert.equal(approval.status, "pending");
+      assert.equal(approval.automatic, undefined);
+      await assert.rejects(session.decide(await claims("approve"), approval.id, { decision: "approve", operation: approval.operation }), /host owner/);
+      await assert.rejects(session.decide(await claims("approve", hostOwner), approval.id, {
+        decision: "approve", operation: { kind: "host.bash", command: "printf changed", timeoutSeconds: 10 },
+      }), /mismatch/);
+      await session.decide(await claims("approve", hostOwner), approval.id, { decision: "approve", operation: approval.operation });
+      await idle(session);
+      const settled = (await session.view()).approvals[0]!;
+      assert.equal(settled.status, "executed");
+      assert.equal(settled.decidedBy, hostOwner);
+      assert.match(settled.result!, /host-command-marker/);
+      await assert.rejects(session.decide(await claims("approve", hostOwner), approval.id, { decision: "approve", operation: approval.operation }), /already been decided/);
+    }
+  });
+});
+
+test("git_repin from chat delegates to the broker without changing the source binding or files", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-repin-command-")));
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("git_repin", { repository: pin.path, ref: "feature/next" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Repin requested."),
+  ]);
+  const models = createModels(); models.setProvider(faux.provider);
+  const target = binding("repin-chat"); target.agent.tools = ["git_repin"];
+  const calls: unknown[] = [];
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: "repin-chat-test-secret-not-for-deployment", controlPlaneUrl: "http://127.0.0.1:8787",
+    allowFaux: true, unsandboxed: true,
+    authorize: async input => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }), readRepository: async () => archive(),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    repin: async request => { calls.push(request); return { sessionId: "successor", path: "/#/s/successor", repositories: [{ ...pin, ref: "feature/next", commit: head }] }; },
+  });
+  await service.initialize();
+  t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
+  const session = await service.provision(target, await ticket(target.session.id, "create"));
+  await session.sandbox.writeFile(`${pin.path}/README.md`, "keep local work", async () => {});
+  await session.submit(await ticket(target.session.id, "submit"), { content: "Repin", requestId: "repin" }, "write");
+  await idle(session);
+  const approval = (await session.view()).approvals[0]!;
+  assert.equal(approval.status, "pending");
+  assert.equal(calls.length, 0);
+  await assert.rejects(session.decide({ ...await ticket(target.session.id, "approve"), actorId: "test:bob" }, approval.id,
+    { decision: "approve", operation: approval.operation, brokerCapability: "capability" }), /session owner/);
+  await assert.rejects(session.decide(await ticket(target.session.id, "approve"), approval.id, { decision: "approve", operation: approval.operation }), /broker capability/);
+  await session.decide(await ticket(target.session.id, "approve"), approval.id, { decision: "approve", operation: approval.operation, brokerCapability: "capability" });
+  await idle(session);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(session.binding.session.repositories, [pin]);
+  assert.equal(await session.sandbox.readFile(`${pin.path}/README.md`, async () => {}), "keep local work");
+  assert.match((await session.view()).approvals[0]!.result!, /successor/);
+});

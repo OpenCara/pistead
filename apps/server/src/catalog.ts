@@ -175,8 +175,10 @@ async function versionBatch(env: Env, statements: Query<AgentRow>[], versionInde
   }
 }
 
-/** Whether a host's connector carries a tool: pushes and GitHub reads and merges need connectors that report them. */
+/** New broker and host tools require an explicit connector capability. */
 function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
+  if (tool === 'host_bash') return capabilities.hostCommands === true;
+  if (tool === 'git_repin') return capabilities.gitRepin === true;
   if (tool === 'git_push') return capabilities.gitPush === true;
   if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
   return true;

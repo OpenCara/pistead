@@ -7,10 +7,14 @@ import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryPinIdentity } from "./protocol.js";
-import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
+import type { HostCommandOperation, Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import type { PushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
+import { runHostShell } from "./host-shell.js";
+import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
+
+export { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 
 export const TIMEOUT_MS = 30_000;
 /** Push rewrites and packs move whole repositories; only push kinds get this deadline. */
@@ -18,7 +22,6 @@ const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
 const PUSH_ID = /^[0-9a-f]{32}$/;
 const OID = /^[0-9a-f]{40}$/;
 export const MAX_FILE_BYTES = 1024 * 1024;
-export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
 /** A whole image file as base64 in one JSON object, with room for its key. */
 const MAX_CONTENT_OUTPUT_BYTES = Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 64;
@@ -52,19 +55,6 @@ export interface SandboxIdentity {
   home: string;
   worktree: string;
   env: Readonly<Record<string, string>>;
-}
-
-export class SandboxProcessError extends Error {
-  constructor(
-    message: string,
-    public readonly exitCode: number | null,
-    public readonly signal: NodeJS.Signals | null,
-    public readonly stdout: string,
-    public readonly stderr: string,
-  ) {
-    super(message);
-    this.name = "SandboxProcessError";
-  }
 }
 
 interface Mounts {
@@ -1356,6 +1346,29 @@ export class Sandbox {
       kind: "repository-materialize",
       archives: this.#repositories.map((repository) => encoded.get(repository.path)!),
     }, false, authorize, true);
+  }
+
+  /** Explicit host-owner-approved execution, serialized with sandbox file/Git operations; never a fallback. */
+  async executeHost(operation: HostCommandOperation, authorize: SandboxAuthorize, signal: AbortSignal): Promise<string> {
+    if (typeof authorize !== "function") throw new Error("Host command authorization is required");
+    await this.initialize();
+    return this.#exclusive(async () => {
+      if (this.#closed) throw new Error("Sandbox is closed");
+      await authorize();
+      if (this.#closed) throw new Error("Sandbox is closed");
+      if (!JSON.parse(await this.#run({ kind: "repository-ready" }, true, false))) throw new Error("Repository cache is not prepared");
+      await authorize();
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      this.#cancelActive = cancel;
+      try {
+        return await runHostShell(operation, {
+          worktree: resolve(this.#root, "worktree"), git: resolve(this.#root, "git"), gitConfig: resolve(this.#root, "owner.gitconfig"),
+          gitName: this.#identity.gitName, gitEmail: this.#identity.gitEmail,
+          signal: AbortSignal.any([signal, controller.signal]),
+        });
+      } finally { if (this.#cancelActive === cancel) this.#cancelActive = undefined; }
+    });
   }
 
   async head(authorize: SandboxAuthorize): Promise<string> {

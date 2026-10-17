@@ -15,7 +15,7 @@ import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
-import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
+import { assertId, ConnectorSetupError, RunnerError, validateRepositories, verifyRunnerTicket } from "./protocol.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { recoverResourceOrphans } from "./resources.js";
 import { RunnerService, createRunnerApp } from "./server.js";
@@ -175,8 +175,8 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, pushes, and
   // reads and merges on GitHub through the control plane.
   const credentials = mode.gitCredentials ? { gitCredentials: true } : {};
-  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
+  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true, hostCommands: true, gitRepin: true, ...credentials };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true, hostCommands: true, gitRepin: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {
@@ -447,6 +447,12 @@ export class LocalConnector {
           return z.object({
             sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/merge", payload));
+        },
+        repin: async request => {
+          const value = z.object({ sessionId: z.string().regex(IDENTIFIER), path: z.string(), repositories: z.array(z.unknown()) }).strict()
+            .parse(await this.brokerCallback(generation, "/api/connectors/self/git/repin", request));
+          if (value.path !== `/#/s/${value.sessionId}`) throw new Error("Invalid repin session link");
+          return { ...value, repositories: validateRepositories(value.repositories) };
         },
         // Minting can take several upstream calls, so push callbacks get the full RPC budget.
         pushCredential: async request => {

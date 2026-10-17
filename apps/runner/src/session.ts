@@ -1,3 +1,4 @@
+import type { HostCommandOperation, GitRepinOperation, RepinRequest, RepinResult } from "../../../packages/shared/src/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -67,6 +68,7 @@ export type RunnerConfig = {
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
   pushComplete?: (request: PushCompleteRequest) => Promise<PushCompletionResult>;
+  repin?: (request: RepinRequest) => Promise<RepinResult>;
   /** Reads this host's own Git credential for a push remote as an Authorization header; set only when its owner opted in (connect --git-credentials). */
   hostGitCredential?: (remote: string, signal?: AbortSignal) => Promise<string>;
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
@@ -798,6 +800,23 @@ export class RunnerSession {
         await this.permit(api, call, "github_merge", `${repository}#${args.pull}`, { write: true });
         return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "github.merge", repository, pull: args.pull, sha: args.sha, method: args.method }, String(api.taskId), { permitted: true }));
       } }),
+      defineTool({ name: "host_bash", executionMode: "sequential",
+        description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact host-owner approval; auto-approve skips it only in that host owner's own session. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
+        parameters: Type.Object({ command: Type.String(), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600 })) }),
+        execute: async (args, api, call) => {
+          const attribution = await this.toolActor(api, true);
+          await this.permit(api, call, "host_bash", args.command, { write: true });
+          return approvalText(await this.createApproval(attribution.initiatedBy,
+            { kind: "host.bash", command: args.command, timeoutSeconds: args.timeout_seconds ?? 300 }, String(api.taskId), { permitted: true }));
+        } }),
+      defineTool({ name: "git_repin", executionMode: "sequential",
+        description: "Repin a repository (its worktree path) to a branch, tag or commit by creating a NEW private session on this host. Other repository pins stay unchanged. Original files, commits and conversation are preserved, not copied. Returns the link to continue; it does not switch this conversation. Requires session-owner approval, skipped for the owner's auto-approve message.",
+        parameters: Type.Object({ repository: Type.String(), ref: Type.String() }),
+        execute: async (args, api, call) => {
+          const attribution = await this.toolActor(api, true);
+          await this.permit(api, call, "git_repin", `${args.repository} -> ${args.ref}`, { write: true });
+          return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.repin", ...args }, String(api.taskId), { permitted: true }));
+        } }),
       defineTool({ name: "git_push", description: "Push the committed session changes of one pinned repository (its worktree path) to a branch on its Git provider, fast-forward only, optionally opening a pull request as the owner. Commit first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
         repository: Type.String(), branch: Type.String(),
         pull_request: Type.Optional(Type.Object({ title: Type.String(), body: Type.String(), base: Type.Optional(Type.String()) })),
@@ -813,6 +832,42 @@ export class RunnerSession {
     ];
   }
 
+  /** Both operations are tracked through shutdown, and never replayed after an ambiguous failure. */
+  private startHostOperation(id: string, operation: HostCommandOperation | GitRepinOperation,
+    auth: { actorId: string; capability?: string; admissionId?: string }, recheck: SandboxAuthorize): Promise<void> {
+    const entry = { controller: new AbortController(), done: Promise.resolve() };
+    const generation = this.generation;
+    entry.done = (async () => {
+      let status: "executed" | "failed" | "interrupted" = "executed";
+      let result: string;
+      try {
+        await recheck();
+        entry.controller.signal.throwIfAborted();
+        if (operation.kind === "host.bash") {
+          if (auth.actorId !== this.binding.session.connectorOwnerId) throw new RunnerError(403, "Only the host owner can execute host commands");
+          result = await this.sandbox.executeHost(operation, recheck, entry.controller.signal);
+        } else {
+          if (auth.actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can repin");
+          const request: RepinRequest = { sessionId: this.binding.session.id, approvalId: id, operation, ...auth };
+          const created = this.config.repin ? await this.config.repin(request)
+            : await this.internalGitHub("repin", request) as RepinResult;
+          result = JSON.stringify({ ...created, message: "Open the new private session and send a message to start it. Original files, commits and conversation are unchanged; they are not copied to the new session." });
+        }
+      } catch (error) {
+        const refused = error instanceof RunnerError && error.status < 500;
+        status = error instanceof SandboxProcessError || refused ? "failed" : "interrupted";
+        result = error instanceof SandboxProcessError ? `${error.message}${error.stdout ? `\n${error.stdout}` : ""}`
+          : refused ? (error as RunnerError).message : "Effect interrupted or outcome unknown. Inspect the session list or host before requesting another operation.";
+      }
+      if (generation === this.generation) await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: boundedResult(result) }); });
+    })().catch(() => { /* Durable executing records become interrupted on reopen. */ }).finally(() => {
+      this.pushes.delete(entry);
+      if (generation === this.generation && !this.closing) this.drainQueue();
+    });
+    this.pushes.add(entry);
+    return entry.done;
+  }
+
   /** The canonical owner/name of the session's pinned github.com repository `name`, in any case. */
   private githubRepository(name: string): string {
     const pinned = (this.binding.session.repositories ?? []).filter(pin => !("provider" in pin)).map(pin => pin.fullName);
@@ -823,8 +878,8 @@ export class RunnerSession {
   }
 
   /** The control plane's GitHub broker for runners without a connector, with the shared secret; refusals keep their status and reason. */
-  private async internalGitHub(action: "comment" | "read" | "merge", request: object): Promise<unknown> {
-    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/github/${action}`, {
+  private async internalGitHub(action: "comment" | "read" | "merge" | "repin", request: object): Promise<unknown> {
+    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/${action === "repin" ? "git/repin" : `github/${action}`}`, {
       method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
       body: JSON.stringify(request), signal: AbortSignal.timeout(30_000), redirect: "error",
     });
@@ -844,7 +899,13 @@ export class RunnerSession {
     const operation = validateOperation(input);
     if (operation.kind === "permission") throw new RunnerError(400, "Permission requests come only from tool calls");
     this.requireShellCapability(operation, consent.unbounded);
-    const toolName = ({ "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "github.merge": "github_merge", "git.push": "git_push" } as const)[operation.kind];
+    if (operation.kind === "host.bash" && (!this.config.connectorId || !this.binding.session.connectorOwnerId)) {
+      throw new RunnerError(403, "Host commands require a connected host with a known owner");
+    }
+    if (operation.kind === "git.repin" && !this.binding.session.repositories?.some(pin => pin.path === operation.repository)) {
+      throw new RunnerError(403, "Repin must name a repository pinned in this session");
+    }
+    const toolName = ({ "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "github.merge": "github_merge", "git.push": "git_push", "git.repin": "git_repin", "host.bash": "host_bash" } as const)[operation.kind];
     if (!consent.permitted && !this.binding.agent.tools.includes(toolName) && !(await this.metadata()).grants?.tools.includes(toolName)) {
       throw new RunnerError(403, "Operation not enabled by pinned agent version");
     }
@@ -862,7 +923,8 @@ export class RunnerSession {
       // GitHub comments and merges need a Worker-minted broker capability, so they always wait for a human decision;
       // automatic pushes mint their credential from the run's owner admission instead.
       automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
-        && operation.kind !== "github.merge" && (operation.kind !== "git.push" || admissionId !== undefined);
+        && operation.kind !== "github.merge" && (!["git.push", "git.repin"].includes(operation.kind) || admissionId !== undefined)
+        && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -881,6 +943,10 @@ export class RunnerSession {
     const operation = approval.operation;
     let status: ApprovalRecord["status"];
     let result: string;
+    if (operation.kind === "host.bash" || operation.kind === "git.repin") {
+      await this.startHostOperation(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); });
+      return (await this.metadata()).approvals[id]!;
+    }
     if (operation.kind === "git.push") {
       // Tracked like approved pushes so close() aborts it and awaits its settlement before the harness closes.
       const entry = { controller: new AbortController(), done: Promise.resolve() };
@@ -921,6 +987,12 @@ export class RunnerSession {
       if (!approval) throw new RunnerError(404, "Approval not found");
       if (stableJson(validateOperation(input.operation)) !== stableJson(approval.operation)) throw new RunnerError(409, "Approval operation mismatch");
       if (approval.status !== "pending") throw new RunnerError(409, "Approval has already been decided; unsafe effects are never retried");
+      if (approval.operation.kind === "host.bash" && ticket.actorId !== this.binding.session.connectorOwnerId) {
+        throw new RunnerError(403, "Only the host owner can decide a host command");
+      }
+      if (approval.operation.kind === "git.repin" && ticket.actorId !== this.binding.owner.id) {
+        throw new RunnerError(403, "Only the session owner can decide a repin");
+      }
       // A tool call is waiting on this request inside a running turn, so it is decided at once rather than after the queue.
       if (approval.operation.kind === "permission") {
         const request = approval.operation;
@@ -959,8 +1031,16 @@ export class RunnerSession {
       this.requireShellCapability(approval.operation, approval.unbounded === true);
       await this.authorize(approval.requestedBy, "write");
       if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status))) throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
-      if (["github.comment", "github.merge", "git.push"].includes(approval.operation.kind) && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
+      if (["github.comment", "github.merge", "git.push", "git.repin"].includes(approval.operation.kind) && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
       await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executing", decidedBy: ticket.actorId }); });
+      if (approval.operation.kind === "host.bash" || approval.operation.kind === "git.repin") {
+        // Long host builds and provider resolution must not hold the connector's 30-second RPC queue.
+        void this.startHostOperation(id, approval.operation, { actorId: ticket.actorId, capability: input.brokerCapability }, async () => {
+          await this.authorize(approval.requestedBy, "write");
+          await this.authorize(ticket.actorId, "approve");
+        });
+        return (await this.metadata()).approvals[id]!;
+      }
       if (approval.operation.kind === "git.push") {
         // Pushes can outlast the connector RPC deadline: report executing now and settle in the background.
         const operation = approval.operation;
