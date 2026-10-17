@@ -26,7 +26,7 @@ Options:
   --pairing-id ID          One-use pairing id from the web app
   --force                  With --pairing-id, replace this machine's saved pairing; the
                            old host stays in Pistead, offline, until you remove it there
-  --state-dir PATH         Private connector state (default ~/.local/share/opencara/connector)
+  --state-dir PATH         Private connector state (default ~/.local/share/pistead/connector)
   --pi-agent-dir PATH      Pi config/auth directory (default: Pi's own getAgentDir())
   --model PROVIDER/MODEL   Advertise this configured local model (repeatable); without it,
                            the models matched by enabledModels in Pi's settings.json are
@@ -231,7 +231,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     ? "None of the models enabled in Pi's settings.json (enabledModels) are authenticated on this machine."
     : "No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
   const resources = values.resources ? await resourceConfig(values.resources) : undefined;
-  const dataDir = values["state-dir"] ?? join(homedir(), ".local", "share", "opencara", "connector");
+  const dataDir = values["state-dir"] ?? join(homedir(), ".local", "share", "pistead", "connector");
   // Checked before any prompt, so no pairing code is typed for nothing; the connector checks again under its lease.
   // --force never reads the saved pairing: it may be revoked, unreadable or bound to another server.
   const paired = !values.force && await readConnectorState(dataDir, undefined, values["allow-insecure-loopback"]) !== undefined;
