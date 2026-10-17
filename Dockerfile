@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Builds the web client and the bundled server, then runs them as a non-root user with /data for
-# the SQLite database and filesystem backups (override with DATABASE_URL / STORAGE_URL).
+# the SQLite database (override with DATABASE_URL). Session backups are off unless STORAGE_URL names
+# a store, such as file:///data/backups in the same volume.
 
 ARG NODE_IMAGE=node:24-bookworm-slim
 FROM ${NODE_IMAGE} AS base
@@ -29,7 +30,7 @@ RUN mkdir -p /data && chown node:node /data
 USER node
 VOLUME /data
 EXPOSE 8787
-ENV HOST=0.0.0.0 PORT=8787 DATABASE_URL=sqlite:///data/pistead.sqlite STORAGE_URL=file:///data/backups
+ENV HOST=0.0.0.0 PORT=8787 DATABASE_URL=sqlite:///data/pistead.sqlite
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/api/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
 CMD ["node", "dist/server/main.js"]
