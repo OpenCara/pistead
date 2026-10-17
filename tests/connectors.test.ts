@@ -1698,7 +1698,7 @@ test('a session started from a model gets its own chat agent with every tool its
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, toolNames.filter(tool => !['git_push', 'github_read', 'github_merge'].includes(tool)));
+  assert.deepEqual(agent.tools, toolNames.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'git_repin'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // Chat agents stay out of their author's catalog and cannot be revised or published.
@@ -1710,10 +1710,10 @@ test('a session started from a model gets its own chat agent with every tool its
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, toolNames.filter(tool => tool !== 'github_read' && tool !== 'github_merge'));
+  assert.deepEqual(startedAgent().tools, toolNames.filter(tool => !['github_read', 'github_merge', 'host_bash', 'git_repin'].includes(tool)));
 
   // A host that also carries GitHub reads and merges gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true, gitRepin: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
   assert.deepEqual(startedAgent().tools, [...toolNames]);

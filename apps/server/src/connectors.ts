@@ -1,3 +1,5 @@
+import { repinSession } from './repin.js';
+import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { sessionActivities, thinkingLevels, type SessionActivity, type ThinkingLevel } from '../../../packages/shared/src/types.js';
@@ -225,7 +227,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     requireOrigin(c);
     const input = await jsonObject(c, 128 * 1024);
     onlyFields(input, ['code', 'models', 'capabilities']);
-    const manifest = parseManifest(input, c.env);
+    const manifest = withHostToolCapabilities(input, base => parseManifest(base, c.env));
     const pairingId = identifier(c.req.param('id'));
     const code = text(input.code, 'code', 128);
     const controlPlaneUrl = appOrigin(c.env);
@@ -284,7 +286,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     const row = await authenticateConnector(c);
     const input = await jsonObject(c, 128 * 1024);
     onlyFields(input, ['models', 'capabilities']);
-    const manifest = parseManifest(input, c.env);
+    const manifest = withHostToolCapabilities(input, base => parseManifest(base, c.env));
     const updated = await c.env.DB.query<ConnectorRow>(`UPDATE connectors SET models_json = ?, capabilities_json = ? WHERE id = ?
       AND revoked_at IS NULL AND connection_hash = ? RETURNING *`)
       .bind(JSON.stringify(manifest.models), JSON.stringify(manifest.capabilities), row.id, row.connection_hash).first();
@@ -297,6 +299,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/github/comment', async c => githubComment(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/read', async c => githubRead(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/merge', async c => githubMerge(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/git/repin', async c => repinSession(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/push/credential', async c => pushCredential(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/push/complete', async c => pushComplete(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));

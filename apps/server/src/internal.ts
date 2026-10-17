@@ -1,3 +1,4 @@
+import { repinSession } from './repin.js';
 import type { Hono, MiddlewareHandler } from 'hono';
 import type { AuthorizationResult, Permission } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
@@ -28,6 +29,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/github/comment', c => githubComment(c, null));
   app.post('/api/internal/github/read', c => githubRead(c, null));
   app.post('/api/internal/github/merge', c => githubMerge(c, null));
+  app.post('/api/internal/git/repin', c => repinSession(c, null));
   app.post('/api/internal/git/push/credential', c => pushCredential(c, null));
   app.post('/api/internal/git/push/complete', c => pushComplete(c, null));
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);

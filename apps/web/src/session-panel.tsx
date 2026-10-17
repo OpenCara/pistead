@@ -199,6 +199,8 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
       <ApprovalStatus approval={approval} />
     </div>
     {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
+      {operation.kind === "host.bash" && <Alert variant="error" title="Runs outside the sandbox">This command runs as the host's OS user with access to their files, credentials and network, without CPU, memory or disk quotas. It runs in this session's files, which the agent can change, so builds, package scripts and Git hooks or settings there can run the agent's code on the host too. Only the host owner can approve it. The time limit is {operation.timeoutSeconds} seconds.</Alert>}
+      {operation.kind === "git.repin" && <Alert title="Creates a new private session">Resolves <code>{operation.repository}</code> at <code>{operation.ref}</code>. Other repository pins stay unchanged. This session's files, commits and conversation stay here; they are not copied. Only the session owner can approve.</Alert>}
       {operation.kind === "git.push" && <GitPushSummary operation={operation} />}
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
       <pre>{JSON.stringify(operation, null, 2)}</pre>
@@ -206,8 +208,17 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
     </>}
     <p className="muted small">Requested by <Username id={approval.requestedBy} /> · <Timestamp value={approval.createdAt} />{approval.automatic ? <> · Ran under the owner's auto-approve access, without a per-command decision</> : decision}</p>
     {approval.result && <pre>{approval.result}</pre>}
+    {operation.kind === "git.repin" && approval.status === "executed" && <RepinLink result={approval.result} />}
     {children}
   </article>;
+}
+
+function RepinLink({ result }: { result?: string }) {
+  try {
+    const value = JSON.parse(result ?? "null");
+    if (typeof value?.sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value.sessionId)) return null;
+    return <LinkButton variant="outline" size="sm" href={href({ name: "session", sessionId: value.sessionId })}>Open repinned session</LinkButton>;
+  } catch { return null; }
 }
 
 const permissionNeedText: Record<PermissionNeed, string> = {
@@ -216,7 +227,7 @@ const permissionNeedText: Record<PermissionNeed, string> = {
   "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk.",
 };
 /** Tools whose effect gets its own approval card after the permission, unless the message auto-approves. */
-const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge"];
+const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge", "host_bash", "git_repin"];
 
 function PermissionSummary({ request, pending }: { request: PermissionRequest; pending: boolean }) {
   return <>

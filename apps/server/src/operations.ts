@@ -1,3 +1,4 @@
+import { validHostOperation } from '../../../packages/shared/src/host-operations.js';
 import type { GitHubMergeMethod, Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
 import { githubMergeMethods, permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
 import { validPushBranch } from '../../../packages/shared/src/repositories.js';
@@ -37,6 +38,13 @@ export function parseOperation(input: unknown): Operation {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail(400, 'invalid_operation', 'Expected an operation.');
   const value = input as Record<string, unknown>;
   switch (value.kind) {
+    case 'host.bash':
+    case 'git.repin':
+      // The same exact keys and bounds as the runner's validation, so approvals compare equal on both sides.
+      if (!validHostOperation(input)) fail(400, 'invalid_operation', 'Invalid host command or repin request.');
+      return input.kind === 'host.bash'
+        ? { kind: input.kind, command: input.command, timeoutSeconds: input.timeoutSeconds }
+        : { kind: input.kind, repository: input.repository, ref: input.ref };
     case 'git.commit': return { kind: value.kind, message: text(value.message, 'commit message', 4000) };
     case 'bash': return { kind: value.kind, command: text(value.command, 'command', 8192) };
     case 'github.comment':

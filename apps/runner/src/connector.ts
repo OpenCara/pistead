@@ -15,7 +15,8 @@ import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
-import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
+import { assertId, ConnectorSetupError, RunnerError, validateRepositories, verifyRunnerTicket } from "./protocol.js";
+import { withHostToolCapabilities } from "./host-capabilities.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { recoverResourceOrphans } from "./resources.js";
 import { RepositoryCache, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCacheScope } from "./repo-cache.js";
@@ -192,7 +193,7 @@ export async function claimConnectorPairing(options: {
   const response = await (options.fetch ?? fetch)(`${origin}/api/connectors/pairings/${id}/claim`, {
     method: "POST", redirect: "error", credentials: "omit",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: capabilities(options.capabilities, options) }),
+    body: JSON.stringify({ code, models: await connectorManifest(options.localModels, options.allowFaux), capabilities: withHostToolCapabilities(capabilities(options.capabilities, options)) }),
     signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]),
   });
   if (!response.ok) { await response.body?.cancel(); throw new ConnectorSetupError("Pairing rejected or unavailable: the code may be wrong, expired (codes last 10 minutes) or already used. Create a new pairing code and try again."); }
@@ -460,6 +461,12 @@ export class LocalConnector {
             sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/merge", payload));
         },
+        repin: async request => {
+          const value = z.object({ sessionId: z.string().regex(IDENTIFIER), path: z.string(), repositories: z.array(z.unknown()) }).strict()
+            .parse(await this.brokerCallback(generation, "/api/connectors/self/git/repin", request));
+          if (value.path !== `/#/s/${value.sessionId}`) throw new Error("Invalid repin session link");
+          return { ...value, repositories: validateRepositories(value.repositories) };
+        },
         // Minting can take several upstream calls, so push callbacks get the full RPC budget.
         pushCredential: async request => {
           const payload = {
@@ -497,7 +504,7 @@ export class LocalConnector {
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
-      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: capabilities(this.options.capabilities, this.options) });
+      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: withHostToolCapabilities(capabilities(this.options.capabilities, this.options)) });
       this.requireGeneration(generation);
       generation.runtimeReady.resolve();
       this.options.onStatus?.("connected");

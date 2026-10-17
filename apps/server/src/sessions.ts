@@ -188,6 +188,12 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (agent && session.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') && capabilities.gitPush !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use git_push.');
     }
+    if (agent && session.connector_id) {
+      const tools = JSON.parse(agent.tools_json) as string[];
+      if ((tools.includes('host_bash') && !capabilities.hostCommands) || (tools.includes('git_repin') && !capabilities.gitRepin)) {
+        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use host_bash and git_repin.');
+      }
+    }
     const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
     // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind.
     agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities);
@@ -382,6 +388,10 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (!approval) fail(404, 'not_found', 'Approval request not found.');
     if (approval.status !== 'pending') fail(409, 'approval_already_decided', 'This approval request is no longer pending.');
     const operation = review.operation;
+    if (operation.kind === 'host.bash' && (!row.connector_id || c.get('auth').userId !== row.connector_owner_id)) {
+      fail(403, 'host_owner_required', 'Only the host owner can decide host commands. Grant the host owner approve access to this session first.');
+    }
+    if (operation.kind === 'git.repin' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can decide a repin.');
     // A permission request lets a tool call do more than the session allows, so only its owner decides it.
     if (operation.kind === 'permission') {
       if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can allow more than the session allows.');
@@ -397,7 +407,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       await reviewedApproval(c, row, approvalId, input.reviewHash);
       const fresh = await requireSession(c, row.id, 'approve');
       if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-      if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'git.push') {
+      if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'git.push' || operation.kind === 'git.repin') {
         const existing = await c.env.DB.query('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');
         brokerCapability = randomToken();

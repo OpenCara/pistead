@@ -3,7 +3,7 @@ import type { GitProvider, SessionRepository } from "./repositories.js";
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash"] as const;
 export type ToolName = (typeof toolNames)[number];
 export interface UserProfile {
   id: string;
@@ -153,12 +153,39 @@ export interface GitHubMergeOperation {
   sha: string;
   method: GitHubMergeMethod;
 }
+/** Runs outside isolation as the connector user; only the host owner may approve. */
+export interface HostCommandOperation {
+  kind: "host.bash";
+  command: string;
+  timeoutSeconds: number;
+}
+/** Creates a private successor session; never replaces the source worktree or its history. */
+export interface GitRepinOperation {
+  kind: "git.repin";
+  repository: string;
+  ref: string;
+}
+export interface RepinRequest {
+  sessionId: string;
+  approvalId: string;
+  actorId: string;
+  operation: GitRepinOperation;
+  capability?: string;
+  admissionId?: string;
+}
+export interface RepinResult {
+  sessionId: string;
+  path: string;
+  repositories: SessionRepository[];
+}
 export type Operation =
   | { kind: "git.commit"; message: string }
   | { kind: "bash"; command: string }
   | { kind: "github.comment"; repository: string; issue: number; body: string }
   | GitHubMergeOperation
   | GitPushOperation
+  | GitRepinOperation
+  | HostCommandOperation
   | PermissionRequest;
 /** Runner -> control plane: read an issue or pull request of a pinned github.com repository as the session owner. */
 export interface GitHubReadRequest {

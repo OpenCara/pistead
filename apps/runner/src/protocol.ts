@@ -1,3 +1,4 @@
+import { validHostOperation } from "../../../packages/shared/src/host-operations.js";
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
@@ -101,6 +102,7 @@ export function validateBinding(value: unknown, id: string, allowNativeModels = 
   return JSON.parse(JSON.stringify(b));
 }
 export function validateOperation(value: unknown): Operation {
+  if (validHostOperation(value)) return value;
   if (!value || typeof value !== "object") throw new RunnerError(400, "Invalid operation");
   const op = value as Operation;
   const text = (v: unknown, max: number) => typeof v === "string" && v.trim().length > 0 && v.length <= max && !v.includes("\0");

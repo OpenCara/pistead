@@ -219,7 +219,9 @@ function SessionPane({ id }: { id: string }) {
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
             // Only the session owner can let a call do more than the session allows.
-            const decides = permission ? isOwner && canApprove : canApprove;
+            const hostCommand = approval.operation.kind === "host.bash";
+            const ownerOnly = permission || approval.operation.kind === "git.repin";
+            const decides = canApprove && (hostCommand ? session.connectorOwnerId === user.id : !ownerOnly || isOwner);
             const disabled = approvalAction.busy || !approval.reviewHash;
             return <ApprovalCard approval={approval} key={approval.id}>
               {decides ? <>
@@ -231,9 +233,9 @@ function SessionPane({ id }: { id: string }) {
                 </div> : <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve")}>Approve</Button>
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
-                  <span className="muted small">Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""} · each approval covers one exact operation and its arguments</span>
+                  <span className="muted small">Runs as {hostCommand ? "the host OS user (outside the sandbox)" : view.owner.displayName} · each approval covers one exact operation and its arguments</span>
                 </div>}
-              </> : <p className="muted small">{permission ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
+              </> : <p className="muted small">{hostCommand ? "Waiting for the host owner, who needs approve access to this session" : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
           })}
           <Feedback {...approvalAction} />

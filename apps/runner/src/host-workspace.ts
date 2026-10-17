@@ -1,3 +1,5 @@
+import { runHostShell } from "./host-shell.js";
+import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats, type Stats } from "node:fs";
@@ -271,6 +273,25 @@ export class HostWorkspace {
     }
     const byPath = new Map(repositories.map((repository, index) => [repository.path, Buffer.from(archives[index]!)]));
     await this.#operation(authorize, () => this.#materialize(this.#repositories.map((repository) => byPath.get(repository.path)!)));
+  }
+
+  /** Explicit host-owner-approved execution, serialized with sandbox file/Git operations; never a fallback. */
+  async executeHost(operation: HostCommandOperation, authorize: SandboxAuthorize, signal: AbortSignal): Promise<string> {
+    if (typeof authorize !== "function") throw new Error("Host command authorization is required");
+    return this.#operation(authorize, async () => {
+      await this.#requireCache();
+      await authorize();
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      this.#cancelActive = cancel;
+      try {
+        return await runHostShell(operation, {
+          worktree: this.worktree, git: join(this.worktree, ".git"), gitConfig: join(this.#root, "owner.gitconfig"),
+          gitName: this.#identity.gitName, gitEmail: this.#identity.gitEmail,
+          signal: AbortSignal.any([signal, controller.signal]),
+        });
+      } finally { if (this.#cancelActive === cancel) this.#cancelActive = undefined; }
+    });
   }
 
   head(authorize: SandboxAuthorize): Promise<string> {
