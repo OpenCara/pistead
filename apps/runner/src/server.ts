@@ -194,7 +194,7 @@ export function createRunnerApp(service: RunnerService): Hono {
     const approval = /^approvals\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(route);
     // view/<revision>: what changed since a view this caller already holds.
     const since = /^view\/([0-9a-f]{32})$/.exec(route)?.[1];
-    const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore" };
+    const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore", stop: "stop" };
     const action = approval ? "approve" : since ? "view" : actions[route];
     if (!action) throw new RunnerError(404, "Unknown runner endpoint");
     if (c.req.method !== (action === "view" || action === "events" ? "GET" : "POST")) throw new RunnerError(405, "Method not allowed");
@@ -243,6 +243,7 @@ export function createRunnerApp(service: RunnerService): Hono {
     const input = body ? JSON.parse(body) : {};
     if (action === "submit" || action === "ask") return c.json(await session.submit(ticket, input as SubmitInput, action === "ask" ? "ask" : "write"));
     if (action === "operations") return c.json({ approval: await session.createApproval(ticket.actorId, input.operation as Operation) }, 201);
+    if (action === "stop") return c.json(await session.stop(ticket));
     if (action === "approve") {
       if (input.approvalId !== approval![1]) throw new RunnerError(403, "Approval ticket path mismatch");
       return c.json({ approval: await session.decide(ticket, approval![1]!, input) });

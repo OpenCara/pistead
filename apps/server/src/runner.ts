@@ -1,14 +1,14 @@
 import type { Permission, RunnerAction, RunnerTicket } from '../../../packages/shared/src/types.js';
 import { sha256, signToken } from '../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
-import { sessionAccess } from './db.js';
+import { requireNoMigration, sessionAccess } from './db.js';
 import type { AppContext, SessionRow } from './types.js';
 import { fail, id, testMode } from './http.js';
 import { connectorRequest, type ConnectionPin } from './connector-transport.js';
 
 const actionPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
-  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write',
+  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write', stop: 'write',
 };
 
 export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown, pin?: ConnectionPin): Promise<Response> {
@@ -23,7 +23,7 @@ export function ownerViewRequest(c: AppContext, row: SessionRow): Promise<Respon
   return actorRequest(c, row.owner_id, row, 'view');
 }
 
-/** What every runner request checks first: the actor may still do `action` on the session, and no restore is under way. */
+/** What every runner request checks first: the actor may still do `action` on the session, and no restore or move is under way. */
 export async function requireRunnerAccess(c: AppContext, actorId: string, row: SessionRow, action: RunnerAction): Promise<SessionRow> {
   const access = await sessionAccess(c.env, row.id, actorId);
   if (!access || !hasPermission(access.permissions, actionPermissions[action]) || access.row.owner_id !== row.owner_id) {
@@ -34,6 +34,8 @@ export async function requireRunnerAccess(c: AppContext, actorId: string, row: S
   if (action !== 'restore' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
+  // The move itself restores into the successor; every other request waits for the move to finish or be cancelled.
+  if (action !== 'view' && action !== 'events') await requireNoMigration(c.env, row.id, action === 'restore');
   return access.row;
 }
 
@@ -52,7 +54,7 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
     create: '/v1/sessions', view: `/v1/sessions/${row.id}/view${suffix ? `/${encodeURIComponent(suffix)}` : ''}`, events: `/v1/sessions/${row.id}/events`,
     submit: `/v1/sessions/${row.id}/submit`, ask: `/v1/sessions/${row.id}/ask`, operations: `/v1/sessions/${row.id}/operations`,
     approve: `/v1/sessions/${row.id}/approvals/${encodeURIComponent(suffix)}`, backup: `/v1/sessions/${row.id}/backup`, restart: `/v1/sessions/${row.id}/restart`,
-    restore: `/v1/sessions/${row.id}/restore`,
+    restore: `/v1/sessions/${row.id}/restore`, stop: `/v1/sessions/${row.id}/stop`,
   };
   const serialized = body === undefined ? '' : JSON.stringify(body);
   const issuedAt = Math.floor(Date.now() / 1000);

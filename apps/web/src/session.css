@@ -35,6 +35,8 @@
   .entry-assistant > .entry-actor { margin-top: var(--space-1); }
   .entry-assistant > .entry-tool { margin-top: var(--space-2); }
   .entry-error > .entry-actor { margin-top: var(--space-1); }
+  .entry-stopped { display: flex; align-items: center; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--font-xs); }
+  .entry-stopped::before, .entry-stopped::after { content: ""; flex: 1 1 0; border-top: 1px solid var(--border); }
 
   /* Assistant markdown: each block is spaced from the one before it, so the first and last sit flush. */
   .markdown { overflow-wrap: break-word; }
@@ -136,7 +138,9 @@
   .composer-toolbar .menu-anchor > .btn { max-width: 100%; }
   /* The hint takes what is left of the row; below ~160px it wraps to its own line rather than truncating. */
   .composer-hint { flex: 1 1 160px; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
-  .composer-send.btn { width: var(--control-sm); margin-left: auto; padding: 0; border-radius: var(--radius-full); }
+  /* Stop and send stay together at the end of the row. */
+  .composer-actions { display: flex; flex: 0 0 auto; gap: var(--space-1); margin-left: auto; }
+  .composer-send.btn, .composer-stop.btn { width: var(--control-sm); padding: 0; border-radius: var(--radius-full); }
 
   /* Right panel: pinned column on wide screens, overlay below. */
   .session-panel {

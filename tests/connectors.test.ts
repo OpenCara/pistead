@@ -298,6 +298,36 @@ function githubFetch(t: TestContext) {
   });
 }
 
+for (const revoked of [false, true]) {
+  test(`permanent host removal preserves history and fences access (revoked=${revoked})`, async t => {
+    const f = await fixture(t);
+    const s = await privateHostSession(f);
+    const path = `/api/connectors/${s.connector.connectorId}/permanent`;
+    await denied(await s.member.request('DELETE', path), 404, 'not_found');
+    await denied(await f.request('DELETE', path, undefined, { Cookie: s.owner.cookie }), 403, 'invalid_csrf');
+    await json(await s.owner.request('PUT', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`));
+    if (revoked) assert.equal((await s.owner.request('DELETE', `/api/connectors/${s.connector.connectorId}`)).status, 204);
+    delete f.env.CONNECTOR_HUB;
+    assert.equal((await s.owner.request('DELETE', path)).status, 204);
+    assert.deepEqual(await json(await s.owner.request('GET', '/api/connectors')), { connectors: [] });
+    assert.deepEqual(await json(await s.member.request('GET', `/api/workspaces/${s.team.id}/connectors`)), { connectors: [] });
+    const row = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(s.connector.connectorId)!;
+    assert.ok(row.removed_at);
+    assert.ok(row.revoked_at);
+    assert.equal(row.connection_hash, null);
+    assert.notEqual(row.credential_hash, await sha256(s.connector.token));
+    assert.equal(f.sqlite.prepare('SELECT connector_id FROM sessions WHERE id = ?').get(s.session.id)!.connector_id, s.connector.connectorId);
+    assert.equal(f.sqlite.prepare('SELECT available FROM models WHERE id = ?').get(s.model.id)!.available, 0);
+    for (const table of ['connector_shares', 'connector_workspaces']) {
+      assert.equal(f.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE connector_id = ?`).get(s.connector.connectorId)!.n, 0);
+    }
+    assert.deepEqual(f.sqlite.prepare('PRAGMA foreign_key_check').all(), []);
+    await denied(await self(f, s.connector, 'manifest', manifest), 401, 'connector_authentication_required');
+    await denied(await s.owner.request('DELETE', path), 404, 'not_found');
+    await denied(await s.owner.request('PUT', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`), 404, 'not_found');
+  });
+}
+
 test('pairings require a CSRF-protected cookie, retain its owner, are single-use, and hash secrets at rest', async t => {
   const f = await fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Pi' }), 401, 'unauthorized');
@@ -1767,6 +1797,7 @@ test('workspace read does not grant mutations, connector credentials, personal e
     ['POST', '/operations', { kind: 'github.comment', repository: 'owner/repo', issue: 1, body: 'No' }],
     ['POST', '/approvals/approval', { decision: 'approve', reviewHash: 'a'.repeat(64) }],
     ['POST', '/restart', {}],
+    ['POST', '/stop', {}],
     ['POST', '/backup', {}],
     ['GET', '/backups', undefined],
     ['GET', '/backups/private-backup/download', undefined],
@@ -1921,6 +1952,25 @@ test('hosts report what the agent of each session they serve is doing; lists sho
   assert.equal('activity' in binding.session, false);
   assert.equal((await listed()).activity, 'failed', 'restarting leaves the activity to the host to report');
   assert.deepEqual(s.hub.unexpected, []);
+});
+
+test('writers stop a session\'s work through its host, audited; archived sessions refuse', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  let stopped: unknown = 2;
+  const requests = rpcHub(f, s.connector, () => Response.json({ stopped }));
+  assert.deepEqual(await json(await s.owner.request('POST', `${path}/stop`, {})), { stopped: 2 });
+  assert.equal(requests.length, 1);
+  const { request } = requests[0]!;
+  assert.deepEqual([request.method, request.path, request.body, request.ticket.action, request.ticket.actorId],
+    ['POST', `/v1/sessions/${s.session.id}/stop`, '{}', 'stop', s.owner.user.id]);
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.stopped'").all(s.session.id);
+  assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ stopped: 2 }) }]);
+  stopped = 'all';
+  await denied(await s.owner.request('POST', `${path}/stop`, {}), 502, 'invalid_runner_response');
+  await json(await s.owner.request('POST', `${path}/archive`));
+  await denied(await s.owner.request('POST', `${path}/stop`, {}), 409, 'session_archived');
+  assert.equal(requests.length, 2);
 });
 
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {

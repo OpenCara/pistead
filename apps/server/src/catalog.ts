@@ -204,6 +204,28 @@ export async function chatAgentVersion(env: Env, ownerId: string, model: ModelRo
   ], 1);
 }
 
+/**
+ * The agent of a session moved to another host: the source agent's name, description and instructions on a model of the
+ * new host, with the tools that host can carry. Like a chat agent it belongs to that one session and stays out of the
+ * author's catalog, so moving never revises or publishes anyone's agent.
+ */
+export async function migratedAgentVersion(env: Env, ownerId: string, source: AgentRow, model: ModelRow, capabilities: ConnectorCapabilities): Promise<AgentRow> {
+  const agentId = id();
+  const createdAt = now();
+  const wanted = JSON.parse(source.tools_json) as unknown[];
+  const tools = toolNames.filter(tool => wanted.includes(tool) && carries(capabilities, tool));
+  const input: AgentInput = { name: source.name, description: source.description, instructions: source.instructions,
+    toolsJson: JSON.stringify(tools), modelId: model.id };
+  return versionBatch(env, [
+    env.DB.query<never>(`INSERT INTO agents (id, author_id, created_at, chat)
+      SELECT ?, ?, ?, 1 FROM models m
+      INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
+      WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
+      .bind(agentId, ownerId, createdAt, ownerId, model.id, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0),
+    privateVersionStatement(env, ownerId, agentId, id(), input, createdAt),
+  ], 1);
+}
+
 export function registerCatalog(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces', async c => {
     const result = await c.env.DB.query<Workspace>(`SELECT w.id, w.name, w.owner_id AS ownerId, member.role

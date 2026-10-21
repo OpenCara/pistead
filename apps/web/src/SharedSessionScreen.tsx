@@ -110,6 +110,7 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 function SharedEntry({ entry }: { entry: EntryView }) {
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
+  if (entry.kind === "workspace.run-stopped") return <div className="entry-stopped" role="note"><span>Stopped</span></div>;
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.

@@ -24,6 +24,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
   - [GitHub issues and pull requests](#github-issues-and-pull-requests)
   - [Host commands and repinning](#host-commands-and-repinning)
   - [Backups, restores and exports](#backups-restores-and-exports)
+  - [Moving a session to another host](#moving-a-session-to-another-host)
   - [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)
 - [Running the server](#running-the-server)
 - [Development](#development)
@@ -153,6 +154,8 @@ Keep it running, for example in `tmux` or under your service manager: it reconne
 
 To pair a machine again (after revoking its host, or to move it to another workspace or server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
 
+An offline host's page in **Settings → Hosts** has **Reconnect**, which shows the command to restart its saved connection on that machine (Pistead can't start it remotely), or **Pair again** once it's revoked. **Remove permanently** (owner only) takes a host off the list for good: it revokes its credentials, stops sharing it, and marks its models unavailable. Its sessions and their history stay, but can't run again, and nothing on the machine is deleted; pair it as a new host to use it again.
+
 > **Upgrading to connector 0.8.0:** it keeps its state in `~/.local/share/pistead/connector` instead of `~/.local/share/opencara/connector`, without moving anything. To keep a pairing made by an older connector, run `npx pistead@latest connect --state-dir ~/.local/share/opencara/connector`, or pair the machine again.
 
 #### Models
@@ -277,6 +280,10 @@ The composer switches between **Shared** and **Side ask**:
 - A **side ask** (**Send side ask**, needs ask permission) asks about the work without changing it: the agent gets only the read-only tools, in a separate thread that starts from the shared conversation (**Side ask 1**, **Side ask 2**, …). Anyone who can view the session can see side asks, but share links don't show them.
 
 Shared messages and side asks share one queue: up to 64 waiting or running, with up to 1 MiB of queued text. Accepted work goes on after you leave the page, as long as the host is online.
+
+#### Stopping the agent
+
+While the agent works, anyone with write permission can press **Stop** (the square beside send) to stop the message running now and every message queued behind it, side asks included (connector newer than 0.8.0). They show as stopped in the queue at once, and the transcript marks where the work stopped and who stopped it. A tool call waiting on a card ends and its card is marked interrupted; a command or push already running finishes, and its card shows the outcome. The queue line reads **Stopping...** until the host has ended the work; messages sent meanwhile wait and then run as usual. A queued message that was stopped never reaches the agent: send it again to run it. A session whose last shared message was stopped shows as **Idle**.
 
 #### Chat options
 
@@ -416,6 +423,15 @@ Exports are JSON records without secrets; a session's conversation is in its bac
 
 - Session owners export a session (details, people, approvals, pushes, backup list and activity) under **Details → Export**.
 - Workspace owners and admins export a workspace (settings, members, models, published agents, repositories, push access, its session database connection and activity, with their own sessions in full and the records of the other sessions they can view) under **Settings → Workspaces → Data export**. Other members' private sessions are left out; their owners can export them.
+
+### Moving a session to another host
+
+While both hosts are connected, a session's owner can move it to a model on another host in its workspace (session panel → **Move to another host**, or `POST /api/sessions/:id/migrate` with `requestId` and `modelId`). The source host's live snapshot, the same one a backup takes, goes straight to the new host, so no `STORAGE_URL` is needed:
+
+- The new host restores it into a new session with the same conversation, files, repository pins, visibility and title (or a new title), running that host's model. Its agent keeps the original's name and instructions, with the tools the new host can carry. Session grants, and approvals given for the rest of the session, aren't copied.
+- Once the new host confirms, the original session is archived: its history stays readable and its owner can unarchive it.
+- The session must be idle. Until the move finishes, both sessions only accept reads, so nothing sent after the snapshot is lost. The control plane holds the snapshot until then; retrying with the same `requestId` needs only the new host, and `POST /api/sessions/:id/migrations/:migrationId/cancel` gives up on the move, archiving the unfinished copy.
+- Moving to a host someone else owns needs `trustedConnectorId`, as starting a session there does. The new host must run a current connector on Linux (`hostMigration` capability).
 
 ### iPhone, iPad and Mac apps
 

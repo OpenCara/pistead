@@ -4,7 +4,7 @@ export type IconName =
   | "plus" | "settings" | "more" | "chevron-right" | "chevron-down" | "chevron-left" | "x" | "check" | "copy"
   | "folder" | "message" | "terminal" | "tool" | "send" | "panel-right" | "menu" | "info" | "alert" | "shield"
   | "server" | "bot" | "users" | "user" | "palette" | "sun" | "moon" | "monitor" | "logout" | "archive"
-  | "git-branch" | "github" | "lock" | "globe" | "refresh" | "search" | "eye" | "trash" | "external" | "history" | "pencil" | "link";
+  | "git-branch" | "github" | "lock" | "globe" | "refresh" | "search" | "eye" | "trash" | "external" | "history" | "pencil" | "link" | "stop";
 
 const paths: Record<Exclude<IconName, "github">, ReactNode> = {
   plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
@@ -22,6 +22,7 @@ const paths: Record<Exclude<IconName, "github">, ReactNode> = {
   terminal: <><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></>,
   tool: <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9Z" />,
   send: <><path d="M12 19V5" /><path d="m5 12 7-7 7 7" /></>,
+  stop: <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />,
   "panel-right": <><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M15 3v18" /></>,
   menu: <><path d="M4 6h16" /><path d="M4 12h16" /><path d="M4 18h16" /></>,
   info: <><circle cx="12" cy="12" r="10" /><path d="M12 16v-4" /><path d="M12 8h.01" /></>,
