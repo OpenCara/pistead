@@ -35,6 +35,8 @@ export interface AuthIdentity {
   userId: string;
   tokenHash: string;
   csrfToken: string;
+  /** "browser": the session cookie, so changes need the CSRF token. "native": an app's bearer token, never ambient. */
+  client: 'browser' | 'native';
 }
 export type WorkerEnv = { Bindings: Env; Variables: { auth: AuthIdentity } };
 export type AppContext = Context<WorkerEnv>;

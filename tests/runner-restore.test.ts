@@ -417,7 +417,9 @@ test("completed metadata still binds every run and approval to the source owner 
     content: "historical input", contentHash: await sha256("historical input"), status: "settled", startEntry: 0, sequence: 0 };
   const prepare = t.mock.fn(async () => {});
   for (const change of [{ key: "different" }, { ownerId: "test:bob" }, { initiatedBy: "" }, { mode: "admin" },
-    { conversationId: 99 }, { contentHash: "wrong" }, { sequence: -1 }, { startEntry: -1 }]) {
+    { conversationId: 99 }, { contentHash: "wrong" }, { sequence: -1 }, { startEntry: -1 },
+    // A stop still ending its work, or one that names nobody.
+    { status: "interrupted", stopped: { by: "test:alice", pending: true } }, { status: "interrupted", stopped: { by: "" } }]) {
     const value = archive();
     value.manifest.runs[key] = { ...run, ...change };
     const saved = envelope(value);

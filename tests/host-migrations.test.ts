@@ -65,7 +65,7 @@ async function fixture(t: TestContext, options: { targetCapabilities?: Record<st
   const snapshot = JSON.stringify({ format: 'pi-runner-backup-v1', binding, manifest: { version: 1 }, sqlite: 'c25hcHNob3Q=', files: [], createdAt: '2026-01-01' });
   const app = new Hono<WorkerEnv>();
   app.use('/api/sessions/*', async (c, next) => {
-    c.set('auth', { userId: c.req.header('x-test-user') ?? 'test:owner', tokenHash: 'test', csrfToken: 'test' });
+    c.set('auth', { userId: c.req.header('x-test-user') ?? 'test:owner', tokenHash: 'test', csrfToken: 'test', client: 'browser' });
     await next();
   });
   registerHostMigrations(app);

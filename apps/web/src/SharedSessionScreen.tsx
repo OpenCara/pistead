@@ -4,7 +4,7 @@ import type { EntryView } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage } from "./api";
 import { Icon, Logo, type IconName } from "./icons";
 import { Markdown } from "./markdown";
-import { splitToolCalls } from "./transcript";
+import { splitToolCalls } from "../../../packages/client/src/transcript";
 import { Alert, EmptyState, formatDuration, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
 import "./session.css";
 import "./shared-session.css";
@@ -110,6 +110,7 @@ function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconNam
 function SharedEntry({ entry }: { entry: EntryView }) {
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
+  if (entry.kind === "workspace.run-stopped") return <div className="entry-stopped" role="note"><span>Stopped</span></div>;
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.

@@ -112,6 +112,16 @@ export interface WorkspaceRepository {
   forbidDefaultBranchPush: boolean;
 }
 
+/** A workspace's repositories, as one member lists them. */
+export interface WorkspaceRepositoryList {
+  repositories: WorkspaceRepository[];
+  /**
+   * The caller's new sessions, host pairings and host shares in this workspace need at least one repository: always,
+   * except for synthetic test users on a test-mode server, which start without any.
+   */
+  required: boolean;
+}
+
 /**
  * A branch an agent may push to: one `git check-ref-format --branch` compatible name, never a full ref, `HEAD`
  * or an option-like name. Whether the default branch is allowed is a per-repository workspace policy.

@@ -14,7 +14,7 @@ import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
-import { repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type SessionRepository, type WorkspaceRepository } from '../packages/shared/src/repositories.js';
+import { repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type SessionRepository, type WorkspaceRepository, type WorkspaceRepositoryList } from '../packages/shared/src/repositories.js';
 import type { AgentVersion, ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
 
 const origin = 'http://localhost:8787';
@@ -551,6 +551,13 @@ test('real users still require configured workspaces for pairing, claim, share a
   assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
   assert.equal(s.provisions.length, 0);
   assert.equal(s.remote.calls.length, 0);
+});
+
+test('the repository listing tells real users they need a repository, even in testMode, and synthetic test users that they do not', async t => {
+  const f = await fixture(t); const real = await f.client('real'); const synthetic = await f.client('synthetic', false);
+  const listing = async (client: Client) => json<WorkspaceRepositoryList>(await client.request('GET', `/api/workspaces/${(await workspace(client)).id}/repositories`));
+  assert.deepEqual(await listing(real), { repositories: [], required: true });
+  assert.deepEqual(await listing(synthetic), { repositories: [], required: false });
 });
 
 test('testMode does not let a real user start an unconnected faux-model session', async t => {

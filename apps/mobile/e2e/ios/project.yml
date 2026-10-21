@@ -1,0 +1,25 @@
+# UI tests that drive an installed Pistead development build (com.pistead.app) on a simulator.
+# Generated with XcodeGen by run.sh; the generated .xcodeproj is not checked in.
+name: PisteadE2E
+options:
+  bundleIdPrefix: com.pistead.e2e
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  PisteadUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [PisteadUITests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        SWIFT_VERSION: "5.0"
+schemes:
+  PisteadUITests:
+    build:
+      targets:
+        PisteadUITests: [test]
+    test:
+      targets: [PisteadUITests]

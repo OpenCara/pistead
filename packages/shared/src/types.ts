@@ -15,6 +15,22 @@ export interface UserProfile {
   env: Record<string, string>;
   githubConnected: boolean;
 }
+/** A native app (iOS, iPadOS, macOS) signed in as the user, listed so the user can revoke it from the web app. */
+export interface SignedInDevice {
+  id: string;
+  /** The name the app reported when it signed in, e.g. the device's name; null when it sent none. */
+  name: string | null;
+  createdAt: string;
+  expiresAt: string;
+  /** This request came from that app. */
+  current: boolean;
+}
+/** A native app's sign-in: its bearer token, until `expiresAt`. */
+export interface NativeSignIn {
+  token: string;
+  expiresAt: string;
+  user: UserProfile;
+}
 export interface Workspace {
   id: string;
   name: string;
@@ -47,7 +63,7 @@ export interface AgentVersion {
 export const defaultAgentName = "Untitled agent";
 /**
  * What a session's agent is doing. `working`: a message is queued or running, or an approved operation runs.
- * `waiting`: a permission request holds a running message, or, once the queue is idle, an approval awaits a decision.
+ * `waiting`: a card (a permission request or an operation's approval) awaits a decision, holding the message whose call asked for it.
  * `done` and `failed`: how the latest shared message ended; `failed` when its model request failed, Pi ended it without
  * an answer, or it was stopped before it ran. `idle`: no shared message yet.
  */
@@ -83,7 +99,7 @@ export interface RunnerBinding {
   agent: AgentVersion;
   model: ModelDefinition;
 }
-export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore";
+export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop";
 export interface RunnerTicket {
   aud: "runner";
   sessionId: string;
@@ -439,7 +455,13 @@ export interface SessionView {
   approvals: ApprovalRecord[];
   conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
   busy: boolean;
+  /**
+   * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host
+   * still ends its work, which holds the queue until it is done.
+   */
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
+  /** The host can stop the session's work: the message running and those queued behind it. Absent from older runners. */
+  stoppable?: boolean;
   /** The shared conversation's current model and reasoning level. */
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
   /** Access mode of the latest shared-conversation submission; absent means "approval". */

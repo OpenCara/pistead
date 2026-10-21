@@ -41,6 +41,8 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      # The desktop app's main process, pages and connector host bundle (packaging needs macOS and is not run here).
+      - run: pnpm --filter @pistead/desktop build
       - run: pnpm test:connected
       - name: Container image builds and serves health
         run: |

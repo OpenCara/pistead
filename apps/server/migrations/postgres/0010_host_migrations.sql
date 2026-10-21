@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0016_host_migrations.sql.
+-- Postgres translation of sqlite/0017_host_migrations.sql.
 CREATE TABLE host_migrations (
   id TEXT PRIMARY KEY,
   request_id TEXT NOT NULL,

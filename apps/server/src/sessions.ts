@@ -478,6 +478,15 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     return c.json({ ok: true });
   });
 
+  // Anyone who can write to the session can stop its work, as they can add to it.
+  app.post('/api/sessions/:id/stop', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
+    const result = await runnerJSON<{ stopped: number }>(await runnerRequest(c, row, 'stop', '', {}));
+    if (!Number.isSafeInteger(result?.stopped) || result.stopped < 0) fail(502, 'invalid_runner_response', 'The runner returned an invalid stop result.');
+    await auditStatement(c.env, c.get('auth').userId, 'session.stopped', row.workspace_id, row.id, { stopped: result.stopped }).run();
+    return c.json({ stopped: result.stopped });
+  });
+
   app.post('/api/sessions/:id/restart', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
     if (row.owner_id !== c.get('auth').userId) fail(403, 'owner_required', 'Only the session owner can restart it.');

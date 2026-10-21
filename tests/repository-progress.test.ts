@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { formatBytes, preparingRepositories, repositoryPhaseLabel, repositoryProgressText, repositoryProgressValue } from "../apps/web/src/repository-progress.ts";
+import { formatBytes, preparingRepositories, repositoryPhaseLabel, repositoryProgressText, repositoryProgressValue } from "../packages/client/src/repository-progress.ts";
 import { repositoryPreparationPhases, type RepositoryPreparationItem } from "../packages/shared/src/types.ts";
 
 const item = (change: Partial<RepositoryPreparationItem>): RepositoryPreparationItem =>

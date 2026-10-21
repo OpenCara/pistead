@@ -14,7 +14,7 @@ import {
   Alert, Button, CardBody, Collapsible, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, RelativeTime,
   ResourceState, Row, Section, SegmentedControl, StatusBadge, Timestamp, useAction, useResource, type ActionState, type Tone,
 } from "./ui";
-import { userIdFromInput, usernameWithId, withUsernames, type Person } from "./usernames";
+import { userIdFromInput, usernameWithId, withUsernames, type Person } from "../../../packages/client/src/usernames";
 
 export type AuditEvent = { id: string; actorId: string; action: string; detail: unknown; createdAt: string };
 export type PanelTab = "details" | "approvals" | "activity";

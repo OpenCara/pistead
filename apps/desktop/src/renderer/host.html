@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>This Mac</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="host.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header class="title">
+        <h1 id="title">This Mac</h1>
+        <span id="status" class="pill" role="status">Stopped</span>
+      </header>
+      <p id="error" class="banner error" role="alert" hidden></p>
+      <p id="development" class="banner note" hidden>Development build: the host offers fixture models instead of Pi's.</p>
+
+      <section aria-labelledby="connection-heading">
+        <h2 id="connection-heading">Host</h2>
+        <dl class="facts">
+          <dt>Server</dt><dd id="server"></dd>
+          <dt>Paired with</dt><dd id="paired"></dd>
+          <dt>Isolation</dt><dd id="isolation"></dd>
+        </dl>
+        <div class="actions">
+          <button id="start" class="primary" type="button">Start Host</button>
+          <button id="stop" type="button">Stop Host</button>
+          <button id="refresh" class="ghost" type="button">Refresh</button>
+        </div>
+      </section>
+
+      <section aria-labelledby="pair-heading">
+        <h2 id="pair-heading">Pair with Pistead</h2>
+        <p class="muted">In Pistead, open Settings › Hosts and create a pairing code. Enter its pairing ID and single-use code here: the code goes only to the host on this computer, never to a file or log.</p>
+        <form id="pair-form" autocomplete="off" novalidate>
+          <label>Pairing ID
+            <input id="pairing-id" name="pairing-id" spellcheck="false" autocapitalize="off" placeholder="1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed" />
+          </label>
+          <label>Pairing code
+            <input id="pairing-code" name="pairing-code" type="password" spellcheck="false" autocapitalize="off" />
+          </label>
+          <label class="check" id="replace-row">
+            <input id="replace" type="checkbox" />
+            <span>Replace existing pairing <span class="muted">— the old host stays in Pistead, offline, until you remove it there</span></span>
+          </label>
+          <div class="actions">
+            <button id="pair" class="primary" type="submit">Pair and Start</button>
+            <span id="pair-server" class="muted"></span>
+          </div>
+        </form>
+      </section>
+
+      <section aria-labelledby="options-heading">
+        <h2 id="options-heading">Options</h2>
+        <label class="check">
+          <input id="git-credentials" type="checkbox" />
+          <span>Use this computer's Git credentials <span class="muted">— approved pushes in your own sessions may use its git credential helpers where the workspace's push access chooses the host's credentials. Applies when the host starts.</span></span>
+        </label>
+        <label class="check" id="login-row">
+          <input id="open-at-login" type="checkbox" />
+          <span>Open Pistead at login <span class="muted">— a host left running when Pistead quits starts again when it opens.</span></span>
+        </label>
+      </section>
+
+      <section aria-labelledby="models-heading">
+        <h2 id="models-heading">Models offered</h2>
+        <p id="models-note" class="muted"></p>
+        <ul id="models" class="list"></ul>
+      </section>
+
+      <section aria-labelledby="prerequisites-heading">
+        <h2 id="prerequisites-heading">Prerequisites</h2>
+        <p id="prerequisites-note" class="muted" hidden></p>
+        <ul id="prerequisites" class="list"></ul>
+      </section>
+
+      <section aria-labelledby="logs-heading">
+        <h2 id="logs-heading">Recent activity</h2>
+        <ol id="logs" class="logs"></ol>
+      </section>
+    </main>
+  </body>
+</html>

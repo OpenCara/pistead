@@ -11,25 +11,27 @@ Connect your Linux or WSL2 Pi host to a [Pistead](https://pistead.com) workspace
 
 ## Usage
 
-In Pistead, open **Connections**, choose a workspace and create a pairing code. Then run, on the Pi host:
+In Pistead, open **Settings → Hosts → Pair a host**, choose a workspace and create a pairing code. Then run, on the Pi host:
 
 ```sh
 npx pistead@latest connect --server https://pistead.com --pairing-id PAIRING_ID
 ```
 
-Enter the single-use code when prompted; it is never accepted as an argument. Later runs reuse the private saved connector token:
+Enter the single-use code when prompted; it is never accepted as an argument and expires after 10 minutes. Later runs reuse the private saved connector token, kept in `~/.local/share/pistead/connector` (`--state-dir` chooses another directory):
 
 ```sh
 npx pistead@latest connect
 ```
 
-To pair the machine again, for example after removing its host in Pistead or to move it to another workspace or server, create a new pairing code and add `--force` to its command:
+To pair the machine again, for example after revoking its host in Pistead or to move it to another workspace or server, create a new pairing code and add `--force` to its command:
 
 ```sh
 npx pistead@latest connect --server https://pistead.com --pairing-id PAIRING_ID --force
 ```
 
-The saved token is replaced only once the new code is accepted. The old host stays in **Connections**, offline, until you remove it there; its sessions are not moved to the new host.
+The saved token is replaced only once the new code is accepted. The old host stays in **Settings → Hosts**, offline, until you revoke it there; its sessions are not moved to the new host.
+
+Connector 0.8.0 moved the default state directory from `~/.local/share/opencara/connector` to `~/.local/share/pistead/connector` without moving anything: to keep a pairing made by an older connector, run `npx pistead@latest connect --state-dir ~/.local/share/opencara/connector`, or pair the machine again.
 
 Run `npx pistead connect --help` for all options.
 

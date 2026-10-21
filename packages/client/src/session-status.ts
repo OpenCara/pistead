@@ -1,8 +1,10 @@
-import type { SessionActivity, SessionRecord } from "../../../packages/shared/src/types";
-import type { Tone } from "./ui";
+import type { SessionActivity, SessionRecord } from "../../shared/src/types";
+
+/** How strongly a status reads; each app maps these onto its own colors. */
+export type SessionStatusTone = "running" | "warning" | "danger" | "success" | "neutral";
 
 export interface SessionStatus {
-  tone: Tone;
+  tone: SessionStatusTone;
   /** Absent for a ready session whose host does not report what its agent is doing. */
   label?: string;
 }

@@ -8,7 +8,7 @@ import { connectorRequest } from './connector-transport.js';
 
 const actionPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
-  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write',
+  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write', stop: 'write',
 };
 
 export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
@@ -48,7 +48,7 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
     create: '/v1/sessions', view: `/v1/sessions/${row.id}/view`, events: `/v1/sessions/${row.id}/events`,
     submit: `/v1/sessions/${row.id}/submit`, ask: `/v1/sessions/${row.id}/ask`, operations: `/v1/sessions/${row.id}/operations`,
     approve: `/v1/sessions/${row.id}/approvals/${encodeURIComponent(suffix)}`, backup: `/v1/sessions/${row.id}/backup`, restart: `/v1/sessions/${row.id}/restart`,
-    restore: `/v1/sessions/${row.id}/restore`,
+    restore: `/v1/sessions/${row.id}/restore`, stop: `/v1/sessions/${row.id}/stop`,
   };
   const serialized = body === undefined ? '' : JSON.stringify(body);
   const issuedAt = Math.floor(Date.now() / 1000);

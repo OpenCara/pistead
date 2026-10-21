@@ -2,7 +2,7 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { segment } from "./api";
 import { useApp } from "./app-context";
 import { useResource } from "./ui";
-import { memberPerson, peopleDirectory, username, usernameWithId, type Person, type WorkspaceMember } from "./usernames";
+import { memberPerson, peopleDirectory, username, usernameWithId, type Person, type WorkspaceMember } from "../../../packages/client/src/usernames";
 
 /** The people a page can name by username: a workspace's members and the signed-in user. */
 export interface People {

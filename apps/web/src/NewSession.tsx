@@ -9,7 +9,7 @@ import { useWorkspacePeople } from "./people";
 import { RepositorySnapshotPolicy, useWorkspaceRepositories } from "./repositories";
 import { href, navigate } from "./router";
 import { Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, IdentityBadge, InfoTip, LinkButton, Loading, PageLoading, useAction, useResource } from "./ui";
-import { usernameWithId } from "./usernames";
+import { usernameWithId } from "../../../packages/client/src/usernames";
 import "./new-session.css";
 
 /** Set by the agent settings "Start a session" action; consumed once. Holds an agent version id or agent id. */
@@ -130,7 +130,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const availableModel = Boolean(model && host?.models.some(item => sameModel(item, model)));
   const available = Boolean(host?.online && !host.revokedAt && availableModel && (host.ownerId === user.id || host.workspaceIds.includes(workspace.id)));
   const repositories = repos.repositories;
-  const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && repositories.length);
+  const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
 
@@ -182,7 +182,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   function blockingAlert() {
     if (repos.error) return <Alert variant="warning" title="Unable to load repositories" actions={<Button variant="outline" size="sm" onClick={repos.refresh}>Retry</Button>}>{repos.error}</Alert>;
-    if (repositories && !repositories.length) return <Alert variant="warning" title="No repositories in this workspace" actions={<LinkButton variant="outline" size="sm" href={workspaceSettings}>Add repository</LinkButton>}>Sessions need at least one repository. Workspace owners and admins can bind one in workspace settings.</Alert>;
+    if (repositories && !repositories.length && repos.required) return <Alert variant="warning" title="No repositories in this workspace" actions={<LinkButton variant="outline" size="sm" href={workspaceSettings}>Add repository</LinkButton>}>Sessions need at least one repository. Workspace owners and admins can bind one in workspace settings.</Alert>;
     if (agentsError) return <Alert variant="error" title="Unable to load models and agents" actions={<Button variant="outline" size="sm" onClick={() => { own.refresh(); published.refresh(); models.refresh(); }}>Retry</Button>}>{agentsError}</Alert>;
     if (!agentsLoading && !connections.loading && !connections.error && !hosts.length && !versions.length) return <Alert variant="info" title="No host to chat with yet" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "hosts" })}>Pair a host</LinkButton>}>Pair your own Pi to chat with its models, or ask a workspace member to share their host here.</Alert>;
     if (!startKey || connections.loading || !modelList) return null;

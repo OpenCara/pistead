@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Pistead's mark (apps/web/public/favicon.svg) on the macOS icon grid: an 824px tile with 100px margins. -->
+  <g transform="translate(100 100) scale(25.75)">
+    <rect width="32" height="32" rx="7.2" fill="#c0491d"/>
+    <g fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M7 15.5 L16 8 L25 15.5"/>
+      <path d="M10.5 17 L21.5 17"/>
+      <path d="M13.75 17 L13.75 24"/>
+      <path d="M18.5 17 L18.5 22.5 C18.5 23.5 19.1 24 20.1 24"/>
+    </g>
+  </g>
+</svg>

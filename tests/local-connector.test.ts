@@ -212,7 +212,7 @@ test('connector manifests reject duplicates, excessive catalogs and implicit fau
 test('relay accepts exactly the supported action/method/path combinations and locally signs bound tickets', async t => {
   const bodies: Record<Exclude<RunnerAction, 'events'>, string> = {
     create: JSON.stringify(binding()), view: '', submit: '{}', ask: '{}', operations: '{}',
-    approve: '{}', backup: '{}', restart: '{}', restore: JSON.stringify({ binding: binding() }),
+    approve: '{}', backup: '{}', restart: '{}', restore: JSON.stringify({ binding: binding() }), stop: '{}',
   };
   for (const action of Object.keys(bodies) as (keyof typeof bodies)[]) {
     await t.test(action, async () => {

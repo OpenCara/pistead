@@ -1,8 +1,8 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { SessionRecord, SessionView } from "../packages/shared/src/types.js";
-import { ApiError } from "../apps/web/src/api.js";
-import { liveTiming, startLiveSession, type EventStream, type StreamStatus } from "../apps/web/src/live-session.js";
+import { ApiError } from "../packages/client/src/api.js";
+import { liveTiming, startLiveSession, type EventStream, type StreamStatus } from "../packages/client/src/live-session.js";
 
 const record = { id: "s1" } as SessionRecord;
 const idleView = { sessionId: "s1", busy: false, queue: [] } as unknown as SessionView;

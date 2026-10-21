@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Settings</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="settings.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <form id="server-form" autocomplete="off" novalidate>
+        <label>Pistead server
+          <input id="server" name="server" type="url" spellcheck="false" autocapitalize="off" required />
+        </label>
+        <p class="muted">The Pistead window opens this server, and the host pairs with it. Use HTTPS; plain HTTP works only for localhost and 127.0.0.1.</p>
+        <p id="message" role="status" hidden></p>
+        <div class="actions">
+          <button class="primary" type="submit">Save</button>
+          <button id="default" type="button">Use Default</button>
+        </div>
+      </form>
+    </main>
+  </body>
+</html>
