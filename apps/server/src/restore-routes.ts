@@ -10,6 +10,7 @@ import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import { bindingIdentity, loadBackupSnapshot, repositoryIdentity, type BackupRow } from './restore-snapshot.js';
+import { downloadMigrationSnapshot } from './host-migrations.js';
 
 interface RestoreJob {
   id: string; request_id: string; owner_id: string; workspace_id: string;
@@ -185,6 +186,11 @@ export async function downloadRestoreSnapshot(c: AppContext, expectedConnectorId
   }
   const token = text(input.downloadToken, 'downloadToken', 43, 43);
   const job = await c.env.DB.query<RestoreJob>('SELECT * FROM restore_jobs WHERE id = ?').bind(restoreId).first();
+  if (!job) {
+    // A host asks for a session moved to it the same way it asks for a backup it restores.
+    const moved = await downloadMigrationSnapshot(c, expectedConnectorId, restoreId, input, token);
+    if (moved) return moved;
+  }
   if (!job || job.status !== 'pending' || input.targetSessionId !== job.target_session_id ||
       input.sourceSessionId !== job.source_session_id || input.backupId !== job.backup_id ||
       !job.download_token_hash || job.download_expires_at <= Date.now() ||

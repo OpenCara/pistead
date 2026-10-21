@@ -45,7 +45,9 @@ function record(value: unknown): value is Record<string, unknown> {
 function digest(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("base64url"); }
 
 function descriptorCopy(value: RestoreDescriptor): RestoreDescriptor {
-  if (!record(value) || Object.keys(value).sort().join(",") !== "backupId,downloadToken,id,sha256,size,sourceSessionId") invalid("Invalid restore descriptor");
+  const keys = Object.keys(value ?? {}).sort().join(",");
+  if (!record(value) || (keys !== "backupId,downloadToken,id,sha256,size,sourceSessionId"
+    && !(keys === "backupId,downloadToken,id,migration,sha256,size,sourceSessionId" && value.migration === true))) invalid("Invalid restore descriptor");
   for (const key of ["id", "sourceSessionId", "backupId"] as const) {
     if (typeof value[key] !== "string") invalid("Invalid restore identifier");
     assertId(value[key]);
@@ -93,8 +95,12 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
     || value.files.length > MAX_FILES || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) invalid("Invalid backup format");
   const source = checkedBinding(value.binding, descriptor.sourceSessionId);
   if (source.session.id === target.session.id || source.owner.id !== target.owner.id
-    || source.session.workspaceId !== target.session.workspaceId
-    || source.session.agentVersionId !== target.session.agentVersionId
+    || source.session.workspaceId !== target.session.workspaceId) invalid("Backup source, owner, agent, model, or connector mismatch");
+  if (descriptor.migration) {
+    // A session moved from another host keeps its owner, workspace and pins, and runs this host's agent and model.
+    if (!source.session.connectorId || !target.session.connectorId || source.session.connectorId === target.session.connectorId)
+      invalid("A host migration must come from another connected host");
+  } else if (source.session.agentVersionId !== target.session.agentVersionId
     || source.session.connectorId !== target.session.connectorId
     || source.session.connectorOwnerId !== target.session.connectorOwnerId
     || stableJson(source.agent) !== stableJson(target.agent)
@@ -354,7 +360,8 @@ export async function restoreSession(config: RestoreConfig, input: RunnerBinding
     fence = await publicationFence(parent, sessions, binding.session.id);
     const target = join(sessions, binding.session.id);
     const receipt = { format: "pi-runner-restore-v1", restoreId: descriptor.id, sha256: descriptor.sha256,
-      sourceSessionId: descriptor.sourceSessionId, backupId: descriptor.backupId, size: descriptor.size, bindingHash: digest(stableJson(binding)) };
+      sourceSessionId: descriptor.sourceSessionId, backupId: descriptor.backupId, size: descriptor.size, bindingHash: digest(stableJson(binding)),
+      ...(descriptor.migration ? { migration: true } : {}) };
     let exists = false;
     try { await lstat(target); exists = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (exists) {

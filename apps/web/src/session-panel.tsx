@@ -5,6 +5,7 @@ import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
 import { BackupList, backupDatabaseLabel, backupDownloadHref, backupLocationLabel, type Backup, type BackupDatabase, type BackupListing, type BackupListingResource } from "./backups";
 import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./hosts";
+import { MoveHostSection } from "./host-migration";
 import { Icon } from "./icons";
 import { Username, usePeople } from "./people";
 import { RepositorySnapshotPolicy } from "./repositories";
@@ -284,6 +285,7 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <RepositoriesSection session={session} refresh={refresh} />
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
+    {isOwner && session.status !== "archived" && session.connectorId && <MoveHostSection session={session} user={user} hosts={hosts} openSession={openSession} changed={changed} />}
     {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
     {isOwner && <ExportSection session={session} />}
     <AccessSection session={session} view={view} user={user} />
