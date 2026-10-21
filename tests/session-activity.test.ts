@@ -19,9 +19,9 @@ test("a session is idle until its first shared message, then working while any m
   assert.equal(sessionActivity([run("settled", 0)], [approval("executing")]), "working", "an approved operation runs");
 });
 
-test("approvals wait for a person: permission requests at once, operations once the queue is idle", () => {
+test("approvals wait for a person, whose decision the tool call holds its message for", () => {
   assert.equal(sessionActivity([run("running", 0)], [approval("pending", "permission")]), "waiting", "the tool call holds its message");
-  assert.equal(sessionActivity([run("running", 0)], [approval("pending")]), "working", "the message goes on while its card waits");
+  assert.equal(sessionActivity([run("running", 0)], [approval("pending")]), "waiting", "an operation's call holds its message too");
   assert.equal(sessionActivity([run("settled", 0)], [approval("pending")]), "waiting");
   assert.equal(sessionActivity([run("settled", 0, { failure: { reason: "model_error" } })], [approval("pending")]), "waiting");
   assert.equal(sessionActivity([], [approval("pending")]), "waiting", "an operation requested without a message");

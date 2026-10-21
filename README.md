@@ -317,7 +317,7 @@ Commands, commits, pushes, GitHub comments and merges, host commands and repins 
 | Host commands | Only the host's owner, who also needs approve permission on the session |
 | Repins | Only the session owner |
 
-The agent's tool call doesn't wait for the decision: it gets the pending request and its message carries on. An operation can be approved once the session's queue is idle (approving while a message is still queued or running is refused), then runs at once, and its output appears on the card. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Git commit**, **Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
+The agent's tool call waits for the decision, and its message waits with it (connector newer than 0.8.0). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Git commit**, **Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
 #### Permission requests
 

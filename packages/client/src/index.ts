@@ -1,6 +1,6 @@
 export { ApiError, createApi, errorMessage, segment, type Api, type ApiOptions, type RequestOptions } from "./api";
 export {
-  accessLabels, autoApproveWarning, chatOptionsBody, clampLevel, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, initialSelection, levelLabels,
+  accessLabels, accessUnavailable, autoApproveWarning, chatOptionsBody, clampLevel, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, initialSelection, levelLabels,
   modelKey, offeredLevels, selectModel, type ChatSelection,
 } from "./chat-options";
 export {

@@ -1,4 +1,4 @@
-import { activeStatuses, chatOptionsBody, initialSelection, preparingRepositories, segment, type ChatSelection } from "@pistead/client";
+import { accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, preparingRepositories, segment, type ChatSelection } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import { Stack } from "expo-router";
@@ -290,7 +290,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: Crypto.randomUUID() };
     const requestId = request.current.id;
     stick.current = true;
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
     void submission.run(async () => {
+      if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
       if (actualMode === "ask") setConversationId(result.conversationId);
@@ -305,7 +307,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
 
   const queued = activeQueue.length > 0 ? ` · ${activeQueue.length} queued` : "";
   const queueLabel = preparingRepositories(view) ? `Preparing repositories...${queued}`
-    : view.busy ? `Working...${queued}`
+    // A call waiting on a card holds its message until someone decides.
+    : view.busy ? `${view.activity === "waiting" ? "Waiting for a decision" : "Working"}...${queued}`
     : activeQueue.length ? `${activeQueue.length} queued` : "Idle";
   const name = useUsername();
   const sideIndex = sideConversations.findIndex(item => item.id === conversationId);

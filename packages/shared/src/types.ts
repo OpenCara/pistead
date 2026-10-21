@@ -63,7 +63,7 @@ export interface AgentVersion {
 export const defaultAgentName = "Untitled agent";
 /**
  * What a session's agent is doing. `working`: a message is queued or running, or an approved operation runs.
- * `waiting`: a permission request holds a running message, or, once the queue is idle, an approval awaits a decision.
+ * `waiting`: a card (a permission request or an operation's approval) awaits a decision, holding the message whose call asked for it.
  * `done` and `failed`: how the latest shared message ended; `failed` when its model request failed, Pi ended it without
  * an answer, or it was stopped before it ran. `idle`: no shared message yet.
  */

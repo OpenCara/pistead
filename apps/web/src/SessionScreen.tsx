@@ -4,7 +4,7 @@ import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResul
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -333,7 +333,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
     const requestId = request.current.id;
     stick.current = true;
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
     void submission.run(async () => {
+      if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
       if (actualMode === "ask") setConversationId(result.conversationId);
@@ -348,8 +350,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
 
   const queueLabel = preparingRepositories(view)
     ? <><Spinner />Preparing repositories...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    // A call waiting on a card holds its message until someone decides.
     : view.busy
-    ? <><Spinner />Working...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    ? <><Spinner />{view.activity === "waiting" ? "Waiting for a decision" : "Working"}...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
     : <>Idle</>;
 
