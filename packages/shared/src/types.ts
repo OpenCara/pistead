@@ -99,7 +99,7 @@ export interface RunnerBinding {
   agent: AgentVersion;
   model: ModelDefinition;
 }
-export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore";
+export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop";
 export interface RunnerTicket {
   aud: "runner";
   sessionId: string;
@@ -455,7 +455,13 @@ export interface SessionView {
   approvals: ApprovalRecord[];
   conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
   busy: boolean;
+  /**
+   * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host
+   * still ends its work, which holds the queue until it is done.
+   */
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
+  /** The host can stop the session's work: the message running and those queued behind it. Absent from older runners. */
+  stoppable?: boolean;
   /** The shared conversation's current model and reasoning level. */
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
   /** Access mode of the latest shared-conversation submission; absent means "approval". */

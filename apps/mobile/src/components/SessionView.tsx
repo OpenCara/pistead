@@ -241,6 +241,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [queueOpen, setQueueOpen] = useState(false);
   const request = useRef<{ key: string; id: string } | null>(null);
   const submission = useAction();
+  const stopping = useAction();
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const list = useRef<FlatList>(null);
   const stick = useRef(true);
@@ -253,6 +254,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
+  // Stopping takes the running message and everything queued; hosts that predate it don't offer it.
+  const canStop = Boolean(view.stoppable) && !archived && canWrite && activeQueue.length > 0;
+  const stopPending = queue.some(item => item.status === "stopping");
   const conversations = view.conversations;
   const sideConversations = conversations.filter(item => item.mode === "ask" && (!item.actorId || item.actorId === user.id));
   const entries = view.entries.filter(entry => {
@@ -302,11 +306,20 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
+  function stop() {
+    if (!canStop || stopping.busy) return;
+    void stopping.run(async () => {
+      await api(`/api/sessions/${segment(id)}/stop`, { method: "POST", body: {} });
+      refresh();
+    });
+  }
+
   // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
   const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
 
   const queued = activeQueue.length > 0 ? ` · ${activeQueue.length} queued` : "";
   const queueLabel = preparingRepositories(view) ? `Preparing repositories...${queued}`
+    : stopPending ? `Stopping...${queued}`
     // A call waiting on a card holds its message until someone decides.
     : view.busy ? `${view.activity === "waiting" ? "Waiting for a decision" : "Working"}...${queued}`
     : activeQueue.length ? `${activeQueue.length} queued` : "Idle";
@@ -345,6 +358,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
         <View style={ui.inline}><Button small icon="refresh" label="Refresh queue" onPress={refresh} /></View>
       </View>}
       <Composer value={content} onChange={setContent} onSubmit={submit} busy={submission.busy} disabled={!permitted}
+        onStop={canStop ? stop : undefined} stopping={stopping.busy}
         placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
         sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
         hint={archived ? "Read-only · this session is archived" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
@@ -363,7 +377,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       {draftHasSecret && <Text testID="draft-secret" style={[ui.small, { color: palette.muted }]} accessibilityLiveRegion="polite">
         This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.
       </Text>}
-      <Feedback error={submission.error} />
+      <Feedback error={submission.error || stopping.error} />
     </View>
     <OptionSheet<string> visible={pickingConversation} title="Side conversation" value={conversationId} onClose={() => setPickingConversation(false)} onSelect={setConversationId}
       options={[{ value: "", label: "All my side asks" }, ...sideConversations.map((conversation, index) => ({ value: conversation.id, label: `Side ask ${index + 1}`, hint: conversation.id.slice(0, 8) }))]} />

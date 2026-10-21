@@ -7,6 +7,8 @@ export interface ActivityRun {
   sequence?: number;
   startEntry: number;
   failure?: unknown;
+  /** Someone stopped it; `pending` while its host still ends its work. */
+  stopped?: { pending?: boolean };
 }
 
 /** The last entry of the shared conversation: its transcript id, and whether its model request failed. */
@@ -33,9 +35,10 @@ export function sessionActivity(runs: readonly ActivityRun[], approvals: readonl
   // A tool call waiting on a card holds its message: the work needs a person rather than more time. A card requested
   // outside a message waits for a decision too.
   if (approvals.some(approval => approval.status === "pending")) return "waiting";
-  if (runs.some(run => activeRuns.includes(run.status)) || approvals.some(approval => approval.status === "executing")) return "working";
+  if (runs.some(run => activeRuns.includes(run.status) || run.stopped?.pending) || approvals.some(approval => approval.status === "executing")) return "working";
   const latest = latestSharedRun(runs);
-  if (!latest) return "idle";
+  // A stopped message did not fail: the session waits for the next one.
+  if (!latest || latest.stopped) return "idle";
   if (latest.failure !== undefined || latest.status === "interrupted") return "failed";
   // Only an entry the message wrote itself can say that its model request failed.
   return last !== undefined && last.id > latest.startEntry && last.failed ? "failed" : "done";

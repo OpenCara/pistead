@@ -446,6 +446,76 @@ test("a shared message stopped before it ran leaves the session failed", options
   await f.reported("failed");
 });
 
+test("stopping ends the running message and those queued behind it, holds new ones until the host is done, then runs them", options, async t => {
+  const f = await fixture(t, { reportActivity: true });
+  const stop = async (actorId: string) => f.session.stop(await ticket(f.session.binding.session.id, "stop", actorId, "{}"));
+  assert.deepEqual(await stop(WRITER), { stopped: 0 }, "nothing to stop");
+  const gate = f.gateTool(OWNER, "write");
+  const running = await submit(f.session, OWNER, "write", { content: "TEST_IDENTITY", requestId: "running" });
+  await gate.entered();
+  const queuedInput = { content: "TEST_WRITE stopped.txt\nnever", requestId: "queued" };
+  const queued = await submit(f.session, WRITER, "write", queuedInput);
+  await assert.rejects(stop("test:carol"), runnerError(403, /revoked/), "stopping needs write access");
+  assert.deepEqual(await stop(WRITER), { stopped: 2 });
+  let view = await f.session.view();
+  assert.equal(view.stoppable, true);
+  // The running call is still in its tool, so its host has not finished stopping it.
+  assert.deepEqual(queue(view).map(run => run.status), ["stopping", "stopped"]);
+  assert.equal(view.busy, true);
+  assert.equal(view.activity, "working");
+  const nextInput = { content: "TEST_WRITE after.txt\nran", requestId: "after" };
+  const next = await submit(f.session, WRITER, "write", nextInput);
+  assert.deepEqual(queue(await f.session.view()).map(run => run.status), ["stopping", "stopped", "queued"], "new work waits for the stop");
+  gate.release();
+  view = await idle(f.session);
+  assert.deepEqual(queue(view).map(run => run.status), ["stopped", "stopped", "settled"]);
+  assert.equal(userEntries(view, queued, queuedInput.content).length, 0, "a stopped queued message never reaches pi");
+  await assert.rejects(file(f.session, "stopped.txt"), { code: "ENOENT" });
+  assert.equal(await file(f.session, "after.txt"), "ran");
+  toolResult(view, next, result => result.written === "after.txt" && result.initiatedBy === WRITER);
+  // The stop follows the stopped message's own entries, before the next message's.
+  const marker = view.entries.findIndex(entry => entry.kind === "workspace.run-stopped");
+  assert.deepEqual(view.entries[marker], { id: `${running.conversationId}:stopped:${running.submissionId}`, kind: "workspace.run-stopped", role: "system", text: "Stopped", actorId: WRITER, conversationId: running.conversationId });
+  assert.ok(view.entries.slice(0, marker).some(entry => entry.role === "user" && entry.text === "TEST_IDENTITY"));
+  assert.ok(view.entries.slice(marker).some(entry => entry.role === "user" && entry.text === nextInput.content));
+  assert.equal(view.activity, "done");
+  const retry = await submit(f.session, WRITER, "write", queuedInput);
+  sameReceipt(retry, queued);
+  assert.equal(retry.status, "interrupted", "a stopped message is never replayed");
+  await f.reported("done");
+});
+
+test("a stop the host had not finished before it closed is finished on reopen, and the held message then runs", options, async t => {
+  const f = await fixture(t);
+  const gate = f.gateTool(OWNER, "write");
+  await submit(f.session, OWNER, "write", { content: "TEST_IDENTITY", requestId: "running" });
+  await gate.entered();
+  assert.deepEqual(await f.session.stop(await ticket(f.session.binding.session.id, "stop", OWNER, "{}")), { stopped: 1 });
+  const next = await submit(f.session, WRITER, "write", { content: "TEST_WRITE reopened.txt\nran", requestId: "held" });
+  assert.deepEqual(queue(await f.session.view()).map(run => run.status), ["stopping", "queued"]);
+  // Closing waits for the gated tool call to return.
+  const closing = f.stop();
+  gate.release();
+  await closing;
+  const recovered = await f.reopen();
+  const view = await idle(recovered);
+  assert.deepEqual(queue(view).map(run => run.status), ["stopped", "settled"]);
+  assert.equal(await file(recovered, "reopened.txt"), "ran");
+  toolResult(view, next, result => result.written === "reopened.txt");
+});
+
+test("a session whose last shared message was stopped is idle, not failed", options, async t => {
+  const f = await fixture(t);
+  await pauseQueue(f.session);
+  await submit(f.session, OWNER, "write", { content: "TEST_IDENTITY", requestId: "queued" });
+  assert.deepEqual(await f.session.stop(await ticket(f.session.binding.session.id, "stop", OWNER, "{}")), { stopped: 1 });
+  const view = await f.session.view();
+  assert.equal(view.busy, false);
+  assert.deepEqual(queue(view).map(run => run.status), ["stopped"]);
+  assert.equal(view.activity, "idle");
+  assert.equal(view.entries.length, 0);
+});
+
 test("backup refuses a queued-only session, not just an active pi generation", options, async t => {
   const f = await fixture(t);
   const resume = await pauseQueue(f.session);

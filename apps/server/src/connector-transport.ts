@@ -10,7 +10,7 @@ import type { AppContext, Env, SessionRow } from './types.js';
 
 export const connectorPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
-  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'manage',
+  operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'manage', stop: 'write',
 };
 export const connectorRequestFrameBytes = connectorLimits.requestBytes * 6 + 16384;
 export interface ConnectorConnection {
@@ -34,7 +34,7 @@ export function connectorPath(action: RunnerAction, sessionId: string, suffix = 
     case 'approve':
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(suffix)) fail(400, 'invalid_approval', 'Invalid approval identifier.');
       return `${base}/approvals/${suffix}`;
-    case 'view': case 'events': case 'submit': case 'ask': case 'operations': case 'backup': case 'restart': case 'restore':
+    case 'view': case 'events': case 'submit': case 'ask': case 'operations': case 'backup': case 'restart': case 'restore': case 'stop':
       return `${base}/${action}`;
     default: return fail(400, 'invalid_action', 'Invalid connector action.');
   }
