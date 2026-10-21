@@ -525,6 +525,22 @@ test("stopping interrupts the stopped message's pending cards, so a later decisi
   await assert.rejects(file(f.session, "asked.txt"), { code: "ENOENT" });
 });
 
+test("an operation requested outside a message cannot run while a stop is still ending the stopped work", options, async t => {
+  const f = await fixture(t);
+  const gate = f.gateTool(OWNER, "write");
+  await submit(f.session, OWNER, "write", { content: "TEST_IDENTITY", requestId: "running" });
+  await gate.entered();
+  await f.session.stop(await ticket(f.session.binding.session.id, "stop", OWNER, "{}"));
+  const outside = await f.session.createApproval(OWNER, { kind: "github.comment", repository: "owner/repo", issue: 1, body: "outside a message" }, undefined, { permitted: true });
+  const decision = { decision: "approve" as const, operation: outside.operation };
+  const decide = async () => f.session.decide(await ticket(f.session.binding.session.id, "approve", OWNER, JSON.stringify(decision)), outside.id, decision);
+  await assert.rejects(decide(), runnerError(409, /queue to finish/));
+  gate.release();
+  await idle(f.session);
+  // Past the queue check once the stopped work has ended: only the comment's missing broker capability refuses it now.
+  await assert.rejects(decide(), runnerError(403, /broker capability/));
+});
+
 test("a session whose last shared message was stopped is idle, not failed", options, async t => {
   const f = await fixture(t);
   await pauseQueue(f.session);
