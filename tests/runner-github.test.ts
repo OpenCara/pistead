@@ -60,6 +60,16 @@ async function idle(session: RunnerSession): Promise<void> {
   assert.fail("runner did not settle");
 }
 
+/** The card a tool call waits on for a person's decision. */
+async function pendingApproval(session: RunnerSession) {
+  for (let count = 0; count < 1000; count++) {
+    const approval = (await session.view()).approvals.find(candidate => candidate.status === "pending");
+    if (approval) return approval;
+    await delay(20);
+  }
+  assert.fail("no pending approval");
+}
+
 test("agents read pinned GitHub pull requests through the broker and merges always wait for a human, failing definitely only on GitHub's refusal", hostMode, async t => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-session-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -98,7 +108,7 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   // Even an auto-approve message reads at once but only asks to merge.
   const admissionId = await sha256("github admission");
   await session.submit(await ticket(id, "submit"), { content: "Read the review and merge.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
-  await idle(session);
+  await pendingApproval(session);
   // The pinned repository's canonical name and the message's admission reach the broker; an unpinned one never does.
   assert.equal(reads.length, 1);
   assert.deepEqual({ ...reads[0], callId: undefined }, { sessionId: id, actorId: "test:alice", admissionId, callId: undefined, repository: "acme/alpha", issue: 7 });
@@ -107,7 +117,7 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   assert.match(transcript, /Fix the parser/);
   assert.match(transcript, /acme\/beta is not pinned in this session; GitHub reads and merges cover acme\/alpha/);
   assert.match(transcript, /full 40-character head commit/);
-  let approvals = (await session.view()).approvals;
+  const approvals = (await session.view()).approvals;
   assert.equal(approvals.length, 1, "an abbreviated head commit never becomes an approval");
   const squash = approvals[0]!;
   assert.equal(squash.status, "pending");
@@ -121,6 +131,8 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   assert.equal(executed.status, "executed");
   assert.deepEqual(JSON.parse(executed.result!), { merged: true, sha: "d".repeat(40), url: "https://github.com/acme/alpha/pull/7" });
   assert.deepEqual(merges, [{ sessionId: id, actorId: "test:alice", approvalId: squash.id, capability: "capability-1", repository: "acme/alpha", pull: 7, sha: head, method: "squash" }]);
+  await idle(session);
+  assert.ok((await session.view()).entries.some(entry => entry.role === "toolResult" && entry.text.includes('\\"merged\\":true')), "the agent learns the merge went through");
 
   // GitHub's refusal is definite, so the agent sees its reason; any other failure leaves the outcome open.
   for (const [requestId, failure, status, result] of [
@@ -129,11 +141,10 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   ] as const) {
     merge = async () => { throw failure; };
     await session.submit(await ticket(id, "submit"), { content: "Merge again.", requestId, admissionId }, "write");
-    await idle(session);
-    approvals = (await session.view()).approvals;
-    const pending = approvals.find(approval => approval.status === "pending")!;
+    const pending = await pendingApproval(session);
     const decided = await session.decide(await ticket(id, "approve"), pending.id, { decision: "approve", operation: pending.operation, brokerCapability: `capability-${requestId}` });
     assert.deepEqual([decided.status, decided.result], [status, result]);
+    await idle(session);
   }
   assert.equal(merges.length, 3);
 });
@@ -162,8 +173,8 @@ test("host_bash auto-approves only on the session owner's own host; shared hosts
     const claims = async (action: RunnerAction, actorId = "test:alice") => ({ ...await ticket(target.session.id, action), actorId, connectorId: "host-connector" });
     const session = await service.provision(target, await claims("create"));
     await session.submit(await claims("submit"), { content: "Run on host", requestId: "host", admissionId: await sha256("host-command-admission"), options: { access: "auto" } }, "write");
-    await idle(session);
-    const approval = (await session.view()).approvals[0]!;
+    if (hostOwner === "test:alice") await idle(session);
+    const approval = hostOwner === "test:alice" ? (await session.view()).approvals[0]! : await pendingApproval(session);
     if (hostOwner === "test:alice") {
       assert.equal(approval.status, "executed");
       assert.equal(approval.automatic, true);
@@ -208,8 +219,7 @@ test("git_repin from chat delegates to the broker without changing the source bi
   const session = await service.provision(target, await ticket(target.session.id, "create"));
   await session.sandbox.writeFile(`${pin.path}/README.md`, "keep local work", async () => {});
   await session.submit(await ticket(target.session.id, "submit"), { content: "Repin", requestId: "repin" }, "write");
-  await idle(session);
-  const approval = (await session.view()).approvals[0]!;
+  const approval = await pendingApproval(session);
   assert.equal(approval.status, "pending");
   assert.equal(calls.length, 0);
   await assert.rejects(session.decide({ ...await ticket(target.session.id, "approve"), actorId: "test:bob" }, approval.id,

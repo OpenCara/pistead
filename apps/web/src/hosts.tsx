@@ -35,7 +35,9 @@ export function useConnections(path: string | null): ConnectionsResource {
         const result = await api<{ connectors: ConnectorInfo[] }>(path!, { signal: controller.signal });
         if (!controller.signal.aborted) { setData(result); setError(""); }
       } catch (reason) {
-        if (!controller.signal.aborted) { setData(null); setError(errorMessage(reason)); }
+        // A failed poll keeps the hosts last seen: without them a chat box would send its message without the
+        // chosen access, which then runs as "Ask before acting".
+        if (!controller.signal.aborted) setError(errorMessage(reason));
       } finally {
         pending = false;
         if (!controller.signal.aborted) setLoading(false);
