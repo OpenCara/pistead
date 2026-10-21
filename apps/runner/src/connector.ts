@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { mkdir, realpath, lstat, open, link, rename, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { WebSocket as CompressingSocket } from "ws";
 import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
@@ -216,10 +217,10 @@ export async function validateRelayRequest(value: unknown, connectorId: string, 
     if (binding.session.connectorId !== connectorId || binding.model?.connectorId !== connectorId
       || binding.owner?.id !== rpc.ticket?.ownerId || binding.session.ownerId !== rpc.ticket?.ownerId) throw new Error("Foreign connector binding");
   } else {
-    const match = /^\/v1\/sessions\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(view|submit|ask|operations|restart|backup|restore|approvals\/[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(rpc.path);
+    const match = /^\/v1\/sessions\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(view|view\/[0-9a-f]{32}|submit|ask|operations|restart|backup|restore|approvals\/[A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(rpc.path);
     if (!match) throw new Error("Relay path is not allowed");
     sessionId = match[1]!;
-    action = match[2]!.startsWith("approvals/") ? "approve" : match[2] as RunnerAction;
+    action = match[2]!.startsWith("approvals/") ? "approve" : match[2]!.startsWith("view/") ? "view" : match[2] as RunnerAction;
     if (rpc.method !== (action === "view" ? "GET" : "POST")) throw new Error("Relay method is not allowed");
     if (action === "restore") {
       const input = decodeJson(encoder.encode(rpc.body)) as { binding?: RunnerBinding };
@@ -394,7 +395,7 @@ export class LocalConnector {
     this.options.onStatus?.("connecting");
     const url = new URL("/api/connectors/socket", state.controlPlaneUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    const socket = (this.options.createSocket ?? ((address, protocols) => new WebSocket(address, protocols)))(url.href, ["opencara-pi-v1", `bearer.${state.token}`]);
+    const socket = (this.options.createSocket ?? defaultSocket)(url.href, ["opencara-pi-v1", `bearer.${state.token}`]);
     const generation: Generation = { socket, abort: new AbortController(), done: Promise.withResolvers<void>(), welcome: Promise.withResolvers<string>(), active: new Set(), tail: Promise.resolve(), waiting: new Set(), incomingBytes: 0, responsesReserved: 0, runtimeReady: Promise.withResolvers<void>() };
     void generation.runtimeReady.promise.catch(() => {});
     this.generation = generation;
@@ -739,6 +740,20 @@ export class LocalConnector {
     try { await this.starting?.catch(() => {}); await this.loop; }
     finally { await this.releaseLease?.(); this.releaseLease = undefined; this.options.onStatus?.("stopped"); }
   }
+}
+
+/**
+ * The relay socket, compressed both ways where the server offers it (Node's built-in WebSocket compresses nothing it
+ * sends, and session views are most of what a host sends). Each message is compressed on its own, so no message's
+ * content shapes another's size, and none may inflate past the frame limit.
+ */
+export const relaySocketOptions = {
+  maxPayload: connectorLimits.frameBytes,
+  perMessageDeflate: { threshold: 1024, clientNoContextTakeover: true, serverNoContextTakeover: true },
+};
+
+function defaultSocket(url: string, protocols: string[]): ConnectorSocket {
+  return new CompressingSocket(url, protocols, relaySocketOptions) as unknown as ConnectorSocket;
 }
 
 async function defaultRuntime(config: RunnerConfig): Promise<ConnectorRuntime> {

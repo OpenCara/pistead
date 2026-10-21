@@ -17,9 +17,11 @@ import { registerOidc } from './push/oidc.js';
 import { registerPushIdentities } from './push/identities.js';
 import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
 import { registerDataExports } from './data-export.js';
+import { compression } from './compression.js';
 
 export const app = new Hono<WorkerEnv>();
 
+app.use('*', compression);
 app.use('*', async (c, next) => {
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('Referrer-Policy', 'no-referrer');

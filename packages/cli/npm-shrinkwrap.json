@@ -14,6 +14,7 @@
         "@earendil-works/pi-coding-agent": "1.2.0",
         "@earendil-works/pi-durable": "1.2.0",
         "hono": "4.12.8",
+        "ws": "8.22.0",
         "zod": "4.3.6"
       },
       "bin": {

@@ -224,6 +224,14 @@ test('relay accepts exactly the supported action/method/path combinations and lo
   }
 });
 
+test('relay accepts a view request for what changed since a revision', async () => {
+  const view = await rpc();
+  const request = { ...view, path: `${view.path}/${'a'.repeat(32)}` };
+  const result = await validateRelayRequest(request, credentials.connectorId, verifierSecret);
+  assert.deepEqual(result.rpc, request);
+  assert.deepEqual(await verifyRunnerTicket(result.authorization, verifierSecret, 'view', 'session', ''), request.ticket);
+});
+
 test('relay rejects events, wrong methods, path tricks, unknown envelope fields and body changes', async t => {
   const view = await rpc();
   const submit = await rpc('submit', '{}');
@@ -236,6 +244,8 @@ test('relay rejects events, wrong methods, path tricks, unknown envelope fields 
     ['encoded session', { ...view, path: '/v1/sessions/%73ession/view' }],
     ['traversal', { ...view, path: '/v1/sessions/session/../view' }],
     ['trailing slash', { ...view, path: `${view.path}/` }], ['unknown route', { ...view, path: '/v1/admin' }],
+    ['short revision', { ...view, path: `${view.path}/abc` }], ['uppercase revision', { ...view, path: `${view.path}/${'A'.repeat(32)}` }],
+    ['revision on submit', { ...submit, path: `${submit.path}/${'a'.repeat(32)}` }], ['POST revision', { ...view, method: 'POST', path: `${view.path}/${'a'.repeat(32)}` }],
     ['extra envelope secret', { ...view, authorization: providerSecret }], ['invalid request ID', { ...view, id: '../request' }],
     ['wrong type', { ...view, type: 'response' }], ['non-string body', { ...submit, body: {} }],
     ['non-empty GET', await rpc('view', '{}')], ['changed body', { ...submit, body: '{"changed":true}' }],

@@ -326,7 +326,9 @@ export class ConnectorHubRegistry implements ConnectorHub {
 
   constructor(private readonly env: Env) {
     this.server = new WebSocketServer({
-      noServer: true, perMessageDeflate: false, maxPayload: connectorLimits.frameBytes,
+      // Compression for connectors that offer it: each message on its own, so no message's content shapes another's size.
+      noServer: true, maxPayload: connectorLimits.frameBytes,
+      perMessageDeflate: { threshold: 1024, serverNoContextTakeover: true, clientNoContextTakeover: true },
       handleProtocols: () => 'opencara-pi-v1',
     });
   }

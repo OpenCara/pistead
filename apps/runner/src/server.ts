@@ -7,6 +7,7 @@ import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import type { RunnerAction, RunnerBinding, RunnerTicket, SubmitInput, Operation } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor, RestoreInput } from "../../../packages/shared/src/connector.js";
+import { ViewRevisions } from "../../../packages/shared/src/view-patch.js";
 import { assertId, permissionFor, RunnerError, stableJson, validateBinding, verifyRunnerTicket } from "./protocol.js";
 import { RunnerSession, type RunnerConfig } from "./session.js";
 import { restoreSession } from "./restore.js";
@@ -164,6 +165,8 @@ export class RunnerService {
 
 export function createRunnerApp(service: RunnerService): Hono {
   const app = new Hono();
+  // Each session's recent views, so a caller holding one gets only what changed since.
+  const revisions = new WeakMap<object, ViewRevisions>();
   app.use("*", bodyLimit({ maxSize: 1024 * 1024, onError: c => c.json({ error: "Request too large" }, 413) }));
   app.onError((error, c) => {
     if (error instanceof RunnerError) return c.json({ error: error.message }, error.status as 400);
@@ -189,8 +192,10 @@ export function createRunnerApp(service: RunnerService): Hono {
     if (!url.pathname.startsWith(prefix) || url.search) throw new RunnerError(400, "Invalid path");
     const route = url.pathname.slice(prefix.length);
     const approval = /^approvals\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(route);
+    // view/<revision>: what changed since a view this caller already holds.
+    const since = /^view\/([0-9a-f]{32})$/.exec(route)?.[1];
     const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore" };
-    const action = approval ? "approve" : actions[route];
+    const action = approval ? "approve" : since ? "view" : actions[route];
     if (!action) throw new RunnerError(404, "Unknown runner endpoint");
     if (c.req.method !== (action === "view" || action === "events" ? "GET" : "POST")) throw new RunnerError(405, "Method not allowed");
     const body = await c.req.text();
@@ -206,7 +211,13 @@ export function createRunnerApp(service: RunnerService): Hono {
     if (ticket.ownerId !== session.binding.owner.id) throw new RunnerError(403, "Ticket owner mismatch");
     await session.authorize(ticket.actorId, permissionFor(action), ticket.policyVersion);
     if (action === "operations" || action === "restart" || action === "backup") await session.consumeTicket(ticket);
-    if (action === "view") return c.json({ view: await session.view() });
+    if (action === "view") {
+      let views = revisions.get(session);
+      if (!views) revisions.set(session, views = new ViewRevisions());
+      const current = views.record(await session.view());
+      const patch = since === undefined ? null : views.since(since, current);
+      return c.json(patch ? { patch } : { view: current.view, revision: current.revision });
+    }
     if (action === "events") return streamSSE(c, async stream => {
       let last = "";
       let checking = false;
