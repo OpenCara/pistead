@@ -59,6 +59,10 @@ const DECISION_WAIT_MS = 60 * 60 * 1000;
 function settled(approval: ApprovalRecord): boolean {
   return approval.operation.kind === "permission" ? approval.status !== "pending" : !["pending", "approved", "executing"].includes(approval.status);
 }
+/** Whether `run` keeps the session busy: it is queued or at work, or a stop of it is still ending its work. */
+function holdsQueue(run: Run): boolean {
+  return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
+}
 /** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
 function boundedResult(value: string): string {
   if (value.length <= 8000) return value;
@@ -883,6 +887,14 @@ export class RunnerSession {
       // A queued message never reached Pi, so there is nothing to abort for it.
       await this.mutate(meta => {
         for (const run of runs) Object.assign(meta.runs[run.key]!, { status: "interrupted", stopped: { by: ticket.actorId, ...(run.status === "queued" ? {} : { pending: true }) } });
+        // Cards of the stopped calls end with the stop, so no decision made before the abort lands can still run them.
+        const keys = new Set(runs.map(run => run.key));
+        for (const [taskId, actor] of Object.entries(meta.toolActors)) {
+          if (!keys.has(actor.runKey)) continue;
+          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`]]) {
+            if (card?.status === "pending") Object.assign(card, { status: "interrupted", result: "The tool call stopped before a decision." });
+          }
+        }
       });
       return runs;
     });
@@ -1414,7 +1426,7 @@ export class RunnerSession {
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
       approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
-      busy: Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending)
+      busy: Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
         .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.status })),
@@ -1471,7 +1483,7 @@ export class RunnerSession {
     return this.exclusive(async () => {
       await this.authorize(ticket.actorId, "manage");
       const state = await this.metadata();
-      if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending)
+      if (Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
       this.requireRepositoriesReady();
       // Their objects live in the host cache, not in the snapshot, so the backup could not be restored.

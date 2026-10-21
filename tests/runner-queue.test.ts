@@ -504,6 +504,27 @@ test("a stop the host had not finished before it closed is finished on reopen, a
   toolResult(view, next, result => result.written === "reopened.txt");
 });
 
+test("stopping interrupts the stopped message's pending cards, so a later decision cannot run them", options, async t => {
+  const f = await fixture(t);
+  // A write in a read-only message asks the owner first and waits on that card.
+  await submit(f.session, OWNER, "write", { content: "TEST_WRITE asked.txt\nmust-not-run", requestId: "asks", options: { access: "read" } });
+  let card: SessionView["approvals"][number] | undefined;
+  for (let count = 0; count < 250 && !card; count++) {
+    card = (await f.session.view()).approvals.find(approval => approval.status === "pending");
+    if (!card) await delay(20);
+  }
+  assert.ok(card, "the call must ask the owner");
+  assert.deepEqual(await f.session.stop(await ticket(f.session.binding.session.id, "stop", OWNER, "{}")), { stopped: 1 });
+  const stopped = (await f.session.view()).approvals.find(approval => approval.id === card.id);
+  assert.equal(stopped?.status, "interrupted");
+  const decision = { decision: "approve" as const, operation: card.operation };
+  await assert.rejects(f.session.decide(await ticket(f.session.binding.session.id, "approve", OWNER, JSON.stringify(decision)), card.id, decision), runnerError(409, /decided/));
+  const view = await idle(f.session);
+  assert.deepEqual(queue(view).map(run => run.status), ["stopped"]);
+  assert.equal(view.approvals.find(approval => approval.id === card.id)?.status, "interrupted");
+  await assert.rejects(file(f.session, "asked.txt"), { code: "ENOENT" });
+});
+
 test("a session whose last shared message was stopped is idle, not failed", options, async t => {
   const f = await fixture(t);
   await pauseQueue(f.session);

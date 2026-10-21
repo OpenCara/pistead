@@ -363,8 +363,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
 
   const queueLabel = preparingRepositories(view)
     ? <><Spinner />Preparing repositories...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
-    // A call waiting on a card holds its message until someone decides.
     : stopPending ? <><Spinner />Stopping...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    // A call waiting on a card holds its message until someone decides.
     : view.busy
     ? <><Spinner />{view.activity === "waiting" ? "Waiting for a decision" : "Working"}...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
