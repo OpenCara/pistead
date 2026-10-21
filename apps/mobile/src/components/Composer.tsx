@@ -4,9 +4,12 @@ import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 
 import { usePalette } from "../theme";
 import { styles as ui } from "./ui";
 
-/** The chat box: a growing text field and a send button, with option pickers and a hint below. */
-export function Composer({ value, onChange, onSubmit, busy, disabled, placeholder, sendLabel, hint, tools }: {
-  value: string; onChange: (value: string) => void; onSubmit: () => void; busy: boolean; disabled?: boolean;
+/**
+ * The chat box: a growing text field and a send button, with option pickers and a hint below. `onStop`, while the agent
+ * works and the person may stop it, shows a stop button beside send; messages can still be queued.
+ */
+export function Composer({ value, onChange, onSubmit, onStop, stopping, busy, disabled, placeholder, sendLabel, hint, tools }: {
+  value: string; onChange: (value: string) => void; onSubmit: () => void; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
   placeholder: string; sendLabel: string; hint: string; tools?: ReactNode;
 }) {
   const palette = usePalette();
@@ -16,6 +19,10 @@ export function Composer({ value, onChange, onSubmit, busy, disabled, placeholde
       <TextInput testID="composer-input" value={value} onChangeText={onChange} editable={!busy && !disabled} multiline
         placeholder={placeholder} placeholderTextColor={palette.muted} accessibilityLabel={placeholder}
         style={[styles.input, { color: palette.text }]} />
+      {onStop && <Pressable testID="composer-stop" accessibilityRole="button" accessibilityLabel={stopping ? "Stopping..." : "Stop"} disabled={stopping} onPress={onStop}
+        style={({ pressed }) => [styles.send, styles.stop, { borderColor: palette.border, opacity: stopping ? 0.35 : pressed ? 0.7 : 1 }]}>
+        <Ionicons name="stop" size={16} color={palette.text} />
+      </Pressable>}
       <Pressable testID="composer-send" accessibilityRole="button" accessibilityLabel={busy ? "Sending..." : sendLabel} disabled={!canSend} onPress={onSubmit}
         style={({ pressed }) => [styles.send, { backgroundColor: palette.primary, opacity: !canSend ? 0.35 : pressed ? 0.7 : 1 }]}>
         {busy ? <ActivityIndicator size="small" color={palette.onPrimary} /> : <Ionicons name="arrow-up" size={20} color={palette.onPrimary} />}
@@ -31,4 +38,5 @@ const styles = StyleSheet.create({
   box: { flexDirection: "row", alignItems: "flex-end", gap: 8, borderWidth: StyleSheet.hairlineWidth, borderRadius: 20, paddingLeft: 14, paddingRight: 6, paddingVertical: 6 },
   input: { flex: 1, fontSize: 16, lineHeight: 21, maxHeight: 160, paddingTop: 6, paddingBottom: 6 },
   send: { width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center" },
+  stop: { borderWidth: StyleSheet.hairlineWidth },
 });

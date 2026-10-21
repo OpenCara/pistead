@@ -39,6 +39,8 @@ type Run = {
   options?: ChatOptions;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
   failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
+  /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
+  stopped?: { by: string; pending?: true };
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 /** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
@@ -56,6 +58,10 @@ const DECISION_WAIT_MS = 60 * 60 * 1000;
 /** Whether a tool call waiting on `approval` can go on: a permission request once decided, an operation once it ran, failed or was denied. */
 function settled(approval: ApprovalRecord): boolean {
   return approval.operation.kind === "permission" ? approval.status !== "pending" : !["pending", "approved", "executing"].includes(approval.status);
+}
+/** Whether `run` keeps the session busy: it is queued or at work, or a stop of it is still ending its work. */
+function holdsQueue(run: Run): boolean {
+  return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
 }
 /** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
 function boundedResult(value: string): string {
@@ -553,6 +559,8 @@ export class RunnerSession {
         this.observeRun(run.key, submission.id);
       }
     }
+    // A stop the previous open did not finish: its work is aborted before the scheduler can restart it.
+    if (Object.values(state.runs).some(run => run.stopped?.pending)) await this.abortStopped();
     this.harness.resume();
     this.drainQueue();
   }
@@ -700,8 +708,11 @@ export class RunnerSession {
       await this.exclusive(async () => {
         if (generation !== this.generation || this.closing) return;
         await this.mutate(meta => {
-          meta.runs[key]!.status = "settled";
-          if (failure) meta.runs[key]!.failure = failure;
+          const run = meta.runs[key]!;
+          // A stopped run stays stopped, whatever its aborted submission came to.
+          if (run.stopped) return;
+          run.status = "settled";
+          if (failure) run.failure = failure;
         });
       });
       if (generation === this.generation && !this.closing) this.drainQueue();
@@ -715,7 +726,7 @@ export class RunnerSession {
     void this.exclusive(async () => {
       while (!this.closing) {
         const state = await this.metadata();
-        if (Object.values(state.runs).some(run => run.status === "running" || run.status === "admitting")
+        if (Object.values(state.runs).some(run => run.status === "running" || run.status === "admitting" || run.stopped?.pending)
           || Object.values(state.approvals).some(approval => approval.status === "executing")) return;
         const run = Object.values(state.runs).filter(candidate => candidate.status === "queued")
           .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))[0];
@@ -859,6 +870,47 @@ export class RunnerSession {
       this.drainQueue();
       return { submissionId: key, conversationId: String(conversation.id), status: "queued", queuePosition: Object.values(state.runs).filter(run => ["queued", "running", "admitting"].includes(run.status)).length + 1 };
     });
+  }
+
+  /**
+   * Stops the session's work: the message running now and every message queued behind it, side asks included. They
+   * show as stopped at once; the conversations still working are aborted in the background, and queued work waits
+   * until that is done (see abortStopped). A call waiting on a card ends and the card is interrupted; an operation
+   * already executing finishes and settles its card, as for any interrupted call. Messages sent afterwards run next.
+   */
+  async stop(ticket: RunnerTicket): Promise<{ stopped: number }> {
+    this.assertTicket(ticket);
+    const stopped = await this.exclusive(async () => {
+      if (this.closing) throw new RunnerError(503, "Session is closing");
+      await this.authorize(ticket.actorId, "write", ticket.policyVersion);
+      const runs = Object.values((await this.metadata()).runs).filter(run => ["queued", "admitting", "running"].includes(run.status));
+      // A queued message never reached Pi, so there is nothing to abort for it.
+      await this.mutate(meta => {
+        for (const run of runs) Object.assign(meta.runs[run.key]!, { status: "interrupted", stopped: { by: ticket.actorId, ...(run.status === "queued" ? {} : { pending: true }) } });
+        // Cards of the stopped calls end with the stop, so no decision made before the abort lands can still run them.
+        const keys = new Set(runs.map(run => run.key));
+        for (const [taskId, actor] of Object.entries(meta.toolActors)) {
+          if (!keys.has(actor.runKey)) continue;
+          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`]]) {
+            if (card?.status === "pending") Object.assign(card, { status: "interrupted", result: "The tool call stopped before a decision." });
+          }
+        }
+      });
+      return runs;
+    });
+    if (stopped.some(run => run.status !== "queued")) void this.abortStopped().catch(() => { /* Reopening aborts what is left (see resumeWork). */ });
+    return { stopped: stopped.length };
+  }
+
+  /** Aborts the conversations of runs whose stop is pending, then lets queued work run again. */
+  private async abortStopped(): Promise<void> {
+    const generation = this.generation;
+    const runs = Object.values((await this.metadata()).runs).filter(run => run.stopped?.pending);
+    // Pi withdraws the queued input and aborts every task of the conversation's current work, then waits for it to end.
+    for (const id of new Set(runs.map(run => run.conversationId))) await (await this.harness.conversation(id as ConversationId, context))?.abort(context);
+    if (generation !== this.generation) return;
+    await this.mutate(meta => { for (const run of runs) delete meta.runs[run.key]!.stopped!.pending; });
+    this.drainQueue();
   }
 
   private async toolActor(api: ToolExecutionApi, write: boolean) {
@@ -1359,11 +1411,13 @@ export class RunnerSession {
       let previous: Run | undefined;
       for (const entry of snapshot.entries) {
         const run = Object.values(state.runs).filter(candidate => (candidate.started || candidate.submissionId !== undefined || candidate.status === "admitting") && candidate.conversationId === entry.conversationId && candidate.startEntry < entry.id).sort((a, b) => b.startEntry - a.startEntry)[0];
-        if (previous?.failure && run !== previous) entries.push(this.failureView(previous, snapshot.branch.id));
+        const ending = run !== previous && previous && this.endView(previous, snapshot.branch.id);
+        if (ending) entries.push(ending);
         previous = run;
         entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy));
       }
-      if (previous?.failure) entries.push(this.failureView(previous, snapshot.branch.id));
+      const ending = previous && this.endView(previous, snapshot.branch.id);
+      if (ending) entries.push(ending);
     }
     const agent = await this.root.agent(context);
     const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
@@ -1372,10 +1426,11 @@ export class RunnerSession {
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
       approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
-      busy: Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing")
-        || repositories?.status === "preparing",
+      busy: Object.values(state.runs).some(holdsQueue)
+        || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
-        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.status })),
+        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.status })),
+      stoppable: true,
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),
       ...(repositories ? { repositories } : {}),
@@ -1405,6 +1460,13 @@ export class RunnerSession {
       ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}) };
   }
 
+  /** What follows a run's entries: its failed model turn, or who stopped it. */
+  private endView(run: Run, branch: number): SessionView["entries"][number] | undefined {
+    if (run.failure) return this.failureView(run, branch);
+    if (run.stopped) return { id: `${branch}:stopped:${run.key}`, kind: "workspace.run-stopped", role: "system", text: "Stopped", actorId: run.stopped.by, conversationId: String(branch) };
+    return undefined;
+  }
+
   /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
   private failureView(run: Run, branch: number): SessionView["entries"][number] {
     const { provider, modelId } = run.failure!;
@@ -1421,7 +1483,8 @@ export class RunnerSession {
     return this.exclusive(async () => {
       await this.authorize(ticket.actorId, "manage");
       const state = await this.metadata();
-      if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
+      if (Object.values(state.runs).some(holdsQueue)
+        || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
       this.requireRepositoriesReady();
       // Their objects live in the host cache, not in the snapshot, so the backup could not be restored.
       if (this.#repositorySource === "cache") throw new RunnerError(409, "Backups of sessions checked out from the host repository cache are not supported yet");

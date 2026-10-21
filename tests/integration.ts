@@ -464,6 +464,22 @@ await check("queued work is reauthorized and revoked writers cannot delay later 
   assert.ok(!results.some(entry => entry.text.includes("must-not-run")));
 });
 
+await check("writers stop the running and queued messages through the host, and the next message runs", async () => {
+  await alice.submit(aliceSession.id, "TEST_HOLD 5000");
+  const queued = await alice.submit(aliceSession.id, "TEST_WRITE stopped-queue.txt\nmust-not-run", "submit", `stopped-queue-${run}`);
+  assert.equal(queued.status, "queued");
+  await bob.request("POST", `/api/sessions/${aliceSession.id}/stop`, {}, [403]);
+  assert.deepEqual(await alice.request("POST", `/api/sessions/${aliceSession.id}/stop`, {}), { stopped: 2 });
+  const stopped = await alice.settled(aliceSession.id);
+  assert.equal(stopped.stoppable, true);
+  assert.deepEqual(stopped.queue!.slice(-2).map(item => item.status), ["stopped", "stopped"]);
+  assert.ok(stopped.entries.some(entry => entry.kind === "workspace.run-stopped" && entry.actorId === alice.user.id));
+  const read = await alice.submit(aliceSession.id, "TEST_READ stopped-queue.txt");
+  const view = await alice.settled(aliceSession.id);
+  const results = view.entries.filter(entry => entry.conversationId === read.conversationId && (entry.role === "tool" || entry.kind === "pi.tool-result"));
+  assert.ok(results.length > 0 && !results.some(entry => entry.text.includes("must-not-run")));
+});
+
 await check("revocation closes existing streams and blocks subsequent requests", async () => {
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), 12_000);

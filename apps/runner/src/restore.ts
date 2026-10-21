@@ -126,7 +126,10 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
       || (run.sequence !== undefined && (!Number.isSafeInteger(run.sequence) || (run.sequence as number) < 0))
       || (run.ordinal !== undefined && (!Number.isSafeInteger(run.ordinal) || (run.ordinal as number) < 0))
       || (run.admissionId !== undefined && (run.mode !== "write" || typeof run.admissionId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(run.admissionId)))
-      || (run.started !== undefined && typeof run.started !== "boolean")) invalid("Invalid backup run binding or receipt");
+      || (run.started !== undefined && typeof run.started !== "boolean")
+      // A backup is taken only once a stop has ended its work, so none is still pending.
+      || (run.stopped !== undefined && (!record(run.stopped) || Object.keys(run.stopped).join(",") !== "by"
+        || typeof run.stopped.by !== "string" || !run.stopped.by || run.stopped.by.length > 256))) invalid("Invalid backup run binding or receipt");
   }
   for (const [id, approval] of Object.entries(manifest.approvals)) {
     if (!record(approval)) invalid("Backup requires idle approvals");
