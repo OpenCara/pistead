@@ -161,7 +161,7 @@ async function reportSessionActivity(c: AppContext, connectorId: string): Promis
 }
 
 async function ownedConnector(c: AppContext): Promise<ConnectorRow> {
-  const row = await c.env.DB.query<ConnectorRow>('SELECT * FROM connectors WHERE id = ? AND owner_id = ?')
+  const row = await c.env.DB.query<ConnectorRow>('SELECT * FROM connectors WHERE id = ? AND owner_id = ? AND removed_at IS NULL')
     .bind(identifier(c.req.param('id')), c.get('auth').userId).first();
   if (!row) fail(404, 'not_found', 'Connector not found.');
   return row;
@@ -340,7 +340,7 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
         ON m.workspace_id = s.workspace_id AND m.user_id = c.owner_id WHERE s.connector_id = c.id) AS workspace_ids,
       (SELECT json_group_array(cw.workspace_id) FROM connector_workspaces cw JOIN workspace_members m
         ON m.workspace_id = cw.workspace_id AND m.user_id = c.owner_id WHERE cw.connector_id = c.id) AS connected_workspace_ids
-      FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.owner_id = ? ORDER BY c.created_at DESC LIMIT 100`)
+      FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.owner_id = ? AND c.removed_at IS NULL ORDER BY c.created_at DESC LIMIT 100`)
       .bind(c.get('auth').userId).all();
     return c.json({ connectors: await connectorInfos(c.env, rows) });
   });
@@ -404,6 +404,25 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
       c.env.DB.query(`UPDATE sessions SET policy_version = policy_version + 1
         WHERE connector_id = ? AND workspace_id = ? AND owner_id <> ?`).bind(row.id, workspaceId, row.owner_id),
     ]);
+    return c.body(null, 204);
+  });
+  app.delete('/api/connectors/:id/permanent', async c => {
+    const row = await ownedConnector(c);
+    const timestamp = now();
+    // Keep a revoked tombstone for immutable session and model bindings.
+    await c.env.DB.batch([
+      c.env.DB.query(`UPDATE connectors SET removed_at = ?, revoked_at = COALESCE(revoked_at, ?),
+        connection_hash = NULL, credential_hash = ?, name = 'Removed host', models_json = '[]', capabilities_json = '{}'
+        WHERE id = ?`).bind(timestamp, timestamp, await sha256(randomToken()), row.id),
+      c.env.DB.query('DELETE FROM connector_shares WHERE connector_id = ?').bind(row.id),
+      c.env.DB.query('DELETE FROM connector_workspaces WHERE connector_id = ?').bind(row.id),
+      c.env.DB.query('UPDATE models SET available = 0 WHERE connector_id = ?').bind(row.id),
+      c.env.DB.query('UPDATE sessions SET policy_version = policy_version + 1 WHERE connector_id = ?').bind(row.id),
+    ]);
+    if (c.env.CONNECTOR_HUB) {
+      try { await c.env.CONNECTOR_HUB.revoke(row.id); }
+      catch { /* Database revocation already fences all authority. */ }
+    }
     return c.body(null, 204);
   });
   app.delete('/api/connectors/:id', async c => {

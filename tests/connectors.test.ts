@@ -297,6 +297,36 @@ function githubFetch(t: TestContext) {
   });
 }
 
+for (const revoked of [false, true]) {
+  test(`permanent host removal preserves history and fences access (revoked=${revoked})`, async t => {
+    const f = await fixture(t);
+    const s = await privateHostSession(f);
+    const path = `/api/connectors/${s.connector.connectorId}/permanent`;
+    await denied(await s.member.request('DELETE', path), 404, 'not_found');
+    await denied(await f.request('DELETE', path, undefined, { Cookie: s.owner.cookie }), 403, 'invalid_csrf');
+    await json(await s.owner.request('PUT', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`));
+    if (revoked) assert.equal((await s.owner.request('DELETE', `/api/connectors/${s.connector.connectorId}`)).status, 204);
+    delete f.env.CONNECTOR_HUB;
+    assert.equal((await s.owner.request('DELETE', path)).status, 204);
+    assert.deepEqual(await json(await s.owner.request('GET', '/api/connectors')), { connectors: [] });
+    assert.deepEqual(await json(await s.member.request('GET', `/api/workspaces/${s.team.id}/connectors`)), { connectors: [] });
+    const row = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(s.connector.connectorId)!;
+    assert.ok(row.removed_at);
+    assert.ok(row.revoked_at);
+    assert.equal(row.connection_hash, null);
+    assert.notEqual(row.credential_hash, await sha256(s.connector.token));
+    assert.equal(f.sqlite.prepare('SELECT connector_id FROM sessions WHERE id = ?').get(s.session.id)!.connector_id, s.connector.connectorId);
+    assert.equal(f.sqlite.prepare('SELECT available FROM models WHERE id = ?').get(s.model.id)!.available, 0);
+    for (const table of ['connector_shares', 'connector_workspaces']) {
+      assert.equal(f.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE connector_id = ?`).get(s.connector.connectorId)!.n, 0);
+    }
+    assert.deepEqual(f.sqlite.prepare('PRAGMA foreign_key_check').all(), []);
+    await denied(await self(f, s.connector, 'manifest', manifest), 401, 'connector_authentication_required');
+    await denied(await s.owner.request('DELETE', path), 404, 'not_found');
+    await denied(await s.owner.request('PUT', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`), 404, 'not_found');
+  });
+}
+
 test('pairings require a CSRF-protected cookie, retain its owner, are single-use, and hash secrets at rest', async t => {
   const f = await fixture(t); const alice = await f.client('alice'); const bob = await f.client('bob');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Pi' }), 401, 'unauthorized');
