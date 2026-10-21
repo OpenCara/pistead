@@ -4,7 +4,7 @@ import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResul
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -78,6 +78,7 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   const actor = entry.actorId && <Username id={entry.actorId} you />;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
+  if (entry.kind === "workspace.run-stopped") return <div className="entry-stopped" role="note"><span>Stopped{actor && <> by {actor}</>}</span></div>;
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
@@ -288,6 +289,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [conversationId, setConversationId] = useState("");
   const request = useRef<{ key: string; id: string } | null>(null);
   const submission = useAction();
+  const stopping = useAction();
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -300,6 +302,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
+  // Stopping takes the running message and everything queued; hosts that predate it don't offer it.
+  const canStop = Boolean(view.stoppable) && !archived && canWrite && activeQueue.length > 0;
+  const stopPending = queue.some(item => item.status === "stopping");
   const conversations = view.conversations;
   const sideConversations = conversations.filter(item => item.mode === "ask" && (!item.actorId || item.actorId === user.id));
   const entries = view.entries.filter(entry => {
@@ -333,7 +338,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
     const requestId = request.current.id;
     stick.current = true;
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
     void submission.run(async () => {
+      if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
       if (actualMode === "ask") setConversationId(result.conversationId);
@@ -343,13 +350,23 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     });
   }
 
+  function stop() {
+    if (!canStop || stopping.busy) return;
+    void stopping.run(async () => {
+      await api(`/api/sessions/${segment(id)}/stop`, { method: "POST", body: {} });
+      refresh();
+    });
+  }
+
   // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
   const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
 
   const queueLabel = preparingRepositories(view)
     ? <><Spinner />Preparing repositories...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    : stopPending ? <><Spinner />Stopping...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    // A call waiting on a card holds its message until someone decides.
     : view.busy
-    ? <><Spinner />Working...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
+    ? <><Spinner />{view.activity === "waiting" ? "Waiting for a decision" : "Working"}...{activeQueue.length > 0 && <span className="muted"> · {activeQueue.length} queued</span>}</>
     : activeQueue.length ? <>{activeQueue.length} queued</>
     : <>Idle</>;
 
@@ -389,6 +406,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           onSubmit={submit}
           busy={submission.busy}
           disabled={!permitted}
+          onStop={canStop ? stop : undefined}
+          stopping={stopping.busy}
           label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
           placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
           sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
@@ -405,15 +424,16 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           </>}
         />
         {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
-        <Feedback error={submission.error} />
+        <Feedback error={submission.error || stopping.error} />
       </div>
     </div>
   </>;
 }
 
 /** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. */
-function ComposerInput({ value, onChange, onSubmit, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
-  value: string; onChange: (value: string) => void; onSubmit: () => void; busy: boolean; disabled?: boolean;
+/** `onStop`, while the agent works and the person may stop it, shows a stop button beside send; messages can still be queued. */
+function ComposerInput({ value, onChange, onSubmit, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
+  value: string; onChange: (value: string) => void; onSubmit: () => void; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
   label: string; placeholder: string; sendLabel: string; hint: ReactNode; tools?: ReactNode;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
@@ -436,7 +456,10 @@ function ComposerInput({ value, onChange, onSubmit, busy, disabled, label, place
     <div className="composer-toolbar">
       {tools}
       <span className="composer-hint">{hint}</span>
-      <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !value.trim()} />
+      <span className="composer-actions">
+        {onStop && <Button variant="outline" size="sm" icon="stop" className="composer-stop" aria-label={stopping ? "Stopping..." : "Stop"} title="Stop the running message and those queued" disabled={stopping} onClick={onStop} />}
+        <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !value.trim()} />
+      </span>
     </div>
   </form>;
 }

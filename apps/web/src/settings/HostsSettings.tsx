@@ -241,9 +241,9 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       <div className="card">
         <Row title="Revoke host" hint={connector.revokedAt ? <>Revoked <Timestamp value={connector.revokedAt} /></> : "Disconnects its runtime and blocks work in every connected workspace"}
           trailing={!connector.revokedAt && <Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={revoke}>{revokeAction.busy ? "Revoking..." : "Revoke"}</Button>} />
+        <Row title="Permanently remove host" hint="Remove from Pistead and invalidate access. Session history and local files are retained."
+          trailing={<Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={remove}>Remove permanently</Button>} />
       </div>
-      <Row title="Permanently remove host" hint="Remove from Pistead and invalidate access. Session history and local files are retained."
-        trailing={<Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={remove}>Remove permanently</Button>} />
       <Feedback error={revokeAction.error} notice={revokeAction.notice} />
     </Section>
     {pairing && <PairHostSheet onClose={() => setPairing(false)} refresh={refresh} />}

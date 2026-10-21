@@ -1769,6 +1769,7 @@ test('workspace read does not grant mutations, connector credentials, personal e
     ['POST', '/operations', { kind: 'github.comment', repository: 'owner/repo', issue: 1, body: 'No' }],
     ['POST', '/approvals/approval', { decision: 'approve', reviewHash: 'a'.repeat(64) }],
     ['POST', '/restart', {}],
+    ['POST', '/stop', {}],
     ['POST', '/backup', {}],
     ['GET', '/backups', undefined],
     ['GET', '/backups/private-backup/download', undefined],
@@ -1923,6 +1924,25 @@ test('hosts report what the agent of each session they serve is doing; lists sho
   assert.equal('activity' in binding.session, false);
   assert.equal((await listed()).activity, 'failed', 'restarting leaves the activity to the host to report');
   assert.deepEqual(s.hub.unexpected, []);
+});
+
+test('writers stop a session\'s work through its host, audited; archived sessions refuse', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  let stopped: unknown = 2;
+  const requests = rpcHub(f, s.connector, () => Response.json({ stopped }));
+  assert.deepEqual(await json(await s.owner.request('POST', `${path}/stop`, {})), { stopped: 2 });
+  assert.equal(requests.length, 1);
+  const { request } = requests[0]!;
+  assert.deepEqual([request.method, request.path, request.body, request.ticket.action, request.ticket.actorId],
+    ['POST', `/v1/sessions/${s.session.id}/stop`, '{}', 'stop', s.owner.user.id]);
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.stopped'").all(s.session.id);
+  assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ stopped: 2 }) }]);
+  stopped = 'all';
+  await denied(await s.owner.request('POST', `${path}/stop`, {}), 502, 'invalid_runner_response');
+  await json(await s.owner.request('POST', `${path}/archive`));
+  await denied(await s.owner.request('POST', `${path}/stop`, {}), 409, 'session_archived');
+  assert.equal(requests.length, 2);
 });
 
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {

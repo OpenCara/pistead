@@ -17,7 +17,7 @@ import { legacyRepositoryFixture, repositoryAuthorize, repositoryDownload, requi
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
   created_at: string; last_seen_at: string | null; connection_hash: string | null;
-  models_json: string; capabilities_json: string;
+  models_json: string; capabilities_json: string; removed_at: string | null;
 }
 
 function onlyFields(value: Record<string, unknown>, fields: string[]): void {

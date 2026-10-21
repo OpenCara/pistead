@@ -80,6 +80,15 @@ export function initialSelection(view: SessionView, owner: boolean): ChatSelecti
 }
 
 /**
+ * Why a shared message can't be sent with `selection` yet, if it can't: until the host is known its options can't go
+ * with the message, which would then run as "Ask before acting" instead of the access shown.
+ */
+export function accessUnavailable(host: ConnectorInfo | undefined, selection: ChatSelection, mode: "submit" | "ask"): string | undefined {
+  if (mode !== "submit" || host || selection.access === "approval") return undefined;
+  return `Still checking this session's host, so "${accessLabels[selection.access].label}" can't be applied yet. Try again in a moment.`;
+}
+
+/**
  * Request options for a selection, or undefined when the host's connector cannot apply them.
  * Only choices the host advertises are sent; access only applies to the shared conversation.
  */

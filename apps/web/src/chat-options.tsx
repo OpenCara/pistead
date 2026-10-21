@@ -8,7 +8,7 @@ import { Icon, type IconName } from "./icons";
 import { Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
-export { chatOptionsBody, initialSelection, type ChatSelection } from "../../../packages/client/src/chat-options";
+export { accessUnavailable, chatOptionsBody, initialSelection, type ChatSelection } from "../../../packages/client/src/chat-options";
 
 const accessIcons: Record<AccessMode, IconName> = { read: "eye", approval: "shield", auto: "alert" };
 

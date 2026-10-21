@@ -31,6 +31,13 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 ? `Tool · ${calls[0].name}` : "";
   const meta = [styles.meta, { color: palette.muted }];
+  if (entry.kind === "workspace.run-stopped") {
+    return <View style={styles.stopped} accessibilityRole="text">
+      <View style={[styles.rule, { backgroundColor: palette.border }]} />
+      <Text style={meta}>Stopped{actor ? ` by ${actor}` : ""}</Text>
+      <View style={[styles.rule, { backgroundColor: palette.border }]} />
+    </View>;
+  }
   if ((toolLabel && !prose.trim()) || entry.role === "system" || entry.role === "toolResult") {
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
@@ -65,6 +72,8 @@ const styles = StyleSheet.create({
   bubble: { borderRadius: 16, paddingHorizontal: 14, paddingVertical: 9, maxWidth: "88%" },
   bubbleText: { fontSize: 16, lineHeight: 22 },
   meta: { fontSize: 12 },
+  stopped: { flexDirection: "row", alignItems: "center", gap: 10 },
+  rule: { flex: 1, height: StyleSheet.hairlineWidth },
   tool: { borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, overflow: "hidden" },
   toolHead: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, paddingVertical: 8 },
   toolLabel: { flex: 1, fontSize: 13 },

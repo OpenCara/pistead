@@ -19,9 +19,9 @@ test("a session is idle until its first shared message, then working while any m
   assert.equal(sessionActivity([run("settled", 0)], [approval("executing")]), "working", "an approved operation runs");
 });
 
-test("approvals wait for a person: permission requests at once, operations once the queue is idle", () => {
+test("approvals wait for a person, whose decision the tool call holds its message for", () => {
   assert.equal(sessionActivity([run("running", 0)], [approval("pending", "permission")]), "waiting", "the tool call holds its message");
-  assert.equal(sessionActivity([run("running", 0)], [approval("pending")]), "working", "the message goes on while its card waits");
+  assert.equal(sessionActivity([run("running", 0)], [approval("pending")]), "waiting", "an operation's call holds its message too");
   assert.equal(sessionActivity([run("settled", 0)], [approval("pending")]), "waiting");
   assert.equal(sessionActivity([run("settled", 0, { failure: { reason: "model_error" } })], [approval("pending")]), "waiting");
   assert.equal(sessionActivity([], [approval("pending")]), "waiting", "an operation requested without a message");
@@ -37,6 +37,9 @@ test("the latest shared message decides done or failed; side asks and earlier me
   assert.equal(sessionActivity([run("settled", 1), run("settled", 0, { failure: { reason: "model_error" } })], []), "done", "by sequence, not order");
   assert.equal(sessionActivity([run("settled", 0), run("interrupted", 1, { mode: "ask" })], []), "done");
   assert.equal(sessionActivity([run("interrupted", 0, { mode: "ask" })], []), "idle", "a side ask is not the session's work");
+  assert.equal(sessionActivity([run("settled", 0), run("interrupted", 1, { stopped: {} })], []), "idle", "someone stopped it");
+  assert.equal(sessionActivity([run("interrupted", 0, { stopped: { pending: true } })], []), "working", "its host is still stopping it");
+  assert.equal(sessionActivity([run("interrupted", 0, { stopped: { pending: true } })], [approval("pending")]), "working", "a card the stop is about to interrupt");
   // Runs from before sequence numbers keep their submission order.
   const legacy = (status: ActivityRun["status"]): ActivityRun => ({ mode: "write", status, startEntry: 0 });
   assert.equal(sessionActivity([legacy("interrupted"), legacy("settled")], []), "done");

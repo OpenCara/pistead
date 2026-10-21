@@ -39,6 +39,8 @@ type Run = {
   options?: ChatOptions;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
   failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
+  /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
+  stopped?: { by: string; pending?: true };
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 /** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
@@ -48,11 +50,19 @@ const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", vers
 /** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files", "git_status"];
 /**
- * How long after a message is sent its tool calls can wait on the owner's permission. Deciding needs the message's write
- * admission, which lasts an hour from sending, so a card older than that can't be decided: the call fails instead of
- * holding the session.
+ * How long after a message is sent its tool calls can wait on a card: the owner's permission or an operation's approval.
+ * Deciding needs the message's write admission, which lasts an hour from sending, so a card older than that can't be
+ * decided: the call fails instead of holding the session.
  */
-const PERMISSION_WAIT_MS = 60 * 60 * 1000;
+const DECISION_WAIT_MS = 60 * 60 * 1000;
+/** Whether a tool call waiting on `approval` can go on: a permission request once decided, an operation once it ran, failed or was denied. */
+function settled(approval: ApprovalRecord): boolean {
+  return approval.operation.kind === "permission" ? approval.status !== "pending" : !["pending", "approved", "executing"].includes(approval.status);
+}
+/** Whether `run` keeps the session busy: it is queued or at work, or a stop of it is still ending its work. */
+function holdsQueue(run: Run): boolean {
+  return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
+}
 /** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
 function boundedResult(value: string): string {
   if (value.length <= 8000) return value;
@@ -140,8 +150,8 @@ export class RunnerSession {
   #failed = false;
   /** The reopen in progress, which every request waits for instead of reaching a half-open session. */
   #recovery: Promise<void> | undefined;
-  /** Tool calls waiting on the owner's decision about a permission request, by request id. */
-  #permissionWaiters = new Map<string, PromiseWithResolvers<ApprovalRecord>>();
+  /** Tool calls waiting on a card, by approval id, until it settles (see `settled`); `mutate` hands them the card. */
+  #approvalWaiters = new Map<string, PromiseWithResolvers<ApprovalRecord>>();
   /**
    * Preparing repositories from the host repository cache can mean a first clone that takes minutes, far longer than
    * the control plane waits for `create`. It runs in the background; runs are held until it is done (see drainQueue).
@@ -505,8 +515,8 @@ export class RunnerSession {
           approval.status = "interrupted";
           approval.result = "Execution interrupted; external effect may have occurred. Reconcile manually; never automatically retry.";
         }
-        // The tool call waiting on this request ended with the previous process.
-        if (approval.status === "pending" && approval.operation.kind === "permission") {
+        // The tool call waiting on this card ended with the previous process.
+        if (approval.status === "pending" && (approval.operation.kind === "permission" || approval.id.startsWith("tool-"))) {
           approval.status = "interrupted";
           approval.result = "The tool call stopped before a decision.";
         }
@@ -549,6 +559,8 @@ export class RunnerSession {
         this.observeRun(run.key, submission.id);
       }
     }
+    // A stop the previous open did not finish: its work is aborted before the scheduler can restart it.
+    if (Object.values(state.runs).some(run => run.stopped?.pending)) await this.abortStopped();
     this.harness.resume();
     this.drainQueue();
   }
@@ -590,14 +602,69 @@ export class RunnerSession {
   }
 
   private async mutate(change: (state: Metadata) => void): Promise<void> {
+    let committed: Metadata | undefined;
     await this.root.commit(async tx => {
       const doc = await tx.doc(RunnerState);
       const state = JSON.parse(doc.json) as Metadata;
       change(state);
       doc.json = JSON.stringify(state);
+      committed = state;
     }, context);
-    // Every run and approval status changes here, so this is where the activity can change.
+    // Every run and approval status changes here, so this is where the activity can change and waiting calls go on.
     this.#activity?.changed();
+    if (committed && this.#approvalWaiters.size) {
+      for (const [id, waiter] of this.#approvalWaiters) {
+        const approval = committed.approvals[id];
+        if (!approval || !settled(approval)) continue;
+        this.#approvalWaiters.delete(id);
+        waiter.resolve(approval);
+      }
+    }
+  }
+
+  private waiter(id: string): PromiseWithResolvers<ApprovalRecord> {
+    let waiter = this.#approvalWaiters.get(id);
+    if (!waiter) this.#approvalWaiters.set(id, waiter = Promise.withResolvers<ApprovalRecord>());
+    return waiter;
+  }
+
+  /**
+   * Holds tool call `waiting` until card `id` settles, and returns it then. A card still undecided at `deadline` (when
+   * its message's write admission ends) or when the call stops is marked interrupted, so no card outlives its call.
+   */
+  private async awaitCard(id: string, waiting: Context, deadline: number): Promise<ApprovalRecord> {
+    const waiter = this.waiter(id);
+    const current = (await this.metadata()).approvals[id];
+    if (current && settled(current)) {
+      this.#approvalWaiters.delete(id);
+      return current;
+    }
+    // decide() records a decision only on a card still pending, so an interrupted card never runs.
+    const interrupt = (result: string) => this.mutate(meta => {
+      const pending = meta.approvals[id];
+      if (pending?.status === "pending") Object.assign(pending, { status: "interrupted", result });
+    });
+    // Once decided, the effect settles the card itself, however late.
+    const expiry = setTimeout(() => void interrupt("The session owner did not answer within an hour of the message.").catch(() => {}), Math.max(0, deadline - Date.now()));
+    expiry.unref();
+    try { return await awaitWithContext(waiter.promise, waiting); }
+    catch (error) {
+      this.#approvalWaiters.delete(id);
+      await interrupt("The tool call stopped before a decision.").catch(() => {});
+      throw error;
+    } finally { clearTimeout(expiry); }
+  }
+
+  /** What an operation a tool call requested came to: the call waits until it is decided and has run. */
+  private async operationOutcome(approval: ApprovalRecord, waiting: Context): Promise<ApprovalRecord> {
+    if (settled(approval)) {
+      this.#approvalWaiters.delete(approval.id);
+      return approval;
+    }
+    const state = await this.metadata();
+    const actor = state.toolActors[approval.id.slice("tool-".length)];
+    const run = actor && state.runs[actor.runKey];
+    return this.awaitCard(approval.id, waiting, (run?.submittedAt ?? Date.now()) + DECISION_WAIT_MS);
   }
 
   /** What the agent is doing now (see SessionActivity). */
@@ -641,8 +708,11 @@ export class RunnerSession {
       await this.exclusive(async () => {
         if (generation !== this.generation || this.closing) return;
         await this.mutate(meta => {
-          meta.runs[key]!.status = "settled";
-          if (failure) meta.runs[key]!.failure = failure;
+          const run = meta.runs[key]!;
+          // A stopped run stays stopped, whatever its aborted submission came to.
+          if (run.stopped) return;
+          run.status = "settled";
+          if (failure) run.failure = failure;
         });
       });
       if (generation === this.generation && !this.closing) this.drainQueue();
@@ -656,7 +726,7 @@ export class RunnerSession {
     void this.exclusive(async () => {
       while (!this.closing) {
         const state = await this.metadata();
-        if (Object.values(state.runs).some(run => run.status === "running" || run.status === "admitting")
+        if (Object.values(state.runs).some(run => run.status === "running" || run.status === "admitting" || run.stopped?.pending)
           || Object.values(state.approvals).some(approval => approval.status === "executing")) return;
         const run = Object.values(state.runs).filter(candidate => candidate.status === "queued")
           .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))[0];
@@ -802,6 +872,47 @@ export class RunnerSession {
     });
   }
 
+  /**
+   * Stops the session's work: the message running now and every message queued behind it, side asks included. They
+   * show as stopped at once; the conversations still working are aborted in the background, and queued work waits
+   * until that is done (see abortStopped). A call waiting on a card ends and the card is interrupted; an operation
+   * already executing finishes and settles its card, as for any interrupted call. Messages sent afterwards run next.
+   */
+  async stop(ticket: RunnerTicket): Promise<{ stopped: number }> {
+    this.assertTicket(ticket);
+    const stopped = await this.exclusive(async () => {
+      if (this.closing) throw new RunnerError(503, "Session is closing");
+      await this.authorize(ticket.actorId, "write", ticket.policyVersion);
+      const runs = Object.values((await this.metadata()).runs).filter(run => ["queued", "admitting", "running"].includes(run.status));
+      // A queued message never reached Pi, so there is nothing to abort for it.
+      await this.mutate(meta => {
+        for (const run of runs) Object.assign(meta.runs[run.key]!, { status: "interrupted", stopped: { by: ticket.actorId, ...(run.status === "queued" ? {} : { pending: true }) } });
+        // Cards of the stopped calls end with the stop, so no decision made before the abort lands can still run them.
+        const keys = new Set(runs.map(run => run.key));
+        for (const [taskId, actor] of Object.entries(meta.toolActors)) {
+          if (!keys.has(actor.runKey)) continue;
+          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`]]) {
+            if (card?.status === "pending") Object.assign(card, { status: "interrupted", result: "The tool call stopped before a decision." });
+          }
+        }
+      });
+      return runs;
+    });
+    if (stopped.some(run => run.status !== "queued")) void this.abortStopped().catch(() => { /* Reopening aborts what is left (see resumeWork). */ });
+    return { stopped: stopped.length };
+  }
+
+  /** Aborts the conversations of runs whose stop is pending, then lets queued work run again. */
+  private async abortStopped(): Promise<void> {
+    const generation = this.generation;
+    const runs = Object.values((await this.metadata()).runs).filter(run => run.stopped?.pending);
+    // Pi withdraws the queued input and aborts every task of the conversation's current work, then waits for it to end.
+    for (const id of new Set(runs.map(run => run.conversationId))) await (await this.harness.conversation(id as ConversationId, context))?.abort(context);
+    if (generation !== this.generation) return;
+    await this.mutate(meta => { for (const run of runs) delete meta.runs[run.key]!.stopped!.pending; });
+    this.drainQueue();
+  }
+
   private async toolActor(api: ToolExecutionApi, write: boolean) {
     const doc = await api.snapshot(RunnerState, context);
     const state: Metadata = JSON.parse(doc!.json);
@@ -860,7 +971,7 @@ export class RunnerSession {
     // Only the owner can pick it, and a command without limits got this far only on their own host (checked above).
     if (run.options?.access === "auto" && run.mode === "write" && run.initiatedBy === this.binding.owner.id) return { unbounded };
     if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
-    const deadline = (run.submittedAt ?? Date.now()) + PERMISSION_WAIT_MS;
+    const deadline = (run.submittedAt ?? Date.now()) + DECISION_WAIT_MS;
     if (deadline <= Date.now()) throw new Error("This message is over an hour old, so the session owner can no longer allow this call. Ask them to send a new message.");
     const id = `permission-${api.taskId}`;
     // The target only shows the owner what the call touches; keep it within what the control plane accepts.
@@ -869,37 +980,10 @@ export class RunnerSession {
     const request: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: run.initiatedBy, createdAt: new Date().toISOString(), status: "pending", operation,
       ...(run.admissionId !== undefined ? { admissionId: run.admissionId } : {}) };
     await this.mutate(meta => { meta.approvals[id] ??= request; });
-    let decided: ApprovalRecord;
-    let expiry: NodeJS.Timeout | undefined;
-    const expired = new Promise<never>((_, reject) => {
-      expiry = setTimeout(() => reject(new Error("The session owner did not answer within an hour of the message.")), deadline - Date.now());
-      expiry.unref();
-    });
-    try { decided = await awaitWithContext(Promise.race([this.permissionDecision(id), expired]), waiting); }
-    catch (error) {
-      // A stopped run takes its card with it.
-      this.#permissionWaiters.delete(id);
-      await this.mutate(meta => {
-        const pending = meta.approvals[id];
-        if (pending?.status === "pending") Object.assign(pending, { status: "interrupted", result: "The tool call stopped before a decision." });
-      }).catch(() => {});
-      throw error;
-    } finally { clearTimeout(expiry); }
+    const decided = await this.awaitCard(id, waiting, deadline);
     if (decided.status === "denied") throw new Error(`The session owner did not allow ${tool}${target ? ` on ${target}` : ""}.`);
-    if (decided.status !== "approved") throw new Error("The permission request ended before the session owner answered.");
+    if (decided.status !== "approved") throw new Error(decided.result ?? "The permission request ended before the session owner answered.");
     return { unbounded };
-  }
-
-  /** Settles when the owner decides permission request `id`, at once if they already have. */
-  private async permissionDecision(id: string): Promise<ApprovalRecord> {
-    let waiter = this.#permissionWaiters.get(id);
-    if (!waiter) this.#permissionWaiters.set(id, waiter = Promise.withResolvers<ApprovalRecord>());
-    const current = (await this.metadata()).approvals[id];
-    if (current && current.status !== "pending") {
-      this.#permissionWaiters.delete(id);
-      return current;
-    }
-    return waiter.promise;
   }
 
   /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
@@ -960,12 +1044,12 @@ export class RunnerSession {
       defineTool({ name: "git_commit", description: "Commit the session worktree as the owner. Waits for an exact human approval unless the owner enabled auto-approve for this request; the result says which.", parameters: Type.Object({ message: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         await this.permit(api, call, "git_commit", args.message, { write: true });
-        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.commit", message: args.message }, String(api.taskId), { permitted: true }));
+        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "git.commit", message: args.message }, String(api.taskId), { permitted: true }), call));
       } }),
       defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const { unbounded } = await this.permit(api, call, "bash", args.command, { write: true, shell: true });
-        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }));
+        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }), call));
       } }),
       defineTool({ name: "github_read", description: "Read a GitHub issue or pull request of a pinned github.com repository (owner/name) as the session owner, through Pistead: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments and checks. Long threads keep their newest items. The sandbox has no network, so use this instead of gh or curl. Read-only; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, false);
@@ -980,17 +1064,17 @@ export class RunnerSession {
         const view = this.config.githubRead ? await this.config.githubRead(request) : await this.internalGitHub("read", request) as GitHubIssueView;
         return text({ ...attribution, ...view });
       } }),
-      defineTool({ name: "github_comment", description: "Request human approval of an exact GitHub comment through the owner's broker; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api, call) => {
+      defineTool({ name: "github_comment", description: "Post an exact GitHub comment through the owner's broker once a human approves it. Waits for the decision, even under auto-approve, and the result carries the outcome; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         await this.permit(api, call, "github_comment", `${args.repository}#${args.issue}`, { write: true });
-        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId), { permitted: true }));
+        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId), { permitted: true }), call));
       } }),
       defineTool({ name: "github_merge", description: "Request human approval to merge a pull request of a pinned github.com repository (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase. Always waits for a human decision, even under auto-approve; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const repository = this.githubRepository(args.repository);
         if (!/^[0-9a-f]{40}$/.test(args.sha)) throw new RunnerError(400, "sha must be the pull request's full 40-character head commit, as github_read reports it");
         await this.permit(api, call, "github_merge", `${repository}#${args.pull}`, { write: true });
-        return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "github.merge", repository, pull: args.pull, sha: args.sha, method: args.method }, String(api.taskId), { permitted: true }));
+        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.merge", repository, pull: args.pull, sha: args.sha, method: args.method }, String(api.taskId), { permitted: true }), call));
       } }),
       defineTool({ name: "host_bash", executionMode: "sequential",
         description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact host-owner approval; auto-approve skips it only in that host owner's own session. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
@@ -998,8 +1082,8 @@ export class RunnerSession {
         execute: async (args, api, call) => {
           const attribution = await this.toolActor(api, true);
           await this.permit(api, call, "host_bash", args.command, { write: true });
-          return approvalText(await this.createApproval(attribution.initiatedBy,
-            { kind: "host.bash", command: args.command, timeoutSeconds: args.timeout_seconds ?? 300 }, String(api.taskId), { permitted: true }));
+          return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy,
+            { kind: "host.bash", command: args.command, timeoutSeconds: args.timeout_seconds ?? 300 }, String(api.taskId), { permitted: true }), call));
         } }),
       defineTool({ name: "git_repin", executionMode: "sequential",
         description: "Repin a repository (its worktree path) to a branch, tag or commit by creating a NEW private session on this host. Other repository pins stay unchanged. Original files, commits and conversation are preserved, not copied. Returns the link to continue; it does not switch this conversation. Requires session-owner approval, skipped for the owner's auto-approve message.",
@@ -1007,7 +1091,7 @@ export class RunnerSession {
         execute: async (args, api, call) => {
           const attribution = await this.toolActor(api, true);
           await this.permit(api, call, "git_repin", `${args.repository} -> ${args.ref}`, { write: true });
-          return approvalText(await this.createApproval(attribution.initiatedBy, { kind: "git.repin", repository: args.repository, ref: args.ref }, String(api.taskId), { permitted: true }));
+          return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "git.repin", repository: args.repository, ref: args.ref }, String(api.taskId), { permitted: true }), call));
         } }),
       defineTool({ name: "git_push", description: "Push the committed session changes of one pinned repository (its worktree path) to a branch on its Git provider, fast-forward only, optionally opening a pull request as the owner. Commit first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
         repository: Type.String(), branch: Type.String(),
@@ -1019,7 +1103,7 @@ export class RunnerSession {
         const request = args.pull_request;
         const operation: GitPushOperation = { kind: "git.push", repository: args.repository, branch: args.branch, commit,
           ...(request ? { pullRequest: { title: request.title, body: request.body, ...(request.base !== undefined ? { base: request.base } : {}) } } : {}) };
-        return approvalText(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId), { permitted: true }));
+        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId), { permitted: true }), call));
       } }),
     ];
   }
@@ -1124,7 +1208,13 @@ export class RunnerSession {
       ...(consent.unbounded && operation.kind === "bash" ? { unbounded: true } : {}) };
     if (admissionId !== undefined) approval.admissionId = admissionId;
     let created = false;
-    await this.mutate(meta => { if (!meta.approvals[id]) { meta.approvals[id] = approval; created = true; } });
+    // The tool call waits on its card: registered first, so a decision never finds the card without its call.
+    if (toolTaskId !== undefined && !automatic) this.waiter(id);
+    try { await this.mutate(meta => { if (!meta.approvals[id]) { meta.approvals[id] = approval; created = true; } }); }
+    catch (error) {
+      this.#approvalWaiters.delete(id);
+      throw error;
+    }
     // A replayed tool task finds its record and never repeats the effect; reopening marks interrupted executions.
     if (automatic && created) return this.executeAutomatically(id, actorId);
     return (await this.metadata()).approvals[id]!;
@@ -1178,7 +1268,14 @@ export class RunnerSession {
       const approval = state.approvals[id];
       if (!approval) throw new RunnerError(404, "Approval not found");
       if (stableJson(validateOperation(input.operation)) !== stableJson(approval.operation)) throw new RunnerError(409, "Approval operation mismatch");
-      if (approval.status !== "pending") throw new RunnerError(409, "Approval has already been decided; unsafe effects are never retried");
+      const decided = () => new RunnerError(409, "Approval has already been decided; unsafe effects are never retried");
+      if (approval.status !== "pending") throw decided();
+      // Its tool call may stop meanwhile and interrupt the card, so each decision is recorded only on a card still pending.
+      const record = (meta: Metadata, decision: Partial<ApprovalRecord>) => {
+        const card = meta.approvals[id]!;
+        if (card.status !== "pending") throw decided();
+        Object.assign(card, decision);
+      };
       if (approval.operation.kind === "host.bash" && ticket.actorId !== this.binding.session.connectorOwnerId) {
         throw new RunnerError(403, "Only the host owner can decide a host command");
       }
@@ -1193,10 +1290,8 @@ export class RunnerSession {
           throw new RunnerError(403, "Only the host's owner can allow a shell without resource limits");
         }
         const scope = input.scope ?? "call";
-        let settled: string[] = [];
         await this.mutate(meta => {
-          settled = [id];
-          Object.assign(meta.approvals[id]!, input.decision === "approve" ? { status: "approved", decidedBy: ticket.actorId, scope } : { status: "denied", decidedBy: ticket.actorId });
+          record(meta, input.decision === "approve" ? { status: "approved", decidedBy: ticket.actorId, scope } : { status: "denied", decidedBy: ticket.actorId });
           if (input.decision !== "approve" || scope !== "session") return;
           const grants = meta.grants ??= { tools: [], write: false, unboundedShell: false };
           if (request.needs.includes("tool") && !grants.tools.includes(request.tool)) grants.tools.push(request.tool);
@@ -1206,27 +1301,24 @@ export class RunnerSession {
           for (const other of Object.values(meta.approvals)) {
             if (other.id === id || other.status !== "pending" || other.operation.kind !== "permission" || !this.coveredBy(other.operation, grants)) continue;
             Object.assign(other, { status: "approved", decidedBy: ticket.actorId, scope });
-            settled.push(other.id);
           }
         });
-        const approvals = (await this.metadata()).approvals;
-        for (const decided of settled) {
-          this.#permissionWaiters.get(decided)?.resolve(approvals[decided]!);
-          this.#permissionWaiters.delete(decided);
-        }
-        return approvals[id]!;
+        return (await this.metadata()).approvals[id]!;
       }
       if (input.decision === "deny") {
-        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "denied", decidedBy: ticket.actorId }); });
+        await this.mutate(meta => { record(meta, { status: "denied", decidedBy: ticket.actorId }); });
         return (await this.metadata()).approvals[id]!;
       }
       // Approved operations run in the sandbox, so they wait for the repositories like runs do.
       this.requireRepositoriesReady();
       this.requireShellCapability(approval.operation, approval.unbounded === true);
       await this.authorize(approval.requestedBy, "write");
-      if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status))) throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
+      // A tool call waiting on this card holds its message, so the operation runs now and the call gets its outcome. Any
+      // other card (one requested outside a message) waits for the queue, so it never runs beside the agent.
+      if (!this.#approvalWaiters.has(id) && Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)))
+        throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
       if (["github.comment", "github.merge", "git.push", "git.repin"].includes(approval.operation.kind) && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
-      await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executing", decidedBy: ticket.actorId }); });
+      await this.mutate(meta => { record(meta, { status: "executing", decidedBy: ticket.actorId }); });
       if (approval.operation.kind === "host.bash" || approval.operation.kind === "git.repin") {
         // Long host builds and provider resolution must not hold the connector's 30-second RPC queue.
         void this.startHostOperation(id, approval.operation, { actorId: ticket.actorId, capability: input.brokerCapability }, async () => {
@@ -1319,11 +1411,13 @@ export class RunnerSession {
       let previous: Run | undefined;
       for (const entry of snapshot.entries) {
         const run = Object.values(state.runs).filter(candidate => (candidate.started || candidate.submissionId !== undefined || candidate.status === "admitting") && candidate.conversationId === entry.conversationId && candidate.startEntry < entry.id).sort((a, b) => b.startEntry - a.startEntry)[0];
-        if (previous?.failure && run !== previous) entries.push(this.failureView(previous, snapshot.branch.id));
+        const ending = run !== previous && previous && this.endView(previous, snapshot.branch.id);
+        if (ending) entries.push(ending);
         previous = run;
         entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy));
       }
-      if (previous?.failure) entries.push(this.failureView(previous, snapshot.branch.id));
+      const ending = previous && this.endView(previous, snapshot.branch.id);
+      if (ending) entries.push(ending);
     }
     const agent = await this.root.agent(context);
     const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
@@ -1332,10 +1426,11 @@ export class RunnerSession {
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
       approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
-      busy: Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing")
-        || repositories?.status === "preparing",
+      busy: Object.values(state.runs).some(holdsQueue)
+        || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
-        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.status })),
+        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.status })),
+      stoppable: true,
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),
       ...(repositories ? { repositories } : {}),
@@ -1365,6 +1460,13 @@ export class RunnerSession {
       ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}) };
   }
 
+  /** What follows a run's entries: its failed model turn, or who stopped it. */
+  private endView(run: Run, branch: number): SessionView["entries"][number] | undefined {
+    if (run.failure) return this.failureView(run, branch);
+    if (run.stopped) return { id: `${branch}:stopped:${run.key}`, kind: "workspace.run-stopped", role: "system", text: "Stopped", actorId: run.stopped.by, conversationId: String(branch) };
+    return undefined;
+  }
+
   /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
   private failureView(run: Run, branch: number): SessionView["entries"][number] {
     const { provider, modelId } = run.failure!;
@@ -1381,7 +1483,8 @@ export class RunnerSession {
     return this.exclusive(async () => {
       await this.authorize(ticket.actorId, "manage");
       const state = await this.metadata();
-      if (Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)) || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
+      if (Object.values(state.runs).some(holdsQueue)
+        || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
       this.requireRepositoriesReady();
       // Their objects live in the host cache, not in the snapshot, so the backup could not be restored.
       if (this.#repositorySource === "cache") throw new RunnerError(409, "Backups of sessions checked out from the host repository cache are not supported yet");
@@ -1410,8 +1513,8 @@ export class RunnerSession {
       await Promise.allSettled([...this.pushes].map(push => push.done));
     }
     this.generation++;
-    // Calls still waiting on a permission end with the harness; their requests are marked interrupted on reopen.
-    this.#permissionWaiters.clear();
+    // Calls still waiting on a card end with the harness; their cards are marked interrupted on reopen.
+    this.#approvalWaiters.clear();
     // A Session that already failed on a storage error has closed itself, and closing again only repeats that error.
     // Read the flag first: a close that fails now also marks the session failed, and its error must still surface.
     const failed = this.#failed;

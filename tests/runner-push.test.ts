@@ -224,6 +224,16 @@ async function idle(session: RunnerSession): Promise<void> {
   assert.fail("runner did not settle");
 }
 
+/** The card a tool call waits on for a person's decision. */
+async function pendingApproval(session: RunnerSession) {
+  for (let count = 0; count < 1000; count++) {
+    const approval = (await session.view()).approvals.find(candidate => candidate.status === "pending");
+    if (approval) return approval;
+    await delay(20);
+  }
+  assert.fail("no pending approval");
+}
+
 test("sessions run approved pushes in the background, auto-push only with an admission, and always report completion", hostMode, async t => {
   const { bare, pin, archive, credential } = await upstream(t);
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-push-session-")));
@@ -264,7 +274,7 @@ test("sessions run approved pushes in the background, auto-push only with an adm
   const admissionId = await sha256("push admission");
   await session.submit(await ticket(id, "submit"), { content: "Change and push.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
   await idle(session);
-  let approvals = (await session.view()).approvals;
+  const approvals = (await session.view()).approvals;
   const automatic = approvals.find(approval => approval.operation.kind === "git.push")!;
   assert.equal(automatic.status, "executed");
   assert.equal(automatic.automatic, true);
@@ -277,10 +287,8 @@ test("sessions run approved pushes in the background, auto-push only with an adm
 
   // Auto access without an admission waits for a human, whose decision returns while the push runs.
   await session.submit(await ticket(id, "submit"), { content: "Push for review.", requestId: "review", options: { access: "auto" } }, "write");
-  await idle(session);
-  approvals = (await session.view()).approvals;
-  const reviewed = approvals.find(approval => approval.operation.kind === "git.push" && approval.operation.branch === "reviewed")!;
-  assert.equal(reviewed.status, "pending");
+  const reviewed = await pendingApproval(session);
+  assert.equal(reviewed.operation.kind === "git.push" && reviewed.operation.branch, "reviewed");
   assert.deepEqual(Object.keys(reviewed.operation), ["kind", "repository", "branch", "commit", "pullRequest"]);
   await assert.rejects(session.decide(await ticket(id, "approve"), reviewed.id, { decision: "approve", operation: reviewed.operation }), /broker capability/);
   const decided = await session.decide(await ticket(id, "approve"), reviewed.id, { decision: "approve", operation: reviewed.operation, brokerCapability: "capability-1" });
@@ -292,13 +300,13 @@ test("sessions run approved pushes in the background, auto-push only with an adm
   assert.match(settled.result ?? "", /https:\/\/forge\.example\/acme\/alpha\/pull\/7/);
   assert.equal(credentialRequests[1]!.capability, "capability-1");
   assert.equal(credentialRequests[1]!.admissionId, undefined);
+  assert.ok((await session.view()).entries.some(entry => entry.role === "toolResult" && entry.text.includes("Pushed 1 commit to reviewed")), "the agent learns the push went through");
 
   // A definite failure is reported as failed, and completion still revokes the credential.
   const other = git(["--git-dir", bare, "commit-tree", `${pin.commit}^{tree}`, "-p", pin.commit, "-m", "elsewhere"], { env: { GIT_AUTHOR_NAME: "x", GIT_AUTHOR_EMAIL: "x@x", GIT_COMMITTER_NAME: "x", GIT_COMMITTER_EMAIL: "x@x" } }).trim();
   git(["--git-dir", bare, "update-ref", "refs/heads/moved", other]);
   await session.submit(await ticket(id, "submit"), { content: "Push to a moved branch.", requestId: "moved" }, "write");
-  await idle(session);
-  const moved = (await session.view()).approvals.find(approval => approval.operation.kind === "git.push" && approval.operation.branch === "moved")!;
+  const moved = await pendingApproval(session);
   assert.equal((await session.decide(await ticket(id, "approve"), moved.id, { decision: "approve", operation: moved.operation, brokerCapability: "capability-2" })).status, "executing");
   await idle(session);
   const failed = (await session.view()).approvals.find(approval => approval.id === moved.id)!;
