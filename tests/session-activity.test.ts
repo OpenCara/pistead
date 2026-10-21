@@ -39,6 +39,7 @@ test("the latest shared message decides done or failed; side asks and earlier me
   assert.equal(sessionActivity([run("interrupted", 0, { mode: "ask" })], []), "idle", "a side ask is not the session's work");
   assert.equal(sessionActivity([run("settled", 0), run("interrupted", 1, { stopped: {} })], []), "idle", "someone stopped it");
   assert.equal(sessionActivity([run("interrupted", 0, { stopped: { pending: true } })], []), "working", "its host is still stopping it");
+  assert.equal(sessionActivity([run("interrupted", 0, { stopped: { pending: true } })], [approval("pending")]), "working", "a card the stop is about to interrupt");
   // Runs from before sequence numbers keep their submission order.
   const legacy = (status: ActivityRun["status"]): ActivityRun => ({ mode: "write", status, startEntry: 0 });
   assert.equal(sessionActivity([legacy("interrupted"), legacy("settled")], []), "done");

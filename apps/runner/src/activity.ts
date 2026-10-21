@@ -32,10 +32,12 @@ export function latestSharedRun<T extends ActivityRun>(runs: Iterable<T>): T | u
  * message has settled, the last entry of the shared conversation.
  */
 export function sessionActivity(runs: readonly ActivityRun[], approvals: readonly Pick<ApprovalRecord, "status" | "operation">[], last?: ActivityEntry): SessionActivity {
+  // A stop still ending its work makes the cards of its calls moot: they are interrupted with it.
+  if (runs.some(run => run.stopped?.pending)) return "working";
   // A tool call waiting on a card holds its message: the work needs a person rather than more time. A card requested
   // outside a message waits for a decision too.
   if (approvals.some(approval => approval.status === "pending")) return "waiting";
-  if (runs.some(run => activeRuns.includes(run.status) || run.stopped?.pending) || approvals.some(approval => approval.status === "executing")) return "working";
+  if (runs.some(run => activeRuns.includes(run.status)) || approvals.some(approval => approval.status === "executing")) return "working";
   const latest = latestSharedRun(runs);
   // A stopped message did not fail: the session waits for the next one.
   if (!latest || latest.stopped) return "idle";
