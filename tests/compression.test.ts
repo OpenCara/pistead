@@ -30,13 +30,17 @@ function server() {
 
 test('JSON responses are gzipped for clients that accept it and left alone for others and for host callbacks', async () => {
   const { app } = server();
+  // An explicit coding outranks `*`; without one, `*` accepts gzip.
+  for (const encoding of ['br;q=1, *;q=0.5', 'X-GZIP']) {
+    assert.equal((await app.request('/api/view', { headers: { 'Accept-Encoding': encoding } })).headers.get('content-encoding'), 'gzip', encoding);
+  }
   const compressed = await app.request('/api/view', { headers: { 'Accept-Encoding': 'gzip, deflate, br' } });
   assert.equal(compressed.headers.get('content-encoding'), 'gzip');
   assert.match(compressed.headers.get('vary') ?? '', /Accept-Encoding/);
   const bytes = Buffer.from(await compressed.arrayBuffer());
   assert.ok(bytes.length < JSON.stringify(view).length / 5, `${bytes.length} compressed bytes`);
   assert.deepEqual(JSON.parse(gunzipSync(bytes).toString()), view);
-  for (const encoding of [undefined, 'identity', 'gzip;q=0']) {
+  for (const encoding of [undefined, 'identity', 'gzip;q=0', 'gzip;q=0, *;q=0.5', '*;q=0.5, x-gzip;q=0']) {
     const plain = await app.request('/api/view', { headers: encoding ? { 'Accept-Encoding': encoding } : {} });
     assert.equal(plain.headers.get('content-encoding'), null, String(encoding));
     assert.deepEqual(await plain.json(), view);

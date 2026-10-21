@@ -22,12 +22,15 @@ export const compression: MiddlewareHandler = async (c, next) => {
   c.res.headers.append('Vary', 'Accept-Encoding');
 };
 
+/** Whether Accept-Encoding allows gzip: a gzip (or x-gzip) entry decides alone, and `*` only when gzip is not named. */
 function acceptsGzip(header: string | undefined): boolean {
-  return (header ?? '').split(',').some(part => {
+  const qualities = new Map<string, number>();
+  for (const part of (header ?? '').split(',')) {
     const [coding, ...parameters] = part.trim().toLowerCase().split(';').map(value => value.trim());
     const quality = parameters.find(value => value.startsWith('q='));
-    return (coding === 'gzip' || coding === '*') && (!quality || Number(quality.slice(2)) > 0);
-  });
+    if (coding) qualities.set(coding === 'x-gzip' ? 'gzip' : coding, quality ? Number(quality.slice(2)) : 1);
+  }
+  return (qualities.get('gzip') ?? qualities.get('*') ?? 0) > 0;
 }
 
 /** One gzip stream over the events, flushed after each write. Cancelling it cancels the events, as the client leaving does. */
