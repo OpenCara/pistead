@@ -6,7 +6,7 @@ import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { ConnectionStatus, HostCapabilities, hostTone, useConnections, type ConnectionsResource } from "../hosts";
 import { Icon } from "../icons";
-import { href } from "../router";
+import { href, navigate } from "../router";
 import { Alert, Button, CardBody, Collapsible, Combobox, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, ResourceState, Row, Section, Sheet, StatusDot, Timestamp, useAction, useResource, type ActionState } from "../ui";
 import "./settings.css";
 
@@ -167,6 +167,8 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
   const { workspaces } = useApp();
   const shareAction = useAction();
   const revokeAction = useAction();
+  const [reconnecting, setReconnecting] = useState(false);
+  const [pairing, setPairing] = useState(false);
   const workspaceNames = new Map(workspaces.map(workspace => [workspace.id, workspace.name]));
   const associated = [...new Set([...(connector.connectedWorkspaceIds ?? []), ...connector.workspaceIds])];
   const available = workspaces.filter(workspace => !connector.workspaceIds.includes(workspace.id));
@@ -178,6 +180,17 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
         await api(`/api/connectors/${segment(connector.id)}/shares/${segment(workspaceId)}`, { method: "DELETE" });
         refresh();
       }, "Host sharing stopped. Your private connection remains available.");
+    })();
+  }
+  function remove() {
+    void (async () => {
+      const confirmed = await confirmDialog({ title: `Permanently remove ${connector.name}?`, message: "This permanently removes the host from your list, invalidates its credentials and stops sharing it in all workspaces. Existing sessions and their historical host references remain, but cannot run on this host. Local files are not deleted. To use this machine again, pair it as a new host.", confirmLabel: "Remove permanently", destructive: true });
+      if (!confirmed) return;
+      await revokeAction.run(async () => {
+        await api(`/api/connectors/${segment(connector.id)}/permanent`, { method: "DELETE" });
+        navigate({ name: "settings", section: "hosts" });
+        refresh();
+      });
     })();
   }
   function revoke() {
@@ -194,6 +207,8 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
     <Section title="Status" bare>
       <div className="card">
         <Row title="Status" trailing={<ConnectionStatus connector={connector} />} />
+        {!connector.online && <Row title={connector.revokedAt ? "Pair again" : "Reconnect host"} hint={connector.revokedAt ? "Revoked credentials cannot be reused; create a new pairing" : "Restart the saved connection on your host machine"}
+          trailing={<Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={() => connector.revokedAt ? setPairing(true) : setReconnecting(true)}>{connector.revokedAt ? "Pair again" : "Reconnect"}</Button>} />}
         <Row title="Owner" trailing={connector.ownerName} />
         <Row title="Paired" trailing={<Timestamp value={connector.createdAt} />} />
         {connector.revokedAt && <Row title="Revoked" trailing={<Timestamp value={connector.revokedAt} />} />}
@@ -226,9 +241,21 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       <div className="card">
         <Row title="Revoke host" hint={connector.revokedAt ? <>Revoked <Timestamp value={connector.revokedAt} /></> : "Disconnects its runtime and blocks work in every connected workspace"}
           trailing={!connector.revokedAt && <Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={revoke}>{revokeAction.busy ? "Revoking..." : "Revoke"}</Button>} />
+        <Row title="Permanently remove host" hint="Remove from Pistead and invalidate access. Session history and local files are retained."
+          trailing={<Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={remove}>Remove permanently</Button>} />
       </div>
       <Feedback error={revokeAction.error} notice={revokeAction.notice} />
     </Section>
+    {pairing && <PairHostSheet onClose={() => setPairing(false)} refresh={refresh} />}
+    {reconnecting && <Sheet open title={`Reconnect ${connector.name}`} onClose={() => setReconnecting(false)} footer={<Button onClick={() => { refresh(); setReconnecting(false); }}>Done</Button>}>
+      <div className="stack">
+        <Alert variant={connector.online ? "success" : "warning"} title={connector.online ? "Host is connected" : "Start the connection on your host"}>Pistead cannot remotely start an offline host. If you use the desktop app, open it on the host and start its connection. For a CLI host, run the command below on the original machine with its saved pairing.</Alert>
+        <Field label="Run on your host"><CopyField value={`npx pistead@latest connect${connector.capabilities.unsandboxed ? " --unsafe-no-sandbox" : ""}`} label="Copy reconnect command" /></Field>
+        <span className="small muted">Use the same OS user and any original options, especially --state-dir, --resources, --pi-agent-dir, --model, --git-credentials and --repo-cache. Do not add --pairing-id or --force: the saved credentials preserve this host and its sessions. Stop any existing connector before starting another. Status refreshes every 10 seconds.</span>
+        <span className="small muted">If the saved pairing is missing, pair a new host instead. A new pairing does not reconnect this host's existing sessions.</span>
+        <Button variant="outline" onClick={refresh}>Refresh status</Button>
+      </div>
+    </Sheet>}
   </>;
 }
 
