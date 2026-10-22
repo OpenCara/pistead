@@ -505,7 +505,9 @@ export class LocalConnector {
           const response = await relayGitRequest(this.options.fetch ?? fetch, `${this.state!.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
             { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken! }, request,
             AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
-          // Like every callback, an answer to a connection that has since been replaced is not used.
+          // Like every callback, an answer to a connection that has since been replaced is not used, except a push's: the
+          // forge has taken it by then, and Git must hear how it went.
+          if (request.service === "receive-pack") return response;
           try { this.requireGeneration(generation); }
           catch (error) { await response.body?.cancel(); throw error; }
           return response;

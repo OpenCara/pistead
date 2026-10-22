@@ -190,7 +190,15 @@ test("a clone session's proxy relays pushes of its own branch, streaming the pac
   const probe = await get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers, body: "0000" });
   assert.equal(probe.status, 200);
   assert.equal(probe.body, "");
+  // Without a status report Git can't show a rejection's reason; it gets the reason as text, after its pack is read.
+  const bare = pkt(`${zero} ${tip} refs/heads/main\0side-band-64k\n`) + "0000";
+  const plain = await get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers, body: bare + "P".repeat(200_000) });
+  assert.equal(plain.status, 403);
+  assert.match(plain.body, /Only this session's branch pistead\/s1/);
   assert.equal(relayed.length, 2);
+  const status = JSON.parse((await get(instance.socketPath, "/__pistead/status")).body) as { sessionBranch: string; gitRemotes: string };
+  assert.equal(status.sessionBranch, "pistead/s1");
+  assert.match(status.gitRemotes, /pistead\/s1 is pushed/);
   const other = await get(instance.socketPath, "/git/github.com/acme/other.git/info/refs?service=git-receive-pack");
   assert.equal(other.status, 403);
   assert.match(other.body, /pushes go only to them/);
