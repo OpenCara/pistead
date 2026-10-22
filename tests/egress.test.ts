@@ -10,6 +10,7 @@ import { EgressProxy, egressEnvironment, parseEgressGrant, publicAddress, reposi
 import { performClonePush, PushError, pushSummary } from "../apps/runner/src/push.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
 import type { EgressGrant } from "../packages/shared/src/network.js";
+import { parsePushCommands, pushRejection, readPushCommands, sessionBranchRefusal } from "../packages/shared/src/git-push.js";
 import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
@@ -21,7 +22,7 @@ function grant(policy: Partial<EgressGrant["policy"]> = {}): EgressGrant {
 }
 
 async function proxy(t: TestContext, options: { grant?: () => Promise<EgressGrant>; relay?: (request: RelayRequest) => Promise<Response>;
-  lookup?: (host: string) => Promise<{ address: string; family: number }[]>; connectTo?: number } = {}) {
+  lookup?: (host: string) => Promise<{ address: string; family: number }[]>; connectTo?: number; sessionBranch?: string } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "egress-"));
   const relayed: RelayRequest[] = [];
   const instance = new EgressProxy({
@@ -33,6 +34,7 @@ async function proxy(t: TestContext, options: { grant?: () => Promise<EgressGran
       return new Response("advertisement", { headers: { "content-type": "application/x-git-upload-pack-advertisement" } });
     },
     lookup: options.lookup ?? (async () => [{ address: "93.184.216.34", family: 4 }]),
+    ...(options.sessionBranch ? { sessionBranch: options.sessionBranch } : {}),
     ...(options.connectTo !== undefined ? { connect: (port: number) => { assert.equal(port, 443); return tcpConnect({ port: options.connectTo!, host: "127.0.0.1" }); } } : {}),
   });
   await instance.start();
@@ -114,7 +116,7 @@ test("Git reads of workspace repositories go to the relay; pushes and other repo
     { method: "POST", headers: { "content-type": "application/x-git-upload-pack-request" }, body: "0000" });
   assert.equal(fetched.status, 200);
   assert.equal(relayed[1]!.service, "upload-pack");
-  assert.equal(Buffer.from(relayed[1]!.body!).toString(), "0000");
+  assert.equal(Buffer.from(relayed[1]!.body as Uint8Array).toString(), "0000");
 
   const push = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-receive-pack");
   assert.equal(push.status, 403);
@@ -126,6 +128,74 @@ test("Git reads of workspace repositories go to the relay; pushes and other repo
   const status = JSON.parse((await get(instance.socketPath, "/__pistead/status")).body) as { network: unknown; repositories: string[]; recent: { outcome: string }[] };
   assert.deepEqual(status.repositories, ["https://github.com/acme/app.git"]);
   assert.deepEqual(status.recent.map(entry => entry.outcome), ["allowed", "allowed", "refused", "refused"]);
+});
+
+/** One pkt-line of `text`. */
+function pkt(text: string): string { return (Buffer.byteLength(text, "latin1") + 4).toString(16).padStart(4, "0") + text; }
+const zero = "0".repeat(40), tip = "c".repeat(40);
+
+test("push requests are parsed up to their first flush, and only the session branch passes", async () => {
+  const commands = pkt(`shallow ${tip}\n`) + pkt(`${zero} ${tip} refs/heads/pistead/s1\0report-status side-band-64k\n`) + "0000";
+  const parsed = parsePushCommands(new TextEncoder().encode(commands + "PACK"))!;
+  assert.deepEqual(parsed.commands, [{ old: zero, new: tip, ref: "refs/heads/pistead/s1" }]);
+  assert.deepEqual(parsed.capabilities, ["report-status", "side-band-64k"]);
+  assert.equal(parsed.end, commands.length);
+  assert.equal(parsePushCommands(new TextEncoder().encode(commands.slice(0, 30))), undefined);
+  assert.throws(() => parsePushCommands(new TextEncoder().encode(pkt("push-cert\0\n"))), /Signed pushes/);
+  assert.throws(() => parsePushCommands(new TextEncoder().encode(pkt("not a command\n"))), /Invalid Git push request/);
+  // The stream is rebuilt unchanged, however its chunks fell.
+  const bytes = new TextEncoder().encode(commands + "PACK-DATA");
+  const chunked = new ReadableStream<Uint8Array>({ start(controller) { for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.subarray(i, i + 7)); controller.close(); } });
+  const read = await readPushCommands(chunked);
+  assert.equal(read.commands.length, 1);
+  assert.equal(await new Response(read.body).text(), commands + "PACK-DATA");
+
+  assert.equal(sessionBranchRefusal(parsed.commands, "pistead/s1"), undefined);
+  assert.match(sessionBranchRefusal([{ old: zero, new: tip, ref: "refs/heads/main" }], "pistead/s1")!, /not main; use the git_push tool/);
+  assert.match(sessionBranchRefusal([{ old: tip, new: zero, ref: "refs/heads/pistead/s1" }], "pistead/s1")!, /can't be deleted/);
+  assert.match(sessionBranchRefusal([...parsed.commands, ...parsed.commands], "pistead/s1")!, /once per push/);
+
+  // A refusal reads like a forge's: one "ng" per command, on band 1 when the client multiplexes.
+  const plain = new TextDecoder().decode(pushRejection([{ old: zero, new: tip, ref: "refs/heads/main" }], ["report-status"], "Not this branch"));
+  assert.equal(plain, `${pkt("unpack ok\n")}${pkt("ng refs/heads/main Not this branch\n")}0000`);
+  const banded = new TextDecoder().decode(pushRejection([{ old: zero, new: tip, ref: "refs/heads/main" }], ["report-status", "side-band-64k"], "Not this branch"));
+  assert.equal(banded, `${pkt(`\x01${plain}`)}0000`);
+  assert.equal(pushRejection([], ["side-band-64k"], "x"), undefined);
+});
+
+test("a clone session's proxy relays pushes of its own branch, streaming the pack, and rejects others like a forge", async t => {
+  const packs: string[] = [];
+  const { instance, relayed } = await proxy(t, { sessionBranch: "pistead/s1", relay: async request => {
+    if (request.service === "receive-refs") return new Response("refs", { headers: { "content-type": "application/x-git-receive-pack-advertisement" } });
+    assert.ok(request.body instanceof ReadableStream);
+    packs.push(await new Response(request.body).text());
+    return new Response("report", { headers: { "content-type": "application/x-git-receive-pack-result" } });
+  } });
+  const refs = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-receive-pack");
+  assert.equal(refs.status, 200);
+  assert.equal(refs.headers["content-type"], "application/x-git-receive-pack-advertisement");
+  const headers = { "content-type": "application/x-git-receive-pack-request" };
+  const branch = pkt(`${zero} ${tip} refs/heads/pistead/s1\0report-status side-band-64k\n`) + "0000";
+  const pushed = await get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers, body: branch + "PACK-DATA" });
+  assert.equal(pushed.status, 200);
+  assert.equal(pushed.body, "report");
+  assert.deepEqual(packs, [branch + "PACK-DATA"]);
+  assert.deepEqual(relayed.map(request => request.service), ["receive-refs", "receive-pack"]);
+
+  const main = pkt(`${zero} ${tip} refs/heads/main\0report-status side-band-64k\n`) + "0000";
+  const rejected = await get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers, body: main + "PACK-DATA" });
+  assert.equal(rejected.status, 200);
+  assert.match(rejected.body, /ng refs\/heads\/main Only this session's branch pistead\/s1 can be pushed without approval, not main/);
+  // Git's probe before a chunked upload is answered here; neither reaches the control plane.
+  const probe = await get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers, body: "0000" });
+  assert.equal(probe.status, 200);
+  assert.equal(probe.body, "");
+  assert.equal(relayed.length, 2);
+  const other = await get(instance.socketPath, "/git/github.com/acme/other.git/info/refs?service=git-receive-pack");
+  assert.equal(other.status, 403);
+  assert.match(other.body, /pushes go only to them/);
+  const gzip = await get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers: { ...headers, "content-encoding": "gzip" }, body: branch });
+  assert.equal(gzip.status, 415);
 });
 
 test("the relay's refusal reaches Git as text, and other repositories on allowed hosts are fetched directly", async t => {
@@ -305,6 +375,55 @@ test("a clone's commit is pushed as it is, fast-forward only", { skip: !sandboxe
     (error: Error) => error instanceof PushError && /fetch and merge or rebase/.test(error.message));
   await assert.rejects(sandbox.cloneHead("missing", authorize));
   await assert.rejects(sandbox.cloneHead("../escape", authorize), /Invalid clone directory/);
+});
+
+test("a sandboxed git push of the session branch goes through the proxy; other branches are rejected", { skip: !sandboxed }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "egress-branch-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = join(directory, "projects");
+  await mkdir(join(projects, "acme"), { recursive: true });
+  const work = join(directory, "upstream");
+  const environment = { ...process.env, GIT_AUTHOR_NAME: "U", GIT_AUTHOR_EMAIL: "u@example.test", GIT_COMMITTER_NAME: "U", GIT_COMMITTER_EMAIL: "u@example.test" };
+  const git = (args: string[], cwd: string) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: environment });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const bare = join(projects, "acme", "app.git");
+  await mkdir(work);
+  git(["init", "-q", "-b", "main"], work);
+  await writeFile(join(work, "README.md"), "from upstream\n");
+  git(["add", "README.md"], work);
+  git(["commit", "-q", "-m", "initial"], work);
+  git(["clone", "-q", "--bare", work, bare], directory);
+  const server = await startGitHttpServer(projects);
+  t.after(() => server.close());
+  // The control plane's relay, here straight to git http-backend: reads and pushes alike.
+  const paths: Record<string, string> = { "info-refs": "info/refs?service=git-upload-pack", "upload-pack": "git-upload-pack",
+    "receive-refs": "info/refs?service=git-receive-pack", "receive-pack": "git-receive-pack" };
+  const { instance, relayed } = await proxy(t, { sessionBranch: "pistead/branch-push", relay: async request => fetch(`${server.url("acme/app.git")}/${paths[request.service]}`, {
+    method: request.service.endsWith("refs") ? "GET" : "POST", body: request.service.endsWith("refs") ? undefined : request.body,
+    headers: { ...(request.contentType ? { "content-type": request.contentType } : {}), ...(request.gitProtocol ? { "git-protocol": request.gitProtocol } : {}) },
+    ...(request.body instanceof ReadableStream ? { duplex: "half" } : {}),
+  } as RequestInit) });
+  const sandbox = new Sandbox(binding("branch-push"), join(directory, "session"), undefined, { egressSocket: instance.socketPath, sessionBranch: "pistead/branch-push" });
+  t.after(() => sandbox.close());
+  await sandbox.initialize();
+  const shell = (command: string) => sandbox.execute({ kind: "bash", command }, false, async () => {}, { allowTestShell: true });
+  await shell("git clone -q https://github.com/acme/app.git app && cd app && echo change > change.txt && git add change.txt && git commit -q -m 'Add a change'"
+    + ' && git push -q origin "HEAD:$PISTEAD_SESSION_BRANCH"');
+  assert.equal(git(["show", "refs/heads/pistead/branch-push:change.txt"], bare), "change");
+  assert.ok(relayed.some(request => request.service === "receive-pack"));
+  // Moving it again is a plain fast-forward push too.
+  await shell("cd app && echo more >> change.txt && git commit -q -am 'More' && git push -q origin HEAD:pistead/branch-push");
+  assert.equal(git(["show", "refs/heads/pistead/branch-push:change.txt"], bare), "change\nmore");
+  // A pack larger than Git's post buffer streams in chunks, after Git's probe.
+  await shell("cd app && head -c 3000000 /dev/urandom > large.bin && git add large.bin && git commit -q -m 'Large' && git push -q origin HEAD:pistead/branch-push");
+  assert.equal(git(["cat-file", "-s", "refs/heads/pistead/branch-push:large.bin"], bare), "3000000");
+  // Any other branch is rejected the way a forge rejects it, naming the session branch.
+  await assert.rejects(shell("cd app && git push origin HEAD:main"), /remote rejected.*Only this session's branch pistead\/branch-push can be pushed without approval/);
+  assert.equal(git(["rev-parse", "refs/heads/main"], bare), git(["rev-parse", "main"], work));
 });
 
 test("https://user@host remotes are the same repository, and a refused grant ends access at once", async t => {

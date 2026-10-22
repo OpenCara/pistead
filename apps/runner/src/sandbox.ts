@@ -53,6 +53,8 @@ export interface SandboxOptions {
    * and the helper relays the sandbox's loopback EGRESS_PORT to it: their only way out of the network namespace.
    */
   egressSocket?: string;
+  /** The branch a clone session's shell commands may push through the proxy, given to them as PISTEAD_SESSION_BRANCH. */
+  sessionBranch?: string;
   /**
    * The host repository cache's mirrors this session may borrow from (clone sessions on a cache host), asked for before
    * each shell command and each step that runs Git in a clone (a borrowing clone can't read its objects without them).
@@ -1552,6 +1554,7 @@ export class Sandbox {
   readonly #repositories: readonly SessionRepository[];
   readonly #cacheObjects: readonly string[];
   readonly #egressSocket: string | undefined;
+  readonly #sessionBranch: string | undefined;
   readonly #mirrors: (() => Promise<readonly MirrorMount[]>) | undefined;
   /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
   #cacheMounted = false;
@@ -1584,6 +1587,7 @@ export class Sandbox {
     this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
     if (options.egressSocket !== undefined && !isAbsolute(options.egressSocket)) throw new Error("Invalid egress socket path");
     this.#egressSocket = options.egressSocket;
+    this.#sessionBranch = options.sessionBranch;
     this.#mirrors = options.mirrors;
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
@@ -1969,7 +1973,7 @@ export class Sandbox {
       "--chdir", this.worktree, "--clearenv",
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
-    if (egress) for (const [name, value] of Object.entries(egressEnvironment())) args.push("--setenv", name, value);
+    if (egress) for (const [name, value] of Object.entries(egressEnvironment(this.#sessionBranch))) args.push("--setenv", name, value);
     if (egress && this.#mirrors) args.push("--setenv", "PATH", `${SHIM_DIRECTORY}:${this.#environment.PATH}`);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;

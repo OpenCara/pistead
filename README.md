@@ -124,7 +124,7 @@ Owners and admins bind a repository under **Settings → Workspaces →** the wo
 How sessions use them depends on the host. On a sandboxed host with an up-to-date connector that can run the session owner's shell commands (the host's owner's own sessions, or any session when the host has [resource limits](#the-sandbox)), sessions **clone on demand**:
 
 - The session starts with an empty worktree and nothing pinned. The agent clones the repositories it needs with plain Git (`git clone https://github.com/acme/app`), and fetches, switches and creates branches as usual. Git reaches the workspace's repositories through the session's [egress proxy](#network-access), which reads them with the **session owner's own** account; the account never reaches the host.
-- The agent commits with Git and publishes a clone with `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
+- The agent commits with Git and pushes its work to the session's own branch, `pistead/<session-id>`, with plain `git push`, without approval. Other branches, and pull requests, go through `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
 - Removing a repository from the workspace stops new reads and pushes of it at once, in running sessions too.
 
 Elsewhere, on older connectors, and for agents without `bash` (a session started from a model has it), sessions **pin** their repositories:
@@ -190,7 +190,7 @@ Shell commands (`bash`) also need resource limits. A connector started with `--r
 A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080`); file tools, commits and every other sandboxed step have no network at all.
 
 - **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. The proxy relays them to Pistead, which reads the repository with the **session owner's own account**; the credential never reaches the host. Pistead re-checks the session and the owner's access on every request.
-- **Pushes don't go through the proxy yet:** commit, then use `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
+- **In a session that clones on demand, pushes of the session's own branch work too:** `git push origin HEAD:pistead/<session-id>` (the branch is in `$PISTEAD_SESSION_BRANCH`). The proxy relays them to Pistead, which pushes with the workspace's [push identity](#push-access); its credential never leaves Pistead. A push of any other branch is rejected, as a Git host rejects one, and goes through `git_push` instead (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). Pinned sessions push only with `git_push`.
 - **Everything else follows the workspace's network access**, under **Settings → Workspaces →** the workspace **→ Network access** (owners and admins):
 
   | Access | HTTPS reaches |
@@ -390,7 +390,7 @@ Everything Pistead shows people (transcripts, approvals and their output, in eve
 
 Agents commit as the session owner's Git identity: with Git itself in a session that clones on demand, or with `git_commit` in a session with pinned repositories. With `git_push` (connector 0.5.0 or newer) they push committed work to a branch:
 
-- In a session that clones on demand, `git_push {directory, branch}` pushes a clone's checked-out commit as it is to the workspace repository the clone's `origin` names. If the branch moved, the agent fetches and merges or rebases first.
+- In a session that clones on demand, the agent pushes the session's own branch `pistead/<session-id>` with plain `git push`, without approval: Pistead checks, as for `git_push`, that the session owner may push to the repository, and pushes with the workspace's push identity (its own Git credentials on the host can't serve here). For any other branch, `git_push {directory, branch}` pushes a clone's checked-out commit as it is to the workspace repository the clone's `origin` names; if the branch moved, the agent fetches and merges or rebases first. To open a pull request from the session branch, the agent calls `git_push` with that branch and a pull request.
 - In a session with pinned repositories, it pushes one repository's committed session work: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so the branch gets only the session's changes.
 - The approval shows the repository, the clone's directory if any, the branch and the exact commit.
 - Pushes are fast-forward only and never forced; a branch that moved elsewhere is refused.

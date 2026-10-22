@@ -1,6 +1,7 @@
 # Design: sessions that use plain Git through a host egress proxy
 
-Status: phases 1 (the egress proxy and Git relay), 2 (clone sessions) and 3 (the host cache for clones) implemented. Phases 4–5 below are planned. This replaces the pinned
+Status: phases 1 (the egress proxy and Git relay), 2 (clone sessions), 3 (the host cache for clones) and the pushes of phase 4
+implemented. Durability (the rest of phase 4) and phase 5 below are planned. This replaces the pinned
 snapshot model of [repository-cache.md](repository-cache.md); that document is rewritten in phase 5.
 
 ## Goal
@@ -86,7 +87,7 @@ it for a minute, and keeps a stale one for up to five minutes if the control pla
 
 ### Not in phase 1
 
-- Pushes through the proxy (phase 4); `git_push` keeps working as before.
+- Pushes through the proxy (phase 4: only the session branch, in clone sessions); `git_push` keeps working as before.
 - Hosts without the sandbox: their commands use the host's network directly, and the policy doesn't apply.
 - Persisting the proxy's decisions: they live in memory for the open session.
 - Shell commands still stop after 30 seconds, which limits large clones until the host cache (phase 3).
@@ -167,3 +168,33 @@ Hosts started with `--repo-cache` already keep one bare mirror per repository fo
 - Backups of sessions whose clones borrow from a mirror hold the clones' own objects only; they restore on a host whose
   mirror still has the rest. Phase 4 replaces them with session branches.
 - Pre-filling a mirror without a session: every fill needs a session's owner and the relay.
+
+## Phase 4: pushing the session branch
+
+A clone session's own branch is `pistead/<session-id>` (`sessionBranch`), given to shell commands as
+`PISTEAD_SESSION_BRANCH`. The agent pushes it with plain Git, without approval; every other branch still goes through
+`git_push` and its approval, and so do pull requests (the agent calls `git_push` with the session branch once it has
+pushed it). Pinned sessions push only with `git_push`.
+
+- **In the proxy.** `info/refs?service=git-receive-pack` (`receive-refs`) and `git-receive-pack` (`receive-pack`) of a
+  workspace repository are relayed only when the session has a branch. The proxy reads a push's command section
+  (`readPushCommands`: pkt-lines up to the first flush, at most 64 KiB) and lets through exactly one command that creates
+  or moves `refs/heads/pistead/<session-id>` (`sessionBranchRefusal`); anything else is answered as a forge answers it
+  (`pushRejection`: `ng <ref> <reason>`, on side-band 1 when negotiated), so Git shows `! [remote rejected] … (reason)`.
+  Git's probe before a chunked upload (a lone flush) is answered here. The pack then streams to the control plane as Git
+  sends it, up to 2 GiB.
+- **In the control plane** (`push/session-branch.ts`, behind the same relay route). Only clone sessions, and only while the
+  owner holds `write` on them, no restore or move is pending, and the binding is still configured. As for an approved
+  push, the owner's own account must be able to push the repository (`pushTarget`), and the binding's default-branch
+  policy applies. The command section is checked again, then the workspace's push
+  identity is minted (`mintPushToken` with `relay`) and used by the control plane itself: the owner's token needs no
+  reset, the host's own Git credentials can't serve (`host_git_credentials_relay`), and the owner's account still serves
+  only sessions on their own hosts. The advertisement and the push each mint, and an installation token is revoked once
+  its answer has streamed back. Each push is audited as `git.push.session_branch` with its old and new commit.
+- **Errors.** The control plane's refusals of the advertisement reach Git as `remote: …` text, which covers a missing or
+  unusable push identity and missing permission before any pack is sent.
+
+### Not yet
+
+- Backups and moves of clone sessions still snapshot the worktree; durability is the next step.
+- A push's upload must finish within the control plane's request timeout.
