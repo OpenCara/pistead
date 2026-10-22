@@ -62,7 +62,11 @@ export function hostAllowed(policy: NetworkPolicy, host: string): boolean {
 }
 
 /** A workspace repository the egress proxy relays for Git reads, with the session owner's own credential. */
-export interface EgressRepository { bindingId: string; provider: GitProvider; host: string; fullName: string }
+export interface EgressRepository {
+  bindingId: string; provider: GitProvider; host: string; fullName: string;
+  /** The provider's id of the repository, which keys the host cache; absent from older control planes. */
+  repositoryId?: string;
+}
 /** What the control plane lets one session's egress proxy do; the proxy asks again every minute. */
 export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[] }
 /** The Git smart-HTTP requests the relay forwards: the ref advertisement and the fetch itself. Pushes are not relayed. */

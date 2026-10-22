@@ -824,7 +824,7 @@ test("clone sessions pin nothing, commit with Git and push a clone's directory",
   assert.throws(() => new RunnerSession(clone, root, config(root, { unsandboxed: true })), /sandboxed host/);
 
   const grant = { policy: { mode: "off" as const, domains: [], packageRegistries: true },
-    repositories: [{ bindingId: "repo-1", provider: "github" as const, host: "github.com", fullName: "acme/project-1" }] };
+    repositories: [{ bindingId: "repo-1", provider: "github" as const, host: "github.com", repositoryId: "1", fullName: "acme/project-1" }] };
   const session = new RunnerSession(clone, root, config(root, { egressGrant: async () => grant, resolveModels: async () => { throw MODEL_BOUNDARY; } }));
   t.after(() => session.sandbox.close());
   await assert.rejects(session.open(), error => error === MODEL_BOUNDARY);

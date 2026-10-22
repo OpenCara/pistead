@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type { Duplex } from "node:stream";
-import { bindingRemote, gitProviders, validGitHost, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
+import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
 import { hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { RunnerError } from "./protocol.js";
 
@@ -44,6 +44,11 @@ export interface EgressOptions {
   /** Overridable for tests: DNS resolution and outbound TCP. */
   lookup?: (host: string) => Promise<{ address: string; family: number }[]>;
   connect?: (port: number, address: string) => Duplex;
+  /**
+   * Brings the host's mirror of a workspace repository up to date and returns where the sandbox sees it; set only
+   * where the host keeps a repository cache. The `git` shim asks for it before a clone, to borrow its objects.
+   */
+  mirror?: (repository: EgressRepository) => Promise<string>;
 }
 
 /**
@@ -304,6 +309,7 @@ export class EgressProxy {
         return refuse(response, 403, "Plain HTTP is not allowed through the Pistead egress proxy; use HTTPS");
       }
       if (url.pathname === "/__pistead/status" && request.method === "GET") return await this.#status(response);
+      if (url.pathname === "/__pistead/mirror" && request.method === "GET") return await this.#mirror(response, url.searchParams.get("remote") ?? "");
       if (url.pathname.startsWith("/git/")) return await this.#git(request, response, url);
       return refuse(response, 404, "Unknown Pistead egress endpoint");
     } catch (error) {
@@ -324,6 +330,23 @@ export class EgressProxy {
       gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`,
       recent: this.#log.slice(-50),
     }, null, 2)}\n`);
+  }
+
+  async #mirror(response: ServerResponse, remote: string): Promise<void> {
+    if (!this.#options.mirror) return refuse(response, 404, "This host keeps no repository cache");
+    const repository = repositoryForRemote((await this.#currentGrant()).repositories, remote.slice(0, 2048));
+    if (!repository) return refuse(response, 404, "Not one of this workspace's repositories");
+    const label = bindingRemote(repository).slice(0, 300);
+    let path: string;
+    try { path = await this.#options.mirror(repository); }
+    catch (error) {
+      const reason = error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached";
+      this.#record({ kind: "git", target: label, outcome: "refused", reason: `mirror: ${reason}` });
+      return refuse(response, 502, reason);
+    }
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: "mirror" });
+    response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    response.end(`${JSON.stringify({ path })}\n`);
   }
 
   async #git(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
@@ -423,9 +446,10 @@ export function parseEgressGrant(value: unknown): EgressGrant {
   const repositories = input.repositories.map((item: unknown): EgressRepository => {
     const repository = item as Partial<EgressRepository> | null;
     if (!repository || typeof repository.bindingId !== "string" || !IDENTIFIER.test(repository.bindingId)
-      || !gitProviders.includes(repository.provider as GitProvider) || !validGitHost(repository.host)
+      || !gitProviders.includes(repository.provider as GitProvider) || !validGitHost(repository.host) || (repository.repositoryId !== undefined && !validRepositoryId(repository.repositoryId))
       || !validRepositoryName(repository.provider!, repository.fullName)) throw new RunnerError(502, "Invalid repositories from the control plane");
-    return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName };
+    return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
+      ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}) };
   });
   return { policy, repositories };
 }
@@ -446,6 +470,30 @@ export async function relayGitRequest(fetchImpl: typeof fetch, url: string, auth
   let error: unknown;
   try { error = (JSON.parse(text) as { error?: unknown }).error; } catch { error = undefined; }
   throw new RunnerError(response.status, typeof error === "string" && /^[\x20-\x7e -￿]{1,500}$/.test(error) ? error : "The control plane refused the Git request");
+}
+
+/**
+ * A `fetch` for GitRemote that sends its Git reads of one workspace repository through the control plane's relay, so
+ * the host's mirror is filled with the session owner's access and every read is checked. Anything else is refused.
+ */
+export function relayFetch(bindingId: string, relay: (request: RelayRequest) => Promise<Response>): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const service: EgressGitService | undefined = url.pathname.endsWith("/info/refs") && url.searchParams.get("service") === "git-upload-pack" ? "info-refs"
+      : url.pathname.endsWith("/git-upload-pack") && !url.search ? "upload-pack" : undefined;
+    if (!service) throw new RunnerError(403, "Only Git reads go through the relay");
+    const headers = new Headers(init?.headers);
+    const body = init?.body ? new Uint8Array(await new Response(init.body).arrayBuffer()) : undefined;
+    if (body && body.byteLength > UPLOAD_REQUEST_BYTES) throw new RunnerError(413, "The Git request is too large");
+    try {
+      return await relay({ bindingId, service, userAgent: headers.get("user-agent") ?? undefined, gitProtocol: headers.get("git-protocol") ?? undefined,
+        contentType: headers.get("content-type") ?? undefined, contentEncoding: headers.get("content-encoding") ?? undefined, ...(body ? { body } : {}) });
+    } catch (error) {
+      // GitRemote reports a status as a failed request; the control plane's reason stays with the caller's own log.
+      if (error instanceof RunnerError) return new Response(null, { status: error.status >= 400 && error.status < 600 ? error.status : 502 });
+      throw error;
+    }
+  }) as typeof fetch;
 }
 
 /** The relay route for one Git read, below the connector or internal prefix. */

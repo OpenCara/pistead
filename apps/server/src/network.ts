@@ -71,7 +71,8 @@ export async function egressGrant(c: AppContext, connectorId: string | null): Pr
     .bind(row.workspace_id).all();
   const grant: EgressGrant = {
     policy: await workspaceNetworkPolicy(c.env.DB, row.workspace_id),
-    repositories: repositories.map(repository => ({ bindingId: repository.id, provider: repository.provider, host: repository.host, fullName: repository.full_name })),
+    repositories: repositories.map(repository => ({ bindingId: repository.id, provider: repository.provider, host: repository.host,
+      repositoryId: repository.repository_id, fullName: repository.full_name })),
   };
   return c.json(grant, 200, { 'Cache-Control': 'private, no-store' });
 }

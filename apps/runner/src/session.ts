@@ -1,6 +1,6 @@
 import type { HostCommandOperation, GitRepinOperation, RepinRequest, RepinResult } from "../../../packages/shared/src/types.js";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, StringEnum, Type, type Models } from "@earendil-works/pi-ai";
@@ -14,19 +14,19 @@ import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
-import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.js";
+import { MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
 import { prepareImage } from "./images.js";
 import { performClonePush, performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
-import { GitRemoteError } from "./git-remote.js";
-import { RepositoryCacheError, checkoutBudget, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCache } from "./repo-cache.js";
+import { GitRemote, GitRemoteError } from "./git-remote.js";
+import { RepositoryCacheError, checkoutBudget, mirrorPath, repositoryAuthorization, type MirrorRepository, type RepositoryAuthorization, type RepositoryCache } from "./repo-cache.js";
 import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
-import { EgressProxy, egressSocketPath, parseEgressGrant, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import type { EgressGrant } from "../../../packages/shared/src/network.js";
+import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
+import type { EgressGrant, EgressRepository } from "../../../packages/shared/src/network.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -118,6 +118,24 @@ function internalOrigin(controlPlaneUrl: string): string {
   return origin.origin;
 }
 
+/** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
+const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
+
+/**
+ * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
+ * from the relay or a GitRemoteError status (relayFetch turns the relay's refusals into HTTP statuses).
+ */
+function refused(error: unknown): boolean {
+  const status = error instanceof RunnerError ? error.status : error instanceof GitRemoteError ? error.status : undefined;
+  return status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/** A grant's repository as the cache keys it; an older control plane that names no provider id offers no mirror. */
+function mirrorRepository(repository: EgressRepository): MirrorRepository & { bindingId: string } {
+  if (repository.repositoryId === undefined) throw new RunnerError(409, "Update the Pistead server to cache this repository on the host");
+  return { bindingId: repository.bindingId, provider: repository.provider, host: repository.host, repositoryId: repository.repositoryId, fullName: repository.fullName };
+}
+
 function preparationFailure(reason: string): string {
   return `${reason.replace(/\.$/, "")}. Restart the session to try again.`;
 }
@@ -177,6 +195,11 @@ export class RunnerSession {
   readonly #clone: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
+  /**
+   * The host cache's mirrors this clone session may borrow from, by sandbox path, and when the relay last let its owner
+   * read each (0: not yet in this open). Mounted only while confirmed in the last MIRROR_CONFIRM_MS (see mirrorMounts).
+   */
+  private readonly mirrors = new Map<string, { mount: MirrorMount; repository: MirrorRepository & { bindingId: string }; confirmedAt: number }>();
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -192,7 +215,8 @@ export class RunnerSession {
     if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"), options);
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
-      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath });
+      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath,
+        ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
     const report = config.reportActivity;
     this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
@@ -205,10 +229,90 @@ export class RunnerSession {
       grant: async () => parseEgressGrant(this.config.egressGrant
         ? await this.config.egressGrant(sessionId)
         : await this.controlPlane("/api/internal/network", { sessionId })),
-      relay: request => this.config.gitRelay ? this.config.gitRelay(sessionId, request)
-        : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
-          { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)),
+      relay: request => this.relay(request),
+      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
     });
+  }
+
+  /**
+   * One Git read through the control plane's relay, with the session owner's access. A refusal also stops this session
+   * borrowing from the host's mirror of that repository.
+   */
+  private async relay(request: RelayRequest): Promise<Response> {
+    const sessionId = this.binding.session.id;
+    try {
+      return await (this.config.gitRelay ? this.config.gitRelay(sessionId, request)
+        : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
+          { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
+    } catch (error) {
+      if (refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
+      throw error;
+    }
+  }
+
+  /** A workspace repository read through the relay, for the host cache: the relay itself adds the owner's credential. */
+  private relayRemote(repository: EgressRepository, signal?: AbortSignal): GitRemote {
+    return new GitRemote({ url: bindingRemote(repository), authorization: "Bearer relay", fetch: relayFetch(repository.bindingId, request => this.relay(request)), signal });
+  }
+
+  /** Refreshes the host's mirror of `repository` for this session and lets its shell commands borrow from it. */
+  private async mirror(value: EgressRepository): Promise<string> {
+    const repository = mirrorRepository(value);
+    await this.config.repositoryCache!.refresh({ repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: this.relayRemote(value) });
+    return this.allowMirror(repository, Date.now());
+  }
+
+  private allowMirror(repository: MirrorRepository & { bindingId: string }, confirmedAt: number): string {
+    // The cache's own layout, at a path every session sees the same way.
+    const mount = { source: this.config.repositoryCache!.mirrorDirectory(repository, this.binding.owner.id), target: `${MIRROR_ROOT}/${mirrorPath(repository)}` };
+    this.mirrors.set(mount.target, { mount, repository, confirmedAt });
+    return mount.target;
+  }
+
+  /**
+   * The mirrors a step that runs Git in a clone gets: those of repositories still in the workspace's grant, each read
+   * through the relay with the owner's access in the last MIRROR_CONFIRM_MS (older ones are confirmed again first, and
+   * their keep refs marked used). A repository the grant or the relay no longer allows is dropped for this open.
+   */
+  private async mirrorMounts(): Promise<MirrorMount[]> {
+    let repositories: EgressRepository[];
+    try { repositories = (await this.#egress!.grant()).repositories; }
+    catch (error) {
+      if (refused(error)) this.mirrors.clear();
+      return [];
+    }
+    const granted = new Set(repositories.map(repository => repository.bindingId));
+    for (const [target, entry] of this.mirrors) if (!granted.has(entry.repository.bindingId)) this.mirrors.delete(target);
+    const stale = [...this.mirrors.values()].filter(entry => Date.now() - entry.confirmedAt > MIRROR_CONFIRM_MS);
+    await Promise.all(stale.map(async entry => {
+      try {
+        await this.relayRemote(entry.repository, AbortSignal.timeout(15_000)).listRefs();
+        entry.confirmedAt = Date.now();
+        await this.config.repositoryCache!.touch(entry.repository, this.binding.owner.id, this.binding.session.id).catch(() => {});
+      } catch (error) {
+        // A refusal ends borrowing for this open; anything else (a timeout, a rate limit, an outage) only skips this step,
+        // and the next one asks again.
+        if (refused(error)) this.mirrors.delete(entry.mount.target);
+      }
+    }));
+    return [...this.mirrors.values()].filter(entry => Date.now() - entry.confirmedAt <= MIRROR_CONFIRM_MS).map(entry => entry.mount);
+  }
+
+  /**
+   * After a reopen, clones made earlier still borrow from mirrors that exist on this host. Each is listed again, but
+   * mounted only once the relay confirms the owner can still read its repository (see mirrorMounts).
+   */
+  private async restoreMirrors(repositories: readonly EgressRepository[]): Promise<void> {
+    const cache = this.config.repositoryCache;
+    if (!this.#clone || !cache) return;
+    this.mirrors.clear();
+    for (const value of repositories) {
+      if (value.repositoryId === undefined) continue;
+      const repository = mirrorRepository(value);
+      try { await lstat(join(cache.mirrorDirectory(repository, this.binding.owner.id), "HEAD")); }
+      catch { continue; }
+      this.allowMirror(repository, 0);
+    }
   }
 
   private assertTicket(ticket: RunnerTicket): void {
@@ -533,8 +637,11 @@ export class RunnerSession {
 
   private async openHarness(): Promise<void> {
     await this.initializeRepositories();
-    if (this.#clone) this.#cloneRepositories = await this.#egress!.grant()
-      .then(grant => grant.repositories.map(repository => bindingRemote(repository)), () => []);
+    if (this.#clone) {
+      const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
+      this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
+      await this.restoreMirrors(repositories);
+    }
     const registry = createRegistry();
     this.tools = this.buildTools();
     const extension = defineExtension({ name: "workspace-tools", tools: this.tools });

@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { link, lstat, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
-import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { repositoryLimits, type GitProvider, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { GitRemote, ProgressLines, parseGitProgress, type GitProgressPhase } from "./git-remote.js";
 import { RunnerError } from "./protocol.js";
@@ -51,6 +51,16 @@ export interface RepositoryCacheOptions {
   progressIntervalMs?: number;
 }
 
+/** A workspace repository a clone session's mirror is kept for: the provider identity, never a pin. */
+export interface MirrorRepository { provider: GitProvider; host: string; repositoryId: string; fullName: string }
+export interface MirrorTarget {
+  repository: MirrorRepository; ownerId: string; sessionId: string;
+  /** Reaches the repository with the session owner's access, through the control plane's relay. */
+  remote: GitRemote;
+}
+/** One cached repository as `pistead cache list` shows it. */
+export interface CachedRepository { directory: string; bytes: number; sessions: number; pins: number }
+
 export class RepositoryCacheError extends Error {
   constructor(message: string) { super(message); this.name = "RepositoryCacheError"; }
 }
@@ -85,6 +95,19 @@ const GIT_TIMEOUT_MS = 60 * 60 * 1000;
 const LOCK_POLL_MS = 250;
 const LOCK_NAME = "pistead.lock";
 const PIN_PREFIX = "refs/pistead/pins/";
+/** A clone session's keep ref: a commit whose parents are the branch tips it saw, so its borrowed objects stay. */
+const SESSION_PREFIX = "refs/pistead/sessions/";
+/** Parents per keep commit; more tips chain several, so no command line grows past the system's limit. */
+const KEEP_PARENTS = 500;
+
+/** A repository's place in the cache, and in every sandbox that mounts its mirror: `<provider>/<host>/<id>.git`. */
+export function mirrorPath(repository: { provider: string; host: string; repositoryId: string }): string {
+  if (!/^[a-z0-9-]{1,32}$/.test(repository.provider) || !/^[a-z0-9.-]{1,253}(?::[0-9]{1,5})?$/.test(repository.host)
+    || !/^[A-Za-z0-9{}_-]{1,100}$/.test(repository.repositoryId)) {
+    throw new RepositoryCacheError("Repository cannot name a cache directory");
+  }
+  return join(repository.provider, repository.host.replace(":", "_"), `${repository.repositoryId}.git`);
+}
 const UPSTREAM_PREFIX = "refs/upstream/";
 const CAPTURE_BYTES = 64 * 1024 * 1024;
 
@@ -113,15 +136,19 @@ export class RepositoryCache {
 
   /** Bare repository directory of a pin; owner-scoped caches never share a directory across owners. */
   directory(pin: SessionRepository, ownerId: string): string {
-    const provider = "provider" in pin ? pin.provider : "github";
-    const host = "provider" in pin ? pin.host : "github.com";
-    const id = String(pin.repositoryId);
-    if (!/^[a-z0-9-]{1,32}$/.test(provider) || !/^[a-z0-9.-]{1,253}(?::[0-9]{1,5})?$/.test(host) || !/^[A-Za-z0-9{}_-]{1,100}$/.test(id)) {
-      throw new RepositoryCacheError("Repository pin cannot name a cache directory");
-    }
-    const base = this.#scope === "owner" ? join(this.#root, "owners", digest(ownerId)) : this.#root;
-    return join(base, provider, host.replace(":", "_"), `${id}.git`);
+    return this.#directory("provider" in pin ? pin.provider : "github", "provider" in pin ? pin.host : "github.com", String(pin.repositoryId), ownerId);
   }
+
+  /** Bare repository directory of a clone session's mirror: the same one a pin of that repository uses. */
+  mirrorDirectory(repository: MirrorRepository, ownerId: string): string {
+    return this.#directory(repository.provider, repository.host, repository.repositoryId, ownerId);
+  }
+
+  #directory(provider: string, host: string, id: string, ownerId: string): string {
+    const base = this.#scope === "owner" ? join(this.#root, "owners", digest(ownerId)) : this.#root;
+    return join(base, mirrorPath({ provider, host, repositoryId: id }));
+  }
+
 
   /** Objects directory a session lists in `objects/info/alternates` once `ensure` has succeeded. */
   objects(pin: SessionRepository, ownerId: string): string {
@@ -160,6 +187,72 @@ export class RepositoryCache {
     return inspectPinnedTree(cacheGit(this.directory(pin, ownerId), signal), pin, budget);
   }
 
+  /**
+   * Brings a clone session's mirror up to date with every branch and tag the remote advertises, and records the
+   * session's keep ref. Fetches only what is new; serialized with every other operation on the repository.
+   */
+  async refresh(target: MirrorTarget, options: { onProgress?: Listener; signal?: AbortSignal } = {}): Promise<{ directory: string; fetched: boolean }> {
+    const directory = this.mirrorDirectory(target.repository, target.ownerId);
+    return this.#serialized(directory, target.repository.fullName, throttle(options.onProgress, this.#interval), options.signal, async (emit) => {
+      await this.#prepare(directory);
+      const git = cacheGit(directory, options.signal);
+      emit({ phase: "connecting", percent: null, done: null, total: null, bytes: 0 });
+      const advertised = await target.remote.listRefs();
+      const before = await git.objectTypes([...advertised.values()]);
+      const wants = [...before].filter(([, type]) => type === null).map(([id]) => id);
+      const bytes = wants.length ? await this.#fetchObjects(git, target.remote, wants, emit) : 0;
+      await this.#updateUpstream(git, advertised, []);
+      // Its branch tips as of now, on top of those it saw before: whatever its clones borrowed stays until prune drops
+      // the keep ref.
+      const heads = [...new Set([...advertised].filter(([ref]) => ref.startsWith("refs/heads/")).map(([, id]) => id))];
+      const present = await git.objectTypes(heads);
+      await keep(git, target.sessionId, heads.filter(id => present.get(id) === "commit"));
+      emit({ phase: "done", percent: 100, done: null, total: null, bytes });
+      return { directory, fetched: wants.length > 0 };
+    });
+  }
+
+  /** Marks a clone session's keep ref as used now, so prune counts its idle time from here. Fetches nothing. */
+  async touch(repository: MirrorRepository, ownerId: string, sessionId: string): Promise<void> {
+    const directory = this.mirrorDirectory(repository, ownerId);
+    try { await lstat(join(directory, "HEAD")); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    await this.#serialized(directory, repository.fullName, undefined, undefined, async () => { await keep(cacheGit(directory), sessionId, []); });
+  }
+
+  /** Every cached repository, with its size and how many sessions and pins keep objects in it. */
+  async list(): Promise<CachedRepository[]> {
+    const repositories: CachedRepository[] = [];
+    for (const directory of await cacheRepositories(this.#root)) {
+      const refs = (await cacheGit(directory).capture(["for-each-ref", "--format=%(refname)", SESSION_PREFIX, PIN_PREFIX])).split("\n").filter(Boolean);
+      repositories.push({ directory, bytes: await directorySize(directory), sessions: refs.filter(ref => ref.startsWith(SESSION_PREFIX)).length,
+        pins: refs.filter(ref => ref.startsWith(PIN_PREFIX)).length });
+    }
+    return repositories;
+  }
+
+  /**
+   * Drops clone sessions' keep refs older than `age` and collects what no ref reaches any more, past the same age.
+   * A clone in a session idle for longer loses the objects it borrowed. Pins are never dropped.
+   */
+  async prune(age: number): Promise<{ repositories: number; sessions: number }> {
+    if (!Number.isSafeInteger(age) || age < 0) throw new RepositoryCacheError("Invalid prune age");
+    const cutoff = Math.floor((Date.now() - age) / 1000);
+    let repositories = 0, sessions = 0;
+    for (const directory of await cacheRepositories(this.#root)) {
+      await this.#serialized(directory, basename(directory), undefined, undefined, async () => {
+        const git = cacheGit(directory);
+        const stale = (await git.capture(["for-each-ref", "--format=%(committerdate:unix) %(refname)", SESSION_PREFIX])).split("\n")
+          .map(line => line.split(" ") as [string, string]).filter(([date, ref]) => ref && Number(date) <= cutoff).map(([, ref]) => ref);
+        if (stale.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${stale.map(ref => `delete ${ref}`).join("\n")}\n`);
+        await git.run(["gc", "--quiet", `--prune=${cutoff}`]);
+        repositories++;
+        sessions += stale.length;
+      });
+    }
+    return { repositories, sessions };
+  }
+
   /** Drops a session's pin ref so cache gc may later reclaim objects only it reached. */
   async release(target: Omit<RepositoryCacheTarget, "remote">): Promise<void> {
     const directory = this.directory(target.pin, target.ownerId);
@@ -182,10 +275,18 @@ export class RepositoryCache {
     // The host's credential lives only in this object for this one fetch.
     const remote = new GitRemote({ url: target.remote, authorization: await this.#authorization(target.remote, deadline), fetch: this.#fetch, signal: deadline });
     const advertised = await remote.listRefs();
-    const haves = (await git.capture(["for-each-ref", "--format=%(objecttype) %(objectname)", "--sort=-committerdate", UPSTREAM_PREFIX]))
-      .split("\n").filter(line => line.startsWith("commit ")).map(line => line.slice(7));
     const before = await git.objectTypes([pin.commit, ...advertised.values()]);
     const wants = [...before].filter(([, type]) => type === null).map(([id]) => id);
+    const bytes = await this.#fetchObjects(git, remote, wants, emit);
+    if (await git.objectType(pin.commit) !== "commit") throw new RepositoryCacheError("The fetched history does not contain the pinned commit");
+    await this.#updateUpstream(git, advertised, [`update ${pinRef(sessionId)} ${pin.commit}`]);
+    emit({ phase: "done", percent: 100, done: null, total: null, bytes });
+  }
+
+  /** Fetches `wants` and their history into the cache, checked complete like `git fetch` does; returns the pack's size. */
+  async #fetchObjects(git: CacheGit, remote: GitRemote, wants: string[], emit: (progress: Omit<RepositoryCacheProgress, "path">) => void): Promise<number> {
+    const haves = (await git.capture(["for-each-ref", "--format=%(objecttype) %(objectname)", "--sort=-committerdate", UPSTREAM_PREFIX]))
+      .split("\n").filter(line => line.startsWith("commit ")).map(line => line.slice(7));
     let bytes = 0;
     let phase: Omit<RepositoryCacheProgress, "path"> = { phase: "connecting", percent: null, done: null, total: null, bytes };
     const update = (line: string) => {
@@ -206,10 +307,14 @@ export class RepositoryCache {
     // index-pack -v reports "Receiving objects" and "Resolving deltas" on stderr.
     await git.run(["index-pack", "--stdin", "-v", "--fix-thin"], counted, update);
     emit({ phase: "verifying", percent: null, done: null, total: null, bytes });
-    if (await git.objectType(pin.commit) !== "commit") throw new RepositoryCacheError("The fetched history does not contain the pinned commit");
     // The same connectivity check `git fetch` performs: everything new must be complete in this repository.
     // "^oid" lines rather than "--not", which older Git does not accept on rev-list's stdin.
     await git.run(["rev-list", "--objects", "--quiet", "--stdin"], [...wants, ...haves.map(id => `^${id}`), ""].join("\n"));
+    return bytes;
+  }
+
+  /** Mirrors the advertised branches and tags as refs/upstream/*, keeping only those whose objects are here. */
+  async #updateUpstream(git: CacheGit, advertised: Map<string, string>, extra: string[]): Promise<void> {
     const after = await git.objectTypes([...advertised.values()]);
     const current = new Map((await git.capture(["for-each-ref", "--format=%(refname) %(objectname)", UPSTREAM_PREFIX]))
       .split("\n").filter(Boolean).map(line => line.split(" ") as [string, string]));
@@ -224,9 +329,8 @@ export class RepositoryCache {
     // Deletes commit first, on their own: a branch renamed from feature/login to feature (or back) is a file/directory
     // conflict that Git refuses inside one transaction, in either order.
     if (deletes.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${deletes.join("\n")}\n`);
-    updates.push(`update ${pinRef(sessionId)} ${pin.commit}`);
-    await git.run(["update-ref", "--no-deref", "--stdin"], `${updates.join("\n")}\n`);
-    emit({ phase: "done", percent: 100, done: null, total: null, bytes });
+    updates.push(...extra);
+    if (updates.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${updates.join("\n")}\n`);
   }
 
   /** Creates the cache root privately and initializes the bare repository atomically. */
@@ -290,6 +394,54 @@ export class RepositoryCache {
       if (state.tail === settled && !state.listeners.size) this.#queues.delete(directory);
     }
   }
+}
+
+/**
+ * Moves a session's keep ref to a new commit, dated now, whose parents are its previous keep commit and `tips`: what its
+ * clones borrowed earlier stays reachable as long as the ref does.
+ */
+async function keep(git: CacheGit, sessionId: string, tips: readonly string[]): Promise<void> {
+  const ref = `${SESSION_PREFIX}${digest(sessionId)}`;
+  const previous = (await git.capture(["for-each-ref", "--format=%(objectname)", ref])).trim();
+  const parents = [...(OID.test(previous) ? [previous] : []), ...tips];
+  if (!parents.length) return;
+  const tree = (await git.capture(["mktree"])).trim();
+  let head: string | undefined;
+  for (let index = 0; index < parents.length; index += KEEP_PARENTS) {
+    const batch = [...(head ? [head] : []), ...parents.slice(index, index + KEEP_PARENTS)];
+    head = (await git.capture(["-c", "user.name=Pistead", "-c", "user.email=pistead@localhost", "commit-tree", tree,
+      ...batch.flatMap(id => ["-p", id]), "-m", "Objects a clone session borrows"])).trim();
+    if (!OID.test(head)) throw new RepositoryCacheError("The session's keep ref could not be written");
+  }
+  await git.run(["update-ref", "--no-deref", ref, head!]);
+}
+
+/** The bare repositories below a cache root: `<provider>/<host>/<id>.git`, also under `owners/<owner>/`. */
+async function cacheRepositories(root: string): Promise<string[]> {
+  const found: string[] = [];
+  const children = async (directory: string): Promise<string[]> => {
+    try { return (await readdir(directory, { withFileTypes: true })).filter(entry => entry.isDirectory()).map(entry => join(directory, entry.name)); }
+    catch (error) { if (errorCode(error) === "ENOENT") return []; throw error; }
+  };
+  const visit = async (base: string) => {
+    for (const provider of await children(base)) {
+      if (basename(provider) === "owners") continue;
+      for (const host of await children(provider)) {
+        for (const repository of await children(host)) if (/^[A-Za-z0-9{}_-]{1,100}\.git$/.test(basename(repository))) found.push(repository);
+      }
+    }
+  };
+  await visit(root);
+  for (const owner of await children(join(root, "owners"))) await visit(owner);
+  return found.sort();
+}
+
+async function directorySize(directory: string): Promise<number> {
+  let total = 0;
+  for (const entry of await readdir(directory, { withFileTypes: true, recursive: true })) {
+    if (entry.isFile()) total += (await lstat(join(entry.parentPath, entry.name))).size;
+  }
+  return total;
 }
 
 function pinRef(sessionId: string): string {
