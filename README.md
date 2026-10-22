@@ -127,7 +127,7 @@ How sessions use them depends on the host. On a sandboxed host with an up-to-dat
 - The agent commits with Git and publishes a clone with `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
 - Removing a repository from the workspace stops new reads and pushes of it at once, in running sessions too.
 
-Elsewhere, and on older connectors, sessions **pin** their repositories:
+Elsewhere, on older connectors, and for agents without `bash` (a session started from a model has it), sessions **pin** their repositories:
 
 - Every new session pins each bound ref to an exact commit, resolved with the **session owner's own** account for that provider. Everyone who starts sessions needs a connected account that can read the workspace's repositories; binding a repository never lends anyone your accounts.
 - The host gets a private snapshot of each repository, one folder per repository in the session's worktree: `owner/repo` for GitHub, under the host name for other providers. Snapshots have no Git history, submodules or LFS files, and the session starts from a single snapshot commit. Existing sessions never follow later changes in the repository or the workspace.
