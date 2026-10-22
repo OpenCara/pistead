@@ -453,6 +453,8 @@ docker compose up -d
 
 The image builds the web app and the bundled server and runs them as a non-root user. The server listens on port 8787 and keeps its SQLite database in the `pistead-data` volume; it stores no session backups unless you set `STORAGE_URL` (see [Database and backup storage](#database-and-backup-storage)). `GET /api/health` reports which providers are configured, and the image's health check uses it. Migrations run automatically at start-up: to upgrade, update the source and run `docker compose up -d --build`.
 
+Each release is also published as `ghcr.io/opencara/pistead` (`latest`, `X.Y` and `X.Y.Z`, for linux/amd64 and linux/arm64); to use it instead of building, set `image: ghcr.io/opencara/pistead:latest` and drop `build: .` in `docker-compose.yml`.
+
 Put a reverse proxy with TLS in front of it (Caddy, nginx, Traefik, a cloud load balancer); the app serves plain HTTP. If the proxy sets `X-Forwarded-Proto`/`X-Forwarded-Host`, set `TRUST_PROXY=true`. The proxy must pass WebSocket upgrades on `/api/connectors/socket`, accept request bodies of 32 MiB for dump imports, and route `/.well-known/` to Pistead if you use `OIDC_SIGNING_KEY`. The server gzips its responses and session event streams itself, and compresses the connector WebSocket for connectors that offer it, so the proxy needs no compression of its own.
 
 ### GitHub sign-in and apps
@@ -558,6 +560,7 @@ await fetch("/api/auth/test", { method: "POST", headers: { Authorization: "Beare
 - `pnpm connect …` runs the connector from source, with the same options as `pistead connect`; add `--allow-insecure-loopback` to pair with a local `http://` server.
 - `pnpm test:connected` runs the end-to-end suite against a real server and connector (Linux with bubblewrap).
 - `pnpm dev:native [--port 8787] [--no-host] [--pairing]` runs a local test-mode server for developing the apps: a test user with an app token, a workspace and, unless `--no-host`, this machine as a host offering the deterministic fixture model (not an LLM) with one session. `--pairing` adds a pairing code for the desktop app. It writes what the apps need to `.local/dev-native.json`; Ctrl-C stops it and deletes its data.
+- Releasing: bump `version` in `packages/cli/package.json`, run `pnpm --filter pistead run shrinkwrap`, merge to `main`, then push a matching tag (`git tag v0.9.0 && git push origin v0.9.0`). The Release workflow checks the tag is on `main` and matches that version, runs CI, then publishes `pistead` to npm (with provenance; a prerelease such as `v0.9.0-beta.1` goes to the `next` dist-tag) and the server image to GHCR. npm needs either a trusted publisher on npmjs.com for `OpenCara/pistead`, workflow `release.yml`, environment `release`, or an `NPM_TOKEN` repository secret.
 
 ## Layout
 
