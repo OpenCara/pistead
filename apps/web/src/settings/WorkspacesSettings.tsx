@@ -10,6 +10,7 @@ import { gitAccountLabel, gitProviderLabel, RepositorySnapshotPolicy, useGitAcco
 import { href } from "../router";
 import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
+import { NetworkAccess } from "./NetworkAccess";
 import { PushAccess } from "./PushAccess";
 import { WorkspaceDatabaseSection } from "./WorkspaceDatabase";
 
@@ -66,6 +67,7 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
     <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />
     <Repositories workspace={workspace} admin={admin} {...repositories} />
     <PushAccess workspace={workspace} admin={admin} />
+    <NetworkAccess workspace={workspace} admin={admin} />
     <WorkspaceDatabaseSection workspace={workspace} owner={role === "owner"} />
     <Members workspace={workspace} admin={admin} />
     {admin && <DataExport workspace={workspace} />}

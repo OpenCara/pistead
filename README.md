@@ -87,7 +87,7 @@ Pistead signs people in with GitHub only, and asks GitHub for the `read:user use
 
 ### Workspaces and members
 
-Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Session database**, **Members** and, for owners and admins, **Data export**.
+Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and the role **Member** or **Admin**; saving an existing member changes their role.
 
@@ -96,6 +96,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | Start sessions, use published agents, view workspace-visible sessions | ✓ | ✓ | ✓ |
 | Bind and remove repositories, set their push policy | ✓ | ✓ | |
 | Manage push identities | ✓ | ✓ | |
+| Set network access | ✓ | ✓ | |
 | Add members, remove members | ✓ | ✓ | |
 | Add, promote or remove admins | ✓ | | |
 | Connect the session database, import dumps | ✓ | | |
@@ -174,9 +175,27 @@ The host's page shows its **Status** (online or offline, owner, capabilities), *
 
 #### The sandbox
 
-With bubblewrap, every session runs in its own sandbox: no network, read-only system directories, and only the session's own worktree writable. Commands in it stop after 30 seconds. Git there runs without hooks, credentials or SSH: an approved push gets a credential for that push alone (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)), and GitHub actions go through Pistead.
+With bubblewrap, every session runs in its own sandbox: no direct network (see [Network access](#network-access)), read-only system directories, and only the session's own worktree writable. Commands in it stop after 30 seconds. Git there runs without hooks, stored credentials or SSH: an approved push gets a credential for that push alone (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)), and GitHub actions go through Pistead.
 
 Shell commands (`bash`) also need resource limits. A connector started with `--resources PATH` (an operator-provisioned cgroup v2 configuration: CPU, memory, process and disk limits, described in [`apps/runner/src/resources.ts`](apps/runner/src/resources.ts)) runs them in every session. Without it, only the host's owner can let commands run without limits, and only in their own sessions, through a [permission request](#permission-requests); in other members' sessions on that host, `bash` is refused.
+
+#### Network access
+
+A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080`); file tools, commits and every other sandboxed step have no network at all.
+
+- **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. The proxy relays them to Pistead, which reads the repository with the **session owner's own account**; the credential never reaches the host. Pistead re-checks the session and the owner's access on every request.
+- **Pushes don't go through the proxy yet:** commit, then use `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
+- **Everything else follows the workspace's network access**, under **Settings → Workspaces →** the workspace **→ Network access** (owners and admins):
+
+  | Access | HTTPS reaches |
+  |---|---|
+  | **Off** (default) | Nothing besides the workspace's repositories |
+  | **Allowlist** | The listed domains (`*.example.com` for subdomains), and, with **Allow package registries**, npm, PyPI, crates.io, Go modules, RubyGems, Maven, NuGet and Packagist |
+  | **Open** | Any public host |
+
+  Other repositories on an allowed host are fetched without credentials. Only HTTPS on port 443 is tunnelled, the proxy never looks inside it, and addresses in the host's own networks (loopback, private, link-local, such as cloud metadata services) are never reachable. Running sessions pick up a change within a minute.
+
+`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the repositories the proxy relays and its recent decisions. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
 
 #### Running without the sandbox
 
@@ -190,6 +209,7 @@ The connector prints the risks and asks you to type `unsandboxed` before it star
 
 - Approved commands and commits run directly as your user, with access to your files, credentials (`~/.ssh`, cloud and Git configuration, Pi's auth) and network, and no CPU, memory or disk limits.
 - File tools are confined to each session's folder by path checks only.
+- Commands use this machine's network directly: the workspace's [network access](#network-access) doesn't apply.
 - Anyone you share the host with, and anyone with approve permission on a session that runs on it, can cause approved commands to run on your machine.
 
 Pistead labels such a host **Unsandboxed** to everyone who can see it.

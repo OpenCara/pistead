@@ -9,7 +9,7 @@ import { resetGitHubToken } from '../auth.js';
 import type { RepositoryAccess } from '../repositories.js';
 import { importRsaPrivateKey, signJwt } from './jwt.js';
 import { issuerAssertion, workspaceSubject } from './oidc.js';
-import { ownerPushAuthorization } from './targets.js';
+import { ownerGitAuthorization } from './targets.js';
 
 export interface MintTarget {
   workspaceId: string; sessionId: string;
@@ -320,7 +320,7 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
     case 'owner-account': {
       // The owner's token goes only to the owner's own host, for this one push.
       requireOwnHost(target, row.kind);
-      const minted = { kind: row.kind, identityId: row.id, authorization: ownerPushAuthorization(target.owner), expiresAt: expiresAt(undefined, 3600) };
+      const minted = { kind: row.kind, identityId: row.id, authorization: ownerGitAuthorization(target.owner), expiresAt: expiresAt(undefined, 3600) };
       if (target.owner.provider !== 'github') return minted;
       // The GitHub sign-in token is reset after the push, which needs Pistead's OAuth app.
       if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {

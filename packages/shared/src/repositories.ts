@@ -179,15 +179,20 @@ export function sessionRepositoryProvider(repository: SessionRepository): GitPro
  * cache derive it themselves and require the control plane's answer to match, so neither side can be pointed elsewhere.
  */
 export function repositoryRemote(pin: SessionRepository): string {
-  const name = pin.fullName;
-  switch (sessionRepositoryProvider(pin)) {
+  return bindingRemote({ provider: sessionRepositoryProvider(pin), host: "provider" in pin ? pin.host : "github.com", fullName: pin.fullName });
+}
+
+/** Credential-free https clone URL of a workspace repository binding; `repositoryRemote` for a pin of it. */
+export function bindingRemote(binding: { provider: GitProvider; host: string; fullName: string }): string {
+  const name = binding.fullName;
+  switch (binding.provider) {
     case "github": return `https://github.com/${name}.git`;
     case "bitbucket": return `https://bitbucket.org/${name}.git`;
     case "azure-devops": {
       const [organization, project, repository] = name.split("/") as [string, string, string];
       return `https://dev.azure.com/${organization}/${encodeURIComponent(project)}/_git/${encodeURIComponent(repository)}`;
     }
-    default: return `https://${"provider" in pin ? pin.host : "github.com"}/${name}.git`;
+    default: return `https://${binding.host}/${name}.git`;
   }
 }
 

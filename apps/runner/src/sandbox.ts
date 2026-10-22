@@ -7,6 +7,7 @@ import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryPinIdentity } from "./protocol.js";
+import { EGRESS_PORT, EGRESS_SOCKET, egressEnvironment } from "./egress.js";
 import type { HostCommandOperation, Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import type { PushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
@@ -47,6 +48,11 @@ export interface SandboxOptions {
    * `objects/info/alternates` names once its repositories are checked out of the cache.
    */
   repositoryObjects?: Readonly<Record<string, string>>;
+  /**
+   * Host path of the session's egress proxy socket (see EgressProxy). Shell commands get it read-only at EGRESS_SOCKET,
+   * and the helper relays the sandbox's loopback EGRESS_PORT to it: their only way out of the network namespace.
+   */
+  egressSocket?: string;
 }
 
 /** "absent": pristine storage. Otherwise how the ready baseline was made: from archives, or from the host repository cache. */
@@ -127,7 +133,7 @@ interface Transfer { input?: AsyncIterable<Uint8Array>; output?: (stdout: Readab
  * with O_NOFOLLOW, so swapping a checked parent for a symlink cannot win a race.
  */
 const HELPER = String.raw`
-import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, shutil, stat, subprocess, sys, zlib
+import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, shutil, socket, stat, subprocess, sys, threading, zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -805,6 +811,55 @@ GIT = GIT_HARDENED + ['-c', 'core.worktree=' + WORK, '-c', 'safe.directory=' + W
                       '-c', 'user.email=' + os.environ['GIT_AUTHOR_EMAIL']]
 
 
+def egress_relay(path, port):
+    # The sandbox has its own network namespace with only loopback. Each connection to the loopback port is relayed,
+    # byte for byte, to the session's egress proxy socket, which decides what may leave.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(('127.0.0.1', port))
+    listener.listen(64)
+
+    def pump(source, target):
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                target.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                target.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def serve(client):
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            upstream.connect(path)
+        except OSError:
+            upstream.close()
+            client.close()
+            return
+        back = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+        back.start()
+        pump(client, upstream)
+        back.join()
+        client.close()
+        upstream.close()
+
+    def accept():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(client,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+
+
 def run(argv, data=None):
     child = subprocess.run(argv, input=data, stdin=subprocess.DEVNULL if data is None else None,
                            cwd=WORK, close_fds=True)
@@ -1087,6 +1142,9 @@ def main():
         run(GIT + ['rev-parse', '--verify', 'HEAD'])
         return
     if kind == 'bash':
+        egress = request.get('egress')
+        if egress is not None:
+            egress_relay(egress['socket'], int(egress['port']))
         run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
         return
     if kind == 'status':
@@ -1340,6 +1398,7 @@ export class Sandbox {
   readonly #testProvider: boolean;
   readonly #repositories: readonly SessionRepository[];
   readonly #cacheObjects: readonly string[];
+  readonly #egressSocket: string | undefined;
   /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
   #cacheMounted = false;
   #initialization: Promise<void> | undefined;
@@ -1369,6 +1428,8 @@ export class Sandbox {
     this.#testProvider = binding.model.provider === "faux";
     this.#repositories = repositoryPins(binding.session.repositories ?? []);
     this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
+    if (options.egressSocket !== undefined && !isAbsolute(options.egressSocket)) throw new Error("Invalid egress socket path");
+    this.#egressSocket = options.egressSocket;
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
@@ -1667,6 +1728,7 @@ export class Sandbox {
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
     if (requireResources && !this.#resources) return Promise.reject(new Error("Production bash resources are unavailable"));
     const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
+    const egress = request.kind === "bash" ? this.#egressSocket : undefined;
     const args = [
       "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
       "--cap-drop", "ALL",
@@ -1683,10 +1745,14 @@ export class Sandbox {
       // the private cache root, so nothing a session controls can redirect these. A missing directory is skipped;
       // Git then reports the missing objects instead of reading anything else.
       ...(this.#cacheMounted ? this.#cacheObjects.flatMap((source, index) => ["--ro-bind-try", source, `${CACHE_MOUNT}/${index}`]) : []),
+      // Only shell commands reach the network, and only through the session's proxy. A missing socket (the session is
+      // not open) is skipped; requests then fail to connect.
+      ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET] : []),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
+    if (egress) for (const [name, value] of Object.entries(egressEnvironment())) args.push("--setenv", name, value);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
     const launch = requireResources
@@ -1781,7 +1847,8 @@ export class Sandbox {
         }
       });
       const line = JSON.stringify({ ...request, expectedRepositories: this.#repositories,
-        repositoryAlternates: this.#cacheObjects.map((_, index) => `${CACHE_MOUNT}/${index}`) });
+        repositoryAlternates: this.#cacheObjects.map((_, index) => `${CACHE_MOUNT}/${index}`),
+        ...(egress ? { egress: { socket: EGRESS_SOCKET, port: EGRESS_PORT } } : {}) });
       const input = transfer.input;
       if (!input) child.stdin!.end(line);
       else {

@@ -25,6 +25,8 @@ import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
+import { EgressProxy, egressSocketPath, parseEgressGrant, relayGitRequest, relayPath, type RelayRequest } from "./egress.js";
+import type { EgressGrant } from "../../../packages/shared/src/network.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -102,6 +104,9 @@ export type RunnerConfig = {
   openStorage?: (path: string) => Promise<Storage>;
   /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
   reportActivity?: (sessionId: string, activity: SessionActivity) => Promise<void>;
+  /** A session's network grant and its Git relay, through the connector; without them, the control plane's internal routes. */
+  egressGrant?: (sessionId: string) => Promise<EgressGrant>;
+  gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
 };
 
 /** Runner callbacks without a connector go to the control plane's internal routes, over HTTPS or local HTTP only. */
@@ -166,6 +171,8 @@ export class RunnerSession {
   #resumed = false;
   /** Reports what the agent is doing while the session is open, when the runner has somewhere to report it. */
   readonly #activity: ActivityReporter | undefined;
+  /** The sandbox's only way out (see EgressProxy); listening while the session is open. Host mode has no sandbox to confine. */
+  readonly #egress: EgressProxy | undefined;
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -176,11 +183,26 @@ export class RunnerSession {
     // Every session on a cache host knows its cache; only a cache-backed one mounts it, once this open re-authorized its pins.
     const options = cache && pins.length
       ? { repositoryObjects: Object.fromEntries(pins.map(pin => [pin.path, cache.objects(pin, binding.owner.id)])) } : {};
-    this.sandbox = config.unsandboxed
-      ? new HostWorkspace(binding, join(directory, "sandbox"), options)
-      : new Sandbox(binding, join(directory, "sandbox"), config.resources, options);
+    if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"), options);
+    else {
+      this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
+      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath });
+    }
     const report = config.reportActivity;
     this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
+  }
+
+  private egressProxy(socketPath: string): EgressProxy {
+    const sessionId = this.binding.session.id;
+    return new EgressProxy({
+      socketPath,
+      grant: async () => parseEgressGrant(this.config.egressGrant
+        ? await this.config.egressGrant(sessionId)
+        : await this.controlPlane("/api/internal/network", { sessionId })),
+      relay: request => this.config.gitRelay ? this.config.gitRelay(sessionId, request)
+        : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
+          { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)),
+    });
   }
 
   private assertTicket(ticket: RunnerTicket): void {
@@ -483,6 +505,7 @@ export class RunnerSession {
   }
 
   async open(): Promise<void> {
+    await this.#egress?.start();
     await this.initializeRepositories();
     const registry = createRegistry();
     this.tools = this.buildTools();
@@ -1518,6 +1541,7 @@ export class RunnerSession {
     // A Session that already failed on a storage error has closed itself, and closing again only repeats that error.
     // Read the flag first: a close that fails now also marks the session failed, and its error must still surface.
     const failed = this.#failed;
+    await this.#egress?.close();
     await this.harness.close(context).catch((error: unknown) => { if (!failed) throw error; });
   }
 

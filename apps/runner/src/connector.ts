@@ -17,6 +17,7 @@ import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
 import { assertId, ConnectorSetupError, RunnerError, validateRepositories, verifyRunnerTicket } from "./protocol.js";
+import { parseEgressGrant, relayGitRequest, relayPath } from "./egress.js";
 import { withHostToolCapabilities } from "./host-capabilities.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { recoverResourceOrphans } from "./resources.js";
@@ -495,6 +496,14 @@ export class LocalConnector {
               url: z.string().max(2048).regex(/^https:\/\/\S+$/), number: z.number().int().positive(), created: z.boolean(),
             }).strict().optional(),
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/complete", payload));
+        },
+        egressGrant: async sessionId => parseEgressGrant(await this.brokerCallback(generation, "/api/connectors/self/network", { sessionId })),
+        // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget.
+        gitRelay: (sessionId, request) => {
+          this.requireGeneration(generation);
+          return relayGitRequest(this.options.fetch ?? fetch, `${this.state!.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
+            { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken! }, request,
+            AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
         readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
