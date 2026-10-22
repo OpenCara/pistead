@@ -15,7 +15,7 @@ import { parseOperation } from './operations.js';
 import { requireConnectorSession } from './connectors.js';
 import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
-import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
+import { cloneRepositories, legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
 import { invalidateSessionView, sessionView, viewChanges } from './view-feed.js';
@@ -198,18 +198,23 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
         fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use host_bash and git_repin.');
       }
     }
-    const resolved = await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
+    // A sandboxed host that can run this owner's shell commands starts the session without pins: its agent clones the
+    // workspace's repositories with plain Git through the host's egress proxy. Elsewhere repositories are pinned.
+    const clone = !!session.connector_id && capabilities.plainGit === true && capabilities.sandbox === true && !capabilities.unsandboxed
+      && (capabilities.productionShell === true || session.connector_owner_id === ownerId);
+    const resolved = clone ? await cloneRepositories(c.env, workspaceId, ownerId) : await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
     // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind.
     agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities);
-    const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: JSON.stringify(resolved.repositories) };
+    const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: JSON.stringify(resolved.repositories),
+      repository_mode: clone ? 'clone' : null };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const providerPins = resolved.repositories.some(repository => 'provider' in repository) ? 1 : 0;
     await requireMember(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
     // Admit pins only while every exact owner credential used to resolve them is still current.
     const inserted = await c.env.DB.query(`INSERT INTO sessions
-      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?
+      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
       AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
       AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ?
@@ -235,10 +240,10 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
             WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
       )) RETURNING id`)
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
-        row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private',
+        row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null,
         workspaceId, ownerId, workspaceId, resolved.bindingIds,
-        // Real owners need pinned repositories; legacy empty sessions are synthetic test-mode fixtures only.
-        ownerId, resolved.repositories.length ? 1 : 0, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
+        // Real owners need pinned repositories or a clone session; other empty sessions are synthetic test-mode fixtures only.
+        ownerId, clone || resolved.repositories.length ? 1 : 0, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
         resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
         JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
         row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,

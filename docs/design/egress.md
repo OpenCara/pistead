@@ -1,6 +1,6 @@
 # Design: sessions that use plain Git through a host egress proxy
 
-Status: phase 1 implemented (the egress proxy and Git relay). Phases 2–5 below are planned. This replaces the pinned
+Status: phases 1 (the egress proxy and Git relay) and 2 (clone sessions) implemented. Phases 3–5 below are planned. This replaces the pinned
 snapshot model of [repository-cache.md](repository-cache.md); that document is rewritten in phase 5.
 
 ## Goal
@@ -90,3 +90,41 @@ it for a minute, and keeps a stale one for up to five minutes if the control pla
 - Hosts without the sandbox: their commands use the host's network directly, and the policy doesn't apply.
 - Persisting the proxy's decisions: they live in memory for the open session.
 - Shell commands still stop after 30 seconds, which limits large clones until the host cache (phase 3).
+
+## Phase 2: clone sessions
+
+### Which sessions clone
+
+A session is created as a **clone session** (`sessions.repository_mode = 'clone'`, `SessionRecord.repositoryMode`) when
+its host's connector advertises `plainGit` (sandboxed connectors of this version) and can run the session owner's shell
+commands: the host has resource limits (`productionShell`), or the owner is the host's owner. Shell access is what
+cloning needs, so elsewhere sessions keep pinning as before; phase 5 revisits that. The mode is immutable like the pins
+(a trigger refuses updates), carried by restores, and required of a host a clone session moves to.
+
+A clone session pins nothing: creation checks the workspace has a repository and that its bindings don't change before
+the insert, but resolves nothing with the owner's accounts. The relay checks the owner's own access on every read.
+
+### In the session
+
+- The worktree starts empty. The agent clones through the proxy, fetches and switches branches with Git, and commits
+  with Git. The instructions say so and list the workspace's repositories from the grant.
+- `git_status`, `git_commit` and `git_repin` are not offered, and their operations are refused; the control plane
+  refuses repins of clone sessions too.
+- `git_push {directory, branch, pull_request?}` pushes a clone. The runner reads the clone's checked-out commit and its
+  `origin` (`clone-head`), maps the origin to a workspace repository (`repositoryForRemote`: `https://`, SSH and the
+  proxy's own form) and asks for approval of `{kind, repository, directory, branch, commit}`, `repository` being that
+  binding's path.
+- The push broker and the GitHub broker resolve a clone session's repository from the workspace's bindings
+  (`cloneSessionRepository`) instead of its pins; everything else about minting, policies and pull requests is
+  unchanged.
+- `performClonePush` sends the commit as it is: the remote's advertisement gives the branch's tip and the other tips;
+  the sandbox (`clone-push-prepare`) reports which tips the clone has, whether the branch's tip is an ancestor of the
+  commit, and the new commits; a branch that moved is refused (fetch and merge or rebase first); the pack
+  (`clone-push-pack`) excludes what the present tips reach. Git runs in the clone read-only, with its own config but the
+  hardened flags, inside the sandbox.
+
+### Not in phase 2
+
+- Clone sessions have backups as before; the snapshot includes the clones and their `.git`, so large clones hit the
+  backup size limit until durability moves to the session branch (phase 4).
+- Recording the commits served by the relay; pushes are recorded in the push ledger as before.

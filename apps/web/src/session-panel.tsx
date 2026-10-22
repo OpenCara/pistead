@@ -259,6 +259,7 @@ function HiddenSecretNote() {
 function GitPushSummary({ operation }: { operation: GitPushOperation }) {
   return <dl className="small">
     <dt className="muted">Repository</dt><dd><code>{operation.repository}</code></dd>
+    {operation.directory && <><dt className="muted">Clone</dt><dd><code>{operation.directory}/</code></dd></>}
     <dt className="muted">Branch</dt><dd><code>{operation.branch}</code></dd>
     <dt className="muted">Commit</dt><dd><code title={operation.commit}>{operation.commit.slice(0, 12)}</code></dd>
     {operation.pullRequest && <><dt className="muted">Pull request</dt><dd>{operation.pullRequest.title}{operation.pullRequest.base ? <> → <code>{operation.pullRequest.base}</code></> : " → default branch"}</dd></>}
@@ -312,6 +313,14 @@ function HostSection({ session, user, hosts }: { session: SessionRecord; user: U
 
 function RepositoriesSection({ session, refresh }: { session: SessionRecord; refresh: () => void }) {
   const repositories = session.repositories ?? [];
+  if (session.repositoryMode === "clone") return <Section title="Repositories" info={<p>
+    The agent clones this workspace's repositories into the session with plain Git, through the host's egress proxy. Reads use the session owner's own Git accounts, which never reach the host; pushes go through approval.
+  </p>} bare>
+    <div className="card">
+      <Row leading={<Icon name="git-branch" size={16} />} title="Cloned on demand" hint="Nothing is pinned: the agent clones and switches branches as it works" />
+      <Row title="Manage repositories and network access" href={href({ name: "settings", section: "workspaces", id: session.workspaceId })} chevron />
+    </div>
+  </Section>;
   return <Section
     title={<>Repositories <span className="muted">{repositories.length}</span></>}
     info={<><RepositorySnapshotPolicy /><p>Pins are fixed at session start using the session owner's connected Git accounts, not the host owner's or a collaborator's. They record source inputs, not live cache status; later workspace changes don't affect them.</p></>}

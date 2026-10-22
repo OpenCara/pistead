@@ -186,6 +186,9 @@ export class EgressProxy {
     await rm(this.socketPath, { force: true });
   }
 
+  /** The session's current grant, as the proxy enforces it. */
+  grant(): Promise<EgressGrant> { return this.#currentGrant(); }
+
   /** The most recent decisions, newest last. */
   entries(): EgressEntry[] { return [...this.#log]; }
 
@@ -352,6 +355,23 @@ export class EgressProxy {
       response.destroy();
     }
   }
+}
+
+/**
+ * The workspace repository a clone's remote URL names: https://host/path, git@host:path, ssh://git@host/path, or the
+ * proxy's own rewritten form. Undefined for anything else.
+ */
+export function repositoryForRemote(repositories: readonly EgressRepository[], url: string): EgressRepository | undefined {
+  let target: string | undefined;
+  if (url.startsWith(EGRESS_GIT_BASE)) target = url.slice(EGRESS_GIT_BASE.length);
+  else if (url.startsWith("https://")) target = url.slice("https://".length).replace(/^[^@/]*@/, "");
+  else {
+    const ssh = /^(?:ssh:\/\/)?git@([^:/]+)[:/](.+)$/.exec(url);
+    if (ssh) target = `${ssh[1]}/${ssh[2]}`;
+  }
+  if (!target) return undefined;
+  const key = repositoryKey(target.split(/[?#]/)[0]!);
+  return repositories.find(repository => repositoryKey(bindingRemote(repository).replace(/^https:\/\//, "")) === key);
 }
 
 const IDENTIFIER = /^[A-Za-z0-9_-]{1,128}$/;

@@ -183,6 +183,32 @@ async function repositoryCommit(access: RepositoryAccess, binding: WorkspaceRepo
   if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) fail(502, 'invalid_repository_commit', `${gitProviderNames[access.provider]} did not return an immutable commit.`);
   return sha;
 }
+/**
+ * In a clone session, the workspace repository a broker request names (`matches`), shaped like a pin so the push and
+ * GitHub brokers treat both kinds of session alike. Its commit is a placeholder: no broker uses a pin's commit. Null when
+ * the session pins its repositories or no binding matches.
+ */
+export async function cloneSessionRepository(env: Env, row: SessionRow, matches: (binding: RepositoryRow) => boolean): Promise<SessionRepository | null> {
+  if (row.repository_mode !== 'clone') return null;
+  const bindings = await env.DB.query<RepositoryRow>('SELECT * FROM workspace_repositories WHERE workspace_id = ? ORDER BY id').bind(row.workspace_id).all();
+  const binding = bindings.find(matches);
+  if (!binding) return null;
+  const commit = '0'.repeat(40);
+  return binding.provider === 'github'
+    ? { bindingId: binding.id, repositoryId: Number(binding.repository_id), fullName: binding.full_name, ref: binding.ref, commit, path: binding.full_name }
+    : { bindingId: binding.id, provider: binding.provider, host: binding.host, repositoryId: binding.repository_id, fullName: binding.full_name,
+      ref: binding.ref, commit, path: repositoryPath({ provider: binding.provider, host: binding.host, fullName: binding.full_name }) };
+}
+/**
+ * A clone session pins nothing and borrows no owner credential at creation: the egress relay checks the owner's own
+ * access on every read. The workspace still needs a repository, and its bindings must not change before the insert.
+ */
+export async function cloneRepositories(env: Env, workspaceId: string, ownerId: string): Promise<RepositoryResolution> {
+  await requireMember(env, workspaceId, ownerId);
+  const configured = await workspaceRepositories(env, workspaceId);
+  if (!configured.length) fail(409, 'workspace_repositories_required', 'Configure at least one repository before starting a session.');
+  return { repositories: [], bindingIds: JSON.stringify(configured.map(item => item.id)), githubAuthority: null, credentials: [] };
+}
 export async function resolveWorkspaceRepositories(env: Env, workspaceId: string, ownerId: string, options: { gitProviders: boolean; repin?: { pins: SessionRepository[]; repository: string; ref: string } }): Promise<RepositoryResolution> {
   await requireMember(env, workspaceId, ownerId);
   const configured = await workspaceRepositories(env, workspaceId);

@@ -121,7 +121,13 @@ Connect the accounts that can read your repositories under **Settings → Profil
 
 Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
 
-How sessions use them:
+How sessions use them depends on the host. On a sandboxed host with an up-to-date connector that can run the session owner's shell commands (the host's owner's own sessions, or any session when the host has [resource limits](#the-sandbox)), sessions **clone on demand**:
+
+- The session starts with an empty worktree and nothing pinned. The agent clones the repositories it needs with plain Git (`git clone https://github.com/acme/app`), and fetches, switches and creates branches as usual. Git reaches the workspace's repositories through the session's [egress proxy](#network-access), which reads them with the **session owner's own** account; the account never reaches the host.
+- The agent commits with Git and publishes a clone with `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
+- Removing a repository from the workspace stops new reads and pushes of it at once, in running sessions too.
+
+Elsewhere, and on older connectors, sessions **pin** their repositories:
 
 - Every new session pins each bound ref to an exact commit, resolved with the **session owner's own** account for that provider. Everyone who starts sessions needs a connected account that can read the workspace's repositories; binding a repository never lends anyone your accounts.
 - The host gets a private snapshot of each repository, one folder per repository in the session's worktree: `owner/repo` for GitHub, under the host name for other providers. Snapshots have no Git history, submodules or LFS files, and the session starts from a single snapshot commit. Existing sessions never follow later changes in the repository or the workspace.
@@ -380,10 +386,12 @@ Everything Pistead shows people (transcripts, approvals and their output, in eve
 
 ### Commits, pushes and pull requests
 
-Agents commit with `git_commit`, as the session owner's Git identity. With `git_push` (connector 0.5.0 or newer) they push one repository's committed session work to a branch:
+Agents commit as the session owner's Git identity: with Git itself in a session that clones on demand, or with `git_commit` in a session with pinned repositories. With `git_push` (connector 0.5.0 or newer) they push committed work to a branch:
 
-- The approval shows the repository, the branch and the exact session commit.
-- Pushes are fast-forward only and never forced: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so the branch gets only the session's changes. A branch that moved elsewhere is refused.
+- In a session that clones on demand, `git_push {directory, branch}` pushes a clone's checked-out commit as it is to the workspace repository the clone's `origin` names. If the branch moved, the agent fetches and merges or rebases first.
+- In a session with pinned repositories, it pushes one repository's committed session work: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so the branch gets only the session's changes.
+- The approval shows the repository, the clone's directory if any, the branch and the exact commit.
+- Pushes are fast-forward only and never forced; a branch that moved elsewhere is refused.
 - The agent can also ask for a pull request, which Pistead opens as the session owner with their connected account.
 - Before each push, Pistead checks with the session owner's own account that they may push to the repository and, where the Git host reports it, to that branch; GitHub protected branches are refused. Owners and admins can forbid pushes to a repository's default branch by clearing **Allow agent pushes to the default branch**.
 - The connector holds the push credential in memory only and talks to the Git host directly; the sandbox never sees it.
@@ -425,11 +433,11 @@ Both always wait for a human decision, even under **Auto-approve**.
 
 Both need connector 0.8.0 or newer.
 
-**Host commands.** When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the offline sandbox. Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the **host owner's** approval; on a shared host, they also need approve permission on the session. The session owner's **Auto-approve** skips this only on their own host.
+**Host commands.** When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the **host owner's** approval; on a shared host, they also need approve permission on the session. The session owner's **Auto-approve** skips this only on their own host.
 
 Host commands run **outside the sandbox, as the connector's OS user**, in the session's worktree: they can read and change host files and credentials, use the network, and run without CPU, memory, process or disk limits. The agent can change the worktree's files and Git configuration, so builds, package scripts and Git hooks there can run its code on the host, even for a command as harmless-looking as `git status`. Approve a host command only if you would run it yourself in that directory. Commands get the host's `PATH` and `HOME`, not the connector's whole environment, and Bash starts without shell profiles.
 
-**Repinning.** To work on another branch, tag or commit, ask the agent to use `git_repin` with the repository's worktree path and the ref, for example `{ "repository": "acme/app", "ref": "feature/next" }`. Once the session owner approves, Pistead creates a **new private session** on the same host with the same agent, that repository resolved to the new ref and the other pins unchanged; open it from the approval card and send a message to start it. Nothing is copied: the source session's changes, commits, conversation, grants and backups stay where they are. Refs resolve with the session owner's Git accounts, and every repository of the source session must still be bound to the workspace.
+**Repinning.** A session that clones on demand doesn't need it: the agent switches branches with `git checkout`. In a session with pinned repositories, to work on another branch, tag or commit, ask the agent to use `git_repin` with the repository's worktree path and the ref, for example `{ "repository": "acme/app", "ref": "feature/next" }`. Once the session owner approves, Pistead creates a **new private session** on the same host with the same agent, that repository resolved to the new ref and the other pins unchanged; open it from the approval card and send a message to start it. Nothing is copied: the source session's changes, commits, conversation, grants and backups stay where they are. Refs resolve with the session owner's Git accounts, and every repository of the source session must still be bound to the workspace.
 
 ### Backups, restores and exports
 

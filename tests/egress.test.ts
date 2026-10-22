@@ -6,7 +6,8 @@ import { createServer as createTcpServer, connect as tcpConnect, type AddressInf
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { EgressProxy, egressEnvironment, parseEgressGrant, publicAddress, type RelayRequest } from "../apps/runner/src/egress.js";
+import { EgressProxy, egressEnvironment, parseEgressGrant, publicAddress, repositoryForRemote, type RelayRequest } from "../apps/runner/src/egress.js";
+import { performClonePush, PushError, pushSummary } from "../apps/runner/src/push.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
 import type { EgressGrant } from "../packages/shared/src/network.js";
 import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.js";
@@ -237,4 +238,70 @@ test("a sandboxed git clone of a workspace repository goes through the proxy and
   await assert.rejects(shell("git ls-remote https://github.com/acme/secret.git"), /not one of this workspace's repositories/);
   await assert.rejects(shell("python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com', timeout=5)\""), /403|Forbidden|Tunnel/);
   assert.ok(instance.entries().some(entry => entry.kind === "connect" && entry.target.startsWith("example.com") && entry.outcome === "refused"));
+});
+
+test("a clone's commit is pushed as it is, fast-forward only", { skip: !sandboxed }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "egress-push-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = join(directory, "projects");
+  await mkdir(join(projects, "acme"), { recursive: true });
+  const work = join(directory, "upstream");
+  const environment = { ...process.env, GIT_AUTHOR_NAME: "U", GIT_AUTHOR_EMAIL: "u@example.test", GIT_COMMITTER_NAME: "U", GIT_COMMITTER_EMAIL: "u@example.test" };
+  const git = (args: string[], cwd: string) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: environment });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  const bare = join(projects, "acme", "app.git");
+  await mkdir(work);
+  git(["init", "-q", "-b", "main"], work);
+  await writeFile(join(work, "README.md"), "from upstream\n");
+  git(["add", "README.md"], work);
+  git(["commit", "-q", "-m", "initial"], work);
+  git(["clone", "-q", "--bare", work, bare], directory);
+  const server = await startGitHttpServer(projects);
+  t.after(() => server.close());
+  const { instance } = await proxy(t, {
+    relay: async request => fetch(request.service === "info-refs"
+      ? `${server.url("acme/app.git")}/info/refs?service=git-upload-pack` : `${server.url("acme/app.git")}/git-upload-pack`, {
+      method: request.body ? "POST" : "GET", body: request.body,
+      headers: { ...(request.contentType ? { "content-type": request.contentType } : {}), ...(request.gitProtocol ? { "git-protocol": request.gitProtocol } : {}) },
+    }),
+  });
+  const sandbox = new Sandbox(binding("clone-push"), join(directory, "session"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => sandbox.close());
+  await sandbox.initialize();
+  const authorize = async () => {};
+  const shell = (command: string) => sandbox.execute({ kind: "bash", command }, false, authorize, { allowTestShell: true });
+  await shell("git clone -q https://github.com/acme/app.git app && cd app && git switch -q -c feature && echo change > change.txt && git add change.txt && git commit -q -m 'Add a change'");
+
+  const head = await sandbox.cloneHead("app", authorize);
+  assert.equal(head.origin, "https://github.com/acme/app.git");
+  assert.equal(repositoryForRemote([repository], head.origin!)?.bindingId, "binding-app");
+  assert.equal(repositoryForRemote([repository], "git@github.com:acme/app.git")?.bindingId, "binding-app");
+  assert.equal(repositoryForRemote([repository], "https://github.com/acme/other.git"), undefined);
+  const operation = { kind: "git.push" as const, repository: "acme/app", directory: "app", branch: "feature", commit: head.commit };
+  const credential = { remote: server.url("acme/app.git"), authorization: "Basic dXNlcjpzZWNyZXQ=" };
+  const pushed = await performClonePush({ workspace: sandbox, operation, credential, authorize });
+  assert.equal(pushed.outcome, "pushed");
+  assert.deepEqual(pushed.commits.map(commit => commit.subject), ["Add a change"]);
+  assert.equal(git(["rev-parse", "refs/heads/feature"], bare), head.commit);
+  assert.equal(git(["show", `${head.commit}:change.txt`], bare), "change");
+  assert.match(pushSummary(pushed), /^Pushed 1 commit to feature \(new branch at [0-9a-f]{12}\)\.$/m);
+  assert.equal((await performClonePush({ workspace: sandbox, operation, credential, authorize })).outcome, "up-to-date");
+
+  // Someone else moved the branch: the clone's next commit is refused until it fetches.
+  git(["fetch", "-q", bare, "feature:feature"], work);
+  git(["switch", "-q", "feature"], work);
+  await writeFile(join(work, "other.txt"), "other\n");
+  git(["add", "other.txt"], work);
+  git(["commit", "-q", "-m", "Elsewhere"], work);
+  git(["push", "-q", bare, "feature"], work);
+  await shell("cd app && echo more >> change.txt && git commit -q -am 'More'");
+  const next = await sandbox.cloneHead("app", authorize);
+  await assert.rejects(performClonePush({ workspace: sandbox, operation: { ...operation, commit: next.commit }, credential, authorize }),
+    (error: Error) => error instanceof PushError && /fetch and merge or rebase/.test(error.message));
+  await assert.rejects(sandbox.cloneHead("missing", authorize));
+  await assert.rejects(sandbox.cloneHead("../escape", authorize), /Invalid clone directory/);
 });

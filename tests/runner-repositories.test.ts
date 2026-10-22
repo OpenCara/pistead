@@ -812,3 +812,35 @@ test("a cache-backed session sees the cache only after this open re-authorized a
   await enabled.promise;
   assert.deepEqual(order, ["authorize acme/project-1", "ensure acme/project-1", "authorize acme/project-2", "ensure acme/project-2", "enable"]);
 });
+
+test("clone sessions pin nothing, commit with Git and push a clone's directory", linux, async t => {
+  const root = await directory(t);
+  const clone = binding("clone-session", []);
+  clone.session.repositoryMode = "clone";
+  clone.agent.tools = [...clone.agent.tools, "git_push"];
+  assert.deepEqual(validateBinding(clone, "clone-session").session.repositoryMode, "clone");
+  assert.throws(() => validateBinding({ ...clone, session: { ...clone.session, repositories: [repository()] } }, "clone-session"), /repository mode/);
+  assert.throws(() => validateBinding({ ...clone, session: { ...clone.session, repositoryMode: "mirror" } }, "clone-session"), /repository mode/);
+  assert.throws(() => new RunnerSession(clone, root, config(root, { unsandboxed: true })), /sandboxed host/);
+
+  const grant = { policy: { mode: "off" as const, domains: [], packageRegistries: true },
+    repositories: [{ bindingId: "repo-1", provider: "github" as const, host: "github.com", fullName: "acme/project-1" }] };
+  const session = new RunnerSession(clone, root, config(root, { egressGrant: async () => grant, resolveModels: async () => { throw MODEL_BOUNDARY; } }));
+  t.after(() => session.sandbox.close());
+  await assert.rejects(session.open(), error => error === MODEL_BOUNDARY);
+  const internals = session as unknown as { buildTools(): { name: string }[]; agentInstructions(mode: string): string };
+  const names = internals.buildTools().map(tool => tool.name);
+  for (const name of ["git_status", "git_commit", "git_repin"]) assert.ok(!names.includes(name), name);
+  assert.equal(names.filter(name => name === "git_push").length, 1);
+  const instructions = internals.agentInstructions("write");
+  assert.match(instructions, /starts empty/);
+  assert.match(instructions, /https:\/\/github\.com\/acme\/project-1\.git/);
+  assert.match(instructions, /git_push \{directory, branch\}/);
+  assert.doesNotMatch(instructions, /pinned commit/);
+  await assert.rejects(session.createApproval(OWNER, { kind: "git.commit", message: "x" }), /commits with git in bash/);
+  await assert.rejects(session.createApproval(OWNER, { kind: "git.push", repository: "acme/project-1", branch: "feature", commit: "a".repeat(40) }), /pushes a clone's directory/);
+  // A pinned session can't name a clone directory.
+  const pinned = new RunnerSession(binding("pinned-session"), join(root, "pinned"), config(join(root, "pinned")));
+  t.after(() => pinned.sandbox.close());
+  await assert.rejects(pinned.createApproval(OWNER, { kind: "git.push", repository: "acme/project-1", directory: "app", branch: "feature", commit: "a".repeat(40) }), /Only clone sessions/);
+});

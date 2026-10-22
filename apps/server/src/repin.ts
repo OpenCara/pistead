@@ -76,6 +76,7 @@ export async function repinSession(c: AppContext, connectorId: string | null): P
     return c.json(value);
   };
   if (existing) return result(existing);
+  if (source.repository_mode === 'clone') fail(409, 'clone_session', 'This session clones its repositories with plain Git: switch branches with git checkout instead of repinning.');
   const pins = JSON.parse(source.repositories_json ?? '[]') as SessionRepository[];
   if (!pins.some(pin => pin.path === operation.repository)) fail(403, 'repository_not_pinned', 'Repin must name a pinned repository path.');
   const resolved = await resolveWorkspaceRepositories(c.env, source.workspace_id, source.owner_id, {

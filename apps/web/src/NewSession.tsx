@@ -264,7 +264,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
             <InfoTip label="Repositories for this session">
               <div className="stack">
                 <ul>{repositories.map(repository => <li key={repository.id}><strong>{repository.fullName}</strong> <span className="muted">at <code>{repository.ref}</code></span></li>)}</ul>
-                <p>Repository access uses your connected Git account as session owner, not the host owner's or an admin's. Each ref is pinned to a commit before the session runs.</p>
+                <p>Repository access uses your connected Git account as session owner, not the host owner's or an admin's. On a sandboxed host that can run your shell commands, the agent clones repositories with plain Git as it works; elsewhere each ref is pinned to a commit before the session runs.</p>
                 <RepositorySnapshotPolicy />
               </div>
             </InfoTip>

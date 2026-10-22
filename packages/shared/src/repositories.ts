@@ -222,3 +222,9 @@ export const repositoryLimits = {
   checkoutBytes: 8 * 1024 * 1024 * 1024,
   checkoutFileBytes: 1024 * 1024 * 1024,
 } as const;
+
+/** A clone's directory in a session worktree: relative, without ".", ".." or ".git" components. */
+export function validCloneDirectory(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 512 && /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+){0,63}$/.test(value)
+    && !value.split("/").some(part => [".", "..", ".git"].includes(part.toLowerCase()));
+}

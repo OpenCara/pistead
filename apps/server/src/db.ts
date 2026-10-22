@@ -24,6 +24,7 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
+    ...(row.repository_mode === 'clone' ? { repositoryMode: 'clone' as const } : {}),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}),
     ...(row.activity ? { activity: row.activity } : {}) };
