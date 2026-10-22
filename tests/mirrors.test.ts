@@ -205,12 +205,16 @@ test("a reopened clone session mounts an existing mirror only once the relay con
   const cache = new RepositoryCache({ root: join(u.directory, "cache") });
   await cache.refresh({ repository, ownerId: "test:alice", sessionId: "earlier", remote: u.remote() });
   const grant: EgressGrant = { policy: { mode: "off", domains: [], packageRegistries: true }, repositories: [repository, { ...repository, bindingId: "binding-other", repositoryId: "1702", fullName: "acme/other" }] };
-  let allowed = true;
+  let allowed: boolean | "busy" = true;
   const open = async (name: string) => {
     const root = join(u.directory, name);
     const session = new RunnerSession(binding(name), root, { dataDir: root, controlPlaneUrl: "https://control.example.test", sharedSecret: "s".repeat(32), allowFaux: true,
       authorize: async request => ({ allowed: true, ownerId: request.ownerId, policyVersion: 1 }), repositoryCache: cache, egressGrant: async () => grant,
-      gitRelay: async (_sessionId, request) => { if (!allowed) throw new RunnerError(403, "No access"); return u.relay(request); },
+      gitRelay: async (_sessionId, request) => {
+        if (allowed === "busy") throw new RunnerError(429, "Rate limited");
+        if (!allowed) throw new RunnerError(403, "No access");
+        return u.relay(request);
+      },
       resolveModels: async () => { throw new Error("model boundary"); } });
     t.after(() => session.sandbox.close());
     await assert.rejects(session.open(), /model boundary/);
@@ -222,6 +226,14 @@ test("a reopened clone session mounts an existing mirror only once the relay con
   allowed = false;
   const refused = await open("refused");
   assert.deepEqual(await refused.mirrorMounts(), []);
+  allowed = true;
+  assert.deepEqual(await refused.mirrorMounts(), [], "a refusal ends borrowing for the rest of the open");
+  // A rate limit or an outage only skips the step: the next one asks again.
+  allowed = "busy";
+  const busy = await open("busy");
+  assert.deepEqual(await busy.mirrorMounts(), []);
+  allowed = true;
+  assert.equal((await busy.mirrorMounts()).length, 1);
   // A repository the workspace no longer binds stops being mounted at once.
   allowed = true;
   const removed = await open("removed");

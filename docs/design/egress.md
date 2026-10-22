@@ -149,8 +149,9 @@ Hosts started with `--repo-cache` already keep one bare mirror per repository fo
   borrowing clone can't read its objects without it). It is mounted only while the repository is in the session's
   grant and the relay let the owner read it in the last 10 minutes: after this open's refresh of it, or, for a mirror
   that already existed when the session was reopened, after a ref listing through the relay confirms it (asked for
-  again every 10 minutes, at the next step that needs it). A refusal from the relay, or the grant dropping the
-  repository, unmounts it for the rest of the open. Mounts are fixed when a step starts, so a mirror the session's
+  again every 10 minutes, at the next step that needs it). A refusal from the relay (a 4xx other than a timeout or rate
+  limit), or the grant dropping the repository, unmounts it for the rest of the open; a timeout, a rate limit or an
+  outage only leaves it out of that step. Mounts are fixed when a step starts, so a mirror the session's
   first clone created is visible from its next command on.
 - **Kept and pruned.** Each refresh moves the session's keep ref (`refs/pistead/sessions/<hash>`) to a new commit whose
   parents are its previous keep commit and the branch tips it saw (500 per commit, chained), so the objects its clones

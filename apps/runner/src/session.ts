@@ -121,6 +121,15 @@ function internalOrigin(controlPlaneUrl: string): string {
 /** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
 
+/**
+ * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
+ * from the relay or a GitRemoteError status (relayFetch turns the relay's refusals into HTTP statuses).
+ */
+function refused(error: unknown): boolean {
+  const status = error instanceof RunnerError ? error.status : error instanceof GitRemoteError ? error.status : undefined;
+  return status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
 /** A grant's repository as the cache keys it; an older control plane that names no provider id offers no mirror. */
 function mirrorRepository(repository: EgressRepository): MirrorRepository & { bindingId: string } {
   if (repository.repositoryId === undefined) throw new RunnerError(409, "Update the Pistead server to cache this repository on the host");
@@ -236,9 +245,7 @@ export class RunnerSession {
         : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
           { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
     } catch (error) {
-      if (error instanceof RunnerError && error.status >= 400 && error.status < 500) {
-        for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
-      }
+      if (refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
       throw error;
     }
   }
@@ -271,7 +278,7 @@ export class RunnerSession {
     let repositories: EgressRepository[];
     try { repositories = (await this.#egress!.grant()).repositories; }
     catch (error) {
-      if (error instanceof RunnerError && error.status >= 400 && error.status < 500) this.mirrors.clear();
+      if (refused(error)) this.mirrors.clear();
       return [];
     }
     const granted = new Set(repositories.map(repository => repository.bindingId));
@@ -282,8 +289,10 @@ export class RunnerSession {
         await this.relayRemote(entry.repository, AbortSignal.timeout(15_000)).listRefs();
         entry.confirmedAt = Date.now();
         await this.config.repositoryCache!.touch(entry.repository, this.binding.owner.id, this.binding.session.id).catch(() => {});
-      } catch {
-        if (Date.now() - entry.confirmedAt > MIRROR_CONFIRM_MS) this.mirrors.delete(entry.mount.target);
+      } catch (error) {
+        // A refusal ends borrowing for this open; anything else (a timeout, a rate limit, an outage) only skips this step,
+        // and the next one asks again.
+        if (refused(error)) this.mirrors.delete(entry.mount.target);
       }
     }));
     return [...this.mirrors.values()].filter(entry => Date.now() - entry.confirmedAt <= MIRROR_CONFIRM_MS).map(entry => entry.mount);
