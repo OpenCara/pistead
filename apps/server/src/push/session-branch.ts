@@ -81,7 +81,8 @@ export async function sessionBranchPush(c: AppContext, input: {
     }
     const refusal = sessionBranchRefusal(parsed.commands, branch);
     if (refusal) {
-      await parsed.body.cancel().catch(() => {});
+      // Read to its end first, as for the probe: the connection must stay up for the answer.
+      if (!await drainStream(parsed.body, PUSH_REQUEST_BYTES)) fail(413, 'body_too_large', 'The push is too large.');
       fail(403, 'session_branch_only', refusal);
     }
     command = parsed.commands[0]!;
