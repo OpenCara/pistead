@@ -506,6 +506,15 @@ export class RunnerSession {
 
   async open(): Promise<void> {
     await this.#egress?.start();
+    try { await this.openHarness(); }
+    catch (error) {
+      // A session that didn't open leaves nothing listening.
+      await this.#egress?.close().catch(() => {});
+      throw error;
+    }
+  }
+
+  private async openHarness(): Promise<void> {
     await this.initializeRepositories();
     const registry = createRegistry();
     this.tools = this.buildTools();

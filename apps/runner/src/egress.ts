@@ -173,6 +173,8 @@ export class EgressProxy {
       server.once("error", reject);
       server.listen(this.socketPath, () => { server.off("error", reject); resolve(); });
     });
+    // Open connections keep the process alive while they last; an idle proxy never does.
+    server.unref();
     this.#server = server;
   }
 
