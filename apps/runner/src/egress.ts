@@ -446,9 +446,10 @@ export function parseEgressGrant(value: unknown): EgressGrant {
   const repositories = input.repositories.map((item: unknown): EgressRepository => {
     const repository = item as Partial<EgressRepository> | null;
     if (!repository || typeof repository.bindingId !== "string" || !IDENTIFIER.test(repository.bindingId)
-      || !gitProviders.includes(repository.provider as GitProvider) || !validGitHost(repository.host) || !validRepositoryId(repository.repositoryId)
+      || !gitProviders.includes(repository.provider as GitProvider) || !validGitHost(repository.host) || (repository.repositoryId !== undefined && !validRepositoryId(repository.repositoryId))
       || !validRepositoryName(repository.provider!, repository.fullName)) throw new RunnerError(502, "Invalid repositories from the control plane");
-    return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, repositoryId: repository.repositoryId, fullName: repository.fullName };
+    return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
+      ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}) };
   });
   return { policy, repositories };
 }

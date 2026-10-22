@@ -142,14 +142,20 @@ Hosts started with `--repo-cache` already keep one bare mirror per repository fo
   URL, it asks the proxy's `/__pistead/mirror?remote=…` (up to 20 seconds), which maps the URL to a workspace
   repository, refreshes its mirror and answers its path in the sandbox; the shim then adds `--reference-if-able`.
   Clones that already chose `--reference`, `--shared` or `--dissociate`, and everything else, run Git unchanged.
-- **Mounted only once authorized.** A mirror is mounted read-only at
-  `/repository-mirrors/<provider>/<host>/<id>.git` for a session's shell commands only after this open's refresh of
-  it, or, at a reopen, after a ref listing through the relay confirms the owner can still read it. Mounts are fixed
-  when a command starts, so a mirror the session's first clone created is visible from its next command on.
-- **Kept and pruned.** Each refresh records a keep ref per session (`refs/pistead/sessions/<hash>`): a commit whose
-  parents are the branch tips it saw, so the objects its clones borrow stay reachable. `pistead cache prune
+- **Mounted only while authorized.** A mirror is mounted read-only at `/repository-mirrors/<provider>/<host>/<id>.git`
+  (`mirrorPath`) for shell commands and for the steps that run Git in a clone (`clone-head`, `clone-push-*`; a
+  borrowing clone can't read its objects without it). It is mounted only while the repository is in the session's
+  grant and the relay let the owner read it in the last 10 minutes: after this open's refresh of it, or, for a mirror
+  that already existed when the session was reopened, after a ref listing through the relay confirms it (asked for
+  again every 10 minutes, at the next step that needs it). A refusal from the relay, or the grant dropping the
+  repository, unmounts it for the rest of the open. Mounts are fixed when a step starts, so a mirror the session's
+  first clone created is visible from its next command on.
+- **Kept and pruned.** Each refresh moves the session's keep ref (`refs/pistead/sessions/<hash>`) to a new commit whose
+  parents are its previous keep commit and the branch tips it saw (500 per commit, chained), so the objects its clones
+  borrowed stay reachable; each confirmation moves it on too (`touch`), dating its last use. `pistead cache prune
   --older-than DAYS` drops keep refs older than that and runs `git gc` with the same cutoff; pins are never dropped.
   `pistead cache list` shows sizes and how many sessions and pins each mirror keeps.
+- **Older control planes.** A grant without provider repository ids still works; its repositories just get no mirror.
 
 ### Not in phase 3
 

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, realpath, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, validCloneDirectory, type SessionRepository } from "../../../packages/shared/src/repositories.js";
@@ -54,17 +54,20 @@ export interface SandboxOptions {
    */
   egressSocket?: string;
   /**
-   * The host repository cache's mirrors this session may borrow from (clone sessions on a cache host), read per shell
-   * command. Each is mounted read-only at its `target` below MIRROR_ROOT, and a `git` shim first on PATH makes clones
-   * of the workspace's repositories borrow from them (see GIT_SHIM).
+   * The host repository cache's mirrors this session may borrow from (clone sessions on a cache host), asked for before
+   * each shell command and each step that runs Git in a clone (a borrowing clone can't read its objects without them).
+   * Each is mounted read-only at its `target` below MIRROR_ROOT, and for shell commands a `git` shim first on PATH makes
+   * clones of the workspace's repositories borrow from them (see GIT_SHIM).
    */
-  mirrors?: () => readonly MirrorMount[];
+  mirrors?: () => Promise<readonly MirrorMount[]>;
 }
 
 export interface MirrorMount { source: string; target: string }
 /** Where a clone session's shell commands see the host's mirrors; clones' `objects/info/alternates` name paths below it. */
 export const MIRROR_ROOT = "/repository-mirrors";
 const SHIM_DIRECTORY = "/opt/pistead/bin";
+/** The steps that may run Git in an agent's clone, and so need the mirrors a clone borrows from. */
+const MIRROR_KINDS: ReadonlySet<Request["kind"]> = new Set(["bash", "clone-head", "clone-push-prepare", "clone-push-pack"]);
 
 /**
  * `git` for clone sessions on a cache host: a clone of a workspace repository first asks the egress proxy to bring the
@@ -1549,7 +1552,7 @@ export class Sandbox {
   readonly #repositories: readonly SessionRepository[];
   readonly #cacheObjects: readonly string[];
   readonly #egressSocket: string | undefined;
-  readonly #mirrors: (() => readonly MirrorMount[]) | undefined;
+  readonly #mirrors: (() => Promise<readonly MirrorMount[]>) | undefined;
   /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
   #cacheMounted = false;
   #initialization: Promise<void> | undefined;
@@ -1639,9 +1642,12 @@ export class Sandbox {
         const config = await pinOwnerConfig(fdPath(root, "owner.gitconfig"), ownerGitConfig(this.#identity));
         // The shim lives beside the session's mounts, where nothing in the sandbox can change it.
         if (this.#mirrors) {
+          const shim = join(this.#root, "bin", "git");
           await mkdir(join(this.#root, "bin"), { recursive: true, mode: 0o700 });
-          await writeFile(join(this.#root, "bin", "git"), GIT_SHIM, { mode: 0o500 });
-          await chmod(join(this.#root, "bin", "git"), 0o500);
+          // Written afresh at every open: the previous one is read-only, and may be an older version.
+          await rm(shim, { force: true });
+          await writeFile(shim, GIT_SHIM, { mode: 0o500 });
+          await chmod(shim, 0o500);
         }
         opened.push(config);
         this.#mounts = { root, home, worktree, git, config };
@@ -1663,8 +1669,13 @@ export class Sandbox {
       // Admission-time permission may have been revoked while this operation waited.
       await authorize();
       if (this.#closed) throw new Error("Sandbox is closed");
-      return this.#run(request, readOnly, gitWritable, requireResources);
+      return this.#run(request, readOnly, gitWritable, requireResources, {}, await this.#mirrorMounts(request));
     });
+  }
+
+  /** The mirrors to mount for `request`: asked for only for steps that may run Git in a clone. */
+  async #mirrorMounts(request: Request): Promise<readonly MirrorMount[]> {
+    return this.#mirrors && MIRROR_KINDS.has(request.kind) ? (await this.#mirrors()).filter(mirrorMount) : [];
   }
 
   async readFile(path: string, authorize: SandboxAuthorize): Promise<string> {
@@ -1888,9 +1899,8 @@ export class Sandbox {
       if (this.#closed) throw new Error("Sandbox is closed");
       await authorize();
       if (this.#closed) throw new Error("Sandbox is closed");
-      await this.#run({ kind: "clone-push-pack", path, commit: input.commit, exclude: [...input.exclude] }, true, false, false, {
-        output: (stdout, kill) => started.resolve({ stdout, kill }),
-      });
+      const request: Request = { kind: "clone-push-pack", path, commit: input.commit, exclude: [...input.exclude] };
+      await this.#run(request, true, false, false, { output: (stdout, kill) => started.resolve({ stdout, kill }) }, await this.#mirrorMounts(request));
     });
     finished.catch((error) => started.reject(error));
     const pack = await started.promise;
@@ -1927,7 +1937,7 @@ export class Sandbox {
     });
   }
 
-  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false, transfer: Transfer = {}): Promise<string> {
+  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false, transfer: Transfer = {}, mirrors: readonly MirrorMount[] = []): Promise<string> {
     const mounts = this.#mounts;
     if (!mounts) return Promise.reject(new Error("Sandbox is not initialized"));
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
@@ -1953,8 +1963,8 @@ export class Sandbox {
       // Only shell commands reach the network, and only through the session's proxy. A missing socket (the session is
       // not open) is skipped; requests then fail to connect.
       ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET] : []),
-      ...(egress && this.#mirrors ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY,
-        ...this.#mirrors().filter(mirrorMount).flatMap(({ source, target }) => ["--ro-bind-try", source, target])] : []),
+      ...(egress && this.#mirrors ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY] : []),
+      ...mirrors.flatMap(({ source, target }) => ["--ro-bind-try", source, target]),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];

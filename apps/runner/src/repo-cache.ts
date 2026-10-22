@@ -97,6 +97,17 @@ const LOCK_NAME = "pistead.lock";
 const PIN_PREFIX = "refs/pistead/pins/";
 /** A clone session's keep ref: a commit whose parents are the branch tips it saw, so its borrowed objects stay. */
 const SESSION_PREFIX = "refs/pistead/sessions/";
+/** Parents per keep commit; more tips chain several, so no command line grows past the system's limit. */
+const KEEP_PARENTS = 500;
+
+/** A repository's place in the cache, and in every sandbox that mounts its mirror: `<provider>/<host>/<id>.git`. */
+export function mirrorPath(repository: { provider: string; host: string; repositoryId: string }): string {
+  if (!/^[a-z0-9-]{1,32}$/.test(repository.provider) || !/^[a-z0-9.-]{1,253}(?::[0-9]{1,5})?$/.test(repository.host)
+    || !/^[A-Za-z0-9{}_-]{1,100}$/.test(repository.repositoryId)) {
+    throw new RepositoryCacheError("Repository cannot name a cache directory");
+  }
+  return join(repository.provider, repository.host.replace(":", "_"), `${repository.repositoryId}.git`);
+}
 const UPSTREAM_PREFIX = "refs/upstream/";
 const CAPTURE_BYTES = 64 * 1024 * 1024;
 
@@ -134,12 +145,10 @@ export class RepositoryCache {
   }
 
   #directory(provider: string, host: string, id: string, ownerId: string): string {
-    if (!/^[a-z0-9-]{1,32}$/.test(provider) || !/^[a-z0-9.-]{1,253}(?::[0-9]{1,5})?$/.test(host) || !/^[A-Za-z0-9{}_-]{1,100}$/.test(id)) {
-      throw new RepositoryCacheError("Repository pin cannot name a cache directory");
-    }
     const base = this.#scope === "owner" ? join(this.#root, "owners", digest(ownerId)) : this.#root;
-    return join(base, provider, host.replace(":", "_"), `${id}.git`);
+    return join(base, mirrorPath({ provider, host, repositoryId: id }));
   }
+
 
   /** Objects directory a session lists in `objects/info/alternates` once `ensure` has succeeded. */
   objects(pin: SessionRepository, ownerId: string): string {
@@ -193,21 +202,22 @@ export class RepositoryCache {
       const wants = [...before].filter(([, type]) => type === null).map(([id]) => id);
       const bytes = wants.length ? await this.#fetchObjects(git, target.remote, wants, emit) : 0;
       await this.#updateUpstream(git, advertised, []);
-      // Its branch tips as of now: whatever a clone of this session borrowed stays until prune drops the keep ref.
+      // Its branch tips as of now, on top of those it saw before: whatever its clones borrowed stays until prune drops
+      // the keep ref.
       const heads = [...new Set([...advertised].filter(([ref]) => ref.startsWith("refs/heads/")).map(([, id]) => id))];
       const present = await git.objectTypes(heads);
-      const parents = heads.filter(id => present.get(id) === "commit");
-      const ref = `${SESSION_PREFIX}${digest(target.sessionId)}`;
-      if (parents.length) {
-        const tree = (await git.capture(["mktree"])).trim();
-        const keep = (await git.capture(["-c", "user.name=Pistead", "-c", "user.email=pistead@localhost", "commit-tree", tree,
-          ...parents.flatMap(id => ["-p", id]), "-m", "Objects a clone session borrows"])).trim();
-        if (!OID.test(keep)) throw new RepositoryCacheError("The session's keep ref could not be written");
-        await git.run(["update-ref", "--no-deref", ref, keep]);
-      }
+      await keep(git, target.sessionId, heads.filter(id => present.get(id) === "commit"));
       emit({ phase: "done", percent: 100, done: null, total: null, bytes });
       return { directory, fetched: wants.length > 0 };
     });
+  }
+
+  /** Marks a clone session's keep ref as used now, so prune counts its idle time from here. Fetches nothing. */
+  async touch(repository: MirrorRepository, ownerId: string, sessionId: string): Promise<void> {
+    const directory = this.mirrorDirectory(repository, ownerId);
+    try { await lstat(join(directory, "HEAD")); }
+    catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+    await this.#serialized(directory, repository.fullName, undefined, undefined, async () => { await keep(cacheGit(directory), sessionId, []); });
   }
 
   /** Every cached repository, with its size and how many sessions and pins keep objects in it. */
@@ -384,6 +394,26 @@ export class RepositoryCache {
       if (state.tail === settled && !state.listeners.size) this.#queues.delete(directory);
     }
   }
+}
+
+/**
+ * Moves a session's keep ref to a new commit, dated now, whose parents are its previous keep commit and `tips`: what its
+ * clones borrowed earlier stays reachable as long as the ref does.
+ */
+async function keep(git: CacheGit, sessionId: string, tips: readonly string[]): Promise<void> {
+  const ref = `${SESSION_PREFIX}${digest(sessionId)}`;
+  const previous = (await git.capture(["for-each-ref", "--format=%(objectname)", ref])).trim();
+  const parents = [...(OID.test(previous) ? [previous] : []), ...tips];
+  if (!parents.length) return;
+  const tree = (await git.capture(["mktree"])).trim();
+  let head: string | undefined;
+  for (let index = 0; index < parents.length; index += KEEP_PARENTS) {
+    const batch = [...(head ? [head] : []), ...parents.slice(index, index + KEEP_PARENTS)];
+    head = (await git.capture(["-c", "user.name=Pistead", "-c", "user.email=pistead@localhost", "commit-tree", tree,
+      ...batch.flatMap(id => ["-p", id]), "-m", "Objects a clone session borrows"])).trim();
+    if (!OID.test(head)) throw new RepositoryCacheError("The session's keep ref could not be written");
+  }
+  await git.run(["update-ref", "--no-deref", ref, head!]);
 }
 
 /** The bare repositories below a cache root: `<provider>/<host>/<id>.git`, also under `owners/<owner>/`. */

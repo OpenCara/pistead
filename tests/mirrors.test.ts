@@ -64,6 +64,18 @@ test("a mirror is filled through the relay, keeps each session's branch tips, an
   const keep = git(["--git-dir", first.directory, "for-each-ref", "--format=%(refname)", "refs/pistead/sessions/"], u.directory).split("\n");
   assert.equal(keep.length, 1);
   assert.equal(git(["--git-dir", first.directory, "rev-parse", `${keep[0]}^1`], u.directory), head);
+  // A later refresh keeps what the session saw before: the new keep commit's first parent is the previous one.
+  const before = git(["--git-dir", first.directory, "rev-parse", keep[0]!], u.directory);
+  await writeFile(join(u.work, "NEXT.md"), "next\n");
+  git(["add", "NEXT.md"], u.work);
+  git(["commit", "-q", "-m", "next"], u.work);
+  git(["push", "-q", "--force", u.bare, "main"], u.work);
+  assert.equal((await cache.refresh({ repository, ownerId: "test:alice", sessionId: "session-1", remote: u.remote() })).fetched, true);
+  assert.equal(git(["--git-dir", first.directory, "rev-parse", `${keep[0]}^1`], u.directory), before);
+  assert.equal(git(["--git-dir", first.directory, "rev-parse", `${keep[0]}^2`], u.directory), git(["rev-parse", "main"], u.work));
+  // Touching moves the keep ref on without fetching.
+  await cache.touch(repository, "test:alice", "session-1");
+  assert.equal(git(["--git-dir", first.directory, "rev-parse", `${keep[0]}^1^1`], u.directory), before);
   // Nothing new upstream: nothing is fetched again.
   u.relayed.length = 0;
   assert.equal((await cache.refresh({ repository, ownerId: "test:alice", sessionId: "session-2", remote: u.remote() })).fetched, false);
@@ -153,7 +165,7 @@ test("a sandboxed clone borrows the host mirror's objects through the git shim",
   // The mirror exists from an earlier session and this one may use it, as after a reopen.
   await cache.refresh({ repository, ownerId: "test:alice", sessionId: "earlier", remote: u.remote() });
   mounts.push({ source: cache.mirrorDirectory(repository, "test:alice"), target });
-  const sandbox = new Sandbox(binding("mirror"), join(u.directory, "session"), undefined, { egressSocket: proxy.socketPath, mirrors: () => mounts });
+  const sandbox = new Sandbox(binding("mirror"), join(u.directory, "session"), undefined, { egressSocket: proxy.socketPath, mirrors: async () => mounts });
   t.after(() => sandbox.close());
   await sandbox.initialize();
   const authorize = async () => {};
@@ -169,6 +181,21 @@ test("a sandboxed clone borrows the host mirror's objects through the git shim",
   await assert.rejects(sandbox.readFile("plain/.git/objects/info/alternates", authorize));
   // Other Git commands go straight through.
   assert.match(await shell("git --version"), /^git version/);
+  // A borrowing clone pushes: the push steps see the mirror too.
+  await shell("cd app && git switch -q -c feature && echo change > change.txt && git add change.txt && git commit -q -m 'Add a change'");
+  const head = await sandbox.cloneHead("app", authorize);
+  const { performClonePush } = await import("../apps/runner/src/push.js");
+  const server = await startGitHttpServer(join(u.directory, "projects"));
+  t.after(() => server.close());
+  const pushed = await performClonePush({ workspace: sandbox, credential: { remote: server.url("acme/app.git"), authorization: "Basic dTpw" }, authorize,
+    operation: { kind: "git.push", repository: "acme/app", directory: "app", branch: "feature", commit: head.commit } });
+  assert.equal(pushed.outcome, "pushed");
+  assert.equal(git(["rev-parse", "refs/heads/feature"], u.bare), head.commit);
+  // Pushing to an existing branch needs the mirror's objects to tell it is a fast-forward.
+  await shell("cd app && echo more >> change.txt && git commit -q -am 'More'");
+  const next = await sandbox.cloneHead("app", authorize);
+  assert.equal((await performClonePush({ workspace: sandbox, credential: { remote: server.url("acme/app.git"), authorization: "Basic dTpw" }, authorize,
+    operation: { kind: "git.push", repository: "acme/app", directory: "app", branch: "feature", commit: next.commit } })).outcome, "pushed");
 });
 
 test("a reopened clone session mounts an existing mirror only once the relay confirms the owner's access", async t => {
@@ -187,12 +214,21 @@ test("a reopened clone session mounts an existing mirror only once the relay con
       resolveModels: async () => { throw new Error("model boundary"); } });
     t.after(() => session.sandbox.close());
     await assert.rejects(session.open(), /model boundary/);
-    return [...(session as unknown as { mirrors: Map<string, { source: string; target: string }> }).mirrors.values()];
+    return session as unknown as { mirrorMounts(): Promise<{ source: string; target: string }[]> };
   };
-  // Only the repository whose mirror exists, and only with the owner's access confirmed.
-  assert.deepEqual(await open("confirmed"), [{ source: cache.mirrorDirectory(repository, "test:alice"), target: "/repository-mirrors/github/github.com/1701.git" }]);
+  // Only the repository whose mirror exists, and only once the relay confirms the owner's access.
+  const confirmed = await open("confirmed");
+  assert.deepEqual(await confirmed.mirrorMounts(), [{ source: cache.mirrorDirectory(repository, "test:alice"), target: "/repository-mirrors/github/github.com/1701.git" }]);
   allowed = false;
-  assert.deepEqual(await open("refused"), []);
+  const refused = await open("refused");
+  assert.deepEqual(await refused.mirrorMounts(), []);
+  // A repository the workspace no longer binds stops being mounted at once.
+  allowed = true;
+  const removed = await open("removed");
+  assert.equal((await removed.mirrorMounts()).length, 1);
+  grant.repositories.length = 0;
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 61_000 });
+  assert.deepEqual(await removed.mirrorMounts(), []);
 });
 
 test("pistead cache lists and prunes a state directory's cache", async t => {
