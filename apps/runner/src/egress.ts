@@ -28,8 +28,6 @@ const CONNECT_TIMEOUT_MS = 10_000;
 const GRANT_STALE_MS = 5 * 60_000;
 const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
 const LOG_ENTRIES = 200;
-/** How long closing waits for pushes under way: the forge may have taken one, and Git must hear how it went. */
-const PUSH_CLOSE_MS = 60_000;
 
 /**
  * One Git request for the control plane's relay, which adds the credential: the session owner's for reads, the
@@ -204,13 +202,10 @@ export class EgressProxy {
   async close(): Promise<void> {
     const server = this.#server;
     this.#server = undefined;
-    // No new requests; a push under way finishes, within PUSH_CLOSE_MS, before its connection goes.
+    // No new requests; a push under way finishes before its connection goes, as the forge may take it and Git must hear
+    // how it went. The relay's own time limit bounds the wait.
     const closed = server && new Promise<void>(resolve => server.close(() => resolve()));
-    if (this.#pushes.size) {
-      let timer: NodeJS.Timeout | undefined;
-      await Promise.race([Promise.allSettled([...this.#pushes]), new Promise<void>(resolve => { timer = setTimeout(resolve, PUSH_CLOSE_MS); })]);
-      clearTimeout(timer);
-    }
+    await Promise.allSettled([...this.#pushes]);
     for (const socket of this.#sockets) socket.destroy();
     if (server) { server.closeAllConnections(); await closed; }
     await rm(this.socketPath, { force: true });

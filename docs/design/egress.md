@@ -181,7 +181,8 @@ pushed it). Pinned sessions push only with `git_push`.
   or moves `refs/heads/pistead/<session-id>` (`sessionBranchRefusal`); anything else is answered as a forge answers it
   (`pushRejection`: `ng <ref> <reason>`, on side-band 1 when negotiated), so Git shows `! [remote rejected] … (reason)`.
   Git's probe before a chunked upload (a lone flush) is answered here. The pack then streams to the control plane as Git
-  sends it, up to 2 GiB.
+  sends it, up to 2 GiB. Closing the proxy (a session closing, as on a connector reconnect) waits for pushes under way,
+  within the relay's hour, so Git hears how one the forge took went.
 - **In the control plane** (`push/session-branch.ts`, behind the same relay route). Only clone sessions, and only while the
   owner holds `write` on them, no restore or move is pending, and the binding is still configured. As for an approved
   push, the owner's own account must be able to push the repository (`pushTarget`), and the binding's default-branch

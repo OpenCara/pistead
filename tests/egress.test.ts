@@ -395,7 +395,11 @@ test("closing the proxy lets a push under way finish before its connection goes"
   const body = pkt(`${zero} ${tip} refs/heads/pistead/s1\0report-status\n`) + "0000PACK";
   const pushed = get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers: { "content-type": "application/x-git-receive-pack-request" }, body });
   await new Promise(resolve => setTimeout(resolve, 50));
+  // However long the forge takes to answer.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const closing = instance.close();
+  t.mock.timers.tick(10 * 60_000);
+  t.mock.timers.reset();
   setTimeout(release, 50);
   assert.deepEqual({ ...(await pushed), headers: undefined }, { status: 200, headers: undefined, body: "report" });
   await closing;
