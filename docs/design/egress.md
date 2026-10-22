@@ -212,21 +212,26 @@ A clone session's backup (and the snapshot a move carries) keeps its clones' loc
 clones that borrow from the host's mirror.
 
 - **Taking it** (`clone-backup`, before the snapshot). The helper finds the worktree's clones (directories up to four
-  levels down holding a `.git` directory) and, in each, without touching its HEAD or index: records `origin`, the
-  checked-out branch, HEAD and every local branch; commits the working tree (untracked files included, ignored ones not)
-  on top of HEAD with a temporary index, or uses HEAD when nothing changed; and bundles that commit and the local
-  branches, less what `refs/remotes/origin/*` reaches. Bundles share a 16 MiB budget. The snapshot (`files`) then leaves
-  the clones out. The backup lists them as `clones` (`CloneBackup`).
+  levels down holding a `.git` directory, clones inside clones included; `node_modules` is not searched) and, in each,
+  without touching its HEAD or index: records `origin`, the checked-out branch, HEAD and every local branch (a name Git
+  allows but `validPushBranch` doesn't fails the backup rather than being dropped); commits the working tree (untracked
+  files included, ignored ones and clones inside it not) on top of HEAD from a copy of its index, so sparse checkouts
+  stay as they are, or uses HEAD when nothing changed; and bundles that commit and the local branches, less what
+  `refs/remotes/origin/*` reaches. Bundles share a 16 MiB budget. The snapshot (`files`) then leaves the clones out. The
+  backup lists them as `clones` (`CloneBackup`); restorations still pending are carried as they were.
 - **Restoring it** (`restore.ts`). Only into a clone session. Each clone is checked (path, branch names, commits, bundle
-  header) and must not overlap another or the snapshot's files; its bundle and the list of pending clones are staged in
-  the worktree's `.git/pistead-clones`, which shell commands see read-only.
+  header, no duplicate paths); clones may nest, and a pending clone may share its path with files. Its bundle and the
+  list of pending clones are staged in the worktree's `.git/pistead-clones`, which shell commands see read-only.
 - **Opening the restored session.** Pending clones are cloned again in the background, as a cache host prepares pinned
   repositories, and runs wait for it. For each (`clone-restore`, with the proxy socket and the mirrors): its origin must
   be one of the workspace's repositories; the mirror is refreshed through the relay where the host keeps a cache and
-  borrowed from; `git clone --no-checkout` goes through the proxy; the bundle is fetched; branches and HEAD are set; the
-  working tree is checked out from the backup commit and the index reset to HEAD, so the changes show as uncommitted
-  again. A path already taken is never overwritten. A clone that fails stays pending, carried by later backups, and is
-  retried at the next open; the agent's instructions say which and where their bundles are.
+  borrowed from; `git clone --no-checkout` goes through the proxy into a staging directory; commits the bundle builds on
+  that the origin no longer lists (a branch merged and deleted) are fetched by commit; the bundle is fetched; branches
+  and HEAD are set; the working tree is checked out from the backup commit and the index reset to HEAD, so the changes
+  show as uncommitted again; and the clone is moved into place. A path already taken is never overwritten, unless it is
+  this restoration's own result (a marker in its `.git`), left by a runner that stopped before updating the list. A
+  clone that fails stays pending, carried by later backups, and is retried at the next open; the agent's instructions say
+  which and where their bundles are. The runner looks for the list on the host before asking the sandbox.
 - **Moves.** The successor's host must advertise `cloneBackups`: an older connector would restore the other files and
   drop the clones.
 
@@ -239,6 +244,6 @@ on the forge. Bundles in the backup keep all of that where backups already go.
 
 ### Not in phase 4
 
-- A clone whose origin rewrote its history after the backup may fail to restore (its bundle's prerequisites are gone);
-  its bundle is kept for the agent to recover from.
+- A clone whose origin no longer serves commits its bundle builds on, not even by commit, fails to restore; its bundle
+  is kept for the agent to recover from.
 - Clones of repositories outside the workspace, worktrees and submodules (`.git` files) are not restored automatically.

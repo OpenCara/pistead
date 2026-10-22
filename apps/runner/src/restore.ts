@@ -5,7 +5,7 @@ import { lstat, mkdir, open, readFile, readdir, realpath, rm, type FileHandle } 
 import { dirname, join, resolve } from "node:path";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import type { RunnerBinding } from "../../../packages/shared/src/types.js";
-import { validCloneDirectory } from "../../../packages/shared/src/repositories.js";
+import { validCloneDirectory, validPushBranch } from "../../../packages/shared/src/repositories.js";
 import { assertId, RunnerError, stableJson, validateBinding, validateOperation } from "./protocol.js";
 import { Sandbox } from "./sandbox.js";
 
@@ -16,12 +16,6 @@ const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBL
 const MARKER = ".restore.json";
 const MAX_CLONES = 50;
 const OID = /^[0-9a-f]{40}$/;
-
-/** A local branch name as a clone's backup records it; mirrors branch_name in the sandbox helper. */
-function branchName(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$/.test(value) && !value.includes("..") && !value.includes("//")
-    && !/(\/|\.|\.lock)$/.test(value) && !value.includes("/.") && !value.includes("@{");
-}
 
 export interface RestoreConfig {
   dataDir: string;
@@ -213,16 +207,16 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
     if (!record(clone) || Object.keys(clone).sort().join(",") !== "branch,branches,bundle,head,origin,path,worktree"
       || !validCloneDirectory(clone.path)
       || (clone.origin !== null && (typeof clone.origin !== "string" || !clone.origin || clone.origin.length > 2048 || /[\x00-\x1f\x7f]/.test(clone.origin)))
-      || (clone.branch !== null && !branchName(clone.branch))
+      || (clone.branch !== null && !validPushBranch(clone.branch))
       || (clone.head !== null && (typeof clone.head !== "string" || !OID.test(clone.head)))
       || typeof clone.worktree !== "string" || !OID.test(clone.worktree)
       || !Array.isArray(clone.branches) || clone.branches.length > 200
-      || !clone.branches.every((branch: unknown) => Array.isArray(branch) && branch.length === 2 && branchName(branch[0]) && typeof branch[1] === "string" && OID.test(branch[1]))
+      || !clone.branches.every((branch: unknown) => Array.isArray(branch) && branch.length === 2 && validPushBranch(branch[0]) && typeof branch[1] === "string" && OID.test(branch[1]))
       || (clone.bundle !== null && typeof clone.bundle !== "string")) invalid("Invalid backup clone");
+    // Clones may nest (a clone inside a clone is restored after it), and a clone still pending may share its path with
+    // files: a restore never clones over anything, so it stays pending there.
     const path = clone.path as string;
-    if (clonePaths.some(other => other === path || other.startsWith(`${path}/`) || path.startsWith(`${other}/`))
-      || [...paths].some(file => file === `worktree/${path}` || file.startsWith(`worktree/${path}/`))
-      || [...paths].some(file => `worktree/${path}`.startsWith(`${file}/`))) invalid("Backup clones overlap");
+    if (clonePaths.includes(path)) invalid("Backup clones overlap");
     clonePaths.push(path);
     let bundle: string | null = null;
     if (clone.bundle !== null) {

@@ -702,8 +702,12 @@ export class RunnerSession {
       await this.restoreMirrors(repositories);
       // A restored or moved session clones its clones again before its work resumes.
       this.#cloneFailures = [];
-      const pending = await (this.sandbox as Sandbox).clonePending(async () => {});
-      if (pending.length) this.prepareClones(pending);
+      // Only a restore writes the list (in the worktree's .git, which shell commands can't change), so a session that
+      // has none needs no sandbox to tell.
+      if (await lstat(join(this.directory, "sandbox", "git", "pistead-clones", "manifest.json")).then(() => true, () => false)) {
+        const pending = await (this.sandbox as Sandbox).clonePending(async () => {});
+        if (pending.length) this.prepareClones(pending);
+      }
     }
     const registry = createRegistry();
     this.tools = this.buildTools();
@@ -1752,8 +1756,8 @@ export class RunnerSession {
         const authorize = async () => { await this.authorize(ticket.actorId, "manage"); };
         // A clone session's clones go into the backup as bundles of their local work, not as files: a restore clones them
         // again from their origin.
-        const clones = this.#clone ? await (this.sandbox as Sandbox).cloneBackup(authorize) : [];
-        const files = this.#clone ? await (this.sandbox as Sandbox).snapshot(authorize, clones.map(clone => clone.path)) : await this.sandbox.snapshot(authorize);
+        const { clones, found } = this.#clone ? await (this.sandbox as Sandbox).cloneBackup(authorize) : { clones: [], found: [] };
+        const files = this.#clone ? await (this.sandbox as Sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
         return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files, ...(clones.length ? { clones } : {}),
           createdAt: new Date().toISOString() };
       } finally { await this.open(); }

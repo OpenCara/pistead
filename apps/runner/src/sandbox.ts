@@ -1225,12 +1225,13 @@ def clone_push_pack(request):
 # has is cloned again on restore. Pending restorations live in the worktree's .git, which shell commands see read-only.
 CLONE_STATE = 'pistead-clones'
 CLONE_PATH = re.compile(r'[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){0,63}')
-CLONE_BRANCH = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}')
 MAX_CLONES = 50
 MAX_CLONE_BRANCHES = 200
 MAX_CLONE_BUNDLES = 16 * 1024 * 1024
+MAX_CLONE_SEARCH = 20000
 BACKUP_IDENTITY = {'GIT_AUTHOR_NAME': 'Pistead', 'GIT_AUTHOR_EMAIL': 'backup@pistead.invalid',
                    'GIT_COMMITTER_NAME': 'Pistead', 'GIT_COMMITTER_EMAIL': 'backup@pistead.invalid'}
+RESTORED_MARKER = 'pistead-restored'
 
 
 def clone_path(value):
@@ -1239,24 +1240,26 @@ def clone_path(value):
 
 
 def branch_name(value):
-    return (isinstance(value, str) and CLONE_BRANCH.fullmatch(value) is not None and '..' not in value and '//' not in value
-            and not value.endswith(('/', '.', '.lock')) and '/.' not in value and '@{' not in value)
+    # Mirrors validPushBranch in packages/shared/src/repositories.ts: Git's own rules for a branch name.
+    return (isinstance(value, str) and 1 <= len(value) <= 200 and value not in ('HEAD', '@') and not value.startswith(('-', 'refs/'))
+            and not re.search(r'[\s\x00-\x1f\x7f\\~^:?*[]', value) and not re.search('[\ud800-\udfff]', value)
+            and '..' not in value and '@{' not in value and not value.endswith(('.', '/'))
+            and not any(not part or part.startswith('.') or part.endswith('.lock') for part in value.split('/')))
 
 
 def find_clones():
-    # Directories of the worktree, a few levels deep, holding a .git directory: what git clone makes.
+    # Directories of the worktree, up to four levels down, holding a .git directory: what git clone makes. Clones inside
+    # clones count too. Dependency trees are not searched, and the search is bounded: a clone it misses is kept as files.
     found, visited = [], 0
 
     def visit(fd, parts):
         nonlocal visited
         for name in sorted(os.listdir(fd)):
-            if not parts and name == '.git':
+            if name in ('.git', 'node_modules') or visited >= MAX_CLONE_SEARCH:
                 continue
             if not stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
                 continue
             visited += 1
-            if visited > 20000:
-                raise ValueError('the worktree has too many directories to back up')
             child = os.open(name, DIR_FLAGS, dir_fd=fd)
             try:
                 try:
@@ -1268,7 +1271,7 @@ def find_clones():
                     if len(found) >= MAX_CLONES:
                         raise ValueError('the worktree has too many clones to back up')
                     found.append(path)
-                elif len(parts) < 3:
+                if len(parts) < 3:
                     visit(child, parts + [name])
             finally:
                 os.close(child)
@@ -1297,7 +1300,7 @@ def clone_state(git):
     return state, clones
 
 
-def save_clone_state(git, state, clones):
+def save_clone_state(state, clones):
     text = json.dumps({'version': 1, 'clones': clones}, ensure_ascii=True).encode('ascii')
     fd = os.open('manifest.json.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=state)
     try:
@@ -1316,32 +1319,47 @@ def clone_git_checked(directory, arguments, data=b'', extra=None, reason='the cl
     return output.decode('utf-8', 'replace').strip()
 
 
-def clone_backup_one(path, budget):
+def clone_backup_one(path, nested, budget):
     directory = os.path.join(WORK, *path.split('/'))
     reason = 'the clone ' + path + ' could not be backed up'
     code, output = clone_git(directory, ['config', '--get', 'remote.origin.url'])
     origin = output.decode('utf-8', 'replace').strip()[:2048] if not code else None
     code, output = clone_git(directory, ['symbolic-ref', '-q', 'HEAD'])
     ref = output.decode('utf-8', 'replace').strip() if not code else ''
-    branch = ref[len('refs/heads/'):] if ref.startswith('refs/heads/') and branch_name(ref[len('refs/heads/'):]) else None
+    branch = None
+    if ref.startswith('refs/heads/'):
+        branch = ref[len('refs/heads/'):]
+        if not branch_name(branch):
+            raise ValueError('the clone ' + path + ' is on a branch whose name can\'t be backed up')
     code, output = clone_git(directory, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])
     head = output.decode('ascii', 'replace').strip() if not code else None
+    if head is None and os.path.exists(os.path.join(directory, '.git', 'objects', 'info', 'alternates')):
+        # A clone borrowing from the host's mirror reads nothing without it, and the mirror is mounted only while this
+        # session may read its repository.
+        raise ValueError('the clone ' + path + ' borrows objects from the host cache that this session can\'t read now')
     if head is not None and not OID.fullmatch(head):
         raise ValueError(reason)
     branches = []
     for line in clone_git_checked(directory, ['for-each-ref', '--format=%(refname)%00%(objectname)', 'refs/heads'], reason=reason).splitlines():
         name, _, oid = line.partition('\0')
-        if name.startswith('refs/heads/') and branch_name(name[len('refs/heads/'):]) and OID.fullmatch(oid):
-            branches.append([name[len('refs/heads/'):], oid])
+        if not name.startswith('refs/heads/') or not branch_name(name[len('refs/heads/'):]) or not OID.fullmatch(oid):
+            raise ValueError('the clone ' + path + ' has a branch whose name can\'t be backed up')
+        branches.append([name[len('refs/heads/'):], oid])
     if len(branches) > MAX_CLONE_BRANCHES:
         raise ValueError('the clone ' + path + ' has too many branches to back up')
-    # The working tree, untracked files included and ignored ones not, as a commit on top of HEAD; the clone's own index
-    # and HEAD are left as they are.
+    # The working tree, untracked files included and ignored ones not, as a commit on top of HEAD. A copy of the clone's
+    # own index is the starting point, so sparse checkouts stay as they are and unchanged files aren't read again; the
+    # clone's index and HEAD are left alone. Clones inside this one are backed up on their own.
     index = os.path.join(directory, '.git', 'pistead-backup-index')
     extra = dict(BACKUP_IDENTITY, GIT_INDEX_FILE=index)
     try:
-        clone_git_checked(directory, ['read-tree', head] if head else ['read-tree', '--empty'], extra=extra, reason=reason)
+        try:
+            shutil.copyfile(os.path.join(directory, '.git', 'index'), index, follow_symlinks=False)
+        except FileNotFoundError:
+            clone_git_checked(directory, ['read-tree', head] if head else ['read-tree', '--empty'], extra=extra, reason=reason)
         clone_git_checked(directory, ['add', '-A'], extra=extra, reason=reason)
+        if nested:
+            clone_git_checked(directory, ['update-index', '--force-remove', '--'] + nested, extra=extra, reason=reason)
         tree = clone_git_checked(directory, ['write-tree'], extra=extra, reason=reason)
     finally:
         try:
@@ -1358,7 +1376,7 @@ def clone_backup_one(path, budget):
                                      b'Pistead backup of the working tree\n', extra=BACKUP_IDENTITY, reason=reason)
     if not OID.fullmatch(worktree):
         raise ValueError(reason)
-    # Only what the clone's origin doesn't have goes into the backup.
+    # Only what the clone's origin has is left out; a restore fetches by commit whatever its origin no longer lists.
     bundle = None
     new = ['refs/pistead/backup', '--branches', '--not', '--remotes=origin']
     clone_git_checked(directory, ['update-ref', 'refs/pistead/backup', worktree], reason=reason)
@@ -1391,11 +1409,13 @@ def clone_backup():
     budget = MAX_CLONE_BUNDLES
     clones = []
     for path in paths:
-        clone = clone_backup_one(path, budget)
+        nested = [other[len(path) + 1:] for other in paths if other.startswith(path + '/')]
+        clone = clone_backup_one(path, nested, budget)
         if clone['bundle'] is not None:
             budget -= len(clone['bundle']) * 3 // 4
         clones.append(clone)
-    # Restorations still pending stay in the backup, as they were restored.
+    # Restorations still pending stay in the backup as they were restored, whatever is at their paths now: a restore
+    # never clones over something, so they stay pending there too.
     work = os.open(WORK, DIR_FLAGS)
     git = os.open('.git', DIR_FLAGS, dir_fd=work)
     state = None
@@ -1421,7 +1441,8 @@ def clone_backup():
             os.close(state)
         os.close(git)
         os.close(work)
-    return clones
+    # The snapshot leaves out the clones found, not the pending ones: whatever is at their paths is kept as files.
+    return {'clones': clones, 'found': paths}
 
 
 def clone_pending():
@@ -1436,6 +1457,19 @@ def clone_pending():
     finally:
         os.close(git)
         os.close(work)
+
+
+def bundle_prerequisites(path):
+    # The commits a bundle builds on: the "-<oid>" lines of its header, which ends at the first empty line.
+    with open(path, 'rb') as handle:
+        header = handle.read(4 * 1024 * 1024).split(b'\n\n', 1)[0]
+    found = []
+    for line in header.split(b'\n')[1:]:
+        if line.startswith(b'-'):
+            oid = line[1:41].decode('ascii', 'replace')
+            if OID.fullmatch(oid):
+                found.append(oid)
+    return found
 
 
 def clone_restore(request):
@@ -1459,10 +1493,22 @@ def clone_restore(request):
                 or not all(isinstance(item, list) and len(item) == 2 and branch_name(item[0]) and OID.fullmatch(str(item[1])) for item in branches)
                 or (bundle is not None and (not isinstance(bundle, str) or not re.fullmatch(r'[0-9]{1,2}\.bundle', bundle)))):
             raise ValueError('invalid clone restoration')
+        remaining = [item for item in clones if not (isinstance(item, dict) and item.get('path') == path)]
         parts = path.split('/')
         directory = os.path.join(WORK, *parts)
+        marker = os.path.join(directory, '.git', RESTORED_MARKER)
         if os.path.lexists(directory):
-            raise ValueError('something else is already at the clone\'s path')
+            # Restored before, but the list kept it (the runner stopped in between): only the list is left to update.
+            try:
+                with open(marker, 'rb') as handle:
+                    done = handle.read(64).decode('ascii', 'replace').strip() == worktree
+            except OSError:
+                done = False
+            if not done or os.path.islink(directory):
+                raise ValueError('something else is already at the clone\'s path')
+            save_clone_state(state, remaining)
+            os.unlink(marker)
+            return
         parent = WORK
         for part in parts[:-1]:
             parent = os.path.join(parent, part)
@@ -1488,37 +1534,52 @@ def clone_restore(request):
             shutil.rmtree(staging, ignore_errors=True)
             raise ValueError('the clone could not be cloned again from its origin')
         reason = 'the clone\'s local work could not be put back'
-        built, directory = directory, staging
         try:
+            def present(oid):
+                return clone_git(staging, ['cat-file', '-e', oid + '^{commit}'])[0] == 0
+
+            # Commits the origin had at backup time but no longer lists (a branch merged and deleted, say) are fetched
+            # by commit, which forges allow for what their pull requests still reach.
+            def fetch_missing(oids):
+                wanted = list(dict.fromkeys(oid for oid in oids if not present(oid)))
+                if len(wanted) > 256:
+                    raise ValueError('commits the backup builds on are no longer on the clone\'s origin')
+                if wanted:
+                    clone_git_checked(staging, ['-c', 'protocol.http.allow=always', 'fetch', '--quiet', '--no-tags', '--no-write-fetch-head', url]
+                                      + wanted, reason='commits the backup builds on are no longer on the clone\'s origin')
+
+            if bundle is not None:
+                source = os.path.join(WORK, '.git', CLONE_STATE, bundle)
+                fetch_missing(bundle_prerequisites(source))
+                clone_git_checked(staging, ['-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--no-tags', source,
+                                            'refs/*:refs/pistead/restore/*'], reason=reason)
+            fetch_missing([oid for _, oid in branches] + ([head] if head else []) + [worktree])
             # The origin as the clone named it (an SSH remote, say), not the form it was cloned again from.
             if origin != url:
-                clone_git_checked(directory, ['remote', 'set-url', 'origin', origin], reason=reason)
-            if bundle is not None:
-                fd = os.open(bundle, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=state)
-                os.close(fd)
-                source = os.path.join(WORK, '.git', CLONE_STATE, bundle)
-                clone_git_checked(directory, ['-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--no-tags', source,
-                                              'refs/*:refs/pistead/restore/*'], reason=reason)
+                clone_git_checked(staging, ['remote', 'set-url', 'origin', origin], reason=reason)
             for name, oid in branches:
-                clone_git_checked(directory, ['update-ref', 'refs/heads/' + name, oid], reason=reason)
+                clone_git_checked(staging, ['update-ref', 'refs/heads/' + name, oid], reason=reason)
             listed = {name for name, _ in branches}
-            for line in clone_git_checked(directory, ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/pistead'], reason=reason).splitlines():
+            for line in clone_git_checked(staging, ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/pistead'], reason=reason).splitlines():
                 if line.startswith('refs/pistead/') or line[len('refs/heads/'):] not in listed:
-                    clone_git_checked(directory, ['update-ref', '-d', line], reason=reason)
+                    clone_git_checked(staging, ['update-ref', '-d', line], reason=reason)
             if branch is not None:
-                clone_git_checked(directory, ['symbolic-ref', 'HEAD', 'refs/heads/' + branch], reason=reason)
+                clone_git_checked(staging, ['symbolic-ref', 'HEAD', 'refs/heads/' + branch], reason=reason)
             elif head is not None:
-                clone_git_checked(directory, ['update-ref', '--no-deref', 'HEAD', head], reason=reason)
-            clone_git_checked(directory, ['read-tree', '--reset', '-u', worktree], reason=reason)
+                clone_git_checked(staging, ['update-ref', '--no-deref', 'HEAD', head], reason=reason)
+            clone_git_checked(staging, ['read-tree', '--reset', '-u', worktree], reason=reason)
             # The index goes back to HEAD, so the backed-up changes show as uncommitted again.
-            clone_git_checked(directory, ['read-tree', head] if head else ['read-tree', '--empty'], reason=reason)
-            if os.path.lexists(built):
+            clone_git_checked(staging, ['read-tree', head] if head else ['read-tree', '--empty'], reason=reason)
+            with open(os.path.join(staging, '.git', RESTORED_MARKER), 'w') as handle:
+                handle.write(worktree + '\n')
+            if os.path.lexists(directory):
                 raise ValueError('something else is already at the clone\'s path')
-            os.rename(staging, built)
+            os.rename(staging, directory)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
-        save_clone_state(git, state, [item for item in clones if not (isinstance(item, dict) and item.get('path') == path)])
+        save_clone_state(state, remaining)
+        os.unlink(marker)
         if bundle is not None:
             try:
                 os.unlink(bundle, dir_fd=state)
@@ -2083,9 +2144,12 @@ export class Sandbox {
   /**
    * A clone session's clones as a backup keeps them: for each, its origin, branches and HEAD, a commit of its working
    * tree, and a bundle of what its origin doesn't have. Restorations still pending are carried over as they are.
+   * `found` are the clones in the worktree, which the snapshot leaves out.
    */
-  async cloneBackup(authorize: SandboxAuthorize): Promise<CloneBackup[]> {
-    return JSON.parse(await this.#operation({ kind: "clone-backup" }, false, authorize)) as CloneBackup[];
+  async cloneBackup(authorize: SandboxAuthorize): Promise<{ clones: CloneBackup[]; found: string[] }> {
+    const value = JSON.parse(await this.#operation({ kind: "clone-backup" }, false, authorize)) as { clones: CloneBackup[]; found: string[] };
+    if (!Array.isArray(value?.clones) || !Array.isArray(value.found) || !value.found.every(path => validCloneDirectory(path))) throw new Error("Invalid sandbox clone response");
+    return value;
   }
 
   /** The clones a restore left to clone again, by worktree path. */

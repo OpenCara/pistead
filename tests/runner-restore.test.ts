@@ -482,12 +482,15 @@ test("a clone session's backup stages its clones' bundles and what is pending; m
     return { ...input, clones };
   };
   const target = cloneBinding("target");
-  const saved = envelope(value([clone, { ...clone, path: "lib", branch: null, branches: [], bundle: null }]));
+  // Clones may nest, and a clone still pending may share its path with files (it stays pending there).
+  const saved = envelope(value([clone, { ...clone, path: "lib", branch: null, branches: [], bundle: null }, { ...clone, path: "work/app/vendor/lib", bundle: null }],
+    [{ path: "worktree/lib/NOTES.md", data: Buffer.from("notes").toString("base64"), mode: 0o600 }]));
   await restoreSession({ ...f.config, readBackup: async () => saved.bytes }, target, saved.descriptor, async stage => { staged = stage; });
   const state = join(f.directory, "sessions", "target", "sandbox", "git", "pistead-clones");
   assert.deepEqual(JSON.parse(await readFile(join(state, "manifest.json"), "utf8")), { version: 1, clones: [
-    { ...clone, bundle: "0.bundle" }, { ...clone, path: "lib", branch: null, branches: [], bundle: null },
+    { ...clone, bundle: "0.bundle" }, { ...clone, path: "lib", branch: null, branches: [], bundle: null }, { ...clone, path: "work/app/vendor/lib", bundle: null },
   ] });
+  assert.equal(await readFile(join(f.directory, "sessions", "target", "sandbox", "worktree", "lib", "NOTES.md"), "utf8"), "notes");
   assert.equal(await readFile(join(state, "0.bundle"), "utf8"), "# v2 git bundle\nrefs\n\nPACK");
   assert.deepEqual((await readdir(state)).sort(), ["0.bundle", "manifest.json"]);
 
@@ -501,10 +504,9 @@ test("a clone session's backup stages its clones' bundles and what is pending; m
   for (const clones of [
     [{ ...clone, path: "../app" }], [{ ...clone, path: "app/.git" }], [{ ...clone, extra: true }], [{ ...clone, branch: "a..b" }],
     [{ ...clone, head: "x" }], [{ ...clone, bundle: Buffer.from("not a bundle").toString("base64") }], [{ ...clone, bundle: "%%%" }],
-    [clone, { ...clone, path: "work" }], [{ ...clone, branches: [["main"]] }],
+    [clone, { ...clone, bundle: null }], [{ ...clone, branches: [["main"]] }], [{ ...clone, branch: "refs/heads/main" }],
   ]) await refused(value(clones), other);
-  // A clone's directory is never also restored as files, nor is the pending list.
-  await refused(value([clone], [{ path: "worktree/work/app/README.md", data: Buffer.from("x").toString("base64"), mode: 0o600 }]), other);
+  // The pending list comes only from the clones, never as files.
   await refused(value([clone], [{ path: "git/pistead-clones/manifest.json", data: Buffer.from("{}").toString("base64"), mode: 0o600 }]), other);
   // Only a clone session restores clones.
   const pinned = value([clone]);
