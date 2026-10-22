@@ -5,6 +5,7 @@ import { lstat, mkdir, open, readFile, readdir, realpath, rm, type FileHandle } 
 import { dirname, join, resolve } from "node:path";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import type { RunnerBinding } from "../../../packages/shared/src/types.js";
+import { validCloneDirectory, validPushBranch } from "../../../packages/shared/src/repositories.js";
 import { assertId, RunnerError, stableJson, validateBinding, validateOperation } from "./protocol.js";
 import { Sandbox } from "./sandbox.js";
 
@@ -13,6 +14,8 @@ const MAX_FILES = 10_000;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const MARKER = ".restore.json";
+const MAX_CLONES = 50;
+const OID = /^[0-9a-f]{40}$/;
 
 export interface RestoreConfig {
   dataDir: string;
@@ -175,7 +178,9 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
       || (parts[0] === "home" && parts[1] === ".gitconfig")
       || (parts[0] === "worktree" && parts[1] === ".git")
       || (parts[0] === "home" && parts[1] === ".tmp" && parts.length === 2)
-      || (parts[0] === "git" && ["objects", "refs"].includes(parts[1]!) && parts.length === 2)) invalid("Unsafe or reserved snapshot path");
+      || (parts[0] === "git" && ["objects", "refs"].includes(parts[1]!) && parts.length === 2)
+      // Written from the backup's clones below, never as files.
+      || (parts[0] === "git" && parts[1] === "pistead-clones")) invalid("Unsafe or reserved snapshot path");
     if (paths.has(file.path)) invalid("Duplicate snapshot path");
     paths.add(file.path);
     for (let i = 1; i < parts.length; i++) {
@@ -192,6 +197,39 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
     const parts = path.split("/");
     for (let i = 1; i < parts.length; i++) if (paths.has(parts.slice(0, i).join("/"))) invalid("Snapshot file is also a parent directory");
   }
+  // A clone session's clones come as bundles of their local work, to be cloned again when the session opens: they are
+  // staged, with the list of what is pending, in the worktree's .git, which the session's shell commands see read-only.
+  const clones = value.clones ?? [];
+  if (!Array.isArray(clones) || clones.length > MAX_CLONES || (clones.length && target.session.repositoryMode !== "clone")) invalid("Invalid backup clones");
+  const pending: Record<string, unknown>[] = [];
+  const clonePaths: string[] = [];
+  clones.forEach((clone: unknown, index: number) => {
+    if (!record(clone) || Object.keys(clone).sort().join(",") !== "branch,branches,bundle,head,origin,path,worktree"
+      || !validCloneDirectory(clone.path)
+      || (clone.origin !== null && (typeof clone.origin !== "string" || !clone.origin || clone.origin.length > 2048 || /[\x00-\x1f\x7f]/.test(clone.origin)))
+      || (clone.branch !== null && !validPushBranch(clone.branch))
+      || (clone.head !== null && (typeof clone.head !== "string" || !OID.test(clone.head)))
+      || typeof clone.worktree !== "string" || !OID.test(clone.worktree)
+      || !Array.isArray(clone.branches) || clone.branches.length > 200
+      || !clone.branches.every((branch: unknown) => Array.isArray(branch) && branch.length === 2 && validPushBranch(branch[0]) && typeof branch[1] === "string" && OID.test(branch[1]))
+      || (clone.bundle !== null && typeof clone.bundle !== "string")) invalid("Invalid backup clone");
+    // Clones may nest (a clone inside a clone is restored after it), and a clone still pending may share its path with
+    // files: a restore never clones over anything, so it stays pending there.
+    const path = clone.path as string;
+    if (clonePaths.includes(path)) invalid("Backup clones overlap");
+    clonePaths.push(path);
+    let bundle: string | null = null;
+    if (clone.bundle !== null) {
+      const bytes = base64(clone.bundle);
+      total += bytes.length;
+      if (total > MAX_BYTES) invalid("Decoded snapshot exceeds size limit");
+      if (!/^# v[23] git bundle\n/.test(bytes.subarray(0, 32).toString("latin1"))) invalid("Invalid backup clone bundle");
+      bundle = `${index}.bundle`;
+      files.push({ path: `git/pistead-clones/${bundle}`, bytes, mode: 0o600 });
+    }
+    pending.push({ path, origin: clone.origin, branch: clone.branch, head: clone.head, worktree: clone.worktree, branches: clone.branches, bundle });
+  });
+  if (pending.length) files.push({ path: "git/pistead-clones/manifest.json", bytes: Buffer.from(JSON.stringify({ version: 1, clones: pending })), mode: 0o600 });
   // Sessions checked out from the host repository cache keep their objects there, not in the snapshot. Their backups
   // are refused when taken; one that exists anyway must not restore into a session missing its history.
   const marker = files.find(file => file.path === "git/repository-cache.json");

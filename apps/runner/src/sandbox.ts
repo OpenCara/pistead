@@ -69,7 +69,7 @@ export interface MirrorMount { source: string; target: string }
 export const MIRROR_ROOT = "/repository-mirrors";
 const SHIM_DIRECTORY = "/opt/pistead/bin";
 /** The steps that may run Git in an agent's clone, and so need the mirrors a clone borrows from. */
-const MIRROR_KINDS: ReadonlySet<Request["kind"]> = new Set(["bash", "clone-head", "clone-push-prepare", "clone-push-pack"]);
+const MIRROR_KINDS: ReadonlySet<Request["kind"]> = new Set(["bash", "clone-head", "clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"]);
 
 /**
  * `git` for clone sessions on a cache host: a clone of a workspace repository first asks the egress proxy to bring the
@@ -155,6 +155,16 @@ export interface SnapshotFile {
   mode: number;
 }
 
+/**
+ * One clone of a clone session as a backup keeps it (see Sandbox.cloneBackup). `worktree` commits its working tree,
+ * untracked files included and ignored ones not, on top of `head`; `bundle` (base64) holds what `origin` doesn't have:
+ * `worktree` and the local branches, as `refs/pistead/backup` and `refs/heads/*`.
+ */
+export interface CloneBackup {
+  path: string; origin: string | null; branch: string | null; head: string | null; worktree: string;
+  branches: [string, string][]; bundle: string | null;
+}
+
 export interface SandboxIdentity {
   ownerId: string;
   githubLogin: string | null;
@@ -180,7 +190,8 @@ type Request =
   | { kind: "repository-checkout" }
   | { kind: "read" | "read-content" | "list"; path: string }
   | { kind: "write"; path: string; content: string }
-  | { kind: "status" | "snapshot" }
+  | { kind: "status" }
+  | { kind: "snapshot"; clones?: string[] }
   | { kind: "commit"; message: string }
   | { kind: "bash"; command: string }
   | { kind: "head" }
@@ -189,7 +200,9 @@ type Request =
   | { kind: "push-cleanup"; id: string }
   | { kind: "clone-head"; path: string }
   | { kind: "clone-push-prepare"; path: string; commit: string; old: string | null; tips: string[] }
-  | { kind: "clone-push-pack"; path: string; commit: string; exclude: string[] };
+  | { kind: "clone-push-pack"; path: string; commit: string; exclude: string[] }
+  | { kind: "clone-backup" | "clone-pending" }
+  | { kind: "clone-restore"; path: string; url: string; reference: string | null };
 
 /** Push transfers: a pack streamed after the request line, or stdout handed over uncapped. */
 interface Transfer { input?: AsyncIterable<Uint8Array>; output?: (stdout: Readable, kill: () => void) => void }
@@ -213,7 +226,7 @@ for fd_name in os.listdir('/proc/self/fd'):
 os.umask(0o077)
 PUSH_KINDS = ('push-prepare', 'push-pack', 'clone-push-prepare', 'clone-push-pack')
 # Checkouts from the host repository cache write whole repositories, like pushes read them.
-LONG_KINDS = PUSH_KINDS + ('repository-checkout',)
+LONG_KINDS = PUSH_KINDS + ('repository-checkout', 'clone-backup', 'clone-restore')
 
 
 def limits(kind):
@@ -933,8 +946,13 @@ def run(argv, data=None):
         sys.exit(child.returncode if child.returncode > 0 else 128 - child.returncode)
 
 
-def snapshot():
+def snapshot(request):
     files, total = [], 0
+    # Clones are backed up as bundles (clone-backup), never as files.
+    clones = request.get('clones', [])
+    if not isinstance(clones, list) or not all(clone_path(path) for path in clones):
+        raise ValueError('invalid snapshot request')
+    skipped = {'worktree/' + path for path in clones}
 
     def add(parent, name, archive_path):
         nonlocal total
@@ -955,6 +973,8 @@ def snapshot():
                 continue
             info = os.stat(name, dir_fd=fd, follow_symlinks=False)
             archive_path = prefix + '/' + name
+            if archive_path in skipped:
+                continue
             if stat.S_ISDIR(info.st_mode):
                 child = os.open(name, DIR_FLAGS, dir_fd=fd)
                 try:
@@ -974,8 +994,9 @@ def snapshot():
         visit(home, 'home', ('.gitconfig',))
         add(home, '.gitconfig', 'owner.gitconfig')
         visit(work, 'worktree', ('.git',))
-        # Push scratch repositories are transient and never belong in a backup.
-        visit(git, 'git', ('pistead-push',))
+        # Push scratch repositories are transient and never belong in a backup; pending clone restorations go with the
+        # clones' bundles.
+        visit(git, 'git', ('pistead-push', CLONE_STATE))
         return files
     finally:
         os.close(git)
@@ -1135,8 +1156,8 @@ def clone_directory(request):
     return directory
 
 
-def clone_spawn(directory, arguments, stdout=subprocess.PIPE):
-    env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+def clone_spawn(directory, arguments, stdout=subprocess.PIPE, extra=None):
+    env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', **(extra or {}))
     argv = GIT_HARDENED + ['--literal-pathspecs', '-c', 'safe.directory=' + directory, '-C', directory] + arguments
     return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL, cwd=directory, env=env, close_fds=True)
 
@@ -1198,6 +1219,377 @@ def clone_push_pack(request):
     child.communicate((commit + '\n' + ''.join('^' + oid + '\n' for oid in exclude)).encode('ascii'))
     if child.returncode:
         raise ValueError('push pack failed')
+
+
+# Clone sessions keep their clones' local work in backups as Git bundles, not as files: what the clone's origin already
+# has is cloned again on restore. Pending restorations live in the worktree's .git, which shell commands see read-only.
+CLONE_STATE = 'pistead-clones'
+CLONE_PATH = re.compile(r'[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){0,63}')
+MAX_CLONES = 50
+MAX_CLONE_BRANCHES = 200
+MAX_CLONE_BUNDLES = 16 * 1024 * 1024
+MAX_CLONE_SEARCH = 20000
+BACKUP_IDENTITY = {'GIT_AUTHOR_NAME': 'Pistead', 'GIT_AUTHOR_EMAIL': 'backup@pistead.invalid',
+                   'GIT_COMMITTER_NAME': 'Pistead', 'GIT_COMMITTER_EMAIL': 'backup@pistead.invalid'}
+RESTORED_MARKER = 'pistead-restored'
+
+
+def clone_path(value):
+    return (isinstance(value, str) and len(value) <= 512 and CLONE_PATH.fullmatch(value) is not None
+            and not any(part.lower() in ('.', '..', '.git') for part in value.split('/')))
+
+
+def branch_name(value):
+    # Mirrors validPushBranch in packages/shared/src/repositories.ts: Git's own rules for a branch name.
+    return (isinstance(value, str) and 1 <= len(value) <= 200 and value not in ('HEAD', '@') and not value.startswith(('-', 'refs/'))
+            and not re.search(r'[\s\x00-\x1f\x7f\\~^:?*[]', value) and not re.search('[\ud800-\udfff]', value)
+            and '..' not in value and '@{' not in value and not value.endswith(('.', '/'))
+            and not any(not part or part.startswith('.') or part.endswith('.lock') for part in value.split('/')))
+
+
+def find_clones():
+    # Directories of the worktree, up to four levels down, holding a .git directory: what git clone makes. Clones inside
+    # clones count too. Dependency trees are not searched, and the search is bounded: a clone it misses is kept as files.
+    found, visited = [], 0
+
+    def visit(fd, parts):
+        nonlocal visited
+        for name in sorted(os.listdir(fd)):
+            if name in ('.git', 'node_modules') or visited >= MAX_CLONE_SEARCH:
+                continue
+            if not stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                continue
+            visited += 1
+            child = os.open(name, DIR_FLAGS, dir_fd=fd)
+            try:
+                try:
+                    marker = os.stat('.git', dir_fd=child, follow_symlinks=False)
+                except FileNotFoundError:
+                    marker = None
+                path = '/'.join(parts + [name])
+                if marker is not None and stat.S_ISDIR(marker.st_mode) and clone_path(path):
+                    if len(found) >= MAX_CLONES:
+                        raise ValueError('the worktree has too many clones to back up')
+                    found.append(path)
+                if len(parts) < 3:
+                    visit(child, parts + [name])
+            finally:
+                os.close(child)
+
+    work = os.open(WORK, DIR_FLAGS)
+    try:
+        visit(work, [])
+    finally:
+        os.close(work)
+    return found
+
+
+def clone_state(git):
+    # The restorations still pending from the last restore of this session, without their bundles.
+    try:
+        state = os.open(CLONE_STATE, DIR_FLAGS, dir_fd=git)
+    except FileNotFoundError:
+        return None, []
+    try:
+        data, _ = read_at(state, 'manifest.json', MAX_FILE)
+    except FileNotFoundError:
+        return state, []
+    clones = json.loads(data).get('clones')
+    if not isinstance(clones, list):
+        raise ValueError('invalid pending clone restorations')
+    return state, clones
+
+
+def save_clone_state(state, clones):
+    text = json.dumps({'version': 1, 'clones': clones}, ensure_ascii=True).encode('ascii')
+    fd = os.open('manifest.json.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=state)
+    try:
+        os.write(fd, text)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename('manifest.json.tmp', 'manifest.json', src_dir_fd=state, dst_dir_fd=state)
+
+
+def clone_git_checked(directory, arguments, data=b'', extra=None, reason='the clone could not be backed up'):
+    child = clone_spawn(directory, arguments, extra=extra)
+    output, _ = child.communicate(data)
+    if child.returncode:
+        raise ValueError(reason)
+    return output.decode('utf-8', 'replace').strip()
+
+
+def clone_backup_one(path, nested, budget):
+    directory = os.path.join(WORK, *path.split('/'))
+    reason = 'the clone ' + path + ' could not be backed up'
+    code, output = clone_git(directory, ['config', '--get', 'remote.origin.url'])
+    origin = output.decode('utf-8', 'replace').strip()[:2048] if not code else None
+    code, output = clone_git(directory, ['symbolic-ref', '-q', 'HEAD'])
+    ref = output.decode('utf-8', 'replace').strip() if not code else ''
+    branch = None
+    if ref.startswith('refs/heads/'):
+        branch = ref[len('refs/heads/'):]
+        if not branch_name(branch):
+            raise ValueError('the clone ' + path + ' is on a branch whose name can\'t be backed up')
+    code, output = clone_git(directory, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])
+    head = output.decode('ascii', 'replace').strip() if not code else None
+    if head is None and os.path.exists(os.path.join(directory, '.git', 'objects', 'info', 'alternates')):
+        # A clone borrowing from the host's mirror reads nothing without it, and the mirror is mounted only while this
+        # session may read its repository.
+        raise ValueError('the clone ' + path + ' borrows objects from the host cache that this session can\'t read now')
+    if head is not None and not OID.fullmatch(head):
+        raise ValueError(reason)
+    branches = []
+    for line in clone_git_checked(directory, ['for-each-ref', '--format=%(refname)%00%(objectname)', 'refs/heads'], reason=reason).splitlines():
+        name, _, oid = line.partition('\0')
+        if not name.startswith('refs/heads/') or not branch_name(name[len('refs/heads/'):]) or not OID.fullmatch(oid):
+            raise ValueError('the clone ' + path + ' has a branch whose name can\'t be backed up')
+        branches.append([name[len('refs/heads/'):], oid])
+    if len(branches) > MAX_CLONE_BRANCHES:
+        raise ValueError('the clone ' + path + ' has too many branches to back up')
+    # The working tree, untracked files included and ignored ones not, as a commit on top of HEAD. A copy of the clone's
+    # own index is the starting point, so sparse checkouts stay as they are and unchanged files aren't read again; the
+    # clone's index and HEAD are left alone. Clones inside this one are backed up on their own.
+    index = os.path.join(directory, '.git', 'pistead-backup-index')
+    extra = dict(BACKUP_IDENTITY, GIT_INDEX_FILE=index)
+    try:
+        try:
+            shutil.copyfile(os.path.join(directory, '.git', 'index'), index, follow_symlinks=False)
+        except FileNotFoundError:
+            clone_git_checked(directory, ['read-tree', head] if head else ['read-tree', '--empty'], extra=extra, reason=reason)
+        clone_git_checked(directory, ['add', '-A'], extra=extra, reason=reason)
+        if nested:
+            clone_git_checked(directory, ['update-index', '--force-remove', '--'] + nested, extra=extra, reason=reason)
+        tree = clone_git_checked(directory, ['write-tree'], extra=extra, reason=reason)
+    finally:
+        try:
+            os.unlink(index)
+        except FileNotFoundError:
+            pass
+    if not OID.fullmatch(tree):
+        raise ValueError(reason)
+    # A clean working tree is HEAD itself.
+    if head is not None and clone_git_checked(directory, ['rev-parse', head + '^{tree}'], reason=reason) == tree:
+        worktree = head
+    else:
+        worktree = clone_git_checked(directory, ['commit-tree', tree] + (['-p', head] if head else []),
+                                     b'Pistead backup of the working tree\n', extra=BACKUP_IDENTITY, reason=reason)
+    if not OID.fullmatch(worktree):
+        raise ValueError(reason)
+    # Only what the clone's origin has is left out; a restore fetches by commit whatever its origin no longer lists.
+    bundle = None
+    new = ['refs/pistead/backup', '--branches', '--not', '--remotes=origin']
+    clone_git_checked(directory, ['update-ref', 'refs/pistead/backup', worktree], reason=reason)
+    target = os.path.join(directory, '.git', 'pistead-backup.bundle')
+    try:
+        if int(clone_git_checked(directory, ['rev-list', '--count'] + new, reason=reason) or '0'):
+            clone_git_checked(directory, ['bundle', 'create', target] + new, reason=reason)
+            fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                if os.fstat(fd).st_size > budget:
+                    raise ValueError('the clones\' local work exceeds the backup size limit')
+                with os.fdopen(os.dup(fd), 'rb') as handle:
+                    bundle = handle.read(budget + 1)
+            finally:
+                os.close(fd)
+            if len(bundle) > budget:
+                raise ValueError('the clones\' local work exceeds the backup size limit')
+    finally:
+        clone_git(directory, ['update-ref', '-d', 'refs/pistead/backup'])
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            pass
+    return {'path': path, 'origin': origin, 'branch': branch, 'head': head, 'worktree': worktree, 'branches': branches,
+            'bundle': base64.b64encode(bundle).decode('ascii') if bundle is not None else None}
+
+
+def clone_backup():
+    paths = find_clones()
+    budget = MAX_CLONE_BUNDLES
+    clones = []
+    for path in paths:
+        nested = [other[len(path) + 1:] for other in paths if other.startswith(path + '/')]
+        clone = clone_backup_one(path, nested, budget)
+        if clone['bundle'] is not None:
+            budget -= len(clone['bundle']) * 3 // 4
+        clones.append(clone)
+    # Restorations still pending stay in the backup as they were restored, whatever is at their paths now: a restore
+    # never clones over something, so they stay pending there too.
+    work = os.open(WORK, DIR_FLAGS)
+    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    state = None
+    try:
+        state, pending = clone_state(git)
+        for entry in pending:
+            if not isinstance(entry, dict) or not clone_path(entry.get('path')) or entry['path'] in paths:
+                continue
+            item = dict(entry)
+            name = entry.get('bundle')
+            item['bundle'] = None
+            if name is not None:
+                if not isinstance(name, str) or not re.fullmatch(r'[0-9]{1,2}\.bundle', name):
+                    raise ValueError('invalid pending clone restorations')
+                data, _ = read_at(state, name, budget)
+                budget -= len(data)
+                item['bundle'] = base64.b64encode(data).decode('ascii')
+            clones.append(item)
+            if len(clones) > MAX_CLONES:
+                raise ValueError('the worktree has too many clones to back up')
+    finally:
+        if state is not None:
+            os.close(state)
+        os.close(git)
+        os.close(work)
+    # The snapshot leaves out the clones found, not the pending ones: whatever is at their paths is kept as files.
+    return {'clones': clones, 'found': paths}
+
+
+def clone_pending():
+    work = os.open(WORK, DIR_FLAGS)
+    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    try:
+        state, clones = clone_state(git)
+        if state is not None:
+            os.close(state)
+        return [{'path': entry.get('path'), 'origin': entry.get('origin'), 'bundle': entry.get('bundle')}
+                for entry in clones if isinstance(entry, dict)]
+    finally:
+        os.close(git)
+        os.close(work)
+
+
+def bundle_prerequisites(path):
+    # The commits a bundle builds on: the "-<oid>" lines of its header, which ends at the first empty line.
+    with open(path, 'rb') as handle:
+        header = handle.read(4 * 1024 * 1024).split(b'\n\n', 1)[0]
+    found = []
+    for line in header.split(b'\n')[1:]:
+        if line.startswith(b'-'):
+            oid = line[1:41].decode('ascii', 'replace')
+            if OID.fullmatch(oid):
+                found.append(oid)
+    return found
+
+
+def clone_restore(request):
+    # Clones one pending clone again through the egress proxy, then puts its local work back from its bundle: its
+    # branches, HEAD, and the working tree as uncommitted changes. Its entry goes once that is done.
+    path, url, reference = request['path'], request['url'], request.get('reference')
+    if (not clone_path(path) or not isinstance(url, str) or not re.fullmatch(r'https://[\x21-\x7e]{1,2040}', url)
+            or (reference is not None and (not isinstance(reference, str) or not reference.startswith('${MIRROR_ROOT}/')))):
+        raise ValueError('invalid clone restoration')
+    work = os.open(WORK, DIR_FLAGS)
+    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    state = None
+    try:
+        state, clones = clone_state(git)
+        entry = next((item for item in clones if isinstance(item, dict) and item.get('path') == path), None)
+        if state is None or entry is None:
+            raise ValueError('no restoration is pending for this clone')
+        origin, branch, head, worktree, branches, bundle = (entry.get(key) for key in ('origin', 'branch', 'head', 'worktree', 'branches', 'bundle'))
+        if (not isinstance(origin, str) or not re.fullmatch(r'[\x21-\x7e]{1,2048}', origin) or (branch is not None and not branch_name(branch))
+                or (head is not None and not OID.fullmatch(str(head))) or not OID.fullmatch(str(worktree)) or not isinstance(branches, list)
+                or not all(isinstance(item, list) and len(item) == 2 and branch_name(item[0]) and OID.fullmatch(str(item[1])) for item in branches)
+                or (bundle is not None and (not isinstance(bundle, str) or not re.fullmatch(r'[0-9]{1,2}\.bundle', bundle)))):
+            raise ValueError('invalid clone restoration')
+        remaining = [item for item in clones if not (isinstance(item, dict) and item.get('path') == path)]
+        parts = path.split('/')
+        directory = os.path.join(WORK, *parts)
+        marker = os.path.join(directory, '.git', RESTORED_MARKER)
+        if os.path.lexists(directory):
+            # Restored before, but the list kept it (the runner stopped in between): only the list is left to update.
+            try:
+                with open(marker, 'rb') as handle:
+                    done = handle.read(64).decode('ascii', 'replace').strip() == worktree
+            except OSError:
+                done = False
+            if not done or os.path.islink(directory):
+                raise ValueError('something else is already at the clone\'s path')
+            save_clone_state(state, remaining)
+            os.unlink(marker)
+            return
+        parent = WORK
+        for part in parts[:-1]:
+            parent = os.path.join(parent, part)
+            try:
+                os.mkdir(parent, 0o700)
+            except FileExistsError:
+                if not stat.S_ISDIR(os.lstat(parent).st_mode):
+                    raise ValueError('something else is already at the clone\'s path')
+        # Built beside its path and moved there whole, so an interrupted restoration leaves nothing in the way of the next.
+        staging = os.path.join(parent, '.' + parts[-1] + '.pistead-restore')
+        if os.path.lexists(staging):
+            if os.path.islink(staging) or not os.path.isdir(staging):
+                raise ValueError('something else is already at the clone\'s path')
+            shutil.rmtree(staging)
+        env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+        # Through the proxy: https remotes are rewritten to its loopback address (see egressEnvironment).
+        argv = GIT_HARDENED + ['-c', 'protocol.http.allow=always', 'clone', '--quiet', '--no-checkout']
+        if reference is not None:
+            argv += ['--reference-if-able', reference]
+        child = subprocess.run(argv + ['--', url, staging], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, cwd=parent, env=env, close_fds=True)
+        if child.returncode:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise ValueError('the clone could not be cloned again from its origin')
+        reason = 'the clone\'s local work could not be put back'
+        try:
+            def present(oid):
+                return clone_git(staging, ['cat-file', '-e', oid + '^{commit}'])[0] == 0
+
+            # Commits the origin had at backup time but no longer lists (a branch merged and deleted, say) are fetched
+            # by commit, which forges allow for what their pull requests still reach.
+            def fetch_missing(oids):
+                wanted = list(dict.fromkeys(oid for oid in oids if not present(oid)))
+                if len(wanted) > 256:
+                    raise ValueError('commits the backup builds on are no longer on the clone\'s origin')
+                if wanted:
+                    clone_git_checked(staging, ['-c', 'protocol.http.allow=always', 'fetch', '--quiet', '--no-tags', '--no-write-fetch-head', url]
+                                      + wanted, reason='commits the backup builds on are no longer on the clone\'s origin')
+
+            if bundle is not None:
+                source = os.path.join(WORK, '.git', CLONE_STATE, bundle)
+                fetch_missing(bundle_prerequisites(source))
+                clone_git_checked(staging, ['-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--no-tags', source,
+                                            'refs/*:refs/pistead/restore/*'], reason=reason)
+            fetch_missing([oid for _, oid in branches] + ([head] if head else []) + [worktree])
+            # The origin as the clone named it (an SSH remote, say), not the form it was cloned again from.
+            if origin != url:
+                clone_git_checked(staging, ['remote', 'set-url', 'origin', origin], reason=reason)
+            for name, oid in branches:
+                clone_git_checked(staging, ['update-ref', 'refs/heads/' + name, oid], reason=reason)
+            listed = {name for name, _ in branches}
+            for line in clone_git_checked(staging, ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/pistead'], reason=reason).splitlines():
+                if line.startswith('refs/pistead/') or line[len('refs/heads/'):] not in listed:
+                    clone_git_checked(staging, ['update-ref', '-d', line], reason=reason)
+            if branch is not None:
+                clone_git_checked(staging, ['symbolic-ref', 'HEAD', 'refs/heads/' + branch], reason=reason)
+            elif head is not None:
+                clone_git_checked(staging, ['update-ref', '--no-deref', 'HEAD', head], reason=reason)
+            clone_git_checked(staging, ['read-tree', '--reset', '-u', worktree], reason=reason)
+            # The index goes back to HEAD, so the backed-up changes show as uncommitted again.
+            clone_git_checked(staging, ['read-tree', head] if head else ['read-tree', '--empty'], reason=reason)
+            with open(os.path.join(staging, '.git', RESTORED_MARKER), 'w') as handle:
+                handle.write(worktree + '\n')
+            if os.path.lexists(directory):
+                raise ValueError('something else is already at the clone\'s path')
+            os.rename(staging, directory)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        save_clone_state(state, remaining)
+        os.unlink(marker)
+        if bundle is not None:
+            try:
+                os.unlink(bundle, dir_fd=state)
+            except FileNotFoundError:
+                pass
+    finally:
+        if state is not None:
+            os.close(state)
+        os.close(git)
+        os.close(work)
 
 
 def push_cleanup(request):
@@ -1290,6 +1682,18 @@ def main():
     if kind == 'clone-push-pack':
         clone_push_pack(request)
         return
+    if kind == 'clone-backup':
+        print(json.dumps(clone_backup(), ensure_ascii=True))
+        return
+    if kind == 'clone-pending':
+        print(json.dumps(clone_pending(), ensure_ascii=True))
+        return
+    if kind == 'clone-restore':
+        egress = request.get('egress')
+        if egress is not None:
+            egress_relay(egress['socket'], int(egress['port']))
+        clone_restore(request)
+        return
     if kind == 'bash':
         egress = request.get('egress')
         if egress is not None:
@@ -1304,7 +1708,7 @@ def main():
         run(GIT + ['commit', '--no-verify', '--no-gpg-sign', '--cleanup=verbatim', '--file=-'], request['message'].encode('utf-8'))
         return
     if kind == 'snapshot':
-        print(json.dumps(snapshot(), ensure_ascii=True))
+        print(json.dumps(snapshot(request), ensure_ascii=True))
         return
     root = os.open(WORK, DIR_FLAGS)
     try:
@@ -1732,8 +2136,40 @@ export class Sandbox {
     }
   }
 
-  async snapshot(authorize: SandboxAuthorize): Promise<SnapshotFile[]> {
-    return JSON.parse(await this.#operation({ kind: "snapshot" }, true, authorize)) as SnapshotFile[];
+  /** The session's files, leaving out `clones` (worktree paths), which a backup keeps as bundles (cloneBackup). */
+  async snapshot(authorize: SandboxAuthorize, clones: readonly string[] = []): Promise<SnapshotFile[]> {
+    return JSON.parse(await this.#operation({ kind: "snapshot", ...(clones.length ? { clones: [...clones] } : {}) }, true, authorize)) as SnapshotFile[];
+  }
+
+  /**
+   * A clone session's clones as a backup keeps them: for each, its origin, branches and HEAD, a commit of its working
+   * tree, and a bundle of what its origin doesn't have. Restorations still pending are carried over as they are.
+   * `found` are the clones in the worktree, which the snapshot leaves out.
+   */
+  async cloneBackup(authorize: SandboxAuthorize): Promise<{ clones: CloneBackup[]; found: string[] }> {
+    const value = JSON.parse(await this.#operation({ kind: "clone-backup" }, false, authorize)) as { clones: CloneBackup[]; found: string[] };
+    if (!Array.isArray(value?.clones) || !Array.isArray(value.found) || !value.found.every(path => validCloneDirectory(path))) throw new Error("Invalid sandbox clone response");
+    return value;
+  }
+
+  /** The clones a restore left to clone again, by worktree path. */
+  async clonePending(authorize: SandboxAuthorize): Promise<{ path: string; origin: string | null }[]> {
+    const value = JSON.parse(await this.#operation({ kind: "clone-pending" }, true, authorize)) as unknown;
+    if (!Array.isArray(value)) throw new Error("Invalid sandbox clone response");
+    return value.filter((entry): entry is { path: string; origin: string | null } => !!entry && typeof entry === "object"
+      && validCloneDirectory((entry as { path?: unknown }).path) && ((entry as { origin?: unknown }).origin === null || typeof (entry as { origin?: unknown }).origin === "string"))
+      .map(entry => ({ path: entry.path, origin: entry.origin }));
+  }
+
+  /**
+   * Clones one pending clone again from `url` (its workspace repository's https remote) through the egress proxy,
+   * borrowing from `reference` (a mounted mirror) when given, and puts its backed-up work back; its origin stays as the
+   * clone named it. Its pending entry goes once that is done.
+   */
+  async cloneRestore(path: string, url: string, reference: string | null, authorize: SandboxAuthorize): Promise<void> {
+    if (!validCloneDirectory(path) || !/^https:\/\/[\x21-\x7e]{1,2040}$/.test(url) || (reference !== null && !reference.startsWith(`${MIRROR_ROOT}/`)))
+      throw new Error("Invalid clone restoration");
+    await this.#operation({ kind: "clone-restore", path, url, reference }, false, authorize, true);
   }
 
   #assertRepositories(repositories: readonly SessionRepository[]): void {
@@ -1947,7 +2383,7 @@ export class Sandbox {
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
     if (requireResources && !this.#resources) return Promise.reject(new Error("Production bash resources are unavailable"));
     const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
-    const egress = request.kind === "bash" ? this.#egressSocket : undefined;
+    const egress = request.kind === "bash" || request.kind === "clone-restore" ? this.#egressSocket : undefined;
     const args = [
       "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
       "--cap-drop", "ALL",
@@ -1976,7 +2412,7 @@ export class Sandbox {
     if (egress) for (const [name, value] of Object.entries(egressEnvironment(this.#sessionBranch))) args.push("--setenv", name, value);
     if (egress && this.#mirrors) args.push("--setenv", "PATH", `${SHIM_DIRECTORY}:${this.#environment.PATH}`);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
-    const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
+    const limit = request.kind === "snapshot" || request.kind === "clone-backup" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
     const launch = requireResources
       ? resourceLaunch(this.#resources!, this.#sessionKey, args)
       : { command: "/usr/bin/bwrap", args };
@@ -2015,7 +2451,8 @@ export class Sandbox {
         kill();
       };
       this.#cancelActive = cancel;
-      const deadline = ["push-prepare", "push-pack", "repository-checkout", "clone-push-prepare", "clone-push-pack"].includes(request.kind) ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
+      const deadline = ["push-prepare", "push-pack", "repository-checkout", "clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"].includes(request.kind)
+        ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
       const timer = setTimeout(() => {
         failure ??= `Sandbox exceeded ${deadline}ms time limit`;
         kill();

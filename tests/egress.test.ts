@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { createServer as createTcpServer, connect as tcpConnect, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -452,6 +452,130 @@ test("a sandboxed git push of the session branch goes through the proxy; other b
   // Any other branch is rejected the way a forge rejects it, naming the session branch.
   await assert.rejects(shell("cd app && git push origin HEAD:main"), /remote rejected.*Only this session's branch pistead\/branch-push can be pushed without approval/);
   assert.equal(git(["rev-parse", "refs/heads/main"], bare), git(["rev-parse", "main"], work));
+});
+
+test("a backup keeps a clone's local work as a bundle, and a restore clones it again and puts the work back", { skip: !sandboxed }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "egress-clone-backup-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = join(directory, "projects");
+  await mkdir(join(projects, "acme"), { recursive: true });
+  const work = join(directory, "upstream");
+  const environment = { ...process.env, GIT_AUTHOR_NAME: "U", GIT_AUTHOR_EMAIL: "u@example.test", GIT_COMMITTER_NAME: "U", GIT_COMMITTER_EMAIL: "u@example.test" };
+  const git = (args: string[], cwd: string) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: environment });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  await mkdir(work);
+  git(["init", "-q", "-b", "main"], work);
+  await writeFile(join(work, "README.md"), "from upstream\n");
+  await writeFile(join(work, ".gitignore"), "*.log\n");
+  git(["add", "README.md", ".gitignore"], work);
+  git(["commit", "-q", "-m", "initial"], work);
+  // A branch someone else pushed, which the clone builds on and which is deleted (merged, say) before the restore.
+  git(["switch", "-q", "-c", "topic"], work);
+  await writeFile(join(work, "topic.txt"), "topic\n");
+  git(["add", "topic.txt"], work);
+  git(["commit", "-q", "-m", "Topic"], work);
+  git(["switch", "-q", "main"], work);
+  const bare = join(projects, "acme", "app.git");
+  git(["clone", "-q", "--bare", work, bare], directory);
+  // As forges serve commits their pull requests still reach, by commit.
+  git(["config", "uploadpack.allowAnySHA1InWant", "true"], bare);
+  const server = await startGitHttpServer(projects);
+  t.after(() => server.close());
+  const { instance } = await proxy(t, {
+    relay: async request => fetch(request.service === "info-refs"
+      ? `${server.url("acme/app.git")}/info/refs?service=git-upload-pack` : `${server.url("acme/app.git")}/git-upload-pack`, {
+      method: request.body ? "POST" : "GET", body: request.body as BodyInit | undefined,
+      headers: { ...(request.contentType ? { "content-type": request.contentType } : {}), ...(request.gitProtocol ? { "git-protocol": request.gitProtocol } : {}) },
+    }),
+  });
+  const authorize = async () => {};
+  const source = new Sandbox(binding("backup-source"), join(directory, "source"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => source.close());
+  await source.initialize();
+  const shell = (sandbox: Sandbox, command: string) => sandbox.execute({ kind: "bash", command }, false, authorize, { allowTestShell: true });
+  // A local commit on a branch, an untracked file, a changed tracked file, an ignored file, a branch on top of the
+  // upstream topic branch, a clean clone with an SSH origin, a clone inside the first, and ordinary files beside them.
+  await shell(source, "git clone -q https://github.com/acme/app.git app && cd app && git switch -q -c feature && echo one > one.txt && git add one.txt"
+    + " && git commit -q -m 'Local commit' && git branch -q 'fix+retry' origin/topic && echo changed >> README.md && echo new > untracked.txt"
+    + " && echo noise > build.log && git clone -q https://github.com/acme/app.git vendor/app && echo inner > vendor/app/inner.txt"
+    + " && cd .. && mkdir -p libs && git clone -q git@github.com:acme/app.git libs/app && echo notes > notes.txt");
+  const local = await source.cloneHead("app", authorize);
+  const { clones, found } = await source.cloneBackup(authorize);
+  assert.deepEqual(found, ["app", "app/vendor/app", "libs/app"]);
+  assert.deepEqual(clones.map(clone => [clone.path, clone.origin, clone.branch, clone.bundle !== null]), [
+    ["app", "https://github.com/acme/app.git", "feature", true],
+    ["app/vendor/app", "https://github.com/acme/app.git", "main", true],
+    ["libs/app", "git@github.com:acme/app.git", "main", false],
+  ]);
+  assert.equal(clones[0]!.head, local.commit);
+  assert.deepEqual(clones[0]!.branches.map(([name]) => name).sort(), ["feature", "fix+retry", "main"]);
+  // A clean clone is its HEAD, which its origin already has.
+  assert.equal(clones[2]!.worktree, clones[2]!.head);
+  const files = await source.snapshot(authorize, found);
+  assert.ok(files.some(file => file.path === "worktree/notes.txt"));
+  assert.ok(!files.some(file => file.path.startsWith("worktree/app/") || file.path.startsWith("worktree/libs/app/")));
+  // The clone itself is untouched.
+  await shell(source, "cd app && git status --porcelain > ../status.txt && git for-each-ref --format='%(refname)' refs/pistead > ../refs.txt");
+  assert.equal(await source.readFile("status.txt", authorize), " M README.md\n?? untracked.txt\n?? vendor/\n");
+  assert.equal(await source.readFile("refs.txt", authorize), "");
+  git(["branch", "-q", "-D", "topic"], bare);
+
+  // What a restore stages (see restore.ts), then the restored session clones again.
+  const target = new Sandbox(binding("backup-target"), join(directory, "target"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => target.close());
+  await target.initialize();
+  const state = join(directory, "target", "git", "pistead-clones");
+  await mkdir(state, { recursive: true, mode: 0o700 });
+  const pending = clones.map((clone, index) => {
+    const { bundle, ...rest } = clone;
+    return { ...rest, bundle: bundle === null ? null : `${index}.bundle` };
+  });
+  for (const [index, clone] of clones.entries()) if (clone.bundle) await writeFile(join(state, `${index}.bundle`), Buffer.from(clone.bundle, "base64"));
+  await writeFile(join(state, "manifest.json"), JSON.stringify({ version: 1, clones: pending }));
+  assert.deepEqual(await target.clonePending(authorize), clones.map(clone => ({ path: clone.path, origin: clone.origin })));
+  const url = "https://github.com/acme/app.git";
+  await target.cloneRestore("app", url, null, authorize);
+  await target.cloneRestore("app/vendor/app", url, null, authorize);
+  assert.deepEqual(await target.clonePending(authorize), [{ path: "libs/app", origin: "git@github.com:acme/app.git" }]);
+  await shell(target, "cd app && git status --porcelain > ../status.txt && git rev-parse --abbrev-ref HEAD > ../branch.txt && git log --format=%s -1 > ../log.txt"
+    + " && git for-each-ref --format='%(refname)' refs/heads refs/pistead > ../refs.txt && git log --format=%s -1 fix+retry > ../topic.txt");
+  assert.equal(await target.readFile("status.txt", authorize), " M README.md\n?? untracked.txt\n?? vendor/\n");
+  assert.equal(await target.readFile("branch.txt", authorize), "feature\n");
+  assert.equal(await target.readFile("log.txt", authorize), "Local commit\n");
+  assert.equal(await target.readFile("refs.txt", authorize), "refs/heads/feature\nrefs/heads/fix+retry\nrefs/heads/main\n");
+  // The deleted upstream branch's commit came back by commit.
+  assert.equal(await target.readFile("topic.txt", authorize), "Topic\n");
+  assert.equal(await target.readFile("app/untracked.txt", authorize), "new\n");
+  assert.equal(await target.readFile("app/vendor/app/inner.txt", authorize), "inner\n");
+  await assert.rejects(target.readFile("app/build.log", authorize));
+  // Something already at a clone's path is never overwritten, and the restoration stays pending.
+  await shell(target, "mkdir -p libs && echo mine > libs/app");
+  await assert.rejects(target.cloneRestore("libs/app", url, null, authorize));
+  assert.equal((await target.clonePending(authorize)).length, 1);
+  assert.equal(await target.readFile("libs/app", authorize), "mine\n");
+  // The pending restoration goes into the next backup as it was restored; what is at its path stays as files.
+  const again = await target.cloneBackup(authorize);
+  assert.deepEqual(again.found, ["app", "app/vendor/app"]);
+  assert.deepEqual(again.clones.map(clone => [clone.path, clone.branch, clone.origin]),
+    [["app", "feature", url], ["app/vendor/app", "main", url], ["libs/app", "main", "git@github.com:acme/app.git"]]);
+  assert.equal(again.clones[2]!.bundle, null);
+  assert.ok((await target.snapshot(authorize, again.found)).some(file => file.path === "worktree/libs/app"));
+  // Once the path is free it restores, past what an interrupted attempt left, keeping the clone's own origin.
+  await shell(target, "rm libs/app && mkdir -p libs/.app.pistead-restore/.git && echo stale > libs/.app.pistead-restore/stale");
+  await target.cloneRestore("libs/app", url, null, authorize);
+  assert.deepEqual(await target.clonePending(authorize), []);
+  assert.match(await shell(target, "cd libs/app && git config --get remote.origin.url && git status --porcelain && ls -a .. | grep -c pistead-restore || true"),
+    /^git@github\.com:acme\/app\.git\n0\n$/);
+  // A restoration that finished but whose entry the runner stopped before dropping is recognised, not refused.
+  await writeFile(join(state, "manifest.json"), JSON.stringify({ version: 1, clones: [pending[2]] }));
+  await writeFile(join(directory, "target", "worktree", "libs", "app", ".git", "pistead-restored"), `${clones[2]!.worktree}\n`);
+  await target.cloneRestore("libs/app", url, null, authorize);
+  assert.deepEqual(await target.clonePending(authorize), []);
+  await assert.rejects(lstat(join(directory, "target", "worktree", "libs", "app", ".git", "pistead-restored")), { code: "ENOENT" });
 });
 
 test("https://user@host remotes are the same repository, and a refused grant ends access at once", async t => {

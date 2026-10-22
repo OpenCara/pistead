@@ -256,3 +256,52 @@ test("pistead cache lists and prunes a state directory's cache", async t => {
   assert.match(output.at(-1)!, /forgot 1 clone session idle/);
   await assert.rejects(cacheMain(["prune", "--older-than", "soon", "--state-dir", state]), /whole number/);
 });
+
+test("a clone session's backup and restore carry its clones' local work, cloned again through the relay from the mirror", { skip: !sandboxed }, async t => {
+  const u = await upstream(t);
+  const { RunnerService } = await import("../apps/runner/src/server.js");
+  const { sha256 } = await import("../packages/shared/src/crypto.js");
+  const { randomUUID } = await import("node:crypto");
+  const allow = async () => {};
+  const ticket = async (sessionId: string, action: "create" | "backup" | "restore") => {
+    const now = Math.floor(Date.now() / 1000);
+    return { aud: "runner" as const, sessionId, actorId: "test:alice", ownerId: "test:alice", action, policyVersion: 1,
+      iat: now, exp: now + 60, jti: randomUUID(), bodyHash: await sha256("") };
+  };
+  const cache = new RepositoryCache({ root: join(u.directory, "cache") });
+  const grant: EgressGrant = { policy: { mode: "off", domains: [], packageRegistries: true }, repositories: [repository] };
+  const config = (name: string, extra: Record<string, unknown> = {}) => ({ dataDir: join(u.directory, name), controlPlaneUrl: "https://control.example.test",
+    sharedSecret: "s".repeat(32), allowFaux: true, authorize: async (request: { ownerId: string }) => ({ allowed: true, ownerId: request.ownerId, policyVersion: 1 }),
+    repositoryCache: cache, egressGrant: async () => grant, gitRelay: async (_sessionId: string, request: RelayRequest) => u.relay(request), ...extra });
+  const sourceService = new RunnerService(config("source"));
+  t.after(() => sourceService.close());
+  await sourceService.initialize();
+  const source = await sourceService.provision(binding("move-source"), await ticket("move-source", "create"));
+  const shell = (session: typeof source, command: string) => session.sandbox.execute({ kind: "bash", command }, false, allow, { allowTestShell: true });
+  await shell(source, "git clone -q https://github.com/acme/app.git app && cd app && git switch -q -c feature && echo one > one.txt && git add one.txt"
+    + " && git commit -q -m 'Local commit' && echo draft > draft.txt && echo notes > ../notes.txt");
+  const backup = await source.backup(await ticket("move-source", "backup")) as { clones?: { path: string; branch: string }[]; files: { path: string }[] };
+  assert.deepEqual(backup.clones?.map(clone => [clone.path, clone.branch]), [["app", "feature"]]);
+  assert.ok(backup.files.some(file => file.path === "worktree/notes.txt"));
+  assert.ok(!backup.files.some(file => file.path.startsWith("worktree/app/")));
+
+  const text = JSON.stringify(backup);
+  const bytes = new TextEncoder().encode(text);
+  const descriptor = { id: "clone-restore", sourceSessionId: "move-source", backupId: "clone-backup", sha256: await sha256(text), size: bytes.byteLength,
+    downloadToken: "scoped-backup-capability" };
+  const targetService = new RunnerService(config("target", { readBackup: async () => bytes }));
+  t.after(() => targetService.close());
+  await targetService.initialize();
+  await targetService.restore({ binding: binding("move-target"), restore: descriptor }, await ticket("move-target", "restore"));
+  const restored = await targetService.get("move-target");
+  // The clone is cloned again in the background; the session's work waits for it.
+  for (let attempt = 0; (await restored.view()).repositories && attempt < 300; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal((await restored.view()).repositories, undefined);
+  assert.equal(await restored.sandbox.readFile("notes.txt", allow), "notes\n");
+  assert.equal(await restored.sandbox.readFile("app/draft.txt", allow), "draft\n");
+  assert.match(await shell(restored, "cd app && git rev-parse --abbrev-ref HEAD && git log --format=%s -1 && git status --porcelain"),
+    /^feature\nLocal commit\n\?\? draft\.txt\n$/);
+  // It borrowed from the host's mirror, which the relay filled with the owner's access.
+  assert.match(await restored.sandbox.readFile("app/.git/objects/info/alternates", allow), /^\/repository-mirrors\/github\/github\.com\/1701\.git\/objects\n$/);
+  assert.deepEqual(await (restored.sandbox as Sandbox).clonePending(allow), []);
+});

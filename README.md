@@ -234,7 +234,7 @@ npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate 
 - The first session waits while a repository is cloned, showing the clone's progress; later sessions fetch only what is new. If the host can't fetch a repository, the session says why and refuses new messages; restart it after fixing the problem.
 - Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
 - `npx pistead@latest cache list` shows each cached repository, its size and how many sessions and pins keep objects in it. `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer than that many days and collects what nothing reaches any more; a clone in such a session loses the objects it borrowed. Pins are kept. Both take `--state-dir`.
-- Still in preview: backups of pinned sessions that use the cache aren't supported yet, and a backup of a session whose clones borrow from the cache restores only on a host whose cache still has those objects.
+- Still in preview: backups of pinned sessions that use the cache aren't supported yet.
 
 #### Connector options
 
@@ -447,6 +447,7 @@ A session's conversation and files live on its host. A backup copies them to the
 
 - Only the session owner can create, download or restore backups, from **Details → Backups** or the session menu (**Create backup**), and only while the session is idle. Listing and downloading work while the host is offline.
 - A backup holds the session's conversation, its files and the owner's personal environment values, so whoever can read the backup store can read them. When backups go to a database another member connected, you confirm that database before each backup.
+- In a session that clones on demand, a backup keeps each clone's **local work** rather than the clone itself: its branches, which branch is checked out, commits its `origin` doesn't have, and its uncommitted changes and untracked files (ignored files aren't kept). The restored session clones each repository again through its egress proxy, with the session owner's access, before its work resumes, and puts that work back: the same branch checked out, the changes uncommitted again. A clone that can't be cloned again (for example, its repository was removed from the workspace) is retried when the session next opens, and the agent is told where its work is kept meanwhile. Clones of repositories outside the workspace keep only their local work too, and can't be restored automatically.
 - **Restore into new private session** creates a new private session from a backup, optionally with a **New session title**, and never overwrites the source. It doesn't replay approvals or run operations, and it needs the original host to be available. Retrying reuses the same request, so it opens the same restored session instead of creating another.
 
 Exports are JSON records without secrets; a session's conversation is in its backups:
@@ -460,6 +461,7 @@ While both hosts are connected, a session's owner can move it to a model on anot
 
 - The new host restores it into a new session with the same conversation, files, repository pins, visibility and title (or a new title), running that host's model. Its agent keeps the original's name and instructions, with the tools the new host can carry. Session grants, and approvals given for the rest of the session, aren't copied.
 - Once the new host confirms, the original session is archived: its history stays readable and its owner can unarchive it.
+- A session that clones on demand moves as its backups restore: each clone is cloned again on the new host and its local work put back. It needs a sandboxed new host with a current connector (`cloneBackups` capability).
 - The session must be idle. Until the move finishes, both sessions only accept reads, so nothing sent after the snapshot is lost. The control plane holds the snapshot until then; retrying with the same `requestId` needs only the new host, and `POST /api/sessions/:id/migrations/:migrationId/cancel` gives up on the move, archiving the unfinished copy.
 - Moving to a host someone else owns needs `trustedConnectorId`, as starting a session there does. The new host must run a current connector on Linux (`hostMigration` capability).
 
