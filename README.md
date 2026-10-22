@@ -222,17 +222,19 @@ Pistead labels such a host **Unsandboxed** to everyone who can see it.
 
 #### Repository cache (preview)
 
-By default a host downloads each pinned repository as an archive (within the limits above), and the session sees a single snapshot commit. With `--repo-cache` (connector 0.8.0 or newer), the connector keeps a full clone of each repository on the host and checks sessions out of it:
+By default a host downloads each pinned repository as an archive (within the limits above), and the session sees a single snapshot commit, and each session that clones on demand downloads its clones itself. With `--repo-cache` (connector 0.8.0 or newer), the connector keeps a full clone of each repository on the host, checks pinned sessions out of it, and lets clones borrow from it:
 
 ```sh
 npx pistead@latest connect --repo-cache                            # one cache for every session on this host
 npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
 ```
 
-- The host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead sends no read credential, but checks before each session that its owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
+- **Sessions that clone on demand:** `git clone` of a workspace repository first brings the host's copy up to date through Pistead, with the session owner's own account like every other read, then borrows its objects (`--reference-if-able`) instead of downloading and storing them again. A clone that doesn't come within 20 seconds goes ahead on its own; clones with `--reference`, `--shared` or `--dissociate` are left alone. A session sees a copy, read-only, only once Pistead has let its owner read the repository, again each time the session is reopened. A copy the session's first command created is visible from its next command on.
+- **Pinned sessions:** the host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead sends no read credential, but checks before each session that its owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
 - The first session waits while a repository is cloned, showing the clone's progress; later sessions fetch only what is new. If the host can't fetch a repository, the session says why and refuses new messages; restart it after fixing the problem.
 - Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
-- Still in preview: backups of sessions that use the cache, and cleaning up the cache, aren't supported yet.
+- `npx pistead@latest cache list` shows each cached repository, its size and how many sessions and pins keep objects in it. `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer than that many days and collects what nothing reaches any more; a clone in such a session loses the objects it borrowed. Pins are kept. Both take `--state-dir`.
+- Still in preview: backups of pinned sessions that use the cache aren't supported yet, and a backup of a session whose clones borrow from the cache restores only on a host whose cache still has those objects.
 
 #### Connector options
 

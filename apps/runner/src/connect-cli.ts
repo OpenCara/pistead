@@ -37,12 +37,12 @@ Options:
   --git-credentials        Let approved pushes in your own sessions use this machine's Git
                            credentials (its git credential helpers) where the workspace's
                            push access chooses the host's Git credentials
-  --repo-cache             Check repositories out of a cache on this machine with their full
-                           history, fetched with this machine's Git credentials (its git
-                           credential helpers) instead of downloaded through Pistead. Pistead
-                           still checks that each session's owner can read every repository
-                           with their own account. Preview: backups of such sessions are not
-                           supported yet
+  --repo-cache             Keep a Git mirror of each repository on this machine. Pinned sessions
+                           check out of it, with their full history, fetched with this machine's
+                           Git credentials (its git credential helpers); Pistead still checks each
+                           session owner's own access. Clone sessions borrow its objects, fetched
+                           through Pistead with the session owner's own account. Preview: backups
+                           of pinned sessions using it are not supported yet. See pistead cache
   --repo-cache-scope SCOPE host (default): one cache for every session on this machine;
                            owner: a separate cache for each session owner
   --help                  Show this help without reading Pi configuration

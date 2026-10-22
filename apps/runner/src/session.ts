@@ -1,6 +1,6 @@
 import type { HostCommandOperation, GitRepinOperation, RepinRequest, RepinResult } from "../../../packages/shared/src/types.js";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, StringEnum, Type, type Models } from "@earendil-works/pi-ai";
@@ -14,19 +14,19 @@ import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
-import { Sandbox, SandboxProcessError, type SandboxAuthorize } from "./sandbox.js";
+import { MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
 import { prepareImage } from "./images.js";
 import { performClonePush, performPush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
-import { GitRemoteError } from "./git-remote.js";
+import { GitRemote, GitRemoteError } from "./git-remote.js";
 import { RepositoryCacheError, checkoutBudget, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCache } from "./repo-cache.js";
 import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
-import { EgressProxy, egressSocketPath, parseEgressGrant, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import type { EgressGrant } from "../../../packages/shared/src/network.js";
+import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
+import type { EgressGrant, EgressRepository } from "../../../packages/shared/src/network.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -177,6 +177,11 @@ export class RunnerSession {
   readonly #clone: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
+  /**
+   * The host cache's mirrors this clone session may borrow from, by sandbox path: only those the control plane let
+   * this open read, through the relay (a mirror's refresh, or the listing at open for one that already exists).
+   */
+  private readonly mirrors = new Map<string, MirrorMount>();
 
   constructor(readonly binding: RunnerBinding, readonly directory: string, readonly config: RunnerConfig) {
     if (binding.session.connectorId !== config.connectorId || binding.model.connectorId !== config.connectorId)
@@ -192,7 +197,8 @@ export class RunnerSession {
     if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"), options);
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
-      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath });
+      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath,
+        ...(this.#clone && cache ? { mirrors: () => [...this.mirrors.values()] } : {}) });
     }
     const report = config.reportActivity;
     this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
@@ -200,15 +206,62 @@ export class RunnerSession {
 
   private egressProxy(socketPath: string): EgressProxy {
     const sessionId = this.binding.session.id;
+    const clone = this.binding.session.repositoryMode === "clone";
     return new EgressProxy({
       socketPath,
       grant: async () => parseEgressGrant(this.config.egressGrant
         ? await this.config.egressGrant(sessionId)
         : await this.controlPlane("/api/internal/network", { sessionId })),
-      relay: request => this.config.gitRelay ? this.config.gitRelay(sessionId, request)
-        : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
-          { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)),
+      relay: request => this.relay(request),
+      ...(clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
     });
+  }
+
+  /** One Git read through the control plane's relay, with the session owner's access. */
+  private relay(request: RelayRequest): Promise<Response> {
+    const sessionId = this.binding.session.id;
+    return this.config.gitRelay ? this.config.gitRelay(sessionId, request)
+      : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
+        { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000));
+  }
+
+  /** A workspace repository read through the relay, for the host cache: the relay itself adds the owner's credential. */
+  private relayRemote(repository: EgressRepository): GitRemote {
+    return new GitRemote({ url: bindingRemote(repository), authorization: "Bearer relay", fetch: relayFetch(repository.bindingId, request => this.relay(request)) });
+  }
+
+  /** Refreshes the host's mirror of `repository` for this session and lets its shell commands borrow from it. */
+  private async mirror(repository: EgressRepository): Promise<string> {
+    const cache = this.config.repositoryCache!;
+    await cache.refresh({ repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: this.relayRemote(repository) });
+    return this.allowMirror(repository);
+  }
+
+  private allowMirror(repository: EgressRepository): string {
+    // The cache's own layout (provider/host/id.git), at a path every session sees the same way.
+    const mount = { source: this.config.repositoryCache!.mirrorDirectory(repository, this.binding.owner.id),
+      target: `${MIRROR_ROOT}/${repository.provider}/${repository.host.replace(":", "_")}/${repository.repositoryId}.git` };
+    this.mirrors.set(mount.target, mount);
+    return mount.target;
+  }
+
+  /**
+   * After a reopen, clones made earlier still borrow from mirrors that exist on this host. Each is mounted again only
+   * once the relay confirms the owner can still read its repository; one that can't be confirmed stays unmounted.
+   */
+  private async restoreMirrors(): Promise<void> {
+    const cache = this.config.repositoryCache;
+    if (!this.#clone || !cache) return;
+    this.mirrors.clear();
+    const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
+    await Promise.all(repositories.map(async repository => {
+      try { await lstat(join(cache.mirrorDirectory(repository, this.binding.owner.id), "HEAD")); }
+      catch { return; }
+      try {
+        await this.relayRemote(repository).listRefs();
+        this.allowMirror(repository);
+      } catch { /* Unconfirmed: its clones fail until the owner's access is back and the session is reopened. */ }
+    }));
   }
 
   private assertTicket(ticket: RunnerTicket): void {
@@ -535,6 +588,7 @@ export class RunnerSession {
     await this.initializeRepositories();
     if (this.#clone) this.#cloneRepositories = await this.#egress!.grant()
       .then(grant => grant.repositories.map(repository => bindingRemote(repository)), () => []);
+    await this.restoreMirrors();
     const registry = createRegistry();
     this.tools = this.buildTools();
     const extension = defineExtension({ name: "workspace-tools", tools: this.tools });

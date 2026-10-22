@@ -14,7 +14,7 @@ import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
 
-const repository = { bindingId: "binding-app", provider: "github", host: "github.com", fullName: "acme/app" } as const;
+const repository = { bindingId: "binding-app", provider: "github", host: "github.com", repositoryId: "1701", fullName: "acme/app" } as const;
 
 function grant(policy: Partial<EgressGrant["policy"]> = {}): EgressGrant {
   return { policy: { mode: "off", domains: [], packageRegistries: true, ...policy }, repositories: [repository] };

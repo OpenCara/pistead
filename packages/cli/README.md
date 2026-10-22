@@ -84,11 +84,13 @@ npx pistead@latest connect --repo-cache                            # one cache f
 npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
 ```
 
-- The host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead never sends a read credential.
+- In sessions that clone on demand, `git clone` of a workspace repository borrows the cached objects (`--reference-if-able`) after bringing the cache up to date through Pistead, with the session owner's own account. A session sees a cached repository, read-only, only once Pistead has let its owner read it.
+- For pinned sessions, the host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead never sends a read credential.
 - Before a session uses the cache, Pistead checks that the session's owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
 - The first session on a host waits while the repository is cloned, and the session shows the clone's progress; later sessions fetch only what is new. Messages sent meanwhile wait in the queue. If the host can't fetch a repository, the session shows why and new messages are refused; restart the session after fixing it.
 - Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
-- Preview: backups of sessions that use the cache, and cleaning up the cache, are not supported yet. It needs a Pistead server that supports the repository cache; older servers refuse the connector's manifest.
+- `npx pistead@latest cache list` shows the cached repositories and their sizes; `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer and collects what nothing reaches any more (their clones lose the objects they borrowed; pins are kept).
+- Preview: backups of pinned sessions that use the cache are not supported yet. It needs a Pistead server that supports the repository cache; older servers refuse the connector's manifest.
 
 ## Pushing commits
 

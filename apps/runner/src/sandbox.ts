@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
-import { isAbsolute, resolve, sep } from "node:path";
+import { chmod, mkdir, open, realpath, writeFile, type FileHandle } from "node:fs/promises";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { repositoryLimits, validCloneDirectory, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryPinIdentity } from "./protocol.js";
@@ -53,7 +53,65 @@ export interface SandboxOptions {
    * and the helper relays the sandbox's loopback EGRESS_PORT to it: their only way out of the network namespace.
    */
   egressSocket?: string;
+  /**
+   * The host repository cache's mirrors this session may borrow from (clone sessions on a cache host), read per shell
+   * command. Each is mounted read-only at its `target` below MIRROR_ROOT, and a `git` shim first on PATH makes clones
+   * of the workspace's repositories borrow from them (see GIT_SHIM).
+   */
+  mirrors?: () => readonly MirrorMount[];
 }
+
+export interface MirrorMount { source: string; target: string }
+/** Where a clone session's shell commands see the host's mirrors; clones' `objects/info/alternates` name paths below it. */
+export const MIRROR_ROOT = "/repository-mirrors";
+const SHIM_DIRECTORY = "/opt/pistead/bin";
+
+/**
+ * `git` for clone sessions on a cache host: a clone of a workspace repository first asks the egress proxy to bring the
+ * host's mirror up to date, then borrows its objects (--reference-if-able) instead of downloading them again. If the
+ * mirror is not ready within 20 seconds, the clone goes ahead on its own. Everything else runs Git unchanged.
+ */
+const GIT_SHIM = String.raw`#!/usr/bin/python3 -I
+import json, os, sys, urllib.parse, urllib.request
+
+args = sys.argv[1:]
+VALUED = {'-o', '--origin', '-b', '--branch', '-u', '--upload-pack', '--template', '-c', '--config', '--depth', '--shallow-since',
+          '--shallow-exclude', '--separate-git-dir', '-j', '--jobs', '--filter', '--bundle-uri', '--server-option', '--ref-format'}
+
+
+def mirror(url):
+    query = urllib.parse.urlencode({'remote': url})
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/mirror?' + query, timeout=20) as response:
+            return json.load(response).get('path')
+    except Exception:
+        return None
+
+
+index = 0
+while index < len(args) and args[index].startswith('-'):
+    index += 2 if args[index] in ('-C', '-c') else 1
+if index < len(args) and args[index] == 'clone':
+    rest = args[index + 1:]
+    position, url = 0, None
+    while position < len(rest):
+        argument = rest[position]
+        if argument == '--':
+            url = rest[position + 1] if position + 1 < len(rest) else None
+            break
+        if argument.startswith('-'):
+            position += 2 if argument in VALUED else 1
+            continue
+        url = argument
+        break
+    borrowing = any(argument.startswith('--reference') or argument in ('-s', '--shared', '--dissociate') for argument in rest)
+    if url and not borrowing:
+        path = mirror(url)
+        if path:
+            args = args[:index + 1] + ['--reference-if-able', path] + rest
+os.execv('/usr/bin/git', ['git'] + args)
+`;
 
 /** "absent": pristine storage. Otherwise how the ready baseline was made: from archives, or from the host repository cache. */
 export type RepositoryCacheState = "absent" | "archive" | "cache";
@@ -1442,6 +1500,12 @@ export function sessionEnvironment(identity: Readonly<SandboxIdentity>, tools: {
   });
 }
 
+/** Only runner-owned cache directories, at their fixed place below MIRROR_ROOT. */
+function mirrorMount(mount: MirrorMount): boolean {
+  return isAbsolute(mount.source) && !mount.source.split(sep).includes("..")
+    && /^\/repository-mirrors\/[a-z0-9-]{1,32}\/[a-z0-9._-]{1,253}\/[A-Za-z0-9{}_-]{1,100}\.git$/.test(mount.target);
+}
+
 /** Creates the read-only owner Git config once, then verifies it is the unchanged private original. */
 export async function pinOwnerConfig(path: string, configText: string): Promise<FileHandle> {
   try {
@@ -1485,6 +1549,7 @@ export class Sandbox {
   readonly #repositories: readonly SessionRepository[];
   readonly #cacheObjects: readonly string[];
   readonly #egressSocket: string | undefined;
+  readonly #mirrors: (() => readonly MirrorMount[]) | undefined;
   /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
   #cacheMounted = false;
   #initialization: Promise<void> | undefined;
@@ -1516,6 +1581,7 @@ export class Sandbox {
     this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
     if (options.egressSocket !== undefined && !isAbsolute(options.egressSocket)) throw new Error("Invalid egress socket path");
     this.#egressSocket = options.egressSocket;
+    this.#mirrors = options.mirrors;
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
@@ -1571,6 +1637,12 @@ export class Sandbox {
         await temporary.close();
         await placeholder(home, ".gitconfig");
         const config = await pinOwnerConfig(fdPath(root, "owner.gitconfig"), ownerGitConfig(this.#identity));
+        // The shim lives beside the session's mounts, where nothing in the sandbox can change it.
+        if (this.#mirrors) {
+          await mkdir(join(this.#root, "bin"), { recursive: true, mode: 0o700 });
+          await writeFile(join(this.#root, "bin", "git"), GIT_SHIM, { mode: 0o500 });
+          await chmod(join(this.#root, "bin", "git"), 0o500);
+        }
         opened.push(config);
         this.#mounts = { root, home, worktree, git, config };
         await this.#run({ kind: "initialize" }, false, true);
@@ -1881,11 +1953,14 @@ export class Sandbox {
       // Only shell commands reach the network, and only through the session's proxy. A missing socket (the session is
       // not open) is skipped; requests then fail to connect.
       ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET] : []),
+      ...(egress && this.#mirrors ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY,
+        ...this.#mirrors().filter(mirrorMount).flatMap(({ source, target }) => ["--ro-bind-try", source, target])] : []),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
     if (egress) for (const [name, value] of Object.entries(egressEnvironment())) args.push("--setenv", name, value);
+    if (egress && this.#mirrors) args.push("--setenv", "PATH", `${SHIM_DIRECTORY}:${this.#environment.PATH}`);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
     const launch = requireResources

@@ -1,4 +1,5 @@
 import { connectMain } from "../../../apps/runner/src/connect-cli.js";
+import { cacheMain } from "../../../apps/runner/src/cache-cli.js";
 import { ConnectorSetupError } from "../../../apps/runner/src/protocol.js";
 import packageJson from "../package.json" with { type: "json" };
 
@@ -6,6 +7,7 @@ const USAGE = `Usage: pistead <command> [options]
 
 Commands:
   connect     Connect this Linux or WSL2 Pi host to a Pistead workspace
+  cache       List or prune this host's repository cache
 
 Options:
   --help      Show this help
@@ -15,8 +17,9 @@ Run "pistead connect --help" for connector options.
 `;
 
 const [command, ...args] = process.argv.slice(2);
-if (command === "connect") {
-  connectMain(args).catch((error: unknown) => {
+const run = command === "connect" ? connectMain : command === "cache" ? cacheMain : undefined;
+if (run) {
+  run(args).catch((error: unknown) => {
     // Only connector-authored preflight text is printed: SDK/HTTP errors can contain auth/config detail.
     process.stderr.write(error instanceof ConnectorSetupError
       ? `${error.message}\n`

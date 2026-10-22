@@ -1,6 +1,6 @@
 # Design: sessions that use plain Git through a host egress proxy
 
-Status: phases 1 (the egress proxy and Git relay) and 2 (clone sessions) implemented. Phases 3–5 below are planned. This replaces the pinned
+Status: phases 1 (the egress proxy and Git relay), 2 (clone sessions) and 3 (the host cache for clones) implemented. Phases 4–5 below are planned. This replaces the pinned
 snapshot model of [repository-cache.md](repository-cache.md); that document is rewritten in phase 5.
 
 ## Goal
@@ -128,3 +128,33 @@ the insert, but resolves nothing with the owner's accounts. The relay checks the
 - Clone sessions have backups as before; the snapshot includes the clones and their `.git`, so large clones hit the
   backup size limit until durability moves to the session branch (phase 4).
 - Recording the commits served by the relay; pushes are recorded in the push ledger as before.
+
+## Phase 3: the host cache for clone sessions
+
+Hosts started with `--repo-cache` already keep one bare mirror per repository for pinned sessions
+([repository-cache.md](repository-cache.md)). Clone sessions borrow from the same mirrors, but fill them differently.
+
+- **Filled through the relay.** `RepositoryCache.refresh` fetches every branch and tag the remote advertises that the
+  mirror lacks, with a `GitRemote` whose `fetch` is `relayFetch`: every read goes through the control plane's relay,
+  with the session owner's own account and the relay's checks. Pinned sessions keep fetching with the host's
+  credentials. Refreshes are serialized per repository with the existing lock, and report progress the same way.
+- **Asked for by the clone.** Clone sessions' shell commands get a `git` shim first on `PATH`. For `git clone` of a
+  URL, it asks the proxy's `/__pistead/mirror?remote=…` (up to 20 seconds), which maps the URL to a workspace
+  repository, refreshes its mirror and answers its path in the sandbox; the shim then adds `--reference-if-able`.
+  Clones that already chose `--reference`, `--shared` or `--dissociate`, and everything else, run Git unchanged.
+- **Mounted only once authorized.** A mirror is mounted read-only at
+  `/repository-mirrors/<provider>/<host>/<id>.git` for a session's shell commands only after this open's refresh of
+  it, or, at a reopen, after a ref listing through the relay confirms the owner can still read it. Mounts are fixed
+  when a command starts, so a mirror the session's first clone created is visible from its next command on.
+- **Kept and pruned.** Each refresh records a keep ref per session (`refs/pistead/sessions/<hash>`): a commit whose
+  parents are the branch tips it saw, so the objects its clones borrow stay reachable. `pistead cache prune
+  --older-than DAYS` drops keep refs older than that and runs `git gc` with the same cutoff; pins are never dropped.
+  `pistead cache list` shows sizes and how many sessions and pins each mirror keeps.
+
+### Not in phase 3
+
+- Shell commands still stop after 30 seconds. A first clone of a big repository can outlast that; its mirror keeps
+  filling in the runner, so a later clone borrows from it.
+- Backups of sessions whose clones borrow from a mirror hold the clones' own objects only; they restore on a host whose
+  mirror still has the rest. Phase 4 replaces them with session branches.
+- Pre-filling a mirror without a session: every fill needs a session's owner and the relay.
