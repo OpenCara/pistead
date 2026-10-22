@@ -1376,3 +1376,47 @@ test('egress grants and the Git relay serve only the connector running the sessi
   await denied(await relay('info-refs'), 403, 'repository_authority_changed');
   await denied(await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers), 403, 'session_archived');
 });
+
+test('sessions start without pins on sandboxed hosts that can run the owner\'s shell, and pin elsewhere', async t => {
+  const f = await fixture(t); const remote = github(t);
+  const admin = await f.client('admin'); const member_ = await f.client('member');
+  const team = await workspace(admin);
+  await member(admin, team.id, member_);
+  await bindRepository(admin, team.id);
+  provisionHub(f);
+  const start = async (actor: Client, capabilities: Record<string, unknown>) => {
+    const host = await connect(f, admin, team.id, { models: manifest.models, capabilities: { ...manifest.capabilities, ...capabilities } });
+    if (actor !== admin) await json(await admin.request('PUT', `/api/connectors/${host.connectorId}/shares/${team.id}`));
+    const { models } = await json<{ models: ModelDefinition[] }>(await actor.request('GET', `/api/workspaces/${team.id}/models`));
+    const model = models.find(item => item.connectorId === host.connectorId)!;
+    remote.calls.length = 0;
+    const { session } = await json<{ session: SessionRecord }>(await actor.request('POST', '/api/sessions', {
+      workspaceId: team.id, modelId: model.id, title: 'Clone', ...(actor !== admin ? { trustedConnectorId: host.connectorId } : {}),
+    }), 201);
+    return session;
+  };
+  // The host's owner can always run their own shell commands.
+  const own = await start(admin, { plainGit: true });
+  assert.equal(own.repositoryMode, 'clone');
+  assert.deepEqual(own.repositories, []);
+  assert.deepEqual(remote.calls, [], 'nothing is resolved with the owner\'s account at creation');
+  // Another member's session needs the host's resource limits; without them it is pinned.
+  const pinned = await start(member_, { plainGit: true });
+  assert.equal(pinned.repositoryMode, undefined);
+  assert.equal(pinned.repositories?.length, 1);
+  const limited = await start(member_, { plainGit: true, productionShell: true });
+  assert.equal(limited.repositoryMode, 'clone');
+  // Older connectors pin.
+  assert.equal((await start(admin, {})).repositoryMode, undefined);
+  // So does an agent that can't run bash: its file and Git tools need the pinned snapshots.
+  const host = await connect(f, admin, team.id, { models: manifest.models, capabilities: { ...manifest.capabilities, plainGit: true } });
+  const { models } = await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`));
+  const model = models.find(item => item.connectorId === host.connectorId)!;
+  const { agent } = await json<{ agent: AgentVersion }>(await admin.request('POST', '/api/agents', {
+    name: 'Files only', description: '', instructions: '', tools: ['read_file', 'git_commit'], modelId: model.id,
+  }), 201);
+  const { session: filesOnly } = await json<{ session: SessionRecord }>(await admin.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id, title: 'Files' }), 201);
+  assert.equal(filesOnly.repositoryMode, undefined);
+  assert.equal(filesOnly.repositories?.length, 1);
+  assert.throws(() => f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = ?").run(own.id), /immutable/);
+});

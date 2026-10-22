@@ -82,18 +82,20 @@ export function registerRestoreRoutes(app: Hono<WorkerEnv>): void {
       const target: SessionRow = { id: id(), workspace_id: source.workspace_id, owner_id: ownerId,
         agent_version_id: source.agent_version_id, connector_id: source.connector_id ?? null,
         connector_owner_id: source.connector_owner_id ?? null, title: title ?? `Restored: ${source.title}`.slice(0, 200),
-        repositories_json: source.repositories_json, visibility: 'private', policy_version: 1, status: 'provisioning', created_at: now() };
+        repositories_json: source.repositories_json, repository_mode: source.repository_mode ?? null, visibility: 'private', policy_version: 1,
+        status: 'provisioning', created_at: now() };
       const binding: RunnerBinding = { ...sourceBinding, session: runnerSessionRecord(target) };
       const restoreId = id();
       // Batches are transactional. The conditional insert prevents a losing concurrent
       // request from leaving an orphan target; the unique receipt selects one winner.
       await c.env.DB.batch([
         c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
-          connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility)
-          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private'
+          connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?
           WHERE NOT EXISTS (SELECT 1 FROM restore_jobs WHERE owner_id = ? AND request_id = ?)`)
           .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
-            target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at, ownerId, requestId),
+            target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
+            target.repository_mode ?? null, ownerId, requestId),
         c.env.DB.query(`INSERT INTO restore_jobs (id, request_id, owner_id, workspace_id, source_session_id,
           backup_id, target_session_id, request_title, sha256, size, binding_json, created_at)
           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?

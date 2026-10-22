@@ -670,3 +670,39 @@ test('push access with the host\'s Git credentials needs its owner\'s opt-in, th
   assert.deepEqual(await done.json(), { pullRequest: { url: 'https://github.com/owner/repo/pull/5', number: 5, created: true } });
   assert.equal(f.calls.find(call => call.method === 'POST' && call.url.endsWith('/pulls'))!.authorization, 'Bearer owner-oauth-token', 'pull requests are still opened as the owner');
 });
+
+test('a clone session pushes to the workspace repository at the operation path, with no pins', async t => {
+  const f = await fixture(t);
+  // The fixture's session pins its repositories; a clone session pins none.
+  f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
+    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone' WHERE id = 'session'; COMMIT;");
+  const op = f.operation({ directory: 'repo' });
+  const reordered = { kind: 'git.push', repository: op.repository, directory: 'repo', branch: op.branch, commit: op.commit };
+  const capability = await f.approve('approval-clone', reordered);
+  const issued = await f.post(credential, { sessionId: 'session', approvalId: 'approval-clone', actorId: owner, operation: reordered, capability });
+  assert.equal(issued.status, 200);
+  assert.equal((await issued.json() as { remote: string }).remote, 'https://github.com/owner/repo.git');
+  assert.equal(f.ledger()[0]!.binding_id, 'binding-gh');
+  // Any repository of the workspace, by its path; nothing else.
+  const gitlab = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-1', actorId: owner,
+    operation: { kind: 'git.push', repository: 'gitlab.com/group/project', directory: 'project', branch: 'feature', commit: op.commit }, admissionId: f.admit('auto') });
+  assert.equal(f.ledger().at(-1)!.binding_id, 'binding-gl', String(gitlab.status));
+  const unknown = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-2', actorId: owner,
+    operation: { kind: 'git.push', repository: 'owner/other', directory: 'other', branch: 'feature', commit: op.commit }, admissionId: f.admit('auto') });
+  assert.equal(unknown.status, 403);
+  assert.equal(await code(unknown), 'repository_binding_mismatch');
+  const traversal = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-3', actorId: owner,
+    operation: { kind: 'git.push', repository: 'owner/repo', directory: '../repo', branch: 'feature', commit: op.commit }, admissionId: f.admit('auto') });
+  assert.equal(traversal.status, 400);
+  // A clone session's pushes name a clone's directory.
+  const pinnedShape = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-4', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') });
+  assert.equal(pinnedShape.status, 400);
+});
+
+test('a pinned session cannot push a clone directory', async t => {
+  const f = await fixture(t);
+  const response = await f.post(credential, { sessionId: 'session', approvalId: 'tool-pinned-1', actorId: owner,
+    operation: f.operation({ directory: 'repo' }), admissionId: f.admit('auto') });
+  assert.equal(response.status, 400);
+  assert.deepEqual(f.ledger(), []);
+});

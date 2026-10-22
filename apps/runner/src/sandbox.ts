@@ -5,11 +5,11 @@ import { constants } from "node:fs";
 import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
-import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { repositoryLimits, validCloneDirectory, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import { repositoryPinIdentity } from "./protocol.js";
 import { EGRESS_PORT, EGRESS_SOCKET, egressEnvironment } from "./egress.js";
 import type { HostCommandOperation, Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
-import type { PushPreparation } from "./push.js";
+import type { ClonePushPreparation, PushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { runHostShell } from "./host-shell.js";
@@ -123,7 +123,10 @@ type Request =
   | { kind: "head" }
   | { kind: "push-prepare"; id: string; path: string; base: string; commit: string }
   | { kind: "push-pack"; id: string; tip: string; exclude: string[] }
-  | { kind: "push-cleanup"; id: string };
+  | { kind: "push-cleanup"; id: string }
+  | { kind: "clone-head"; path: string }
+  | { kind: "clone-push-prepare"; path: string; commit: string; old: string | null; tips: string[] }
+  | { kind: "clone-push-pack"; path: string; commit: string; exclude: string[] };
 
 /** Push transfers: a pack streamed after the request line, or stdout handed over uncapped. */
 interface Transfer { input?: AsyncIterable<Uint8Array>; output?: (stdout: Readable, kill: () => void) => void }
@@ -145,7 +148,7 @@ for fd_name in os.listdir('/proc/self/fd'):
         except OSError:
             pass
 os.umask(0o077)
-PUSH_KINDS = ('push-prepare', 'push-pack')
+PUSH_KINDS = ('push-prepare', 'push-pack', 'clone-push-prepare', 'clone-push-pack')
 # Checkouts from the host repository cache write whole repositories, like pushes read them.
 LONG_KINDS = PUSH_KINDS + ('repository-checkout',)
 
@@ -1060,6 +1063,80 @@ def push_pack(request):
         raise ValueError('push pack failed')
 
 
+def clone_directory(request):
+    # A clone the agent made in the worktree: Git runs in it read-only, with its own config but the hardened flags.
+    parts = parts_for(request['path'])
+    directory = os.path.join(WORK, *parts)
+    if not parts or not os.path.isdir(directory) or not os.path.lexists(os.path.join(directory, '.git')):
+        raise ValueError('the clone directory is not a Git clone in the worktree')
+    return directory
+
+
+def clone_spawn(directory, arguments, stdout=subprocess.PIPE):
+    env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+    argv = GIT_HARDENED + ['--literal-pathspecs', '-c', 'safe.directory=' + directory, '-C', directory] + arguments
+    return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL, cwd=directory, env=env, close_fds=True)
+
+
+def clone_git(directory, arguments, data=b''):
+    child = clone_spawn(directory, arguments)
+    output, _ = child.communicate(data)
+    return child.returncode, output
+
+
+def clone_head(request):
+    directory = clone_directory(request)
+    code, output = clone_git(directory, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])
+    commit = output.decode('ascii', 'replace').strip()
+    if code or not OID.fullmatch(commit):
+        raise ValueError('the clone has no commit to push')
+    code, output = clone_git(directory, ['config', '--get', 'remote.origin.url'])
+    origin = output.decode('utf-8', 'replace').strip() if not code else None
+    return {'commit': commit, 'origin': origin[:2048] if origin else None}
+
+
+def clone_push_prepare(request):
+    directory = clone_directory(request)
+    commit, old, tips = request['commit'], request['old'], request['tips']
+    if (not isinstance(commit, str) or not OID.fullmatch(commit) or (old is not None and (not isinstance(old, str) or not OID.fullmatch(old)))
+            or not isinstance(tips, list) or len(tips) > 1024 or not all(isinstance(tip, str) and OID.fullmatch(tip) for tip in tips)):
+        raise ValueError('invalid push request')
+    names = [commit] + tips
+    _, output = clone_git(directory, ['cat-file', '--batch-check=%(objecttype)'], ''.join(name + '^{commit}\n' for name in names).encode('ascii'))
+    kinds = output.decode('ascii', 'replace').splitlines()
+    if len(kinds) != len(names) or kinds[0] != 'commit':
+        raise ValueError('the commit to push is not in the clone')
+    present = [tip for tip, kind in zip(tips, kinds[1:]) if kind == 'commit']
+    ancestor = None
+    if old is not None:
+        ancestor = old in present and clone_git(directory, ['merge-base', '--is-ancestor', old, commit])[0] == 0
+    revisions = (commit + '\n' + ''.join('^' + tip + '\n' for tip in present)).encode('ascii')
+    _, output = clone_git(directory, ['rev-list', '--count', '--stdin'], revisions)
+    total = int(output.strip() or b'0')
+    _, output = clone_git(directory, ['log', '--stdin', '--max-count=100', '--format=%H%x00%s'], revisions)
+    commits = []
+    for line in output.decode('utf-8', 'replace').splitlines():
+        source, _, subject = line.partition('\0')
+        if OID.fullmatch(source):
+            commits.append({'source': source, 'subject': subject[:200]})
+    return {'present': present, 'ancestor': ancestor, 'commits': commits, 'total': total}
+
+
+def clone_push_pack(request):
+    directory = clone_directory(request)
+    commit, exclude = request['commit'], request['exclude']
+    if (not isinstance(commit, str) or not OID.fullmatch(commit) or not isinstance(exclude, list) or len(exclude) > 1024
+            or not all(isinstance(oid, str) and OID.fullmatch(oid) for oid in exclude)):
+        raise ValueError('invalid push request')
+    sys.stdout.flush()
+    # The pack streams straight to the runner on the helper's stdout.
+    child = clone_spawn(directory, ['-c', 'core.bigFileThreshold=64m', 'pack-objects', '--stdout', '--revs',
+                                    '--delta-base-offset', '-q'], stdout=None)
+    child.communicate((commit + '\n' + ''.join('^' + oid + '\n' for oid in exclude)).encode('ascii'))
+    if child.returncode:
+        raise ValueError('push pack failed')
+
+
 def push_cleanup(request):
     scratch, directory = push_directory(request)
     try:
@@ -1140,6 +1217,15 @@ def main():
         os.close(work)
     if kind == 'head':
         run(GIT + ['rev-parse', '--verify', 'HEAD'])
+        return
+    if kind == 'clone-head':
+        print(json.dumps(clone_head(request), ensure_ascii=True))
+        return
+    if kind == 'clone-push-prepare':
+        print(json.dumps(clone_push_prepare(request), ensure_ascii=True))
+        return
+    if kind == 'clone-push-pack':
+        clone_push_pack(request)
         return
     if kind == 'bash':
         egress = request.get('egress')
@@ -1701,6 +1787,53 @@ export class Sandbox {
     })();
   }
 
+  /** The checked-out commit of a clone the agent made in the worktree, and its origin remote (clone sessions). */
+  async cloneHead(path: string, authorize: SandboxAuthorize): Promise<{ commit: string; origin: string | null }> {
+    if (!validCloneDirectory(path)) throw new Error("Invalid clone directory");
+    const value = JSON.parse(await this.#operation({ kind: "clone-head", path }, true, authorize)) as { commit: unknown; origin: unknown };
+    if (typeof value.commit !== "string" || !OID.test(value.commit) || (value.origin !== null && typeof value.origin !== "string")) throw new Error("Invalid clone head");
+    return { commit: value.commit, origin: value.origin };
+  }
+
+  /** Which advertised tips the clone has, whether the branch's tip is an ancestor of `commit`, and the commits to push. */
+  async clonePushPrepare(path: string, input: { commit: string; old: string | null; tips: string[] }, authorize: SandboxAuthorize): Promise<ClonePushPreparation> {
+    if (!validCloneDirectory(path) || !OID.test(input.commit) || (input.old !== null && !OID.test(input.old))
+      || input.tips.length > 1024 || !input.tips.every((tip) => OID.test(tip))) throw new Error("Invalid push request");
+    const value = JSON.parse(await this.#operation({ kind: "clone-push-prepare", path, commit: input.commit, old: input.old, tips: [...input.tips] }, true, authorize)) as ClonePushPreparation;
+    if (!Array.isArray(value.present) || !value.present.every((tip) => input.tips.includes(tip)) || (value.ancestor !== null && typeof value.ancestor !== "boolean")
+      || !Array.isArray(value.commits) || value.commits.some((commit) => !OID.test(commit.source) || typeof commit.subject !== "string")
+      || !Number.isSafeInteger(value.total) || value.total < value.commits.length) throw new Error("Invalid push preparation");
+    return { present: value.present, ancestor: value.ancestor, commits: value.commits.map(({ source, subject }) => ({ source, subject })), total: value.total };
+  }
+
+  /** Streams the clone's pack of `commit` minus `exclude`; the session queue is held until the stream ends. */
+  async clonePushPack(path: string, input: { commit: string; exclude: string[] }, authorize: SandboxAuthorize): Promise<AsyncIterable<Uint8Array>> {
+    if (!validCloneDirectory(path) || !OID.test(input.commit) || input.exclude.length > 1024 || !input.exclude.every((oid) => OID.test(oid))) throw new Error("Invalid push request");
+    if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
+    await this.initialize();
+    const started = Promise.withResolvers<{ stdout: Readable; kill: () => void }>();
+    const finished = this.#exclusive(async () => {
+      if (this.#closed) throw new Error("Sandbox is closed");
+      await authorize();
+      if (this.#closed) throw new Error("Sandbox is closed");
+      await this.#run({ kind: "clone-push-pack", path, commit: input.commit, exclude: [...input.exclude] }, true, false, false, {
+        output: (stdout, kill) => started.resolve({ stdout, kill }),
+      });
+    });
+    finished.catch((error) => started.reject(error));
+    const pack = await started.promise;
+    return (async function* () {
+      let complete = false;
+      try {
+        for await (const chunk of pack.stdout) yield chunk as Uint8Array;
+        await finished;
+        complete = true;
+      } finally {
+        if (!complete) { pack.kill(); await finished.catch(() => undefined); }
+      }
+    })();
+  }
+
   async pushCleanup(id: string): Promise<void> {
     if (!PUSH_ID.test(id)) throw new Error("Invalid push id");
     this.#pushStreams.get(id)?.();
@@ -1793,7 +1926,7 @@ export class Sandbox {
         kill();
       };
       this.#cancelActive = cancel;
-      const deadline = request.kind === "push-prepare" || request.kind === "push-pack" || request.kind === "repository-checkout" ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
+      const deadline = ["push-prepare", "push-pack", "repository-checkout", "clone-push-prepare", "clone-push-pack"].includes(request.kind) ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
       const timer = setTimeout(() => {
         failure ??= `Sandbox exceeded ${deadline}ms time limit`;
         kill();

@@ -1,6 +1,6 @@
 import { HTTPException } from 'hono/http-exception';
 import type { GitProvider, SessionRepository } from '../../../../packages/shared/src/repositories.js';
-import { repositoryLimits } from '../../../../packages/shared/src/repositories.js';
+import { repositoryLimits, repositoryPath } from '../../../../packages/shared/src/repositories.js';
 import type { GitPushOperation, HostPushCredential, PushCompletionResult, PushCredential, PushOutcome } from '../../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../../packages/shared/src/policy.js';
@@ -11,7 +11,7 @@ import { parseOperation } from '../operations.js';
 import { decryptToken, encryptToken } from '../vault.js';
 import { requireCallbackScope } from '../connectors.js';
 import { requireBrokerReview, requireOperationTool } from '../approval-reviews.js';
-import { recheckAccess, repositoryAccess, validPin } from '../repositories.js';
+import { cloneSessionRepository, recheckAccess, repositoryAccess, validPin } from '../repositories.js';
 import { mintPushToken, revokePushToken, type MintedToken, type PushRevocation } from './mint.js';
 import { branchTip, openPullRequest, pushTarget } from './targets.js';
 
@@ -26,8 +26,20 @@ export async function requireNoRestore(c: AppContext, sessionId: string): Promis
   await requireNoMigration(c.env, sessionId);
 }
 
-/** The pinned repository whose worktree path the operation names. */
-function pushPin(row: SessionRow, path: string): SessionRepository {
+/**
+ * The pinned repository whose worktree path the operation names; in a clone session, the workspace repository at that
+ * path. A clone session's pushes name the clone's directory, and only theirs do.
+ */
+async function pushPin(env: Env, row: SessionRow, operation: GitPushOperation): Promise<SessionRepository> {
+  const path = operation.repository;
+  if ((row.repository_mode === 'clone') !== (operation.directory !== undefined)) {
+    fail(400, 'invalid_operation', row.repository_mode === 'clone' ? 'A clone session pushes a clone\'s directory.' : 'Only clone sessions push a clone\'s directory.');
+  }
+  if (row.repository_mode === 'clone') {
+    const repository = await cloneSessionRepository(env, row, binding => repositoryPath({ provider: binding.provider, host: binding.host, fullName: binding.full_name }) === path);
+    if (!repository) fail(403, 'repository_binding_mismatch', 'The push does not name a repository of this workspace.');
+    return repository;
+  }
   let repositories: SessionRepository[];
   try { repositories = JSON.parse(row.repositories_json ?? '[]'); } catch { return fail(409, 'invalid_binding', 'Session repository binding is invalid.'); }
   if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) fail(409, 'invalid_binding', 'Session repository binding is invalid.');
@@ -153,7 +165,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
   const authority = await authorize();
   const row = authority.row;
   await requireNoRestore(c, sessionId);
-  const pin = pushPin(row, operation.repository);
+  const pin = await pushPin(c.env, row, operation);
   const policy = await requireBinding(c, row.workspace_id, pin);
   const { provider, host } = pinProvider(pin);
   const access = await repositoryAccess(c.env, row.owner_id, provider, host, pin.fullName);
@@ -294,7 +306,7 @@ export async function pushComplete(c: AppContext, connectorId: string | null): P
   };
   try {
     const row = await authorize();
-    const pin = pushPin(row, operation.repository);
+    const pin = await pushPin(c.env, row, operation);
     if (pin.bindingId !== ledger.binding_id) fail(403, 'repository_binding_mismatch', 'The pinned repository changed.');
     await requireBinding(c, row.workspace_id, pin);
     const { provider, host } = pinProvider(pin);

@@ -95,6 +95,11 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   if (pins.some(pin => 'provider' in pin) && capabilities.gitProviders !== true) {
     fail(409, 'connector_update_required', 'Update the target host\'s connector (npx pistead@latest connect) to carry this session\'s repositories.');
   }
+  // A clone session has no pins to carry: its successor needs a host where the agent can clone again.
+  if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.sandbox !== true || capabilities.unsandboxed
+    || (capabilities.productionShell !== true && model.connector_owner_id !== ownerId))) {
+    fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a sandboxed host with an up-to-date connector that can run your shell commands.');
+  }
   const sourceAgent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
   if (!sourceAgent) fail(409, 'invalid_binding', 'Session binding is incomplete.');
   const sourceBinding = await bindingForSession(c, source);
@@ -112,7 +117,7 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   const agent = await migratedAgentVersion(c.env, ownerId, sourceAgent, model, capabilities);
   const target: SessionRow = { id: id(), workspace_id: source.workspace_id, owner_id: ownerId, agent_version_id: agent.id,
     connector_id: model.connector_id, connector_owner_id: model.connector_owner_id, title: input.title ?? source.title,
-    repositories_json: source.repositories_json ?? '[]', visibility: source.visibility ?? 'private', policy_version: 1,
+    repositories_json: source.repositories_json ?? '[]', repository_mode: source.repository_mode ?? null, visibility: source.visibility ?? 'private', policy_version: 1,
     status: 'provisioning', created_at: now() };
   await requireConnectorSession(c.env, model.connector_id, target);
   const binding: RunnerBinding = { session: runnerSessionRecord(target), owner: sourceBinding.owner, agent: agentVersion(agent), model: modelDefinition(model) };
@@ -130,11 +135,11 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   try {
     await c.env.DB.batch([
       c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
-        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
+        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
         .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
           target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
-          target.visibility ?? 'private', ...admissibleValues),
+          target.visibility ?? 'private', target.repository_mode ?? null, ...admissibleValues),
       c.env.DB.query(`INSERT INTO host_migrations (id, request_id, owner_id, workspace_id, source_session_id, source_connector_id,
         target_session_id, target_connector_id, target_model_id, request_title, sha256, size, snapshot, binding_json, created_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)`)

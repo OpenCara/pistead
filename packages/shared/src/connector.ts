@@ -37,6 +37,12 @@ export interface ConnectorCapabilities {
    * successor session bound to this host and one of its models. Absent on older connectors.
    */
   hostMigration?: boolean;
+  /**
+   * Sandboxed sessions on this host can start without pinned repositories: the agent clones the workspace's repositories
+   * with plain Git through the session's egress proxy, and git_push pushes a clone's commits. Absent on older connectors
+   * and on hosts without the sandbox.
+   */
+  plainGit?: boolean;
 }
 
 export interface ConnectorInfo {

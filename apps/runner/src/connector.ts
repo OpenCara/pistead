@@ -181,7 +181,8 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // So does the owner's choice to check repositories out of this host's cache, fetched with its own Git credentials.
   const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true,
+    ...(result.sandbox ? { plainGit: true } : {}), ...credentials };
 }
 
 export async function claimConnectorPairing(options: {

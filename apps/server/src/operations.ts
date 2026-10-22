@@ -1,7 +1,7 @@
 import { validHostOperation } from '../../../packages/shared/src/host-operations.js';
 import type { GitHubMergeMethod, Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
 import { githubMergeMethods, permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
-import { validPushBranch } from '../../../packages/shared/src/repositories.js';
+import { validCloneDirectory, validPushBranch } from '../../../packages/shared/src/repositories.js';
 import { fail, text } from './http.js';
 
 /** A pinned repository's worktree path, as produced by repositoryPath(): 2-64 safe segments. */
@@ -61,8 +61,10 @@ export function parseOperation(input: unknown): Operation {
       if (!validRepositoryPath(value.repository)) fail(400, 'invalid_operation', 'Expected a pinned repository path.');
       if (!validPushBranch(value.branch)) fail(400, 'invalid_operation', 'Invalid branch name.');
       if (typeof value.commit !== 'string' || !/^[0-9a-f]{40}$/.test(value.commit)) fail(400, 'invalid_operation', 'Expected a 40-character session commit.');
+      if (value.directory !== undefined && !validCloneDirectory(value.directory)) fail(400, 'invalid_operation', 'Invalid clone directory.');
       // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
-      return { kind: value.kind, repository: value.repository, branch: value.branch, commit: value.commit,
+      return { kind: value.kind, repository: value.repository, ...(value.directory === undefined ? {} : { directory: value.directory as string }),
+        branch: value.branch, commit: value.commit,
         ...(value.pullRequest === undefined ? {} : { pullRequest: pullRequest(value.pullRequest) }) };
     }
     case 'permission': {

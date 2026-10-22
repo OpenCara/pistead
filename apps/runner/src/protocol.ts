@@ -3,7 +3,7 @@ import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
 import { githubMergeMethods, permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
-import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
+import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validCloneDirectory, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -98,6 +98,8 @@ export function validateBinding(value: unknown, id: string, allowNativeModels = 
     throw new RunnerError(400, "Invalid runner workspace or connector binding");
   if (b.session.connectorId !== undefined) assertId(b.session.connectorId);
   validateRepositories(b.session.repositories);
+  if (b.session.repositoryMode !== undefined && (b.session.repositoryMode !== "clone" || b.session.repositories?.length))
+    throw new RunnerError(400, "Invalid session repository mode");
   b.owner.env = validateUserEnv(b.owner.env ?? {});
   return JSON.parse(JSON.stringify(b));
 }
@@ -124,9 +126,10 @@ export function validateOperation(value: unknown): Operation {
       && (request.base === undefined || validPushBranch(request.base)));
     if (typeof op.repository === "string" && op.repository.length <= 512 && /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+){1,63}$/.test(op.repository)
       && !op.repository.split("/").some(part => [".", "..", ".git"].includes(part.toLowerCase()))
+      && (op.directory === undefined || validCloneDirectory(op.directory))
       && validPushBranch(op.branch) && typeof op.commit === "string" && /^[0-9a-f]{40}$/.test(op.commit)
-      && keys.every(key => ["kind", "repository", "branch", "commit", "pullRequest"].includes(key))
-      && keys.length === (request === undefined ? 4 : 5) && validRequest) return op;
+      && keys.every(key => ["kind", "repository", "directory", "branch", "commit", "pullRequest"].includes(key))
+      && keys.length === 4 + (request === undefined ? 0 : 1) + (op.directory === undefined ? 0 : 1) && validRequest) return op;
   }
   if (op.kind === "permission") {
     const keys = Object.keys(op);

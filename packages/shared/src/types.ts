@@ -82,6 +82,11 @@ export interface SessionRecord {
   connectorId?: string;
   connectorOwnerId?: string;
   repositories?: SessionRepository[];
+  /**
+   * "clone": the session has no pinned repositories; its agent clones the workspace's repositories with plain Git through
+   * the host's egress proxy and pushes a clone's commits with git_push. Absent: repositories are pinned at creation.
+   */
+  repositoryMode?: "clone";
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
   // Present only on single-session reads: the pinned host explicitly runs without isolation.
@@ -137,7 +142,10 @@ export interface PullRequestRequest {
  */
 export interface GitPushOperation {
   kind: "git.push";
+  /** The workspace repository's path (`repositoryPath`): a pin's path, or in a clone session the repository the clone's origin names. */
   repository: string;
+  /** Clone sessions only: the clone's directory in the worktree, whose commit is pushed as it is. */
+  directory?: string;
   branch: string;
   commit: string;
   pullRequest?: PullRequestRequest;

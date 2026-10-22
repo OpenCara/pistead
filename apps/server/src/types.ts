@@ -67,6 +67,8 @@ export interface SessionRow {
   policy_version: number; status: 'provisioning' | 'ready' | 'error' | 'archived'; created_at: string;
   connector_id?: string | null; connector_owner_id?: string | null;
   repositories_json?: string;
+  /** 'clone': no pins; the agent clones the workspace's repositories through the host's egress proxy. */
+  repository_mode?: 'clone' | null;
   visibility?: 'private' | 'workspace';
   /** The status before archiving, restored on unarchive. */
   archived_status?: 'provisioning' | 'ready' | 'error' | null;

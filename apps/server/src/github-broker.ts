@@ -12,7 +12,7 @@ import { githubRepositoryName, issueNumber, parseOperation } from './operations.
 import { decryptToken } from './vault.js';
 import { requireCallbackScope } from './connectors.js';
 import { requireBrokerReview, requireToolCall } from './approval-reviews.js';
-import { recheckAccess, validPin, verifyRepository, type GitHubAccess } from './repositories.js';
+import { cloneSessionRepository, recheckAccess, validPin, verifyRepository, type GitHubAccess } from './repositories.js';
 import { requireBinding, requireNoRestore } from './push/broker.js';
 
 /*
@@ -49,6 +49,13 @@ async function ownerGitHub(env: Env, ownerId: string): Promise<GitHubAccess> {
 
 /** The session's pin of github.com repository `name` (owner/name, any case), while the workspace still configures it. */
 async function pinnedGitHubRepository(c: AppContext, row: SessionRow, name: string): Promise<GitHubSessionRepository> {
+  if (row.repository_mode === 'clone') {
+    // A clone session reads and merges in any github.com repository of its workspace.
+    const repository = await cloneSessionRepository(c.env, row, binding => binding.provider === 'github' && binding.full_name.toLowerCase() === name.toLowerCase());
+    if (!repository || 'provider' in repository) fail(403, 'repository_not_pinned', `${name} is not a github.com repository of this workspace.`);
+    await requireBinding(c, row.workspace_id, repository);
+    return repository;
+  }
   let repositories: SessionRepository[];
   try { repositories = JSON.parse(row.repositories_json ?? '[]'); } catch { return fail(409, 'invalid_binding', 'Session repository binding is invalid.'); }
   if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) fail(409, 'invalid_binding', 'Session repository binding is invalid.');
