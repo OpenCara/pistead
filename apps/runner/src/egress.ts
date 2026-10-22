@@ -8,8 +8,8 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
-import { egressReadServices, hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
-import { boundedStream, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
+import { egressPushService, hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
 import { RunnerError } from "./protocol.js";
 
 /** Where sandboxed commands reach the proxy: a loopback port the sandbox helper relays to this session's socket. */
@@ -27,8 +27,6 @@ const CONNECT_TIMEOUT_MS = 10_000;
 /** A grant the control plane can't refresh stays in use this long, so a brief outage doesn't cut running commands off. */
 const GRANT_STALE_MS = 5 * 60_000;
 const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
-/** Forges refuse pushes far below this. */
-const PUSH_REQUEST_BYTES = 2 * 1024 * 1024 * 1024;
 const LOG_ENTRIES = 200;
 
 /**
@@ -342,7 +340,9 @@ export class EgressProxy {
       network: grant?.policy ?? null,
       ...(error ? { error } : {}),
       repositories: grant?.repositories.map(repository => bindingRemote(repository)) ?? [],
-      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`,
+      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`
+        + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : ""),
+      sessionBranch: this.#options.sessionBranch ?? null,
       recent: this.#log.slice(-50),
     }, null, 2)}\n`);
   }
@@ -371,7 +371,7 @@ export class EgressProxy {
     const target = parsed.target.replace(/^[^@/]*@/, "");
     const key = repositoryKey(target);
     const label = key.slice(0, 300);
-    const push = !egressReadServices.includes(parsed.service);
+    const push = egressPushService(parsed.service);
     if (push && !this.#options.sessionBranch) {
       this.#record({ kind: "git", target: label, outcome: "refused", reason: "push" });
       return refuse(response, 403, "Pushes don't go through the egress proxy in this session: commit, then use the git_push tool");
@@ -413,23 +413,18 @@ export class EgressProxy {
       if (error instanceof PushRequestError) return refuse(response, 400, error.message);
       throw error;
     }
+    // Answers here come once the request is read: Git reads them only after sending it, and the connection must stay up.
     if (!parsed.commands.length) {
-      await parsed.body.cancel().catch(() => {});
+      if (!await drainStream(parsed.body, PUSH_REQUEST_BYTES)) return refuse(response, 413, "The push is too large");
       response.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-store" });
       return void response.end();
     }
     const refusal = sessionBranchRefusal(parsed.commands, branch);
     if (refusal) {
       this.#record({ kind: "git", target: label, outcome: "refused", reason: `push: ${refusal}` });
+      if (!await drainStream(parsed.body, PUSH_REQUEST_BYTES)) return refuse(response, 413, "The push is too large");
       const rejection = pushRejection(parsed.commands, parsed.capabilities, refusal);
-      if (!rejection) {
-        await parsed.body.cancel().catch(() => {});
-        return refuse(response, 403, refusal);
-      }
-      // Git reads the answer only once it has sent its pack, so the rest of the request is read and dropped first.
-      const reader = boundedStream(parsed.body, PUSH_REQUEST_BYTES, "The push is too large").getReader();
-      try { while (!(await reader.read()).done); }
-      catch { return refuse(response, 413, "The push is too large"); }
+      if (!rejection) return refuse(response, 403, refusal);
       response.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-store" });
       return void response.end(rejection);
     }

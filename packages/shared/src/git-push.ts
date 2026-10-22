@@ -8,6 +8,8 @@ export interface PushCommand { old: string; new: string; ref: string }
 
 /** A push request's command section is a few lines; a pack follows it. */
 export const PUSH_COMMANDS_BYTES = 64 * 1024;
+/** Forges refuse pushes far below this; it bounds what one push can make the proxy and the control plane stream. */
+export const PUSH_REQUEST_BYTES = 2 * 1024 * 1024 * 1024;
 
 const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 export const ZERO_OBJECT = /^0+$/;
@@ -86,6 +88,24 @@ export async function readPushCommands(body: ReadableStream<Uint8Array>): Promis
       cancel(reason) { return reader.cancel(reason); },
     }),
   };
+}
+
+/**
+ * Reads `body` to its end, discarding it, and returns false if it holds more than `limit` bytes. An HTTP server answers
+ * a request it refuses only once the request is read: cancelling the request's stream would close the connection
+ * before the client reads the answer.
+ */
+export async function drainStream(body: ReadableStream<Uint8Array>, limit: number): Promise<boolean> {
+  const reader = body.getReader();
+  let size = 0;
+  try {
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) return true;
+      size += part.value.byteLength;
+      if (size > limit) { await reader.cancel().catch(() => {}); return false; }
+    }
+  } catch { return false; }
 }
 
 /** `body`, failing once more than `limit` bytes have passed. */

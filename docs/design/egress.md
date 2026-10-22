@@ -191,11 +191,20 @@ pushed it). Pinned sessions push only with `git_push`.
   only sessions on their own hosts. The advertisement and the push each mint, and an installation token is revoked once
   its answer has streamed back. Each push is audited as `git.push.session_branch` with its old and new commit.
 - **Errors.** The control plane's refusals of the advertisement reach Git as `remote: …` text, which covers a missing or
-  unusable push identity and missing permission before any pack is sent.
+  unusable push identity and missing permission before any pack is sent. Answers the proxy gives itself (a probe, a
+  rejection) come once the request is read, so the connection stays up for Git to read them.
+- **Force pushes** of the session branch are allowed: it is the session's own, and receive-pack can't tell a fast-forward
+  from a rewrite without the objects. Branch rules on the forge can forbid them; pull requests from it are opened with
+  `git_push` and its approval.
+- **The owner's account** as push identity still serves only sessions on the owner's own hosts, although its token stays
+  on the control plane: on another person's host, that host's owner decides what the session pushes under the member's
+  name.
 
 ### Not yet
 
-- A push's upload must finish within the control plane's request timeout.
+- Backups and moves of clone sessions still snapshot the worktree; durability is the next step.
+- A push's upload must finish within the control plane's request timeout (Node's default is five minutes) and its
+  outbound fetch's; the proxy itself allows an hour.
 
 ## Phase 4: backups and moves of clone sessions
 
@@ -219,8 +228,8 @@ clones that borrow from the host's mirror.
   working tree is checked out from the backup commit and the index reset to HEAD, so the changes show as uncommitted
   again. A path already taken is never overwritten. A clone that fails stays pending, carried by later backups, and is
   retried at the next open; the agent's instructions say which and where their bundles are.
-- **Moves.** The successor's host must advertise `cloneBackups`: an older connector would restore
-  the other files and drop the clones.
+- **Moves.** The successor's host must advertise `cloneBackups`: an older connector would restore the other files and
+  drop the clones.
 
 ### Why not a WIP commit on the session branch
 

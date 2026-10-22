@@ -77,3 +77,7 @@ export const egressGitServices = ["info-refs", "upload-pack", "receive-refs", "r
 export type EgressGitService = (typeof egressGitServices)[number];
 /** The services that only read. */
 export const egressReadServices: readonly EgressGitService[] = ["info-refs", "upload-pack"];
+/** A push's services: only a clone session's own branch is pushed this way. */
+export function egressPushService(service: EgressGitService): service is "receive-refs" | "receive-pack" {
+  return !egressReadServices.includes(service);
+}

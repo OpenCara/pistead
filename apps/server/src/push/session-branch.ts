@@ -1,6 +1,6 @@
 import type { EgressGitService } from '../../../../packages/shared/src/network.js';
 import { gitProviderNames } from '../../../../packages/shared/src/repositories.js';
-import { boundedStream, PushRequestError, readPushCommands, sessionBranch, sessionBranchRefusal, type PushCommand } from '../../../../packages/shared/src/git-push.js';
+import { boundedStream, drainStream, PUSH_REQUEST_BYTES, PushRequestError, readPushCommands, sessionBranch, sessionBranchRefusal, type PushCommand } from '../../../../packages/shared/src/git-push.js';
 import type { AppContext, RepositoryRow, SessionRow } from '../types.js';
 import { auditStatement } from '../db.js';
 import { fail } from '../http.js';
@@ -9,8 +9,6 @@ import { requireBinding, requireNoRestore } from './broker.js';
 import { mintPushToken, revokePushToken } from './mint.js';
 import { pushTarget } from './targets.js';
 
-/** Forges refuse pushes far below this; it bounds what one request can make the control plane stream. */
-const pushRequestBytes = 2 * 1024 * 1024 * 1024;
 /** The upstream answer starts within this; a large pack may stream for as long as the session's command runs. */
 const relayTimeout = 60 * 60 * 1000;
 const pushTypes = {
@@ -68,7 +66,7 @@ export async function sessionBranchPush(c: AppContext, input: {
     if (c.req.header('content-type')?.toLowerCase() !== 'application/x-git-receive-pack-request') fail(415, 'unsupported_media_type', 'Expected a Git receive-pack request.');
     if (c.req.header('content-encoding')) fail(415, 'unsupported_media_type', 'Unsupported Git request encoding.');
     const declared = Number(c.req.header('content-length'));
-    if (Number.isFinite(declared) && declared > pushRequestBytes) fail(413, 'body_too_large', 'The push is too large.');
+    if (Number.isFinite(declared) && declared > PUSH_REQUEST_BYTES) fail(413, 'body_too_large', 'The push is too large.');
     if (!c.req.raw.body) fail(400, 'invalid_push_request', 'The Git push request is empty.');
     let parsed: Awaited<ReturnType<typeof readPushCommands>>;
     try { parsed = await readPushCommands(c.req.raw.body); }
@@ -76,9 +74,9 @@ export async function sessionBranchPush(c: AppContext, input: {
       if (error instanceof PushRequestError) fail(400, 'invalid_push_request', error.message);
       throw error;
     }
-    // Git's probe before a chunked upload changes nothing: it is answered without a credential.
+    // Git's probe before a chunked upload changes nothing: it is answered without a credential, once read.
     if (!parsed.commands.length) {
-      await parsed.body.cancel().catch(() => {});
+      if (!await drainStream(parsed.body, PUSH_REQUEST_BYTES)) fail(413, 'body_too_large', 'The push is too large.');
       return new Response(null, { headers: { 'Content-Type': pushTypes[service], 'Cache-Control': 'private, no-store' } });
     }
     const refusal = sessionBranchRefusal(parsed.commands, branch);
@@ -87,7 +85,7 @@ export async function sessionBranchPush(c: AppContext, input: {
       fail(403, 'session_branch_only', refusal);
     }
     command = parsed.commands[0]!;
-    body = boundedStream(parsed.body, pushRequestBytes, 'The push is too large.');
+    body = boundedStream(parsed.body, PUSH_REQUEST_BYTES, 'The push is too large.');
   }
   await recheckAccess(c.env, access);
   await authorize();

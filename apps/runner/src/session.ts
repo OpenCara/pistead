@@ -26,7 +26,7 @@ import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { egressPushService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 
 type Run = {
@@ -250,7 +250,7 @@ export class RunnerSession {
         : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
           { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
     } catch (error) {
-      if (egressReadServices.includes(request.service) && refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
+      if (!egressPushService(request.service) && refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
       throw error;
     }
   }
