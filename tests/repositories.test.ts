@@ -1344,6 +1344,8 @@ test('egress grants and the Git relay serve only the connector running the sessi
       ? new Response('# service=git-upload-pack', { headers: { 'Content-Type': 'application/x-git-upload-pack-advertisement' } })
       : new Response('PACK', { headers: { 'Content-Type': 'application/x-git-upload-pack-result' } });
   };
+  const verified = () => remote.calls.filter(call => call.url === `https://api.github.com/repos/${metadata.full_name}`).length;
+  const before = verified();
   const refs = await relay('info-refs', { headers: { 'Git-Protocol': 'version=2', 'User-Agent': 'git/2.43.0' } });
   assert.equal(refs.status, 200);
   assert.equal(refs.headers.get('content-type'), 'application/x-git-upload-pack-advertisement');
@@ -1356,6 +1358,8 @@ test('egress grants and the Git relay serve only the connector running the sessi
     [`https://github.com/${metadata.full_name}.git/git-upload-pack`, basic, '0000'],
   ]);
   assert.equal(seen[0]!.protocol, 'version=2');
+  // Every relayed request re-verifies the bound repository's identity, the fetch as much as the advertisement.
+  assert.equal(verified() - before, 2);
   // Pushes are never relayed, nor sessions of other connectors, nor repositories of other workspaces.
   assert.equal((await relay('receive-pack')).status, 404);
   await denied(await relay('upload-pack', { body: '0000', headers: { 'Content-Type': 'text/plain' } }), 415, 'unsupported_media_type');
