@@ -124,8 +124,8 @@ export async function gitRelay(c: AppContext, connector: ConnectorRow | null): P
     .bind(bindingId, original.workspace_id).first();
   if (!binding) fail(404, 'repository_not_bound', 'This repository is not bound to the session\'s workspace.');
   const access = await repositoryAccess(c.env, original.owner_id, binding.provider, binding.host, binding.full_name);
-  // Renames and transfers fail closed; once per clone or fetch is enough, as every fetch starts with the advertisement.
-  if (service === 'info-refs') await verifyRepository(access, { repositoryId: binding.repository_id, fullName: binding.full_name });
+  // Renames and transfers fail closed, on every request: nothing makes a sandboxed client fetch only after an advertisement.
+  await verifyRepository(access, { repositoryId: binding.repository_id, fullName: binding.full_name });
   const remote = bindingRemote({ provider: binding.provider, host: binding.host, fullName: binding.full_name });
   const agent = c.req.header('user-agent');
   const protocol = c.req.header('git-protocol');
@@ -153,7 +153,7 @@ export async function gitRelay(c: AppContext, connector: ConnectorRow | null): P
   } catch {
     return fail(502, 'git_unavailable', `${gitProviderNames[binding.provider]} could not be reached.`);
   }
-  const type = upstream.headers.get('content-type')?.split(';')[0]?.trim();
+  const type = upstream.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
   if (upstream.status !== 200 || type !== gitTypes[service] || !upstream.body) {
     await upstream.body?.cancel();
     const status: ContentfulStatusCode = [401, 403, 404].includes(upstream.status) ? 403 : 502;

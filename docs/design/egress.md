@@ -80,7 +80,7 @@ it for a minute, and keeps a stale one for up to five minutes if the control pla
 - `POST /api/connectors/self/git/relay/:bindingId/:service?sessionId=…` (and `/api/internal/git/relay/…`), `service`
   being `info-refs` or `upload-pack`. Each request re-checks the session's authority and the connector, requires the
   binding to belong to the session's workspace, loads the session owner's own account for it, verifies the
-  repository's identity (on `info-refs`, which starts every fetch), adds the owner's credential
+  repository's identity on every request, adds the owner's credential
   (`ownerGitAuthorization`) and streams the provider's answer back after checking its content type. Upload requests
   are bounded to 64 MiB. Refusals by the provider become fixed, credential-free reasons.
 

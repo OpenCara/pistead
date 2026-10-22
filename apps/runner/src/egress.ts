@@ -247,11 +247,14 @@ export class EgressProxy {
   }
 
   async #tunnel(request: IncomingMessage, client: Duplex, head: Buffer): Promise<void> {
+    // Node hands the socket over without its own error handling: a client that drops while the tunnel is being set up
+    // must not take the runner down.
+    client.on("error", () => client.destroy());
     const target = authority(request.url);
     const name = request.url ?? "";
     const deny = (status: number, reason: string) => {
       this.#record({ kind: "connect", target: name.slice(0, 300), outcome: "refused", reason });
-      client.end(`HTTP/1.1 ${status} ${status === 403 ? "Forbidden" : "Bad Gateway"}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n${reason}\n`);
+      if (!client.destroyed) client.end(`HTTP/1.1 ${status} ${status === 403 ? "Forbidden" : "Bad Gateway"}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n${reason}\n`);
     };
     try {
       if (!target) return deny(403, "Invalid tunnel target");
@@ -264,6 +267,7 @@ export class EgressProxy {
       }
       const addresses = await this.#addresses(target.host);
       if (!addresses.length) return deny(403, `${target.host} does not resolve to a public address`);
+      if (client.destroyed) return;
       this.#sockets.add(client);
       let upstream: Duplex;
       try { upstream = await this.#open(target.port, addresses); }
@@ -345,7 +349,9 @@ export class EgressProxy {
       return void response.end();
     }
     this.#record({ kind: "git", target: label, outcome: "refused", reason: "not a workspace repository" });
-    return refuse(response, 403, `${target.slice(0, 300)} is not one of this workspace's repositories, and its network policy doesn't allow ${host.slice(0, 253)}`);
+    return refuse(response, 403, hostAllowed(grant.policy, host)
+      ? `${target.slice(0, 300)} is not one of this workspace's repositories; fetch it from https://${target.slice(0, 300)} directly`
+      : `${target.slice(0, 300)} is not one of this workspace's repositories, and its network policy doesn't allow ${host.slice(0, 253)}`);
   }
 
   async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string): Promise<void> {

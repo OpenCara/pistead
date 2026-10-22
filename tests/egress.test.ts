@@ -348,3 +348,18 @@ test("a tunnel tries the host's next address when one can't be reached", async t
   assert.deepEqual(tried, ["2606:4700::6810:1", "104.16.0.1"]);
   open.socket!.destroy();
 });
+
+test("a client that drops while its tunnel is being set up doesn't take the proxy down", async t => {
+  const pending = Promise.withResolvers<EgressGrant>();
+  const { instance } = await proxy(t, { grant: () => pending.promise });
+  const request = httpRequest({ socketPath: instance.socketPath, method: "CONNECT", path: "docs.example.com:443" });
+  request.on("error", () => {});
+  request.end();
+  // The proxy is still waiting for the grant when the client goes away; its refusal then meets a closed socket.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  request.destroy();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  pending.resolve(grant());
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal((await get(instance.socketPath, "/__pistead/status")).status, 200);
+});
