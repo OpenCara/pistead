@@ -385,6 +385,22 @@ test("a clone's commit is pushed as it is, fast-forward only", { skip: !sandboxe
   await assert.rejects(sandbox.cloneHead("../escape", authorize), /Invalid clone directory/);
 });
 
+test("closing the proxy lets a push under way finish before its connection goes", async t => {
+  let release!: () => void;
+  const answered = new Promise<void>(resolve => { release = resolve; });
+  const { instance } = await proxy(t, { sessionBranch: "pistead/s1", relay: async request => {
+    if (request.service === "receive-pack") { await new Response(request.body as ReadableStream).arrayBuffer(); await answered; }
+    return new Response("report", { headers: { "content-type": "application/x-git-receive-pack-result" } });
+  } });
+  const body = pkt(`${zero} ${tip} refs/heads/pistead/s1\0report-status\n`) + "0000PACK";
+  const pushed = get(instance.socketPath, "/git/github.com/acme/app.git/git-receive-pack", { method: "POST", headers: { "content-type": "application/x-git-receive-pack-request" }, body });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const closing = instance.close();
+  setTimeout(release, 50);
+  assert.deepEqual({ ...(await pushed), headers: undefined }, { status: 200, headers: undefined, body: "report" });
+  await closing;
+});
+
 test("a sandboxed git push of the session branch goes through the proxy; other branches are rejected", { skip: !sandboxed }, async t => {
   const directory = await mkdtemp(join(tmpdir(), "egress-branch-"));
   await chmod(directory, 0o700);

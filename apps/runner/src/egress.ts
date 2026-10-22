@@ -28,6 +28,8 @@ const CONNECT_TIMEOUT_MS = 10_000;
 const GRANT_STALE_MS = 5 * 60_000;
 const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
 const LOG_ENTRIES = 200;
+/** How long closing waits for pushes under way: the forge may have taken one, and Git must hear how it went. */
+const PUSH_CLOSE_MS = 60_000;
 
 /**
  * One Git request for the control plane's relay, which adds the credential: the session owner's for reads, the
@@ -172,6 +174,7 @@ export class EgressProxy {
   readonly #options: EgressOptions;
   readonly #log: EgressEntry[] = [];
   readonly #sockets = new Set<Socket | Duplex>();
+  readonly #pushes = new Set<Promise<void>>();
   #server: Server | undefined;
   #grant: { value: EgressGrant; at: number } | undefined;
   #refresh: Promise<EgressGrant> | undefined;
@@ -201,8 +204,15 @@ export class EgressProxy {
   async close(): Promise<void> {
     const server = this.#server;
     this.#server = undefined;
+    // No new requests; a push under way finishes, within PUSH_CLOSE_MS, before its connection goes.
+    const closed = server && new Promise<void>(resolve => server.close(() => resolve()));
+    if (this.#pushes.size) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([Promise.allSettled([...this.#pushes]), new Promise<void>(resolve => { timer = setTimeout(resolve, PUSH_CLOSE_MS); })]);
+      clearTimeout(timer);
+    }
     for (const socket of this.#sockets) socket.destroy();
-    if (server) await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); });
+    if (server) { server.closeAllConnections(); await closed; }
     await rm(this.socketPath, { force: true });
   }
 
@@ -428,7 +438,9 @@ export class EgressProxy {
       response.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-store" });
       return void response.end(rejection);
     }
-    return this.#relay(request, response, repository, service, label, boundedStream(parsed.body, PUSH_REQUEST_BYTES, "The push is too large"));
+    const pushed = this.#relay(request, response, repository, service, label, boundedStream(parsed.body, PUSH_REQUEST_BYTES, "The push is too large"));
+    this.#pushes.add(pushed);
+    try { await pushed; } finally { this.#pushes.delete(pushed); }
   }
 
   async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string,
