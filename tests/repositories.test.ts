@@ -155,6 +155,8 @@ function github(t: TestContext) {
     redirect: (): Response => new Response(null, { status: 302,
       headers: { Location: `https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/${state.commit}` } }),
     archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
+    // Git smart HTTP on github.com itself, which the egress relay reads with the session owner's credential.
+    git: async (url: string, _init?: RequestInit): Promise<Response> => new Response(`unexpected ${url}`, { status: 500 }),
   };
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -168,6 +170,7 @@ function github(t: TestContext) {
     if (url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitA}` ||
         url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitB}`) return state.redirect();
     if (url.startsWith(`https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/`)) return state.archive();
+    if (url.startsWith(`https://github.com/${metadata.full_name}.git/`)) return state.git(url, init);
     unexpected.push(url);
     throw new Error('Unexpected outbound repository request');
   });
@@ -175,7 +178,8 @@ function github(t: TestContext) {
     assert.deepEqual(unexpected, []);
     for (const call of calls) {
       assert.equal(call.redirect, 'manual');
-      if (new URL(call.url).origin !== 'https://api.github.com') assert.equal(call.authorization, null, 'Never forward OAuth across origins');
+      if (call.url.startsWith(`https://github.com/${metadata.full_name}.git/`)) assert.match(call.authorization ?? '', /^Basic /, 'Git reads carry the owner credential');
+      else if (new URL(call.url).origin !== 'https://api.github.com') assert.equal(call.authorization, null, 'Never forward OAuth across origins');
     }
   });
   return { state, calls };
@@ -938,6 +942,8 @@ function gitea(t: TestContext) {
     resolve: async (): Promise<Response> => Response.json([{ sha: commitA }]),
     pinned: async (): Promise<Response> => Response.json([{ sha: commitA }]),
     archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
+    // Git smart HTTP on github.com itself, which the egress relay reads with the session owner's credential.
+    git: async (url: string, _init?: RequestInit): Promise<Response> => new Response(`unexpected ${url}`, { status: 500 }),
   };
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -1295,4 +1301,78 @@ test('token-provider cache authorization checks the pinned commit with the owner
   for (const call of s.remote.calls) assert.equal(call.authorization, `token ${giteaToken(s.owner)}`);
   s.remote.state.pinned = async () => Response.json([]);
   await denied(await authorizeCache(s.f, session, pin, s.connector), 403, 'git_repository_unavailable');
+});
+
+test('workspace network policies: members read, administrators write, invalid domains are refused', async t => {
+  const f = await fixture(t); github(t);
+  const owner = await f.client('owner'); const reader = await f.client('reader');
+  const team = await workspace(owner); await member(owner, team.id, reader);
+  const path = `/api/workspaces/${team.id}/network-policy`;
+  const initial = await json<{ policy: { mode: string; domains: string[]; packageRegistries: boolean }; packageRegistryDomains: string[] }>(await reader.request('GET', path));
+  assert.deepEqual(initial.policy, { mode: 'off', domains: [], packageRegistries: true });
+  assert.ok(initial.packageRegistryDomains.includes('registry.npmjs.org'));
+  const allowlist = { mode: 'allowlist', domains: ['docs.example.com', '*.cdn.example.net'], packageRegistries: false };
+  await denied(await reader.request('PUT', path, allowlist), 403, 'forbidden');
+  await denied(await owner.request('PUT', path, { ...allowlist, domains: ['169.254.169.254'] }), 400, 'invalid_network_policy');
+  await denied(await owner.request('PUT', path, { ...allowlist, mode: 'everything' }), 400, 'invalid_network_policy');
+  assert.deepEqual((await json<{ policy: unknown }>(await owner.request('PUT', path, allowlist))).policy, allowlist);
+  assert.deepEqual((await json<{ policy: unknown }>(await reader.request('GET', path))).policy, allowlist);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.network_policy.updated'").get()!.n, 1);
+  const outsider = await f.client('outsider');
+  await denied(await outsider.request('GET', path), 404, 'not_found');
+});
+
+test('egress grants and the Git relay serve only the connector running the session, with the owner credential', async t => {
+  const { f, remote, owner, repository, connector, start } = await connectedSetup(t);
+  const session = await start();
+  const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
+  const grant = await json<{ policy: { mode: string }; repositories: { bindingId: string; fullName: string }[] }>(
+    await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers));
+  assert.equal(grant.policy.mode, 'off');
+  assert.deepEqual(grant.repositories.map(item => [item.bindingId, item.fullName]), [[repository.id, metadata.full_name]]);
+  await denied(await f.request('POST', '/api/internal/network', { sessionId: session.id }, { Authorization: `Bearer ${internalSecret}` }), 403, 'connector_scope_required');
+
+  const relay = (service: string, init: { body?: string; headers?: Record<string, string> } = {}, sessionId = session.id, bindingId = repository.id) =>
+    app.request(`${origin}/api/connectors/self/git/relay/${bindingId}/${service}?sessionId=${sessionId}`, {
+      method: 'POST', headers: { ...headers, ...init.headers }, body: init.body ?? '' }, f.env);
+  const seen: { url: string; authorization: string | null; protocol: string | null; body: string }[] = [];
+  remote.state.git = async (url, init) => {
+    const request = new Headers(init?.headers);
+    seen.push({ url, authorization: request.get('authorization'), protocol: request.get('git-protocol'),
+      body: init?.body ? Buffer.from(init.body as Uint8Array).toString() : '' });
+    return url.endsWith('/info/refs?service=git-upload-pack')
+      ? new Response('# service=git-upload-pack', { headers: { 'Content-Type': 'application/x-git-upload-pack-advertisement' } })
+      : new Response('PACK', { headers: { 'Content-Type': 'application/x-git-upload-pack-result' } });
+  };
+  const verified = () => remote.calls.filter(call => call.url === `https://api.github.com/repos/${metadata.full_name}`).length;
+  const before = verified();
+  const refs = await relay('info-refs', { headers: { 'Git-Protocol': 'version=2', 'User-Agent': 'git/2.43.0' } });
+  assert.equal(refs.status, 200);
+  assert.equal(refs.headers.get('content-type'), 'application/x-git-upload-pack-advertisement');
+  assert.equal(await refs.text(), '# service=git-upload-pack');
+  const pack = await relay('upload-pack', { body: '0000', headers: { 'Content-Type': 'application/x-git-upload-pack-request' } });
+  assert.equal(await pack.text(), 'PACK');
+  const basic = `Basic ${Buffer.from(`x-access-token:${owner.githubToken}`).toString('base64')}`;
+  assert.deepEqual(seen.map(call => [call.url, call.authorization, call.body]), [
+    [`https://github.com/${metadata.full_name}.git/info/refs?service=git-upload-pack`, basic, ''],
+    [`https://github.com/${metadata.full_name}.git/git-upload-pack`, basic, '0000'],
+  ]);
+  assert.equal(seen[0]!.protocol, 'version=2');
+  // Every relayed request re-verifies the bound repository's identity, the fetch as much as the advertisement.
+  assert.equal(verified() - before, 2);
+  // Pushes are never relayed, nor sessions of other connectors, nor repositories of other workspaces.
+  assert.equal((await relay('receive-pack')).status, 404);
+  await denied(await relay('upload-pack', { body: '0000', headers: { 'Content-Type': 'text/plain' } }), 415, 'unsupported_media_type');
+  await denied(await relay('info-refs', {}, session.id, 'missing-binding'), 404, 'repository_not_bound');
+  await denied(await app.request(`${origin}/api/connectors/self/git/relay/${repository.id}/info-refs?sessionId=${session.id}`, {
+    method: 'POST', headers: { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': token() } }, f.env), 401, 'stale_connection');
+  await denied(await app.request(`${origin}/api/internal/git/relay/${repository.id}/info-refs?sessionId=${session.id}`, {
+    method: 'POST', headers: { Authorization: `Bearer ${internalSecret}` } }, f.env), 403, 'connector_scope_required');
+  // GitHub refusing the owner's account comes back as a fixed reason.
+  remote.state.git = async () => new Response('denied', { status: 403 });
+  await denied(await relay('info-refs'), 403, 'repository_unavailable');
+  // An archived session has no relay.
+  f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = ?").run(session.id);
+  await denied(await relay('info-refs'), 403, 'repository_authority_changed');
+  await denied(await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers), 403, 'session_archived');
 });

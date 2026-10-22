@@ -57,11 +57,12 @@ function api(access: RepositoryAccess, pin: SessionRepository): Api {
 }
 
 /**
- * The owner's own credential as a git smart-HTTP Authorization header, for push access that uses the owner's account.
+ * The owner's own credential as a git smart-HTTP Authorization header: for push access that uses the owner's account,
+ * and for the egress relay's reads, which never hand it to the host.
  * Forges ignore the user name for tokens except Bitbucket, whose API tokens (connected with the account email) and
  * access tokens each have a fixed Git user name.
  */
-export function ownerPushAuthorization(access: RepositoryAccess): string {
+export function ownerGitAuthorization(access: RepositoryAccess): string {
   if (access.provider === 'github') return basic('x-access-token', access.github.token);
   const { token, username } = access.account.credential;
   switch (access.provider) {

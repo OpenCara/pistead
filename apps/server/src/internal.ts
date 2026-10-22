@@ -12,6 +12,7 @@ import { githubComment, githubMerge, githubRead } from './github-broker.js';
 import { legacyRestoreDownload } from './restore-routes.js';
 import { repositoryAuthorize, repositoryDownload } from './repositories.js';
 import { pushComplete, pushCredential } from './push/broker.js';
+import { egressGrant, gitRelay } from './network.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   const configured = c.env.RUNNER_SHARED_SECRET;
@@ -35,6 +36,8 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
   app.post('/api/internal/repositories/:bindingId/download', c => repositoryDownload(c, null));
   app.post('/api/internal/repositories/:bindingId/authorize', c => repositoryAuthorize(c, null));
+  app.post('/api/internal/network', c => egressGrant(c, null));
+  app.post('/api/internal/git/relay/:bindingId/:service', c => gitRelay(c, null));
 }
 
 export async function authorizeSession(c: AppContext, connectorId: string | null): Promise<Response> {

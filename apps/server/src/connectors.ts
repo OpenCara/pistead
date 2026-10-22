@@ -1,4 +1,5 @@
 import { repinSession } from './repin.js';
+import { egressGrant, gitRelay } from './network.js';
 import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
@@ -307,6 +308,8 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/repositories/:bindingId/download', async c => repositoryDownload(c, await authenticateConnector(c)));
   app.post('/api/connectors/self/repositories/:bindingId/authorize', async c => repositoryAuthorize(c, await authenticateConnector(c)));
+  app.post('/api/connectors/self/network', async c => egressGrant(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/git/relay/:bindingId/:service', async c => gitRelay(c, await authenticateConnector(c)));
 }
 
 export function registerConnectors(app: Hono<WorkerEnv>): void {

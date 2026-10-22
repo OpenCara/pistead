@@ -18,6 +18,7 @@ import { registerOidc } from './push/oidc.js';
 import { registerPushIdentities } from './push/identities.js';
 import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
 import { registerDataExports } from './data-export.js';
+import { registerNetworkPolicies } from './network.js';
 import { compression } from './compression.js';
 
 export const app = new Hono<WorkerEnv>();
@@ -72,6 +73,7 @@ registerRestoreRoutes(app);
 registerHostMigrations(app);
 registerWorkspaceDatabases(app);
 registerDataExports(app);
+registerNetworkPolicies(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));
 
 export default app;

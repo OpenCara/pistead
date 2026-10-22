@@ -2,12 +2,14 @@ import type { Hono } from 'hono';
 import type {
   AgentVersion, BackupLocation, ModelDefinition, PushIdentity, SessionRecord, WorkspaceDatabase, WorkspaceRole,
 } from '../../../packages/shared/src/types.js';
+import type { NetworkPolicy } from '../../../packages/shared/src/network.js';
 import type { WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
 import type { Database, SqlValue } from './db/types.js';
 import type { AgentRow, ModelRow, PushIdentityRow, RepositoryRow, SessionRow, WorkerEnv, WorkspaceRow } from './types.js';
 import { agentVersion, auditStatement, modelDefinition, requireMember, requireSession, sessionRecord, workspaceSessionAccess } from './db.js';
 import { fail, identifier, now } from './http.js';
 import { publicRepository } from './repositories.js';
+import { workspaceNetworkPolicy } from './network.js';
 import { publicIdentity } from './push/identities.js';
 import { publicWorkspaceDatabase, type WorkspaceDatabaseRow } from './workspace-databases/store.js';
 
@@ -60,6 +62,7 @@ export interface WorkspaceExport {
   agents: AgentVersion[];
   repositories: WorkspaceRepository[];
   pushIdentities: PushIdentity[];
+  networkPolicy: NetworkPolicy;
   database: WorkspaceDatabase | null;
   /** Workspace activity not tied to a session; each session's activity is in its own entry. */
   audit: AuditEntry[];
@@ -168,6 +171,7 @@ export async function exportWorkspace(db: Database, workspaceId: string,
     agents: agents.map(agentVersion),
     repositories: repositories.map(repository => publicRepository(repository)),
     pushIdentities: identities.map(identity => publicIdentity(identity)),
+    networkPolicy: await workspaceNetworkPolicy(db, workspaceId),
     database: database ? publicWorkspaceDatabase(database) : null,
     audit: await auditEntries(db, 'workspace_id = ? AND session_id IS NULL', workspaceId),
     sessions,

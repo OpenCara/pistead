@@ -1,0 +1,297 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest, type IncomingMessage } from "node:http";
+import { createServer as createTcpServer, connect as tcpConnect, type AddressInfo, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
+import { EgressProxy, egressEnvironment, parseEgressGrant, publicAddress, type RelayRequest } from "../apps/runner/src/egress.js";
+import { Sandbox } from "../apps/runner/src/sandbox.js";
+import type { EgressGrant } from "../packages/shared/src/network.js";
+import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.js";
+import type { RunnerBinding } from "../packages/shared/src/types.js";
+import { startGitHttpServer } from "./helpers/git-http.js";
+
+const repository = { bindingId: "binding-app", provider: "github", host: "github.com", fullName: "acme/app" } as const;
+
+function grant(policy: Partial<EgressGrant["policy"]> = {}): EgressGrant {
+  return { policy: { mode: "off", domains: [], packageRegistries: true, ...policy }, repositories: [repository] };
+}
+
+async function proxy(t: TestContext, options: { grant?: () => Promise<EgressGrant>; relay?: (request: RelayRequest) => Promise<Response>;
+  lookup?: (host: string) => Promise<{ address: string; family: number }[]>; connectTo?: number } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), "egress-"));
+  const relayed: RelayRequest[] = [];
+  const instance = new EgressProxy({
+    socketPath: join(directory, "proxy.sock"),
+    grant: options.grant ?? (async () => grant()),
+    relay: async request => {
+      relayed.push(request);
+      if (options.relay) return options.relay(request);
+      return new Response("advertisement", { headers: { "content-type": "application/x-git-upload-pack-advertisement" } });
+    },
+    lookup: options.lookup ?? (async () => [{ address: "93.184.216.34", family: 4 }]),
+    ...(options.connectTo !== undefined ? { connect: (port: number) => { assert.equal(port, 443); return tcpConnect({ port: options.connectTo!, host: "127.0.0.1" }); } } : {}),
+  });
+  await instance.start();
+  t.after(async () => { await instance.close(); await rm(directory, { recursive: true, force: true }); });
+  return { instance, relayed };
+}
+
+function get(socketPath: string, path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; headers: IncomingMessage["headers"]; body: string }> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ socketPath, path, method: init.method ?? "GET", headers: init.headers }, response => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode!, headers: response.headers, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    request.on("error", reject);
+    request.end(init.body);
+  });
+}
+
+function tunnel(socketPath: string, target: string): Promise<{ status: number; socket?: import("node:net").Socket; body?: string }> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ socketPath, method: "CONNECT", path: target });
+    request.on("connect", (response, socket, head: Buffer) => {
+      if (response.statusCode === 200) return resolve({ status: 200, socket });
+      const chunks: Buffer[] = [head];
+      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+      socket.on("end", () => resolve({ status: response.statusCode!, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+test("public addresses exclude the host, its networks and metadata services", () => {
+  for (const address of ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "8.8.8.8"]) assert.equal(publicAddress(address), true, address);
+  for (const address of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
+    "::1", "::", "fe80::1", "fd00::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "224.0.0.1", "not-an-ip"]) {
+    assert.equal(publicAddress(address), false, address);
+  }
+});
+
+test("network policies parse strictly and match hosts by mode", () => {
+  assert.throws(() => parseNetworkPolicy({ mode: "everything", domains: [], packageRegistries: true }), /mode/);
+  assert.throws(() => parseNetworkPolicy({ mode: "allowlist", domains: ["10.0.0.1"], packageRegistries: true }), /Invalid domain/);
+  assert.throws(() => parseNetworkPolicy({ mode: "allowlist", domains: ["example.com:8443"], packageRegistries: true }), /Invalid domain/);
+  assert.throws(() => parseNetworkPolicy({ mode: "allowlist", domains: [], packageRegistries: true, extra: 1 }));
+  const policy = parseNetworkPolicy({ mode: "allowlist", domains: ["docs.example.com", "*.cdn.example.net", "docs.example.com"], packageRegistries: true });
+  assert.deepEqual(policy.domains, ["docs.example.com", "*.cdn.example.net"]);
+  assert.equal(hostAllowed(policy, "docs.example.com"), true);
+  assert.equal(hostAllowed(policy, "a.cdn.example.net"), true);
+  assert.equal(hostAllowed(policy, "cdn.example.net"), false);
+  assert.equal(hostAllowed(policy, "registry.npmjs.org"), true);
+  assert.equal(hostAllowed({ ...policy, packageRegistries: false }, "registry.npmjs.org"), false);
+  assert.equal(hostAllowed({ ...policy, mode: "off" }, "docs.example.com"), false);
+  assert.equal(hostAllowed({ ...policy, mode: "open" }, "anything.example.org"), true);
+  assert.throws(() => parseEgressGrant({ policy, repositories: [{ ...repository, host: "127.0.0.1" }] }), /Invalid repositories/);
+  assert.deepEqual(parseEgressGrant({ policy, repositories: [repository] }), { policy, repositories: [repository] });
+});
+
+test("sandboxed commands get the proxy and Git rewrites, without credentials", () => {
+  const env = egressEnvironment();
+  assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:41080");
+  const rewrites = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, index) => [env[`GIT_CONFIG_KEY_${index}`], env[`GIT_CONFIG_VALUE_${index}`]]);
+  assert.deepEqual(rewrites[0], ["url.http://127.0.0.1:41080/git/.insteadOf", "https://"]);
+  assert.ok(rewrites.some(([key, value]) => key === "url.http://127.0.0.1:41080/git/github.com/.insteadOf" && value === "git@github.com:"));
+  assert.ok(!Object.values(env).some(value => /token|password|authorization/i.test(value)));
+});
+
+test("Git reads of workspace repositories go to the relay; pushes and other repositories are refused", async t => {
+  const { instance, relayed } = await proxy(t);
+  const refs = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-upload-pack",
+    { headers: { "user-agent": "git/2.43.0", "git-protocol": "version=2" } });
+  assert.equal(refs.status, 200);
+  assert.equal(refs.body, "advertisement");
+  assert.equal(refs.headers["content-type"], "application/x-git-upload-pack-advertisement");
+  assert.deepEqual(relayed[0], { bindingId: "binding-app", service: "info-refs", userAgent: "git/2.43.0", gitProtocol: "version=2", contentType: undefined, contentEncoding: undefined });
+  // Without ".git" and in another case it is the same repository.
+  const fetched = await get(instance.socketPath, "/git/github.com/ACME/App/git-upload-pack",
+    { method: "POST", headers: { "content-type": "application/x-git-upload-pack-request" }, body: "0000" });
+  assert.equal(fetched.status, 200);
+  assert.equal(relayed[1]!.service, "upload-pack");
+  assert.equal(Buffer.from(relayed[1]!.body!).toString(), "0000");
+
+  const push = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-receive-pack");
+  assert.equal(push.status, 403);
+  assert.match(push.body, /git_push/);
+  const other = await get(instance.socketPath, "/git/github.com/acme/other.git/info/refs?service=git-upload-pack");
+  assert.equal(other.status, 403);
+  assert.match(other.body, /not one of this workspace's repositories/);
+  assert.equal(relayed.length, 2);
+  const status = JSON.parse((await get(instance.socketPath, "/__pistead/status")).body) as { network: unknown; repositories: string[]; recent: { outcome: string }[] };
+  assert.deepEqual(status.repositories, ["https://github.com/acme/app.git"]);
+  assert.deepEqual(status.recent.map(entry => entry.outcome), ["allowed", "allowed", "refused", "refused"]);
+});
+
+test("the relay's refusal reaches Git as text, and other repositories on allowed hosts are fetched directly", async t => {
+  const { RunnerError } = await import("../apps/runner/src/protocol.js");
+  const { instance } = await proxy(t, {
+    grant: async () => grant({ mode: "allowlist", domains: ["github.com"] }),
+    relay: async () => { throw new RunnerError(403, "GitHub did not let the session owner's account read acme/app."); },
+  });
+  const refused = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-upload-pack");
+  assert.equal(refused.status, 403);
+  assert.equal(refused.headers["content-type"], "text/plain; charset=utf-8");
+  assert.match(refused.body, /did not let the session owner's account read/);
+  const other = await get(instance.socketPath, "/git/github.com/public/tool.git/info/refs?service=git-upload-pack");
+  assert.equal(other.status, 302);
+  assert.equal(other.headers.location, "https://github.com/public/tool.git/info/refs?service=git-upload-pack");
+});
+
+test("tunnels follow the network policy and never reach private addresses", async t => {
+  const echo: Server = createTcpServer(socket => socket.pipe(socket));
+  await new Promise<void>(resolve => echo.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => { echo.close(() => resolve()); }));
+  let policy: EgressGrant["policy"] = { mode: "off", domains: [], packageRegistries: true };
+  const lookups: Record<string, string> = { "docs.example.com": "93.184.216.34", "registry.npmjs.org": "104.16.0.1", "internal.example.com": "10.0.0.8" };
+  const { instance } = await proxy(t, {
+    grant: async () => ({ policy, repositories: [] }),
+    lookup: async host => [{ address: lookups[host] ?? "93.184.216.35", family: 4 }],
+    connectTo: (echo.address() as AddressInfo).port,
+  });
+  const off = await tunnel(instance.socketPath, "docs.example.com:443");
+  assert.equal(off.status, 403);
+  assert.match(off.body!, /network access is off/);
+
+  policy = { mode: "allowlist", domains: ["docs.example.com", "internal.example.com"], packageRegistries: false };
+  // The grant is cached for a minute; a fresh proxy sees the new policy.
+  const { instance: allowlist } = await proxy(t, {
+    grant: async () => ({ policy, repositories: [] }),
+    lookup: async host => [{ address: lookups[host] ?? "93.184.216.35", family: 4 }],
+    connectTo: (echo.address() as AddressInfo).port,
+  });
+  const open = await tunnel(allowlist.socketPath, "docs.example.com:443");
+  assert.equal(open.status, 200);
+  const reply = await new Promise<string>(resolve => { open.socket!.once("data", (chunk: Buffer) => resolve(chunk.toString())); open.socket!.write("ping"); });
+  assert.equal(reply, "ping");
+  open.socket!.destroy();
+  assert.equal((await tunnel(allowlist.socketPath, "registry.npmjs.org:443")).status, 403);
+  const internal = await tunnel(allowlist.socketPath, "internal.example.com:443");
+  assert.equal(internal.status, 403);
+  assert.match(internal.body!, /public address/);
+  assert.match((await tunnel(allowlist.socketPath, "docs.example.com:22")).body!, /port 443/);
+  assert.equal((await tunnel(allowlist.socketPath, "10.0.0.1:443")).status, 403);
+  const plain = await get(allowlist.socketPath, "http://docs.example.com/");
+  assert.equal(plain.status, 403);
+  assert.match(plain.body, /Plain HTTP/);
+});
+
+function binding(id: string): RunnerBinding {
+  return {
+    session: { id, workspaceId: "workspace", ownerId: "test:alice", agentVersionId: "version-1", title: "Egress test", policyVersion: 1,
+      status: "ready", createdAt: "2026-01-01T00:00:00Z", repositories: [] },
+    owner: { id: "test:alice", githubId: null, githubLogin: "alice", displayName: "Alice", gitName: "Alice Owner",
+      gitEmail: "alice@example.test", env: {}, githubConnected: false },
+    agent: { id: "version-1", agentId: "agent", authorId: "test:template-author", workspaceId: "workspace", version: 1, name: "Egress agent",
+      description: "Test", instructions: "Use tools.", tools: ["bash"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
+    model: { id: "model-1", workspaceId: "workspace", name: "Explicit faux test provider", provider: "faux", modelId: "egress-faux" },
+  };
+}
+
+const sandboxed = process.platform === "linux" && spawnSync("bwrap", ["--version"]).status === 0;
+
+test("a sandboxed git clone of a workspace repository goes through the proxy and the relay", { skip: !sandboxed }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "egress-sandbox-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // The upstream repository, served by git http-backend in place of the control plane's relay to GitHub.
+  const projects = join(directory, "projects");
+  await mkdir(join(projects, "acme"), { recursive: true });
+  const work = join(directory, "upstream");
+  const git = (args: string[], cwd: string) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "U", GIT_AUTHOR_EMAIL: "u@example.test", GIT_COMMITTER_NAME: "U", GIT_COMMITTER_EMAIL: "u@example.test" } });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  await mkdir(work);
+  git(["init", "-q", "-b", "main"], work);
+  await writeFile(join(work, "README.md"), "from upstream\n");
+  git(["add", "README.md"], work);
+  git(["commit", "-q", "-m", "initial"], work);
+  git(["clone", "-q", "--bare", work, join(projects, "acme", "app.git")], directory);
+  const server = await startGitHttpServer(projects);
+  t.after(() => server.close());
+
+  const { instance, relayed } = await proxy(t, {
+    relay: async request => fetch(request.service === "info-refs"
+      ? `${server.url("acme/app.git")}/info/refs?service=git-upload-pack` : `${server.url("acme/app.git")}/git-upload-pack`, {
+      method: request.body ? "POST" : "GET", body: request.body,
+      headers: { ...(request.contentType ? { "content-type": request.contentType } : {}), ...(request.gitProtocol ? { "git-protocol": request.gitProtocol } : {}) },
+    }),
+  });
+  const sandbox = new Sandbox(binding("egress"), join(directory, "session"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => sandbox.close());
+  await sandbox.initialize();
+  const shell = (command: string) => sandbox.execute({ kind: "bash", command }, false, async () => {}, { allowTestShell: true });
+
+  await shell("git clone -q https://github.com/acme/app.git clones/app");
+  assert.equal(await sandbox.readFile("clones/app/README.md", async () => {}), "from upstream\n");
+  assert.deepEqual([...new Set(relayed.map(request => request.service))].sort(), ["info-refs", "upload-pack"]);
+  // SSH remotes of GitHub take the same way.
+  await shell("git ls-remote git@github.com:acme/app.git > ssh-refs.txt");
+  assert.match(await sandbox.readFile("ssh-refs.txt", async () => {}), /refs\/heads\/main/);
+  // Anything else is refused by the proxy, with its reason.
+  await assert.rejects(shell("git ls-remote https://github.com/acme/secret.git"), /not one of this workspace's repositories/);
+  await assert.rejects(shell("python3 -c \"import urllib.request; urllib.request.urlopen('https://example.com', timeout=5)\""), /403|Forbidden|Tunnel/);
+  assert.ok(instance.entries().some(entry => entry.kind === "connect" && entry.target.startsWith("example.com") && entry.outcome === "refused"));
+});
+
+test("https://user@host remotes are the same repository, and a refused grant ends access at once", async t => {
+  const { RunnerError } = await import("../apps/runner/src/protocol.js");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  let refuse = false;
+  const { instance, relayed } = await proxy(t, {
+    grant: async () => { if (refuse) throw new RunnerError(403, "Archived sessions have no network access."); return grant({ mode: "open" }); },
+  });
+  assert.equal((await get(instance.socketPath, "/git/someone@github.com/acme/app.git/info/refs?service=git-upload-pack")).status, 200);
+  assert.equal(relayed[0]!.bindingId, "binding-app");
+  refuse = true;
+  // Still within the grant's minute: the cached grant serves.
+  assert.equal((await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-upload-pack")).status, 200);
+  t.mock.timers.tick(61_000);
+  const refused = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-upload-pack");
+  assert.equal(refused.status, 403);
+  assert.match(refused.body, /Archived sessions/);
+  assert.equal(relayed.length, 2);
+});
+
+test("a tunnel tries the host's next address when one can't be reached", async t => {
+  const echo: Server = createTcpServer(socket => socket.pipe(socket));
+  await new Promise<void>(resolve => echo.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => { echo.close(() => resolve()); }));
+  const tried: string[] = [];
+  const directory = await mkdtemp(join(tmpdir(), "egress-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const instance = new EgressProxy({
+    socketPath: join(directory, "proxy.sock"),
+    grant: async () => ({ policy: { mode: "open", domains: [], packageRegistries: true }, repositories: [] }),
+    relay: async () => { throw new Error("unused"); },
+    lookup: async () => [{ address: "2606:4700::6810:1", family: 6 }, { address: "104.16.0.1", family: 4 }],
+    // The IPv6 address is unreachable from this host; the IPv4 one answers.
+    connect: (_port, address) => { tried.push(address); return tcpConnect({ port: address.includes(":") ? 1 : (echo.address() as AddressInfo).port, host: "127.0.0.1" }); },
+  });
+  await instance.start();
+  t.after(() => instance.close());
+  const open = await tunnel(instance.socketPath, "registry.npmjs.org:443");
+  assert.equal(open.status, 200);
+  assert.deepEqual(tried, ["2606:4700::6810:1", "104.16.0.1"]);
+  open.socket!.destroy();
+});
+
+test("a client that drops while its tunnel is being set up doesn't take the proxy down", async t => {
+  const pending = Promise.withResolvers<EgressGrant>();
+  const { instance } = await proxy(t, { grant: () => pending.promise });
+  const request = httpRequest({ socketPath: instance.socketPath, method: "CONNECT", path: "docs.example.com:443" });
+  request.on("error", () => {});
+  request.end();
+  // The proxy is still waiting for the grant when the client goes away; its refusal then meets a closed socket.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  request.destroy();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  pending.resolve(grant());
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal((await get(instance.socketPath, "/__pistead/status")).status, 200);
+});
