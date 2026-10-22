@@ -69,7 +69,7 @@ async function liveSession(t: TestContext, backend: Backend) {
       for (let elapsed = 0; elapsed < ms; elapsed += 250) { now += 250; t.mock.timers.tick(250); await flush(); }
     },
     async setHidden(value: boolean) { hidden = value; for (const listener of visibility) listener(); await flush(); },
-    opens: () => requests.filter(request => request.path.endsWith("/events")).map(request => request.at),
+    opens: () => requests.filter(request => request.path.includes("/events")).map(request => request.at),
     since: (at: number) => requests.filter(request => request.at >= at).length,
   };
 }
@@ -96,7 +96,7 @@ test("a hidden page makes no requests until it is visible again", async t => {
   assert.equal(live.requests.length, hiddenAt);
   await live.setHidden(false);
   const resumed = live.requests.slice(hiddenAt).map(request => request.path);
-  assert.deepEqual(resumed, ["/api/sessions/s1", "/api/sessions/s1/events"]);
+  assert.deepEqual(resumed, ["/api/sessions/s1", "/api/sessions/s1/events?since="]);
 });
 
 test("idle sessions reopen slowly, running ones quickly, and snapshots render without refetching the view", async t => {
@@ -166,4 +166,38 @@ test("a host preparing repositories reopens the stream quickly before any messag
   assert.equal(live.opens().length, 3);
   await live.advance(250);
   assert.equal(live.opens().length, 4);
+});
+
+test("streams ask for what changed since the held revision and apply patches to the view shown", async t => {
+  const first = "a".repeat(32);
+  const second = "b".repeat(32);
+  const entry = { id: "0:1", kind: "message", role: "user", text: "hello" };
+  const reply = { id: "0:2", kind: "message", role: "assistant", text: "hi" };
+  const base = { ...idleView, entries: [entry], approvals: [], conversations: [] } as unknown as SessionView;
+  const backend: Backend = { session: record, view: base, stream: "hold" };
+  const live = await liveSession(t, backend);
+  const open = live.streams.at(-1)!;
+  open.emit("view", JSON.stringify({ view: base, revision: first }));
+  const held = live.state.view!.entries[0];
+  open.emit("patch", JSON.stringify({ patch: { base: first, revision: second, view: { sessionId: "s1", busy: true },
+    lists: { entries: [1, reply], approvals: [], conversations: [], queue: [] } } }));
+  assert.equal(live.state.view?.busy, true);
+  assert.deepEqual(live.state.view?.entries, [entry, reply]);
+  // The unchanged entry is the very object shown before.
+  assert.equal(live.state.view?.entries[0], held);
+  const shown = live.state.view;
+  open.emit("patch", JSON.stringify({ patch: { base: second, revision: second } }));
+  assert.equal(live.state.view, shown, "No change shows the same view");
+  open.emit("error");
+  await live.advance(liveTiming.activeReopenMs);
+  assert.equal(live.requests.at(-1)!.path, `/api/sessions/s1/events?since=${second}`);
+
+  // A patch from a revision this client does not hold is not applied, and the next stream asks for a whole view.
+  const next = live.streams.at(-1)!;
+  next.emit("patch", JSON.stringify({ patch: { base: first, revision: "c".repeat(32), view: { sessionId: "s1", busy: false },
+    lists: { entries: [], approvals: [], conversations: [] } } }));
+  assert.equal(live.state.view, shown);
+  next.emit("error");
+  await live.advance(liveTiming.firstBackoffMs);
+  assert.equal(live.requests.filter(request => request.path.includes("/events")).at(-1)!.path, "/api/sessions/s1/events?since=");
 });

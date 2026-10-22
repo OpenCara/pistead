@@ -4,8 +4,9 @@ import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionVie
 import { accessModes, permissions, thinkingLevels } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities, LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
+import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
-import { redactApproval, redactView } from '../../../packages/shared/src/redaction.js';
+import { redactApproval } from '../../../packages/shared/src/redaction.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
 import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
@@ -17,6 +18,7 @@ import { issueRunAdmission } from './run-admissions.js';
 import { legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
+import { invalidateSessionView, sessionView, viewChanges } from './view-feed.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host advertises; auto-approve is the
@@ -84,7 +86,14 @@ function sessionVisibility(value: unknown): 'private' | 'workspace' {
   return value;
 }
 
+/**
+ * Snapshots of the session's view. A client that passes `since` (empty when it holds no view yet) understands patches:
+ * after a whole `view` event it gets `patch` events with only what changed since the revision it holds, and a patch
+ * with no changes while nothing did. Clients without `since` get the whole view every time, as before patches.
+ */
 function pollingEvents(c: AppContext, row: SessionRow): Response {
+  const since = c.req.query('since');
+  let held = isRevision(since) ? since : undefined;
   const response = streamSSE(c, async stream => {
     let releaseStop!: () => void;
     const stopped = new Promise<undefined>(resolve => { releaseStop = () => resolve(undefined); });
@@ -99,23 +108,18 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
     try {
       if (c.req.raw.signal.aborted) abort();
       for (let snapshot = 0; snapshot < snapshots && !stream.aborted; snapshot++) {
-        const result = await Promise.race([
-          runnerRequest(c, row, 'view').then(response => runnerJSON<{ view: SessionView }>(response)),
-          stopped,
-        ]);
-        if (!result || stream.aborted) break;
-        if (result.view?.sessionId !== row.id || result.view.owner?.id !== row.owner_id) {
-          abort();
-          break;
-        }
-        result.view.approvals = await presentApprovals(c, row, result.view.approvals);
+        // The view is checked against the session, presented and redacted by the feed.
+        const shown = await Promise.race([sessionView(c, row), stopped]);
+        if (!shown || stream.aborted) break;
         // Never emit a snapshot fetched before a grant was revoked without a fresh policy check.
         const access = await Promise.race([requireSession(c, row.id, 'read'), stopped]);
         if (!access || stream.aborted) break;
         if (access.row.connector_id) await requireConnectorSession(c.env, access.row.connector_id, access.row);
         if (stream.aborted) break;
-        // Secrets are hidden from everyone; approvals keep the review hash committed to the real operation.
-        await Promise.race([stream.writeSSE({ event: 'view', data: JSON.stringify({ ...result, view: redactView(result.view) }) }), stopped]);
+        const patch = since === undefined ? null : viewChanges(c, row, held, shown);
+        held = shown.revision;
+        await Promise.race([stream.writeSSE(patch ? { event: 'patch', data: JSON.stringify({ patch }) }
+          : { event: 'view', data: JSON.stringify(since === undefined ? { view: shown.view } : { view: shown.view, revision: shown.revision }) }), stopped]);
         if (snapshot < snapshots - 1 && !stream.aborted) {
           await Promise.race([new Promise<void>(resolve => {
             const timer = setTimeout(resolve, 1000);
@@ -330,12 +334,11 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   });
   app.get('/api/sessions/:id/view', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
-    const result = await runnerJSON<{ view: SessionView }>(await runnerRequest(c, row, 'view'));
-    if (!result?.view || result.view.sessionId !== row.id || result.view.owner?.id !== row.owner_id) fail(502, 'invalid_runner_response', 'The runner returned an inconsistent session binding.');
-    result.view.approvals = await presentApprovals(c, row, result.view.approvals);
+    const shown = await sessionView(c, row, { latest: true });
     const fresh = await requireSession(c, row.id, 'read');
     if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-    return c.json({ ...result, view: redactView(result.view) });
+    // The revision lets the client's next /events stream send only what changed.
+    return c.json({ view: shown.view, revision: shown.revision });
   });
   app.get('/api/sessions/:id/events', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
@@ -353,6 +356,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       const options = await chatOptions(c, row, mode, input.options);
       const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access) : undefined;
       const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}) }));
+      invalidateSessionView(c, row.id);
       if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
       await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}) }).run();
       return c.json(result, 202);
@@ -365,6 +369,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (operation.kind === 'permission') fail(400, 'invalid_operation', 'Permission requests come only from tool calls.');
     await requireOperationTool(c.env, row, operation);
     const result = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'operations', '', { operation }));
+    invalidateSessionView(c, row.id);
     if (!result?.approval || result.approval.sessionId !== row.id || result.approval.requestedBy !== c.get('auth').userId) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval request.');
     [result.approval] = await presentApprovals(c, row, [result.approval], { operation, requestedBy: c.get('auth').userId });
     await auditStatement(c.env, c.get('auth').userId, 'approval.requested', row.workspace_id, row.id, { approvalId: result.approval.id, kind: operation.kind }).run();
@@ -427,6 +432,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const decided = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'approve', approvalId, {
       approvalId, decision: input.decision, operation, ...(brokerCapability ? { brokerCapability } : {}), ...(scope ? { scope } : {}),
     }));
+    invalidateSessionView(c, row.id);
     if (!decided?.approval || decided.approval.id !== approvalId || decided.approval.sessionId !== row.id) fail(502, 'invalid_runner_response', 'The runner returned an invalid approval result.');
     [decided.approval] = await presentApprovals(c, row, [decided.approval]);
     await auditStatement(c.env, c.get('auth').userId, `approval.${input.decision}`, row.workspace_id, row.id, { approvalId, kind: operation.kind, status: decided.approval.status, ...(scope ? { scope } : {}) }).run();
@@ -482,6 +488,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/stop', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
     const result = await runnerJSON<{ stopped: number }>(await runnerRequest(c, row, 'stop', '', {}));
+    invalidateSessionView(c, row.id);
     if (!Number.isSafeInteger(result?.stopped) || result.stopped < 0) fail(502, 'invalid_runner_response', 'The runner returned an invalid stop result.');
     await auditStatement(c.env, c.get('auth').userId, 'session.stopped', row.workspace_id, row.id, { stopped: result.stopped }).run();
     return c.json({ stopped: result.stopped });
@@ -493,6 +500,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const result = row.status === 'error' || row.status === 'provisioning'
       ? await runnerRequest(c, row, 'create', '', await bindingForSession(c, row))
       : await runnerRequest(c, row, 'restart', '', {});
+    invalidateSessionView(c, row.id);
     await result.body?.cancel();
     await c.env.DB.batch([
       c.env.DB.query('UPDATE sessions SET status = ? WHERE id = ?').bind('ready', row.id),

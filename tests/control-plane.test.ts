@@ -8,7 +8,8 @@ import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { userIdentifier } from '../apps/server/src/http.js';
 import { sessionAccess } from '../apps/server/src/db.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
-import { defaultAgentName } from '../packages/shared/src/types.js';
+import { defaultAgentName, type SessionView } from '../packages/shared/src/types.js';
+import { applyViewPatch, diffView, type SessionViewPatch } from '../packages/shared/src/view-patch.js';
 import { testDatabase } from './helpers/control-plane.js';
 
 const origin = 'http://localhost:8787';
@@ -482,4 +483,139 @@ test('poll SSE deadline also closes a stalled upstream without exposing errors',
   await requested;
   t.mock.timers.tick(8000);
   assert.equal(await response.text(), '');
+});
+
+function events(body: string): { event: string; data: Record<string, unknown> }[] {
+  return body.split('\n\n').filter(block => block.includes('data: ')).map(block => ({
+    event: /^event: (.*)$/m.exec(block)?.[1] ?? 'message',
+    data: JSON.parse(/^data: (.*)$/m.exec(block)![1]!) as Record<string, unknown>,
+  }));
+}
+
+async function readSnapshots(t: TestContext, response: Response, count: number): Promise<string> {
+  const reader = response.body!.getReader();
+  let body = '';
+  for (let snapshot = 0; snapshot < count; snapshot++) {
+    const chunk = await reader.read();
+    assert.equal(chunk.done, false);
+    body += new TextDecoder().decode(chunk.value);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    t.mock.timers.tick(1000);
+  }
+  while (!(await reader.read()).done) { /* The stream ends after its snapshots. */ }
+  return body;
+}
+
+test('a runner that reports revisions is asked only for what changed, and one that refuses is asked for the whole view', async t => {
+  const f = await pollingFixture(t);
+  const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
+  const first = 'a'.repeat(32);
+  const second = 'b'.repeat(32);
+  const entry = { id: '0:1', kind: 'message', role: 'user', text: 'token ghp_abcdefghijklmnopqrstuvwxyz0123456789' };
+  const v1: SessionView = { ...f.view, entries: [entry] };
+  const v2: SessionView = { ...v1, entries: [entry, { id: '0:2', kind: 'message', role: 'assistant', text: 'done' }], busy: true };
+  const paths: string[] = [];
+  let refuse = false;
+  let misfit = false;
+  globalThis.fetch = async input => {
+    const path = new URL(String(input)).pathname;
+    paths.push(path);
+    if (path.endsWith('/view')) return Response.json({ view: v1, revision: first });
+    if (refuse) return Response.json({ error: 'Unknown runner endpoint' }, { status: 404 });
+    if (misfit) return Response.json({ patch: { base: 'c'.repeat(32), revision: 'd'.repeat(32), view: {}, lists: {} } });
+    if (path.endsWith(`/view/${first}`)) return Response.json({ patch: diffView(v1, v2, first, second) });
+    if (path.endsWith(`/view/${second}`)) return Response.json({ patch: { base: second, revision: second } });
+    return Response.json({ error: 'unexpected' }, { status: 500 });
+  };
+  const read = async () => (await f.reader.request('GET', '/api/sessions/poll-session/view')).json() as Promise<{ view: SessionView; revision: string }>;
+  const one = await read();
+  assert.equal(one.view.entries[0]!.text, 'token ghp_[redacted]');
+  const two = await read();
+  assert.equal(two.view.busy, true);
+  assert.deepEqual(two.view.entries.map(item => item.id), ['0:1', '0:2']);
+  assert.equal(two.view.entries[0]!.text, 'token ghp_[redacted]', 'Patched entries are redacted like whole views');
+  assert.notEqual(two.revision, one.revision);
+  const three = await read();
+  assert.equal(three.revision, two.revision, 'An unchanged host view keeps its revision');
+  assert.deepEqual(paths, ['/v1/sessions/poll-session/view', `/v1/sessions/poll-session/view/${first}`, `/v1/sessions/poll-session/view/${second}`]);
+  // A runner that does not know the path (an older one) answers the whole view instead.
+  refuse = true;
+  paths.length = 0;
+  const four = await read();
+  assert.deepEqual(four.view.entries.map(item => item.id), ['0:1']);
+  assert.deepEqual(paths, [`/v1/sessions/poll-session/view/${second}`, '/v1/sessions/poll-session/view']);
+  // A patch that does not fit the view the server holds is replaced by the whole view, not asked for again.
+  refuse = false;
+  misfit = true;
+  paths.length = 0;
+  assert.deepEqual((await read()).view.entries.map(item => item.id), ['0:1']);
+  assert.deepEqual(paths, [`/v1/sessions/poll-session/view/${first}`, '/v1/sessions/poll-session/view']);
+});
+
+test('viewers of one session share a host read, and a message makes the next read ask the host again', async t => {
+  const f = await pollingFixture(t);
+  const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let polls = 0;
+  globalThis.fetch = async input => {
+    const path = new URL(String(input)).pathname;
+    if (path.endsWith('/submit')) return Response.json({ submissionId: 'sub-1', conversationId: '0', status: 'queued' });
+    polls++;
+    return Response.json({ view: { ...f.view, busy: polls > 1 } });
+  };
+  const [owner, reader] = await Promise.all([
+    f.owner.request('GET', '/api/sessions/poll-session/events'),
+    f.reader.request('GET', '/api/sessions/poll-session/events'),
+  ]);
+  const ownerReader = owner.body!.getReader();
+  const readerReader = reader.body!.getReader();
+  t.after(() => { void ownerReader.cancel(); void readerReader.cancel(); });
+  const [a, b] = await Promise.all([ownerReader.read(), readerReader.read()]);
+  assert.ok(new TextDecoder().decode(a.value).includes('event: view'));
+  assert.ok(new TextDecoder().decode(b.value).includes('event: view'));
+  assert.equal(polls, 1, 'Two viewers at once cost one host read');
+  // A third read within the same second is served the same view.
+  assert.equal((await (await f.reader.request('GET', '/api/sessions/poll-session/events')).body!.getReader().read()).done, false);
+  assert.equal(polls, 1);
+  const submitted = await f.owner.request('POST', '/api/sessions/poll-session/submit', { content: 'go', requestId: 'request-1' });
+  assert.equal(submitted.status, 202, await submitted.clone().text());
+  const after = await (await f.reader.request('GET', '/api/sessions/poll-session/events')).body!.getReader().read();
+  assert.equal(polls, 2, 'The view after a message comes from the host, not from before it');
+  assert.ok(new TextDecoder().decode(after.value).includes('"busy":true'));
+});
+
+test('a client holding a revision gets patches: nothing while nothing changed, then only the change', async t => {
+  const f = await pollingFixture(t);
+  const previousFetch = globalThis.fetch; t.after(() => { globalThis.fetch = previousFetch; });
+  const entries = Array.from({ length: 50 }, (_, index) => ({ id: `0:${index}`, kind: 'message', role: 'assistant', text: 'x'.repeat(400) }));
+  let current: SessionView = { ...f.view, entries };
+  globalThis.fetch = async () => Response.json({ view: current });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const loaded = await (await f.reader.request('GET', '/api/sessions/poll-session/view')).json() as { view: SessionView; revision: string };
+  const response = await f.reader.request('GET', `/api/sessions/poll-session/events?since=${loaded.revision}`);
+  const reader = response.body!.getReader();
+  const first = await reader.read();
+  const [unchanged] = events(new TextDecoder().decode(first.value));
+  assert.deepEqual(unchanged, { event: 'patch', data: { patch: { base: loaded.revision, revision: loaded.revision } } });
+  current = { ...current, entries: [...entries, { id: '0:50', kind: 'message', role: 'assistant', text: 'new' }] };
+  await new Promise<void>(resolve => setImmediate(resolve));
+  t.mock.timers.tick(1000);
+  const second = new TextDecoder().decode((await reader.read()).value);
+  assert.ok(second.length < 1000, `The change alone travels, not the ${JSON.stringify(current).length}-byte view`);
+  const [changed] = events(second);
+  assert.equal(changed!.event, 'patch');
+  const patch = changed!.data.patch as SessionViewPatch;
+  assert.equal(patch.base, loaded.revision);
+  assert.deepEqual(applyViewPatch(loaded.view, patch).entries, current.entries);
+  await reader.cancel();
+
+  // A revision the server does not hold, or none at all, starts again from a whole view with its revision.
+  for (const since of ['f'.repeat(32), '']) {
+    const body = await readSnapshots(t, await f.reader.request('GET', `/api/sessions/poll-session/events?since=${since}`), 4);
+    const [whole, next] = events(body);
+    assert.equal(whole!.event, 'view');
+    assert.deepEqual((whole!.data.view as SessionView).entries, current.entries);
+    assert.equal(whole!.data.revision, patch.revision);
+    assert.deepEqual(next, { event: 'patch', data: { patch: { base: patch.revision, revision: patch.revision } } });
+  }
 });

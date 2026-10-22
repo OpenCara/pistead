@@ -13,6 +13,7 @@ import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../p
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
+import { diffView } from '../packages/shared/src/view-patch.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'connectors-test-secret-not-for-deployment';
@@ -893,6 +894,33 @@ test('connected SSE emits only two authoritative snapshots within the fifty-quer
   assert.ok(queries + requests.length <= 50, `Connected polling used ${queries} database queries plus ${requests.length} relay calls`);
 });
 
+test('a host is asked for what changed only on the connection that reported the revision', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const view: SessionView = {
+    sessionId: s.session.id,
+    owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+    entries: [{ id: '0:1', kind: 'message', role: 'user', text: 'hello' }], approvals: [], conversations: [], busy: false,
+  };
+  const busy: SessionView = { ...view, busy: true };
+  const [first, second] = ['a'.repeat(32), 'b'.repeat(32)];
+  const seen: { path: string; connection: string }[] = [];
+  f.env.CONNECTOR_HUB = fakeHub({ async rpc(_connectorId, envelope) {
+    seen.push({ path: envelope.request.path, connection: envelope.connectionHash });
+    if (envelope.request.path.endsWith(`/view/${first}`)) return Response.json({ patch: diffView(view, busy, first, second) });
+    return Response.json({ view, revision: first });
+  } });
+  const read = async () => (await json<{ view: SessionView }>(await s.creator.request('GET', `/api/sessions/${s.session.id}/view`))).view;
+  assert.deepEqual(await read(), view);
+  assert.deepEqual(await read(), busy);
+  const base = `/v1/sessions/${s.session.id}/view`;
+  assert.deepEqual(seen.map(item => item.path), [base, `${base}/${first}`]);
+  // The host reconnects, perhaps as an older connector that would drop the connection on the unknown path.
+  f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(token()), s.connector.connectorId);
+  assert.deepEqual(await read(), view);
+  assert.equal(seen[2]!.path, base);
+  assert.notEqual(seen[2]!.connection, seen[1]!.connection);
+});
+
 for (const mutation of ['operation', 'requester'] as const) {
   test(`a reviewed explicit approval rejects a host ${mutation} swap before capability minting`, async t => {
     const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
@@ -1704,7 +1732,7 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
     assert.equal(envelope.request.ticket.ownerId, s.owner.user.id);
     return Response.json({ view: s.view });
   });
-  assert.deepEqual(await json(await s.member.request('GET', `/api/sessions/${s.session.id}/view`)), { view: s.view });
+  assert.deepEqual((await json<{ view: SessionView }>(await s.member.request('GET', `/api/sessions/${s.session.id}/view`))).view, s.view);
   assert.equal(requests.length, 1);
   await denied(await s.outsider.request('GET', `/api/sessions/${s.session.id}`), 404, 'not_found');
   await denied(await s.outsider.request('GET', `/api/sessions/${s.session.id}/view`), 404, 'not_found');
@@ -2063,7 +2091,7 @@ test('opt-in sharing admits a teammate runtime; unshare blocks foreign sessions 
   await denied(await self(f, s.connector, 'authorize', authorization(foreign)), 403, 'connector_unavailable');
   await denied(await s.member.request('POST', '/api/sessions', input), 403, 'connector_unavailable');
   assert.equal(requests.length, beforeDenied);
-  assert.deepEqual(await json(await s.member.request('GET', `/api/sessions/${s.session.id}/view`)), { view: s.view });
+  assert.deepEqual((await json<{ view: SessionView }>(await s.member.request('GET', `/api/sessions/${s.session.id}/view`))).view, s.view);
   assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
   assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', { ...authorization(s.session, s.member.user.id), permission: 'read' }))).allowed, true);
   assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session, s.member.user.id)))).allowed, false);

@@ -12,7 +12,8 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { signToken, sha256 } from "../packages/shared/src/crypto.js";
-import type { ApprovalRecord, RunnerBinding, RunnerTicket, RunnerAction, Permission, AuthorizationRequest } from "../packages/shared/src/types.js";
+import type { ApprovalRecord, RunnerBinding, RunnerTicket, RunnerAction, Permission, AuthorizationRequest, SessionView } from "../packages/shared/src/types.js";
+import { applyViewPatch, isRevision, type SessionViewPatch } from "../packages/shared/src/view-patch.js";
 import type { RestoreDescriptor, RestoreInput } from "../packages/shared/src/connector.js";
 import { RunnerError, assertId, requestKey, stableJson, validateBinding, validateOperation, verifyRunnerTicket } from "../apps/runner/src/protocol.js";
 import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
@@ -111,6 +112,33 @@ test("unsigned HTTP session calls fail closed before opening a harness", async t
   const app = createRunnerApp(service);
   const response = await app.request("/v1/sessions/unknown/view");
   assert.equal(response.status, 401);
+});
+
+test("a view request naming a revision gets only what changed since it", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const session = await service.provision(binding("revision-session"), await ticket("revision-session", "create"));
+  const app = createRunnerApp(service);
+  const get = async (path: string) => {
+    const response = await app.request(path, { headers: { authorization: `Bearer ${await signToken(await ticket("revision-session", "view"), SECRET)}` } });
+    assert.equal(response.status, 200);
+    return response.json() as Promise<{ view?: SessionView; revision?: string; patch?: SessionViewPatch }>;
+  };
+  const whole = await get("/v1/sessions/revision-session/view");
+  assert.ok(isRevision(whole.revision));
+  assert.deepEqual(await get(`/v1/sessions/revision-session/view/${whole.revision}`), { patch: { base: whole.revision, revision: whole.revision } });
+  await session.submit(await ticket("revision-session", "submit"), { content: "TEST_IDENTITY", requestId: "revision" }, "write");
+  await idle(session);
+  const { patch } = await get(`/v1/sessions/revision-session/view/${whole.revision}`);
+  assert.ok(patch && patch.revision !== whole.revision);
+  const latest = await get("/v1/sessions/revision-session/view");
+  assert.equal(latest.revision, patch.revision);
+  assert.deepEqual(applyViewPatch(whole.view!, patch), latest.view);
+  // A revision the runner never issued gets the whole view.
+  assert.deepEqual(await get(`/v1/sessions/revision-session/view/${"f".repeat(32)}`), latest);
+  for (const path of ["view/abc", `view/${"A".repeat(32)}`, `view/${whole.revision}/x`]) {
+    const response = await app.request(`/v1/sessions/revision-session/${path}`, { headers: { authorization: `Bearer ${await signToken(await ticket("revision-session", "view"), SECRET)}` } });
+    assert.equal(response.status, 404, path);
+  }
 });
 
 test("real pi faux sessions isolate owners and retain actor attribution", { skip: process.platform !== "linux" }, async t => {

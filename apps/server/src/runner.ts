@@ -4,15 +4,15 @@ import { hasPermission } from '../../../packages/shared/src/policy.js';
 import { requireNoMigration, sessionAccess } from './db.js';
 import type { AppContext, SessionRow } from './types.js';
 import { fail, id, testMode } from './http.js';
-import { connectorRequest } from './connector-transport.js';
+import { connectorRequest, type ConnectionPin } from './connector-transport.js';
 
 const actionPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
   operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write', stop: 'write',
 };
 
-export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
-  return actorRequest(c, c.get('auth').userId, row, action, suffix, body);
+export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown, pin?: ConnectionPin): Promise<Response> {
+  return actorRequest(c, c.get('auth').userId, row, action, suffix, body, pin);
 }
 
 /**
@@ -23,7 +23,8 @@ export function ownerViewRequest(c: AppContext, row: SessionRow): Promise<Respon
   return actorRequest(c, row.owner_id, row, 'view');
 }
 
-async function actorRequest(c: AppContext, actorId: string, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown): Promise<Response> {
+/** What every runner request checks first: the actor may still do `action` on the session, and no restore or move is under way. */
+export async function requireRunnerAccess(c: AppContext, actorId: string, row: SessionRow, action: RunnerAction): Promise<SessionRow> {
   const access = await sessionAccess(c.env, row.id, actorId);
   if (!access || !hasPermission(access.permissions, actionPermissions[action]) || access.row.owner_id !== row.owner_id) {
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
@@ -35,7 +36,12 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
   }
   // The move itself restores into the successor; every other request waits for the move to finish or be cancelled.
   if (action !== 'view' && action !== 'events') await requireNoMigration(c.env, row.id, action === 'restore');
-  if (access.row.connector_id) return connectorRequest(c, access.row, action, suffix, body, actorId);
+  return access.row;
+}
+
+async function actorRequest(c: AppContext, actorId: string, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown, pin?: ConnectionPin): Promise<Response> {
+  const current = await requireRunnerAccess(c, actorId, row, action);
+  if (current.connector_id) return connectorRequest(c, current, action, suffix, body, actorId, pin);
   const secret = c.env.RUNNER_SHARED_SECRET;
   if (!secret || secret.length < 32 || !c.env.RUNNER_URL) fail(503, 'runner_unavailable', 'The external runner is not configured.');
   let base: URL;
@@ -45,7 +51,7 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
     fail(503, 'runner_unavailable', 'The external runner URL is not configured securely.');
   }
   const paths: Record<RunnerAction, string> = {
-    create: '/v1/sessions', view: `/v1/sessions/${row.id}/view`, events: `/v1/sessions/${row.id}/events`,
+    create: '/v1/sessions', view: `/v1/sessions/${row.id}/view${suffix ? `/${encodeURIComponent(suffix)}` : ''}`, events: `/v1/sessions/${row.id}/events`,
     submit: `/v1/sessions/${row.id}/submit`, ask: `/v1/sessions/${row.id}/ask`, operations: `/v1/sessions/${row.id}/operations`,
     approve: `/v1/sessions/${row.id}/approvals/${encodeURIComponent(suffix)}`, backup: `/v1/sessions/${row.id}/backup`, restart: `/v1/sessions/${row.id}/restart`,
     restore: `/v1/sessions/${row.id}/restore`, stop: `/v1/sessions/${row.id}/stop`,
@@ -53,7 +59,7 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
   const serialized = body === undefined ? '' : JSON.stringify(body);
   const issuedAt = Math.floor(Date.now() / 1000);
   const ticket: RunnerTicket = { aud: 'runner', sessionId: row.id, actorId, ownerId: row.owner_id, action,
-    policyVersion: access.row.policy_version, iat: issuedAt, exp: issuedAt + 60, jti: id(), bodyHash: await sha256(serialized) };
+    policyVersion: current.policy_version, iat: issuedAt, exp: issuedAt + 60, jti: id(), bodyHash: await sha256(serialized) };
   const authorization = await signToken(ticket, secret);
   let response: Response;
   try {

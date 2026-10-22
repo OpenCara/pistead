@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test, { type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { WebSocket } from 'ws';
+import { WebSocket, type ClientOptions } from 'ws';
+import { relaySocketOptions } from '../apps/runner/src/connector.js';
 import { ConnectorHubRegistry } from '../apps/server/src/connector-hub.js';
 import { connectorPath, connectorRequest, validateConnectorRpc, connectorUtf8Bytes, connectorJsonValid, type ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import { openDatabase } from '../apps/server/src/db/index.js';
@@ -111,8 +112,8 @@ async function fixture(t: TestContext) {
   if (!address || typeof address === 'string') throw new Error('No listen address');
   const origin = `ws://127.0.0.1:${address.port}`;
   const sockets: RelaySocket[] = [];
-  async function connect(headers: Record<string, string> = { 'X-Connector-Id': 'connector', 'X-Connector-Credential-Hash': credentialHash }) {
-    const ws = new WebSocket(`${origin}/api/connectors/socket`, ['opencara-pi-v1', 'bearer.unused'], { headers });
+  async function connect(headers: Record<string, string> = { 'X-Connector-Id': 'connector', 'X-Connector-Credential-Hash': credentialHash }, options: ClientOptions = {}) {
+    const ws = new WebSocket(`${origin}/api/connectors/socket`, ['opencara-pi-v1', 'bearer.unused'], { ...options, headers });
     const socket = new RelaySocket(ws);
     sockets.push(socket);
     const welcome = await new Promise<{ type: string; connectorId: string; connectionToken: string }>((resolve, reject) => {
@@ -173,6 +174,42 @@ test('connector handshake stores only the connection hash, negotiates the protoc
   const wire = await socket.nextRequest();
   f.reply(socket, wire);
   assert.deepEqual(await (await pending).json(), { ok: true });
+});
+
+test('the relay compresses each message both ways for connectors that offer it, and stays plain for those that do not', async t => {
+  const f = await fixture(t);
+  const view = JSON.stringify({ view: { entries: Array.from({ length: 500 }, (_, index) => ({ id: `0:${index}`, text: 'the same words again and again' })) } });
+  for (const [label, options, compressed] of [['connector', relaySocketOptions, true], ['older connector', { perMessageDeflate: false }, false]] as const) {
+    const { socket } = await f.connect(undefined, options);
+    assert.equal(socket.ws.extensions.includes('permessage-deflate'), compressed, label);
+    const raw = (socket.ws as unknown as { _socket: { bytesWritten: number } })._socket;
+    const pending = f.rpc(await f.envelope());
+    const wire = await socket.nextRequest();
+    const before = raw.bytesWritten;
+    f.reply(socket, wire, view);
+    assert.equal(await (await pending).text(), view, label);
+    const sent = raw.bytesWritten - before;
+    if (compressed) assert.ok(sent < view.length / 10, `${label}: ${sent} bytes on the wire for a ${view.length}-byte reply`);
+    else assert.ok(sent > view.length, `${label}: ${sent} bytes`);
+  }
+});
+
+test('a view request may name a well-formed revision and nothing else', async t => {
+  const f = await fixture(t);
+  const revision = 'a'.repeat(32);
+  assert.equal(connectorPath('view', 'session', revision), `/v1/sessions/session/view/${revision}`);
+  assert.throws(() => connectorPath('view', 'session', 'abc'));
+  const valid = await f.envelope();
+  valid.request.path = `${valid.request.path}/${revision}`;
+  await validateConnectorRpc(valid);
+  for (const suffix of ['abc', 'A'.repeat(32), `${revision}/x`, '']) {
+    const invalid = await f.envelope();
+    invalid.request.path = `${invalid.request.path}/${suffix}`;
+    await assert.rejects(validateConnectorRpc(invalid), `suffix ${JSON.stringify(suffix)}`);
+  }
+  const submit = await f.envelope('submit', '{}');
+  submit.request.path = `${submit.request.path}/${revision}`;
+  await assert.rejects(validateConnectorRpc(submit));
 });
 
 test('handshake rejects wrong credentials and stale generations with HTTP errors before upgrading', async t => {

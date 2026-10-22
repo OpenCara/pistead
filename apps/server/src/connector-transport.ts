@@ -2,6 +2,7 @@ import { HTTPException } from 'hono/http-exception';
 import { connectorLimits, type ConnectorRpcRequest } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
+import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import type { Permission, RunnerAction, RunnerTicket } from '../../../packages/shared/src/types.js';
 import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
@@ -34,7 +35,11 @@ export function connectorPath(action: RunnerAction, sessionId: string, suffix = 
     case 'approve':
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(suffix)) fail(400, 'invalid_approval', 'Invalid approval identifier.');
       return `${base}/approvals/${suffix}`;
-    case 'view': case 'events': case 'submit': case 'ask': case 'operations': case 'backup': case 'restart': case 'restore': case 'stop':
+    case 'view':
+      if (!suffix) return `${base}/view`;
+      if (!isRevision(suffix)) fail(400, 'invalid_revision', 'Invalid view revision.');
+      return `${base}/view/${suffix}`;
+    case 'events': case 'submit': case 'ask': case 'operations': case 'backup': case 'restart': case 'restore': case 'stop':
       return `${base}/${action}`;
     default: return fail(400, 'invalid_action', 'Invalid connector action.');
   }
@@ -83,7 +88,9 @@ export async function validateConnectorRpc(envelope: ConnectorRelayEnvelope): Pr
       !Object.hasOwn(connectorPermissions, ticket.action) || ticket.action === 'events') {
     fail(400, 'invalid_rpc', 'Invalid connector request.');
   }
-  const suffix = ticket.action === 'approve' && typeof request.path === 'string' ? request.path.split('/').at(-1)! : '';
+  const parts = typeof request.path === 'string' ? request.path.split('/') : [];
+  // An approval's id, or the revision a view request asks for changes since (/v1/sessions/<id>/view/<revision>).
+  const suffix = ticket.action === 'approve' || (ticket.action === 'view' && parts.length === 6) ? parts.at(-1) ?? '' : '';
   if (request.path !== connectorPath(ticket.action, ticket.sessionId, suffix) ||
       request.method !== (ticket.action === 'view' ? 'GET' : 'POST') ||
       (request.method === 'GET' && request.body !== '') ||
@@ -91,8 +98,17 @@ export async function validateConnectorRpc(envelope: ConnectorRelayEnvelope): Pr
       await sha256(request.body) !== ticket.bodyHash) fail(400, 'invalid_rpc', 'Invalid connector request.');
 }
 
+/**
+ * The connection a request goes to. A set `hash` must still be the current one or the request is refused, with
+ * `replaced` set; either way `hash` ends up naming the connection the request went to.
+ */
+export interface ConnectionPin {
+  hash?: string | null;
+  replaced?: boolean;
+}
+
 export async function connectorRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown,
-  actorId: string = c.get('auth').userId): Promise<Response> {
+  actorId: string = c.get('auth').userId, pin?: ConnectionPin): Promise<Response> {
   if (!row.connector_id || !c.env.CONNECTOR_HUB) fail(503, 'connector_unavailable', 'The connector transport is unavailable.');
   const serialized = body === undefined ? '' : JSON.stringify(body);
   if (typeof serialized !== 'string' || connectorUtf8Bytes(serialized) > connectorLimits.requestBytes) fail(413, 'body_too_large', 'The connector request is too large.');
@@ -103,6 +119,13 @@ export async function connectorRequest(c: AppContext, row: SessionRow, action: R
   await authorizeConnectorTicket(c.env, ticket);
   const connection = await currentConnector(c.env, row.connector_id);
   if (!connection.connection_hash) fail(503, 'connector_offline', 'The connector is offline.');
+  if (pin) {
+    if (pin.hash !== undefined && pin.hash !== connection.connection_hash) {
+      pin.replaced = true;
+      fail(503, 'connector_replaced', 'The connector connection changed.');
+    }
+    pin.hash = connection.connection_hash;
+  }
   const envelope: ConnectorRelayEnvelope = { connectorId: row.connector_id, credentialHash: connection.credential_hash,
     connectionHash: connection.connection_hash, request: { type: 'request', id: ticket.jti,
       method: action === 'view' || action === 'events' ? 'GET' : 'POST', path: connectorPath(action, row.id, suffix), body: serialized, ticket } };

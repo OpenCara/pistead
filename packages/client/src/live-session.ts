@@ -1,4 +1,5 @@
 import type { SessionRecord, SessionView } from "../../shared/src/types";
+import { applyViewPatch, isViewPatch } from "../../shared/src/view-patch";
 import { ApiError, errorMessage, segment } from "./api";
 
 export type StreamStatus = "connecting" | "online" | "reconnecting" | "offline";
@@ -59,9 +60,14 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
   let loading = false;
   let pending: boolean | undefined;
   let revoked = false;
+  /** The view shown and its revision: streams send only what changed since it. */
+  let current: SessionView | null = null;
+  let revision: string | undefined;
   const running = () => !revoked && !controller.signal.aborted;
 
-  function showView(view: SessionView) {
+  function showView(view: SessionView, at?: string) {
+    current = view;
+    revision = typeof at === "string" ? at : undefined;
     // A cache host preparing repositories reports progress worth showing every second, even before any message.
     active = view.busy || (view.queue ?? []).some(item => activeStatuses.includes(item.status)) || view.repositories?.status === "preparing";
     handlers.view(view);
@@ -76,6 +82,8 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
   function revoke() {
     // Do not keep a previously authorized transcript visible after access is revoked.
     revoked = true;
+    current = null;
+    revision = undefined;
     closeStream();
     cancelReopen();
     handlers.session(null);
@@ -95,8 +103,8 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
       if (!running()) return;
       handlers.session(metadata.session);
       if (!withView) return;
-      const snapshot = await dependencies.api<{ view: SessionView }>(`${base}/view`, { signal: controller.signal });
-      if (running()) showView(snapshot.view);
+      const snapshot = await dependencies.api<{ view: SessionView; revision?: string }>(`${base}/view`, { signal: controller.signal });
+      if (running()) showView(snapshot.view, snapshot.revision);
     } catch (reason) {
       if (!running()) return;
       handlers.error(errorMessage(reason));
@@ -121,23 +129,40 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
   function openStream() {
     cancelReopen();
     if (!running() || dependencies.hidden() || stream) return;
-    const current = dependencies.openEvents(`${base}/events`);
-    stream = current;
+    const opened = dependencies.openEvents(`${base}/events?since=${revision ?? ""}`);
+    stream = opened;
     let delivered = false;
-    // Snapshots carry the same checked view as GET /view, so they render without a refetch.
-    current.addEventListener("view", event => {
-      if (stream !== current || !running()) return;
-      let snapshot: { view?: SessionView } | null;
-      try { snapshot = JSON.parse(String(event.data)) as { view?: SessionView } | null; } catch { return; }
-      if (!snapshot?.view) return;
+    const deliver = (view: SessionView, at: string | undefined) => {
       delivered = true;
       failures = 0;
       handlers.status("online");
-      showView(snapshot.view);
+      showView(view, at);
+    };
+    // Snapshots carry the same checked view as GET /view, so they render without a refetch.
+    opened.addEventListener("view", event => {
+      if (stream !== opened || !running()) return;
+      let snapshot: { view?: SessionView; revision?: string } | null;
+      try { snapshot = JSON.parse(String(event.data)) as { view?: SessionView; revision?: string } | null; } catch { return; }
+      if (!snapshot?.view) return;
+      deliver(snapshot.view, snapshot.revision);
+    });
+    // What changed since the revision this client holds; nothing at all while the session is quiet.
+    opened.addEventListener("patch", event => {
+      if (stream !== opened || !running()) return;
+      let patch: unknown;
+      try { patch = (JSON.parse(String(event.data)) as { patch?: unknown } | null)?.patch; } catch { return; }
+      if (!isViewPatch(patch) || !current || patch.base !== revision) {
+        // Not ours to apply: the next stream starts again from a whole view.
+        revision = undefined;
+        return;
+      }
+      let view: SessionView;
+      try { view = applyViewPatch(current, patch); } catch { revision = undefined; return; }
+      deliver(view, patch.revision);
     });
     // EventSource reports the end of every stream as an error, including the Worker's normal close.
-    current.addEventListener("error", () => {
-      if (stream !== current) return;
+    opened.addEventListener("error", () => {
+      if (stream !== opened) return;
       closeStream();
       if (!running()) return;
       const eager = followUp;

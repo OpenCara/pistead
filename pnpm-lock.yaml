@@ -199,6 +199,9 @@ importers:
       hono:
         specifier: 4.12.8
         version: 4.12.8
+      ws:
+        specifier: 8.22.0
+        version: 8.22.0
       zod:
         specifier: 4.3.6
         version: 4.3.6
@@ -6594,7 +6597,9 @@ snapshots:
       metro-runtime: 0.87.1
     transitivePeerDependencies:
       - '@babel/core'
+      - bufferutil
       - supports-color
+      - utf-8-validate
 
   '@react-native/normalize-colors@0.88.0': {}
 
