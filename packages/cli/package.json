@@ -4,6 +4,7 @@
   "description": "Connect your Linux or WSL2 Pi host to a Pistead workspace.",
   "license": "MIT",
   "homepage": "https://pistead.com",
+  "repository": { "type": "git", "url": "git+https://github.com/OpenCara/pistead.git", "directory": "packages/cli" },
   "keywords": ["pistead", "pi", "agent", "connector"],
   "type": "module",
   "bin": { "pistead": "dist/pistead.js" },
