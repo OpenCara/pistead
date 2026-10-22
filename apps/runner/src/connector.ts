@@ -499,11 +499,15 @@ export class LocalConnector {
         },
         egressGrant: async sessionId => parseEgressGrant(await this.brokerCallback(generation, "/api/connectors/self/network", { sessionId })),
         // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget.
-        gitRelay: (sessionId, request) => {
+        gitRelay: async (sessionId, request) => {
           this.requireGeneration(generation);
-          return relayGitRequest(this.options.fetch ?? fetch, `${this.state!.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
+          const response = await relayGitRequest(this.options.fetch ?? fetch, `${this.state!.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
             { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken! }, request,
             AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
+          // Like every callback, an answer to a connection that has since been replaced is not used.
+          try { this.requireGeneration(generation); }
+          catch (error) { await response.body?.cancel(); throw error; }
+          return response;
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
         readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
