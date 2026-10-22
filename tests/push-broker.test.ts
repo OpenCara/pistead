@@ -699,6 +699,90 @@ test('a clone session pushes to the workspace repository at the operation path, 
   assert.equal(pinnedShape.status, 400);
 });
 
+/** One pkt-line of `text`. */
+function pkt(text: string): string { return (Buffer.byteLength(text, 'latin1') + 4).toString(16).padStart(4, '0') + text; }
+
+test('a clone session pushes its own branch through the egress relay with the push identity, and nothing else', async t => {
+  const f = await fixture(t);
+  f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
+    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone' WHERE id = 'session'; COMMIT;");
+  const forge: { method: string; url: string; authorization: string | null; body: string }[] = [];
+  const report = pkt(`\x01${pkt('unpack ok\n')}${pkt('ok refs/heads/pistead/session\n')}0000`) + '0000';
+  const mocked = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (!url.startsWith('https://github.com/owner/repo.git/')) return mocked(input, init);
+    const body = init.body ? Buffer.from(await new Response(init.body as BodyInit).arrayBuffer()).toString('latin1') : '';
+    forge.push({ method: init.method ?? 'GET', url, authorization: new Headers(init.headers).get('authorization'), body });
+    return url.endsWith('/info/refs?service=git-receive-pack')
+      ? new Response('001f# service=git-receive-pack\n0000', { headers: { 'Content-Type': 'application/x-git-receive-pack-advertisement' } })
+      : new Response(report, { headers: { 'Content-Type': 'application/x-git-receive-pack-result' } });
+  };
+  t.after(() => { globalThis.fetch = mocked; });
+  const relay = (service: string, body?: string, contentType = 'application/x-git-receive-pack-request') =>
+    app.request(`/api/internal/git/relay/binding-gh/${service}?sessionId=session`, { method: 'POST',
+      headers: { Authorization: `Bearer ${internalSecret}`, ...(body === undefined ? {} : { 'Content-Type': contentType }) }, body }, f.env);
+  const command = (ref: string, next = tip) => pkt(`${'0'.repeat(40)} ${next} ${ref}\0report-status side-band-64k agent=git/2.43.0\n`) + '0000';
+  const installation = 'Basic ' + Buffer.from('x-access-token:ghs_installation_token').toString('base64');
+  const revoked = () => f.calls.filter(call => call.method === 'DELETE' && call.url === 'https://api.github.com/installation/token').length;
+
+  const refs = await relay('receive-refs');
+  assert.equal(refs.status, 200);
+  assert.equal(refs.headers.get('content-type'), 'application/x-git-receive-pack-advertisement');
+  assert.match(await refs.text(), /service=git-receive-pack/);
+  const pushed = await relay('receive-pack', command('refs/heads/pistead/session') + 'PACK-DATA');
+  assert.equal(pushed.status, 200);
+  assert.equal(await pushed.text(), report);
+  // The workspace's push identity (here the operator's GitHub App) pushes; the host never sees its token, which is
+  // revoked once each answer has streamed.
+  assert.deepEqual(forge.map(call => [call.method, call.url, call.authorization]), [
+    ['GET', 'https://github.com/owner/repo.git/info/refs?service=git-receive-pack', installation],
+    ['POST', 'https://github.com/owner/repo.git/git-receive-pack', installation],
+  ]);
+  assert.equal(forge[1]!.body, command('refs/heads/pistead/session') + 'PACK-DATA');
+  assert.equal(revoked(), 2);
+  const audit = f.audits('git.push.session_branch') as { actor_id: string; detail_json: string }[];
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0]!.actor_id, owner);
+  assert.deepEqual(JSON.parse(audit[0]!.detail_json), { bindingId: 'binding-gh', branch: 'pistead/session', old: '0'.repeat(40), new: tip, kind: 'github-app' });
+
+  // Anything but creating or moving the session branch is refused before a credential is minted.
+  const mints = () => f.calls.filter(call => call.url === 'https://api.github.com/app/installations/55/access_tokens').length;
+  const before = mints();
+  for (const [body, status, expected] of [
+    [command('refs/heads/main'), 403, 'session_branch_only'],
+    [command('refs/heads/pistead/session', '0'.repeat(40)), 403, 'session_branch_only'],
+    [command('refs/heads/pistead/session') .slice(0, -4) + pkt(`${'0'.repeat(40)} ${tip} refs/heads/pistead/session\n`) + '0000', 403, 'session_branch_only'],
+    [pkt('push-cert\0report-status\n') + '0000', 400, 'invalid_push_request'],
+    ['zzzz', 400, 'invalid_push_request'],
+  ] as const) {
+    const refused = await relay('receive-pack', body);
+    assert.equal(refused.status, status, body);
+    assert.equal(await code(refused), expected);
+  }
+  assert.equal((await relay('receive-pack', command('refs/heads/pistead/session'), 'text/plain')).status, 415);
+  // Git's probe before a chunked upload is answered without a credential.
+  const probe = await relay('receive-pack', '0000');
+  assert.equal(probe.status, 200);
+  assert.equal(await probe.text(), '');
+  assert.equal(mints(), before);
+  assert.equal(forge.length, 2);
+
+  // The owner must be able to push the repository, with an identity the control plane can push with.
+  f.state.canPush = false;
+  assert.equal(await code(await relay('receive-refs')), 'push_permission_required');
+  f.state.canPush = true;
+  f.pushIdentity('github', 'github.com', '', 'host-credentials');
+  const host = await relay('receive-refs');
+  assert.equal(host.status, 409);
+  assert.equal(await code(host), 'host_git_credentials_relay');
+  f.pushIdentity('github', 'github.com', '', 'owner-account');
+  assert.equal(await code(await relay('receive-refs')), 'push_identity_own_host_required');
+  // Pinned sessions push only with git_push.
+  f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = 'session'").run();
+  assert.equal(await code(await relay('receive-refs')), 'session_branch_unavailable');
+});
+
 test('a pinned session cannot push a clone directory', async t => {
   const f = await fixture(t);
   const response = await f.post(credential, { sessionId: 'session', approvalId: 'tool-pinned-1', actorId: owner,

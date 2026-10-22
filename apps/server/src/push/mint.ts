@@ -18,6 +18,11 @@ export interface MintTarget {
   ownerId: string; connectorId: string | null; hostOwnerId: string | null;
   /** The session owner's own account for the repository, already checked for push permission. */
   owner: RepositoryAccess;
+  /**
+   * The control plane pushes with the credential itself (the egress relay), so it never reaches the host: the owner's
+   * token needs no reset afterwards, and the host's own Git credentials can't serve.
+   */
+  relay?: boolean;
 }
 export interface MintedToken {
   kind: PushIdentityKind;            // 'github-app' for the operator app too
@@ -321,7 +326,7 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
       // The owner's token goes only to the owner's own host, for this one push.
       requireOwnHost(target, row.kind);
       const minted = { kind: row.kind, identityId: row.id, authorization: ownerGitAuthorization(target.owner), expiresAt: expiresAt(undefined, 3600) };
-      if (target.owner.provider !== 'github') return minted;
+      if (target.owner.provider !== 'github' || target.relay) return minted;
       // The GitHub sign-in token is reset after the push, which needs Pistead's OAuth app.
       if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
         fail(409, 'owner_token_reset_unavailable', 'Pushes with the session owner\'s GitHub account need Pistead\'s GitHub sign-in app to reset the token afterwards, and it is not configured.');
@@ -330,6 +335,10 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
       return { ...minted, revocation: { kind: 'github-owner', userId, token, ciphertext } };
     }
     case 'host-credentials': {
+      if (target.relay) {
+        fail(409, 'host_git_credentials_relay', `Pushes to ${gitProviderNames[target.provider]} (${target.host}) use the host's Git credentials, which the session's ` +
+          'egress proxy can\'t use. Push with the git_push tool instead, or ask a workspace owner or admin to change the push identity in Settings → Workspaces.');
+      }
       requireOwnHost(target, row.kind);
       const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ? AND owner_id = ?')
         .bind(target.connectorId, target.ownerId).first();

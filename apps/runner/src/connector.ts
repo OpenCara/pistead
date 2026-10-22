@@ -499,13 +499,17 @@ export class LocalConnector {
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/complete", payload));
         },
         egressGrant: async sessionId => parseEgressGrant(await this.brokerCallback(generation, "/api/connectors/self/network", { sessionId })),
-        // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget.
+        // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget. A push
+        // outlives a replaced connection: once its pack is under way, the forge's answer must reach Git.
         gitRelay: async (sessionId, request) => {
           this.requireGeneration(generation);
+          const push = request.service === "receive-pack";
           const response = await relayGitRequest(this.options.fetch ?? fetch, `${this.state!.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
             { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken! }, request,
-            AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
-          // Like every callback, an answer to a connection that has since been replaced is not used.
+            AbortSignal.any([...(push ? [] : [generation.abort.signal]), this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
+          // Like every callback, an answer to a connection that has since been replaced is not used, except a push's: the
+          // forge has taken it by then, and Git must hear how it went.
+          if (push) return response;
           try { this.requireGeneration(generation); }
           catch (error) { await response.body?.cancel(); throw error; }
           return response;

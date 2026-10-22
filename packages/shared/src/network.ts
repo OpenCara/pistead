@@ -69,6 +69,15 @@ export interface EgressRepository {
 }
 /** What the control plane lets one session's egress proxy do; the proxy asks again every minute. */
 export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[] }
-/** The Git smart-HTTP requests the relay forwards: the ref advertisement and the fetch itself. Pushes are not relayed. */
-export const egressGitServices = ["info-refs", "upload-pack"] as const;
+/**
+ * The Git smart-HTTP requests the relay forwards: a fetch's ref advertisement and the fetch itself, and in clone sessions a
+ * push's (`receive-refs`, `receive-pack`), which may only update the session branch.
+ */
+export const egressGitServices = ["info-refs", "upload-pack", "receive-refs", "receive-pack"] as const;
 export type EgressGitService = (typeof egressGitServices)[number];
+/** The services that only read. */
+export const egressReadServices: readonly EgressGitService[] = ["info-refs", "upload-pack"];
+/** A push's services: only a clone session's own branch is pushed this way. */
+export function egressPushService(service: EgressGitService): service is "receive-refs" | "receive-pack" {
+  return !egressReadServices.includes(service);
+}

@@ -1360,8 +1360,9 @@ test('egress grants and the Git relay serve only the connector running the sessi
   assert.equal(seen[0]!.protocol, 'version=2');
   // Every relayed request re-verifies the bound repository's identity, the fetch as much as the advertisement.
   assert.equal(verified() - before, 2);
-  // Pushes are never relayed, nor sessions of other connectors, nor repositories of other workspaces.
-  assert.equal((await relay('receive-pack')).status, 404);
+  // A pinned session's pushes are never relayed, nor sessions of other connectors, nor repositories of other workspaces.
+  await denied(await relay('receive-pack'), 403, 'session_branch_unavailable');
+  assert.equal((await relay('send-pack')).status, 404);
   await denied(await relay('upload-pack', { body: '0000', headers: { 'Content-Type': 'text/plain' } }), 415, 'unsupported_media_type');
   await denied(await relay('info-refs', {}, session.id, 'missing-binding'), 404, 'repository_not_bound');
   await denied(await app.request(`${origin}/api/connectors/self/git/relay/${repository.id}/info-refs?sessionId=${session.id}`, {

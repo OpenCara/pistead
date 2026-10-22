@@ -1,8 +1,9 @@
 import type { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { bindingRemote, gitProviderNames } from '../../../packages/shared/src/repositories.js';
-import { defaultNetworkPolicy, egressGitServices, packageRegistryDomains, parseNetworkPolicy,
+import { defaultNetworkPolicy, egressGitServices, egressPushService, packageRegistryDomains, parseNetworkPolicy,
   type EgressGitService, type EgressGrant, type NetworkPolicy } from '../../../packages/shared/src/network.js';
+import { hasPermission } from '../../../packages/shared/src/policy.js';
 import type { AppContext, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
 import type { Database } from './db/types.js';
 import { auditStatement, requireMember, sessionAccess } from './db.js';
@@ -10,6 +11,7 @@ import { fail, identifier, jsonObject, now } from './http.js';
 import { authenticateConnector, requireCallbackScope, requireConnectorSession, type ConnectorRow } from './connectors.js';
 import { recheckAccess, repositoryAccess, verifyRepository } from './repositories.js';
 import { ownerGitAuthorization } from './push/targets.js';
+import { sessionBranchPush } from './push/session-branch.js';
 
 /** Owner/admin authority, re-checked inside the write (binds workspace id, user id). */
 const adminSql = `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))`;
@@ -17,7 +19,7 @@ const adminSql = `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ?
 const uploadRequestBytes = 64 * 1024 * 1024;
 /** Upstream answers start within this; the pack itself may stream for as long as the session's command runs. */
 const relayTimeout = 60 * 60 * 1000;
-const gitTypes: Record<EgressGitService, string> = {
+const gitTypes: Record<'info-refs' | 'upload-pack', string> = {
   'info-refs': 'application/x-git-upload-pack-advertisement',
   'upload-pack': 'application/x-git-upload-pack-result',
 };
@@ -98,9 +100,10 @@ async function boundedRequest(c: AppContext, limit: number): Promise<Uint8Array<
 }
 
 /**
- * Relays one Git read of a workspace repository for a session's egress proxy, with the session OWNER's own credential.
- * The credential never leaves the control plane; the host sees only the Git protocol. Only the ref advertisement and
- * fetches are relayed: pushes keep going through the approved push broker.
+ * Relays one Git request for a session's egress proxy. Reads of a workspace repository use the session OWNER's own
+ * credential; a clone session's pushes of its own branch use the workspace's push identity (sessionBranchPush). Either
+ * credential stays on the control plane; the host sees only the Git protocol. Pushes elsewhere go through the approved
+ * push broker.
  */
 export async function gitRelay(c: AppContext, connector: ConnectorRow | null): Promise<Response> {
   const bindingId = identifier(c.req.param('bindingId'), 'bindingId');
@@ -109,9 +112,12 @@ export async function gitRelay(c: AppContext, connector: ConnectorRow | null): P
   const sessionId = identifier(c.req.query('sessionId'), 'sessionId');
   const original = await c.env.DB.query<SessionRow>('SELECT * FROM sessions WHERE id = ?').bind(sessionId).first();
   if (!original) fail(404, 'not_found', 'Session not found.');
+  const push = egressPushService(service);
+  if (push && original.repository_mode !== 'clone') fail(403, 'session_branch_unavailable', 'Only clone sessions push through the egress proxy; use the git_push tool.');
   const authorize = async () => {
     const fresh = await sessionAccess(c.env, sessionId, original.owner_id);
-    if (!fresh || fresh.row.status === 'archived' || fresh.row.owner_id !== original.owner_id || fresh.row.workspace_id !== original.workspace_id) {
+    if (!fresh || fresh.row.status === 'archived' || fresh.row.owner_id !== original.owner_id || fresh.row.workspace_id !== original.workspace_id
+        || (push && !hasPermission(fresh.permissions, 'write'))) {
       fail(403, 'repository_authority_changed', 'Session repository access is no longer authorized.');
     }
     if (connector) {
@@ -125,6 +131,7 @@ export async function gitRelay(c: AppContext, connector: ConnectorRow | null): P
     .bind(bindingId, original.workspace_id).first();
   if (!binding) fail(404, 'repository_not_bound', 'This repository is not bound to the session\'s workspace.');
   const access = await repositoryAccess(c.env, original.owner_id, binding.provider, binding.host, binding.full_name);
+  if (egressPushService(service)) return sessionBranchPush(c, { session: original, binding, access, service, authorize });
   // Renames and transfers fail closed, on every request: nothing makes a sandboxed client fetch only after an advertisement.
   await verifyRepository(access, { repositoryId: binding.repository_id, fullName: binding.full_name });
   const remote = bindingRemote({ provider: binding.provider, host: binding.host, fullName: binding.full_name });

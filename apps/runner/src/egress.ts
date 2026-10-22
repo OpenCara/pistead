@@ -6,9 +6,10 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import type { Duplex } from "node:stream";
+import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
-import { hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { egressPushService, hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
 import { RunnerError } from "./protocol.js";
 
 /** Where sandboxed commands reach the proxy: a loopback port the sandbox helper relays to this session's socket. */
@@ -28,11 +29,14 @@ const GRANT_STALE_MS = 5 * 60_000;
 const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
 const LOG_ENTRIES = 200;
 
-/** One Git read for the control plane's relay, which adds the session owner's credential. */
+/**
+ * One Git request for the control plane's relay, which adds the credential: the session owner's for reads, the
+ * workspace's push identity for a push of the session branch. A push's pack streams.
+ */
 export interface RelayRequest {
   bindingId: string; service: EgressGitService;
   userAgent?: string; gitProtocol?: string; contentType?: string; contentEncoding?: string;
-  body?: Uint8Array<ArrayBuffer>;
+  body?: Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>;
 }
 export interface EgressEntry { at: string; kind: "git" | "connect" | "http"; target: string; outcome: "allowed" | "refused"; reason?: string }
 export interface EgressOptions {
@@ -49,6 +53,11 @@ export interface EgressOptions {
    * where the host keeps a repository cache. The `git` shim asks for it before a clone, to borrow its objects.
    */
   mirror?: (repository: EgressRepository) => Promise<string>;
+  /**
+   * The branch this session may push without approval (a clone session's `pistead/<session-id>`); pushes of it are
+   * relayed to the control plane, which pushes with the workspace's push identity. Without it, every push is refused.
+   */
+  sessionBranch?: string;
 }
 
 /**
@@ -56,7 +65,7 @@ export interface EgressOptions {
  * SSH remotes of the common hosts) go to its Git endpoint, which relays the workspace's repositories with the owner's
  * credential. None of this is a boundary: the sandbox has no other network, so bypassing it only fails.
  */
-export function egressEnvironment(): Record<string, string> {
+export function egressEnvironment(sessionBranch?: string): Record<string, string> {
   const proxy = `http://127.0.0.1:${EGRESS_PORT}`;
   const rewrites: [string, string][] = [["https://", EGRESS_GIT_BASE],
     ...SSH_HOSTS.flatMap((host): [string, string][] => [[`git@${host}:`, `${EGRESS_GIT_BASE}${host}/`], [`ssh://git@${host}/`, `${EGRESS_GIT_BASE}${host}/`]])];
@@ -70,6 +79,7 @@ export function egressEnvironment(): Record<string, string> {
     NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1",
     NODE_USE_ENV_PROXY: "1",
     PISTEAD_EGRESS_STATUS: `${proxy}/__pistead/status`,
+    ...(sessionBranch ? { PISTEAD_SESSION_BRANCH: sessionBranch } : {}),
     ...config,
   };
 }
@@ -114,11 +124,11 @@ function repositoryKey(hostAndPath: string): string {
   return value.toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "");
 }
 
-function gitRequest(path: string, search: string): { target: string; service: EgressGitService | "receive-pack" } | undefined {
+function gitRequest(path: string, search: string): { target: string; service: EgressGitService } | undefined {
   const service = new URLSearchParams(search).get("service");
   if (path.endsWith("/info/refs")) {
     if (service === "git-upload-pack") return { target: path.slice(0, -"/info/refs".length), service: "info-refs" };
-    if (service === "git-receive-pack") return { target: path.slice(0, -"/info/refs".length), service: "receive-pack" };
+    if (service === "git-receive-pack") return { target: path.slice(0, -"/info/refs".length), service: "receive-refs" };
     return undefined;
   }
   if (path.endsWith("/git-upload-pack")) return { target: path.slice(0, -"/git-upload-pack".length), service: "upload-pack" };
@@ -151,7 +161,8 @@ function refuse(response: ServerResponse, status: number, message: string): void
  * One session's way out of its sandbox. It listens on a Unix socket that only that session's sandbox can reach, so every
  * request it serves is that session's, and it:
  * - relays Git reads of the workspace's repositories to the control plane, which adds the session owner's credential
- *   (the host never holds it) and re-checks the session's authority;
+ *   (the host never holds it) and re-checks the session's authority, and pushes of the session branch, which the
+ *   control plane makes with the workspace's push identity;
  * - opens HTTPS tunnels (CONNECT, port 443) to hosts the workspace's network policy allows, never to private,
  *   loopback or link-local addresses, without looking inside them;
  * - refuses everything else with a reason, and answers `/__pistead/status` with the policy and recent decisions.
@@ -161,6 +172,7 @@ export class EgressProxy {
   readonly #options: EgressOptions;
   readonly #log: EgressEntry[] = [];
   readonly #sockets = new Set<Socket | Duplex>();
+  readonly #pushes = new Set<Promise<void>>();
   #server: Server | undefined;
   #grant: { value: EgressGrant; at: number } | undefined;
   #refresh: Promise<EgressGrant> | undefined;
@@ -180,6 +192,8 @@ export class EgressProxy {
       server.once("error", reject);
       server.listen(this.socketPath, () => { server.off("error", reject); resolve(); });
     });
+    // A push's request is its whole pack, which may take longer to send than Node's default allows.
+    server.requestTimeout = 60 * 60 * 1000;
     // Open connections keep the process alive while they last; an idle proxy never does.
     server.unref();
     this.#server = server;
@@ -188,8 +202,12 @@ export class EgressProxy {
   async close(): Promise<void> {
     const server = this.#server;
     this.#server = undefined;
+    // No new requests; a push under way finishes before its connection goes, as the forge may take it and Git must hear
+    // how it went. The relay's own time limit bounds the wait.
+    const closed = server && new Promise<void>(resolve => server.close(() => resolve()));
+    await Promise.allSettled([...this.#pushes]);
     for (const socket of this.#sockets) socket.destroy();
-    if (server) await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); });
+    if (server) { server.closeAllConnections(); await closed; }
     await rm(this.socketPath, { force: true });
   }
 
@@ -327,7 +345,9 @@ export class EgressProxy {
       network: grant?.policy ?? null,
       ...(error ? { error } : {}),
       repositories: grant?.repositories.map(repository => bindingRemote(repository)) ?? [],
-      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`,
+      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`
+        + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : ""),
+      sessionBranch: this.#options.sessionBranch ?? null,
       recent: this.#log.slice(-50),
     }, null, 2)}\n`);
   }
@@ -356,13 +376,18 @@ export class EgressProxy {
     const target = parsed.target.replace(/^[^@/]*@/, "");
     const key = repositoryKey(target);
     const label = key.slice(0, 300);
-    if (parsed.service === "receive-pack") {
+    const push = egressPushService(parsed.service);
+    if (push && !this.#options.sessionBranch) {
       this.#record({ kind: "git", target: label, outcome: "refused", reason: "push" });
-      return refuse(response, 403, "Pushes don't go through the egress proxy yet: commit, then use the git_push tool");
+      return refuse(response, 403, "Pushes don't go through the egress proxy in this session: commit, then use the git_push tool");
     }
     const grant = await this.#currentGrant();
     const repository = grant.repositories.find(item => repositoryKey(bindingRemote(item).replace(/^https:\/\//, "")) === key);
-    if (repository) return this.#relay(request, response, repository, parsed.service, label);
+    if (repository) return push ? this.#push(request, response, repository, parsed.service, label) : this.#relay(request, response, repository, parsed.service, label);
+    if (push) {
+      this.#record({ kind: "git", target: label, outcome: "refused", reason: "push: not a workspace repository" });
+      return refuse(response, 403, `${target.slice(0, 300)} is not one of this workspace's repositories; pushes go only to them`);
+    }
     // Any other repository is fetched directly, without credentials, if the network policy allows its host: the client
     // follows the redirect through its HTTPS proxy, where the tunnel enforces the policy again.
     const host = key.split("/")[0]!;
@@ -377,10 +402,47 @@ export class EgressProxy {
       : `${target.slice(0, 300)} is not one of this workspace's repositories, and its network policy doesn't allow ${host.slice(0, 253)}`);
   }
 
-  async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string): Promise<void> {
+  /**
+   * A push of the session branch: its commands are checked here, so a push of anything else is refused before its pack
+   * is sent, and checked again by the control plane. Git's probe before a chunked upload is answered here.
+   */
+  async #push(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string): Promise<void> {
+    const branch = this.#options.sessionBranch!;
+    if (service === "receive-refs") return this.#relay(request, response, repository, service, label);
+    if (request.method !== "POST") return refuse(response, 405, "Git pushes use POST");
+    if (request.headers["content-type"]?.toLowerCase() !== "application/x-git-receive-pack-request" || request.headers["content-encoding"])
+      return refuse(response, 415, "Expected a Git receive-pack request");
+    let parsed: Awaited<ReturnType<typeof readPushCommands>>;
+    try { parsed = await readPushCommands(Readable.toWeb(request) as ReadableStream<Uint8Array>); }
+    catch (error) {
+      if (error instanceof PushRequestError) return refuse(response, 400, error.message);
+      throw error;
+    }
+    // Answers here come once the request is read: Git reads them only after sending it, and the connection must stay up.
+    if (!parsed.commands.length) {
+      if (!await drainStream(parsed.body, PUSH_REQUEST_BYTES)) return refuse(response, 413, "The push is too large");
+      response.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-store" });
+      return void response.end();
+    }
+    const refusal = sessionBranchRefusal(parsed.commands, branch);
+    if (refusal) {
+      this.#record({ kind: "git", target: label, outcome: "refused", reason: `push: ${refusal}` });
+      if (!await drainStream(parsed.body, PUSH_REQUEST_BYTES)) return refuse(response, 413, "The push is too large");
+      const rejection = pushRejection(parsed.commands, parsed.capabilities, refusal);
+      if (!rejection) return refuse(response, 403, refusal);
+      response.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-store" });
+      return void response.end(rejection);
+    }
+    const pushed = this.#relay(request, response, repository, service, label, boundedStream(parsed.body, PUSH_REQUEST_BYTES, "The push is too large"));
+    this.#pushes.add(pushed);
+    try { await pushed; } finally { this.#pushes.delete(pushed); }
+  }
+
+  async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string,
+    stream?: ReadableStream<Uint8Array>): Promise<void> {
     const header = (name: string) => { const value = request.headers[name]; return typeof value === "string" ? value : undefined; };
     if (service === "upload-pack" && request.method !== "POST") return refuse(response, 405, "Git fetches use POST");
-    const body = service === "upload-pack" ? await boundedBody(request, UPLOAD_REQUEST_BYTES) : undefined;
+    const body = service === "upload-pack" ? await boundedBody(request, UPLOAD_REQUEST_BYTES) : stream;
     let upstream: Response;
     try {
       upstream = await this.#options.relay({
@@ -393,7 +455,7 @@ export class EgressProxy {
       this.#record({ kind: "git", target: label, outcome: "refused", reason });
       return refuse(response, error instanceof RunnerError && error.status >= 400 && error.status < 600 ? error.status : 502, reason);
     }
-    this.#record({ kind: "git", target: label, outcome: "allowed", reason: service });
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: service === "receive-pack" ? `push ${this.#options.sessionBranch}` : service });
     response.writeHead(200, { "Content-Type": upstream.headers.get("content-type") ?? "application/octet-stream", "Cache-Control": "no-store" });
     if (!upstream.body) return void response.end();
     const reader = upstream.body.getReader();
@@ -464,7 +526,9 @@ export async function relayGitRequest(fetchImpl: typeof fetch, url: string, auth
   if (request.gitProtocol) headers["git-protocol"] = request.gitProtocol;
   if (request.contentType) headers["content-type"] = request.contentType;
   if (request.contentEncoding) headers["content-encoding"] = request.contentEncoding;
-  const response = await fetchImpl(url, { method: "POST", redirect: "error", credentials: "omit", headers, body: request.body ?? new Uint8Array(), signal });
+  // A push's pack streams through as the sandbox sends it.
+  const response = await fetchImpl(url, { method: "POST", redirect: "error", credentials: "omit", headers, body: request.body ?? new Uint8Array(),
+    ...(request.body instanceof ReadableStream ? { duplex: "half" } : {}), signal } as RequestInit);
   if (response.ok) return response;
   const text = (await response.text().catch(() => "")).slice(0, 4096);
   let error: unknown;

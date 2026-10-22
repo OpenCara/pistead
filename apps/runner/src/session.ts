@@ -26,7 +26,8 @@ import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import type { EgressGrant, EgressRepository } from "../../../packages/shared/src/network.js";
+import { egressPushService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -216,6 +217,7 @@ export class RunnerSession {
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
       this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath,
+        ...(this.#clone ? { sessionBranch: sessionBranch(binding.session.id) } : {}),
         ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
     const report = config.reportActivity;
@@ -231,12 +233,13 @@ export class RunnerSession {
         : await this.controlPlane("/api/internal/network", { sessionId })),
       relay: request => this.relay(request),
       ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
+      ...(this.#clone ? { sessionBranch: sessionBranch(sessionId) } : {}),
     });
   }
 
   /**
-   * One Git read through the control plane's relay, with the session owner's access. A refusal also stops this session
-   * borrowing from the host's mirror of that repository.
+   * One Git request through the control plane's relay: a read with the session owner's access, or a push of the session
+   * branch. A refused read also stops this session borrowing from the host's mirror of that repository.
    */
   private async relay(request: RelayRequest): Promise<Response> {
     const sessionId = this.binding.session.id;
@@ -245,7 +248,7 @@ export class RunnerSession {
         : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
           { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
     } catch (error) {
-      if (refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
+      if (!egressPushService(request.service) && refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
       throw error;
     }
   }
@@ -596,16 +599,20 @@ export class RunnerSession {
     let instructions = this.binding.agent.instructions;
     const repositories = this.binding.session.repositories ?? [];
     if (this.#clone) {
+      const branch = sessionBranch(this.binding.session.id);
       instructions += "\n\nTrusted runtime repository context:\n"
         + "The execution root is the isolated session worktree, which starts empty; file-tool paths are relative to it. "
         + "Clone the repositories you need into it with plain Git in bash (for example git clone https://github.com/<owner>/<name>), "
         + "and fetch, switch and create branches as usual. Git reaches this workspace's repositories through the session's egress proxy "
-        + "with the session owner's own access; no credentials are needed or available. Commit with git in bash."
+        + "with the session owner's own access; no credentials are needed or available. Commit with git in bash. "
+        + `This session's own branch is ${branch} (also in $PISTEAD_SESSION_BRANCH): push your work to it with plain git, for example `
+        + `git push origin HEAD:${branch}, in any of the workspace's repositories, without approval. Pushes of other branches are refused there.`
         + (this.#cloneRepositories.length ? `\nThis workspace's repositories: ${this.#cloneRepositories.join(", ")}.` : "");
       if (this.binding.agent.tools.includes("git_push"))
-        instructions += "\ngit_push publishes a clone's checked-out commit, as it is, to a branch of the workspace repository it was cloned from: "
-          + "git_push {directory, branch}, where directory is the clone's path in the worktree. Pushes are fast-forward only (never forced); "
-          + "if the branch moved, fetch and merge or rebase first. Optionally request a pull request with pull_request {title, body, base?}.";
+        instructions += "\ngit_push publishes a clone's checked-out commit, as it is, to another branch of the workspace repository it was cloned from, "
+          + "with approval: git_push {directory, branch}, where directory is the clone's path in the worktree. Pushes are fast-forward only (never forced); "
+          + "if the branch moved, fetch and merge or rebase first. Optionally request a pull request with pull_request {title, body, base?}; "
+          + `to open one from the session branch once you pushed it, call git_push with branch ${branch}.`;
     } else if (repositories.length) {
       instructions += "\n\nTrusted runtime repository context:\n"
         + "The execution root is the isolated session worktree. File-tool paths are relative to that worktree, not to a repository root.\n"
