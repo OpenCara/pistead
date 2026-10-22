@@ -202,7 +202,6 @@ pushed it). Pinned sessions push only with `git_push`.
 
 ### Not yet
 
-- Backups and moves of clone sessions still snapshot the worktree; durability is the next step.
 - A push's upload must finish within the control plane's request timeout (Node's default is five minutes) and its
   outbound fetch's; the proxy itself allows an hour.
 
