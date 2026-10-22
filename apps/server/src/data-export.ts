@@ -2,13 +2,14 @@ import type { Hono } from 'hono';
 import type {
   AgentVersion, BackupLocation, ModelDefinition, PushIdentity, SessionRecord, WorkspaceDatabase, WorkspaceRole,
 } from '../../../packages/shared/src/types.js';
-import { defaultNetworkPolicy, type NetworkPolicy } from '../../../packages/shared/src/network.js';
+import type { NetworkPolicy } from '../../../packages/shared/src/network.js';
 import type { WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
 import type { Database, SqlValue } from './db/types.js';
 import type { AgentRow, ModelRow, PushIdentityRow, RepositoryRow, SessionRow, WorkerEnv, WorkspaceRow } from './types.js';
 import { agentVersion, auditStatement, modelDefinition, requireMember, requireSession, sessionRecord, workspaceSessionAccess } from './db.js';
 import { fail, identifier, now } from './http.js';
 import { publicRepository } from './repositories.js';
+import { workspaceNetworkPolicy } from './network.js';
 import { publicIdentity } from './push/identities.js';
 import { publicWorkspaceDatabase, type WorkspaceDatabaseRow } from './workspace-databases/store.js';
 
@@ -156,8 +157,6 @@ export async function exportWorkspace(db: Database, workspaceId: string,
     WHERE r.workspace_id = ? ORDER BY r.created_at, r.id`).bind(workspaceId).all();
   const identities = await db.query<PushIdentityRow>('SELECT * FROM push_identities WHERE workspace_id = ? ORDER BY provider, host, scope, id')
     .bind(workspaceId).all();
-  const network = await db.query<{ mode: NetworkPolicy['mode']; domains_json: string; package_registries: number }>(
-    'SELECT mode, domains_json, package_registries FROM workspace_network_policies WHERE workspace_id = ?').bind(workspaceId).first();
   const database = await db.query<WorkspaceDatabaseRow>('SELECT * FROM workspace_databases WHERE workspace_id = ?').bind(workspaceId).first();
   const rows = exporter?.sessions
     ?? await db.query<SessionRow>('SELECT * FROM sessions WHERE workspace_id = ? ORDER BY created_at, id').bind(workspaceId).all();
@@ -172,9 +171,7 @@ export async function exportWorkspace(db: Database, workspaceId: string,
     agents: agents.map(agentVersion),
     repositories: repositories.map(repository => publicRepository(repository)),
     pushIdentities: identities.map(identity => publicIdentity(identity)),
-    networkPolicy: network
-      ? { mode: network.mode, domains: parsed(network.domains_json) as string[], packageRegistries: network.package_registries === 1 }
-      : { ...defaultNetworkPolicy, domains: [] },
+    networkPolicy: await workspaceNetworkPolicy(db, workspaceId),
     database: database ? publicWorkspaceDatabase(database) : null,
     audit: await auditEntries(db, 'workspace_id = ? AND session_id IS NULL', workspaceId),
     sessions,

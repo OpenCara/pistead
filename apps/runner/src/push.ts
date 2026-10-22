@@ -8,7 +8,11 @@ import type { SandboxAuthorize } from "./sandbox.js";
 export interface PushPreparation { tip: string; base: string; commits: { source: string; rewritten: string; subject: string }[] }
 
 /** A clone's side of a push: the advertised tips it has, whether the branch fast-forwards, and the commits that are new. */
-export interface ClonePushPreparation { present: string[]; ancestor: boolean | null; commits: { source: string; subject: string }[] }
+export interface ClonePushPreparation {
+  present: string[]; ancestor: boolean | null;
+  /** The newest of the commits the remote lacks, at most 100; `total` counts them all. */
+  commits: { source: string; subject: string }[]; total: number;
+}
 
 /** Clone sessions run only in the sandbox. */
 export interface ClonePushWorkspace {
@@ -36,6 +40,8 @@ export interface PushResult {
   base: string;
   previous: string | null;
   commits: PushPreparation["commits"];
+  /** How many commits the push carries, when `commits` lists only the newest of them. */
+  total?: number;
 }
 
 const OID = /^[0-9a-f]{40}$/;
@@ -142,7 +148,7 @@ export async function performClonePush(options: {
     throw new PushError("Git remote request failed");
   }
   const result = { branch: operation.branch, tip: operation.commit, base: previous === ZERO_OID ? "" : previous, previous: previous === ZERO_OID ? null : previous,
-    commits: prepared.commits.map(commit => ({ source: commit.source, rewritten: commit.source, subject: commit.subject })) };
+    commits: prepared.commits.map(commit => ({ source: commit.source, rewritten: commit.source, subject: commit.subject })), total: prepared.total };
   if (previous === operation.commit) return { outcome: "up-to-date", ...result };
   if (previous !== ZERO_OID && !prepared.ancestor) {
     throw new PushError(`Remote branch ${operation.branch} has commits the clone doesn't have; fetch and merge or rebase first, as pushes are fast-forward only`);
@@ -165,8 +171,9 @@ export async function performClonePush(options: {
 export function pushSummary(result: PushResult, pullRequest?: { url: string; number: number; created: boolean }): string {
   const lines = [result.outcome === "up-to-date"
     ? `Branch ${result.branch} is already up to date at ${result.tip}.`
-    : `Pushed ${result.commits.length} commit${result.commits.length === 1 ? "" : "s"} to ${result.branch} (${result.previous ? `${result.previous.slice(0, 12)}..` : "new branch at "}${result.tip.slice(0, 12)})${result.base ? `, based on ${result.base.slice(0, 12)}` : ""}.`];
+    : `Pushed ${result.total ?? result.commits.length} commit${(result.total ?? result.commits.length) === 1 ? "" : "s"} to ${result.branch} (${result.previous ? `${result.previous.slice(0, 12)}..` : "new branch at "}${result.tip.slice(0, 12)})${result.base ? `, based on ${result.base.slice(0, 12)}` : ""}.`];
   for (const commit of result.commits) lines.push(`- ${commit.rewritten.slice(0, 12)} ${commit.subject}`);
+  if (result.total !== undefined && result.total > result.commits.length) lines.push(`- … and ${result.total - result.commits.length} older`);
   if (pullRequest) lines.push(`Pull request #${pullRequest.number} ${pullRequest.created ? "opened" : "already open"}: ${pullRequest.url}`);
   return lines.join("\n");
 }

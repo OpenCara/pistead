@@ -21,6 +21,8 @@ export const EGRESS_GIT_BASE = `http://127.0.0.1:${EGRESS_PORT}/git/`;
 const SSH_HOSTS = ["github.com", "gitlab.com", "bitbucket.org"];
 
 const GRANT_TTL_MS = 60_000;
+/** Each address of a tunnel's host gets this long to accept the connection before the next is tried. */
+const CONNECT_TIMEOUT_MS = 10_000;
 /** A grant the control plane can't refresh stays in use this long, so a brief outage doesn't cut running commands off. */
 const GRANT_STALE_MS = 5 * 60_000;
 const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -206,7 +208,11 @@ export class EgressProxy {
     }).finally(() => { this.#refresh = undefined; });
     try { return await this.#refresh; }
     catch (error) {
-      if (cached && Date.now() - cached.at < GRANT_STALE_MS) return cached.value;
+      // A refusal (the session was archived, the host lost the workspace) ends access at once; only an unreachable
+      // control plane falls back to the last grant.
+      const refused = error instanceof RunnerError && error.status >= 400 && error.status < 500 && ![408, 429].includes(error.status);
+      if (refused) this.#grant = undefined;
+      else if (cached && Date.now() - cached.at < GRANT_STALE_MS) return cached.value;
       throw error instanceof RunnerError ? error : new RunnerError(503, "The session's network policy is unavailable");
     }
   }
@@ -217,6 +223,27 @@ export class EgressProxy {
     // Every address must be public: a name that also points inside the host's networks is refused outright.
     if (!results.length || results.some(result => !publicAddress(result.address))) return [];
     return results.map(result => result.address);
+  }
+
+  /** The first of `addresses` that accepts a connection in time; IPv6 first on an IPv4-only host just falls through. */
+  async #open(port: number, addresses: string[]): Promise<Duplex> {
+    let failure: unknown = new Error("No address");
+    for (const address of addresses.slice(0, 8)) {
+      const socket = (this.#options.connect ?? ((port, address) => tcpConnect({ port, host: address })))(port, address);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const failed = (error: unknown) => { clearTimeout(timer); reject(error); };
+          const timer = setTimeout(() => failed(new Error("Connection timed out")), CONNECT_TIMEOUT_MS);
+          socket.once("error", failed);
+          socket.once("connect", () => { clearTimeout(timer); socket.off("error", failed); resolve(); });
+        });
+        return socket;
+      } catch (error) {
+        socket.destroy();
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   async #tunnel(request: IncomingMessage, client: Duplex, head: Buffer): Promise<void> {
@@ -237,29 +264,26 @@ export class EgressProxy {
       }
       const addresses = await this.#addresses(target.host);
       if (!addresses.length) return deny(403, `${target.host} does not resolve to a public address`);
-      const upstream = (this.#options.connect ?? ((port, address) => tcpConnect({ port, host: address })))(target.port, addresses[0]!);
-      this.#sockets.add(upstream);
       this.#sockets.add(client);
-      let connected = false;
+      let upstream: Duplex;
+      try { upstream = await this.#open(target.port, addresses); }
+      catch {
+        this.#sockets.delete(client);
+        return deny(502, `${target.host} could not be reached`);
+      }
+      this.#sockets.add(upstream);
       const cleanup = () => { upstream.destroy(); client.destroy(); this.#sockets.delete(upstream); this.#sockets.delete(client); };
-      upstream.once("error", () => {
-        if (!connected) {
-          this.#record({ kind: "connect", target: `${target.host}:${target.port}`, outcome: "refused", reason: "unreachable" });
-          client.end(`HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n${target.host} could not be reached\n`);
-        }
-        upstream.destroy();
-      });
-      client.once("error", cleanup);
-      upstream.once("close", () => { if (connected) cleanup(); else this.#sockets.delete(upstream); });
-      client.once("close", cleanup);
-      upstream.once("connect", () => {
-        connected = true;
-        this.#record({ kind: "connect", target: `${target.host}:${target.port}`, outcome: "allowed" });
-        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (head.length) upstream.write(head);
-        upstream.pipe(client);
-        client.pipe(upstream);
-      });
+      for (const socket of [upstream, client]) {
+        socket.once("error", cleanup);
+        socket.once("close", cleanup);
+      }
+      // The client may have left while the connection was being opened.
+      if (client.destroyed) return cleanup();
+      this.#record({ kind: "connect", target: `${target.host}:${target.port}`, outcome: "allowed" });
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length) upstream.write(head);
+      upstream.pipe(client);
+      client.pipe(upstream);
     } catch (error) {
       deny(error instanceof RunnerError ? error.status === 503 ? 502 : 403 : 502, error instanceof RunnerError ? error.message : "The tunnel could not be opened");
     }
@@ -301,7 +325,9 @@ export class EgressProxy {
   async #git(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     const parsed = gitRequest(url.pathname.slice("/git/".length), url.search);
     if (!parsed) return refuse(response, 404, "Not a Git smart-HTTP request");
-    const key = repositoryKey(parsed.target);
+    // https://user@host/... remotes (as Azure DevOps and Bitbucket show them) name the same repository.
+    const target = parsed.target.replace(/^[^@/]*@/, "");
+    const key = repositoryKey(target);
     const label = key.slice(0, 300);
     if (parsed.service === "receive-pack") {
       this.#record({ kind: "git", target: label, outcome: "refused", reason: "push" });
@@ -315,11 +341,11 @@ export class EgressProxy {
     const host = key.split("/")[0]!;
     if (parsed.service === "info-refs" && hostAllowed(grant.policy, host)) {
       this.#record({ kind: "git", target: label, outcome: "allowed", reason: "not a workspace repository: fetched directly, without credentials" });
-      response.writeHead(302, { Location: `https://${parsed.target}/info/refs${url.search}`, "Cache-Control": "no-store" });
+      response.writeHead(302, { Location: `https://${target}/info/refs${url.search}`, "Cache-Control": "no-store" });
       return void response.end();
     }
     this.#record({ kind: "git", target: label, outcome: "refused", reason: "not a workspace repository" });
-    return refuse(response, 403, `${parsed.target.slice(0, 300)} is not one of this workspace's repositories, and its network policy doesn't allow ${host.slice(0, 253)}`);
+    return refuse(response, 403, `${target.slice(0, 300)} is not one of this workspace's repositories, and its network policy doesn't allow ${host.slice(0, 253)}`);
   }
 
   async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string): Promise<void> {
@@ -347,7 +373,11 @@ export class EgressProxy {
       while (true) {
         const part = await reader.read();
         if (part.done) break;
-        if (!response.write(part.value)) await new Promise<void>(resolve => { response.once("drain", resolve); response.once("close", resolve); });
+        if (!response.write(part.value)) await new Promise<void>(resolve => {
+          const done = () => { response.off("drain", done); response.off("close", done); resolve(); };
+          response.once("drain", done);
+          response.once("close", done);
+        });
         if (response.destroyed) break;
       }
       response.end();

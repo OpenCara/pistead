@@ -286,6 +286,7 @@ test("a clone's commit is pushed as it is, fast-forward only", { skip: !sandboxe
   const pushed = await performClonePush({ workspace: sandbox, operation, credential, authorize });
   assert.equal(pushed.outcome, "pushed");
   assert.deepEqual(pushed.commits.map(commit => commit.subject), ["Add a change"]);
+  assert.equal(pushed.total, 1);
   assert.equal(git(["rev-parse", "refs/heads/feature"], bare), head.commit);
   assert.equal(git(["show", `${head.commit}:change.txt`], bare), "change");
   assert.match(pushSummary(pushed), /^Pushed 1 commit to feature \(new branch at [0-9a-f]{12}\)\.$/m);
@@ -304,4 +305,46 @@ test("a clone's commit is pushed as it is, fast-forward only", { skip: !sandboxe
     (error: Error) => error instanceof PushError && /fetch and merge or rebase/.test(error.message));
   await assert.rejects(sandbox.cloneHead("missing", authorize));
   await assert.rejects(sandbox.cloneHead("../escape", authorize), /Invalid clone directory/);
+});
+
+test("https://user@host remotes are the same repository, and a refused grant ends access at once", async t => {
+  const { RunnerError } = await import("../apps/runner/src/protocol.js");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  let refuse = false;
+  const { instance, relayed } = await proxy(t, {
+    grant: async () => { if (refuse) throw new RunnerError(403, "Archived sessions have no network access."); return grant({ mode: "open" }); },
+  });
+  assert.equal((await get(instance.socketPath, "/git/someone@github.com/acme/app.git/info/refs?service=git-upload-pack")).status, 200);
+  assert.equal(relayed[0]!.bindingId, "binding-app");
+  refuse = true;
+  // Still within the grant's minute: the cached grant serves.
+  assert.equal((await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-upload-pack")).status, 200);
+  t.mock.timers.tick(61_000);
+  const refused = await get(instance.socketPath, "/git/github.com/acme/app.git/info/refs?service=git-upload-pack");
+  assert.equal(refused.status, 403);
+  assert.match(refused.body, /Archived sessions/);
+  assert.equal(relayed.length, 2);
+});
+
+test("a tunnel tries the host's next address when one can't be reached", async t => {
+  const echo: Server = createTcpServer(socket => socket.pipe(socket));
+  await new Promise<void>(resolve => echo.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => { echo.close(() => resolve()); }));
+  const tried: string[] = [];
+  const directory = await mkdtemp(join(tmpdir(), "egress-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const instance = new EgressProxy({
+    socketPath: join(directory, "proxy.sock"),
+    grant: async () => ({ policy: { mode: "open", domains: [], packageRegistries: true }, repositories: [] }),
+    relay: async () => { throw new Error("unused"); },
+    lookup: async () => [{ address: "2606:4700::6810:1", family: 6 }, { address: "104.16.0.1", family: 4 }],
+    // The IPv6 address is unreachable from this host; the IPv4 one answers.
+    connect: (_port, address) => { tried.push(address); return tcpConnect({ port: address.includes(":") ? 1 : (echo.address() as AddressInfo).port, host: "127.0.0.1" }); },
+  });
+  await instance.start();
+  t.after(() => instance.close());
+  const open = await tunnel(instance.socketPath, "registry.npmjs.org:443");
+  assert.equal(open.status, 200);
+  assert.deepEqual(tried, ["2606:4700::6810:1", "104.16.0.1"]);
+  open.socket!.destroy();
 });

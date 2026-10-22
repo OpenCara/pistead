@@ -1110,14 +1110,16 @@ def clone_push_prepare(request):
     ancestor = None
     if old is not None:
         ancestor = old in present and clone_git(directory, ['merge-base', '--is-ancestor', old, commit])[0] == 0
-    _, output = clone_git(directory, ['log', '--stdin', '--max-count=100', '--format=%H%x00%s'],
-                          (commit + '\n' + ''.join('^' + tip + '\n' for tip in present)).encode('ascii'))
+    revisions = (commit + '\n' + ''.join('^' + tip + '\n' for tip in present)).encode('ascii')
+    _, output = clone_git(directory, ['rev-list', '--count', '--stdin'], revisions)
+    total = int(output.strip() or b'0')
+    _, output = clone_git(directory, ['log', '--stdin', '--max-count=100', '--format=%H%x00%s'], revisions)
     commits = []
     for line in output.decode('utf-8', 'replace').splitlines():
         source, _, subject = line.partition('\0')
         if OID.fullmatch(source):
             commits.append({'source': source, 'subject': subject[:200]})
-    return {'present': present, 'ancestor': ancestor, 'commits': commits}
+    return {'present': present, 'ancestor': ancestor, 'commits': commits, 'total': total}
 
 
 def clone_push_pack(request):
@@ -1799,8 +1801,9 @@ export class Sandbox {
       || input.tips.length > 1024 || !input.tips.every((tip) => OID.test(tip))) throw new Error("Invalid push request");
     const value = JSON.parse(await this.#operation({ kind: "clone-push-prepare", path, commit: input.commit, old: input.old, tips: [...input.tips] }, true, authorize)) as ClonePushPreparation;
     if (!Array.isArray(value.present) || !value.present.every((tip) => input.tips.includes(tip)) || (value.ancestor !== null && typeof value.ancestor !== "boolean")
-      || !Array.isArray(value.commits) || value.commits.some((commit) => !OID.test(commit.source) || typeof commit.subject !== "string")) throw new Error("Invalid push preparation");
-    return { present: value.present, ancestor: value.ancestor, commits: value.commits.map(({ source, subject }) => ({ source, subject })) };
+      || !Array.isArray(value.commits) || value.commits.some((commit) => !OID.test(commit.source) || typeof commit.subject !== "string")
+      || !Number.isSafeInteger(value.total) || value.total < value.commits.length) throw new Error("Invalid push preparation");
+    return { present: value.present, ancestor: value.ancestor, commits: value.commits.map(({ source, subject }) => ({ source, subject })), total: value.total };
   }
 
   /** Streams the clone's pack of `commit` minus `exclude`; the session queue is held until the stream ends. */

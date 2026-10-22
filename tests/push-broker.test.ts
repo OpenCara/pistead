@@ -694,4 +694,15 @@ test('a clone session pushes to the workspace repository at the operation path, 
   const traversal = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-3', actorId: owner,
     operation: { kind: 'git.push', repository: 'owner/repo', directory: '../repo', branch: 'feature', commit: op.commit }, admissionId: f.admit('auto') });
   assert.equal(traversal.status, 400);
+  // A clone session's pushes name a clone's directory.
+  const pinnedShape = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-4', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') });
+  assert.equal(pinnedShape.status, 400);
+});
+
+test('a pinned session cannot push a clone directory', async t => {
+  const f = await fixture(t);
+  const response = await f.post(credential, { sessionId: 'session', approvalId: 'tool-pinned-1', actorId: owner,
+    operation: f.operation({ directory: 'repo' }), admissionId: f.admit('auto') });
+  assert.equal(response.status, 400);
+  assert.deepEqual(f.ledger(), []);
 });

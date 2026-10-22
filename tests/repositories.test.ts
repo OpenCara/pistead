@@ -1404,5 +1404,15 @@ test('sessions start without pins on sandboxed hosts that can run the owner\'s s
   assert.equal(limited.repositoryMode, 'clone');
   // Older connectors pin.
   assert.equal((await start(admin, {})).repositoryMode, undefined);
+  // So does an agent that can't run bash: its file and Git tools need the pinned snapshots.
+  const host = await connect(f, admin, team.id, { models: manifest.models, capabilities: { ...manifest.capabilities, plainGit: true } });
+  const { models } = await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`));
+  const model = models.find(item => item.connectorId === host.connectorId)!;
+  const { agent } = await json<{ agent: AgentVersion }>(await admin.request('POST', '/api/agents', {
+    name: 'Files only', description: '', instructions: '', tools: ['read_file', 'git_commit'], modelId: model.id,
+  }), 201);
+  const { session: filesOnly } = await json<{ session: SessionRecord }>(await admin.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id, title: 'Files' }), 201);
+  assert.equal(filesOnly.repositoryMode, undefined);
+  assert.equal(filesOnly.repositories?.length, 1);
   assert.throws(() => f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = ?").run(own.id), /immutable/);
 });

@@ -3,7 +3,8 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { bindingRemote, gitProviderNames } from '../../../packages/shared/src/repositories.js';
 import { defaultNetworkPolicy, egressGitServices, packageRegistryDomains, parseNetworkPolicy,
   type EgressGitService, type EgressGrant, type NetworkPolicy } from '../../../packages/shared/src/network.js';
-import type { AppContext, Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
+import type { AppContext, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
+import type { Database } from './db/types.js';
 import { auditStatement, requireMember, sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, now } from './http.js';
 import { authenticateConnector, requireCallbackScope, requireConnectorSession, type ConnectorRow } from './connectors.js';
@@ -23,8 +24,8 @@ const gitTypes: Record<EgressGitService, string> = {
 
 interface PolicyRow { mode: NetworkPolicy['mode']; domains_json: string; package_registries: number }
 
-export async function workspaceNetworkPolicy(env: Env, workspaceId: string): Promise<NetworkPolicy> {
-  const row = await env.DB.query<PolicyRow>('SELECT mode, domains_json, package_registries FROM workspace_network_policies WHERE workspace_id = ?')
+export async function workspaceNetworkPolicy(db: Database, workspaceId: string): Promise<NetworkPolicy> {
+  const row = await db.query<PolicyRow>('SELECT mode, domains_json, package_registries FROM workspace_network_policies WHERE workspace_id = ?')
     .bind(workspaceId).first();
   if (!row) return { ...defaultNetworkPolicy, domains: [] };
   return { mode: row.mode, domains: JSON.parse(row.domains_json) as string[], packageRegistries: row.package_registries === 1 };
@@ -35,7 +36,7 @@ export function registerNetworkPolicies(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/network-policy', async c => {
     const workspaceId = identifier(c.req.param('id'));
     await requireMember(c.env, workspaceId, c.get('auth').userId);
-    return c.json({ policy: await workspaceNetworkPolicy(c.env, workspaceId), packageRegistryDomains });
+    return c.json({ policy: await workspaceNetworkPolicy(c.env.DB, workspaceId), packageRegistryDomains });
   });
   app.put('/api/workspaces/:id/network-policy', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
@@ -69,7 +70,7 @@ export async function egressGrant(c: AppContext, connectorId: string | null): Pr
   const repositories = await c.env.DB.query<RepositoryRow>('SELECT * FROM workspace_repositories WHERE workspace_id = ? ORDER BY id')
     .bind(row.workspace_id).all();
   const grant: EgressGrant = {
-    policy: await workspaceNetworkPolicy(c.env, row.workspace_id),
+    policy: await workspaceNetworkPolicy(c.env.DB, row.workspace_id),
     repositories: repositories.map(repository => ({ bindingId: repository.id, provider: repository.provider, host: repository.host, fullName: repository.full_name })),
   };
   return c.json(grant, 200, { 'Cache-Control': 'private, no-store' });

@@ -200,8 +200,10 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     }
     // A sandboxed host that can run this owner's shell commands starts the session without pins: its agent clones the
     // workspace's repositories with plain Git through the host's egress proxy. Elsewhere repositories are pinned.
+    // An agent without bash (a chat agent always has it) keeps pinned repositories, which its file and Git tools can use.
     const clone = !!session.connector_id && capabilities.plainGit === true && capabilities.sandbox === true && !capabilities.unsandboxed
-      && (capabilities.productionShell === true || session.connector_owner_id === ownerId);
+      && (capabilities.productionShell === true || session.connector_owner_id === ownerId)
+      && (!agent || (JSON.parse(agent.tools_json) as string[]).includes('bash'));
     const resolved = clone ? await cloneRepositories(c.env, workspaceId, ownerId) : await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
     // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind.
     agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities);
