@@ -97,8 +97,10 @@ it for a minute, and keeps a stale one for up to five minutes if the control pla
 
 A session is created as a **clone session** (`sessions.repository_mode = 'clone'`, `SessionRecord.repositoryMode`) when
 its host's connector advertises `plainGit` (sandboxed connectors of this version) and can run the session owner's shell
-commands: the host has resource limits (`productionShell`), or the owner is the host's owner. Shell access is what
-cloning needs, so elsewhere sessions keep pinning as before; phase 5 revisits that. The mode is immutable like the pins
+commands: the host has resource limits (`productionShell`), or the owner is the host's owner. The session's agent must
+also have `bash` (a session started from a model always does). Shell access is what cloning needs, so elsewhere
+sessions keep pinning as before, and an agent with only file and Git tools keeps its pinned snapshots; phase 5
+revisits that. The mode is immutable like the pins
 (a trigger refuses updates), carried by restores, and required of a host a clone session moves to.
 
 A clone session pins nothing: creation checks the workspace has a repository and that its bindings don't change before
