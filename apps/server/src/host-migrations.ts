@@ -95,8 +95,9 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   if (pins.some(pin => 'provider' in pin) && capabilities.gitProviders !== true) {
     fail(409, 'connector_update_required', 'Update the target host\'s connector (npx pistead@latest connect) to carry this session\'s repositories.');
   }
-  // A clone session has no pins to carry: its successor needs a host where the agent can clone again.
-  if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.sandbox !== true || capabilities.unsandboxed
+  // A clone session has no pins to carry: its successor needs a host where the agent can clone again, and that restores
+  // its clones' local work from the snapshot.
+  if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.cloneBackups !== true || capabilities.sandbox !== true || capabilities.unsandboxed
     || (capabilities.productionShell !== true && model.connector_owner_id !== ownerId))) {
     fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a sandboxed host with an up-to-date connector that can run your shell commands.');
   }

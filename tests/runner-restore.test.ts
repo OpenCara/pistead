@@ -465,3 +465,51 @@ test("backups of sessions checked out from the host repository cache are refused
   assert.equal(prepare.mock.callCount(), 0);
   await absent(join(f.directory, "sessions", "target"));
 });
+
+test("a clone session's backup stages its clones' bundles and what is pending; malformed clones are refused", linux, async t => {
+  const f = await fixture(t);
+  let staged = "";
+  fakeInitializer(t, () => staged);
+  const cloneBinding = (id: string) => { const value = binding(id); value.session.repositoryMode = "clone"; return value; };
+  const bundle = Buffer.from("# v2 git bundle\nrefs\n\nPACK").toString("base64");
+  const clone = { path: "work/app", origin: "https://github.com/acme/app.git", branch: "feature", head: "a".repeat(40), worktree: "b".repeat(40),
+    branches: [["feature", "a".repeat(40)], ["main", "c".repeat(40)]], bundle };
+  const value = (clones: unknown[], extra: { path: string; data: string; mode: number }[] = []) => {
+    const input = archive();
+    input.binding = cloneBinding("source");
+    input.manifest.binding = structuredClone(input.binding);
+    input.files.push(...extra);
+    return { ...input, clones };
+  };
+  const target = cloneBinding("target");
+  const saved = envelope(value([clone, { ...clone, path: "lib", branch: null, branches: [], bundle: null }]));
+  await restoreSession({ ...f.config, readBackup: async () => saved.bytes }, target, saved.descriptor, async stage => { staged = stage; });
+  const state = join(f.directory, "sessions", "target", "sandbox", "git", "pistead-clones");
+  assert.deepEqual(JSON.parse(await readFile(join(state, "manifest.json"), "utf8")), { version: 1, clones: [
+    { ...clone, bundle: "0.bundle" }, { ...clone, path: "lib", branch: null, branches: [], bundle: null },
+  ] });
+  assert.equal(await readFile(join(state, "0.bundle"), "utf8"), "# v2 git bundle\nrefs\n\nPACK");
+  assert.deepEqual((await readdir(state)).sort(), ["0.bundle", "manifest.json"]);
+
+  const prepare = t.mock.fn(async () => {});
+  const refused = async (input: unknown, into = target) => {
+    const bytes = envelope(input);
+    await assert.rejects(restoreSession({ ...f.config, readBackup: async () => bytes.bytes }, into, bytes.descriptor, prepare),
+      /Invalid backup clone|Backup clones overlap|Unsafe or reserved snapshot path|Invalid snapshot base64/);
+  };
+  const other = cloneBinding("other");
+  for (const clones of [
+    [{ ...clone, path: "../app" }], [{ ...clone, path: "app/.git" }], [{ ...clone, extra: true }], [{ ...clone, branch: "a..b" }],
+    [{ ...clone, head: "x" }], [{ ...clone, bundle: Buffer.from("not a bundle").toString("base64") }], [{ ...clone, bundle: "%%%" }],
+    [clone, { ...clone, path: "work" }], [{ ...clone, branches: [["main"]] }],
+  ]) await refused(value(clones), other);
+  // A clone's directory is never also restored as files, nor is the pending list.
+  await refused(value([clone], [{ path: "worktree/work/app/README.md", data: Buffer.from("x").toString("base64"), mode: 0o600 }]), other);
+  await refused(value([clone], [{ path: "git/pistead-clones/manifest.json", data: Buffer.from("{}").toString("base64"), mode: 0o600 }]), other);
+  // Only a clone session restores clones.
+  const pinned = value([clone]);
+  pinned.binding = binding("source");
+  pinned.manifest.binding = structuredClone(pinned.binding);
+  await refused(pinned, binding("other"));
+  assert.equal(prepare.mock.callCount(), 0);
+});

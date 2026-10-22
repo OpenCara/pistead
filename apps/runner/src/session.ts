@@ -196,6 +196,8 @@ export class RunnerSession {
   readonly #clone: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
+  /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
+  #cloneFailures: { path: string; reason: string }[] = [];
   /**
    * The host cache's mirrors this clone session may borrow from, by sandbox path, and when the relay last let its owner
    * read each (0: not yet in this open). Mounted only while confirmed in the last MIRROR_CONFIRM_MS (see mirrorMounts).
@@ -507,7 +509,15 @@ export class RunnerSession {
       }
       if ((await this.sandbox.repositoryCacheState(repositories, authorize)) !== "cache") throw new RunnerError(409, "Repository cache initialization did not complete");
     })();
-    const preparing: RepositoryPreparation = { status: "preparing", done, controller, items };
+    this.trackPreparation(epoch, { status: "preparing", done, controller, items });
+  }
+
+  /**
+   * Makes `preparing` the session's repository preparation: runs wait for it, and once it is done the work it held
+   * resumes; a failure leaves it all suspended until the session restarts.
+   */
+  private trackPreparation(epoch: number, preparing: Extract<RepositoryPreparation, { status: "preparing" }>): void {
+    const { done, items } = preparing;
     this.#repositories = preparing;
     done.then(() => {
       if (this.#repositories !== preparing) return;
@@ -529,6 +539,44 @@ export class RunnerSession {
       this.#repositories = { status: "failed", reason: error instanceof RunnerError ? error.message : "Repositories could not be prepared on this host", items };
       this.#activity?.changed();
     });
+  }
+
+  /**
+   * Clones a restored clone session's clones again in the background, through the egress proxy with the owner's access
+   * (borrowing from the host's mirror where there is one), and puts their backed-up work back. Runs wait for it, as for
+   * prepared repositories. A clone that can't be restored stays pending for the next open, and the agent is told so.
+   */
+  private prepareClones(pending: { path: string; origin: string | null }[]): void {
+    const epoch = ++this.#preparations;
+    const controller = new AbortController();
+    const authorize = async () => { controller.signal.throwIfAborted(); await this.authorize(this.binding.owner.id, "write"); };
+    const items: RepositoryPreparationItem[] = pending.map(({ path }) => ({ path, phase: "queued", percent: null, done: null, total: null, bytes: 0 }));
+    const update: ProgressUpdate = (path, change) => { const item = items.find(each => each.path === path); if (item) Object.assign(item, change); };
+    const done = (async () => {
+      const failures: { path: string; reason: string }[] = [];
+      for (const entry of pending) {
+        controller.signal.throwIfAborted();
+        update(entry.path, { phase: "connecting" });
+        try {
+          const repository = repositoryForRemote((await this.#egress!.grant()).repositories, entry.origin ?? "");
+          if (!repository) throw new RunnerError(409, "its origin is not one of this workspace's repositories");
+          let reference: string | null = null;
+          if (this.config.repositoryCache && repository.repositoryId !== undefined) {
+            try { reference = await this.mirror(repository); } catch { /* cloned without borrowing */ }
+          }
+          update(entry.path, { phase: "receiving" });
+          await (this.sandbox as Sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          const reason = error instanceof RunnerError ? error.message
+            : error instanceof Error ? /sandbox: ([a-z0-9 ,.'()-]{1,160})$/i.exec(error.message.trim())?.[1] ?? "it could not be cloned again" : "it could not be cloned again";
+          failures.push({ path: entry.path, reason });
+        }
+        update(entry.path, { phase: "done" });
+      }
+      this.#cloneFailures = failures;
+    })();
+    this.trackPreparation(epoch, { status: "preparing", done, controller, items });
   }
 
   /** Sandbox work outside runs (approved operations, backups) waits for prepared repositories, and never runs after a failure. */
@@ -607,7 +655,11 @@ export class RunnerSession {
         + "with the session owner's own access; no credentials are needed or available. Commit with git in bash. "
         + `This session's own branch is ${branch} (also in $PISTEAD_SESSION_BRANCH): push your work to it with plain git, for example `
         + `git push origin HEAD:${branch}, in any of the workspace's repositories, without approval. Pushes of other branches are refused there.`
-        + (this.#cloneRepositories.length ? `\nThis workspace's repositories: ${this.#cloneRepositories.join(", ")}.` : "");
+        + (this.#cloneRepositories.length ? `\nThis workspace's repositories: ${this.#cloneRepositories.join(", ")}.` : "")
+        + (this.#cloneFailures.length ? "\nThis session was restored from a backup or moved, and these clones could not be cloned again: "
+          + this.#cloneFailures.map(failure => `${failure.path} (${failure.reason})`).join(", ")
+          + ". Their backed-up work (branches, and the working tree as a commit) is in Git bundles under .git/pistead-clones, listed in its "
+          + "manifest.json; Pistead tries again when the session next opens, as long as nothing else is at their paths." : "");
       if (this.binding.agent.tools.includes("git_push"))
         instructions += "\ngit_push publishes a clone's checked-out commit, as it is, to another branch of the workspace repository it was cloned from, "
           + "with approval: git_push {directory, branch}, where directory is the clone's path in the worktree. Pushes are fast-forward only (never forced); "
@@ -648,6 +700,10 @@ export class RunnerSession {
       const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
       this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
       await this.restoreMirrors(repositories);
+      // A restored or moved session clones its clones again before its work resumes.
+      this.#cloneFailures = [];
+      const pending = await (this.sandbox as Sandbox).clonePending(async () => {});
+      if (pending.length) this.prepareClones(pending);
     }
     const registry = createRegistry();
     this.tools = this.buildTools();
@@ -1693,8 +1749,13 @@ export class RunnerSession {
       await this.close();
       try {
         const sqlite = await readFile(this.sqlitePath, "base64");
-        const files = await this.sandbox.snapshot(async () => { await this.authorize(ticket.actorId, "manage"); });
-        return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files, createdAt: new Date().toISOString() };
+        const authorize = async () => { await this.authorize(ticket.actorId, "manage"); };
+        // A clone session's clones go into the backup as bundles of their local work, not as files: a restore clones them
+        // again from their origin.
+        const clones = this.#clone ? await (this.sandbox as Sandbox).cloneBackup(authorize) : [];
+        const files = this.#clone ? await (this.sandbox as Sandbox).snapshot(authorize, clones.map(clone => clone.path)) : await this.sandbox.snapshot(authorize);
+        return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files, ...(clones.length ? { clones } : {}),
+          createdAt: new Date().toISOString() };
       } finally { await this.open(); }
     });
   }

@@ -43,6 +43,12 @@ export interface ConnectorCapabilities {
    * and on hosts without the sandbox.
    */
   plainGit?: boolean;
+  /**
+   * Backups and moves of this host's clone sessions keep each clone's local work as a Git bundle, and restoring one
+   * clones it again (see Sandbox.cloneBackup). A clone session moves only to a host that has it: an older connector
+   * would restore its other files and drop the clones.
+   */
+  cloneBackups?: boolean;
 }
 
 export interface ConnectorInfo {

@@ -1,7 +1,7 @@
 # Design: sessions that use plain Git through a host egress proxy
 
-Status: phases 1 (the egress proxy and Git relay), 2 (clone sessions), 3 (the host cache for clones) and the pushes of phase 4
-implemented. Durability (the rest of phase 4) and phase 5 below are planned. This replaces the pinned
+Status: phases 1 (the egress proxy and Git relay), 2 (clone sessions), 3 (the host cache for clones) and 4 (session-branch
+pushes, and backups and moves of clone sessions) implemented. Phase 5 below is planned. This replaces the pinned
 snapshot model of [repository-cache.md](repository-cache.md); that document is rewritten in phase 5.
 
 ## Goal
@@ -30,7 +30,8 @@ The rules this keeps from today:
    `pistead cache add` / `pistead cache prune`. Sparse checkout and partial clone served from the mirror.
 4. **Pushes and durability.** Pushes to the session branch `pistead/<session-id>` go through the proxy without
    approval; pushes elsewhere need approval. Pull requests, comments and merges keep the broker. Backups and moves
-   to another host push the session branch (with a WIP commit) and clone it again.
+   keep each clone's local work (branches, unpushed commits, uncommitted changes) as a Git bundle and clone the rest
+   again. (The first plan pushed a WIP commit to the session branch instead; see below for why it doesn't.)
 5. **Removal.** Pin resolution at creation, archive downloads and their validation, `repositoryLimits`,
    `git_repin`, the push rewrite (`pushPrepare`) and snapshot restores go away. Sessions created before the change
    stay readable but frozen.
@@ -165,8 +166,6 @@ Hosts started with `--repo-cache` already keep one bare mirror per repository fo
 
 - Shell commands still stop after 30 seconds. A first clone of a big repository can outlast that; its mirror keeps
   filling in the runner, so a later clone borrows from it.
-- Backups of sessions whose clones borrow from a mirror hold the clones' own objects only; they restore on a host whose
-  mirror still has the rest. Phase 4 replaces them with session branches.
 - Pre-filling a mirror without a session: every fill needs a session's owner and the relay.
 
 ## Phase 4: pushing the session branch
@@ -196,5 +195,42 @@ pushed it). Pinned sessions push only with `git_push`.
 
 ### Not yet
 
-- Backups and moves of clone sessions still snapshot the worktree; durability is the next step.
 - A push's upload must finish within the control plane's request timeout.
+
+## Phase 4: backups and moves of clone sessions
+
+A clone session's backup (and the snapshot a move carries) keeps its clones' local work, not the clones: what a clone's
+`origin` already has is cloned again on restore. That keeps backups small whatever the repository's size, and works for
+clones that borrow from the host's mirror.
+
+- **Taking it** (`clone-backup`, before the snapshot). The helper finds the worktree's clones (directories up to four
+  levels down holding a `.git` directory) and, in each, without touching its HEAD or index: records `origin`, the
+  checked-out branch, HEAD and every local branch; commits the working tree (untracked files included, ignored ones not)
+  on top of HEAD with a temporary index, or uses HEAD when nothing changed; and bundles that commit and the local
+  branches, less what `refs/remotes/origin/*` reaches. Bundles share a 16 MiB budget. The snapshot (`files`) then leaves
+  the clones out. The backup lists them as `clones` (`CloneBackup`).
+- **Restoring it** (`restore.ts`). Only into a clone session. Each clone is checked (path, branch names, commits, bundle
+  header) and must not overlap another or the snapshot's files; its bundle and the list of pending clones are staged in
+  the worktree's `.git/pistead-clones`, which shell commands see read-only.
+- **Opening the restored session.** Pending clones are cloned again in the background, as a cache host prepares pinned
+  repositories, and runs wait for it. For each (`clone-restore`, with the proxy socket and the mirrors): its origin must
+  be one of the workspace's repositories; the mirror is refreshed through the relay where the host keeps a cache and
+  borrowed from; `git clone --no-checkout` goes through the proxy; the bundle is fetched; branches and HEAD are set; the
+  working tree is checked out from the backup commit and the index reset to HEAD, so the changes show as uncommitted
+  again. A path already taken is never overwritten. A clone that fails stays pending, carried by later backups, and is
+  retried at the next open; the agent's instructions say which and where their bundles are.
+- **Moves.** The successor's host must advertise `cloneBackups`: an older connector would restore
+  the other files and drop the clones.
+
+### Why not a WIP commit on the session branch
+
+The plan was to push a WIP commit to the session branch and clone it on restore. It would put uncommitted work, including
+untracked files the agent never meant to publish, on the forge, publicly for a public repository; it would need a push
+identity for every backup; it would race the agent's own pushes to that branch; and it would leave a branch per session
+on the forge. Bundles in the backup keep all of that where backups already go.
+
+### Not in phase 4
+
+- A clone whose origin rewrote its history after the backup may fail to restore (its bundle's prerequisites are gone);
+  its bundle is kept for the agent to recover from.
+- Clones of repositories outside the workspace, worktrees and submodules (`.git` files) are not restored automatically.

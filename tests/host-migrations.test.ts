@@ -143,6 +143,25 @@ test('a move needs another host that accepts moved sessions', async t => {
   for (const s of [f, g]) assert.equal(s.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
 });
 
+test('a clone session moves only to a host that restores its clones', async t => {
+  const capabilities = { platform: 'linux', sandbox: true, productionShell: false, hostMigration: true, plainGit: true };
+  const clone = (s: { sqlite: { exec(sql: string): void } }) => s.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repository_mode_immutable;"
+    + " UPDATE sessions SET repository_mode = 'clone' WHERE id = 'source'; COMMIT;");
+  // A connector from before clone backups would restore the session's files and drop its clones.
+  const older = await fixture(t, { targetCapabilities: capabilities });
+  clone(older);
+  older.hosts();
+  const refused = await older.request(migratePath, { requestId: 'older', modelId: 'new-model' });
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json() as { code: string }).code, 'clone_host_required');
+  const current = await fixture(t, { targetCapabilities: { ...capabilities, cloneBackups: true } });
+  clone(current);
+  current.hosts();
+  const moved = await current.request(migratePath, { requestId: 'current', modelId: 'new-model' });
+  assert.equal(moved.status, 201);
+  assert.equal((await moved.json() as { session: { repositoryMode?: string } }).session.repositoryMode, 'clone');
+});
+
 test('a move that fails on the target locks the source until it is retried or cancelled', async t => {
   const f = await fixture(t);
   f.hosts(async () => Response.json({ error: 'busy' }, { status: 503 }));
