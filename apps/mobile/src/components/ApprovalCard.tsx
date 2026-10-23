@@ -97,9 +97,10 @@ export function ApprovalCard({ approval, onOpenSession, children }: { approval: 
   const palette = usePalette();
   const name = useUsername();
   const { operation } = approval;
+  const allowed = (decidedBy: string, scope: ApprovalRecord["scope"]) => ` · Allowed by ${name(decidedBy)} ${scope === "session" ? "for the rest of the session" : "for this call"}`;
   const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
-    ? ` · Allowed by ${name(approval.decidedBy)} ${approval.scope === "session" ? "for the rest of the session" : "for this call"}`
-    : approval.decidedBy ? ` · Decision by ${name(approval.decidedBy)}` : "";
+    ? allowed(approval.decidedBy, approval.scope)
+    : `${approval.permission ? allowed(approval.permission.decidedBy, approval.permission.scope) : ""}${approval.decidedBy ? ` · Decision by ${name(approval.decidedBy)}` : ""}`;
   return <Card>
     <View style={ui.inline}>
       <Text style={[styles.kind, { color: palette.text }]}>{operation.kind === "permission" ? "Permission" : operation.kind}</Text>

@@ -429,6 +429,21 @@ export interface ApprovalRecord {
   scope?: "call" | "session";
   /** A shell command the host's owner allowed to run without resource limits, which this host lacks. */
   unbounded?: boolean;
+  /**
+   * The permission someone gave this operation's tool call first. Its own card is folded into this one in a view, as
+   * the operation shows what the permission let through.
+   */
+  permission?: { decidedBy: string; scope?: "call" | "session" };
+}
+/**
+ * A tool call whose shell command ran under the owner's auto-approve access. A view lists no card for it: the call and
+ * its result are in the transcript, and this marks the call.
+ */
+export interface AutoApprovedCall {
+  tool: string;
+  status: ApprovalRecord["status"];
+  /** It ran without resource limits, on the owner's own host. */
+  unbounded?: true;
 }
 export interface EntryView {
   id: string;
@@ -441,6 +456,8 @@ export interface EntryView {
   error?: { provider?: string; modelId?: string; status?: number };
   /** How long the model took to write this reply, or the tool to run; absent for entries recorded before Pi 1.1.0. */
   durationMs?: number;
+  /** This entry's tool calls whose commands ran under auto-approve, in call order; absent from older runners. */
+  autoApproved?: AutoApprovedCall[];
 }
 /**
  * Phases of preparing one pinned repository on a host with a repository cache (connect --repo-cache): its turn, the
@@ -472,7 +489,13 @@ export interface SessionView {
   sessionId: string;
   owner: Pick<UserProfile, "id" | "displayName" | "gitName" | "gitEmail" | "githubLogin">;
   entries: EntryView[];
+  /**
+   * Approvals people decide or follow: every one still in play and the newest settled ones. Commands that ran under
+   * auto-approve are marked on their transcript entries instead (`EntryView.autoApproved`). Older runners list them all.
+   */
   approvals: ApprovalRecord[];
+  /** How many older settled approvals `approvals` leaves out; the host keeps them. */
+  olderApprovals?: number;
   conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
   busy: boolean;
   /**

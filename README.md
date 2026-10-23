@@ -330,6 +330,8 @@ Beside the composer you can pick, for each message:
 
 Turning on **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
+The **Approvals** list keeps to what people decide. Shell and host commands that ran under **Auto-approve** get no card there: the conversation marks their tool calls **Auto-approved** (with their outcome when it isn't the usual "executed"), and each call's result holds the command's output. Automatic commits, pushes and repins keep their cards. The list shows every approval still in play and the newest 50 settled ones, each with the start and end of its result; the host keeps them all. Hosts running an older connector list every approval.
+
 #### Status, menu and panel
 
 Session lists show what each session's agent is doing: **Starting**, **Not started**, **In progress**, **Needs approval**, **Done**, **Failed**, **Idle** or **Archived**. The **Sessions** page groups sessions by workspace, with a search box, **Show archived** and **Open by ID** (for a session ID someone gave you).
@@ -359,7 +361,7 @@ The agent's tool call waits for the decision, and its message waits with it (con
 
 When a tool call needs more than the session allows (a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a host without resource limits), the agent asks instead of failing, and the session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. Only the session owner decides these, and only a host's owner can let commands run without resource limits, in their own sessions.
 
-The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits and the rest still need their own approval. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
+The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits and the rest still need their own approval. Once allowed, the permission shows on that operation's card instead of a card of its own. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
 
 ### Collaborating on a session
 
