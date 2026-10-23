@@ -1525,7 +1525,8 @@ export class RunnerSession {
     const repositories = this.repositoryView();
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
-      approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
+      // Live UI only needs actionable cards; shipping every settled approval (with boundedResult) bloated views into hub/UI 502s. See #54.
+      approvals: Object.values(state.approvals).filter(approval => approval.status === "pending" || approval.status === "executing"), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
       busy: Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
