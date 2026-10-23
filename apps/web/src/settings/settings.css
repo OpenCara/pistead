@@ -5,6 +5,10 @@
 
   .settings-back { margin: 0 0 var(--space-4) calc(-1 * var(--space-2)); }
 
+  /* Administration's filter sits between sections and keeps their rhythm. */
+  .admin-filter { margin-top: var(--space-8); }
+  .admin-filter + .section { margin-top: var(--space-4); }
+
   .env-row { display: grid; grid-template-columns: minmax(0, 2fr) auto minmax(0, 3fr); align-items: center; gap: var(--space-2); }
   @media (max-width: 640px) {
     .env-row { grid-template-columns: minmax(0, 1fr); }

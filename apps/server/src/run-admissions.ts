@@ -31,7 +31,7 @@ const ELIGIBLE_SESSION = `SELECT s.id FROM sessions s
   JOIN models m ON m.id = a.model_id AND m.workspace_id = s.workspace_id
   WHERE s.id = ? AND s.workspace_id = ? AND s.owner_id = ? AND s.agent_version_id = ?
     AND s.policy_version = ? AND s.connector_id IS ? AND s.connector_owner_id IS ?
-    AND s.status <> 'archived'
+    AND s.status <> 'archived' AND actor_user.suspended_at IS NULL AND owner_user.suspended_at IS NULL
     AND m.connector_id IS s.connector_id AND m.connector_owner_id IS s.connector_owner_id
     AND (? = 1 OR (actor_user.auth_kind <> 'test' AND owner_user.auth_kind <> 'test' AND m.provider <> 'faux'))
     AND (s.owner_id = actor.user_id OR EXISTS (
@@ -46,7 +46,7 @@ const ELIGIBLE_SESSION = `SELECT s.id FROM sessions s
       JOIN workspace_members host ON host.workspace_id = s.workspace_id AND host.user_id = connector.owner_id
       JOIN users host_user ON host_user.id = host.user_id
       WHERE connector.id = s.connector_id AND connector.owner_id = s.connector_owner_id
-        AND connector.revoked_at IS NULL AND m.available = 1
+        AND connector.revoked_at IS NULL AND host_user.suspended_at IS NULL AND m.available = 1
         AND (connector.owner_id = s.owner_id OR EXISTS (SELECT 1 FROM connector_shares share
           WHERE share.connector_id = connector.id AND share.workspace_id = s.workspace_id))
         AND (? = 1 OR host_user.auth_kind <> 'test')

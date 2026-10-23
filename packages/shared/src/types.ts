@@ -20,6 +20,8 @@ export interface UserProfile {
   gitEmail: string;
   env: Record<string, string>;
   githubConnected: boolean;
+  /** Present on the signed-in user's own profile when the server lists them in ADMIN_USER_IDS. */
+  instanceAdmin?: true;
 }
 /** A native app (iOS, iPadOS, macOS) signed in as the user, listed so the user can revoke it from the web app. */
 export interface SignedInDevice {

@@ -82,7 +82,7 @@ export async function authenticateConnector(c: AppContext, currentConnection = t
 export async function authenticateConnectorToken(env: Env, token: string, connectionToken?: string, currentConnection = false): Promise<ConnectorRow> {
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) fail(401, 'connector_authentication_required', 'Connector authentication is required.');
   const row = await env.DB.query<ConnectorRow>(`SELECT c.* FROM connectors c JOIN users u ON u.id = c.owner_id
-    WHERE c.credential_hash = ? AND c.revoked_at IS NULL AND (? = 1 OR u.auth_kind <> 'test')`)
+    WHERE c.credential_hash = ? AND c.revoked_at IS NULL AND u.suspended_at IS NULL AND (? = 1 OR u.auth_kind <> 'test')`)
     .bind(await sha256(token), testMode(env) ? 1 : 0).first();
   if (!row) fail(401, 'connector_authentication_required', 'Connector authentication is required.');
   if (currentConnection && (!connectionToken || !/^[A-Za-z0-9_-]{43}$/.test(connectionToken) || !row.connection_hash || !constantTimeEqual(await sha256(connectionToken), row.connection_hash))) {
@@ -119,8 +119,9 @@ export async function requireConnectorSession(env: Env, connectorId: string, row
     JOIN workspace_members host ON host.workspace_id = cw.workspace_id AND host.user_id = c.owner_id
     JOIN workspace_members owner ON owner.workspace_id = cw.workspace_id AND owner.user_id = ?
     JOIN users u ON u.id = c.owner_id
+    JOIN users session_owner ON session_owner.id = owner.user_id
     JOIN agent_versions a ON a.id = ? JOIN models m ON m.id = a.model_id
-    WHERE c.id = ? AND c.owner_id = ? AND c.revoked_at IS NULL
+    WHERE c.id = ? AND c.owner_id = ? AND c.revoked_at IS NULL AND u.suspended_at IS NULL AND session_owner.suspended_at IS NULL
       AND (c.owner_id = owner.user_id OR EXISTS (SELECT 1 FROM connector_shares sh
         WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
       AND m.connector_id = c.id AND m.connector_owner_id = c.owner_id AND m.workspace_id = cw.workspace_id

@@ -18,7 +18,7 @@ export interface ConnectorHub {
   rpc(connectorId: string, envelope: ConnectorRelayEnvelope): Promise<Response>;
   /** Whether a live, still-authorized connection exists; a database check bounded by `timeoutMs`. */
   status(connectorId: string, timeoutMs: number): Promise<boolean>;
-  /** Closes the current connection after the connectors row has been revoked. */
+  /** Closes the current connection after the connectors row has been revoked or its owner suspended. */
   revoke(connectorId: string): Promise<void>;
   /** Closes every connection; used on server shutdown. */
   close(): Promise<void>;

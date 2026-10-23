@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type SettingsSection = "profile" | "appearance" | "hosts" | "workspaces" | "agents";
+export type SettingsSection = "profile" | "appearance" | "hosts" | "workspaces" | "agents" | "admin";
 
 export type Route =
   | { name: "home" }
@@ -11,7 +11,7 @@ export type Route =
   /** A session's share link: the token lives in the fragment, so opening the link never sends it to the server. */
   | { name: "shared"; token: string };
 
-const sections: readonly SettingsSection[] = ["profile", "appearance", "hosts", "workspaces", "agents"];
+const sections: readonly SettingsSection[] = ["profile", "appearance", "hosts", "workspaces", "agents", "admin"];
 
 function decode(value: string | undefined): string | undefined {
   if (!value) return undefined;

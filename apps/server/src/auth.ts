@@ -4,6 +4,7 @@ import { HTTPException } from 'hono/http-exception';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import { validateUserEnv } from '../../../packages/shared/src/policy.js';
 import type { NativeSignIn, SignedInDevice } from '../../../packages/shared/src/types.js';
+import { isInstanceAdmin } from './admin.js';
 import { getUser, userProfile } from './db.js';
 import type { Query, SqlValue } from './db/types.js';
 import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
@@ -24,6 +25,7 @@ const NATIVE_CALLBACK = 'pistead://auth';
 const VERIFIER = /^[A-Za-z0-9_-]{43,128}$/;
 const APP_STATE = /^[A-Za-z0-9_-]{16,128}$/;
 const PROFILE_FIELDS: Record<string, true> = { displayName: true, gitName: true, gitEmail: true, env: true };
+const SUSPENDED = 'This account is suspended. Ask the administrator of this Pistead server to restore it.';
 
 function cookies(env: Env) {
   const secure = new URL(appOrigin(env)).protocol === 'https:';
@@ -55,7 +57,7 @@ export const authenticate: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   if (!token || !OPAQUE_TOKEN.test(token)) fail(401, 'unauthorized', 'Authentication is required.');
   const tokenHash = await sha256(token);
   const session = await dbResult(c.env.DB.query<{ user_id: string; csrf_token: string; expires_at: number; auth_kind: string; client: string }>(`SELECT s.user_id, s.csrf_token, s.expires_at, s.client, u.auth_kind
-    FROM auth_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`)
+    FROM auth_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND u.suspended_at IS NULL`)
     .bind(tokenHash).first());
   if (!session || session.client !== client || session.expires_at <= Date.now() || !Number.isSafeInteger(session.expires_at) ||
       !OPAQUE_TOKEN.test(session.csrf_token) ||
@@ -136,6 +138,11 @@ async function currentUser(c: AppContext): Promise<UserRow> {
   const user = await dbResult(getUser(c.env, c.get('auth').userId));
   if (!user) fail(401, 'unauthorized', 'Authentication is required.');
   return user;
+}
+
+/** The signed-in user's own profile, which also says whether they administer this server. */
+function ownProfile(env: Env, user: UserRow) {
+  return { ...userProfile(user), ...(isInstanceAdmin(env, user.id) ? { instanceAdmin: true as const } : {}) };
 }
 
 /** A new sign-in. Native sessions are bearer tokens listed as devices under the app's `deviceName`. */
@@ -334,6 +341,8 @@ async function githubUser(c: AppContext, config: GitHubConfig, code: string, ver
   if (!user || user.auth_kind !== 'github' || user.id.startsWith('test:')) {
     fail(409, 'identity_conflict', 'GitHub identity cannot be used for this account.');
   }
+  // Refused before the new token is stored, so a suspended account keeps none it didn't already have.
+  if (user.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   const ciphertext = await encryptToken(c.env, user.id, exchange.access_token);
   return { user, tokenStatement: c.env.DB.query(`INSERT INTO github_tokens (user_id, ciphertext, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`)
@@ -411,6 +420,7 @@ async function nativeToken(c: AppContext) {
   }
   const user = await dbResult(getUser(c.env, saved.user_id));
   if (!user || user.auth_kind !== 'github' || user.id.startsWith('test:')) fail(401, 'unauthorized', 'Authentication is required.');
+  if (user.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   const session = await newSession(c.env, user.id, 'github', { deviceName });
   await dbResult(session.statement.run());
   return c.json({ token: session.token, expiresAt: new Date(session.expiresAt).toISOString(), user: userProfile(user) } satisfies NativeSignIn);
@@ -440,6 +450,7 @@ async function testLogin(c: AppContext) {
   if (existing && (existing.auth_kind !== 'test' || existing.github_id !== null || existing.github_connected)) {
     fail(409, 'identity_conflict', 'Test identity cannot be used for this account.');
   }
+  if (existing?.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   // Omitted fields preserve an existing identity's profile; names and emails never select an identity.
   const displayName = profile.displayName ?? existing?.display_name ?? stableId;
   const gitName = profile.gitName ?? existing?.git_name ?? displayName;
@@ -476,7 +487,7 @@ export function registerAuth(app: Hono<WorkerEnv>): void {
   app.post('/api/auth/native/token', privateResponse, nativeToken);
   app.post('/api/auth/test', privateResponse, csrfGuard, testLogin);
   app.get('/api/auth/csrf', privateResponse, authenticate, (c) => c.json({ csrfToken: c.get('auth').csrfToken }));
-  app.get('/api/me', privateResponse, authenticate, async (c) => c.json({ user: userProfile(await currentUser(c)) }));
+  app.get('/api/me', privateResponse, authenticate, async (c) => c.json({ user: ownProfile(c.env, await currentUser(c)) }));
   app.patch('/api/me', privateResponse, authenticate, csrfGuard, async (c) => {
     const profile = profileInput(await jsonObject(c, 131_072));
     const assignments: string[] = [];
@@ -488,7 +499,7 @@ export function registerAuth(app: Hono<WorkerEnv>): void {
     if (!assignments.length) fail(400, 'invalid_profile', 'Provide at least one editable profile field.');
     await dbResult(c.env.DB.query(`UPDATE users SET ${assignments.join(', ')} WHERE id = ?`)
       .bind(...values, c.get('auth').userId).run());
-    return c.json({ user: userProfile(await currentUser(c)) });
+    return c.json({ user: ownProfile(c.env, await currentUser(c)) });
   });
   app.post('/api/auth/logout', privateResponse, authenticate, csrfGuard, async (c) => {
     await dbResult(c.env.DB.query('DELETE FROM auth_sessions WHERE token_hash = ?').bind(c.get('auth').tokenHash).run());

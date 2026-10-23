@@ -30,6 +30,8 @@ export interface Env {
   GITHUB_APP_PRIVATE_KEY?: string;
   /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
   OIDC_SIGNING_KEY?: string;
+  /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */
+  ADMIN_USER_IDS?: string;
 }
 export interface AuthIdentity {
   userId: string;
@@ -50,6 +52,8 @@ export interface UserRow {
   env_json: string;
   auth_kind: 'github' | 'test';
   created_at: string;
+  /** Set while an instance administrator has the account suspended. */
+  suspended_at?: string | null;
   github_connected?: number;
 }
 export interface WorkspaceRow { id: string; name: string; owner_id: string; created_at: string }

@@ -250,7 +250,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
       AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
-      AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ?
+      AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
         AND ((? = 1 AND session_owner.auth_kind = 'github') OR (? = 1 AND session_owner.auth_kind = 'test'))
         AND (? IS NULL OR (session_owner.auth_kind = 'github' AND session_owner.github_id = ?
           AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))))
@@ -262,7 +262,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
         JOIN workspace_members member ON member.workspace_id = association.workspace_id AND member.user_id = host.owner_id
         JOIN users host_user ON host_user.id = host.owner_id
         JOIN models m ON m.id = ?
-        WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND association.workspace_id = ?
+        WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND host_user.suspended_at IS NULL AND association.workspace_id = ?
           AND (host.owner_id = ? OR EXISTS (SELECT 1 FROM connector_shares share
             WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
           AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id

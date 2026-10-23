@@ -102,7 +102,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | Connect the session database, import dumps | ✓ | | |
 | Export the workspace | ✓ | ✓ | |
 
-A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
+Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
 
 ### Repositories and Git accounts
 
@@ -517,8 +517,19 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | none | GitHub OAuth app for sign-in |
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | none | Operator GitHub App for github.com pushes (PEM as one line with `\n` escapes) |
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
+| `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |
+
+### Administration
+
+The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890`); each person finds theirs under **Settings → Profile**. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
+
+- **Overview** counts accounts, workspaces, hosts (and how many are online) and sessions.
+- **Accounts**, **Workspaces** and **Hosts** list each one with its owner and how many members, repositories, hosts and sessions it has. They never show session titles, prompts, repository names, models, environment values or credentials.
+- **Suspend**, in an account's menu, signs the account out of every browser and app and refuses its sign-ins, disconnects its hosts and keeps them from reconnecting, and closes the sessions it owns to everyone, as when someone leaves a workspace. Sessions other members run on its hosts stop too. Nothing is deleted: **Unsuspend** restores the account, its hosts can reconnect and its sessions open again. Administrators can't be suspended; remove them from `ADMIN_USER_IDS` and restart the server first.
+
+Each suspension and unsuspension is recorded in the server's audit table with the administrator who made it.
 
 ### Database and backup storage
 
@@ -597,7 +608,7 @@ await fetch("/api/auth/test", { method: "POST", headers: { Authorization: "Beare
 
 ## Layout
 
-- `apps/server`: the control plane (Hono on Node). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/connector-hub.ts` the WebSocket relay to connected hosts.
+- `apps/server`: the control plane (Hono on Node). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/connector-hub.ts` the WebSocket relay to connected hosts.
 - `apps/web`: the React UI.
 - `apps/mobile`: the iPhone and iPad app (Expo; Android later). `apps/desktop`: the macOS app (Electron; Linux and Windows later).
 - `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` and bundled into the desktop app.
