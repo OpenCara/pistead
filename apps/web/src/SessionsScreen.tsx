@@ -37,8 +37,8 @@ export function SessionsScreen() {
     <InfoTip label="Who can see a session">
       <div className="stack">
         <p>Private sessions are visible to their owner and people with an explicit grant. Workspace-visible sessions can be viewed by every workspace member.</p>
-        <p>Viewing never allows asking, writing, approving or managing; those need separate grants. An agent's author gets no automatic access. Opening a session keeps its original owner identity and history.</p>
-        <p>Only the owner can change visibility, which is separate from sharing a host or publishing an agent.</p>
+        <p>Viewing never allows asking, writing, approving or managing; those need separate grants. Opening a session keeps its original owner identity and history.</p>
+        <p>Only the owner can change visibility, which is separate from sharing a host.</p>
       </div>
     </InfoTip>
     {archivedCount > 0 && <Button variant="ghost" size="sm" icon="archive" aria-pressed={showArchived} onClick={() => setShowArchived(value => !value)}>

@@ -8,9 +8,9 @@ import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { userIdentifier } from '../apps/server/src/http.js';
 import { sessionAccess } from '../apps/server/src/db.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
-import { defaultAgentName, type SessionView } from '../packages/shared/src/types.js';
+import type { SessionView } from '../packages/shared/src/types.js';
 import { applyViewPatch, diffView, type SessionViewPatch } from '../packages/shared/src/view-patch.js';
-import { testDatabase } from './helpers/control-plane.js';
+import { seedAgentVersion, testDatabase } from './helpers/control-plane.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'control-plane-test-secret-not-for-deployment';
@@ -212,15 +212,23 @@ test('cookie mutations require CSRF and reject hostile origins; logout revokes t
   assert.equal((await alice.request('GET', '/api/me')).status, 401);
 });
 
-test('published definitions are immutable and do not grant authors access to another owner session', async t => {
+test('agents are gone; saved versions are immutable and do not grant authors access to another owner session', async t => {
   const f = await fixture(t);
   const alice = await f.client('alice'); const bob = await f.client('bob'); const eve = await f.client('eve');
   const workspace = (await (await alice.request('POST', '/api/workspaces', { name: 'team' })).json() as { workspace: { id: string } }).workspace;
   assert.equal((await alice.request('POST', `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: 'member' })).status, 200);
   const model = (await (await alice.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'fixture', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
-  const privateVersion = (await (await alice.request('POST', '/api/agents', { name: 'agent', description: '', instructions: '', tools: ['identity'], modelId: model.id })).json() as { agent: { id: string; agentId: string } }).agent;
-  assert.equal((await bob.request('POST', '/api/sessions', { workspaceId: workspace.id, agentVersionId: privateVersion.id })).status, 404);
-  const published = (await (await alice.request('POST', `/api/agents/${privateVersion.agentId}/publish`, { workspaceId: workspace.id })).json() as { agent: { id: string } }).agent;
+  // A version alice published before agents were removed. Nothing lists, revises, publishes or starts one any more.
+  const published = seedAgentVersion(f.sqlite, { authorId: alice.user.id, workspaceId: workspace.id, modelId: model.id, tools: ['identity'] });
+  const routes: [string, string][] = [['GET', '/api/agents'], ['GET', `/api/workspaces/${workspace.id}/agents`], ['POST', '/api/agents'],
+    ['POST', `/api/agents/${published.agentId}/versions`], ['POST', `/api/agents/${published.agentId}/publish`]];
+  for (const [method, path] of routes) {
+    const response = await alice.request(method, path, method === 'POST' ? { workspaceId: workspace.id, tools: ['identity'], modelId: model.id } : undefined);
+    assert.equal(response.status, 404, `${method} ${path}`);
+  }
+  const fromAgent = await bob.request('POST', '/api/sessions', { workspaceId: workspace.id, agentVersionId: published.id });
+  assert.equal(fromAgent.status, 400);
+  assert.equal((await fromAgent.json() as { code: string }).code, 'invalid_input');
   assert.throws(() => f.sqlite.prepare('UPDATE agent_versions SET name = ? WHERE id = ?').run('changed', published.id), /immutable/);
   f.sqlite.prepare("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'private')")
     .run('bob-session', workspace.id, bob.user.id, published.id, 'private session', 1, 'ready', new Date().toISOString());
@@ -239,24 +247,9 @@ test('published definitions are immutable and do not grant authors access to ano
   assert.equal((await bob.request('GET', '/api/sessions/bob-session/view')).status, 503);
 });
 
-test('agent name, description and instructions are optional; a blank name stores the default', async t => {
+test('workspace names must not be blank', async t => {
   const f = await fixture(t);
   const alice = await f.client('alice');
-  const workspace = (await (await alice.request('POST', '/api/workspaces', { name: 'team' })).json() as { workspace: { id: string } }).workspace;
-  const model = (await (await alice.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'fixture', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
-  const save = async (path: string, fields: object) => {
-    const response = await alice.request('POST', path, { ...fields, tools: ['identity'], modelId: model.id });
-    assert.equal(response.status, 201);
-    return (await response.json() as { agent: { agentId: string; name: string; description: string; instructions: string } }).agent;
-  };
-  const created = await save('/api/agents', {});
-  assert.deepEqual([created.name, created.description, created.instructions], [defaultAgentName, '', '']);
-  for (const name of [null, '   ']) assert.equal((await save(`/api/agents/${created.agentId}/versions`, { name })).name, defaultAgentName);
-  assert.equal((await save(`/api/agents/${created.agentId}/versions`, { name: '  Reviewer  ' })).name, 'Reviewer');
-  for (const invalid of [{ name: 1 }, { name: 'x'.repeat(201) }, { instructions: ['x'] }]) {
-    assert.equal((await alice.request('POST', '/api/agents', { ...invalid, tools: ['identity'], modelId: model.id })).status, 400);
-  }
-  // Workspace names still go through nameInput and must not be blank.
   assert.equal((await alice.request('POST', '/api/workspaces', { name: '   ' })).status, 400);
 });
 
@@ -355,7 +348,7 @@ async function pollingFixture(t: TestContext) {
   const workspace = (await (await owner.request('POST', '/api/workspaces', { name: 'polling' })).json() as { workspace: { id: string } }).workspace;
   await owner.request('POST', `/api/workspaces/${workspace.id}/members`, { userId: reader.user.id, role: 'member' });
   const model = (await (await owner.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'polling', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
-  const agent = (await (await owner.request('POST', '/api/agents', { name: 'polling', description: '', instructions: '', tools: ['identity'], modelId: model.id })).json() as { agent: { id: string } }).agent;
+  const agent = seedAgentVersion(f.sqlite, { authorId: owner.user.id, modelId: model.id, tools: ['identity'] });
   f.sqlite.prepare("INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,visibility) VALUES (?,?,?,?,?,?,?,'private')")
     .run('poll-session', workspace.id, owner.user.id, agent.id, 'polling', 'ready', new Date().toISOString());
   await owner.request('POST', '/api/sessions/poll-session/grants', { userId: reader.user.id, permissions: ['read'] });

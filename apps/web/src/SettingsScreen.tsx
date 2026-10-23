@@ -1,6 +1,5 @@
 import { Icon, type IconName } from "./icons";
 import { href, type SettingsSection } from "./router";
-import { AgentsSettings } from "./settings/AgentsSettings";
 import { AppearanceSettings } from "./settings/AppearanceSettings";
 import { HostsSettings } from "./settings/HostsSettings";
 import { ProfileSettings } from "./settings/ProfileSettings";
@@ -11,7 +10,6 @@ const sections: { id: SettingsSection; label: string; icon: IconName }[] = [
   { id: "profile", label: "Profile", icon: "user" },
   { id: "hosts", label: "Hosts", icon: "server" },
   { id: "workspaces", label: "Workspaces", icon: "users" },
-  { id: "agents", label: "Agents", icon: "bot" },
   { id: "appearance", label: "Appearance", icon: "palette" },
 ];
 
@@ -31,7 +29,6 @@ export function SettingsScreen({ section, id }: { section: SettingsSection; id?:
         {section === "profile" ? <ProfileSettings />
           : section === "hosts" ? <HostsSettings id={id} />
           : section === "workspaces" ? <WorkspacesSettings id={id} />
-          : section === "agents" ? <AgentsSettings id={id} />
           : <AppearanceSettings />}
       </div>
     </div>

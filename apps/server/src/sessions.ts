@@ -166,25 +166,15 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const input = await jsonObject(c);
     if (['ownerId', 'permissions', 'githubId', 'repositories', 'repositories_json', 'pins'].some(key => key in input)) fail(400, 'server_owned_identity', 'Session identity, repository pins, and permissions are assigned by the server.');
     const workspaceId = identifier(input.workspaceId, 'workspaceId');
-    // A session runs a chosen agent version, or starts from a model with a chat agent of its own.
-    if ((input.agentVersionId === undefined) === (input.modelId === undefined)) fail(400, 'invalid_input', 'Choose either an agent version or a model.');
+    // A session starts from a model, with a chat agent of its own.
+    if (input.agentVersionId !== undefined) fail(400, 'invalid_input', 'Sessions start from a model; agents were removed.');
     const title = text(input.title ?? 'Untitled session', 'title', 200);
     const visibility = sessionVisibility(input.visibility === undefined ? 'workspace' : input.visibility);
     const ownerId = c.get('auth').userId;
     await requireMember(c.env, workspaceId, ownerId);
-    let agent: AgentRow | null = null;
-    let model: ModelRow | null;
-    if (input.agentVersionId !== undefined) {
-      agent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ? AND (author_id = ? OR workspace_id = ?)')
-        .bind(identifier(input.agentVersionId, 'agentVersionId'), ownerId, workspaceId).first();
-      if (!agent || (agent.workspace_id !== null && agent.workspace_id !== workspaceId)) fail(404, 'not_found', 'Agent version not found in this workspace.');
-      model = await c.env.DB.query<ModelRow>('SELECT * FROM models WHERE id = ? AND workspace_id = ?').bind(agent.model_id, workspaceId).first();
-      if (!model) fail(400, 'model_workspace_mismatch', 'The agent model must belong to the session workspace.');
-    } else {
-      // The same live check as choosing an agent's model: the owner's own host here, or a host shared here.
-      model = await requireModel(c.env, identifier(input.modelId, 'modelId'), ownerId);
-      if (model.workspace_id !== workspaceId) fail(404, 'not_found', 'Model not found.');
-    }
+    // A live check: a model of the owner's own host here, or of a host shared here.
+    const model = await requireModel(c.env, identifier(input.modelId, 'modelId'), ownerId);
+    if (model.workspace_id !== workspaceId) fail(404, 'not_found', 'Model not found.');
     if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are disabled.');
     const syntheticLegacy = model.provider === 'faux' && await legacyRepositoryFixture(c.env, ownerId);
     if (!model.connector_id && !syntheticLegacy) fail(400, 'connector_required', 'New sessions require a connected model.');
@@ -193,7 +183,6 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     }
     const session = { id: id(), workspace_id: workspaceId, owner_id: ownerId, title, visibility, policy_version: 1, status: 'provisioning' as const,
       created_at: now(), connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
-    if (agent && session.connector_id) await requireConnectorSession(c.env, session.connector_id, { ...session, agent_version_id: agent.id });
     const host = session.connector_id
       ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(session.connector_id).first()
       : null;
@@ -202,22 +191,13 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (session.connector_id && capabilities.plainGit !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
     }
-    // Older connectors cannot carry approved pushes; refuse agents that would offer git_push.
-    if (agent && session.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') && capabilities.gitPush !== true) {
-      fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use git_push.');
-    }
-    if (agent && session.connector_id) {
-      const tools = JSON.parse(agent.tools_json) as string[];
-      if (tools.includes('host_bash') && !capabilities.hostCommands) {
-        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use host_bash.');
-      }
-    }
     // Every session starts empty, pinning nothing: its agent clones the workspace's repositories with plain Git, through
     // the host's egress proxy on a sandboxed host or with the host's own Git where its owner runs it unsandboxed. An
     // agent that can't run shell commands there can't clone, and works in an empty worktree (cloneUnavailable says why).
     const resolved = await cloneRepositories(c.env, workspaceId, ownerId);
-    // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind.
-    agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities);
+    // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind. It offers only
+    // the tools this host can carry, so an older connector never gets one it can't run.
+    const agent = await chatAgentVersion(c.env, ownerId, model, capabilities);
     const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone' };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
