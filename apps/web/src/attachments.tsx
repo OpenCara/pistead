@@ -159,7 +159,7 @@ function draw(bitmap: ImageBitmap, width: number, height: number, mimeType: Chat
   }
   context.imageSmoothingQuality = "high";
   context.drawImage(bitmap, 0, 0, width, height);
-  return new Promise(resolve => canvas.toBlob(resolve, mimeType, quality));
+  return new Promise<Blob | null>(resolve => canvas.toBlob(resolve, mimeType, quality));
 }
 
 /** The image type a file's first bytes say it is, of those a message can carry. */
