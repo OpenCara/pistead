@@ -77,11 +77,18 @@ export interface ChatPreference {
   thinkingLevel?: ThinkingLevel;
 }
 
-/** What to remember after a message goes to `host` with `selection`: the model and the reasoning it actually ran at. */
-export function chatPreference(host: ConnectorInfo | undefined, selection: ChatSelection): ChatPreference | undefined {
-  const model = host?.capabilities.chatOptions ? findModel(host, selection.model) : undefined;
+/**
+ * What to remember after a message goes to `host` with `selection`: the model and the reasoning it actually ran at.
+ * Unset picks keep the conversation's `current` model and reasoning, so those are what it ran with.
+ */
+export function chatPreference(
+  host: ConnectorInfo | undefined,
+  selection: ChatSelection,
+  current?: { provider: string; modelId: string; thinkingLevel?: ThinkingLevel },
+): ChatPreference | undefined {
+  const model = host?.capabilities.chatOptions ? findModel(host, selection.model ?? current) : undefined;
   if (!host || !model) return undefined;
-  const thinkingLevel = effectiveLevel(model, selection.thinkingLevel);
+  const thinkingLevel = effectiveLevel(model, selection.thinkingLevel ?? (selection.model ? undefined : current?.thinkingLevel));
   return { connectorId: host.id, provider: model.provider, modelId: model.modelId, ...(thinkingLevel ? { thinkingLevel } : {}) };
 }
 

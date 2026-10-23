@@ -233,7 +233,7 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
   return <>
     <Section title="Members" info={<div className="stack">
       {!admin && <p>Only workspace owners and admins can manage membership.</p>}
-      <p>Members can use published agents and follow workspace-visible sessions read-only, which shows prompts, tool output and repository content in the transcript. Private sessions, and ask, write, approve or manage permissions, require explicit grants.</p>
+      <p>Members can follow workspace-visible sessions read-only, which shows prompts, tool output and repository content in the transcript. Private sessions, and ask, write, approve or manage permissions, require explicit grants.</p>
       <p>Membership never grants GitHub access, tool execution, or use of anyone's private Pi host.</p>
     </div>} action={admin && <Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add member</Button>}>
       <ResourceState {...resource} retry={resource.refresh}>

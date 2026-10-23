@@ -17,9 +17,9 @@ export function readChatPreference(): ChatPreference | undefined {
   try { return parseChatPreference(localStorage.getItem(LAST_CHAT_KEY)); } catch { return undefined; }
 }
 
-/** Remembers the model and reasoning a message just went to `host` with. */
-export function rememberChat(host: ConnectorInfo | undefined, selection: ChatSelection) {
-  const preference = chatPreference(host, selection);
+/** Remembers the model and reasoning a message just went to `host` with; unset picks are the conversation's `current` ones. */
+export function rememberChat(host: ConnectorInfo | undefined, selection: ChatSelection, current?: Parameters<typeof chatPreference>[2]) {
+  const preference = chatPreference(host, selection, current);
   if (!preference) return;
   try { localStorage.setItem(LAST_CHAT_KEY, JSON.stringify(preference)); } catch { /* Private mode: the choice is simply not remembered. */ }
 }

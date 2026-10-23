@@ -31,8 +31,8 @@ interface AppData {
   setLastWorkspaceId: (id: string) => void;
   /** The model and reasoning last chatted with; new sessions start from them where the host offers them. */
   lastChat: ChatPreference | undefined;
-  /** Remembers the model and reasoning a message just went to `host` with. */
-  rememberChat: (host: ConnectorInfo | undefined, selection: ChatSelection) => void;
+  /** Remembers the model and reasoning a message just went to `host` with; unset picks are the conversation's `current` ones. */
+  rememberChat: (host: ConnectorInfo | undefined, selection: ChatSelection, current?: Parameters<typeof chatPreference>[2]) => void;
   liveActivity: LiveActivity | null;
   setLiveActivity: (value: LiveActivity | null) => void;
 }
@@ -60,8 +60,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     SecureStore.getItemAsync(LAST_CHAT_KEY).then(raw => { if (current) setLastChat(stored => stored ?? parseChatPreference(raw)); }, () => undefined);
     return () => { current = false; };
   }, []);
-  const rememberChat = useCallback((host: ConnectorInfo | undefined, selection: ChatSelection) => {
-    const preference = chatPreference(host, selection);
+  const rememberChat = useCallback((host: ConnectorInfo | undefined, selection: ChatSelection, current?: Parameters<typeof chatPreference>[2]) => {
+    const preference = chatPreference(host, selection, current);
     if (!preference) return;
     setLastChat(preference);
     SecureStore.setItemAsync(LAST_CHAT_KEY, JSON.stringify(preference)).catch(() => undefined);

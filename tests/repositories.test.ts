@@ -11,11 +11,11 @@ import { parseManifest } from '../apps/server/src/connectors.js';
 import { gitProviderAdapters } from '../apps/server/src/git/providers.js';
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
-import { fakeHub, testDatabase } from './helpers/control-plane.js';
+import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type SessionRepository, type WorkspaceRepository, type WorkspaceRepositoryList } from '../packages/shared/src/repositories.js';
-import type { AgentVersion, ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
+import type { ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'repositories-test-secret-not-for-deployment';
@@ -196,15 +196,12 @@ async function connectedSetup(t: TestContext) {
   await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
   assert.equal(models.length, 1);
-  const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
-    name: 'Repository agent', description: '', instructions: '', tools: ['identity'], modelId: models[0].id,
-  }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: team.id }), 201);
+  const model = models[0];
   const provisions = provisionHub(f);
-  const input = { workspaceId: team.id, agentVersionId: agent.id, trustedConnectorId: connector.connectorId, title: 'Pinned repositories' };
+  const input = { workspaceId: team.id, modelId: model.id, trustedConnectorId: connector.connectorId, title: 'Pinned repositories' };
   const start = async () => (await json<{ session: SessionRecord }>(await owner.request('POST', '/api/sessions', input), 201)).session;
   remote.calls.length = 0;
-  return { f, remote, admin, host, owner, team, repository, connector, agent, provisions, input, start };
+  return { f, remote, admin, host, owner, team, repository, connector, model, provisions, input, start };
 }
 function download(f: Fixture, session: SessionRecord, pin: SessionRepository, connector?: Connected, body: unknown = { sessionId: session.id, commit: pin.commit }) {
   return f.request('POST', connector ? `/api/connectors/self/repositories/${pin.bindingId}/download` : `/api/internal/repositories/${pin.bindingId}/download`,
@@ -222,9 +219,7 @@ async function legacySetup(t: TestContext) {
   const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
     name: 'Legacy model', provider: 'openai', modelId: 'legacy-model',
   }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
-    name: 'Legacy agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
-  }), 201);
+  const agent = seedAgentVersion(f.sqlite, { authorId: owner.user.id, modelId: model.id, tools: ['identity'] });
   const pin: SessionRepository = { bindingId: repository.id, repositoryId: metadata.id, fullName: metadata.full_name,
     ref: repository.ref, commit: commitA, path: metadata.full_name };
   const session: SessionRecord = { id: 'legacy-session', workspaceId: team.id, ownerId: owner.user.id, agentVersionId: agent.id,
@@ -386,14 +381,10 @@ test('session repositories are server-owned and immutable', async t => {
   assert.equal(s.remote.calls.length, 0);
 });
 
-test('a GitHub-connected host runs its unpublished agent privately, cloning, with no host trust', async t => {
+test('a GitHub-connected host\'s owner runs a session on it privately, cloning, with no host trust', async t => {
   const s = await connectedSetup(t);
   assert.equal((await s.host.request('DELETE', `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`)).status, 204);
-  const { agent } = await json<{ agent: AgentVersion }>(await s.host.request('POST', '/api/agents', {
-    name: 'Private repository agent', description: '', instructions: '', tools: ['identity'], modelId: s.agent.modelId,
-  }), 201);
-  assert.equal(agent.workspaceId, null);
-  const input = { workspaceId: s.team.id, agentVersionId: agent.id, title: 'Host-owned session' };
+  const input = { workspaceId: s.team.id, modelId: s.model.id, title: 'Host-owned session' };
   const { session } = await json<{ session: SessionRecord }>(await s.host.request('POST', '/api/sessions', input), 201);
   assert.equal(session.ownerId, s.host.user.id);
   assert.equal(session.connectorOwnerId, s.host.user.id);
@@ -414,7 +405,7 @@ for (const change of ['association-removed', 'share-removed', 'revoked', 'model-
       if (change === 'association-removed') s.f.sqlite.prepare('DELETE FROM connector_workspaces WHERE connector_id = ?').run(s.connector.connectorId);
       if (change === 'share-removed') s.f.sqlite.prepare('DELETE FROM connector_shares WHERE connector_id = ?').run(s.connector.connectorId);
       if (change === 'revoked') s.f.sqlite.prepare("UPDATE connectors SET revoked_at = '2026-01-02' WHERE id = ?").run(s.connector.connectorId);
-      if (change === 'model-unavailable') s.f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run(s.agent.modelId);
+      if (change === 'model-unavailable') s.f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run(s.model.id);
     });
     await denied(await actor.request('POST', '/api/sessions', s.input), 409, 'session_configuration_changed');
     assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
@@ -446,14 +437,11 @@ for (const change of ['identity', 'test-mode'] as const) {
     const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
       name: 'Faux', provider: 'faux', modelId: 'faux',
     }), 201);
-    const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
-      name: 'Faux agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
-    }), 201);
     beforeStatement(t, f, /^INSERT INTO sessions\b/, () => {
       if (change === 'identity') f.sqlite.prepare("UPDATE users SET auth_kind = 'github', github_id = '999' WHERE id = ?").run(owner.user.id);
       else f.env.TEST_AUTH_ENABLED = 'false';
     });
-    await denied(await owner.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id }), 409, 'session_configuration_changed');
+    await denied(await owner.request('POST', '/api/sessions', { workspaceId: team.id, modelId: model.id }), 409, 'session_configuration_changed');
     assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
   });
 }
@@ -487,10 +475,7 @@ test('testMode does not let a real user start an unconnected faux-model session'
   const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
     name: 'Faux', provider: 'faux', modelId: 'faux',
   }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
-    name: 'Faux agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
-  }), 201);
-  await denied(await owner.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id }), 400, 'connector_required');
+  await denied(await owner.request('POST', '/api/sessions', { workspaceId: team.id, modelId: model.id }), 400, 'connector_required');
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
 });
 
@@ -739,12 +724,8 @@ async function providerSetup(t: TestContext, claim: object = providerManifest) {
   const connector = await connect(f, host, team.id, claim);
   await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
-  const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
-    name: 'Gitea agent', description: '', instructions: '', tools: ['identity'], modelId: models[0].id,
-  }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: team.id }), 201);
   const provisions = provisionHub(f);
-  const input = { workspaceId: team.id, agentVersionId: agent.id, trustedConnectorId: connector.connectorId, title: 'Gitea session' };
+  const input = { workspaceId: team.id, modelId: models[0].id, trustedConnectorId: connector.connectorId, title: 'Gitea session' };
   const start = async () => (await json<{ session: SessionRecord }>(await owner.request('POST', '/api/sessions', input), 201)).session;
   remote.calls.length = 0;
   return { f, remote, admin, host, owner, team, repository, connector, provisions, input, start };
@@ -836,28 +817,21 @@ test('binding without a token account fails with git_account_required; GitHub si
   assert.equal(s.remote.calls.length, 0);
 });
 
-test('agents with git_push need a connector that claims gitPush, checked again inside the session insert', async t => {
+test('a session gets git_push only from a connector that claims gitPush, checked again inside the session insert', async t => {
   const s = await providerSetup(t);
-  const { models } = await json<{ models: ModelDefinition[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/models`));
-  const { agent: draft } = await json<{ agent: AgentVersion }>(await s.host.request('POST', '/api/agents', {
-    name: 'Pushing agent', description: '', instructions: '', tools: ['identity', 'git_push'], modelId: models[0].id,
-  }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await s.host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: s.team.id }), 201);
-  const input = { ...s.input, agentVersionId: agent.id };
-  const body = await json<{ code: string; error: string }>(await s.owner.request('POST', '/api/sessions', input), 409);
-  assert.deepEqual(body, { code: 'connector_update_required', error: 'Update the host\'s connector (npx pistead@latest connect) to use git_push.' });
-  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
-  assert.equal(s.provisions.length, 0);
+  // Without the capability the session's agent simply has no git_push.
+  assert.equal((await s.start()).status, 'ready');
+  assert.equal(s.provisions.length, 1);
+  assert.ok(!(JSON.parse(s.provisions[0].request.body) as RunnerBinding).agent.tools.includes('git_push'));
   assert.equal(s.remote.calls.length, 0);
 
   s.f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_set(capabilities_json, '$.gitPush', json('true')) WHERE id = ?").run(s.connector.connectorId);
   beforeStatement(t, s.f, /^INSERT INTO sessions\b/, () => {
     s.f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_remove(capabilities_json, '$.gitPush') WHERE id = ?").run(s.connector.connectorId);
   });
-  await denied(await s.owner.request('POST', '/api/sessions', input), 409, 'session_configuration_changed');
-  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
-  // Agents without git_push are unaffected by the missing capability.
-  assert.equal((await s.start()).status, 'ready');
+  await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'session_configuration_changed');
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
+  assert.equal(s.provisions.length, 1);
 });
 
 test('token-provider binding rechecks the acting account in its final write', async t => {
@@ -974,7 +948,8 @@ test('every session clones: older connectors are refused, and a session whose ag
     });
   };
   // The host's owner can always run their own shell commands.
-  const { session: own } = await json<{ session: SessionRecord }>(await start(admin, await host({}, false)), 201);
+  const ownHost = await host({}, false);
+  const { session: own } = await json<{ session: SessionRecord }>(await start(admin, ownHost), 201);
   assert.equal(own.repositoryMode, 'clone');
   assert.deepEqual(own.repositories, []);
   assert.equal(own.cloneUnavailable, undefined);
@@ -989,13 +964,11 @@ test('every session clones: older connectors are refused, and a session whose ag
   assert.equal(limited.cloneUnavailable, undefined);
   // A connector from before sessions cloned can't run one.
   await denied(await start(admin, await host({ plainGit: undefined }, false)), 409, 'connector_update_required');
-  // An agent without bash starts empty too.
+  // A session started from a saved agent without bash, before agents were removed, works in an empty worktree too.
   const { models } = await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`));
-  const model = models.find(item => item.connectorId === unlimited.connectorId)!;
-  const { agent } = await json<{ agent: AgentVersion }>(await admin.request('POST', '/api/agents', {
-    name: 'Files only', description: '', instructions: '', tools: ['read_file'], modelId: model.id,
-  }), 201);
-  const { session: filesOnly } = await json<{ session: SessionRecord }>(await admin.request('POST', '/api/sessions', { workspaceId: team.id, agentVersionId: agent.id, title: 'Files' }), 201);
+  const model = models.find(item => item.connectorId === ownHost.connectorId)!;
+  const filesOnlyId = seedSavedAgentSession(f.sqlite, own.id, seedAgentVersion(f.sqlite, { authorId: admin.user.id, modelId: model.id, tools: ['read_file'] }));
+  const { session: filesOnly } = await json<{ session: SessionRecord }>(await admin.request('GET', `/api/sessions/${filesOnlyId}`));
   assert.equal(filesOnly.repositoryMode, 'clone');
   assert.match(filesOnly.cloneUnavailable ?? '', /doesn't have the bash tool/);
   assert.throws(() => f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = ?").run(own.id), /immutable/);

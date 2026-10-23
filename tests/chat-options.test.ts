@@ -55,3 +55,16 @@ test("the last chatted model and reasoning start the next new chat where the hos
   assert.equal(parseChatPreference(JSON.stringify({ provider: "p" })), undefined);
   assert.deepEqual(parseChatPreference(JSON.stringify({ ...preference, thinkingLevel: "huge" })), { connectorId: "host-a", provider: "p", modelId: "deep" });
 });
+
+test("a message sent without picking a model remembers the conversation's current model and reasoning", () => {
+  const host = {
+    id: "host-a", capabilities: { chatOptions: true },
+    models: [{ provider: "p", modelId: "deep", name: "Deep", thinkingLevels: ["off", "low", "high"], thinkingLevel: "low" }],
+  } as unknown as ConnectorInfo;
+  const current = { provider: "p", modelId: "deep", thinkingLevel: "high" as const };
+  assert.deepEqual(chatPreference(host, { access: "approval" }, current), { connectorId: "host-a", provider: "p", modelId: "deep", thinkingLevel: "high" });
+  // A level picked on its own applies to the current model.
+  assert.deepEqual(chatPreference(host, { thinkingLevel: "off", access: "approval" }, current), { connectorId: "host-a", provider: "p", modelId: "deep", thinkingLevel: "off" });
+  // Without either, there is nothing to remember.
+  assert.equal(chatPreference(host, { access: "approval" }), undefined);
+});
