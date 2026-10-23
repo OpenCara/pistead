@@ -31,7 +31,7 @@ type Metadata = {
   }>;
   [key: string]: unknown;
 };
-const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
+const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
 
 function binding(): RunnerBinding {
   const createdAt = "2026-01-01T00:00:00Z";
@@ -110,7 +110,7 @@ async function pauseQueue(session: RunnerSession): Promise<() => void> {
   return () => { scheduler.drainQueue = drain; drain.call(session); };
 }
 
-async function fixture(t: TestContext, { reportActivity = false } = {}) {
+async function fixture(t: TestContext, { reportActivity = false, config: overrides = {} }: { reportActivity?: boolean; config?: Partial<RunnerConfig> } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "runner-queue-"));
   const input = binding();
   const grants: Record<string, Permission[]> = {
@@ -134,6 +134,7 @@ async function fixture(t: TestContext, { reportActivity = false } = {}) {
       }
       return { allowed: grants[request.actorId]?.includes(request.permission) ?? false, ownerId: input.owner.id, policyVersion: 1 };
     },
+    ...overrides,
   };
   let service: RunnerService | undefined;
   t.after(async () => {
@@ -679,4 +680,68 @@ test("synthetic post-submit activation crash window reuses pi requestId rather t
     assert.equal(run.submissionId, piSubmissionId, "recovery must rediscover the original numeric pi submission");
     assert.equal(run.status, "settled");
   });
+});
+
+test("a message whose work host crashes cut off again and again ends, says why, and the next message runs", options, async t => {
+  // A crash leaves the running tasks as they were stored: storage that fails every call from some point on fails the
+  // Harness without the close that would write them back, as a host that died mid-message would.
+  let crash = () => {};
+  const f = await fixture(t, { config: { openStorage: async path => {
+    const storage = await openNodeSqliteStorage(path);
+    let crashed = false;
+    crash = () => { crashed = true; };
+    return new Proxy(storage, { get(target, key) {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => crashed && key !== "close" ? Promise.reject(new Error("simulated host crash")) : value.apply(target, args);
+    } });
+  } } });
+  const crashing = await submit(f.session, OWNER, "write", { content: "TEST_HOLD 1000", requestId: "crashing" });
+  // A test seam: the open Harness's own view of its tasks says when the model is answering.
+  const answering = async () => (await (f.session as unknown as { harness: Harness }).harness.inspect(context)).tasks.some(task => task.state.kind === "running");
+  let crashes = 0;
+  while (queue(await f.session.view())[0]?.status !== "interrupted") {
+    assert.ok(crashes < 10, "the runner must end the message");
+    // The host goes down while the model answers the message.
+    for (let count = 0; count < 250 && !(await answering()); count++) await delay(20);
+    assert.ok(await answering(), "the message's model request must be running");
+    crash();
+    await assert.rejects(f.session.consumeTicket(await ticket(f.session.binding.session.id, "view")), /simulated host crash/);
+    for (let count = 0; count < 250 && !f.session.failed; count++) await delay(20);
+    assert.equal(f.session.failed, true);
+    crashes++;
+    await f.session.recover();
+  }
+  assert.equal(crashes, 5, "Pi parks a task cut off five times in a row (settings.restartLimit) when it next opens");
+  let view = await idle(f.session);
+  assert.deepEqual(queue(view).map(run => run.status), ["interrupted"]);
+  assert.equal(view.activity, "failed");
+  assert.deepEqual(view.entries.at(-1), { id: `${crashing.conversationId}:crashed:${crashing.submissionId}`, kind: "workspace.run-crashed", role: "system",
+    text: "Stopped: the host crashed repeatedly while working on this message. Send it again to retry.", conversationId: crashing.conversationId });
+  const next = await submit(f.session, WRITER, "write", { content: "TEST_WRITE after-crashes.txt\nran", requestId: "after-crashes" });
+  view = await idle(f.session);
+  assert.deepEqual(queue(view).map(run => run.status), ["interrupted", "settled"]);
+  assert.equal(await file(f.session, "after-crashes.txt"), "ran");
+  toolResult(view, next, result => result.written === "after-crashes.txt");
+  assert.equal(view.activity, "done");
+});
+
+test("sessions compact by the host's Pi compaction settings, per model where it names one", options, async t => {
+  const compactions = async (compaction: RunnerConfig["compaction"]) => {
+    const f = await fixture(t, { config: { compaction } });
+    for (const requestId of ["first", "second"]) {
+      await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId });
+      await idle(f.session);
+    }
+    // The second message's request compacts the first message's entries before it is sent.
+    const view = await f.session.view();
+    await f.stop();
+    return view.entries.filter(entry => entry.kind === "pi.compaction").length;
+  };
+  // A threshold no context fits under, keeping nothing verbatim, compacts before every request with older entries.
+  const always = { reserveTokens: Number.MAX_SAFE_INTEGER, keepRecentTokens: 0 };
+  assert.ok(await compactions({ modelOverrides: { "faux/queue-faux": always } }) > 0, "the session's model compacts by its override");
+  assert.equal(await compactions({ modelOverrides: { "faux/other-model": always } }), 0, "another model's override does not apply");
+  assert.ok(await compactions(always) > 0, "a host-wide threshold applies to every model");
+  assert.equal(await compactions({ ...always, enabled: false }), 0, "the host's Pi can turn automatic compaction off");
 });

@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
-import { getSupportedThinkingLevels, StringEnum, Type, type Models } from "@earendil-works/pi-ai";
-import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
+import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
+import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
@@ -44,12 +44,15 @@ type Run = {
   failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
   /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
   stopped?: { by: string; pending?: true };
+  /** Pi parked its work after host crashes cut it off again and again, so it ended (see endParkedRuns). */
+  crashed?: true;
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 /** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
 type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
 type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
-const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
+/** One JSON string that every change replaces, so each change is stored whole: a delta would be as large and only lengthen replay. */
+const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
 /** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files"];
 /**
@@ -89,6 +92,10 @@ export type RunnerConfig = {
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
+  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them. */
+  compaction?: CompactionSettings;
+  /** How the host's Pi identifies its requests to providers; pi-durable's default (attributed to pi) without it. */
+  identity?: ClientIdentity;
   /**
    * This host's repository cache (connect --repo-cache): a mirror per repository, filled through the control plane's
    * relay, that clones borrow objects from.
@@ -132,6 +139,9 @@ type RepositoryPreparation = { status: "ready" }
   | { status: "preparing"; done: Promise<void>; controller: AbortController; items: RepositoryPreparationItem[] }
   | { status: "failed"; reason: string; items: RepositoryPreparationItem[] };
 type ProgressUpdate = (path: string, change: Partial<Omit<RepositoryPreparationItem, "path">>) => void;
+
+/** What the transcript says after a run that the host's crashes ended (see endParkedRuns). */
+const CRASHED_TEXT = "Stopped: the host crashed repeatedly while working on this message. Send it again to retry.";
 
 /** Whether the model request behind a transcript entry failed, which the session view shows as a failed model turn. */
 function modelFailed(entry: EntryRecord): boolean {
@@ -546,7 +556,11 @@ export class RunnerSession {
     this.models = resolved.models;
     const models = this.models;
     const storage = await this.openStorage();
-    try { this.harness = await Harness.open(storage, { models, registry }, context); }
+    try {
+      this.harness = await Harness.open(storage, { models, registry,
+        ...(this.config.compaction ? { settings: { compaction: this.config.compaction } } : {}),
+        ...(this.config.identity ? { identity: this.config.identity } : {}) }, context);
+    }
     catch (error) { await storage.close(context); throw error; }
     this.#failed = false;
     const harness = this.harness;
@@ -599,6 +613,7 @@ export class RunnerSession {
   /** Recovered runs, then the harness and the queue: at most once per open, and only once the repositories are ready. */
   private async resumeWork(): Promise<void> {
     this.#resumed = true;
+    await this.endParkedRuns();
     const state = await this.metadata();
     for (const run of Object.values(state.runs)) {
       if (run.status !== "running" && run.status !== "admitting") continue;
@@ -626,6 +641,20 @@ export class RunnerSession {
     if (Object.values(state.runs).some(run => run.stopped?.pending)) await this.abortStopped();
     this.harness.resume();
     this.drainQueue();
+  }
+
+  /**
+   * Ends the runs whose work Pi parked: host crashes cut a task of their conversation off `restartLimit` times in a
+   * row, so Pi stopped running it rather than crash the host again. Left alone, such a run would hold the session for
+   * good. It ends as a stop would, aborted before the scheduler starts, and says why; sending it again runs it afresh.
+   */
+  private async endParkedRuns(): Promise<void> {
+    const parked = new Set((await this.harness.inspect(context)).tasks
+      .filter(task => task.state.kind === "blocked" && task.state.reason === "restart_limit").map(task => Number(task.record.conversationId)));
+    if (!parked.size) return;
+    const runs = Object.values((await this.metadata()).runs).filter(run => (run.status === "running" || run.status === "admitting") && parked.has(run.conversationId));
+    for (const id of new Set(runs.map(run => run.conversationId))) await (await this.harness.conversation(id as ConversationId, context))?.abort(context);
+    if (runs.length) await this.mutate(meta => { for (const run of runs) Object.assign(meta.runs[run.key]!, { status: "interrupted", crashed: true }); });
   }
 
   private openStorage(): Promise<Storage> {
@@ -1522,10 +1551,11 @@ export class RunnerSession {
       ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}) };
   }
 
-  /** What follows a run's entries: its failed model turn, or who stopped it. */
+  /** What follows a run's entries: its failed model turn, who stopped it, or that its host's crashes ended it. */
   private endView(run: Run, branch: number): SessionView["entries"][number] | undefined {
     if (run.failure) return this.failureView(run, branch);
     if (run.stopped) return { id: `${branch}:stopped:${run.key}`, kind: "workspace.run-stopped", role: "system", text: "Stopped", actorId: run.stopped.by, conversationId: String(branch) };
+    if (run.crashed) return { id: `${branch}:crashed:${run.key}`, kind: "workspace.run-crashed", role: "system", text: CRASHED_TEXT, conversationId: String(branch) };
     return undefined;
   }
 

@@ -438,6 +438,7 @@ export class LocalConnector {
         allowFaux: this.options.allowFaux === true, allowTestShell: this.options.allowTestShell === true,
         resources: this.options.resources, unsandboxed: this.options.unsandboxed === true,
         resolveModels: model => { this.requireGeneration(generation); return this.options.localModels.resolve(model); },
+        compaction: this.options.localModels.compaction, identity: this.options.localModels.identity,
         authorize: request => this.authorize(generation, request),
         reportActivity: (sessionId, activity) => this.reportActivity(generation, sessionId, activity),
         githubComment: async request => {

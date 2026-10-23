@@ -305,7 +305,7 @@ test("restore checks actual paused pi tasks, not only a manifest claiming idle",
   const harness = await Harness.open(storage, { models: runnerModels(source.model, true), registry: createRegistry() }, context);
   const root = await harness.root(context, { agent: { model: { provider: "faux", modelId: source.model.modelId } } });
   const manifest = { binding: source, branches: [{ id: root.id, mode: "write" as const }], runs: {}, approvals: {}, toolActors: {} };
-  const state = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
+  const state = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
   await root.commit(async tx => { (await tx.doc(state)).json = JSON.stringify(manifest); }, context);
   await root.submit({ type: "input", content: "TEST_HOLD 5000", requestId: "hidden-live-task" }, context);
   await harness.close(context);

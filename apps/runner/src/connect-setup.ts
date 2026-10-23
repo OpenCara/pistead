@@ -60,7 +60,8 @@ export async function loadConnectorModels(choice: ModelChoice): Promise<LocalMod
   });
   const enabledModels = choice.models ? undefined : settings.enabledModels;
   const localModels = await loadLocalPiModels({ agentDir: choice.piAgentDir, models: choice.models, enabledModels,
-    defaultThinkingLevel: settings.defaultThinkingLevel, modelThinkingLevels: settings.modelThinkingLevels });
+    defaultThinkingLevel: settings.defaultThinkingLevel, modelThinkingLevels: settings.modelThinkingLevels,
+    compaction: settings.compaction, attribution: settings.attribution });
   if (!(await localModels.manifest()).length) throw new ConnectorSetupError(enabledModels
     ? "None of the models enabled in Pi's settings.json (enabledModels) are authenticated on this machine."
     : "No authenticated local Pi models are configured. Configure a provider and model in Pi on this machine first.");
