@@ -1,4 +1,4 @@
-import { sha256 } from '../../../packages/shared/src/crypto.js';
+import { messageHash, type ChatImage } from '../../../packages/shared/src/chat-images.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
 import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
@@ -60,11 +60,13 @@ async function admissionStorage<T>(operation: Promise<T>): Promise<T> {
   catch { fail(503, 'admission_unavailable', 'Run admission storage is temporarily unavailable.'); }
 }
 
-export async function issueRunAdmission(c: AppContext, row: SessionRow, content: string, requestId: string, access?: AccessMode): Promise<string> {
+export async function issueRunAdmission(c: AppContext, row: SessionRow, content: string, requestId: string, access?: AccessMode,
+  images?: readonly ChatImage[]): Promise<string> {
   // Authentication middleware derives this identity from the cookie, never the submit body.
   const actorId = c.get('auth')?.userId;
   if (!actorId) fail(401, 'unauthorized', 'Authentication is required.');
-  text(content, 'content', 60000);
+  // A message of images alone has no text.
+  text(content, 'content', 60000, images?.length ? 0 : 1);
   text(requestId, 'requestId', 128);
 
   const actor = await sessionAccess(c.env, row.id, actorId);
@@ -80,7 +82,8 @@ export async function issueRunAdmission(c: AppContext, row: SessionRow, content:
   if (current.status === 'archived') fail(409, 'session_archived', 'Session is archived.');
   if (current.connector_id) await requireConnectorSession(c.env, current.connector_id, current);
 
-  const contentHash = await sha256(content);
+  // The request ID then can't be reused for other images either; a message without images keeps the hash of its text.
+  const contentHash = await messageHash(content, images);
   const createdAt = now();
   const issuedAt = Math.floor(Date.parse(createdAt) / 1000);
   const allowTest = testMode(c.env) ? 1 : 0;

@@ -18,6 +18,11 @@ export interface ConnectorCapabilities {
   unsandboxed?: boolean;
   /** The connector applies per-message model, reasoning and access choices. Absent on older connectors. */
   chatOptions?: boolean;
+  /**
+   * The connector gives the model the images pasted into a message. Absent on older connectors, which would drop them
+   * and run the text alone, so they are never sent any.
+   */
+  chatImages?: boolean;
   /** The connector accepts repositories from providers other than github.com (provider/host pins). Absent on older connectors. */
   gitProviders?: boolean;
   /** The connector pushes session commits with control-plane minted credentials (git_push). Absent on older connectors. */

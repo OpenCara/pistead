@@ -25,6 +25,12 @@ export function runnerModels(model: ModelDefinition, allowFaux: boolean) {
         return fauxAssistantMessage(`Deterministic test provider result:\n${text}`);
       }
       const lastUser = context.messages.findLast(message => message.role === "user");
+      // A message with images is answered with what the model received of it, its images named as for tool results.
+      if (latest?.role === "user" && typeof latest.content !== "string" && latest.content.some(part => part.type === "image")) {
+        const text = latest.content.map(part => part.type === "text" ? part.text
+          : `image ${part.mimeType} sha256:${createHash("sha256").update(Buffer.from(part.data, "base64")).digest("hex")}`).join("\n");
+        return fauxAssistantMessage(`Deterministic test provider saw:\n${text}`);
+      }
       const prompt = lastUser?.role === "user" ? (typeof lastUser.content === "string" ? lastUser.content : lastUser.content.filter(part => part.type === "text").map(part => part.text).join("\n")) : "";
       let tool: string | undefined;
       let args: Record<string, string> = {};

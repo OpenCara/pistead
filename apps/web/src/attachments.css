@@ -1,0 +1,26 @@
+@layer screens {
+  /* Images pasted into a composer, above its text box, until the message is sent. */
+  .composer-attachments { display: flex; flex-wrap: wrap; gap: var(--space-2); padding: 0 var(--space-1); }
+  .composer-attachment {
+    position: relative;
+    width: 64px;
+    height: 64px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--surface2);
+  }
+  .composer-attachment > img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .composer-attachment-remove.btn.icon-only {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 20px;
+    height: 20px;
+    min-height: 0;
+    padding: 0;
+    border-radius: var(--radius-full);
+  }
+  .composer-attachment-remove.btn.icon-only svg { width: 12px; height: 12px; }
+  .composer-notice { color: var(--foreground-muted); font-size: var(--font-xs); padding: 0 var(--space-1); }
+}
