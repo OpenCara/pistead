@@ -8,7 +8,15 @@ interface WorkspaceDatabaseResponse {
   available: boolean;
   /** Hosts on private networks, and unencrypted connections to them, are allowed. */
   privateHosts: boolean;
+  /** The server has backup storage of its own (STORAGE_URL) for workspaces without a database. */
+  backupStorage: boolean;
   database: WorkspaceDatabase | null;
+}
+
+/** Where backups go without a workspace database, as the end of a sentence. */
+function withoutDatabase(backupStorage: boolean): string {
+  return backupStorage ? "session backups are kept in the server's backup storage"
+    : "this server keeps no session backups, as it has no backup storage of its own (STORAGE_URL)";
 }
 
 /** What the server reports after importing a dump into the workspace database. */
@@ -61,7 +69,7 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
     if (!database || action.busy) return;
     const confirmed = await confirmDialog({
       title: "Disconnect database",
-      message: `Disconnect ${databaseLabel(database)}? New session backups go to the server's backup storage again. Backups already saved in that database stay there, but can't be downloaded or restored until it is connected again.`,
+      message: `Disconnect ${databaseLabel(database)}? ${data?.backupStorage ? "New session backups go to the server's backup storage again." : "This server has no backup storage of its own, so no new session backups can be saved."} Backups already saved in that database stay there, but can't be downloaded or restored until it is connected again.`,
       confirmLabel: "Disconnect",
       destructive: true,
     });
@@ -69,7 +77,8 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
     void action.run(async () => {
       await api(path, { method: "DELETE" });
       resource.refresh();
-    }, "Database disconnected. New session backups go to the server's backup storage.");
+    }, data?.backupStorage ? "Database disconnected. New session backups go to the server's backup storage."
+      : "Database disconnected. This server keeps no session backups without one.");
   }
   const items: MenuItem[] = [
     ...(data?.available ? [
@@ -78,9 +87,12 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
     ] : []),
     { label: "Disconnect", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void disconnect() },
   ];
-  const empty = !data?.available ? "This server doesn't connect to workspace databases, so session backups are kept in its backup storage"
-    : owner ? "No database connected. Session backups are kept in the server's backup storage"
-    : "Session backups are kept in the server's backup storage. Only the workspace owner can connect a database";
+  // Session databases are an operator setting: say who can turn them on rather than implying they can't exist here.
+  const fallback = withoutDatabase(data?.backupStorage ?? false);
+  const empty = !data?.available
+    ? `Session databases are turned off on this server, so ${fallback}. The server's operator can turn them on with WORKSPACE_DATABASES=true`
+    : owner ? `No database connected, so ${fallback}`
+    : `No database connected, so ${fallback}. Only the workspace owner can connect one`;
   return <Section title="Session database" info={<div className="stack">
     <p>The workspace owner can connect a Postgres database of their own. Backups of this workspace's sessions are then saved there, with each session's details, instead of in the server's backup storage, and downloads and restores read them back from it.</p>
     <p>Whoever can read that database can read the sessions saved there, private ones and their owners' personal environment values included. Other members confirm the database before each of their backups goes there, and again after it is pointed at another database.</p>
@@ -94,7 +106,9 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
         </>} />
         : <CardBody><span className="muted">{empty}</span></CardBody>}
       {database && data && !data.available && <CardBody><Alert variant="warning" title="Workspace databases are turned off">
-        This server no longer connects to workspace databases, so backups of this workspace's sessions can't be created, downloaded or restored. {owner ? "Disconnect the database to use the server's backup storage again." : "The workspace owner can disconnect it to use the server's backup storage again."}
+        This server no longer connects to workspace databases, so backups of this workspace's sessions can't be created, downloaded or restored. {!data.backupStorage ? "The server's operator can turn them on again with WORKSPACE_DATABASES=true."
+          : owner ? "Disconnect the database to use the server's backup storage again, or ask the server's operator to turn workspace databases on again."
+          : "The workspace owner can disconnect it to use the server's backup storage again."}
       </Alert></CardBody>}
       {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
     </ResourceState>
