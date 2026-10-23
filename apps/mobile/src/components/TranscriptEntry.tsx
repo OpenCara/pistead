@@ -31,10 +31,10 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 ? `Tool · ${calls[0].name}` : "";
   const meta = [styles.meta, { color: palette.muted }];
-  if (entry.kind === "workspace.run-stopped") {
+  if (entry.kind === "workspace.run-stopped" || entry.kind === "workspace.run-crashed") {
     return <View style={styles.stopped} accessibilityRole="text">
       <View style={[styles.rule, { backgroundColor: palette.border }]} />
-      <Text style={meta}>Stopped{actor ? ` by ${actor}` : ""}</Text>
+      <Text style={[meta, styles.stoppedText]}>{entry.kind === "workspace.run-crashed" ? entry.text : `Stopped${actor ? ` by ${actor}` : ""}`}</Text>
       <View style={[styles.rule, { backgroundColor: palette.border }]} />
     </View>;
   }
@@ -73,6 +73,8 @@ const styles = StyleSheet.create({
   bubbleText: { fontSize: 16, lineHeight: 22 },
   meta: { fontSize: 12 },
   stopped: { flexDirection: "row", alignItems: "center", gap: 10 },
+  // A longer note wraps between the rules instead of pushing them off the screen.
+  stoppedText: { flexShrink: 1, textAlign: "center" },
   rule: { flex: 1, height: StyleSheet.hairlineWidth },
   tool: { borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, overflow: "hidden" },
   toolHead: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, paddingVertical: 8 },

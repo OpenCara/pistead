@@ -358,6 +358,8 @@ type FixtureOptions = {
   execute?: (request: Request, generation: number) => Response | Promise<Response>;
   unblock?: () => void;
   gitCredentials?: boolean;
+  /** What the host's Pi settings add to its models. */
+  piSettings?: Pick<LocalModels, 'compaction' | 'identity'>;
 };
 
 async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
@@ -373,7 +375,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
   const leases = { acquired: 0, released: 0 };
   let manifests = 0;
   const connector = createConnector({
-    dataDir, server: origin, localModels: localModels([{ ...summary, ...{ apiKey: providerSecret } }]),
+    dataDir, server: origin, localModels: { ...localModels([{ ...summary, ...{ apiKey: providerSecret } }]), ...options.piSettings },
     capabilities: publicCapabilities, reconnectDelayMs: 1, gitCredentials: options.gitCredentials,
     acquireLease: path => {
       assert.equal(path, dataDir);
@@ -516,6 +518,8 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   assert.equal(config.hostGitCredential, undefined, 'the host\'s Git credentials stay unused without the owner\'s opt-in');
   assert.equal(config.allowFaux, false);
   assert.equal(config.allowTestShell, false);
+  assert.equal(config.compaction, undefined, 'without Pi settings, sessions compact by pi-durable\'s defaults');
+  assert.equal(config.identity, undefined);
   assert.ok(config.sharedSecret.length >= 32);
   assert.notEqual(config.sharedSecret, credentials.token);
   assertWorkerBoundary(fixture.allCalls, fixture.allSockets, [config.sharedSecret]);
@@ -543,6 +547,15 @@ test('the owner\'s --git-credentials opt-in is advertised and lets push credenti
   // A credential is either a token or the host's own: never both.
   issued = { ...host, authorization: 'Basic eDp5' };
   await assert.rejects(config.pushCredential!(request));
+});
+
+test('sessions follow the compaction and attribution settings of the host\'s Pi', { timeout: 10000 }, async t => {
+  const compaction = { reserveTokens: 8192, modelOverrides: { 'native.fixture/region/model': { keepRecentTokens: 4000 } } };
+  const fixture = await connectorFixture(t, { piSettings: { compaction, identity: { attribution: null } } });
+  await startFixture(fixture);
+  const config = fixture.runtimes[0]!.config;
+  assert.deepEqual(config.compaction, compaction);
+  assert.deepEqual(config.identity, { attribution: null });
 });
 
 test('github reads and merges reach the control plane over the connection, pass its refusals on, and allow read results above the callback limit', { timeout: 10000 }, async t => {
