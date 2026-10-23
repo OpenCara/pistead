@@ -1,7 +1,8 @@
 name: Release
 # Pushing a version tag (v1.2.3, or v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then publishes the
-# `pistead` connector from packages/cli to npm and the server image to ghcr.io/opencara/pistead. The tag must match
-# packages/cli/package.json's version. npm auth: a trusted publisher for this workflow on npmjs.com, or an NPM_TOKEN
+# `pistead` connector from packages/cli to npm and the server image to ghcr.io/opencara/pistead. The tag decides the
+# published version: the npm job sets it in packages/cli/package.json and npm-shrinkwrap.json before building, so no
+# version bump needs committing first. npm auth: a trusted publisher for this workflow on npmjs.com, or an NPM_TOKEN
 # repository secret.
 on:
   push:
@@ -28,13 +29,12 @@ jobs:
             echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main."
             exit 1
           fi
-      - name: Tag matches the connector version
+      - name: Version from the tag
         id: version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p 'require("./packages/cli/package.json").version')"
-          if [ "$version" != "$package_version" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match packages/cli/package.json version $package_version."
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME is not a version (v1.2.3, or v1.2.3-beta.1 for a prerelease)."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -60,6 +60,25 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
+      # The tag's version, in the manifest and the shrinkwrap alike (prepublishOnly checks they agree); the build bundles it.
+      - name: Set the connector version from the tag
+        working-directory: packages/cli
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const version = process.env.VERSION;
+            // Only the version field changes; the manifest keeps its own formatting.
+            const manifest = fs.readFileSync("package.json", "utf8").replace(/^(  "version": )"[^"]*"/m, (_, key) => key + JSON.stringify(version));
+            if (JSON.parse(manifest).version !== version) throw new Error("package.json has no top-level version field");
+            fs.writeFileSync("package.json", manifest);
+            const shrinkwrap = JSON.parse(fs.readFileSync("npm-shrinkwrap.json", "utf8"));
+            shrinkwrap.version = version;
+            shrinkwrap.packages[""].version = version;
+            fs.writeFileSync("npm-shrinkwrap.json", JSON.stringify(shrinkwrap, null, 2) + "\n");
+          '
+          node -p '"Publishing pistead@" + require("./package.json").version'
       # prepublishOnly checks the shrinkwrap and builds dist.
       - name: Publish pistead
         working-directory: packages/cli
