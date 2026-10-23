@@ -11,7 +11,7 @@ import type { Env } from '../apps/server/src/types.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { AdminHost, AdminList, AdminOverview, AdminUser, AdminWorkspace } from '../packages/shared/src/admin.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ModelDefinition, SessionRecord, UserProfile } from '../packages/shared/src/types.js';
+import type { ModelDefinition, SessionRecord, UserProfile } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 
 const origin = 'http://localhost:8787';
@@ -89,10 +89,8 @@ async function team(f: Fixture) {
   const models = async (member: Client) => (await json<{ models: ModelDefinition[] }>(await member.request('GET', `/api/workspaces/${workspaceId}/models`))).models;
   const [model] = await models(alice);
   async function session(owner: Client) {
-    const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents',
-      { name: 'Agent', description: '', instructions: '', tools: ['identity'], modelId: model.id }), 201);
     return (await json<{ session: SessionRecord }>(await owner.request('POST', '/api/sessions',
-      { workspaceId, agentVersionId: agent.id, title: 'Private work', trustedConnectorId: connector.connectorId }), 201)).session;
+      { workspaceId, modelId: model.id, title: 'Private work', trustedConnectorId: connector.connectorId }), 201)).session;
   }
   return { operator, alice, bob, workspaceId, connector, models, aliceSession: await session(alice), bobSession: await session(bob) };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import type { AgentVersion, ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
+import type { ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
@@ -13,9 +13,7 @@ import { Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, IdentityBa
 import { usernameWithId } from "../../../packages/client/src/usernames";
 import "./new-session.css";
 
-/** Set by the agent settings "Start a session" action; consumed once. Holds an agent version id or agent id. */
-const HANDOFF_KEY = "pistead.newSessionAgent";
-/** How the last session started: `agent:<version id>`, or `model:<workspace model id>` when started from a model. */
+/** The model the last session started on: `model:<workspace model id>`. */
 const LAST_START_KEY = "pistead.lastStart";
 const TITLE_LIMIT = 80;
 
@@ -30,13 +28,6 @@ function writeStorage(storage: () => Storage, key: string, value: string | null)
     if (value === null) storage().removeItem(key);
     else storage().setItem(key, value);
   } catch { /* Private mode: the preference is simply not remembered. */ }
-}
-
-/** Matches an exact version id, else the newest runnable version of a logical agent id. */
-function findVersion(versions: AgentVersion[], id: string): AgentVersion | undefined {
-  if (!id) return undefined;
-  return versions.find(version => version.id === id)
-    ?? versions.filter(version => version.agentId === id).sort((a, b) => b.version - a.version)[0];
 }
 
 function deriveTitle(content: string, fallback: string): string {
@@ -64,22 +55,18 @@ export function NewSession({ workspaceId }: { workspaceId: string }) {
     if (workspacesError) return <div className="new-session"><Alert variant="error" title="Unable to load workspaces" actions={<Button variant="outline" size="sm" onClick={refreshWorkspaces}>Retry</Button>}>{workspacesError}</Alert></div>;
     return <div className="new-session"><EmptyState title="Workspace not found" action={<LinkButton variant="ghost" href={href({ name: "sessions" })}>View sessions</LinkButton>}>You may no longer be a member of this workspace.</EmptyState></div>;
   }
-  // Keyed so agent, trust and repository state never carry across workspaces.
+  // Keyed so host, trust and repository state never carry across workspaces.
   return <Composer key={workspace.id} workspace={workspace} />;
 }
 
 function Composer({ workspace }: { workspace: Workspace }) {
   const { user, refreshSessions } = useApp();
   const workspacePath = `/api/workspaces/${segment(workspace.id)}`;
-  const own = useResource<{ agents: AgentVersion[] }>("/api/agents");
-  const published = useResource<{ agents: AgentVersion[] }>(`${workspacePath}/agents`);
   const models = useResource<{ models: ModelDefinition[] }>(`${workspacePath}/models`);
   const connections = useConnections(`${workspacePath}/connectors`);
   const repos = useWorkspaceRepositories(workspace.id);
 
-  const [handoff] = useState(() => readStorage(() => sessionStorage, HANDOFF_KEY));
   const [lastStart] = useState(() => readStorage(() => localStorage, LAST_START_KEY));
-  useEffect(() => { writeStorage(() => sessionStorage, HANDOFF_KEY, null); }, []);
 
   const [choice, setChoice] = useState("");
   const [content, setContent] = useState("");
@@ -90,54 +77,39 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   const modelList = models.data?.models;
   const connectors = connections.data?.connectors;
-  // Runnable: your own private versions whose model this workspace offers, plus versions published here.
-  const versions = useMemo(() => {
-    const workspaceModelIds = new Set((modelList ?? []).map(model => model.id));
-    const privateVersions = (own.data?.agents ?? []).filter(agent => !agent.workspaceId && agent.authorId === user.id && workspaceModelIds.has(agent.modelId));
-    return [...privateVersions, ...(published.data?.agents ?? [])];
-  }, [own.data, published.data, modelList, user.id]);
-  // Hosts with a model you can use here, yours first. Starting on one needs no agent: just a model.
+  // Hosts with a model you can use here, yours first.
   const hosts = useMemo(() => {
     const offering = new Set((modelList ?? []).map(model => model.connectorId));
     return (connectors ?? []).filter(host => offering.has(host.id) && !host.revokedAt)
       .sort((a, b) => Number(b.ownerId === user.id) - Number(a.ownerId === user.id));
   }, [connectors, modelList, user.id]);
-  const agentsLoading = own.loading || published.loading || models.loading;
-  const agentsError = own.error || published.error || models.error;
-
-  // `host:<connector id>` chats with a model on that host; `agent:<version id>` runs an agent on its pinned model.
+  // The chosen host, else the one the last session started on, else the first online one.
   const remembered = lastStart.startsWith("model:") ? modelList?.find(model => model.id === lastStart.slice(6)) : undefined;
-  const preferredVersion = findVersion(versions, handoff) ?? (lastStart.startsWith("agent:") ? findVersion(versions, lastStart.slice(6)) : undefined);
-  const preferredHost = hosts.find(host => host.id === remembered?.connectorId) ?? hosts.find(host => host.online) ?? hosts[0];
-  const startKeys = new Set([...hosts.map(host => `host:${host.id}`), ...versions.map(version => `agent:${version.id}`)]);
-  const startKey = [choice, preferredVersion && `agent:${preferredVersion.id}`, preferredHost && `host:${preferredHost.id}`, versions[0] && `agent:${versions[0].id}`]
-    .find(key => key && startKeys.has(key)) ?? "";
-  const version = startKey.startsWith("agent:") ? versions.find(item => item.id === startKey.slice(6)) : undefined;
-  const agentModel = version && modelList?.find(item => item.id === version.modelId);
-  const host = startKey.startsWith("host:") ? hosts.find(item => item.id === startKey.slice(5)) : connectors?.find(item => item.id === agentModel?.connectorId);
+  const host = hosts.find(item => item.id === choice)
+    ?? hosts.find(item => item.id === remembered?.connectorId) ?? hosts.find(item => item.online) ?? hosts[0];
+  const hostKey = host?.id ?? "";
   const hostModel = (wanted?: { provider: string; modelId: string }) => wanted && host && host.models.some(item => sameModel(item, wanted))
     ? modelList?.find(item => item.connectorId === host.id && sameModel(item, wanted)) : undefined;
-  // Picks belong to one start choice; switching starts from its model again: the agent's, else the model last
-  // started on this host, else the host's first model.
+  // Picks belong to one host; switching starts from its model again: the model last started on this host, else the
+  // host's first model.
   const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
-  const initialModel = version ? agentModel : hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
+  const initialModel = hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
   // The level the host's Pi starts that model at, as the session itself will.
   const initialLevel = initialModel && host?.models.find(item => sameModel(item, initialModel))?.thinkingLevel;
-  const selection: ChatSelection = chat?.key === startKey ? chat.value
+  const selection: ChatSelection = chat?.key === hostKey ? chat.value
     : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "approval" };
-  // An agent pins its own model; without one, the session starts on the model picked here.
-  const model = version ? agentModel : hostModel(selection.model);
+  // The session starts on the model picked here, one the host offers.
+  const model = hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);
-  const availableModel = Boolean(model && host?.models.some(item => sameModel(item, model)));
-  const available = Boolean(host?.online && !host.revokedAt && availableModel && (host.ownerId === user.id || host.workspaceIds.includes(workspace.id)));
+  const available = Boolean(host?.online && !host.revokedAt && model && (host.ownerId === user.id || host.workspaceIds.includes(workspace.id)));
   const repositories = repos.repositories;
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
   const attachments = useAttachments(imagesUnavailable(host));
 
-  // A trust acknowledgement covers one start choice on one host against one repository set.
-  useEffect(() => { setTrustedHost(""); }, [startKey, host?.id, host?.ownerId, repositories]);
+  // A trust acknowledgement covers one host against one repository set.
+  useEffect(() => { setTrustedHost(""); }, [hostKey, host?.ownerId, repositories]);
 
   useLayoutEffect(() => {
     const element = input.current;
@@ -152,13 +124,12 @@ function Composer({ workspace }: { workspace: Workspace }) {
     const message = content.trim();
     const pasted = attachments.images;
     const options = chatOptionsBody(host, selection, "submit");
-    const from = version ? { agentVersionId: version.id } : { modelId: model.id };
     void action.run(async () => {
       // Before the session exists: an image that can't be read stops the start instead of leaving a session behind.
       const images = await encodeImages(pasted);
-      const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, ...from, title: deriveTitle(content, version?.name ?? model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
+      const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, modelId: model.id, title: deriveTitle(content, model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
       const sessionId = result.session.id;
-      writeStorage(() => localStorage, LAST_START_KEY, version ? `agent:${version.id}` : `model:${model.id}`);
+      writeStorage(() => localStorage, LAST_START_KEY, `model:${model.id}`);
       if (message || images.length) {
         try {
           await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}),
@@ -182,22 +153,16 @@ function Composer({ workspace }: { workspace: Workspace }) {
   }
 
   const workspaceSettings = href({ name: "settings", section: "workspaces", id: workspace.id });
-  const hostName = (version: AgentVersion) => {
-    const connectorId = modelList?.find(item => item.id === version.modelId)?.connectorId;
-    return connectors?.find(item => item.id === connectorId)?.name ?? "No host";
-  };
 
   function blockingAlert() {
     if (repos.error) return <Alert variant="warning" title="Unable to load repositories" actions={<Button variant="outline" size="sm" onClick={repos.refresh}>Retry</Button>}>{repos.error}</Alert>;
     if (repositories && !repositories.length && repos.required) return <Alert variant="warning" title="No repositories in this workspace" actions={<LinkButton variant="outline" size="sm" href={workspaceSettings}>Add repository</LinkButton>}>Sessions need at least one repository. Workspace owners and admins can bind one in workspace settings.</Alert>;
-    if (agentsError) return <Alert variant="error" title="Unable to load models and agents" actions={<Button variant="outline" size="sm" onClick={() => { own.refresh(); published.refresh(); models.refresh(); }}>Retry</Button>}>{agentsError}</Alert>;
-    if (!agentsLoading && !connections.loading && !connections.error && !hosts.length && !versions.length) return <Alert variant="info" title="No host to chat with yet" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "hosts" })}>Pair a host</LinkButton>}>Pair your own Pi to chat with its models, or ask a workspace member to share their host here.</Alert>;
-    if (!startKey || connections.loading || !modelList) return null;
+    if (models.error) return <Alert variant="error" title="Unable to load models" actions={<Button variant="outline" size="sm" onClick={models.refresh}>Retry</Button>}>{models.error}</Alert>;
+    if (!models.loading && !connections.loading && !connections.error && !hosts.length) return <Alert variant="info" title="No host to chat with yet" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "hosts" })}>Pair a host</LinkButton>}>Pair your own Pi to chat with its models, or ask a workspace member to share their host here.</Alert>;
+    if (!host || connections.loading || !modelList) return null;
     const refreshHost = <Button variant="outline" size="sm" onClick={connections.refresh}>Refresh host status</Button>;
     if (connections.error) return <Alert variant="warning" title="Unable to check host" actions={refreshHost}>{connections.error}</Alert>;
-    if (!host) return <Alert variant="warning" title="No available host for this agent" actions={refreshHost}>Connect your own Pi, ask the host owner to share access, or save a revision with a model available to you.</Alert>;
     if (!model) return <Alert variant="warning" title={`No model on ${host.name}`} actions={refreshHost}>{host.name} offers no model you can use in this workspace.</Alert>;
-    if (!availableModel) return <Alert variant="warning" title="Model no longer offered" actions={refreshHost}>This pinned model is no longer offered by {host.name}. Ask the host owner to restore it; no substitute will be chosen.</Alert>;
     if (!available) return <Alert variant="warning" title={`${host.name} is unavailable`} actions={refreshHost}>{host.revokedAt ? "This host was revoked." : !host.online ? "It must reconnect before work can run." : "This host isn't shared with this workspace."}</Alert>;
     if (foreign) return <Alert variant="warning" title={`Hosted by ${host.ownerName}`}>
       <label className="check-row new-session-trust">
@@ -229,18 +194,17 @@ function Composer({ workspace }: { workspace: Workspace }) {
         <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message" autoFocus />
         {attachments.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
         <div className="composer-toolbar">
-          <Combobox label="Host or agent" placeholder={agentsLoading || connections.loading ? "Loading..." : "Choose a host or agent"} disabled={!startKeys.size} value={startKey}
-            options={[...hosts.map(item => ({ value: `host:${item.id}`, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` })),
-              ...versions.map(item => ({ value: `agent:${item.id}`, label: item.name, hint: `Agent v${item.version} · ${hostName(item)}` }))]}
+          <Combobox label="Host" placeholder={models.loading || connections.loading ? "Loading..." : "Choose a host"} disabled={!hosts.length} value={hostKey}
+            options={hosts.map(item => ({ value: item.id, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` }))}
             onChange={setChoice} />
           <DropdownMenu label="Visibility" align="start" items={visibilityItems} trigger={<><Icon name={visibility === "workspace" ? "globe" : "lock"} size={14} />{visibility === "workspace" ? "Workspace" : "Private"}</>} />
           <InfoTip label="Who can see and do what">
             <div className="stack">
               <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Asking the agent, invoking tools, or controlling the session needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
-              <p>You are the session owner; the agent author and host owner are separate roles. Viewing never grants access to your Git accounts, and visibility does not share your Pi host, private agent, or local models.</p>
+              <p>You are the session owner; the host owner is a separate role. Viewing never grants access to your Git accounts, and visibility does not share your Pi host or local models.</p>
             </div>
           </InfoTip>
-          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: startKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
+          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: hostKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
           <span className="spacer" />
           {action.busy && <Loading>Preparing repositories...</Loading>}
           <Button type="submit" variant="default" icon="send" className="composer-send" aria-label="Start session" title="Start session" disabled={!canStart} />
@@ -252,7 +216,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
       {action.busy
         ? <span role="status">Resolving repository commits and downloading snapshots to the Pi host's private session cache. The agent starts once every repository is ready.</span>
         : <>
-          {startKey && (connections.loading || models.loading ? <Loading>Checking host...</Loading> : host && <>
+          {host && (connections.loading || models.loading ? <Loading>Checking host...</Loading> : <>
             <ConnectionStatus connector={host} />
             <span>{host.name}</span>
             <span>·</span>
@@ -263,7 +227,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
               <div className="stack">
                 <p>Model: {model?.name} <span className="muted">{model?.provider} / {model?.modelId}</span></p>
                 <p className="muted small">Host owner: <HostOwner workspaceId={workspace.id} ownerId={host.ownerId} /><br />Connection ID: {host.id}</p>
-                <p>This creates a new session, not access to the host's personal Pi history or old sessions. Publishing an agent does not grant use of its host. Your Git account credentials are not sent to the host; model credentials stay on it.</p>
+                <p>This creates a new session, not access to the host's personal Pi history or old sessions. Your Git account credentials are not sent to the host; model credentials stay on it.</p>
               </div>
             </InfoTip>
           </>)}
