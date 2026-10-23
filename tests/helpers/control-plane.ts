@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Duplex } from "node:stream";
@@ -6,6 +7,7 @@ import type { Database, Query } from "../../apps/server/src/db/types.js";
 import type { ConnectorHub } from "../../apps/server/src/connector-hub-types.js";
 import type { ConnectorRelayEnvelope } from "../../apps/server/src/connector-transport.js";
 import type { ObjectMetadata, ObjectStorage, StoredObject } from "../../apps/server/src/storage/types.js";
+import type { AgentVersion, ToolName } from "../../packages/shared/src/types.js";
 
 export interface TestDatabase {
   /** The provider handed to `Env.DB`; every `query()` call is observed. */
@@ -96,4 +98,48 @@ export function fakeHub(options: FakeHubOptions = {}): FakeHub {
     async revoke(connectorId) { revoked.push(connectorId); },
     async close() {},
   };
+}
+
+export interface SeededAgent {
+  authorId: string;
+  modelId: string;
+  tools: readonly ToolName[];
+  /** Set for a version published to that workspace. */
+  workspaceId?: string | null;
+  instructions?: string;
+  name?: string;
+}
+
+/**
+ * An agent version saved before agents were removed. Sessions started from one keep its tools and instructions and
+ * still run; sessions started now get a chat agent with every tool their host carries.
+ */
+export function seedAgentVersion(sqlite: DatabaseSync, input: SeededAgent): AgentVersion {
+  const agent: AgentVersion = { id: randomUUID(), agentId: randomUUID(), authorId: input.authorId, workspaceId: input.workspaceId ?? null,
+    version: 1, name: input.name ?? "Saved agent", description: "", instructions: input.instructions ?? "", tools: [...input.tools],
+    modelId: input.modelId, createdAt: new Date().toISOString() };
+  sqlite.prepare("INSERT INTO agents (id, author_id, created_at) VALUES (?, ?, ?)").run(agent.agentId, agent.authorId, agent.createdAt);
+  sqlite.prepare(`INSERT INTO agent_versions
+      (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(agent.id, agent.agentId, agent.authorId, agent.workspaceId, agent.version, agent.name,
+    agent.description, agent.instructions, JSON.stringify(agent.tools), agent.modelId, agent.createdAt);
+  return agent;
+}
+
+/**
+ * A session started from a saved agent before agents were removed: a copy of the session `sessionId` (owner, host,
+ * repositories, visibility and status) that runs `agent`, which must be on the same model. Returns the copy's id.
+ */
+export function seedSavedAgentSession(sqlite: DatabaseSync, sessionId: string, agent: AgentVersion, id: string = randomUUID()): string {
+  const copied = sqlite.prepare(`INSERT INTO sessions
+      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id,
+        repositories_json, visibility, repository_mode)
+    SELECT ?, s.workspace_id, s.owner_id, a.id, s.title, s.policy_version, s.status, s.created_at, s.connector_id, s.connector_owner_id,
+      s.repositories_json, s.visibility, s.repository_mode
+    FROM sessions s
+    JOIN agent_versions pinned ON pinned.id = s.agent_version_id
+    JOIN agent_versions a ON a.id = ? AND a.model_id = pinned.model_id
+    WHERE s.id = ?`).run(id, agent.id, sessionId);
+  if (copied.changes !== 1) throw new Error("The saved agent must be on the session's model.");
+  return id;
 }
