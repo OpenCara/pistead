@@ -91,6 +91,8 @@ test('sharing migration backfills every populated share without creating new gra
   ]);
   assert.deepEqual(sqlite.prepare('PRAGMA foreign_key_check').all(), []);
   assert.equal(sqlite.prepare('PRAGMA foreign_keys').get()!.foreign_keys, 1);
+  // Today's access checks read columns later migrations add.
+  migrate(sqlite, migrationFiles.filter(file => file > sharingMigration));
   // Read the migrated file through the real provider; it must not re-run the hand-applied migrations.
   const db = await openDatabase(`sqlite://${path}`);
   t.after(() => db.close());

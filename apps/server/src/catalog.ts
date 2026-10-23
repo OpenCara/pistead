@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
 import type { ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
-import { auditStatement, modelDefinition, requireMember } from './db.js';
+import { auditAfterChange, auditStatement, modelDefinition, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
 import { ConstraintError, type Query } from './db/types.js';
@@ -77,7 +77,7 @@ function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id
       JOIN connector_workspaces cw ON cw.connector_id = c.id AND cw.workspace_id = m.workspace_id
       JOIN workspace_members host ON host.workspace_id = cw.workspace_id AND host.user_id = c.owner_id
       JOIN users host_user ON host_user.id = c.owner_id
-      WHERE c.id = m.connector_id AND c.owner_id = m.connector_owner_id AND c.revoked_at IS NULL
+      WHERE c.id = m.connector_id AND c.owner_id = m.connector_owner_id AND c.revoked_at IS NULL AND host_user.suspended_at IS NULL
         AND (? = 1 OR host_user.auth_kind <> 'test')
         AND (c.owner_id = ${actor} OR EXISTS (SELECT 1 FROM connector_shares sh
           WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
@@ -94,16 +94,6 @@ export async function requireModel(env: Env, modelId: string, actorId: string): 
     .bind(actorId, modelId, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0).first();
   if (!model) fail(404, 'not_found', 'Model not found.');
   return model;
-}
-
-function auditAfterChange(
-  env: Env, actorId: string, action: string, workspaceId: string | null,
-  detail: Record<string, unknown>, auditId = id(),
-): Query<never> {
-  // This must immediately follow a single-row mutation in the same atomic batch.
-  return env.DB.query<never>(`INSERT INTO audit (id, workspace_id, session_id, actor_id, action, detail_json, created_at)
-    SELECT ?, ?, NULL, ?, ?, ?, ? WHERE changes() = 1`)
-    .bind(auditId, workspaceId, actorId, action, JSON.stringify(detail), now());
 }
 
 function privateVersionStatement(

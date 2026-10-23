@@ -161,8 +161,9 @@ class ConnectorRelay {
   }
 
   async revoke(): Promise<void> {
-    const row = await this.env.DB.query<{ revoked_at: string | null }>('SELECT revoked_at FROM connectors WHERE id = ?').bind(this.connectorId).first();
-    if (row && !row.revoked_at) fail(409, 'not_revoked', 'Revoke the connector before closing its connection.');
+    const row = await this.env.DB.query<{ revoked_at: string | null; suspended_at: string | null }>(`SELECT c.revoked_at, u.suspended_at
+      FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.id = ?`).bind(this.connectorId).first();
+    if (row && !row.revoked_at && !row.suspended_at) fail(409, 'not_revoked', 'Revoke the connector before closing its connection.');
     if (this.current) await this.disconnect(this.current, 403, 'Connector revoked');
   }
 

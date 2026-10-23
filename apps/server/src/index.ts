@@ -19,6 +19,7 @@ import { registerPushIdentities } from './push/identities.js';
 import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
 import { registerDataExports } from './data-export.js';
 import { registerNetworkPolicies } from './network.js';
+import { registerAdmin } from './admin.js';
 import { compression } from './compression.js';
 
 export const app = new Hono<WorkerEnv>();
@@ -74,6 +75,7 @@ registerHostMigrations(app);
 registerWorkspaceDatabases(app);
 registerDataExports(app);
 registerNetworkPolicies(app);
+registerAdmin(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));
 
 export default app;
