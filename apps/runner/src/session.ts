@@ -644,17 +644,26 @@ export class RunnerSession {
   }
 
   /**
-   * Ends the runs whose work Pi parked: host crashes cut a task of their conversation off `restartLimit` times in a
-   * row, so Pi stopped running it rather than crash the host again. Left alone, such a run would hold the session for
-   * good. It ends as a stop would, aborted before the scheduler starts, and says why; sending it again runs it afresh.
+   * Ends the work Pi parked: host crashes cut each of these tasks off `restartLimit` times in a row, so Pi stopped
+   * running it rather than crash the host again. A parked task of a run's own work would hold the session for good:
+   * that run ends as a stop would, and says why; sending it again runs it afresh. Background work, such as an automatic
+   * compaction, belongs to no run and leaves the run alone. Every parked task is aborted, before the scheduler starts,
+   * so none stays parked into later opens.
    */
   private async endParkedRuns(): Promise<void> {
-    const parked = new Set((await this.harness.inspect(context)).tasks
-      .filter(task => task.state.kind === "blocked" && task.state.reason === "restart_limit").map(task => Number(task.record.conversationId)));
-    if (!parked.size) return;
-    const runs = Object.values((await this.metadata()).runs).filter(run => (run.status === "running" || run.status === "admitting") && parked.has(run.conversationId));
+    const tasks = (await this.harness.inspect(context)).tasks;
+    const parked = tasks.filter(task => task.state.kind === "blocked" && task.state.reason === "restart_limit").map(task => task.record);
+    if (!parked.length) return;
+    // A child task is background work when the task that owns it, or one above that, is.
+    const records = new Map(tasks.map(task => [String(task.record.id), task.record]));
+    const background = (record: (typeof parked)[number] | undefined): boolean => !!record && (record.background || (record.owner !== undefined && background(records.get(String(record.owner)))));
+    const conversations = new Set(parked.filter(record => !background(record)).map(record => Number(record.conversationId)));
+    const runs = Object.values((await this.metadata()).runs).filter(run => (run.status === "running" || run.status === "admitting") && conversations.has(run.conversationId));
     for (const id of new Set(runs.map(run => run.conversationId))) await (await this.harness.conversation(id as ConversationId, context))?.abort(context);
     if (runs.length) await this.mutate(meta => { for (const run of runs) Object.assign(meta.runs[run.key]!, { status: "interrupted", crashed: true }); });
+    // What those aborts did not end: background work, and work no running message holds. Its abort handler runs once
+    // the scheduler starts.
+    for (const record of parked) await this.harness.abortTask(record.id, context);
   }
 
   private openStorage(): Promise<Storage> {

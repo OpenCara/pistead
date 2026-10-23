@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
-import { createRegistry, defineDoc, Harness, type ConversationId } from "@earendil-works/pi-durable";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
+import { createRegistry, defineDoc, Harness, type ConversationId, type TaskInspection } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { sha256 } from "../packages/shared/src/crypto.js";
 import type { AuthorizationRequest, Permission, RunnerAction, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult } from "../packages/shared/src/types.js";
@@ -682,35 +684,57 @@ test("synthetic post-submit activation crash window reuses pi requestId rather t
   });
 });
 
+/**
+ * Storage a test can crash: from `crash()` on, every call fails, which fails the Harness without the close that would
+ * write its running tasks back, as a host that died mid-message would. `crash()` then reopens the session.
+ */
+function crashableStorage() {
+  let crashed = () => {};
+  return {
+    async open(path: string) {
+      const storage = await openNodeSqliteStorage(path);
+      let dead = false;
+      crashed = () => { dead = true; };
+      return new Proxy(storage, { get(target, key) {
+        const value: unknown = Reflect.get(target, key);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => dead && key !== "close" ? Promise.reject(new Error("simulated host crash")) : value.apply(target, args);
+      } });
+    },
+    async crash(session: RunnerSession) {
+      crashed();
+      // A commit fails the Harness, unless running work hit the crash first.
+      await assert.rejects(session.consumeTicket(await ticket(session.binding.session.id, "view")), /simulated host crash|Session failed/);
+      for (let count = 0; count < 250 && !session.failed; count++) await delay(20);
+      assert.equal(session.failed, true);
+      await session.recover();
+    },
+  };
+}
+
+/** A test seam: the open Harness's own view of its tasks. */
+async function tasks(session: RunnerSession): Promise<readonly TaskInspection[]> {
+  return (await (session as unknown as { harness: Harness }).harness.inspect(context)).tasks;
+}
+
+/** Waits until a task `which` picks is running. */
+async function running(session: RunnerSession, which: (task: TaskInspection) => boolean, what: string): Promise<void> {
+  const found = async () => (await tasks(session)).some(task => task.state.kind === "running" && which(task));
+  for (let count = 0; count < 250 && !(await found()); count++) await delay(20);
+  assert.ok(await found(), `${what} must be running`);
+}
+
 test("a message whose work host crashes cut off again and again ends, says why, and the next message runs", options, async t => {
-  // A crash leaves the running tasks as they were stored: storage that fails every call from some point on fails the
-  // Harness without the close that would write them back, as a host that died mid-message would.
-  let crash = () => {};
-  const f = await fixture(t, { config: { openStorage: async path => {
-    const storage = await openNodeSqliteStorage(path);
-    let crashed = false;
-    crash = () => { crashed = true; };
-    return new Proxy(storage, { get(target, key) {
-      const value: unknown = Reflect.get(target, key);
-      if (typeof value !== "function") return value;
-      return (...args: unknown[]) => crashed && key !== "close" ? Promise.reject(new Error("simulated host crash")) : value.apply(target, args);
-    } });
-  } } });
+  const storage = crashableStorage();
+  const f = await fixture(t, { config: { openStorage: path => storage.open(path) } });
   const crashing = await submit(f.session, OWNER, "write", { content: "TEST_HOLD 1000", requestId: "crashing" });
-  // A test seam: the open Harness's own view of its tasks says when the model is answering.
-  const answering = async () => (await (f.session as unknown as { harness: Harness }).harness.inspect(context)).tasks.some(task => task.state.kind === "running");
   let crashes = 0;
   while (queue(await f.session.view())[0]?.status !== "interrupted") {
     assert.ok(crashes < 10, "the runner must end the message");
     // The host goes down while the model answers the message.
-    for (let count = 0; count < 250 && !(await answering()); count++) await delay(20);
-    assert.ok(await answering(), "the message's model request must be running");
-    crash();
-    await assert.rejects(f.session.consumeTicket(await ticket(f.session.binding.session.id, "view")), /simulated host crash/);
-    for (let count = 0; count < 250 && !f.session.failed; count++) await delay(20);
-    assert.equal(f.session.failed, true);
+    await running(f.session, () => true, "the message's model request");
+    await storage.crash(f.session);
     crashes++;
-    await f.session.recover();
   }
   assert.equal(crashes, 5, "Pi parks a task cut off five times in a row (settings.restartLimit) when it next opens");
   let view = await idle(f.session);
@@ -744,4 +768,46 @@ test("sessions compact by the host's Pi compaction settings, per model where it 
   assert.equal(await compactions({ modelOverrides: { "faux/other-model": always } }), 0, "another model's override does not apply");
   assert.ok(await compactions(always) > 0, "a host-wide threshold applies to every model");
   assert.equal(await compactions({ ...always, enabled: false }), 0, "the host's Pi can turn automatic compaction off");
+});
+
+test("parked background work, such as a compaction, is aborted without ending the message that is running", options, async t => {
+  const storage = crashableStorage();
+  // A model that takes a second to summarize, and to answer "hold"; it answers anything else at once.
+  const faux = fauxProvider({ models: [{ id: "queue-faux", name: "Deterministic test provider (not an LLM)" }] });
+  const respond: FauxResponseFactory = async request => {
+    faux.appendResponses([respond]);
+    const summarizing = request.messages.some(message => message.role === "system" && String(message.content).startsWith("You are a context summarization assistant"));
+    const prompt = request.messages.findLast(message => message.role === "user");
+    const text = typeof prompt?.content === "string" ? prompt.content : prompt?.content.map(part => part.type === "text" ? part.text : "").join("");
+    if (summarizing || text === "hold") await delay(1000);
+    return fauxAssistantMessage(summarizing ? "Summary." : "Answered.");
+  };
+  faux.setResponses([respond]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const f = await fixture(t, { config: { openStorage: path => storage.open(path),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    // Every request with older entries starts a compaction in the background, keeping nothing verbatim.
+    compaction: { reserveTokens: 1000, keepRecentTokens: 0, backgroundTokens: Number.MAX_SAFE_INTEGER } } });
+  for (const requestId of ["first", "second"]) {
+    await submit(f.session, OWNER, "write", { content: requestId, requestId });
+    await idle(f.session);
+  }
+  const compacting = (task: TaskInspection) => task.record.background;
+  // The host goes down four times while the second message's compaction summarizes, then a fifth while a message runs too.
+  for (let crash = 0; crash < 4; crash++) {
+    await running(f.session, compacting, "the background compaction");
+    await storage.crash(f.session);
+  }
+  await running(f.session, compacting, "the background compaction");
+  const held = await submit(f.session, OWNER, "write", { content: "hold", requestId: "held" });
+  await running(f.session, task => !compacting(task), "the held message's model request");
+  await storage.crash(f.session);
+  const view = await idle(f.session);
+  assert.deepEqual(queue(view).map(run => run.status), ["settled", "settled", "settled"], "only the message's own work ends it");
+  assert.equal(view.entries.some(entry => entry.kind === "workspace.run-crashed"), false);
+  assert.ok(view.entries.some(entry => entry.conversationId === held.conversationId && entry.role === "assistant" && entry.text === "Answered."));
+  // The parked compaction was aborted, so no later open finds it.
+  for (let count = 0; count < 250 && (await tasks(f.session)).length; count++) await delay(20);
+  assert.deepEqual(await tasks(f.session), []);
 });
