@@ -13,16 +13,10 @@ export interface GitCredential {
   token: string;
 }
 
-/** A pinned or bound repository on one provider. `id` is the provider-stable identity as a string. */
+/** A bound repository on one provider. `id` is the provider-stable identity as a string. */
 export interface RepositoryRef {
   id: string;
   fullName: string;
-}
-
-export interface RepositoryArchive {
-  bytes: Uint8Array<ArrayBuffer>;
-  /** tar.gz archives must already have exactly one top-level directory; zip archives are converted by the caller. */
-  format: 'tar.gz' | 'zip';
 }
 
 /**
@@ -31,7 +25,7 @@ export interface RepositoryArchive {
  *   other non-2xx, malformed JSON or network errors -> 502 `git_provider_unavailable` / `invalid_git_response`
  * Requests use redirect: 'manual'; a redirect is followed only where the method documents it, and credentials are
  * never sent to a different origin. Bodies are bounded (JSON 512 KiB, repository list pages 2 MiB and Azure DevOps'
- * unpaged listing 4 MiB, archives repositoryLimits.archiveBytes).
+ * unpaged listing 4 MiB).
  */
 export interface GitProviderAdapter {
   /** Confirms the token works and returns the provider's account name. */
@@ -42,6 +36,4 @@ export interface GitProviderAdapter {
   repository(credential: GitCredential, repository: RepositoryRef): Promise<ProviderRepository>;
   /** Resolves a branch, tag or commit to an immutable 40-hex commit SHA. */
   commit(credential: GitCredential, repository: RepositoryRef, ref: string): Promise<string>;
-  /** Snapshot of exactly `commit`. */
-  archive(credential: GitCredential, repository: RepositoryRef, commit: string): Promise<RepositoryArchive>;
 }

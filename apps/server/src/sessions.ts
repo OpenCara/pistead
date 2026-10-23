@@ -8,14 +8,14 @@ import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import { redactApproval } from '../../../packages/shared/src/redaction.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
+import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import { parseOperation } from './operations.js';
 import { requireConnectorSession } from './connectors.js';
 import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
-import { cloneRepositories, legacyRepositoryFixture, resolveWorkspaceRepositories } from './repositories.js';
+import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
 import { invalidateSessionView, sessionView, viewChanges } from './view-feed.js';
@@ -142,6 +142,18 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
   return response;
 }
 
+/**
+ * Why a session's agent can't run shell commands on its host, and so can't clone the workspace's repositories; undefined
+ * when it can. Such a session works in an empty worktree.
+ */
+export function cloneUnavailable(capabilities: ConnectorCapabilities, hostOwnerId: string | null, ownerId: string, tools: readonly string[]): string | undefined {
+  if (!tools.includes('bash')) return 'This session\'s agent doesn\'t have the bash tool, so it can\'t clone the workspace\'s repositories and works in an empty worktree.';
+  if (capabilities.productionShell !== true && hostOwnerId !== ownerId) {
+    return 'This session\'s host runs shell commands only for its owner, as it has no resource limits, so the agent can\'t clone the workspace\'s repositories and works in an empty worktree.';
+  }
+  return undefined;
+}
+
 export function registerSessions(app: Hono<WorkerEnv>): void {
   app.get('/api/sessions', async c => {
     const actorId = c.get('auth').userId;
@@ -182,38 +194,37 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const session = { id: id(), workspace_id: workspaceId, owner_id: ownerId, title, visibility, policy_version: 1, status: 'provisioning' as const,
       created_at: now(), connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
     if (agent && session.connector_id) await requireConnectorSession(c.env, session.connector_id, { ...session, agent_version_id: agent.id });
-    // Older connectors only understand GitHub pins; refuse before contacting any provider.
     const host = session.connector_id
       ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(session.connector_id).first()
       : null;
     const capabilities = JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities;
-    const gitProviders = !session.connector_id || capabilities.gitProviders === true;
+    // Every session clones its repositories with plain Git; a connector from before that can't run one.
+    if (session.connector_id && capabilities.plainGit !== true) {
+      fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
+    }
     // Older connectors cannot carry approved pushes; refuse agents that would offer git_push.
     if (agent && session.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') && capabilities.gitPush !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use git_push.');
     }
     if (agent && session.connector_id) {
       const tools = JSON.parse(agent.tools_json) as string[];
-      if ((tools.includes('host_bash') && !capabilities.hostCommands) || (tools.includes('git_repin') && !capabilities.gitRepin)) {
-        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use host_bash and git_repin.');
+      if (tools.includes('host_bash') && !capabilities.hostCommands) {
+        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to use host_bash.');
       }
     }
-    // A sandboxed host that can run this owner's shell commands starts the session without pins: its agent clones the
-    // workspace's repositories with plain Git through the host's egress proxy. Elsewhere repositories are pinned.
-    // An agent without bash (a chat agent always has it) keeps pinned repositories, which its file and Git tools can use.
-    const clone = !!session.connector_id && capabilities.plainGit === true && capabilities.sandbox === true && !capabilities.unsandboxed
-      && (capabilities.productionShell === true || session.connector_owner_id === ownerId)
-      && (!agent || (JSON.parse(agent.tools_json) as string[]).includes('bash'));
-    const resolved = clone ? await cloneRepositories(c.env, workspaceId, ownerId) : await resolveWorkspaceRepositories(c.env, workspaceId, ownerId, { gitProviders });
+    // Every session starts empty, pinning nothing: its agent clones the workspace's repositories with plain Git, through
+    // the host's egress proxy on a sandboxed host or with the host's own Git where its owner runs it unsandboxed. An
+    // agent that can't run shell commands there can't clone, and works in an empty worktree (cloneUnavailable says why).
+    const resolved = await cloneRepositories(c.env, workspaceId, ownerId);
     // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind.
     agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities);
-    const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: JSON.stringify(resolved.repositories),
-      repository_mode: clone ? 'clone' : null };
+    const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone' };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
-    const providerPins = resolved.repositories.some(repository => 'provider' in repository) ? 1 : 0;
+    const providerPins = 0;
+    const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
     await requireMember(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
-    // Admit pins only while every exact owner credential used to resolve them is still current.
+    // Admit the session only while its workspace's repositories, membership and host are as they were checked.
     const inserted = await c.env.DB.query(`INSERT INTO sessions
       (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
@@ -244,8 +255,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
         row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null,
         workspaceId, ownerId, workspaceId, resolved.bindingIds,
-        // Real owners need pinned repositories or a clone session; other empty sessions are synthetic test-mode fixtures only.
-        ownerId, clone || resolved.repositories.length ? 1 : 0, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
+        // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
+        ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
         resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
         JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
         row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
@@ -263,7 +274,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       await auditStatement(c.env, ownerId, 'session.provision_failed', workspaceId, row.id).run();
       throw error;
     }
-    return c.json({ session: sessionRecord(row, [...permissions]) }, 201);
+    return c.json({ session: { ...sessionRecord(row, [...permissions]), ...(notice ? { cloneUnavailable: notice } : {}) } }, 201);
   });
 
   app.get('/api/sessions/:id', async c => {
@@ -274,9 +285,14 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       : null;
     const capabilities: unknown = host ? JSON.parse(host.capabilities_json) : null;
     const hostUnsandboxed = typeof capabilities === 'object' && capabilities !== null && 'unsandboxed' in capabilities && capabilities.unsandboxed === true;
+    // A clone session whose agent can't run shell commands on its host learns why it can't clone.
+    const agent = access.row.repository_mode === 'clone' && access.row.connector_id && capabilities
+      ? await c.env.DB.query<{ tools_json: string }>('SELECT tools_json FROM agent_versions WHERE id = ?').bind(access.row.agent_version_id).first() : null;
+    const notice = agent ? cloneUnavailable(capabilities as ConnectorCapabilities, access.row.connector_owner_id ?? null, access.row.owner_id, JSON.parse(agent.tools_json) as string[]) : undefined;
     // Everyone who can view the session learns that its shared conversation is also visible to anyone with its link.
     const linkShared = await isLinkShared(c.env, access.row.id);
-    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}), ...(linkShared ? { linkShared } : {}) } });
+    return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}), ...(linkShared ? { linkShared } : {}),
+      ...(notice ? { cloneUnavailable: notice } : {}) } });
   });
   app.patch('/api/sessions/:id', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
@@ -356,6 +372,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   for (const mode of ['submit', 'ask'] as const) {
     app.post(`/api/sessions/:id/${mode}`, async c => {
       const { row } = await requireSession(c, identifier(c.req.param('id')), mode === 'ask' ? 'ask' : 'write');
+      // Before an admission is issued: a read-only session runs nothing.
+      requireUnfrozen(row);
       const input = await jsonObject(c);
       if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
       const content = text(input.content, 'content', 60000);
@@ -387,6 +405,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.post('/api/sessions/:id/approvals/:approvalId', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'approve');
+    requireUnfrozen(row);
     const approvalId = identifier(c.req.param('approvalId'), 'approvalId');
     const input = await jsonObject(c);
     if (input.decision !== 'approve' && input.decision !== 'deny') fail(400, 'invalid_decision', 'Expected approve or deny.');
@@ -403,7 +422,6 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (operation.kind === 'host.bash' && (!row.connector_id || c.get('auth').userId !== row.connector_owner_id)) {
       fail(403, 'host_owner_required', 'Only the host owner can decide host commands. Grant the host owner approve access to this session first.');
     }
-    if (operation.kind === 'git.repin' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can decide a repin.');
     // A permission request lets a tool call do more than the session allows, so only its owner decides it.
     if (operation.kind === 'permission') {
       if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can allow more than the session allows.');
@@ -419,7 +437,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       await reviewedApproval(c, row, approvalId, input.reviewHash);
       const fresh = await requireSession(c, row.id, 'approve');
       if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-      if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'git.push' || operation.kind === 'git.repin') {
+      if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'git.push') {
         const existing = await c.env.DB.query('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');
         brokerCapability = randomToken();

@@ -8,7 +8,7 @@ import { ConnectionStatus, HostCapabilities, type ConnectionsResource } from "./
 import { MoveHostSection } from "./host-migration";
 import { Icon } from "./icons";
 import { Username, usePeople } from "./people";
-import { RepositorySnapshotPolicy } from "./repositories";
+import { RepositoryClonePolicy } from "./repositories";
 import { href } from "./router";
 import {
   Alert, Button, CardBody, Collapsible, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, RelativeTime,
@@ -286,7 +286,7 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <RepositoriesSection session={session} refresh={refresh} />
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
-    {isOwner && session.status !== "archived" && session.connectorId && <MoveHostSection session={session} user={user} hosts={hosts} openSession={openSession} changed={changed} />}
+    {isOwner && session.status !== "archived" && !session.frozen && session.connectorId && <MoveHostSection session={session} user={user} hosts={hosts} openSession={openSession} changed={changed} />}
     {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
     {isOwner && <ExportSection session={session} />}
     <AccessSection session={session} view={view} user={user} />
@@ -313,9 +313,7 @@ function HostSection({ session, user, hosts }: { session: SessionRecord; user: U
 
 function RepositoriesSection({ session, refresh }: { session: SessionRecord; refresh: () => void }) {
   const repositories = session.repositories ?? [];
-  if (session.repositoryMode === "clone") return <Section title="Repositories" info={<p>
-    The agent clones this workspace's repositories into the session with plain Git, through the host's egress proxy. Reads use the session owner's own Git accounts, which never reach the host; pushes go through approval.
-  </p>} bare>
+  if (session.repositoryMode === "clone") return <Section title="Repositories" info={<RepositoryClonePolicy />} bare>
     <div className="card">
       <Row leading={<Icon name="git-branch" size={16} />} title="Cloned on demand" hint="Nothing is pinned: the agent clones and switches branches as it works" />
       <Row title="Manage repositories and network access" href={href({ name: "settings", section: "workspaces", id: session.workspaceId })} chevron />
@@ -323,13 +321,12 @@ function RepositoriesSection({ session, refresh }: { session: SessionRecord; ref
   </Section>;
   return <Section
     title={<>Repositories <span className="muted">{repositories.length}</span></>}
-    info={<><RepositorySnapshotPolicy /><p>Pins are fixed at session start using the session owner's connected Git accounts, not the host owner's or a collaborator's. They record source inputs, not live cache status; later workspace changes don't affect them.</p></>}
+    info={<p>This session was created before sessions cloned their repositories: it holds snapshots of these commits, pinned when it started, and is read-only.</p>}
     action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh repositories" title="Refresh" onClick={refresh} />}
     bare
   >
     <div className="stack">
       {session.status === "error" && <Alert variant="error" title="Snapshots not confirmed">This session is in an error state, so repository snapshots are not confirmed. Check the host, then refresh.</Alert>}
-      {session.status === "provisioning" && <Alert variant="info" role="status" title="Still provisioning">Pins below don't mean snapshots are downloaded yet.</Alert>}
       {session.status === "archived" && <Alert title="Archived">Pinned files may no longer be on the host.</Alert>}
       <div className="card">
         {repositories.length ? repositories.map(repository => <Row
@@ -337,7 +334,7 @@ function RepositoriesSection({ session, refresh }: { session: SessionRecord; ref
           leading={<Icon name="git-branch" size={16} />}
           title={repository.fullName}
           hint={<><span title={repository.commit}>{repository.ref}@{repository.commit.slice(0, 7)}</span> · <code>{repository.path}/</code></>}
-        />) : <Row title="No repository pins" hint={session.status === "provisioning" ? "None recorded yet. Refresh to check progress" : session.status === "error" ? "None are available for this session" : "This older session has no pinned repositories. Start a new session to use them"} />}
+        />) : <Row title="No repository pins" hint={session.status === "provisioning" ? "None recorded yet. Refresh to check progress" : session.status === "error" ? "None are available for this session" : "This older session has no pinned repositories"} />}
         <Row title="Manage repositories for future sessions" href={href({ name: "settings", section: "workspaces", id: session.workspaceId })} chevron />
       </div>
     </div>

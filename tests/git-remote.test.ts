@@ -46,27 +46,6 @@ async function fixture(t: TestContext, options: { protocolV2?: boolean } = {}) {
   return { root, upstream, work, commits, server, remote: new GitRemote({ url: server.url("upstream.git"), authorization: AUTH }) };
 }
 
-for (const protocolV2 of [true, false]) {
-  test(`fetchCommit (${protocolV2 ? "v2" : "v0"}) fetches a non-tip commit at depth 1 without blobs`, gitAvailable, async (t) => {
-    const { root, commits, remote } = await fixture(t, { protocolV2 });
-    const target = commits[1]!;
-    const result = await remote.fetchCommit(target);
-    assert.equal(result.filtered, true);
-    assert.deepEqual(result.shallow, [target]);
-    const pack = await collect(result.pack);
-    assert.equal(pack.subarray(0, 4).toString(), "PACK");
-    const scratch = join(root, "scratch");
-    git(root, ["init", "--bare", scratch]);
-    git(scratch, ["index-pack", "--stdin"], pack);
-    assert.ok(exists(scratch, target));
-    assert.ok(exists(scratch, `${target}^{tree}`));
-    assert.ok(!exists(scratch, commits[0]!), "parent must be excluded at depth 1");
-    assert.ok(!exists(scratch, commits[2]!));
-    const blob = git(join(root, "work"), ["rev-parse", `${target}:file2.txt`]);
-    assert.ok(!exists(scratch, blob), "blobs must be filtered");
-  });
-}
-
 test("push creates a branch from a pack-objects pack", gitAvailable, async (t) => {
   const { upstream, work, commits, remote } = await fixture(t);
   await writeFile(join(work, "file4.txt"), "content 4\n");

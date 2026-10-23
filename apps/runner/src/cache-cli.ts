@@ -7,12 +7,13 @@ import { RepositoryCache } from "./repo-cache.js";
 const HELP = `Usage: pistead cache <command> [options]
 
 The repository cache of a connector started with --repo-cache: one Git mirror per repository, which clone sessions
-borrow objects from and pinned sessions check out of.
+borrow objects from.
 
 Commands:
-  list                    Show each cached repository, its size, and how many sessions and pins keep objects in it
+  list                    Show each cached repository, its size, and how many sessions keep objects in it
+                          (pins: sessions from before every session cloned; kept, never pruned)
   prune                   Forget clone sessions idle for longer than --older-than, then collect what nothing reaches
-                          any more. A clone in a session idle for longer loses the objects it borrowed; pins are kept
+                          any more. A clone in a session idle for longer loses the objects it borrowed
 
 Options:
   --state-dir PATH        Connector state (default ~/.local/share/pistead/connector)

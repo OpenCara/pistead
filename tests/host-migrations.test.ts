@@ -144,7 +144,8 @@ test('a move needs another host that accepts moved sessions', async t => {
 });
 
 test('a clone session moves only to a host that restores its clones', async t => {
-  const capabilities = { platform: 'linux', sandbox: true, productionShell: false, hostMigration: true, plainGit: true };
+  // An unverified sandbox (as real connectors advertise it) still runs clone sessions.
+  const capabilities = { platform: 'linux', sandbox: false, productionShell: false, hostMigration: true, plainGit: true };
   const clone = (s: { sqlite: { exec(sql: string): void } }) => s.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repository_mode_immutable;"
     + " UPDATE sessions SET repository_mode = 'clone' WHERE id = 'source'; COMMIT;");
   // A connector from before clone backups would restore the session's files and drop its clones.

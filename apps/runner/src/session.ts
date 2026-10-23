@@ -1,5 +1,5 @@
-import type { HostCommandOperation, GitRepinOperation, RepinRequest, RepinResult } from "../../../packages/shared/src/types.js";
-import { createHash, randomUUID } from "node:crypto";
+import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
+import { randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
@@ -9,17 +9,17 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
-import { bindingRemote, repositoryLimits, repositoryPath, repositoryRemote, validCloneDirectory, type SessionRepository } from "../../../packages/shared/src/repositories.js";
+import { bindingRemote, repositoryPath, validCloneDirectory } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
-import { assertId, requestKey, RunnerError, stableJson, validateOperation, validateRepositories } from "./protocol.js";
+import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
 import { MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
 import { prepareImage } from "./images.js";
-import { performClonePush, performPush, PushError, pushSummary, type PushResult } from "./push.js";
+import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
 import { GitRemote, GitRemoteError } from "./git-remote.js";
-import { RepositoryCacheError, checkoutBudget, mirrorPath, repositoryAuthorization, type MirrorRepository, type RepositoryAuthorization, type RepositoryCache } from "./repo-cache.js";
+import { mirrorPath, type MirrorRepository, type RepositoryCache } from "./repo-cache.js";
 import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
@@ -51,7 +51,7 @@ type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
 type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }) });
 /** Tools that never change files or run commands: the whole toolset of side asks. */
-const readOnlyTools = ["identity", "read_file", "list_files", "git_status"];
+const readOnlyTools = ["identity", "read_file", "list_files"];
 /**
  * How long after a message is sent its tool calls can wait on a card: the owner's permission or an operation's approval.
  * Deciding needs the message's write admission, which lasts an hour from sending, so a card older than that can't be
@@ -84,20 +84,16 @@ export type RunnerConfig = {
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
   pushComplete?: (request: PushCompleteRequest) => Promise<PushCompletionResult>;
-  repin?: (request: RepinRequest) => Promise<RepinResult>;
   /** Reads this host's own Git credential for a push remote as an Authorization header; set only when its owner opted in (connect --git-credentials). */
   hostGitCredential?: (remote: string, signal?: AbortSignal) => Promise<string>;
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
-  readRepository?: (repository: SessionRepository, sessionId: string) => Promise<Uint8Array>;
   /**
-   * This host's repository cache (connect --repo-cache): pinned repositories are fetched with the host's own Git
-   * credentials and checked out of it, in the background, instead of being downloaded as archives.
+   * This host's repository cache (connect --repo-cache): a mirror per repository, filled through the control plane's
+   * relay, that clones borrow objects from.
    */
   repositoryCache?: RepositoryCache;
-  /** The control plane re-checks the session owner's own access to one pinned repository; it never returns a credential. */
-  authorizeRepository?: (repository: SessionRepository, sessionId: string) => Promise<RepositoryAuthorization>;
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
@@ -109,15 +105,6 @@ export type RunnerConfig = {
   egressGrant?: (sessionId: string) => Promise<EgressGrant>;
   gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
 };
-
-/** Runner callbacks without a connector go to the control plane's internal routes, over HTTPS or local HTTP only. */
-function internalOrigin(controlPlaneUrl: string): string {
-  const origin = new URL(controlPlaneUrl);
-  if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/"
-    || (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname))))
-    throw new RunnerError(503, "Invalid repository control-plane origin");
-  return origin.origin;
-}
 
 /** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
@@ -177,12 +164,10 @@ export class RunnerSession {
   /** Tool calls waiting on a card, by approval id, until it settles (see `settled`); `mutate` hands them the card. */
   #approvalWaiters = new Map<string, PromiseWithResolvers<ApprovalRecord>>();
   /**
-   * Preparing repositories from the host repository cache can mean a first clone that takes minutes, far longer than
-   * the control plane waits for `create`. It runs in the background; runs are held until it is done (see drainQueue).
+   * Cloning a restored session's clones again can take minutes, far longer than the control plane waits for `create`.
+   * It runs in the background; runs are held until it is done (see drainQueue).
    */
   #repositories: RepositoryPreparation = { status: "ready" };
-  /** How this session's repositories are checked out, for the agent's instructions and backups. */
-  #repositorySource: "archive" | "cache" = "archive";
   /** Bumped by every preparation and by close(), so a superseded preparation never changes what came after it. */
   #preparations = 0;
   /** open() has finished; with #resumed, recovered and queued work resumes exactly once per open, and only when ready. */
@@ -194,6 +179,11 @@ export class RunnerSession {
   readonly #egress: EgressProxy | undefined;
   /** A clone session: no pins; the agent clones the workspace's repositories with plain Git through the egress proxy. */
   readonly #clone: boolean;
+  /**
+   * A session that pinned its repositories when it started: read-only now. It opens to show its history, and nothing
+   * resumes or runs in it.
+   */
+  readonly #frozen: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
   /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
@@ -209,16 +199,12 @@ export class RunnerSession {
       throw new RunnerError(403, "Session connector mismatch");
     this.sqlitePath = join(directory, "session.sqlite");
     const cache = config.repositoryCache;
-    const pins = binding.session.repositories ?? [];
-    // Every session on a cache host knows its cache; only a cache-backed one mounts it, once this open re-authorized its pins.
-    const options = cache && pins.length
-      ? { repositoryObjects: Object.fromEntries(pins.map(pin => [pin.path, cache.objects(pin, binding.owner.id)])) } : {};
     this.#clone = binding.session.repositoryMode === "clone";
-    if (this.#clone && config.unsandboxed) throw new RunnerError(409, "Clone sessions need a sandboxed host");
-    if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"), options);
+    this.#frozen = !this.#clone && (binding.session.repositories ?? []).length > 0;
+    if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
-      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { ...options, egressSocket: this.#egress.socketPath,
+      this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { egressSocket: this.#egress.socketPath,
         ...(this.#clone ? { sessionBranch: sessionBranch(binding.session.id) } : {}),
         ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
@@ -226,13 +212,17 @@ export class RunnerSession {
     this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
   }
 
+  /** The session's network grant from the control plane: its workspace's repositories and network policy. */
+  private async requestGrant(): Promise<EgressGrant> {
+    const sessionId = this.binding.session.id;
+    return parseEgressGrant(this.config.egressGrant ? await this.config.egressGrant(sessionId) : await this.controlPlane("/api/internal/network", { sessionId }));
+  }
+
   private egressProxy(socketPath: string): EgressProxy {
     const sessionId = this.binding.session.id;
     return new EgressProxy({
       socketPath,
-      grant: async () => parseEgressGrant(this.config.egressGrant
-        ? await this.config.egressGrant(sessionId)
-        : await this.controlPlane("/api/internal/network", { sessionId })),
+      grant: () => this.requestGrant(),
       relay: request => this.relay(request),
       ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
       ...(this.#clone ? { sessionBranch: sessionBranch(sessionId) } : {}),
@@ -347,7 +337,7 @@ export class RunnerSession {
   }
 
   async prepareRestore(manifest: RestoreManifest): Promise<void> {
-    await this.initializeRepositories(true);
+    await this.initializeRepositories();
     const resolved = this.config.resolveModels ? await this.config.resolveModels(this.binding.model)
       : { models: runnerModels(this.binding.model, this.config.allowFaux) };
     const storage = await this.openStorage();
@@ -396,120 +386,12 @@ export class RunnerSession {
     } finally { await harness.close(context); }
   }
 
-  private async pullRepository(repository: SessionRepository): Promise<Uint8Array> {
-    if (this.config.readRepository) return this.config.readRepository({ ...repository }, this.binding.session.id);
-    if (this.config.connectorId) throw new RunnerError(503, "Connected repository download requires its scoped callback");
-    const origin = internalOrigin(this.config.controlPlaneUrl);
-    const signal = AbortSignal.timeout(30_000);
-    const response = await (this.config.fetch ?? fetch)(`${origin}/api/internal/repositories/${assertId(repository.bindingId)}/download`, {
-      method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
-      body: JSON.stringify({ sessionId: this.binding.session.id, commit: repository.commit }), signal, redirect: "error",
-    });
-    const checksum = response.headers.get("x-archive-sha256");
-    const length = response.headers.get("content-length");
-    if (!response.ok || response.headers.get("x-repository-commit") !== repository.commit || !checksum
-      || !/^[A-Za-z0-9_-]{43}$/.test(checksum) || Buffer.from(checksum, "base64url").toString("base64url") !== checksum
-      || (length !== null && (!/^[0-9]+$/.test(length) || Number(length) > repositoryLimits.archiveBytes)) || !response.body) {
-      await response.body?.cancel();
-      throw new RunnerError(403, "Repository download denied or metadata mismatch");
-    }
-    const reader = response.body.getReader();
-    const cancel = () => { void reader.cancel().catch(() => {}); };
-    signal.addEventListener("abort", cancel, { once: true });
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    try {
-      for (;;) {
-        signal.throwIfAborted();
-        const chunk = await reader.read();
-        signal.throwIfAborted();
-        if (chunk.done) break;
-        size += chunk.value.byteLength;
-        if (size > repositoryLimits.archiveBytes) throw new RunnerError(413, "Repository archive exceeds its bound");
-        chunks.push(chunk.value);
-      }
-    } finally {
-      signal.removeEventListener("abort", cancel);
-      await reader.cancel().catch(() => {});
-      reader.releaseLock();
-    }
-    const bytes = Buffer.concat(chunks, size);
-    if (!size || (length !== null && Number(length) !== size)
-      || createHash("sha256").update(bytes).digest("base64url") !== checksum) throw new RunnerError(400, "Repository archive checksum or size mismatch");
-    return bytes;
-  }
-
-  private async initializeRepositories(restoring = false): Promise<void> {
-    const repositories = validateRepositories(this.binding.session.repositories);
-    const authorize = async () => { await this.authorize(this.binding.owner.id, restoring ? "manage" : "write"); };
-    if (repositories.length) await authorize();
-    await this.sandbox.initialize();
-    if (!repositories.length) return;
-    if (this.config.repositoryCache) {
-      const state = await this.sandbox.repositoryCacheState(repositories, authorize);
-      this.#repositorySource = state === "archive" ? "archive" : "cache";
-      // Archive-backed sessions keep working on a cache host, and never see the cache.
-      if (state === "archive") return;
-      // A restored cache is authoritative: never replace its files with a fresh download.
-      if (restoring && state === "absent") throw new RunnerError(409, "Restored repository cache is not ready");
-      // Their snapshots are refused, and their objects would be missing from one anyway.
-      if (restoring) throw new RunnerError(409, "Sessions checked out from the host repository cache cannot be restored yet");
-      // Every open re-checks the owner's access to each pin before the sandbox sees the cache (prepareRepositories).
-      this.prepareRepositories(repositories, state === "absent");
-      return;
-    }
-    if (await this.sandbox.repositoryCachesReady(repositories, authorize)) return;
-    // A restored cache is authoritative: never replace its files with a fresh download.
-    if (restoring) throw new RunnerError(409, "Restored repository cache is not ready");
-    const archives: Uint8Array[] = [];
-    for (const repository of repositories) {
-      await authorize();
-      const bytes = await this.pullRepository(repository);
-      await authorize();
-      if (!(bytes instanceof Uint8Array) || !bytes.byteLength || bytes.byteLength > repositoryLimits.archiveBytes)
-        throw new RunnerError(413, "Repository archive exceeds its bound");
-      archives.push(bytes);
-    }
-    try {
-      await this.sandbox.materializeRepositories(repositories, archives, authorize);
-    } catch (error) {
-      if (error instanceof RunnerError) throw error;
-      // Helper reasons are fixed "sandbox: ..." phrases; anything carrying paths or other detail stays local.
-      const reason = error instanceof Error ? /sandbox: ([a-z0-9 ,.'()-]{1,160})$/i.exec(error.message.trim())?.[1] : undefined;
-      throw new RunnerError(422, `Repository snapshot could not be prepared${reason ? `: ${reason}` : ""}`);
-    }
-    if (!await this.sandbox.repositoryCachesReady(repositories, authorize)) throw new RunnerError(409, "Repository cache initialization did not complete");
-  }
-
   /**
-   * Prepares the session's repositories from the host repository cache in the background: for each pin, the control
-   * plane re-checks the owner's access, the cache fetches it if needed (with the host's own Git credentials) and its
-   * tree is checked; then everything is checked out at once. A later preparation, or close(), supersedes this one.
+   * The sandbox, ready for the session. Nothing is pinned or downloaded: a clone session's agent clones what it needs,
+   * and a session that pinned its repositories (read-only now) keeps the files it has.
    */
-  private prepareRepositories(repositories: SessionRepository[], checkout: boolean): void {
-    const epoch = ++this.#preparations;
-    const controller = new AbortController();
-    const authorize = async () => { controller.signal.throwIfAborted(); await this.authorize(this.binding.owner.id, "write"); };
-    // What the session view shows, one row per pin; only structured progress, never Git's or a remote's text.
-    const items: RepositoryPreparationItem[] = repositories.map(({ path }) => ({ path, phase: "queued", percent: null, done: null, total: null, bytes: 0 }));
-    const update: ProgressUpdate = (path, change) => { const item = items.find(each => each.path === path); if (item) Object.assign(item, change); };
-    const done = (async () => {
-      await this.fetchRepositories(repositories, authorize, checkout, controller.signal, update);
-      // Only now, with every pin re-authorized for this owner, does the sandbox see the cache at all.
-      this.sandbox.enableRepositoryCache();
-      if (checkout) {
-        for (const { path } of repositories) update(path, { phase: "checking-out", percent: null, done: null, total: null });
-        try { await this.sandbox.materializeFromCache(repositories, authorize); }
-        catch (error) {
-          if (error instanceof RunnerError) throw error;
-          // Helper reasons are fixed "sandbox: ..." phrases; anything carrying paths or other detail stays local.
-          const reason = error instanceof Error ? /sandbox: ([a-z0-9 ,.'()-]{1,160})$/i.exec(error.message.trim())?.[1] : undefined;
-          throw new RunnerError(422, `Repository checkout could not be prepared${reason ? `: ${reason}` : ""}`);
-        }
-      }
-      if ((await this.sandbox.repositoryCacheState(repositories, authorize)) !== "cache") throw new RunnerError(409, "Repository cache initialization did not complete");
-    })();
-    this.trackPreparation(epoch, { status: "preparing", done, controller, items });
+  private async initializeRepositories(): Promise<void> {
+    await this.sandbox.initialize();
   }
 
   /**
@@ -593,60 +475,16 @@ export class RunnerSession {
     return { status: preparation.status, items: preparation.items.map(item => ({ ...item })), ...(preparation.status === "failed" ? { error: preparation.reason } : {}) };
   }
 
-  private async fetchRepositories(repositories: SessionRepository[], authorize: () => Promise<void>, inspect: boolean, signal: AbortSignal, update: ProgressUpdate): Promise<void> {
-    const cache = this.config.repositoryCache;
-    if (!cache) throw new RunnerError(503, "This host has no repository cache");
-    const budget = checkoutBudget();
-    for (const repository of repositories) {
-      update(repository.path, { phase: "authorizing" });
-      await authorize();
-      const answer = await this.authorizeRepository(repository, signal);
-      // The remote is derived from the pin on both sides: a control plane cannot point this host's credentials elsewhere.
-      if (answer.bindingId !== repository.bindingId || answer.commit !== repository.commit || answer.remote !== repositoryRemote(repository)) {
-        throw new RunnerError(403, "Repository authorization does not match the pinned repository");
-      }
-      await authorize();
-      try {
-        await cache.ensure({ pin: repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: answer.remote }, {
-          signal, onProgress: ({ phase, percent, done, total, bytes }) => update(repository.path, { phase, percent, done, total, bytes }),
-        });
-        if (inspect) {
-          update(repository.path, { phase: "checking", percent: null, done: null, total: null });
-          const summary = await cache.inspect(repository, this.binding.owner.id, budget, signal);
-          budget.entries -= summary.entries;
-          budget.bytes -= summary.bytes;
-        }
-        update(repository.path, { phase: "done", percent: null, done: null, total: null });
-      } catch (error) {
-        if (signal.aborted) throw new RunnerError(503, "Repository preparation was cancelled");
-        // Only these errors carry fixed, credential-free messages; anything else stays local.
-        const reason = error instanceof RepositoryCacheError || error instanceof GitRemoteError || error instanceof HostCredentialError
-          ? error.message : "this host could not fetch it";
-        throw new RunnerError(502, `${repository.fullName} could not be prepared on this host: ${reason}`);
-      }
-    }
-    await authorize();
-  }
-
-  private async authorizeRepository(repository: SessionRepository, signal: AbortSignal): Promise<RepositoryAuthorization> {
-    if (this.config.authorizeRepository) return this.config.authorizeRepository({ ...repository }, this.binding.session.id);
-    if (this.config.connectorId) throw new RunnerError(503, "Connected repository authorization requires its scoped callback");
-    const response = await (this.config.fetch ?? fetch)(`${internalOrigin(this.config.controlPlaneUrl)}/api/internal/repositories/${assertId(repository.bindingId)}/authorize`, {
-      method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
-      body: JSON.stringify({ sessionId: this.binding.session.id, commit: repository.commit }),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]), redirect: "error",
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      throw new RunnerError(403, "Repository authorization denied");
-    }
-    return repositoryAuthorization(await response.json());
-  }
-
   private agentInstructions(mode: "write" | "ask" | "read"): string {
     let instructions = this.binding.agent.instructions;
-    const repositories = this.binding.session.repositories ?? [];
-    if (this.#clone) {
+    if (this.#clone && !this.#egress) {
+      // An unsandboxed host: commands run on its owner's machine, with its own Git, network and credentials.
+      instructions += "\n\nTrusted runtime repository context:\n"
+        + "The execution root is the session worktree, which starts empty; file-tool paths are relative to it. This host runs without a sandbox: "
+        + "clone the repositories you need into the worktree with plain Git in bash (for example git clone https://github.com/<owner>/<name>), "
+        + "and fetch, switch, commit and push as usual. Git uses this host's own network and credentials, and each command waits for approval."
+        + (this.#cloneRepositories.length ? `\nThis workspace's repositories: ${this.#cloneRepositories.join(", ")}.` : "");
+    } else if (this.#clone) {
       const branch = sessionBranch(this.binding.session.id);
       instructions += "\n\nTrusted runtime repository context:\n"
         + "The execution root is the isolated session worktree, which starts empty; file-tool paths are relative to it. "
@@ -665,19 +503,6 @@ export class RunnerSession {
           + "with approval: git_push {directory, branch}, where directory is the clone's path in the worktree. Pushes are fast-forward only (never forced); "
           + "if the branch moved, fetch and merge or rebase first. Optionally request a pull request with pull_request {title, body, base?}; "
           + `to open one from the session branch once you pushed it, call git_push with branch ${branch}.`;
-    } else if (repositories.length) {
-      instructions += "\n\nTrusted runtime repository context:\n"
-        + "The execution root is the isolated session worktree. File-tool paths are relative to that worktree, not to a repository root.\n"
-        + repositories.map(repository => `- Source snapshot: worktree/${repository.path}; file-tool path prefix: ${repository.path}/; pinned commit: ${repository.commit}.`).join("\n")
-        + (this.#repositorySource === "cache"
-          ? "\nOperate only on isolated session files. Each repository's full history up to its pinned commit is available read-only: "
-            + "refs/remotes/<path>/pinned names the pinned commit (for example git log <path>/pinned), and inside that commit file paths "
-            + "are relative to the repository (git blame <pinned commit> -- <file>). Upstream branches and tags are not available."
-          : "\nOperate only on isolated session files. These are pinned source snapshots, not full upstream Git histories.");
-      if (this.binding.agent.tools.includes("git_push"))
-        instructions += "\ngit_push publishes one repository's committed session changes to a branch on its Git provider: commit first with git_commit; "
-          + "the session commits that touch that repository path are replayed onto its pinned commit, so the branch contains only your changes. "
-          + "Pushes are fast-forward only (never forced); a branch that moved elsewhere is refused. Optionally request a pull request with pull_request {title, body, base?}.";
     }
     if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
     if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files; any change to files, command or other effect waits for the session owner to allow it.";
@@ -696,7 +521,9 @@ export class RunnerSession {
 
   private async openHarness(): Promise<void> {
     await this.initializeRepositories();
-    if (this.#clone) {
+    if (this.#clone && !this.#egress) {
+      this.#cloneRepositories = await this.requestGrant().then(grant => grant.repositories.map(repository => bindingRemote(repository)), () => []);
+    } else if (this.#clone) {
       const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
       this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
       await this.restoreMirrors(repositories);
@@ -751,8 +578,9 @@ export class RunnerSession {
     this.closing = false;
     this.#opened = true;
     // Recovered and queued work waits for repositories prepared in the background: their preparation resumes it once
-    // they are ready, and a failure leaves it all suspended, harness included, until the session restarts.
-    if (this.#repositories.status === "ready") await this.resumeWork();
+    // they are ready, and a failure leaves it all suspended, harness included, until the session restarts. Nothing
+    // resumes in a read-only session.
+    if (this.#repositories.status === "ready" && !this.#frozen) await this.resumeWork();
     // Reported while its repositories are still being prepared too; reopening is also how a report lost with a previous
     // connection or process gets through.
     this.#activity?.start();
@@ -1040,8 +868,14 @@ export class RunnerSession {
     return Object.keys(options).length ? options : undefined;
   }
 
+  /** A session that pinned its repositories is read-only: nothing new runs, is decided or backed up in it. */
+  private requireUnfrozen(): void {
+    if (this.#frozen) throw new RunnerError(409, "This session pinned its repositories when it started, which sessions no longer do; it is read-only");
+  }
+
   async submit(ticket: RunnerTicket, input: SubmitInput, mode: "write" | "ask"): Promise<SubmitResult> {
     this.assertTicket(ticket);
+    this.requireUnfrozen();
     if (typeof input?.content !== "string" || input.content.length > 100_000 || !input.content.trim()
       || typeof input.requestId !== "string" || !input.requestId || input.requestId.length > 200) throw new RunnerError(400, "Invalid submission");
     if ((input.admissionId !== undefined && (mode !== "write" || typeof input.admissionId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(input.admissionId)))
@@ -1218,10 +1052,10 @@ export class RunnerSession {
   }
 
   private buildTools(): ToolRegistration[] {
+    // Sessions commit and switch branches with Git itself, and push a clone's directory with git_push; on an unsandboxed
+    // host they push with Git itself too, with the host's own credentials.
     const tools = this.sessionTools();
-    if (!this.#clone) return tools;
-    // A clone session commits and switches branches with Git itself, and pushes a clone's directory.
-    return [...tools.filter(tool => !["git_status", "git_commit", "git_repin", "git_push"].includes(tool.name)), this.clonePushTool()];
+    return this.#clone && this.#egress ? [...tools, this.clonePushTool()] : tools;
   }
 
   private clonePushTool(): ToolRegistration {
@@ -1289,22 +1123,12 @@ export class RunnerSession {
           await this.sandbox.writeFile(args.path, applyEdits(await this.sandbox.readFile(args.path, recheck), args.edits, args.path), recheck);
           return text({ ...attribution, edited: args.path, edits: args.edits.length });
         } }),
-      defineTool({ name: "git_status", description: "Read local git status without mutation or network.", parameters: Type.Object({}), execute: async (_args, api, call) => {
-        const attribution = await this.toolActor(api, false);
-        await this.permit(api, call, "git_status", "");
-        return text({ ...attribution, status: await this.sandbox.gitStatus(() => this.recheckTool(attribution)) });
-      } }),
-      defineTool({ name: "git_commit", description: "Commit the session worktree as the owner. Waits for an exact human approval unless the owner enabled auto-approve for this request; the result says which.", parameters: Type.Object({ message: Type.String() }), execute: async (args, api, call) => {
-        const attribution = await this.toolActor(api, true);
-        await this.permit(api, call, "git_commit", args.message, { write: true });
-        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "git.commit", message: args.message }, String(api.taskId), { permitted: true }), call));
-      } }),
       defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const { unbounded } = await this.permit(api, call, "bash", args.command, { write: true, shell: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }), call));
       } }),
-      defineTool({ name: "github_read", description: "Read a GitHub issue or pull request of a pinned github.com repository (owner/name) as the session owner, through Pistead: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments and checks. Long threads keep their newest items. The sandbox has no network, so use this instead of gh or curl. Read-only; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }) }), execute: async (args, api, call) => {
+      defineTool({ name: "github_read", description: "Read a GitHub issue or pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through Pistead: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments and checks. Long threads keep their newest items. The sandbox has no network, so use this instead of gh or curl. Read-only; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, false);
         const repository = this.githubRepository(args.repository);
         await this.permit(api, call, "github_read", `${repository}#${args.issue}`);
@@ -1322,7 +1146,7 @@ export class RunnerSession {
         await this.permit(api, call, "github_comment", `${args.repository}#${args.issue}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId), { permitted: true }), call));
       } }),
-      defineTool({ name: "github_merge", description: "Request human approval to merge a pull request of a pinned github.com repository (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase. Always waits for a human decision, even under auto-approve; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
+      defineTool({ name: "github_merge", description: "Request human approval to merge a pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase. Always waits for a human decision, even under auto-approve; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const repository = this.githubRepository(args.repository);
         if (!/^[0-9a-f]{40}$/.test(args.sha)) throw new RunnerError(400, "sha must be the pull request's full 40-character head commit, as github_read reports it");
@@ -1338,31 +1162,11 @@ export class RunnerSession {
           return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy,
             { kind: "host.bash", command: args.command, timeoutSeconds: args.timeout_seconds ?? 300 }, String(api.taskId), { permitted: true }), call));
         } }),
-      defineTool({ name: "git_repin", executionMode: "sequential",
-        description: "Repin a repository (its worktree path) to a branch, tag or commit by creating a NEW private session on this host. Other repository pins stay unchanged. Original files, commits and conversation are preserved, not copied. Returns the link to continue; it does not switch this conversation. Requires session-owner approval, skipped for the owner's auto-approve message.",
-        parameters: Type.Object({ repository: Type.String(), ref: Type.String() }),
-        execute: async (args, api, call) => {
-          const attribution = await this.toolActor(api, true);
-          await this.permit(api, call, "git_repin", `${args.repository} -> ${args.ref}`, { write: true });
-          return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "git.repin", repository: args.repository, ref: args.ref }, String(api.taskId), { permitted: true }), call));
-        } }),
-      defineTool({ name: "git_push", description: "Push the committed session changes of one pinned repository (its worktree path) to a branch on its Git provider, fast-forward only, optionally opening a pull request as the owner. Commit first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
-        repository: Type.String(), branch: Type.String(),
-        pull_request: Type.Optional(Type.Object({ title: Type.String(), body: Type.String(), base: Type.Optional(Type.String()) })),
-      }), execute: async (args, api, call) => {
-        const attribution = await this.toolActor(api, true);
-        await this.permit(api, call, "git_push", `${args.repository} → ${args.branch}`, { write: true });
-        const commit = await this.sandbox.head(() => this.recheckTool(attribution));
-        const request = args.pull_request;
-        const operation: GitPushOperation = { kind: "git.push", repository: args.repository, branch: args.branch, commit,
-          ...(request ? { pullRequest: { title: request.title, body: request.body, ...(request.base !== undefined ? { base: request.base } : {}) } } : {}) };
-        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId), { permitted: true }), call));
-      } }),
     ];
   }
 
-  /** Both operations are tracked through shutdown, and never replayed after an ambiguous failure. */
-  private startHostOperation(id: string, operation: HostCommandOperation | GitRepinOperation,
+  /** Tracked through shutdown, and never replayed after an ambiguous failure. */
+  private startHostOperation(id: string, operation: HostCommandOperation,
     auth: { actorId: string; capability?: string; admissionId?: string }, recheck: SandboxAuthorize): Promise<void> {
     const entry = { controller: new AbortController(), done: Promise.resolve() };
     const generation = this.generation;
@@ -1372,16 +1176,8 @@ export class RunnerSession {
       try {
         await recheck();
         entry.controller.signal.throwIfAborted();
-        if (operation.kind === "host.bash") {
-          if (auth.actorId !== this.binding.session.connectorOwnerId) throw new RunnerError(403, "Only the host owner can execute host commands");
-          result = await this.sandbox.executeHost(operation, recheck, entry.controller.signal);
-        } else {
-          if (auth.actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can repin");
-          const request: RepinRequest = { sessionId: this.binding.session.id, approvalId: id, operation, ...auth };
-          const created = this.config.repin ? await this.config.repin(request)
-            : await this.internalGitHub("repin", request) as RepinResult;
-          result = JSON.stringify({ ...created, message: "Open the new private session and send a message to start it. Original files, commits and conversation are unchanged; they are not copied to the new session." });
-        }
+        if (auth.actorId !== this.binding.session.connectorOwnerId) throw new RunnerError(403, "Only the host owner can execute host commands");
+        result = await this.sandbox.executeHost(operation, recheck, entry.controller.signal);
       } catch (error) {
         const refused = error instanceof RunnerError && error.status < 500;
         status = error instanceof SandboxProcessError || refused ? "failed" : "interrupted";
@@ -1397,23 +1193,15 @@ export class RunnerSession {
     return entry.done;
   }
 
-  /** The canonical owner/name of the session's pinned github.com repository `name`, in any case. */
+  /** A github.com owner/name: a session reads and merges in any github.com repository of its workspace, as the control plane checks. */
   private githubRepository(name: string): string {
-    // A clone session reads and merges in any github.com repository of its workspace; the control plane checks which.
-    if (this.#clone) {
-      if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(name)) throw new RunnerError(400, "repository must be a github.com owner/name");
-      return name;
-    }
-    const pinned = (this.binding.session.repositories ?? []).filter(pin => !("provider" in pin)).map(pin => pin.fullName);
-    const match = pinned.find(fullName => fullName.toLowerCase() === name.toLowerCase());
-    if (!match) throw new RunnerError(403, pinned.length ? `${name} is not pinned in this session; GitHub reads and merges cover ${pinned.join(", ")}.`
-      : "This session pins no github.com repository, so it can't read or merge on GitHub.");
-    return match;
+    if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(name)) throw new RunnerError(400, "repository must be a github.com owner/name");
+    return name;
   }
 
   /** The control plane's GitHub broker for runners without a connector, with the shared secret; refusals keep their status and reason. */
-  private async internalGitHub(action: "comment" | "read" | "merge" | "repin", request: object): Promise<unknown> {
-    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/${action === "repin" ? "git/repin" : `github/${action}`}`, {
+  private async internalGitHub(action: "comment" | "read" | "merge", request: object): Promise<unknown> {
+    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/github/${action}`, {
       method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
       body: JSON.stringify(request), signal: AbortSignal.timeout(30_000), redirect: "error",
     });
@@ -1430,19 +1218,18 @@ export class RunnerSession {
    * command to run without the resource limits this host lacks.
    */
   async createApproval(actorId: string, input: Operation, toolTaskId?: string, consent: { permitted?: boolean; unbounded?: boolean } = {}): Promise<ApprovalRecord> {
+    this.requireUnfrozen();
     const operation = validateOperation(input);
     if (operation.kind === "permission") throw new RunnerError(400, "Permission requests come only from tool calls");
+    // Sessions commit and switch branches with Git itself, and push a clone's directory.
+    if (operation.kind === "git.commit" || operation.kind === "git.repin" || (operation.kind === "git.push" && operation.directory === undefined)) {
+      throw new RunnerError(400, "Commit and switch branches with git in bash; a push names a clone's directory");
+    }
     this.requireShellCapability(operation, consent.unbounded);
     if (operation.kind === "host.bash" && (!this.config.connectorId || !this.binding.session.connectorOwnerId)) {
       throw new RunnerError(403, "Host commands require a connected host with a known owner");
     }
-    if (this.#clone ? operation.kind === "git.commit" || operation.kind === "git.repin" || (operation.kind === "git.push" && operation.directory === undefined)
-      : operation.kind === "git.push" && operation.directory !== undefined) {
-      throw new RunnerError(400, this.#clone ? "A clone session commits with git in bash and pushes a clone's directory" : "Only clone sessions push a clone's directory");
-    }
-    if (operation.kind === "git.repin" && !this.binding.session.repositories?.some(pin => pin.path === operation.repository)) {
-      throw new RunnerError(403, "Repin must name a repository pinned in this session");
-    }
+    if (operation.kind === "git.push" && !this.#clone) throw new RunnerError(400, "Only clone sessions push a clone's directory");
     const toolName = ({ "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "github.merge": "github_merge", "git.push": "git_push", "git.repin": "git_repin", "host.bash": "host_bash" } as const)[operation.kind];
     if (!consent.permitted && !this.binding.agent.tools.includes(toolName) && !(await this.metadata()).grants?.tools.includes(toolName)) {
       throw new RunnerError(403, "Operation not enabled by pinned agent version");
@@ -1461,7 +1248,7 @@ export class RunnerSession {
       // GitHub comments and merges need a Worker-minted broker capability, so they always wait for a human decision;
       // automatic pushes mint their credential from the run's owner admission instead.
       automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
-        && operation.kind !== "github.merge" && (!["git.push", "git.repin"].includes(operation.kind) || admissionId !== undefined)
+        && operation.kind !== "github.merge" && (operation.kind !== "git.push" || admissionId !== undefined)
         && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
@@ -1487,7 +1274,7 @@ export class RunnerSession {
     const operation = approval.operation;
     let status: ApprovalRecord["status"];
     let result: string;
-    if (operation.kind === "host.bash" || operation.kind === "git.repin") {
+    if (operation.kind === "host.bash") {
       await this.startHostOperation(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); });
       return (await this.metadata()).approvals[id]!;
     }
@@ -1521,6 +1308,7 @@ export class RunnerSession {
 
   /** `scope` applies to permission requests: allow the one call (default), or the same need for the rest of the session. */
   async decide(ticket: RunnerTicket, id: string, input: { decision: "approve" | "deny"; operation: Operation; brokerCapability?: string; scope?: "call" | "session" }): Promise<ApprovalRecord> {
+    this.requireUnfrozen();
     this.assertTicket(ticket);
     if (input.decision !== "approve" && input.decision !== "deny") throw new RunnerError(400, "Invalid approval decision");
     if (input.scope !== undefined && input.scope !== "call" && input.scope !== "session") throw new RunnerError(400, "Invalid approval scope");
@@ -1579,10 +1367,10 @@ export class RunnerSession {
       // other card (one requested outside a message) waits for the queue, so it never runs beside the agent.
       if (!this.#approvalWaiters.has(id) && Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)))
         throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
-      if (["github.comment", "github.merge", "git.push", "git.repin"].includes(approval.operation.kind) && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
+      if (["github.comment", "github.merge", "git.push"].includes(approval.operation.kind) && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
       await this.mutate(meta => { record(meta, { status: "executing", decidedBy: ticket.actorId }); });
-      if (approval.operation.kind === "host.bash" || approval.operation.kind === "git.repin") {
-        // Long host builds and provider resolution must not hold the connector's 30-second RPC queue.
+      if (approval.operation.kind === "host.bash") {
+        // Long host builds must not hold the connector's 30-second RPC queue.
         void this.startHostOperation(id, approval.operation, { actorId: ticket.actorId, capability: input.brokerCapability }, async () => {
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
@@ -1748,16 +1536,17 @@ export class RunnerSession {
       if (Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing")) throw new RunnerError(409, "Backup requires an idle session including queued work");
       this.requireRepositoriesReady();
-      // Their objects live in the host cache, not in the snapshot, so the backup could not be restored.
-      if (this.#repositorySource === "cache") throw new RunnerError(409, "Backups of sessions checked out from the host repository cache are not supported yet");
+      this.requireUnfrozen();
       await this.close();
       try {
         const sqlite = await readFile(this.sqlitePath, "base64");
         const authorize = async () => { await this.authorize(ticket.actorId, "manage"); };
         // A clone session's clones go into the backup as bundles of their local work, not as files: a restore clones them
         // again from their origin.
-        const { clones, found } = this.#clone ? await (this.sandbox as Sandbox).cloneBackup(authorize) : { clones: [], found: [] };
-        const files = this.#clone ? await (this.sandbox as Sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
+        // On an unsandboxed host the worktree, clones included, is kept as files.
+        const sandboxed = this.#clone && this.#egress;
+        const { clones, found } = sandboxed ? await (this.sandbox as Sandbox).cloneBackup(authorize) : { clones: [], found: [] };
+        const files = sandboxed ? await (this.sandbox as Sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
         return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files, ...(clones.length ? { clones } : {}),
           createdAt: new Date().toISOString() };
       } finally { await this.open(); }
@@ -1791,8 +1580,8 @@ export class RunnerSession {
 
   /** Credential → push → completion. The credential stays in this frame; results carry only fixed, credential-free text. */
   private async runPush(id: string, operation: GitPushOperation, auth: { actorId: string; capability?: string; admissionId?: string }, recheck: SandboxAuthorize, signal?: AbortSignal): Promise<{ status: "executed" | "failed" | "interrupted"; result: string }> {
-    const repository = validateRepositories(this.binding.session.repositories).find(pin => pin.path === operation.repository);
-    if (!repository && !this.#clone) return { status: "failed", result: "Push failed: the repository is not pinned in this session. Nothing was pushed." };
+    if (!this.#clone || operation.directory === undefined) return { status: "failed", result: "Push failed: a push names a clone's directory. Nothing was pushed." };
+    if (!this.#egress) return { status: "failed", result: "Push failed: on a host without the sandbox, push with git in bash. Nothing was pushed." };
     const request: PushCredentialRequest = { sessionId: this.binding.session.id, approvalId: id, actorId: auth.actorId, operation,
       ...(auth.capability !== undefined ? { capability: auth.capability } : {}), ...(auth.admissionId !== undefined ? { admissionId: auth.admissionId } : {}) };
     let credential: PushCredential | HostPushCredential;
@@ -1810,9 +1599,7 @@ export class RunnerSession {
     let failure: { status: "failed" | "interrupted"; result: string } | undefined;
     try {
       const authorization = "hostCredentials" in credential ? await this.hostAuthorization(credential.remote, signal) : credential.authorization;
-      pushed = this.#clone
-        ? await performClonePush({ workspace: this.sandbox as Sandbox, operation, credential: { remote: credential.remote, authorization }, authorize: recheck, signal })
-        : await performPush({ workspace: this.sandbox, operation, repository: repository!, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
+      pushed = await performClonePush({ workspace: this.sandbox as Sandbox, operation, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
     } catch (error) {
       failure = error instanceof PushError && !signal?.aborted
         ? { status: "failed", result: `Push failed: ${error.message}. Nothing was pushed.` }

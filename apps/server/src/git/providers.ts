@@ -4,7 +4,7 @@ import {
 } from '../../../../packages/shared/src/repositories.js';
 import { fail } from '../http.js';
 import { boundedRepositoryBody, repositoryRef } from '../repositories.js';
-import type { GitCredential, GitProviderAdapter, RepositoryArchive, RepositoryRef } from './types.js';
+import type { GitCredential, GitProviderAdapter, RepositoryRef } from './types.js';
 
 // GitHub, GitHub Enterprise Server, GitLab and Bitbucket serve at most 100 repositories per list page.
 export const listPageSize = 100;
@@ -20,7 +20,6 @@ const userAgent = 'OpenCara-Agent-Workspace';
 const deniedStatuses: readonly number[] = [401, 403, 404];
 // Azure DevOps answers unauthenticated requests with 203 (sign-in HTML) or a 302 to its sign-in service.
 const azureDeniedStatuses: readonly number[] = [203, 302, 401, 403, 404];
-const redirectStatuses: readonly number[] = [301, 302, 303, 307, 308];
 const sha1 = /^[0-9a-f]{40}$/;
 const sha256 = /^[0-9a-f]{64}$/;
 const azureOrganization = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,48}[A-Za-z0-9])?$/;
@@ -44,9 +43,6 @@ function invalidResponse(provider: TokenGitProvider): never {
 }
 function emptyRepository(provider: TokenGitProvider): never {
   return fail(409, 'git_repository_empty', `This ${label(provider)} repository has no default branch yet. Push a commit first.`);
-}
-function untrustedRedirect(provider: TokenGitProvider): never {
-  return fail(502, 'invalid_archive_redirect', `${label(provider)} returned an untrusted archive location.`);
 }
 
 async function discard(response: Response): Promise<void> {
@@ -132,10 +128,6 @@ function target(provider: TokenGitProvider, repository: RepositoryRef): Reposito
   }
   return repository;
 }
-function pinnedCommit(commit: string): string {
-  if (!sha1.test(commit)) fail(400, 'invalid_repository_commit', 'A 40-character lowercase commit SHA is required.');
-  return commit;
-}
 /**
  * Requests pages 1, 2, ... of `size` entries until the provider reports no more, keeping at most
  * repositoryLimits.pickerRepositories. The page count is bounded too, so skipped entries cannot extend a listing.
@@ -161,48 +153,6 @@ export function basic(user: string, password: string): string {
   let binary = '';
   for (const byte of new TextEncoder().encode(`${user}:${password}`)) binary += String.fromCharCode(byte);
   return `Basic ${btoa(binary)}`;
-}
-
-/** Resolves and checks one archive redirect; credentials are never attached to the follow-up request. */
-function redirectTarget(provider: TokenGitProvider, location: string | null, base: string, allowed: (url: URL) => boolean): string {
-  if (!location) untrustedRedirect(provider);
-  let url: URL;
-  try { url = new URL(location, base); } catch { return untrustedRedirect(provider); }
-  if (url.protocol !== 'https:' || url.username || url.password || location.includes('#') || !allowed(url)) untrustedRedirect(provider);
-  return url.href;
-}
-
-interface ArchiveRequest {
-  provider: TokenGitProvider;
-  url: string;
-  headers: Headers;
-  format: RepositoryArchive['format'];
-  /** Allowed single redirect target, or null when the provider must answer 200 directly. */
-  redirect: ((url: URL) => boolean) | null;
-  redirectRequired?: boolean;
-  denied?: readonly number[];
-}
-async function download(input: ArchiveRequest): Promise<RepositoryArchive> {
-  const { provider } = input;
-  let response = await request(provider, input.url, input.headers);
-  if ((input.denied ?? deniedStatuses).includes(response.status)) { await discard(response); accessFailure(provider, false); }
-  if (redirectStatuses.includes(response.status)) {
-    const location = response.headers.get('location');
-    await discard(response);
-    if (!input.redirect) untrustedRedirect(provider);
-    const url = redirectTarget(provider, location, input.url, input.redirect);
-    response = await request(provider, url, { Accept: input.format === 'zip' ? 'application/zip' : 'application/gzip' });
-  } else if (input.redirectRequired) {
-    await discard(response);
-    fail(502, 'invalid_archive_redirect', `${label(provider)} did not return the expected archive redirect.`);
-  }
-  if (response.status !== 200) { await discard(response); fail(502, 'repository_download_failed', `${label(provider)} could not supply the pinned archive.`); }
-  const bytes = await boundedRepositoryBody(response, repositoryLimits.archiveBytes);
-  const magic = input.format === 'zip' ? bytes[0] === 0x50 && bytes[1] === 0x4b : bytes[0] === 0x1f && bytes[1] === 0x8b;
-  if (bytes.length < 4 || !magic) {
-    fail(502, 'invalid_repository_archive', `${label(provider)} did not return a ${input.format === 'zip' ? 'zip' : 'gzip'} archive.`);
-  }
-  return { bytes, format: input.format };
 }
 
 // GitHub Enterprise Server: REST v3 under /api/v3.
@@ -245,17 +195,6 @@ const githubEnterprise: GitProviderAdapter = {
       { ...api.headers, Accept: 'application/vnd.github.sha' });
     await expectOk('github-enterprise', response, { denied: [...deniedStatuses, 422] });
     return commitSha('github-enterprise', (await readText('github-enterprise', response, 1024)).trim());
-  },
-  async archive(credential, repository, commit) {
-    const api = githubEnterpriseApi(credential);
-    const { fullName } = target('github-enterprise', repository);
-    const host = api.origin.host;
-    return download({
-      provider: 'github-enterprise', url: `${api.base}/repos/${fullName}/tarball/${pinnedCommit(commit)}`, headers: api.headers,
-      format: 'tar.gz', redirectRequired: true,
-      // GHES serves archives from codeload.<host> (subdomain isolation) or from <host>/_codeload.
-      redirect: url => url.host === host || url.host === `codeload.${host}`,
-    });
   },
 };
 
@@ -303,14 +242,6 @@ const gitlab: GitProviderAdapter = {
       `${api.base}/projects/${encodeURIComponent(id)}/repository/commits/${encodeURIComponent(repositoryRef(ref))}`, api.headers);
     return commitSha('gitlab', record('gitlab', body).id);
   },
-  async archive(credential, repository, commit) {
-    const api = gitlabApi(credential);
-    const { id } = target('gitlab', repository);
-    return download({
-      provider: 'gitlab', url: `${api.base}/projects/${encodeURIComponent(id)}/repository/archive.tar.gz?sha=${pinnedCommit(commit)}`,
-      headers: api.headers, format: 'tar.gz', redirect: null,
-    });
-  },
 };
 
 // Gitea and Forgejo: REST v1.
@@ -351,14 +282,6 @@ const gitea: GitProviderAdapter = {
     const items = list('gitea', body);
     if (items.length === 0) accessFailure('gitea', false);
     return commitSha('gitea', record('gitea', items[0]).sha);
-  },
-  async archive(credential, repository, commit) {
-    const api = giteaApi(credential);
-    const { fullName } = target('gitea', repository);
-    return download({
-      provider: 'gitea', url: `${api.base}/repos/${fullName}/archive/${pinnedCommit(commit)}.tar.gz`,
-      headers: api.headers, format: 'tar.gz', redirect: null,
-    });
   },
 };
 
@@ -446,19 +369,6 @@ const bitbucket: GitProviderAdapter = {
       `${bitbucketApi}/repositories/${fullName}/commit/${encodeURIComponent(repositoryRef(ref))}`, bitbucketHeaders(credential));
     return commitSha('bitbucket', record('bitbucket', body).hash);
   },
-  async archive(credential, repository, commit) {
-    const { fullName } = target('bitbucket', repository);
-    // Not part of the REST API: the web download endpoint accepts the same API credentials. A single redirect is
-    // followed only to bitbucket.org or its subdomains, without credentials; a sign-in redirect means no access.
-    return download({
-      provider: 'bitbucket', url: `${bitbucketWeb}/${fullName}/get/${pinnedCommit(commit)}.tar.gz`,
-      headers: bitbucketHeaders(credential), format: 'tar.gz',
-      redirect: url => {
-        if (url.hostname === 'id.atlassian.com' || (url.hostname === 'bitbucket.org' && url.pathname.startsWith('/account/'))) accessFailure('bitbucket', false);
-        return url.port === '' && (url.hostname === 'bitbucket.org' || url.hostname.endsWith('.bitbucket.org'));
-      },
-    });
-  },
 };
 
 // Azure DevOps Services: REST 7.1 under https://dev.azure.com/{organization}.
@@ -540,18 +450,6 @@ const azureDevOps: GitProviderAdapter = {
     const tag = (await azureRefs(api, `tags/${name}`, true)).find(item => item.name === `refs/tags/${name}`);
     if (tag) return commitSha('azure-devops', tag.peeledObjectId ?? tag.objectId);
     return accessFailure('azure-devops', false);
-  },
-  async archive(credential, repository, commit) {
-    const api = azureTarget(credential, repository);
-    const organizationHost = `${api.organization.toLowerCase()}.visualstudio.com`;
-    return download({
-      provider: 'azure-devops',
-      url: `${api.base}/_apis/git/repositories/${api.id}/items?path=/&versionDescriptor.version=${pinnedCommit(commit)}` +
-        '&versionDescriptor.versionType=commit&$format=zip&download=true&api-version=7.1',
-      headers: { ...api.headers, Accept: 'application/zip' }, format: 'zip', denied: deniedStatuses,
-      redirect: url => url.port === '' && (url.hostname.endsWith('.blob.core.windows.net') || url.hostname === organizationHost ||
-        (url.hostname === 'dev.azure.com' && url.pathname.startsWith(`/${api.organization}/`))),
-    });
   },
 };
 

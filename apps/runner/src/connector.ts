@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { constants } from "node:fs";
 import { mkdir, realpath, lstat, open, link, rename, unlink } from "node:fs/promises";
@@ -9,19 +9,17 @@ import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
-import type { SessionRepository } from "../../../packages/shared/src/repositories.js";
-import { repositoryLimits } from "../../../packages/shared/src/repositories.js";
 import type { AuthorizationRequest, AuthorizationResult, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
-import { assertId, ConnectorSetupError, RunnerError, validateRepositories, verifyRunnerTicket } from "./protocol.js";
+import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
 import { parseEgressGrant, relayGitRequest, relayPath } from "./egress.js";
 import { withHostToolCapabilities } from "./host-capabilities.js";
 import { hostGitAuthorization } from "./git-credentials.js";
 import { recoverResourceOrphans } from "./resources.js";
-import { RepositoryCache, repositoryAuthorization, type RepositoryAuthorization, type RepositoryCacheScope } from "./repo-cache.js";
+import { RepositoryCache, type RepositoryCacheScope } from "./repo-cache.js";
 import { RunnerService, createRunnerApp } from "./server.js";
 import type { RunnerConfig } from "./session.js";
 
@@ -178,11 +176,14 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
   // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, pushes, and
   // reads and merges on GitHub through the control plane.
-  // So does the owner's choice to check repositories out of this host's cache, fetched with its own Git credentials.
+  // So does the owner's choice to keep a repository cache on this host. Every session clones its repositories with plain
+  // Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait for
+  // `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
   const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
-  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true, ...credentials };
+  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true,
+    plainGit: true, ...credentials };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true,
-    ...(result.sandbox ? { plainGit: true, cloneBackups: true } : {}), ...credentials };
+    plainGit: true, cloneBackups: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {
@@ -464,12 +465,6 @@ export class LocalConnector {
             sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/merge", payload));
         },
-        repin: async request => {
-          const value = z.object({ sessionId: z.string().regex(IDENTIFIER), path: z.string(), repositories: z.array(z.unknown()) }).strict()
-            .parse(await this.brokerCallback(generation, "/api/connectors/self/git/repin", request));
-          if (value.path !== `/#/s/${value.sessionId}`) throw new Error("Invalid repin session link");
-          return { ...value, repositories: validateRepositories(value.repositories) };
-        },
         // Minting can take several upstream calls, so push callbacks get the full RPC budget.
         pushCredential: async request => {
           const payload = {
@@ -515,11 +510,7 @@ export class LocalConnector {
           return response;
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
-        readRepository: (repository, sessionId) => this.readRepository(generation, repository, sessionId),
-        ...(this.repositoryCache ? {
-          repositoryCache: this.repositoryCache,
-          authorizeRepository: (repository: SessionRepository, sessionId: string) => this.authorizeRepository(generation, repository, sessionId),
-        } : {}),
+        ...(this.repositoryCache ? { repositoryCache: this.repositoryCache } : {}),
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
@@ -639,40 +630,6 @@ export class LocalConnector {
     this.requireGeneration(generation);
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     if (bytes.length !== restore.size || response.headers.get("x-backup-sha256") !== restore.sha256 || await sha256(text) !== restore.sha256) throw new Error("Backup integrity mismatch");
-    return bytes;
-  }
-
-  /** The control plane re-checks the session owner's own access to one pinned repository; no credential comes back. */
-  private async authorizeRepository(generation: Generation, repository: SessionRepository, sessionId: string): Promise<RepositoryAuthorization> {
-    const { bindingId, commit } = repository;
-    if (typeof bindingId !== "string" || !IDENTIFIER.test(bindingId)
-      || typeof sessionId !== "string" || !IDENTIFIER.test(sessionId)
-      || typeof commit !== "string" || !/^[a-f0-9]{40}$/.test(commit)) throw new Error("Invalid repository descriptor");
-    // Its refusals (owner lost access, commit gone) are fixed, credential-free messages the session shows as they are.
-    return repositoryAuthorization(await this.brokerCallback(generation, `/api/connectors/self/repositories/${bindingId}/authorize`, { sessionId, commit }));
-  }
-
-  private async readRepository(generation: Generation, repository: SessionRepository, sessionId: string): Promise<Uint8Array> {
-    this.requireGeneration(generation);
-    const { bindingId, commit } = repository;
-    if (typeof bindingId !== "string" || !IDENTIFIER.test(bindingId)
-      || typeof sessionId !== "string" || !IDENTIFIER.test(sessionId)
-      || typeof commit !== "string" || !/^[a-f0-9]{40}$/.test(commit)) throw new Error("Invalid repository descriptor");
-    // Archive preparation includes upstream GitHub reads; allow the full RPC budget.
-    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(RPC_TIMEOUT)]);
-    const response = await this.callbackResponse(generation, `/api/connectors/self/repositories/${bindingId}/download`, { sessionId, commit }, signal);
-    const checksum = response.headers.get("x-archive-sha256");
-    if (response.headers.get("x-repository-commit") !== commit || !checksum || !/^[A-Za-z0-9_-]{43}$/.test(checksum)) {
-      await response.body?.cancel();
-      throw new Error("Repository integrity mismatch");
-    }
-    const bytes = await boundedBody(response, repositoryLimits.archiveBytes, signal);
-    this.requireGeneration(generation);
-    const declared = response.headers.get("content-length");
-    if (!bytes.byteLength || (declared !== null && Number(declared) !== bytes.byteLength)
-      || createHash("sha256").update(bytes).digest("base64url") !== checksum) throw new Error("Repository integrity mismatch");
-    signal.throwIfAborted();
-    this.requireGeneration(generation);
     return bytes;
   }
 

@@ -127,7 +127,7 @@ async function connectFixture(client: Client): Promise<ConnectorFixture> {
   const replay = await fetch(`${base}/api/connectors/pairings/${pairing.id}/claim`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ code: pairing.code, models: [{ provider: "faux", modelId: "faux-1", name: "Fixture" }],
-      capabilities: { platform: process.platform, sandbox: true, productionShell: false } }),
+      capabilities: { platform: process.platform, sandbox: true, productionShell: false, plainGit: true } }),
     signal: AbortSignal.timeout(10_000),
   });
   assert.ok([400, 401, 403, 409].includes(replay.status), "pairing code must be single-use");
@@ -199,7 +199,7 @@ if (connectedRuntime) {
     for (const mode of ["submit", "ask"]) {
       await bob.request("POST", `/api/sessions/${sessionId}/${mode}`, { content: "TEST_IDENTITY", requestId: `viewer-${mode}` }, [403]);
     }
-    await bob.request("POST", `/api/sessions/${sessionId}/operations`, { kind: "git.commit", message: "forbidden" }, [403]);
+    await bob.request("POST", `/api/sessions/${sessionId}/operations`, { kind: "bash", command: "true" }, [403]);
     await bob.request("POST", `/api/sessions/${sessionId}/approvals/${crypto.randomUUID()}`, { decision: "approve" }, [403]);
     await bob.request("POST", `/api/sessions/${sessionId}/grants`, { userId: bob.user.id, permissions: ["write", "manage"] }, [403]);
     await bob.request("POST", `/api/sessions/${sessionId}/restart`, {}, [403]);
@@ -289,7 +289,7 @@ await check("repository setup stays workspace-scoped and synthetic sign-in grant
 });
 
 await check("private agents remain private; publishing exposes definition, not author environment", async () => {
-  const own: AgentVersion = (await alice.request("POST", "/api/agents", { name: `Reviewer ${run}`, description: "Shared identity-neutral integration fixture", instructions: "Use the connected session owner's identity. Never change identity configuration.", tools: ["identity", "list_files", "read_file", "write_file", "git_status", "git_commit", "bash", "github_comment"], modelId: model.id })).agent;
+  const own: AgentVersion = (await alice.request("POST", "/api/agents", { name: `Reviewer ${run}`, description: "Shared identity-neutral integration fixture", instructions: "Use the connected session owner's identity. Never change identity configuration.", tools: ["identity", "list_files", "read_file", "write_file", "bash", "github_comment"], modelId: model.id })).agent;
   await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: own.id, title: "Forbidden private use" }, [403, 404]);
   published = (await alice.request("POST", `/api/agents/${own.agentId}/publish`, { workspaceId: workspace.id })).agent;
   assert.equal(published.authorId, alice.user.id);
@@ -300,7 +300,7 @@ await check("private agents remain private; publishing exposes definition, not a
   assert.equal("githubToken" in published, false);
 });
 
-await check("repository pins and cache destinations are assigned by the server, not the session caller", async () => {
+await check("session repositories are assigned by the server, not the session caller", async () => {
   await alice.request("POST", "/api/sessions", {
     workspaceId: workspace.id, agentVersionId: published.id, title: "Forbidden repository injection",
     repositories: [{
@@ -406,13 +406,15 @@ await check("collaborative writes execute as owner; another user's worktree stay
 });
 
 await check("write access does not grant approval; approved git commits use owner identity", async () => {
-  const approval: ApprovalRecord = (await bob.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "git.commit", message: `Integration ${run}` })).approval;
+  // The session's own Git metadata is read-only to commands: commits happen in repositories the agent makes or clones.
+  const commit = `git init -q integration && cd integration && git commit -q --allow-empty -m 'Integration ${run}'`;
+  const approval: ApprovalRecord = (await bob.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "bash", command: commit })).approval;
   assert.equal(approval.status, "pending");
   assert.ok(approval.reviewHash, "the Worker must commit to the displayed operation and requester");
   await bob.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve", reviewHash: approval.reviewHash }, [403]);
   const decided: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve", reviewHash: approval.reviewHash })).approval;
   assert.ok(["approved", "executing", "executed"].includes(decided.status));
-  const query: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "bash", command: "git log -1 --format='%an <%ae>|%cn <%ce>'" })).approval;
+  const query: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "bash", command: "cd integration && git log -1 --format='%an <%ae>|%cn <%ce>'" })).approval;
   const inspected: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${query.id}`, { decision: "approve", reviewHash: query.reviewHash })).approval;
   assert.ok(inspected.result?.includes("Alice Integration <alice@example.invalid>"), "git commit author and committer must use owner identity");
 });

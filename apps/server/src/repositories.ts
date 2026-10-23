@@ -1,17 +1,15 @@
 import type { Hono } from 'hono';
 import type { GitProvider, ProviderRepository, ProviderRepositoryList, SessionRepository, TokenGitProvider, WorkspaceRepository, WorkspaceRepositoryList } from '../../../packages/shared/src/repositories.js';
-import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, repositoryRemote, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
-import type { AppContext, Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
-import { getUser, requireMember, sessionAccess } from './db.js';
+import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
+import type { Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
+import { getUser, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode } from './http.js';
 import { decryptToken } from './vault.js';
-import { authenticateConnector, requireConnectorSession, type ConnectorRow } from './connectors.js';
 import {
   credentialOrganization, gitAccountRequired, gitHost, loadCredential, providerRepository, recheckCredential, tokenProvider, validProviderHost,
   type LoadedCredential,
 } from './git/accounts.js';
 import { collectRepositories, gitProviderAdapters, listBytes, listPageSize } from './git/providers.js';
-import { zipToTarGz } from './git/zip.js';
 
 export interface GitHubAccess { token: string; ciphertext: string; userId: string; githubId: string }
 /** The acting user's credential for one provider/host: the sign-in OAuth token for github.com, a token account otherwise. */
@@ -175,14 +173,6 @@ export async function verifyRepository(access: RepositoryAccess, expected: Expec
   }
   return metadata;
 }
-async function repositoryCommit(access: RepositoryAccess, binding: WorkspaceRepository): Promise<string> {
-  const ref = repositoryRef(binding.ref);
-  const sha = access.provider === 'github'
-    ? (await githubJSON(access.github, `/repos/${binding.fullName}/commits/${encodeURIComponent(ref)}`) as { sha?: unknown } | null)?.sha
-    : await gitProviderAdapters[access.provider].commit(access.account.credential, { id: binding.repositoryId, fullName: binding.fullName }, ref);
-  if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) fail(502, 'invalid_repository_commit', `${gitProviderNames[access.provider]} did not return an immutable commit.`);
-  return sha;
-}
 /**
  * In a clone session, the workspace repository a broker request names (`matches`), shaped like a pin so the push and
  * GitHub brokers treat both kinds of session alike. Its commit is a placeholder: no broker uses a pin's commit. Null when
@@ -206,64 +196,9 @@ export async function cloneSessionRepository(env: Env, row: SessionRow, matches:
 export async function cloneRepositories(env: Env, workspaceId: string, ownerId: string): Promise<RepositoryResolution> {
   await requireMember(env, workspaceId, ownerId);
   const configured = await workspaceRepositories(env, workspaceId);
-  if (!configured.length) fail(409, 'workspace_repositories_required', 'Configure at least one repository before starting a session.');
+  if (!configured.length && !await legacyRepositoryFixture(env, ownerId)) fail(409, 'workspace_repositories_required', 'Configure at least one repository before starting a session.');
   return { repositories: [], bindingIds: JSON.stringify(configured.map(item => item.id)), githubAuthority: null, credentials: [] };
 }
-export async function resolveWorkspaceRepositories(env: Env, workspaceId: string, ownerId: string, options: { gitProviders: boolean; repin?: { pins: SessionRepository[]; repository: string; ref: string } }): Promise<RepositoryResolution> {
-  await requireMember(env, workspaceId, ownerId);
-  const configured = await workspaceRepositories(env, workspaceId);
-  const bindingIds = JSON.stringify(configured.map(item => item.id));
-  if (!configured.length) {
-    if (options.repin) fail(409, 'repository_configuration_changed', 'The source repositories are no longer configured.');
-    if (await legacyRepositoryFixture(env, ownerId)) return { repositories: [], bindingIds, githubAuthority: null, credentials: [] };
-    fail(409, 'workspace_repositories_required', 'Configure at least one repository before starting a session.');
-  }
-  if (configured.length > repositoryLimits.repositories) fail(409, 'repository_limit', 'Too many workspace repositories.');
-  const foreign = configured.find(item => item.provider !== 'github');
-  if (foreign && !options.gitProviders) {
-    fail(409, 'connector_update_required', `Update the host's connector (npx pistead@latest connect) to use ${gitProviderNames[foreign.provider]} repositories.`);
-  }
-  if (conflictingPaths(configured.map(repositoryPath))) fail(409, 'repository_path_conflict', 'Two workspace repositories would share a worktree directory. Remove one binding.');
-  const repin = options.repin;
-  if (repin && (!repin.pins.length || !repin.pins.some(pin => pin.path === repin.repository)
-    || repin.pins.some(pin => !validPin(pin) || !configured.some(binding => binding.id === pin.bindingId
-      && binding.repositoryId === String(pin.repositoryId) && binding.fullName === pin.fullName
-      && binding.provider === ('provider' in pin ? pin.provider : 'github')
-      && binding.host === ('provider' in pin ? pin.host : 'github.com'))))) {
-    fail(409, 'repository_configuration_changed', 'A source repository is no longer configured with the same identity.');
-  }
-  // Every binding resolves with the SESSION OWNER's own account for its provider; sharing never lends credentials.
-  const accounts = new Map<string, RepositoryAccess>();
-  const repositories: SessionRepository[] = [];
-  for (const binding of configured) {
-    const previous = repin?.pins.find(pin => pin.bindingId === binding.id);
-    if (repin && !previous) continue; // Newly configured repositories are not silently added to a repin.
-    const selected = !!repin && previous?.path === repin.repository;
-    const ref = selected ? repositoryRef(repin!.ref) : previous?.ref ?? binding.ref;
-    const key = JSON.stringify([binding.provider, binding.host, credentialOrganization(binding.provider, binding.fullName)]);
-    const access = accounts.get(key) ?? await repositoryAccess(env, ownerId, binding.provider, binding.host, binding.fullName);
-    accounts.set(key, access);
-    await verifyRepository(access, binding);
-    const commit = previous && !selected ? previous.commit : await repositoryCommit(access, { ...binding, ref });
-    await verifyRepository(access, binding);
-    // GitHub pins keep their original key order and numeric id so persisted bindings stay byte-identical.
-    repositories.push(binding.provider === 'github'
-      ? { bindingId: binding.id, repositoryId: Number(binding.repositoryId), fullName: binding.fullName, ref, commit, path: binding.fullName }
-      : { bindingId: binding.id, provider: binding.provider, host: binding.host, repositoryId: binding.repositoryId, fullName: binding.fullName,
-        ref, commit, path: repositoryPath(binding) });
-  }
-  for (const access of accounts.values()) await recheckAccess(env, access);
-  await requireMember(env, workspaceId, ownerId);
-  if (JSON.stringify((await workspaceRepositories(env, workspaceId)).map(item => item.id)) !== bindingIds) {
-    fail(409, 'repository_configuration_changed', 'Workspace repositories changed while resolving references. Try again.');
-  }
-  const used = [...accounts.values()];
-  const github = used.find(access => access.provider === 'github')?.github;
-  return { repositories, bindingIds,
-    githubAuthority: github ? { ciphertext: github.ciphertext, githubId: github.githubId } : null,
-    credentials: used.flatMap(access => access.provider === 'github' ? [] : [{ id: access.account.credential.id, ciphertext: access.account.ciphertext }]) };
-}
-
 export function registerRepositories(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/repositories', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
@@ -317,147 +252,4 @@ export function registerRepositories(app: Hono<WorkerEnv>): void {
       .bind(identifier(c.req.param('repositoryId')), workspaceId, workspaceId, actor).run();
     return c.body(null, 204);
   });
-}
-
-/** A pin must have exactly one of the two persisted shapes, with the path the server would have assigned. */
-export function validPin(pin: SessionRepository): boolean {
-  const keys = Object.keys(pin).sort().join(',');
-  if (!('provider' in pin)) {
-    return keys === 'bindingId,commit,fullName,path,ref,repositoryId' && Number.isSafeInteger(pin.repositoryId) && pin.repositoryId > 0 &&
-      validRepositoryName('github', pin.fullName) && pin.path === pin.fullName;
-  }
-  return keys === 'bindingId,commit,fullName,host,path,provider,ref,repositoryId' && tokenProvider(pin.provider) &&
-    validProviderHost(pin.provider, pin.host) && validRepositoryId(pin.repositoryId) && validRepositoryName(pin.provider, pin.fullName) &&
-    pin.path === repositoryPath(pin);
-}
-function pinnedRepository(row: SessionRow, bindingId: string, commit: unknown): SessionRepository {
-  let repositories: SessionRepository[];
-  try { repositories = JSON.parse(row.repositories_json ?? '[]'); } catch { return fail(409, 'invalid_binding', 'Session repository binding is invalid.'); }
-  if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) fail(409, 'invalid_binding', 'Session repository binding is invalid.');
-  const pin = repositories.find(item => item && typeof item === 'object' && item.bindingId === bindingId);
-  if (!pin || pin.commit !== commit || !/^[0-9a-f]{40}$/.test(pin.commit) || !validPin(pin)) fail(403, 'repository_binding_mismatch', 'This download does not match a pinned session repository.');
-  return pin;
-}
-export function archiveRedirect(location: string | null, repository: { fullName: string; commit: string }): string {
-  if (!location) fail(502, 'invalid_archive_redirect', 'GitHub did not return a trusted archive location.');
-  let url: URL;
-  try { url = new URL(location); } catch { return fail(502, 'invalid_archive_redirect', 'GitHub returned an invalid archive location.'); }
-  const path = `/${repository.fullName}/legacy.tar.gz/${repository.commit}`;
-  const query = url.search;
-  if (url.origin !== 'https://codeload.github.com' || url.username || url.password || url.port || url.hash || url.pathname !== path ||
-      (query !== '' && !/^\?token=[A-Za-z0-9_-]{1,1024}$/.test(query)) ||
-      location !== `${url.origin}${path}${query}`) fail(502, 'invalid_archive_redirect', 'GitHub returned an untrusted archive location.');
-  return url.href;
-}
-async function githubArchive(access: GitHubAccess, repository: { fullName: string; commit: string }): Promise<Uint8Array<ArrayBuffer>> {
-  const redirect = await remoteFetch(`${apiOrigin}/repos/${repository.fullName}/tarball/${repository.commit}`, { headers: headers(access) });
-  if (redirect.status !== 302) { await redirect.body?.cancel(); fail(502, 'invalid_archive_redirect', 'GitHub did not return the expected archive redirect.'); }
-  const location = redirect.headers.get('location'); await redirect.body?.cancel();
-  const url = archiveRedirect(location, repository);
-  // OAuth credentials are never forwarded across origins, even to GitHub's archive service.
-  const response = await remoteFetch(url, { headers: { Accept: 'application/gzip', 'User-Agent': 'OpenCara-Agent-Workspace' } });
-  if (response.status !== 200) { await response.body?.cancel(); fail(502, 'repository_download_failed', 'GitHub could not supply the pinned archive.'); }
-  return boundedRepositoryBody(response, repositoryLimits.archiveBytes);
-}
-async function providerArchive(access: Extract<RepositoryAccess, { account: LoadedCredential }>, repository: SessionRepository): Promise<Uint8Array<ArrayBuffer>> {
-  const archive = await gitProviderAdapters[access.provider].archive(access.account.credential,
-    { id: String(repository.repositoryId), fullName: repository.fullName }, repository.commit);
-  if (archive.format === 'tar.gz') return archive.bytes;
-  // Zip snapshots become the same single-top-directory tar.gz the runner extracts for GitHub (name bounded to 80 characters).
-  const name = repository.fullName.split('/').at(-1)!.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^\.+/, '-').slice(0, 64);
-  const bytes = await zipToTarGz(archive.bytes, `${name}-${repository.commit.slice(0, 12)}`);
-  if (bytes.length > repositoryLimits.archiveBytes) fail(502, 'repository_size_limit', 'The repository response exceeds the supported size limit.');
-  return bytes;
-}
-/**
- * The pinned repository a runner callback names, and a recheck of the session and connector authority behind it.
- * Callers run `authorize` before and after every slow provider request.
- */
-async function pinnedCallback(c: AppContext, connector: ConnectorRow | null, invalidCode: string):
-  Promise<{ original: SessionRow; repository: SessionRepository; authorize: () => Promise<void> }> {
-  const input = await jsonObject(c, 4096);
-  if (Object.keys(input).some(key => !['sessionId', 'commit'].includes(key))) fail(400, invalidCode, 'Only the session and pinned commit are accepted.');
-  const sessionId = identifier(input.sessionId, 'sessionId'); const bindingId = identifier(c.req.param('bindingId'));
-  const original = await c.env.DB.query<SessionRow>('SELECT * FROM sessions WHERE id = ?').bind(sessionId).first();
-  if (!original) fail(404, 'not_found', 'Session not found.');
-  const repository = pinnedRepository(original, bindingId, input.commit);
-  const authorize = async () => {
-    const fresh = await sessionAccess(c.env, sessionId, original.owner_id);
-    if (!fresh || fresh.row.status === 'archived' || fresh.row.policy_version !== original.policy_version ||
-        fresh.row.repositories_json !== original.repositories_json || fresh.row.owner_id !== original.owner_id) fail(403, 'repository_authority_changed', 'Session repository access is no longer authorized.');
-    if (connector) {
-      const current = await authenticateConnector(c);
-      if (current.id !== connector.id || current.connection_hash !== connector.connection_hash) fail(401, 'stale_connection', 'The connector connection changed.');
-      await requireConnectorSession(c.env, connector.id, fresh.row, connector.connection_hash!);
-    } else if (fresh.row.connector_id) fail(403, 'connector_scope_required', 'Use the connector-scoped repository callback.');
-  };
-  return { original, repository, authorize };
-}
-
-export async function repositoryDownload(c: AppContext, connector: ConnectorRow | null): Promise<Response> {
-  const { original, repository, authorize } = await pinnedCallback(c, connector, 'invalid_repository_download');
-  await authorize();
-  const provider: GitProvider = 'provider' in repository ? repository.provider : 'github';
-  const host = 'provider' in repository ? repository.host : 'github.com';
-  const access = await repositoryAccess(c.env, original.owner_id, provider, host, repository.fullName);
-  const expected = { repositoryId: String(repository.repositoryId), fullName: repository.fullName };
-  await verifyRepository(access, expected);
-  await authorize();
-  const bytes = access.provider === 'github' ? await githubArchive(access.github, repository) : await providerArchive(access, repository);
-  if (bytes.length < 2 || bytes[0] !== 0x1f || bytes[1] !== 0x8b) fail(502, 'invalid_repository_archive', `${gitProviderNames[provider]} did not return a gzip archive.`);
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-  const checksum = btoa(String.fromCharCode(...digest)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  await verifyRepository(access, expected);
-  await recheckAccess(c.env, access);
-  await authorize();
-  return new Response(bytes, { headers: { 'Content-Type': 'application/gzip', 'Content-Length': String(bytes.length),
-    'Cache-Control': 'private, no-store', 'X-Repository-Commit': repository.commit, 'X-Archive-SHA256': checksum } });
-}
-
-/** The commit id GitHub resolves `commit` to for the owner; the sha media type answers with the bare id, never a file list. */
-async function githubCommitSha(access: GitHubAccess, fullName: string, commit: string): Promise<string> {
-  const response = await remoteFetch(`${apiOrigin}/repos/${fullName}/commits/${commit}`,
-    { headers: { ...headers(access), Accept: 'application/vnd.github.sha' } });
-  if (response.status !== 200) {
-    await response.body?.cancel();
-    if (response.status === 404 || response.status === 422) fail(403, 'repository_commit_unavailable', 'The pinned commit is no longer readable in this GitHub repository.');
-    if (response.status === 401 || response.status === 403) fail(403, 'github_repository_unavailable', 'GitHub repository access could not be verified. Check repository access and try again.');
-    fail(502, 'github_unavailable', 'GitHub could not complete the repository request.');
-  }
-  return new TextDecoder().decode(await boundedRepositoryBody(response, 1024)).trim();
-}
-
-/** The session owner's own account must still read the exact pinned commit in the bound repository. */
-async function requirePinnedCommit(access: RepositoryAccess, repository: SessionRepository): Promise<void> {
-  // Every adapter resolves a full commit id as a ref and fails with git_repository_unavailable when it is unreadable.
-  const sha = access.provider === 'github'
-    ? await githubCommitSha(access.github, repository.fullName, repository.commit)
-    : await gitProviderAdapters[access.provider].commit(access.account.credential, { id: String(repository.repositoryId), fullName: repository.fullName }, repository.commit);
-  if (sha !== repository.commit) {
-    fail(403, 'repository_commit_unavailable', `The pinned commit is no longer readable in this ${gitProviderNames[access.provider]} repository.`);
-  }
-}
-
-/**
- * Lets a host use its repository cache for one pinned repository (docs/design/repository-cache.md). The session and
- * connector authority must still hold, and the session OWNER's own account must still read the repository and its exact
- * pinned commit; the host's credential only decides what the host can fetch, never what an owner may read. The answer
- * carries no credential and no repository content: the host fetches with its own Git credentials, from the
- * credential-free remote below, which it also derives from the pin itself and requires to match.
- */
-export async function repositoryAuthorize(c: AppContext, connector: ConnectorRow | null): Promise<Response> {
-  const { original, repository, authorize } = await pinnedCallback(c, connector, 'invalid_repository_authorization');
-  await authorize();
-  const provider: GitProvider = 'provider' in repository ? repository.provider : 'github';
-  const host = 'provider' in repository ? repository.host : 'github.com';
-  const access = await repositoryAccess(c.env, original.owner_id, provider, host, repository.fullName);
-  const expected = { repositoryId: String(repository.repositoryId), fullName: repository.fullName };
-  await verifyRepository(access, expected);
-  await authorize();
-  await requirePinnedCommit(access, repository);
-  await verifyRepository(access, expected);
-  await recheckAccess(c.env, access);
-  await authorize();
-  return c.json({ repository: { bindingId: repository.bindingId, commit: repository.commit, remote: repositoryRemote(repository) } }, 200,
-    { 'Cache-Control': 'private, no-store' });
 }

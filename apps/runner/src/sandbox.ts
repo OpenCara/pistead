@@ -5,11 +5,10 @@ import { constants } from "node:fs";
 import { chmod, mkdir, open, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
-import { repositoryLimits, validCloneDirectory, type SessionRepository } from "../../../packages/shared/src/repositories.js";
-import { repositoryPinIdentity } from "./protocol.js";
+import { validCloneDirectory } from "../../../packages/shared/src/repositories.js";
 import { EGRESS_PORT, EGRESS_SOCKET, egressEnvironment } from "./egress.js";
 import type { HostCommandOperation, Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
-import type { ClonePushPreparation, PushPreparation } from "./push.js";
+import type { ClonePushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { runHostShell } from "./host-shell.js";
@@ -20,7 +19,6 @@ export { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 export const TIMEOUT_MS = 30_000;
 /** Push rewrites and packs move whole repositories; only push kinds get this deadline. */
 const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
-const PUSH_ID = /^[0-9a-f]{32}$/;
 const OID = /^[0-9a-f]{40}$/;
 export const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
@@ -42,12 +40,6 @@ export interface SandboxExecutionOptions {
 }
 
 export interface SandboxOptions {
-  /**
-   * Host paths of the repository cache's object directories, keyed by pin path (`RepositoryCache.objects`). Each is
-   * mounted read-only for every sandboxed process, at `/repository-cache/<n>` in pin order, which the session's
-   * `objects/info/alternates` names once its repositories are checked out of the cache.
-   */
-  repositoryObjects?: Readonly<Record<string, string>>;
   /**
    * Host path of the session's egress proxy socket (see EgressProxy). Shell commands get it read-only at EGRESS_SOCKET,
    * and the helper relays the sandbox's loopback EGRESS_PORT to it: their only way out of the network namespace.
@@ -118,36 +110,6 @@ if index < len(args) and args[index] == 'clone':
 os.execv('/usr/bin/git', ['git'] + args)
 `;
 
-/** "absent": pristine storage. Otherwise how the ready baseline was made: from archives, or from the host repository cache. */
-export type RepositoryCacheState = "absent" | "archive" | "cache";
-
-export function repositoryCacheState(value: unknown): RepositoryCacheState {
-  if (value === false) return "absent";
-  if (value === "cache") return "cache";
-  if (value === true || value === "archive") return "archive";
-  throw new Error("Invalid repository cache state");
-}
-
-const CACHE_MOUNT = "/repository-cache";
-
-/**
- * Cache object directories in pin order. Only the runner configures them; they must still be canonical absolute
- * paths outside the session's own storage, and usable as alternates entries (no newline or ":").
- */
-export function repositoryObjectPaths(repositories: readonly SessionRepository[], objects: Readonly<Record<string, string>> | undefined, root: string): string[] {
-  if (objects === undefined) return [];
-  if (!objects || typeof objects !== "object" || Object.keys(objects).sort().join("\n") !== repositories.map(({ path }) => path).sort().join("\n")) {
-    throw new Error("Repository cache paths do not match pins");
-  }
-  const storage = resolve(root);
-  return repositories.map(({ path }) => {
-    const value = objects[path];
-    if (typeof value !== "string" || !isAbsolute(value) || resolve(value) !== value || /[\0\n:]/.test(value) || value === sep
-      || value === storage || value.startsWith(`${storage}/`) || storage.startsWith(`${value}/`)) throw new Error("Invalid repository cache path");
-    return value;
-  });
-}
-
 export interface SnapshotFile {
   /** Relative to the constructor's sandbox root; data is base64, including binary files. */
   path: string;
@@ -185,19 +147,10 @@ interface Mounts {
 
 type Request =
   | { kind: "initialize" }
-  | { kind: "repository-ready" }
-  | { kind: "repository-materialize"; archives: string[] }
-  | { kind: "repository-checkout" }
   | { kind: "read" | "read-content" | "list"; path: string }
   | { kind: "write"; path: string; content: string }
-  | { kind: "status" }
   | { kind: "snapshot"; clones?: string[] }
-  | { kind: "commit"; message: string }
   | { kind: "bash"; command: string }
-  | { kind: "head" }
-  | { kind: "push-prepare"; id: string; path: string; base: string; commit: string }
-  | { kind: "push-pack"; id: string; tip: string; exclude: string[] }
-  | { kind: "push-cleanup"; id: string }
   | { kind: "clone-head"; path: string }
   | { kind: "clone-push-prepare"; path: string; commit: string; old: string | null; tips: string[] }
   | { kind: "clone-push-pack"; path: string; commit: string; exclude: string[] }
@@ -212,9 +165,7 @@ interface Transfer { input?: AsyncIterable<Uint8Array>; output?: (stdout: Readab
  * with O_NOFOLLOW, so swapping a checked parent for a symlink cannot win a race.
  */
 const HELPER = String.raw`
-import base64, binascii, ctypes, fcntl, json, os, re, resource, secrets, shutil, socket, stat, subprocess, sys, threading, zlib
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+import base64, json, os, re, resource, secrets, shutil, socket, stat, subprocess, sys, threading
 
 for fd_name in os.listdir('/proc/self/fd'):
     fd = int(fd_name)
@@ -224,9 +175,9 @@ for fd_name in os.listdir('/proc/self/fd'):
         except OSError:
             pass
 os.umask(0o077)
-PUSH_KINDS = ('push-prepare', 'push-pack', 'clone-push-prepare', 'clone-push-pack')
+PUSH_KINDS = ('clone-push-prepare', 'clone-push-pack')
 # Checkouts from the host repository cache write whole repositories, like pushes read them.
-LONG_KINDS = PUSH_KINDS + ('repository-checkout', 'clone-backup', 'clone-restore')
+LONG_KINDS = PUSH_KINDS + ('clone-backup', 'clone-restore')
 
 
 def limits(kind):
@@ -263,516 +214,6 @@ MAX_SNAPSHOT = 32 * 1024 * 1024
 MAX_ENTRIES = 10000
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-
-REPOSITORY_LIMITS = ${JSON.stringify(repositoryLimits)}
-CACHE_MARKER = 'repository-cache.json'
-CACHE_LOCK = 'repository-cache.lock'
-RESERVED = {'.git'}
-
-
-def archive_parts(value, directory=False):
-    if directory and value.endswith('/'):
-        value = value[:-1]
-    if not value or len(value.encode('utf-8')) > 1024 or value.startswith('/') or '\\' in value:
-        raise ValueError('invalid repository archive path')
-    parts = value.split('/')
-    if len(parts) > 64 or any(p in ('', '.', '..') or len(p.encode('utf-8')) > 255 for p in parts):
-        raise ValueError('repository archive traversal or depth limit')
-    if any(ord(c) < 32 or ord(c) == 127 for c in value) or any(':' in p for p in parts):
-        raise ValueError('invalid repository archive path')
-    if any(p.lower() in RESERVED for p in parts):
-        raise ValueError('repository archive contains reserved Git or identity files')
-    return parts
-
-
-def expand_archive(encoded, budget):
-    try:
-        packed = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error):
-        raise ValueError('invalid repository archive encoding')
-    if not packed or len(packed) > REPOSITORY_LIMITS['archiveBytes']:
-        raise ValueError('repository archive exceeds compressed size limit')
-    # No tar parser sees a byte until the complete gzip stream (metadata included)
-    # has passed the aggregate expansion bound. Concatenated streams are refused.
-    inflater = zlib.decompressobj(31)
-    expanded = inflater.decompress(packed, budget + 1)
-    if len(expanded) > budget or inflater.unconsumed_tail:
-        raise ValueError('repository archives exceed expanded size limit')
-    if not inflater.eof or inflater.unused_data:
-        raise ValueError('incomplete or concatenated repository gzip archive')
-    return expanded
-
-
-def tar_number(raw):
-    value = raw.rstrip(b'\x00 ').lstrip(b' ')
-    if not value:
-        return 0
-    if not re.fullmatch(b'[0-7]+', value):
-        raise ValueError('unsupported repository tar numeric field')
-    return int(value, 8)
-
-
-def tar_text(raw):
-    value, separator, padding = raw.partition(b'\x00')
-    if separator and any(padding):
-        raise ValueError('invalid repository tar name padding')
-    return value.decode('utf-8')
-
-
-def pax_fields(data, global_header):
-    result, offset = {}, 0
-    while offset < len(data):
-        space = data.find(b' ', offset, min(len(data), offset + 12))
-        if space < 0 or not re.fullmatch(b'[1-9][0-9]*', data[offset:space]):
-            raise ValueError('invalid repository PAX length')
-        length = int(data[offset:space])
-        end = offset + length
-        if end > len(data) or end <= space + 2 or data[end - 1:end] != b'\n':
-            raise ValueError('incomplete repository PAX record')
-        key, separator, value = data[space + 1:end - 1].partition(b'=')
-        key, value = key.decode('utf-8'), value.decode('utf-8')
-        if not separator or key in result:
-            raise ValueError('duplicate or invalid repository PAX key')
-        # GitHub emits a global commit comment and may use POSIX path metadata.
-        # Size overrides, sparse maps, linkpaths and vendor extensions are unsafe.
-        if key not in ('comment', 'mtime', 'atime', 'ctime', 'uid', 'gid', 'uname', 'gname', 'path'):
-            raise ValueError('unsupported repository PAX metadata')
-        if key == 'path':
-            if global_header:
-                raise ValueError('global repository PAX path is not supported')
-            archive_parts(value, True)
-        result[key] = value
-        offset = end
-    return result
-
-
-def link_target(path, link):
-    # Symlinks resolve lexically inside their repository; '..' may never climb above its root.
-    if not link or link.startswith('/') or '\\' in link or any(ord(c) < 32 or ord(c) == 127 for c in link):
-        raise ValueError('repository symlink target must be a relative path')
-    parts = list(path[:-1])
-    for part in link.split('/'):
-        if part in ('', '.'):
-            continue
-        if part == '..':
-            if not parts:
-                raise ValueError('repository symlink escapes its repository')
-            parts.pop()
-        else:
-            parts.append(part)
-    if not parts:
-        raise ValueError('repository symlink escapes its repository')
-    return tuple(parts)
-
-
-def parse_archive(data, budget, destination):
-    if len(data) % 512:
-        raise ValueError('incomplete repository tar archive')
-    offset, entries, prefix, pending, ended = 0, 0, None, None, False
-    explicit, nodes, files, links = set(), {}, [], {}
-    while offset < len(data):
-        header = data[offset:offset + 512]
-        offset += 512
-        if not any(header):
-            if pending is not None or offset + 512 > len(data) or any(data[offset:]):
-                raise ValueError('incomplete repository tar terminator')
-            ended = True
-            break
-        entries += 1
-        if entries > budget:
-            raise ValueError('repository archives have too many entries')
-        if tar_number(header[148:156]) != sum(header[:148]) + 8 * 32 + sum(header[156:]):
-            raise ValueError('invalid repository tar checksum')
-        if header[257:263] not in (b'ustar\x00', b'ustar '):
-            raise ValueError('unsupported repository tar format')
-        name = tar_text(header[:100])
-        if header[257:263] == b'ustar\x00':
-            parent = tar_text(header[345:500])
-            if parent:
-                name = parent + '/' + name
-        kind, size = header[156:157], tar_number(header[124:136])
-        if offset + ((size + 511) // 512) * 512 > len(data):
-            raise ValueError('incomplete repository tar entry')
-        body = data[offset:offset + size]
-        offset += ((size + 511) // 512) * 512
-        archive_parts(name, kind == b'5')
-        if kind in (b'x', b'g'):
-            if pending is not None:
-                raise ValueError('conflicting repository PAX headers')
-            metadata = pax_fields(body, kind == b'g')
-            if kind == b'x':
-                pending = metadata
-            continue
-        if kind == b'2':
-            # Symlinks become copies of an in-repository regular file; no link is ever created.
-            if size:
-                raise ValueError('repository symlink entries cannot carry data')
-            link = tar_text(header[157:257])
-        elif kind not in (b'0', b'\x00', b'5') or any(header[157:257]):
-            raise ValueError('repository archive links and special files are forbidden')
-        if pending is not None:
-            name = pending.get('path', name)
-            pending = None
-        parts = archive_parts(name, kind == b'5')
-        if prefix is None:
-            prefix = parts[0]
-        if parts[0] != prefix:
-            raise ValueError('repository archive must have one top-level directory')
-        path = tuple(parts[1:])
-        if len(path) + 2 > 64 or len('/'.join([destination] + list(path)).encode('utf-8')) > 1024:
-            raise ValueError('repository destination exceeds path or depth limit')
-        if not path and kind != b'5':
-            raise ValueError('repository archive root must be a directory')
-        if path in explicit:
-            raise ValueError('duplicate repository archive entry')
-        explicit.add(path)
-        for depth in range(1, len(path)):
-            parent = path[:depth]
-            if nodes.get(parent) == 'file':
-                raise ValueError('conflicting repository archive paths')
-            nodes[parent] = 'directory'
-        if kind == b'5':
-            if size or nodes.get(path) == 'file':
-                raise ValueError('conflicting repository directory entry')
-            nodes[path] = 'directory'
-        elif kind == b'2':
-            if path in nodes:
-                raise ValueError('conflicting repository archive paths')
-            nodes[path] = 'file'
-            links[path] = link
-        else:
-            if size > REPOSITORY_LIMITS['fileBytes']:
-                raise ValueError('repository file exceeds size limit')
-            if path in nodes:
-                raise ValueError('conflicting repository archive paths')
-            nodes[path] = 'file'
-            mode = 0o700 if tar_number(header[100:108]) & 0o111 else 0o600
-            files.append((path, body, mode))
-        if len(nodes) > REPOSITORY_LIMITS['entries']:
-            raise ValueError('repository archive has too many filesystem entries')
-    if not ended or prefix is None:
-        raise ValueError('incomplete or empty repository tar archive')
-    regular_files = {path: (body, mode) for path, body, mode in files}
-    copied = 0
-    for path, link in links.items():
-        target = link_target(path, link)
-        for _ in range(8):
-            if target not in links:
-                break
-            target = link_target(target, links[target])
-        if target not in regular_files:
-            raise ValueError('repository symlink must point to a regular file in its repository')
-        body, mode = regular_files[target]
-        copied += len(body)
-        files.append((path, body, mode))
-    return files, nodes, max(entries, len(nodes)), copied
-
-
-def git_capture(arguments, success=True):
-    result = subprocess.run(GIT + arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
-    if success and result.returncode:
-        raise ValueError('repository Git baseline validation failed')
-    return result
-
-
-def read_alternates(git):
-    try:
-        info = walk(git, ['objects', 'info'])
-    except FileNotFoundError:
-        return ''
-    try:
-        return read_at(info, 'alternates', 65536)[0].decode('utf-8')
-    except FileNotFoundError:
-        return ''
-    finally:
-        os.close(info)
-
-
-def cache_ready(work, git, repositories, alternates=()):
-    # False for pristine storage; otherwise how the ready baseline was made: 'archive' (version 1 marker, or no
-    # repositories) or 'cache' (version 2: checked out from the host repository cache through read-only mounts).
-    try:
-        raw, _ = read_at(git, CACHE_MARKER, 65536)
-    except FileNotFoundError:
-        if not repositories:
-            return True
-        if os.listdir(work) != ['.git'] or git_capture(['rev-parse', '--verify', 'HEAD'], False).returncode == 0:
-            raise ValueError('repository cache is unmarked and nonempty; refusing to overwrite')
-        if git_capture(['ls-files', '--stage']).stdout:
-            raise ValueError('repository cache has an existing Git index')
-        return False
-    marker = json.loads(raw)
-    if not isinstance(marker, dict) or type(marker.get('version')) is not int:
-        raise ValueError('repository cache binding does not match immutable pins')
-    if marker['version'] == 1:
-        source = 'archive'
-    elif marker['version'] == 2 and marker.get('source') == 'cache':
-        source = 'cache'
-    else:
-        raise ValueError('repository cache binding does not match immutable pins')
-    if json.dumps(marker.get('repositories'), sort_keys=True) != json.dumps(repositories, sort_keys=True):
-        raise ValueError('repository cache binding does not match immutable pins')
-    if source == 'cache' and not alternates:
-        raise ValueError('this session needs the host repository cache; its connector must run with --repo-cache')
-    expected = ''.join(path + '\n' for path in alternates) if source == 'cache' else ''
-    if read_alternates(git) != expected:
-        raise ValueError('repository cache mounts do not match this session')
-    if marker.get('status') != 'ready':
-        raise ValueError('repository cache preparation is incomplete; refusing to overwrite')
-    baseline = marker.get('baseline')
-    if not isinstance(baseline, str) or not re.fullmatch('[0-9a-f]{40}', baseline):
-        raise ValueError('invalid repository cache baseline')
-    if git_capture(['cat-file', '-t', baseline]).stdout.strip() != b'commit':
-        raise ValueError('repository cache baseline is missing')
-    git_capture(['merge-base', '--is-ancestor', baseline, 'HEAD'])
-    return source
-
-
-def cache_marker(git, repositories, status, baseline=None, source='archive'):
-    value = {'version': 1, 'repositories': repositories, 'status': status}
-    if source == 'cache':
-        # Version 2: older runners refuse these sessions instead of using them without the cache mounts.
-        value = {'version': 2, 'source': 'cache', 'repositories': repositories, 'status': status}
-    if baseline is not None:
-        value['baseline'] = baseline
-    write_at(git, [CACHE_MARKER], json.dumps(value, ensure_ascii=True))
-
-
-def rename_new(source, destination, name):
-    renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
-    renameat2.restype = ctypes.c_int
-    encoded = os.fsencode(name)
-    if renameat2(source, encoded, destination, encoded, 1) != 0:  # RENAME_NOREPLACE
-        raise OSError(ctypes.get_errno(), 'repository destination cannot be promoted')
-
-
-def sync_cache(root, entry_limit, byte_limit, links=False):
-    # Only pinned descendants are flushed, never the shared host filesystem.
-    # With links=True, symlinks are allowed (cache checkouts create real ones); the fsync
-    # of their parent directory makes them durable, and they are never followed.
-    # Bound both traversal and outstanding descriptors; concurrent fsync calls
-    # let storage coalesce flushes without weakening the ready-marker barrier.
-    pending = deque()
-    entries, size = 0, 0
-
-    def mount_id(fd):
-        # Overlay files and directories can legitimately have different st_dev.
-        # Kernel fdinfo identifies the actual mount of the pinned descriptor.
-        with open('/proc/self/fdinfo/' + str(fd), 'r', encoding='ascii') as stream:
-            match = re.search(r'^mnt_id:\s*([0-9]+)$', stream.read(4096), re.MULTILINE)
-        if match is None:
-            raise ValueError('repository durability mount identity is unavailable')
-        return match.group(1)
-
-    mount = mount_id(root)
-
-    def persist(fd):
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        def enqueue(fd):
-            try:
-                if len(pending) >= 16:
-                    pending.popleft().result()
-                future = pool.submit(persist, fd)
-            except BaseException:
-                os.close(fd)
-                raise
-            pending.append(future)
-
-        def visit(directory, depth, path_bytes):
-            nonlocal entries, size
-            with os.scandir(directory) as children:
-                for child in children:
-                    entries += 1
-                    length = path_bytes + len(os.fsencode(child.name)) + (1 if depth else 0)
-                    if entries > entry_limit or depth >= 64 or length > 1024:
-                        raise ValueError('repository durability traversal limit exceeded')
-                    before = child.stat(follow_symlinks=False)
-                    if links and stat.S_ISLNK(before.st_mode):
-                        continue
-                    is_directory = stat.S_ISDIR(before.st_mode)
-                    if not is_directory:
-                        regular(before)
-                    fd = os.open(child.name, DIR_FLAGS if is_directory else FILE_FLAGS, dir_fd=directory)
-                    try:
-                        info = os.fstat(fd)
-                        if mount_id(fd) != mount or (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
-                            raise ValueError('repository durability entry changed or crosses a mount')
-                        if is_directory:
-                            visit(fd, depth + 1, length)
-                        else:
-                            regular(info)
-                            size += info.st_size
-                            if size > byte_limit:
-                                raise ValueError('repository durability byte limit exceeded')
-                            enqueue(os.dup(fd))
-                    finally:
-                        os.close(fd)
-            enqueue(os.dup(directory))
-
-        visit(root, 0, 0)
-        while pending:
-            pending.popleft().result()
-
-
-def materialize_repositories(work, git, repositories, archives, alternates=()):
-    if cache_ready(work, git, repositories, alternates):
-        return
-    if len(archives) != len(repositories):
-        raise ValueError('repository archives do not match pins')
-    prepared, expanded, entries = [], 0, 0
-    for repository, encoded in zip(repositories, archives):
-        data = expand_archive(encoded, REPOSITORY_LIMITS['expandedBytes'] - expanded)
-        expanded += len(data)
-        files, nodes, count, copied = parse_archive(data, REPOSITORY_LIMITS['entries'] - entries, repository['path'])
-        # Symlink copies occupy disk too; they count against the same aggregate bound.
-        expanded += copied
-        if expanded > REPOSITORY_LIMITS['expandedBytes']:
-            raise ValueError('repository archives exceed expanded size limit')
-        entries += count
-        if entries > REPOSITORY_LIMITS['entries']:
-            raise ValueError('repository archives have too many entries')
-        prepared.append((repository['path'].split('/'), files, nodes))
-    # Validate every archive before the first filesystem change. Thereafter a
-    # durable preparing marker makes interruption fail closed, never reset edits.
-    cache_marker(git, repositories, 'preparing')
-    stage_name = '.repository-stage-' + secrets.token_hex(16)
-    os.mkdir(stage_name, 0o700, dir_fd=work)
-    stage = os.open(stage_name, DIR_FLAGS, dir_fd=work)
-    try:
-        for destination, files, nodes in prepared:
-            root = walk(stage, destination, True)
-            try:
-                directories = sorted((path for path in nodes if nodes[path] == 'directory'), key=lambda p: (len(p), p))
-                for path in directories:
-                    os.close(walk(root, path, True))
-                for path, body, mode in files:
-                    parent = walk(root, path[:-1], True)
-                    try:
-                        fd = os.open(path[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                     mode, dir_fd=parent)
-                        with os.fdopen(fd, 'wb') as stream:
-                            stream.write(body)
-                    finally:
-                        os.close(parent)
-            finally:
-                os.close(root)
-        sync_cache(stage, REPOSITORY_LIMITS['entries'] + 2 * len(repositories),
-                   REPOSITORY_LIMITS['expandedBytes'])
-        for owner in os.listdir(stage):
-            # Atomic no-replace promotion, including against concurrent insertion.
-            rename_new(stage, work, owner)
-        os.rmdir(stage_name, dir_fd=work)
-        os.fsync(work)
-        git_capture(['add', '--force', '--all', '--', '.'])
-        git_capture(['commit', '--quiet', '--allow-empty', '--no-verify', '--no-gpg-sign',
-                     '-m', 'Initialize pinned repository snapshots'])
-        baseline = git_capture(['rev-parse', '--verify', 'HEAD']).stdout.decode('ascii').strip()
-        # Loose blobs and trees add at most two objects per imported node.
-        # Include bounded overhead for refs, logs, index and Git administrative
-        # directories, independently of the worktree's archive quotas.
-        sync_cache(git, 2 * REPOSITORY_LIMITS['entries'] + 1024,
-                   4 * REPOSITORY_LIMITS['expandedBytes'] + 1024 * REPOSITORY_LIMITS['entries'])
-        cache_marker(git, repositories, 'ready', baseline)
-    finally:
-        os.close(stage)
-
-
-def cache_mounts(alternates, count):
-    if not isinstance(alternates, list) or not count or len(alternates) != count:
-        raise ValueError('repository cache mounts do not match pins')
-    for path in alternates:
-        if (not isinstance(path, str) or not path.startswith('/') or os.path.normpath(path) != path
-                or any(character in path for character in '\0\n:')
-                or os.path.commonpath((WORK, path)) == WORK or os.path.commonpath((HOME, path)) == HOME):
-            raise ValueError('invalid repository cache mount')
-    return alternates
-
-
-def pinned_ref(path):
-    # refs/remotes/<path>/pinned names each pinned commit for the agent, when <path> is also a valid ref name.
-    if all(re.fullmatch('[A-Za-z0-9_-][A-Za-z0-9._-]*', part) and not part.endswith(('.', '.lock')) and '..' not in part
-           for part in path.split('/')):
-        return 'refs/remotes/' + path + '/pinned'
-    return None
-
-
-def compose_tree(node):
-    # Only the directories above the pinned paths are new; each pinned tree is referenced, never rewritten, so no
-    # object of the read-only cache is copied into the session (Git would duplicate any object it "writes" there).
-    lines = []
-    for name in sorted(node):
-        value = node[name]
-        lines.append('040000 tree ' + (compose_tree(value) if isinstance(value, dict) else value) + '\t' + name + '\n')
-    result = subprocess.run(GIT + ['mktree'], input=''.join(lines).encode('utf-8'), stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
-    tree = result.stdout.decode('ascii').strip()
-    if result.returncode or not re.fullmatch('[0-9a-f]{40}', tree):
-        raise ValueError('repository baseline tree could not be written')
-    return tree
-
-
-def materialize_from_cache(work, git, repositories, alternates):
-    # Checks pinned trees out of the host repository cache, which the runner validated (repo-cache.ts inspect) and
-    # mounted read-only; the session's object store borrows its objects through objects/info/alternates.
-    if cache_ready(work, git, repositories, alternates):
-        return
-    cache_mounts(alternates, len(repositories))
-    env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=':'.join(alternates))
-    root = {}
-    # Nothing is written until every pinned commit is readable through the mounts.
-    for repository in repositories:
-        commit = repository['commit']
-        if not isinstance(commit, str) or not re.fullmatch('[0-9a-f]{40}', commit):
-            raise ValueError('invalid repository pin')
-        kind = subprocess.run(GIT + ['cat-file', '-t', commit], env=env, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
-        tree = subprocess.run(GIT + ['rev-parse', '--verify', '--quiet', commit + '^{tree}'], env=env, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=WORK, close_fds=True)
-        if kind.returncode or kind.stdout.strip() != b'commit' or tree.returncode:
-            raise ValueError('pinned commit is missing from the repository cache')
-        parts, node = repository['path'].split('/'), root
-        for part in parts[:-1]:
-            node = node.setdefault(part, {})
-            if not isinstance(node, dict):
-                raise ValueError('repository paths overlap')
-        if parts[-1] in node:
-            raise ValueError('repository paths overlap')
-        node[parts[-1]] = tree.stdout.decode('ascii').strip()
-    # Thereafter a durable preparing marker makes interruption fail closed, never reset edits.
-    cache_marker(git, repositories, 'preparing', source='cache')
-    write_at(git, ['objects', 'info', 'alternates'], ''.join(path + '\n' for path in alternates))
-    baseline_tree = compose_tree(root)
-    # One tree, no prefix: read-tree primes the cache tree, so later commits rewrite only what changed.
-    git_capture(['read-tree', baseline_tree])
-    # The worktree holds only .git (cache_ready): checkout-index writes into empty directories, real symlinks
-    # included, and records stat data so the new baseline is clean without hashing every file again.
-    git_capture(['checkout-index', '--all', '--index'])
-    for name in sorted(os.listdir(work)):
-        if name == '.git':
-            continue
-        owner = os.open(name, DIR_FLAGS, dir_fd=work)
-        try:
-            sync_cache(owner, REPOSITORY_LIMITS['checkoutEntries'] + 1024, REPOSITORY_LIMITS['checkoutBytes'], links=True)
-        finally:
-            os.close(owner)
-    os.fsync(work)
-    baseline = git_capture(['commit-tree', baseline_tree, '-m', 'Initialize pinned repository snapshots']).stdout.decode('ascii').strip()
-    git_capture(['update-ref', 'HEAD', baseline])
-    for repository in repositories:
-        ref = pinned_ref(repository['path'])
-        if ref:
-            git_capture(['update-ref', ref, repository['commit']])
-    # The index grows with the checkout; objects are only the few new trees and the baseline commit.
-    sync_cache(git, 4096, 256 * REPOSITORY_LIMITS['checkoutEntries'] + 64 * 1024 * 1024)
-    cache_marker(git, repositories, 'ready', baseline, source='cache')
-
 
 def parts_for(value, writing=False):
     if not isinstance(value, str) or not value or len(value) > 1024:
@@ -1005,146 +446,6 @@ def snapshot(request):
 
 
 OID = re.compile('[0-9a-f]{40}')
-ZERO_OID = '0' * 40
-
-
-def push_directory(request):
-    push_id = request['id']
-    if not isinstance(push_id, str) or not re.fullmatch('[0-9a-f]{32}', push_id):
-        raise ValueError('invalid push id')
-    return os.path.join(WORK, '.git', 'pistead-push'), os.path.join(WORK, '.git', 'pistead-push', push_id)
-
-
-def push_spawn(directory, arguments, stdout=subprocess.PIPE, extra=None):
-    # Scratch repositories get a clean config and the same hardening flags; never the session config.
-    env = dict(os.environ, GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
-               GIT_INDEX_FILE=os.path.join(directory, 'pistead-index'))
-    env.update(extra or {})
-    argv = GIT_HARDENED + ['--literal-pathspecs', '-c', 'safe.directory=' + directory, '--git-dir=' + directory] + arguments
-    return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL,
-                            cwd=directory, env=env, close_fds=True)
-
-
-def push_git(directory, arguments, data=b'', extra=None, success=True):
-    child = push_spawn(directory, arguments, extra=extra)
-    output, _ = child.communicate(data)
-    if success and child.returncode:
-        raise ValueError('push rewrite failed')
-    return output if success else (child.returncode, output)
-
-
-def push_prepare(request, git):
-    path, base, commit = request['path'], request['base'], request['commit']
-    if (not any(repository['path'] == path for repository in request['expectedRepositories'])
-            or not isinstance(base, str) or not OID.fullmatch(base) or not isinstance(commit, str) or not OID.fullmatch(commit)):
-        raise ValueError('invalid push request')
-    scratch, directory = push_directory(request)
-    try:
-        os.mkdir(scratch, 0o700)
-    except FileExistsError:
-        pass
-    if not stat.S_ISDIR(os.lstat(scratch).st_mode):
-        raise ValueError('push scratch directory is unsafe')
-    # Pushes are serialized per session: any existing scratch repository is an orphan of an interrupted push.
-    for name in os.listdir(scratch):
-        if stat.S_ISDIR(os.lstat(os.path.join(scratch, name)).st_mode):
-            shutil.rmtree(os.path.join(scratch, name))
-    os.mkdir(directory, 0o700)
-    for name in ('objects/info', 'objects/pack', 'refs/heads', 'refs/tags'):
-        os.makedirs(os.path.join(directory, name), 0o700)
-    for name, content in (('HEAD', 'ref: refs/heads/main\n'),
-                          ('config', '[core]\n\trepositoryformatversion = 0\n\tbare = true\n'),
-                          ('objects/info/alternates', os.path.join(WORK, '.git', 'objects') + '\n')):
-        with open(os.path.join(directory, name), 'x', encoding='utf-8') as stream:
-            stream.write(content)
-    # The upstream pack follows the request line on stdin.
-    child = push_spawn(directory, ['index-pack', '--stdin', '--fix-thin'], stdout=subprocess.DEVNULL)
-    try:
-        while True:
-            chunk = sys.stdin.buffer.read1(65536)
-            if not chunk:
-                break
-            child.stdin.write(chunk)
-        child.stdin.close()
-    except BrokenPipeError:
-        pass
-    if child.wait():
-        raise ValueError('upstream pack could not be indexed')
-    if push_git(directory, ['cat-file', '-t', base], success=False)[1].strip() != b'commit':
-        raise ValueError('pinned commit is missing from the upstream pack')
-    with open(os.path.join(directory, 'shallow'), 'x', encoding='ascii') as stream:
-        stream.write(base + '\n')
-    raw, _ = read_at(git, CACHE_MARKER, 65536)
-    baseline = json.loads(raw).get('baseline')
-    if not isinstance(baseline, str) or not OID.fullmatch(baseline):
-        raise ValueError('invalid repository cache baseline')
-    if (push_git(directory, ['cat-file', '-t', commit], success=False)[1].strip() != b'commit'
-            or push_git(directory, ['merge-base', '--is-ancestor', baseline, commit], success=False)[0]):
-        raise ValueError('push commit is not a session commit')
-    sources = push_git(directory, ['rev-list', '--reverse', '--first-parent', baseline + '..' + commit]).decode('ascii').split()
-    push_git(directory, ['read-tree', base + '^{tree}'])
-    previous = base
-    previous_tree = push_git(directory, ['rev-parse', base + '^{tree}']).strip()
-    prefix = path.encode('utf-8') + b'/'
-    commits = []
-    for source in sources:
-        if not OID.fullmatch(source):
-            raise ValueError('push rewrite failed')
-        fields = push_git(directory, ['diff-tree', '-r', '-z', '--raw', '--no-renames', '--full-index',
-                                      source + '^1', source, '--', path + '/']).split(b'\0')
-        records, index = [], 0
-        while index + 1 < len(fields) and fields[index]:
-            meta, name = fields[index][1:].split(b' '), fields[index + 1]
-            index += 2
-            if len(meta) != 5 or not name.startswith(prefix) or name == prefix:
-                raise ValueError('push rewrite failed')
-            entry = b'0 ' + ZERO_OID.encode('ascii') if meta[4] == b'D' else meta[1] + b' ' + meta[3]
-            records.append(entry + b'\t' + name[len(prefix):] + b'\0')
-        if records:
-            push_git(directory, ['update-index', '-z', '--replace', '--index-info'], b''.join(records))
-        tree = push_git(directory, ['write-tree', '--missing-ok']).strip()
-        if tree == previous_tree:
-            continue
-        header, separator, message = push_git(directory, ['cat-file', 'commit', source]).partition(b'\n\n')
-        identities = {}
-        for line in header.split(b'\n'):
-            match = re.fullmatch(rb'(author|committer) (.*) <([^<>]*)> ([0-9]+) ([+-][0-9]{4})', line)
-            if match and match.group(1) not in identities:
-                identities[match.group(1)] = match
-        if set(identities) != {b'author', b'committer'}:
-            raise ValueError('push rewrite failed')
-        extra = {}
-        for kind, label in ((b'author', 'AUTHOR'), (b'committer', 'COMMITTER')):
-            match = identities[kind]
-            extra['GIT_' + label + '_NAME'] = os.fsdecode(match.group(2))
-            extra['GIT_' + label + '_EMAIL'] = os.fsdecode(match.group(3))
-            extra['GIT_' + label + '_DATE'] = '@' + match.group(4).decode('ascii') + ' ' + match.group(5).decode('ascii')
-        rewritten = push_git(directory, ['commit-tree', tree.decode('ascii'), '-p', previous], message, extra).decode('ascii').strip()
-        if not OID.fullmatch(rewritten):
-            raise ValueError('push rewrite failed')
-        commits.append({'source': source, 'rewritten': rewritten,
-                        'subject': message.split(b'\n', 1)[0].decode('utf-8', 'replace')[:200]})
-        previous, previous_tree = rewritten, tree
-    if not commits:
-        raise ValueError('session commits do not change the repository')
-    return {'tip': previous, 'base': base, 'commits': commits}
-
-
-def push_pack(request):
-    _, directory = push_directory(request)
-    tip, exclude = request['tip'], request['exclude']
-    if (not isinstance(tip, str) or not OID.fullmatch(tip) or not isinstance(exclude, list) or len(exclude) > 16
-            or not all(isinstance(oid, str) and OID.fullmatch(oid) for oid in exclude)):
-        raise ValueError('invalid push request')
-    if not stat.S_ISDIR(os.lstat(directory).st_mode):
-        raise ValueError('push scratch directory is unsafe')
-    sys.stdout.flush()
-    # The pack streams straight to the runner on the helper's stdout.
-    child = push_spawn(directory, ['-c', 'core.bigFileThreshold=64m', 'pack-objects', '--stdout', '--revs',
-                                   '--delta-base-offset', '-q'], stdout=None)
-    child.communicate((tip + '\n' + ''.join('^' + oid + '\n' for oid in exclude)).encode('ascii'))
-    if child.returncode:
-        raise ValueError('push pack failed')
 
 
 def clone_directory(request):
@@ -1592,86 +893,17 @@ def clone_restore(request):
         os.close(work)
 
 
-def push_cleanup(request):
-    scratch, directory = push_directory(request)
-    try:
-        if not stat.S_ISDIR(os.lstat(scratch).st_mode):
-            raise ValueError('push scratch directory is unsafe')
-    except FileNotFoundError:
-        return
-    try:
-        shutil.rmtree(directory)
-    except FileNotFoundError:
-        pass
-
-
 def main():
-    # One JSON line; push-prepare streams the upstream pack after it.
+    # One JSON line.
     request = json.loads(sys.stdin.buffer.readline())
     kind = request['kind']
     limits(kind)
-    repositories = request['expectedRepositories']
-    alternates = request.get('repositoryAlternates', [])
-    if not isinstance(alternates, list) or not all(isinstance(path, str) for path in alternates):
-        raise ValueError('invalid repository cache mounts')
     if kind == 'initialize':
         try:
             os.stat(os.path.join(WORK, '.git', 'HEAD'), follow_symlinks=False)
         except FileNotFoundError:
-            if repositories:
-                try:
-                    os.stat(os.path.join(WORK, '.git', CACHE_MARKER), follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
-                    raise ValueError('repository cache Git HEAD is missing; refusing to reinitialize')
             run(GIT + ['init', '--quiet', '--template=', '--initial-branch=main', WORK])
         run(GIT + ['rev-parse', '--is-inside-work-tree'])
-        return
-    work = os.open(WORK, DIR_FLAGS)
-    git = os.open('.git', DIR_FLAGS, dir_fd=work)
-    lock = None
-    try:
-        if kind == 'repository-materialize':
-            lock = os.open(CACHE_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                           0o600, dir_fd=git)
-            regular(os.fstat(lock))
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            materialize_repositories(work, git, repositories, request['archives'], alternates)
-            return
-        if kind == 'repository-checkout':
-            lock = os.open(CACHE_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                           0o600, dir_fd=git)
-            regular(os.fstat(lock))
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            materialize_from_cache(work, git, repositories, alternates)
-            return
-        if kind == 'repository-ready' or repositories:
-            ready = cache_ready(work, git, repositories, alternates)
-            if kind == 'repository-ready':
-                print(json.dumps(ready))
-                return
-            if not ready:
-                raise ValueError('repository cache is not prepared')
-            if kind == 'snapshot' and ready == 'cache':
-                # Its objects live in the host cache, not in the session: a backup would not restore.
-                raise ValueError('backups of sessions checked out from the host repository cache are not supported yet')
-        if kind == 'push-prepare':
-            print(json.dumps(push_prepare(request, git), ensure_ascii=True))
-            return
-        if kind == 'push-pack':
-            push_pack(request)
-            return
-        if kind == 'push-cleanup':
-            push_cleanup(request)
-            return
-    finally:
-        if lock is not None:
-            os.close(lock)
-        os.close(git)
-        os.close(work)
-    if kind == 'head':
-        run(GIT + ['rev-parse', '--verify', 'HEAD'])
         return
     if kind == 'clone-head':
         print(json.dumps(clone_head(request), ensure_ascii=True))
@@ -1699,13 +931,6 @@ def main():
         if egress is not None:
             egress_relay(egress['socket'], int(egress['port']))
         run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
-        return
-    if kind == 'status':
-        run(GIT + ['status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=all'])
-        return
-    if kind == 'commit':
-        run(GIT + ['add', '--all', '--', '.'])
-        run(GIT + ['commit', '--no-verify', '--no-gpg-sign', '--cleanup=verbatim', '--file=-'], request['message'].encode('utf-8'))
         return
     if kind == 'snapshot':
         print(json.dumps(snapshot(request), ensure_ascii=True))
@@ -1751,7 +976,7 @@ def main():
 
 try:
     main()
-except (OSError, ValueError, KeyError, TypeError, UnicodeError, zlib.error) as error:
+except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
     print('sandbox: ' + str(error), file=sys.stderr)
     sys.exit(1)
 `;
@@ -1775,27 +1000,6 @@ export function text(value: unknown, label: string, limit: number, multiline = f
     throw new Error(`Invalid ${label}`);
   }
   return value;
-}
-
-export function repositoryPins(repositories: readonly SessionRepository[]): SessionRepository[] {
-  if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) throw new Error("Invalid repository pin set");
-  const names = new Set<string>();
-  const ids = new Set<string>();
-  const bindings = new Set<string>();
-  return repositories.map((repository) => {
-    const id = repositoryPinIdentity(repository);
-    if (!id) throw new Error("Invalid repository pin");
-    if (names.has(repository.path.toLowerCase()) || ids.has(id) || bindings.has(repository.bindingId)) throw new Error("Invalid or duplicate repository pin");
-    names.add(repository.path.toLowerCase());
-    ids.add(id);
-    bindings.add(repository.bindingId);
-    if ("provider" in repository) {
-      const { bindingId, provider, host, repositoryId, fullName, ref, commit, path } = repository;
-      return { bindingId, provider, host, repositoryId, fullName, ref, commit, path };
-    }
-    const { bindingId, repositoryId, fullName, ref, commit, path } = repository;
-    return { bindingId, repositoryId, fullName, ref, commit, path };
-  }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 }
 
 function fdPath(directory: FileHandle, name: string): string {
@@ -1955,18 +1159,13 @@ export class Sandbox {
   readonly #resources: Readonly<ResourceConfig> | undefined;
   readonly #sessionKey: string;
   readonly #testProvider: boolean;
-  readonly #repositories: readonly SessionRepository[];
-  readonly #cacheObjects: readonly string[];
   readonly #egressSocket: string | undefined;
   readonly #sessionBranch: string | undefined;
   readonly #mirrors: (() => Promise<readonly MirrorMount[]>) | undefined;
-  /** Whether processes see the cache at all: only cache-backed sessions, after their owner's access was re-checked. */
-  #cacheMounted = false;
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
   #closed = false;
   #cancelActive: (() => void) | undefined;
-  readonly #pushStreams = new Map<string, () => void>();
 
   constructor(binding: RunnerBinding, root: string, resources?: ResourceConfig, options: SandboxOptions = {}) {
     if (process.platform !== "linux" || !isAbsolute(root) || resolve(root) === sep) {
@@ -1987,8 +1186,6 @@ export class Sandbox {
     this.#sessionKey = key;
     this.#resources = resources ? validateResourceConfig(resources) : undefined;
     this.#testProvider = binding.model.provider === "faux";
-    this.#repositories = repositoryPins(binding.session.repositories ?? []);
-    this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
     if (options.egressSocket !== undefined && !isAbsolute(options.egressSocket)) throw new Error("Invalid egress socket path");
     this.#egressSocket = options.egressSocket;
     this.#sessionBranch = options.sessionBranch;
@@ -2111,15 +1308,8 @@ export class Sandbox {
     return JSON.parse(output) as string[];
   }
 
-  gitStatus(authorize: SandboxAuthorize): Promise<string> {
-    return this.#operation({ kind: "status" }, true, authorize);
-  }
-
   async execute(operation: Operation, readOnly: boolean, authorize: SandboxAuthorize, options: SandboxExecutionOptions = {}): Promise<string> {
     switch (operation.kind) {
-      case "git.commit":
-        if (readOnly) throw new Error("Read-only sandbox cannot commit");
-        return this.#operation({ kind: "commit", message: text(operation.message, "commit message", 16 * 1024, true) }, false, authorize, true);
       case "bash": {
         if (options.allowTestShell === true && !this.#testProvider) throw new Error("Test shell bypass is restricted to the explicit faux provider");
         const bounded = options.allowTestShell !== true && (!!this.#resources || options.unbounded !== true);
@@ -2172,63 +1362,6 @@ export class Sandbox {
     await this.#operation({ kind: "clone-restore", path, url, reference }, false, authorize, true);
   }
 
-  #assertRepositories(repositories: readonly SessionRepository[]): void {
-    if (JSON.stringify(repositoryPins(repositories)) !== JSON.stringify(this.#repositories)) {
-      throw new Error("Repository pins do not match the immutable sandbox binding");
-    }
-  }
-
-  /** False only for pristine storage; mismatched or interrupted caches fail closed. */
-  async repositoryCachesReady(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<boolean> {
-    return (await this.repositoryCacheState(repositories, authorize)) !== "absent";
-  }
-
-  /** How the session's repositories were prepared; a cache-backed session also needs its cache mounts to match. */
-  async repositoryCacheState(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<RepositoryCacheState> {
-    this.#assertRepositories(repositories);
-    return repositoryCacheState(JSON.parse(await this.#operation({ kind: "repository-ready" }, true, authorize)));
-  }
-
-  /**
-   * Checks the pinned trees out of the host repository cache, mounted read-only. The runner must already have made
-   * each pinned commit available (`RepositoryCache.ensure`) and checked its tree (`RepositoryCache.inspect`). Ready
-   * caches never overwrite edits.
-   */
-  async materializeFromCache(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<void> {
-    this.#assertRepositories(repositories);
-    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
-    if (!this.#cacheMounted) throw new Error("The repository cache is not mounted for this session");
-    await this.#operation({ kind: "repository-checkout" }, false, authorize, true);
-  }
-
-  /**
-   * Mounts the cache's object directories, read-only, into every later process of this sandbox. Only for a session
-   * checked out (or about to be) from the cache, once the control plane has re-checked its owner's access to every
-   * pinned repository: archive-backed sessions on a cache host never see the cache, which other owners' fetches fill.
-   */
-  enableRepositoryCache(): void {
-    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
-    this.#cacheMounted = true;
-  }
-
-  /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
-  async materializeRepositories(
-    repositories: readonly SessionRepository[],
-    archives: readonly Uint8Array[],
-    authorize: SandboxAuthorize,
-  ): Promise<void> {
-    this.#assertRepositories(repositories);
-    if (!Array.isArray(archives) || archives.length !== repositories.length
-      || archives.some((archive) => !(archive instanceof Uint8Array) || !archive.byteLength || archive.byteLength > repositoryLimits.archiveBytes)) {
-      throw new Error("Repository archives exceed size limits or do not match pins");
-    }
-    const encoded = new Map(repositories.map((repository, index) => [repository.path, Buffer.from(archives[index]!).toString("base64")]));
-    await this.#operation({
-      kind: "repository-materialize",
-      archives: this.#repositories.map((repository) => encoded.get(repository.path)!),
-    }, false, authorize, true);
-  }
-
   /** Explicit host-owner-approved execution, serialized with sandbox file/Git operations; never a fallback. */
   async executeHost(operation: HostCommandOperation, authorize: SandboxAuthorize, signal: AbortSignal): Promise<string> {
     if (typeof authorize !== "function") throw new Error("Host command authorization is required");
@@ -2237,8 +1370,6 @@ export class Sandbox {
       if (this.#closed) throw new Error("Sandbox is closed");
       await authorize();
       if (this.#closed) throw new Error("Sandbox is closed");
-      if (!JSON.parse(await this.#run({ kind: "repository-ready" }, true, false))) throw new Error("Repository cache is not prepared");
-      await authorize();
       const controller = new AbortController();
       const cancel = () => controller.abort();
       this.#cancelActive = cancel;
@@ -2251,66 +1382,6 @@ export class Sandbox {
       } finally { if (this.#cancelActive === cancel) this.#cancelActive = undefined; }
     });
   }
-
-  async head(authorize: SandboxAuthorize): Promise<string> {
-    const head = (await this.#operation({ kind: "head" }, true, authorize)).trim();
-    if (!OID.test(head)) throw new Error("Session HEAD is not a commit");
-    return head;
-  }
-
-  /** Rewrites session commits under `path` onto the upstream `base` in a scratch repository under the session Git dir. */
-  async pushPrepare(id: string, input: { path: string; base: string; commit: string }, pack: AsyncIterable<Uint8Array>, authorize: SandboxAuthorize): Promise<PushPreparation> {
-    if (!PUSH_ID.test(id) || !this.#repositories.some((repository) => repository.path === input.path) || !OID.test(input.base) || !OID.test(input.commit)) {
-      throw new Error("Invalid push request");
-    }
-    if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
-    await this.initialize();
-    const output = await this.#exclusive(async () => {
-      if (this.#closed) throw new Error("Sandbox is closed");
-      await authorize();
-      if (this.#closed) throw new Error("Sandbox is closed");
-      return this.#run({ kind: "push-prepare", id, path: input.path, base: input.base, commit: input.commit }, false, true, false, { input: pack });
-    });
-    const value = JSON.parse(output) as PushPreparation;
-    if (!value || value.base !== input.base || !OID.test(value.tip) || !Array.isArray(value.commits) || !value.commits.length
-      || value.commits.some((commit) => !OID.test(commit.source) || !OID.test(commit.rewritten) || typeof commit.subject !== "string")
-      || value.commits.at(-1)!.rewritten !== value.tip) throw new Error("Invalid push preparation");
-    return { tip: value.tip, base: value.base, commits: value.commits.map(({ source, rewritten, subject }) => ({ source, rewritten, subject })) };
-  }
-
-  /** Streams the pack of `tip` minus `exclude`; the session queue is held until the stream ends. */
-  async pushPack(id: string, input: { tip: string; exclude: string[] }, authorize: SandboxAuthorize): Promise<AsyncIterable<Uint8Array>> {
-    if (!PUSH_ID.test(id) || !OID.test(input.tip) || !Array.isArray(input.exclude) || input.exclude.length > 16 || !input.exclude.every((oid) => OID.test(oid))) {
-      throw new Error("Invalid push request");
-    }
-    if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
-    await this.initialize();
-    const started = Promise.withResolvers<{ stdout: Readable; kill: () => void }>();
-    const finished = this.#exclusive(async () => {
-      if (this.#closed) throw new Error("Sandbox is closed");
-      await authorize();
-      if (this.#closed) throw new Error("Sandbox is closed");
-      try {
-        await this.#run({ kind: "push-pack", id, tip: input.tip, exclude: [...input.exclude] }, true, false, false, {
-          output: (stdout, kill) => { this.#pushStreams.set(id, kill); started.resolve({ stdout, kill }); },
-        });
-      } finally { this.#pushStreams.delete(id); }
-    });
-    finished.catch((error) => started.reject(error));
-    const pack = await started.promise;
-    return (async function* () {
-      let complete = false;
-      try {
-        for await (const chunk of pack.stdout) yield chunk as Uint8Array;
-        await finished;
-        complete = true;
-      } finally {
-        if (!complete) { pack.kill(); await finished.catch(() => undefined); }
-      }
-    })();
-  }
-
-  /** The checked-out commit of a clone the agent made in the worktree, and its origin remote (clone sessions). */
   async cloneHead(path: string, authorize: SandboxAuthorize): Promise<{ commit: string; origin: string | null }> {
     if (!validCloneDirectory(path)) throw new Error("Invalid clone directory");
     const value = JSON.parse(await this.#operation({ kind: "clone-head", path }, true, authorize)) as { commit: unknown; origin: unknown };
@@ -2356,15 +1427,6 @@ export class Sandbox {
     })();
   }
 
-  async pushCleanup(id: string): Promise<void> {
-    if (!PUSH_ID.test(id)) throw new Error("Invalid push id");
-    this.#pushStreams.get(id)?.();
-    if (!this.#mounts) await this.initialize();
-    await this.#exclusive(async () => {
-      await this.#run({ kind: "push-cleanup", id }, false, true);
-    });
-  }
-
   /** Release pinned descriptors when the owning runner session closes. */
   async close(): Promise<void> {
     this.#closed = true;
@@ -2396,10 +1458,6 @@ export class Sandbox {
       mount, "4", this.worktree,
       gitWritable ? "--bind-fd" : "--ro-bind-fd", "5", `${this.worktree}/.git`,
       "--ro-bind-fd", "6", `${this.home}/.gitconfig`,
-      // By path, not descriptor: the resource supervisor passes only fds 3-6 to bwrap. Only the runner writes below
-      // the private cache root, so nothing a session controls can redirect these. A missing directory is skipped;
-      // Git then reports the missing objects instead of reading anything else.
-      ...(this.#cacheMounted ? this.#cacheObjects.flatMap((source, index) => ["--ro-bind-try", source, `${CACHE_MOUNT}/${index}`]) : []),
       // Only shell commands reach the network, and only through the session's proxy. A missing socket (the session is
       // not open) is skipped; requests then fail to connect.
       ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET] : []),
@@ -2451,7 +1509,7 @@ export class Sandbox {
         kill();
       };
       this.#cancelActive = cancel;
-      const deadline = ["push-prepare", "push-pack", "repository-checkout", "clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"].includes(request.kind)
+      const deadline = ["clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"].includes(request.kind)
         ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
       const timer = setTimeout(() => {
         failure ??= `Sandbox exceeded ${deadline}ms time limit`;
@@ -2502,12 +1560,10 @@ export class Sandbox {
         } else {
           // Structured filesystem responses use stdout only; shell/Git diagnostics
           // remain visible without corrupting their exit status or JSON tool output.
-          resolveResult(request.kind === "bash" || request.kind === "commit" || request.kind === "status" ? out + err : out);
+          resolveResult(request.kind === "bash" ? out + err : out);
         }
       });
-      const line = JSON.stringify({ ...request, expectedRepositories: this.#repositories,
-        repositoryAlternates: this.#cacheObjects.map((_, index) => `${CACHE_MOUNT}/${index}`),
-        ...(egress ? { egress: { socket: EGRESS_SOCKET, port: EGRESS_PORT } } : {}) });
+      const line = JSON.stringify({ ...request, ...(egress ? { egress: { socket: EGRESS_SOCKET, port: EGRESS_PORT } } : {}) });
       const input = transfer.input;
       if (!input) child.stdin!.end(line);
       else {

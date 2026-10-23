@@ -1,18 +1,17 @@
-import type { GitHubSessionRepository, SessionRepository } from '../../../packages/shared/src/repositories.js';
-import { repositoryLimits } from '../../../packages/shared/src/repositories.js';
+import type { GitHubSessionRepository } from '../../../packages/shared/src/repositories.js';
 import type {
   GitHubCommentView, GitHubIssueView, GitHubMergeResult, GitHubPullRequestView, GitHubReviewCommentView, GitHubReviewView, Operation,
 } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
 import type { AppContext, Env, SessionRow } from './types.js';
-import { auditStatement, getUser, sessionAccess } from './db.js';
+import { auditStatement, getUser, requireUnfrozen, sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, now, text, userIdentifier } from './http.js';
 import { githubRepositoryName, issueNumber, parseOperation } from './operations.js';
 import { decryptToken } from './vault.js';
 import { requireCallbackScope } from './connectors.js';
 import { requireBrokerReview, requireToolCall } from './approval-reviews.js';
-import { cloneSessionRepository, recheckAccess, validPin, verifyRepository, type GitHubAccess } from './repositories.js';
+import { cloneSessionRepository, recheckAccess, verifyRepository, type GitHubAccess } from './repositories.js';
 import { requireBinding, requireNoRestore } from './push/broker.js';
 
 /*
@@ -47,23 +46,14 @@ async function ownerGitHub(env: Env, ownerId: string): Promise<GitHubAccess> {
   return { token: await decryptToken(env, owner.id, vault.ciphertext), ciphertext: vault.ciphertext, userId: owner.id, githubId: owner.github_id };
 }
 
-/** The session's pin of github.com repository `name` (owner/name, any case), while the workspace still configures it. */
+/** The workspace's github.com repository `name` (owner/name, any case), shaped like a pin, while it is still bound. */
 async function pinnedGitHubRepository(c: AppContext, row: SessionRow, name: string): Promise<GitHubSessionRepository> {
-  if (row.repository_mode === 'clone') {
-    // A clone session reads and merges in any github.com repository of its workspace.
-    const repository = await cloneSessionRepository(c.env, row, binding => binding.provider === 'github' && binding.full_name.toLowerCase() === name.toLowerCase());
-    if (!repository || 'provider' in repository) fail(403, 'repository_not_pinned', `${name} is not a github.com repository of this workspace.`);
-    await requireBinding(c, row.workspace_id, repository);
-    return repository;
-  }
-  let repositories: SessionRepository[];
-  try { repositories = JSON.parse(row.repositories_json ?? '[]'); } catch { return fail(409, 'invalid_binding', 'Session repository binding is invalid.'); }
-  if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) fail(409, 'invalid_binding', 'Session repository binding is invalid.');
-  const pin = repositories.find((item): item is GitHubSessionRepository => !!item && typeof item === 'object' && !('provider' in item)
-    && typeof item.fullName === 'string' && item.fullName.toLowerCase() === name.toLowerCase());
-  if (!pin || !validPin(pin)) fail(403, 'repository_not_pinned', `${name} is not a github.com repository pinned in this session.`);
-  await requireBinding(c, row.workspace_id, pin);
-  return pin;
+  // A session reads and merges in any github.com repository of its workspace; a pinned session is read-only.
+  const repository = row.repository_mode === 'clone'
+    ? await cloneSessionRepository(c.env, row, binding => binding.provider === 'github' && binding.full_name.toLowerCase() === name.toLowerCase()) : null;
+  if (!repository || 'provider' in repository) fail(403, 'repository_not_pinned', `${name} is not a github.com repository of this workspace.`);
+  await requireBinding(c, row.workspace_id, repository);
+  return repository;
 }
 
 /** The pin must still name the repository it was pinned to (renames and transfers fail closed), read with the owner's token. */
@@ -101,6 +91,7 @@ async function approvedEffect<T>(c: AppContext, connectorId: string | null, appr
       approver.row.status === 'archived' || !hasPermission(approver.permissions, 'approve') || !hasPermission(writer.permissions, 'write')) {
     fail(403, 'permission_revoked', 'The operation requester or approver is no longer authorized.');
   }
+  requireUnfrozen(approver.row);
   await requireCallbackScope(c, approver.row, connectorId);
   await requireBrokerReview(c.env, approver.row, approvalId, stored.requested_by, operation);
   await requireNoRestore(c, sessionId);

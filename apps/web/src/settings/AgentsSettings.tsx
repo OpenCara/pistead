@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { defaultAgentName, toolNames, type AgentVersion, type ModelDefinition, type ToolName, type UserProfile, type Workspace } from "../../../../packages/shared/src/types";
+import { defaultAgentName, retiredToolNames, toolNames, type AgentVersion, type ModelDefinition, type ToolName, type UserProfile, type Workspace } from "../../../../packages/shared/src/types";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { useConnections } from "../hosts";
@@ -191,7 +191,7 @@ function AgentEditor({ agent, readOnly, models, hostNames, connectionsError, not
       {connectionsError && <CardBody><Feedback error={connectionsError} /></CardBody>}
     </Section>
     <Section title="Tools" info="The agent uses these without asking; any other tool waits for the session owner's permission. Sensitive operations still need approval">
-      {toolNames.map(tool => <label className="row check-row" key={tool}>
+      {toolNames.filter(tool => !retiredToolNames.includes(tool)).map(tool => <label className="row check-row" key={tool}>
         <input type="checkbox" className="checkbox" disabled={readOnly} checked={tools.includes(tool)} onChange={event => setTools(current => event.target.checked ? [...current, tool] : current.filter(value => value !== tool))} />
         <span className="mono">{tool}</span>
       </label>)}

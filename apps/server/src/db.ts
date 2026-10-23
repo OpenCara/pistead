@@ -20,11 +20,30 @@ export function agentVersion(row: AgentRow): AgentVersion {
   return { id: row.id, agentId: row.agent_id, authorId: row.author_id, workspaceId: row.workspace_id, version: row.version,
     name: row.name, description: row.description, instructions: row.instructions, tools: JSON.parse(row.tools_json), modelId: row.model_id, createdAt: row.created_at };
 }
+/**
+ * A session that pinned its repositories when it started, as sessions did before they cloned them: it stays readable
+ * (transcript, approvals, backups, exports) but runs nothing. Sessions without pins and clone sessions are not frozen.
+ */
+export function frozenSession(row: Pick<SessionRow, 'repository_mode' | 'repositories_json'>): boolean {
+  if (row.repository_mode === 'clone') return false;
+  try {
+    const pins: unknown = JSON.parse(row.repositories_json ?? '[]');
+    return !Array.isArray(pins) || pins.length > 0;
+  } catch { return true; }
+}
+export function requireUnfrozen(row: Pick<SessionRow, 'repository_mode' | 'repositories_json'>): void {
+  if (frozenSession(row)) {
+    fail(409, 'session_frozen', 'This session pinned its repositories when it started, which sessions no longer do. It stays readable, but it no longer '
+      + 'runs messages, approvals, backups, restores or moves; start a new session to continue the work.');
+  }
+}
+
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
     ...(row.repository_mode === 'clone' ? { repositoryMode: 'clone' as const } : {}),
+    ...(frozenSession(row) ? { frozen: true as const } : {}),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}),
     ...(row.activity ? { activity: row.activity } : {}) };
@@ -32,7 +51,7 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
 export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity'> {
   // Visibility is live control-plane policy and activity is what the host reports, so neither is part of the
   // immutable runner binding.
-  const { visibility: _visibility, permissions: _permissions, activity: _activity, ...record } = sessionRecord(row);
+  const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {

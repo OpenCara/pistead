@@ -1,4 +1,3 @@
-import { repinSession } from './repin.js';
 import { egressGrant, gitRelay } from './network.js';
 import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
@@ -13,7 +12,7 @@ import { authorizeSession } from './internal.js';
 import { githubComment, githubMerge, githubRead } from './github-broker.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
-import { legacyRepositoryFixture, repositoryAuthorize, repositoryDownload, requireConfiguredWorkspace } from './repositories.js';
+import { legacyRepositoryFixture, requireConfiguredWorkspace } from './repositories.js';
 
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
@@ -59,8 +58,8 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
     || (cap.github !== undefined && typeof cap.github !== 'boolean')
     || (cap.repositoryCache !== undefined && typeof cap.repositoryCache !== 'boolean')
     || (cap.hostMigration !== undefined && typeof cap.hostMigration !== 'boolean')
-    || (cap.plainGit !== undefined && typeof cap.plainGit !== 'boolean') || (cap.plainGit && !cap.sandbox)
-    || (cap.cloneBackups !== undefined && typeof cap.cloneBackups !== 'boolean') || (cap.cloneBackups && !cap.plainGit)) fail(400, 'invalid_manifest', 'Invalid capabilities.');
+    || (cap.plainGit !== undefined && typeof cap.plainGit !== 'boolean')
+    || (cap.cloneBackups !== undefined && typeof cap.cloneBackups !== 'boolean') || (cap.cloneBackups && (!cap.plainGit || cap.unsandboxed))) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
     ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
     ...(cap.github ? { github: true } : {}), ...(cap.repositoryCache ? { repositoryCache: true } : {}),
@@ -304,12 +303,9 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/github/comment', async c => githubComment(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/read', async c => githubRead(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/merge', async c => githubMerge(c, (await authenticateConnector(c)).id));
-  app.post('/api/connectors/self/git/repin', async c => repinSession(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/push/credential', async c => pushCredential(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/push/complete', async c => pushComplete(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));
-  app.post('/api/connectors/self/repositories/:bindingId/download', async c => repositoryDownload(c, await authenticateConnector(c)));
-  app.post('/api/connectors/self/repositories/:bindingId/authorize', async c => repositoryAuthorize(c, await authenticateConnector(c)));
   app.post('/api/connectors/self/network', async c => egressGrant(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/git/relay/:bindingId/:service', async c => gitRelay(c, await authenticateConnector(c)));
 }

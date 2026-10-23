@@ -197,37 +197,17 @@ test('restore pins one new target, uses current owner profile and copies no gran
   assert.throws(() => f.sqlite.exec('DELETE FROM restore_jobs'), /retained/);
 });
 
-test('restore copies source repository pins after live workspace bindings are removed or replaced', async t => {
+test('a session that pinned its repositories is read-only: its backups download, but restore nothing', async t => {
   const f = await fixture(t, false, repositoryPins);
-  f.sqlite.prepare(`INSERT INTO workspace_repositories (id, workspace_id, repository_id, full_name, ref, private, created_at)
-    VALUES ('original-binding', 'workspace', 123, 'Owner/Project', 'main', 1, '2026-01-01')`).run();
-  f.sqlite.exec(`DELETE FROM workspace_repositories;
-    INSERT INTO workspace_repositories (id, workspace_id, repository_id, full_name, ref, private, created_at)
-    VALUES ('replacement-binding', 'workspace', 456, 'Other/Project', 'new-branch', 0, '2026-01-02')`);
-  let targetId = '';
-  t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => {
-    const body = JSON.parse(String(init.body)) as RestoreInput;
-    targetId = body.binding.session.id;
-    assert.deepEqual(body.binding.session.repositories, repositoryPins);
-    const download = await f.request(`/api/internal/restores/${body.restore.id}/download`, {
-      targetSessionId: targetId, sourceSessionId: 'source', backupId: 'backup', downloadToken: body.restore.downloadToken,
-    }, { Authorization: `Bearer ${secret}` });
-    assert.equal(download.status, 200);
-    const snapshot = await download.json() as { binding: RunnerBinding };
-    assert.equal(snapshot.binding.session.id, 'source');
-    assert.deepEqual(snapshot.binding.session.repositories, repositoryPins);
-    return runnerReceipt(body);
-  });
+  t.mock.method(globalThis, 'fetch', async () => assert.fail('a refused restore reaches no runner'));
   const response = await f.request(restorePath, { requestId: 'pinned' });
-  assert.equal(response.status, 201);
-  assert.deepEqual((await response.json() as { session: RunnerBinding['session'] }).session.repositories, repositoryPins);
-  const target = f.sqlite.prepare('SELECT repositories_json FROM sessions WHERE id = ?').get(targetId)!;
-  assert.equal(target.repositories_json, JSON.stringify(repositoryPins));
-  assert.throws(() => f.sqlite.prepare('UPDATE sessions SET repositories_json = ? WHERE id = ?')
-    .run('[]', targetId), /immutable/);
+  assert.equal(response.status, 409);
+  assert.equal((await response.json() as { code: string }).code, 'session_frozen');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
+  assert.equal((await f.app.request('/api/sessions/source/backups/backup/download', {}, f.env)).status, 200);
 });
 
-test('snapshot repositories must match every source pin before target creation or owner download', async t => {
+test('snapshot repositories must match every source pin before an owner download', async t => {
   const changes: ((session: RunnerBinding['session']) => void)[] = [
     session => { delete session.repositories; },
     session => { session.repositories = []; },
@@ -243,7 +223,6 @@ test('snapshot repositories must match every source pin before target creation o
   for (const change of changes) {
     const f = await fixture(t, false, repositoryPins);
     await f.replaceSnapshot(snapshot => change(snapshot.binding.session));
-    assert.equal((await f.request(restorePath, { requestId: 'wrong-pins' })).status, 502);
     assert.equal((await f.app.request('/api/sessions/source/backups/backup/download', {}, f.env)).status, 502);
     assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
   }

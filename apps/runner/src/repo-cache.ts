@@ -2,19 +2,17 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { link, lstat, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
-import { repositoryLimits, type GitProvider, type SessionRepository } from "../../../packages/shared/src/repositories.js";
-import { hostGitAuthorization } from "./git-credentials.js";
+import type { GitProvider } from "../../../packages/shared/src/repositories.js";
 import { GitRemote, ProgressLines, parseGitProgress, type GitProgressPhase } from "./git-remote.js";
-import { RunnerError } from "./protocol.js";
 
 /**
- * Host repository cache (docs/design/repository-cache.md). One bare repository per provider repository
- * identity, holding full history with every blob, so sessions that borrow its objects through
- * `objects/info/alternates` never need the remote or a credential.
+ * Host repository cache (docs/design/repository-cache.md). One bare mirror per provider repository identity,
+ * holding full history with every blob, so clones in sandboxed sessions borrow its objects through
+ * `objects/info/alternates` and fetch only what is new.
  *
- * Only the runner writes here, outside any sandbox. Fetches use the HOST's own Git credentials
- * (`hostGitAuthorization`); the control plane never sends a read credential. Whether a session's owner may
- * use a cached repository is decided by the server for every session, before `ensure` is called.
+ * Only the runner writes here, outside any sandbox. Every fetch goes through the session's egress relay with the
+ * session owner's access (`MirrorTarget.remote`), so the server decides for each session whether its owner may
+ * read a repository; the host never uses a credential of its own.
  */
 
 export type RepositoryCacheScope = "host" | "owner";
@@ -32,21 +30,10 @@ export interface RepositoryCacheProgress {
   bytes: number;
 }
 
-export interface RepositoryCacheTarget {
-  pin: SessionRepository;
-  ownerId: string;
-  sessionId: string;
-  /** Non-secret https clone URL of the pinned repository, supplied by the control plane. */
-  remote: string;
-}
-
 export interface RepositoryCacheOptions {
   /** Absolute, runner-owned, private directory. */
   root: string;
   scope?: RepositoryCacheScope;
-  /** Host credential lookup; defaults to the host user's Git credential helpers. */
-  authorization?: (remote: string, signal?: AbortSignal) => Promise<string>;
-  fetch?: typeof fetch;
   /** Minimum interval between progress callbacks of the same phase. */
   progressIntervalMs?: number;
 }
@@ -65,35 +52,12 @@ export class RepositoryCacheError extends Error {
   constructor(message: string) { super(message); this.name = "RepositoryCacheError"; }
 }
 
-/**
- * The control plane's answer to a repository cache authorization (`repositoryAuthorize` on the server): the pin it
- * re-checked and its credential-free remote. Never a credential, never content.
- */
-export interface RepositoryAuthorization { bindingId: string; commit: string; remote: string }
-
-export function repositoryAuthorization(value: unknown): RepositoryAuthorization {
-  const outer = value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).join() === "repository" ? (value as { repository: unknown }).repository : undefined;
-  if (!outer || typeof outer !== "object" || Array.isArray(outer) || Object.keys(outer).sort().join() !== "bindingId,commit,remote") throw new RunnerError(502, "Invalid repository authorization");
-  const { bindingId, commit, remote } = outer as Record<string, unknown>;
-  if (typeof bindingId !== "string" || typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit) || typeof remote !== "string" || remote.length > 2048) {
-    throw new RunnerError(502, "Invalid repository authorization");
-  }
-  return { bindingId, commit, remote };
-}
-
-/** What checking out one pinned tree writes; `inspect` subtracts it from the session's remaining budget. */
-export interface PinnedTreeSummary { entries: number; bytes: number; symlinks: number; submodules: number }
-export interface CheckoutBudget { entries: number; bytes: number }
-
-export function checkoutBudget(): CheckoutBudget {
-  return { entries: repositoryLimits.checkoutEntries, bytes: repositoryLimits.checkoutBytes };
-}
-
 const OID = /^[0-9a-f]{40}$/;
 const FETCH_TIMEOUT_MS = 60 * 60 * 1000;
 const GIT_TIMEOUT_MS = 60 * 60 * 1000;
 const LOCK_POLL_MS = 250;
 const LOCK_NAME = "pistead.lock";
+/** Pin refs of sessions from before every session cloned; they are listed and kept, but no longer written. */
 const PIN_PREFIX = "refs/pistead/pins/";
 /** A clone session's keep ref: a commit whose parents are the branch tips it saw, so its borrowed objects stay. */
 const SESSION_PREFIX = "refs/pistead/sessions/";
@@ -116,8 +80,6 @@ type Listener = (progress: RepositoryCacheProgress) => void;
 export class RepositoryCache {
   readonly #root: string;
   readonly #scope: RepositoryCacheScope;
-  readonly #authorization: (remote: string, signal?: AbortSignal) => Promise<string>;
-  readonly #fetch: typeof fetch | undefined;
   readonly #interval: number;
   /** Per cache repository: the tail of its serialized operations, and who is watching the current one. */
   readonly #queues = new Map<string, { tail: Promise<void>; listeners: Set<Listener>; last: RepositoryCacheProgress | undefined }>();
@@ -127,19 +89,12 @@ export class RepositoryCache {
     this.#root = resolve(options.root);
     this.#scope = options.scope ?? "host";
     if (this.#scope !== "host" && this.#scope !== "owner") throw new RepositoryCacheError("Repository cache scope must be host or owner");
-    this.#authorization = options.authorization ?? ((remote, signal) => hostGitAuthorization(remote, { signal }));
-    this.#fetch = options.fetch;
     this.#interval = options.progressIntervalMs ?? 250;
   }
 
   get scope(): RepositoryCacheScope { return this.#scope; }
 
-  /** Bare repository directory of a pin; owner-scoped caches never share a directory across owners. */
-  directory(pin: SessionRepository, ownerId: string): string {
-    return this.#directory("provider" in pin ? pin.provider : "github", "provider" in pin ? pin.host : "github.com", String(pin.repositoryId), ownerId);
-  }
-
-  /** Bare repository directory of a clone session's mirror: the same one a pin of that repository uses. */
+  /** Bare repository directory of a clone session's mirror; owner-scoped caches never share one across owners. */
   mirrorDirectory(repository: MirrorRepository, ownerId: string): string {
     return this.#directory(repository.provider, repository.host, repository.repositoryId, ownerId);
   }
@@ -147,44 +102,6 @@ export class RepositoryCache {
   #directory(provider: string, host: string, id: string, ownerId: string): string {
     const base = this.#scope === "owner" ? join(this.#root, "owners", digest(ownerId)) : this.#root;
     return join(base, mirrorPath({ provider, host, repositoryId: id }));
-  }
-
-
-  /** Objects directory a session lists in `objects/info/alternates` once `ensure` has succeeded. */
-  objects(pin: SessionRepository, ownerId: string): string {
-    return join(this.directory(pin, ownerId), "objects");
-  }
-
-  /**
-   * Makes the pinned commit and its full history available in the cache and records a pin ref for the session.
-   * Fetches only when the commit is missing. Concurrent callers for one repository are serialized, and a caller
-   * that waits sees the progress of the operation in front of it.
-   */
-  async ensure(target: RepositoryCacheTarget, options: { onProgress?: Listener; signal?: AbortSignal } = {}): Promise<{ objects: string; fetched: boolean }> {
-    const { pin, ownerId, sessionId } = target;
-    if (!OID.test(pin.commit)) throw new RepositoryCacheError("Repository pin has no commit");
-    const directory = this.directory(pin, ownerId);
-    const report = throttle(options.onProgress, this.#interval);
-    return this.#serialized(directory, pin.path, report, options.signal, async (emit) => {
-      await this.#prepare(directory);
-      const git = cacheGit(directory, options.signal);
-      if (await git.objectType(pin.commit) === "commit") {
-        await git.run(["update-ref", "--no-deref", pinRef(sessionId), pin.commit]);
-        emit({ phase: "done", percent: 100, done: null, total: null, bytes: 0 });
-        return { objects: join(directory, "objects"), fetched: false };
-      }
-      await this.#fetchInto(git, target, emit, options.signal);
-      return { objects: join(directory, "objects"), fetched: true };
-    });
-  }
-
-  /**
-   * Checks that the pinned tree is safe to check out, before anything is written to a session (see `inspectPinnedTree`).
-   * A commit's tree never changes, so this needs no lock; the pin ref keeps the commit from being collected meanwhile.
-   */
-  async inspect(pin: SessionRepository, ownerId: string, budget: CheckoutBudget, signal?: AbortSignal): Promise<PinnedTreeSummary> {
-    if (!OID.test(pin.commit)) throw new RepositoryCacheError("Repository pin has no commit");
-    return inspectPinnedTree(cacheGit(this.directory(pin, ownerId), signal), pin, budget);
   }
 
   /**
@@ -201,7 +118,7 @@ export class RepositoryCache {
       const before = await git.objectTypes([...advertised.values()]);
       const wants = [...before].filter(([, type]) => type === null).map(([id]) => id);
       const bytes = wants.length ? await this.#fetchObjects(git, target.remote, wants, emit) : 0;
-      await this.#updateUpstream(git, advertised, []);
+      await this.#updateUpstream(git, advertised);
       // Its branch tips as of now, on top of those it saw before: whatever its clones borrowed stays until prune drops
       // the keep ref.
       const heads = [...new Set([...advertised].filter(([ref]) => ref.startsWith("refs/heads/")).map(([, id]) => id))];
@@ -233,7 +150,7 @@ export class RepositoryCache {
 
   /**
    * Drops clone sessions' keep refs older than `age` and collects what no ref reaches any more, past the same age.
-   * A clone in a session idle for longer loses the objects it borrowed. Pins are never dropped.
+   * A clone in a session idle for longer loses the objects it borrowed. Pin refs are never dropped.
    */
   async prune(age: number): Promise<{ repositories: number; sessions: number }> {
     if (!Number.isSafeInteger(age) || age < 0) throw new RepositoryCacheError("Invalid prune age");
@@ -251,36 +168,6 @@ export class RepositoryCache {
       });
     }
     return { repositories, sessions };
-  }
-
-  /** Drops a session's pin ref so cache gc may later reclaim objects only it reached. */
-  async release(target: Omit<RepositoryCacheTarget, "remote">): Promise<void> {
-    const directory = this.directory(target.pin, target.ownerId);
-    try {
-      if (!(await lstat(directory)).isDirectory()) return;
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return;
-      throw error;
-    }
-    await this.#serialized(directory, target.pin.path, undefined, undefined, async () => {
-      await cacheGit(directory).run(["update-ref", "--no-deref", "-d", pinRef(target.sessionId)]);
-    });
-  }
-
-  async #fetchInto(git: CacheGit, target: RepositoryCacheTarget, emit: (progress: Omit<RepositoryCacheProgress, "path">) => void, signal?: AbortSignal): Promise<void> {
-    const { pin, sessionId } = target;
-    emit({ phase: "connecting", percent: null, done: null, total: null, bytes: 0 });
-    const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
-    const deadline = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    // The host's credential lives only in this object for this one fetch.
-    const remote = new GitRemote({ url: target.remote, authorization: await this.#authorization(target.remote, deadline), fetch: this.#fetch, signal: deadline });
-    const advertised = await remote.listRefs();
-    const before = await git.objectTypes([pin.commit, ...advertised.values()]);
-    const wants = [...before].filter(([, type]) => type === null).map(([id]) => id);
-    const bytes = await this.#fetchObjects(git, remote, wants, emit);
-    if (await git.objectType(pin.commit) !== "commit") throw new RepositoryCacheError("The fetched history does not contain the pinned commit");
-    await this.#updateUpstream(git, advertised, [`update ${pinRef(sessionId)} ${pin.commit}`]);
-    emit({ phase: "done", percent: 100, done: null, total: null, bytes });
   }
 
   /** Fetches `wants` and their history into the cache, checked complete like `git fetch` does; returns the pack's size. */
@@ -314,7 +201,7 @@ export class RepositoryCache {
   }
 
   /** Mirrors the advertised branches and tags as refs/upstream/*, keeping only those whose objects are here. */
-  async #updateUpstream(git: CacheGit, advertised: Map<string, string>, extra: string[]): Promise<void> {
+  async #updateUpstream(git: CacheGit, advertised: Map<string, string>): Promise<void> {
     const after = await git.objectTypes([...advertised.values()]);
     const current = new Map((await git.capture(["for-each-ref", "--format=%(refname) %(objectname)", UPSTREAM_PREFIX]))
       .split("\n").filter(Boolean).map(line => line.split(" ") as [string, string]));
@@ -329,7 +216,6 @@ export class RepositoryCache {
     // Deletes commit first, on their own: a branch renamed from feature/login to feature (or back) is a file/directory
     // conflict that Git refuses inside one transaction, in either order.
     if (deletes.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${deletes.join("\n")}\n`);
-    updates.push(...extra);
     if (updates.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${updates.join("\n")}\n`);
   }
 
@@ -444,11 +330,6 @@ async function directorySize(directory: string): Promise<number> {
   return total;
 }
 
-function pinRef(sessionId: string): string {
-  if (typeof sessionId !== "string" || !sessionId) throw new RepositoryCacheError("Invalid session id");
-  return `${PIN_PREFIX}${digest(sessionId)}`;
-}
-
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
 }
@@ -526,10 +407,6 @@ function alive(pid: number): boolean {
 interface CacheGit {
   run(args: string[], input?: string | AsyncIterable<Uint8Array>, onProgress?: (line: string) => void): Promise<void>;
   capture(args: string[]): Promise<string>;
-  /** Stdout goes to `onStdout` instead of memory; if it throws, Git is killed and the call fails with that error. */
-  stream(args: string[], onStdout: (chunk: Buffer) => void): Promise<void>;
-  /** Raw stdout for binary output such as `cat-file --batch`. */
-  batch(args: string[], input: string): Promise<Buffer>;
   objectType(id: string): Promise<string | null>;
   /** Types of many objects in one process; null for a missing object. */
   objectTypes(ids: readonly string[]): Promise<Map<string, string | null>>;
@@ -539,8 +416,6 @@ function cacheGit(directory: string, signal?: AbortSignal): CacheGit {
   return {
     run: async (args, input, onProgress) => { await runGit(directory, args, { input, onProgress, signal }); },
     capture: async (args) => (await runGit(directory, args, { signal })).stdout.toString("utf8"),
-    stream: async (args, onStdout) => { await runGit(directory, args, { signal, onStdout }); },
-    batch: async (args, input) => (await runGit(directory, args, { signal, input })).stdout,
     objectType: async (id) => {
       if (!OID.test(id)) return null;
       const result = await runGit(directory, ["cat-file", "-t", id], { signal, allowFailure: true });
@@ -566,7 +441,7 @@ function cacheGit(directory: string, signal?: AbortSignal): CacheGit {
  * config, no hooks, no credential helpers, no protocols (all network traffic goes through GitRemote).
  */
 function runGit(directory: string, args: string[], options: {
-  input?: string | AsyncIterable<Uint8Array>; onProgress?: (line: string) => void; onStdout?: (chunk: Buffer) => void;
+  input?: string | AsyncIterable<Uint8Array>; onProgress?: (line: string) => void;
   signal?: AbortSignal; allowFailure?: boolean; cwd?: string;
 }): Promise<{ code: number | null; stdout: Buffer }> {
   // A signal can be aborted before it is ever listened to; then Git must not start at all.
@@ -597,10 +472,6 @@ function runGit(directory: string, args: string[], options: {
   options.signal?.addEventListener("abort", abort, { once: true });
   child.stdout.on("data", (chunk: Buffer) => {
     if (failure) return;
-    if (options.onStdout) {
-      try { options.onStdout(chunk); } catch (error) { kill(error instanceof Error ? error : new RepositoryCacheError("Git output could not be processed")); }
-      return;
-    }
     size += chunk.length;
     if (size > CAPTURE_BYTES) kill(new RepositoryCacheError("Git output exceeds its limit in the repository cache"));
     else stdout.push(chunk);
@@ -643,116 +514,4 @@ function runGit(directory: string, args: string[], options: {
     })().catch(error => kill(error instanceof Error ? error : new RepositoryCacheError("Repository fetch failed")));
   }
   return promise;
-}
-
-const REGULAR_MODES = new Set(["100644", "100755", "100664"]);
-const MAX_TREE_RECORD = 8192;
-
-/**
- * Checks one pinned tree in the cache before any of it is checked out into a session, with the archive parser's path
- * rules: no traversal, empty or dot components, control characters, backslashes or ":" in paths, no ".git" component
- * (or its NTFS short and trailing-dot spellings), bounded depth and length, and UTF-8 names. Entries must be regular
- * files, symlinks or submodules; submodules check out as empty directories, as archives left them. Symlinks are
- * checked out for real, so each target must be relative and resolve lexically inside its own repository.
- */
-async function inspectPinnedTree(git: CacheGit, pin: SessionRepository, budget: CheckoutBudget): Promise<PinnedTreeSummary> {
-  const summary: PinnedTreeSummary = { entries: 0, bytes: 0, symlinks: 0, submodules: 0 };
-  const destination = pin.path.split("/");
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const links: { oid: string; parts: string[]; size: number }[] = [];
-  const malformed = () => new RepositoryCacheError("Repository tree listing is malformed");
-  const entry = (raw: Buffer) => {
-    const tab = raw.indexOf(9);
-    const meta = tab < 0 ? [] : raw.subarray(0, tab).toString("latin1").split(/ +/);
-    if (meta.length !== 4) throw malformed();
-    const [mode, type, oid, size] = meta as [string, string, string, string];
-    let name: string;
-    try { name = decoder.decode(raw.subarray(tab + 1)); } catch { throw new RepositoryCacheError("Repository tree contains a path that is not UTF-8"); }
-    const parts = checkoutParts(name);
-    if (destination.length + parts.length > 64 || Buffer.byteLength(`${pin.path}/${name}`) > 1024) {
-      throw new RepositoryCacheError("Repository tree path exceeds the path or depth limit");
-    }
-    if (!OID.test(oid)) throw malformed();
-    if (++summary.entries > budget.entries) throw new RepositoryCacheError("Repository checkout has too many entries");
-    if (mode === "160000" && type === "commit") { summary.submodules += 1; return; }
-    if (type !== "blob" || !/^[0-9]{1,15}$/.test(size)) throw new RepositoryCacheError("Repository tree contains an unsupported entry");
-    const bytes = Number(size);
-    if (REGULAR_MODES.has(mode)) {
-      if (bytes > repositoryLimits.checkoutFileBytes) throw new RepositoryCacheError("Repository file exceeds the checkout size limit");
-    } else if (mode === "120000") {
-      if (bytes < 1 || bytes > 1024) throw new RepositoryCacheError("Repository symlink target is empty or too long");
-      summary.symlinks += 1;
-      links.push({ oid, parts, size: bytes });
-    } else {
-      throw new RepositoryCacheError("Repository tree contains an unsupported entry");
-    }
-    summary.bytes += bytes;
-    if (summary.bytes > budget.bytes) throw new RepositoryCacheError("Repository checkout exceeds its size limit");
-  };
-  let pending: Buffer = Buffer.alloc(0);
-  await git.stream(["ls-tree", "-r", "-z", "-l", "--full-tree", pin.commit], chunk => {
-    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    let start = 0;
-    for (let end = pending.indexOf(0); end >= 0; end = pending.indexOf(0, start)) {
-      entry(pending.subarray(start, end));
-      start = end + 1;
-    }
-    pending = Buffer.from(pending.subarray(start));
-    if (pending.length > MAX_TREE_RECORD) throw new RepositoryCacheError("Repository tree path exceeds the path or depth limit");
-  });
-  if (pending.length) throw malformed();
-  if (links.length) {
-    const output = await git.batch(["cat-file", "--batch"], links.map(link => `${link.oid}\n`).join(""));
-    let offset = 0;
-    for (const link of links) {
-      const newline = output.indexOf(10, offset);
-      const body = newline < 0 ? Buffer.alloc(0) : output.subarray(newline + 1, newline + 1 + link.size);
-      if (newline < 0 || output.subarray(offset, newline).toString("latin1") !== `${link.oid} blob ${link.size}`
-        || body.length !== link.size || output[newline + 1 + link.size] !== 10) {
-        throw new RepositoryCacheError("Repository symlink could not be read");
-      }
-      offset = newline + 2 + link.size;
-      let target: string;
-      try { target = decoder.decode(body); } catch { throw new RepositoryCacheError("Repository symlink target is not UTF-8"); }
-      symlinkTarget(link.parts, target);
-    }
-  }
-  return summary;
-}
-
-/** ".git" in any spelling Git itself treats as the repository directory on some filesystem. */
-function reservedGitName(part: string): boolean {
-  const name = part.toLowerCase().replace(/[. ]+$/, "");
-  return name === ".git" || name === "git~1";
-}
-
-function checkoutParts(value: string): string[] {
-  if (!value || Buffer.byteLength(value) > 1024 || value.startsWith("/") || value.includes("\\")) {
-    throw new RepositoryCacheError("Repository tree contains an invalid path");
-  }
-  const parts = value.split("/");
-  if (parts.length > 64 || parts.some(part => part === "" || part === "." || part === ".." || Buffer.byteLength(part) > 255)) {
-    throw new RepositoryCacheError("Repository tree path traversal or depth limit");
-  }
-  if (/[\x00-\x1f\x7f]/.test(value) || parts.some(part => part.includes(":"))) throw new RepositoryCacheError("Repository tree contains an invalid path");
-  if (parts.some(reservedGitName)) throw new RepositoryCacheError("Repository tree contains reserved Git metadata");
-  return parts;
-}
-
-/** A symlink resolves lexically inside its repository: ".." may never climb above the repository root. */
-function symlinkTarget(path: readonly string[], link: string): string[] {
-  if (!link || link.startsWith("/") || link.includes("\\") || /[\x00-\x1f\x7f]/.test(link)) {
-    throw new RepositoryCacheError("Repository symlink target must be a relative path");
-  }
-  const parts = path.slice(0, -1);
-  for (const part of link.split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") {
-      if (!parts.length) throw new RepositoryCacheError("Repository symlink escapes its repository");
-      parts.pop();
-    } else parts.push(part);
-  }
-  if (!parts.length) throw new RepositoryCacheError("Repository symlink escapes its repository");
-  if (parts.some(reservedGitName)) throw new RepositoryCacheError("Repository symlink points into Git metadata");
-  return parts;
 }

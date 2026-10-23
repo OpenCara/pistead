@@ -5,36 +5,21 @@ import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats, type Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { crc32, inflateRawSync } from "node:zlib";
-import { repositoryLimits, type SessionRepository } from "../../../packages/shared/src/repositories.js";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
-import type { PushPreparation } from "./push.js";
 import {
-  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, drained, ownerGitConfig, pinOwnerConfig, repositoryObjectPaths, repositoryPins, sessionEnvironment, text,
-  type RepositoryCacheState, type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SandboxOptions, type SnapshotFile,
+  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, ownerGitConfig, pinOwnerConfig, sessionEnvironment, text,
+  type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
 } from "./sandbox.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 
 const MAX_ENTRIES = 10_000;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
-const CACHE_MARKER = "repository-cache.json";
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const queues = new Map<string, Promise<void>>();
-const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
-/** Cache checkouts write whole repositories; like pushes, they get far longer than single commands. */
-const CHECKOUT_TIMEOUT_MS = 60 * 60 * 1000;
-const PUSH_CAPTURE_BYTES = 64 * 1024 * 1024;
-const PUSH_ID = /^[0-9a-f]{32}$/;
-const OID = /^[0-9a-f]{40}$/;
-const ZERO = "0".repeat(40);
 
 type Captured = { code: number | null; stdout: string; stderr: string };
 type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number };
-type TreeNode = Map<string, string | TreeNode>;
-type ArchiveNode = "file" | "directory";
-type ArchiveFile = { path: string[]; body: Buffer; mode: number };
-type PushProcess = { stdout: AsyncIterable<Buffer>; done: Promise<{ code: number | null; stdout: Buffer }>; kill: () => void };
 
 /**
  * Owner-consented host mode for macOS or Linux without bubblewrap. It runs as the
@@ -49,17 +34,12 @@ export class HostWorkspace {
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;
   readonly #testProvider: boolean;
-  readonly #repositories: readonly SessionRepository[];
-  readonly #cacheObjects: readonly string[];
-  /** Like the sandbox's cache mounts: only cache-backed sessions, after their owner's access was re-checked. */
-  #cacheEnabled = false;
   #initialization: Promise<void> | undefined;
   #ready = false;
   #closed = false;
   #cancelActive: (() => void) | undefined;
-  readonly #pushStreams = new Map<string, () => void>();
 
-  constructor(binding: RunnerBinding, root: string, options: SandboxOptions = {}) {
+  constructor(binding: RunnerBinding, root: string) {
     if (!["linux", "darwin"].includes(process.platform) || !isAbsolute(root) || resolve(root) === sep) {
       throw new Error("Host workspace requires Linux or macOS and an absolute, non-root private storage path");
     }
@@ -72,9 +52,6 @@ export class HostWorkspace {
     const githubLogin = binding.owner.githubLogin === null ? null : text(binding.owner.githubLogin, "GitHub login", 256);
     this.#root = resolve(root);
     this.#testProvider = binding.model.provider === "faux";
-    this.#repositories = repositoryPins(binding.session.repositories ?? []);
-    // Nothing can be mounted read-only here: alternates name the cache's host paths directly.
-    this.#cacheObjects = Object.freeze(repositoryObjectPaths(this.#repositories, options.repositoryObjects, root));
     this.#identity = Object.freeze({
       ownerId, githubLogin, gitName, gitEmail, home: join(this.#root, "home"), worktree: join(this.#root, "worktree"),
       env: Object.freeze({ ...binding.owner.env }),
@@ -104,9 +81,6 @@ export class HostWorkspace {
       }
       await (await pinOwnerConfig(join(this.#root, "owner.gitconfig"), ownerGitConfig(this.#identity))).close();
       if (!await exists(join(this.worktree, ".git", "HEAD"))) {
-        if (this.#repositories.length && await exists(join(this.worktree, ".git", CACHE_MARKER))) {
-          throw hostError("repository cache Git HEAD is missing; refusing to reinitialize");
-        }
         await this.#git(["init", "--quiet", "--template=", "--initial-branch=main", this.worktree]);
       }
       await this.#git(["rev-parse", "--is-inside-work-tree"]);
@@ -118,7 +92,6 @@ export class HostWorkspace {
   async readFile(path: string, authorize: SandboxAuthorize): Promise<string> {
     const value = text(path, "path", 1024);
     return this.#operation(authorize, async () => {
-      await this.#requireCache();
       const parts = await this.#parts(value, false);
       if (!parts.length) throw hostError("a file path is required");
       const parent = await directoryAt(this.worktree, parts.slice(0, -1));
@@ -132,7 +105,6 @@ export class HostWorkspace {
   async readContent(path: string, authorize: SandboxAuthorize): Promise<FileContent> {
     const value = text(path, "path", 1024);
     return this.#operation(authorize, async () => {
-      await this.#requireCache();
       const parts = await this.#parts(value, false);
       if (!parts.length) throw hostError("a file path is required");
       const parent = await directoryAt(this.worktree, parts.slice(0, -1));
@@ -148,7 +120,6 @@ export class HostWorkspace {
     const value = text(path, "path", 1024);
     if (typeof content !== "string" || Buffer.byteLength(content) > MAX_FILE_BYTES) throw new Error("File exceeds size limit");
     await this.#operation(authorize, async () => {
-      await this.#requireCache();
       await writeAt(this.worktree, await this.#parts(value, true), content);
     });
   }
@@ -156,39 +127,21 @@ export class HostWorkspace {
   async listFiles(path: string | undefined, authorize: SandboxAuthorize): Promise<string[]> {
     const value = text(path ?? ".", "path", 1024);
     return this.#operation(authorize, async () => {
-      await this.#requireCache();
       const names = await readdir(await directoryAt(this.worktree, await this.#parts(value, false)));
       if (names.length > MAX_ENTRIES) throw hostError("directory has too many entries");
       return names.sort();
     });
   }
 
-  gitStatus(authorize: SandboxAuthorize): Promise<string> {
-    return this.#operation(authorize, async () => {
-      await this.#requireCache();
-      return output(await this.#git(["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]));
-    });
-  }
-
   async execute(operation: Operation, readOnly: boolean, authorize: SandboxAuthorize, options: SandboxExecutionOptions = {}): Promise<string> {
     switch (operation.kind) {
-      case "git.commit": {
-        if (readOnly) throw new Error("Read-only sandbox cannot commit");
-        const message = text(operation.message, "commit message", 16 * 1024, true);
-        return this.#operation(authorize, async () => {
-          await this.#requireCache();
-          const added = await this.#git(["add", "--all", "--", "."]);
-          return output(added) + output(await this.#git(["commit", "--no-verify", "--no-gpg-sign", "--cleanup=verbatim", "--file=-"], message));
-        });
-      }
       case "bash": {
         if (options.allowTestShell === true && !this.#testProvider) throw new Error("Test shell bypass is restricted to the explicit faux provider");
         // Nothing can be mounted read-only on the host, so only writable approved commands run.
         if (readOnly) throw new Error("Unsandboxed hosts cannot run read-only shell commands");
         const command = text(operation.command, "shell command", 64 * 1024, true);
         return this.#operation(authorize, async () => {
-          await this.#requireCache();
-          return output(checked(await this.#spawn("/bin/bash", ["--noprofile", "--norc", "-c", command])));
+              return output(checked(await this.#spawn("/bin/bash", ["--noprofile", "--norc", "-c", command])));
         });
       }
       case "github.comment":
@@ -201,11 +154,6 @@ export class HostWorkspace {
 
   snapshot(authorize: SandboxAuthorize): Promise<SnapshotFile[]> {
     return this.#operation(authorize, async () => {
-      await this.#requireCache();
-      // Its objects live in the host cache, not in the session: a backup would not restore.
-      if (this.#repositories.length && (await this.#cacheState()) === "cache") {
-        throw hostError("backups of sessions checked out from the host repository cache are not supported yet");
-      }
       const files: SnapshotFile[] = [];
       let total = 0;
       const add = async (parent: string, name: string, archivePath: string) => {
@@ -236,50 +184,10 @@ export class HostWorkspace {
     });
   }
 
-  /** False only for pristine storage; mismatched or interrupted caches fail closed. */
-  async repositoryCachesReady(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<boolean> {
-    return (await this.repositoryCacheState(repositories, authorize)) !== "absent";
-  }
-
-  /** How the session's repositories were prepared; a cache-backed session also needs its cache paths to match. */
-  async repositoryCacheState(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<RepositoryCacheState> {
-    this.#assertRepositories(repositories);
-    return this.#operation(authorize, () => this.#cacheState());
-  }
-
-  /** Like `Sandbox.materializeFromCache`: the runner has ensured and inspected every pinned tree. */
-  async materializeFromCache(repositories: readonly SessionRepository[], authorize: SandboxAuthorize): Promise<void> {
-    this.#assertRepositories(repositories);
-    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
-    if (!this.#cacheEnabled) throw new Error("The repository cache is not mounted for this session");
-    await this.#operation(authorize, () => this.#checkout());
-  }
-
-  /**
-   * Mirrors `Sandbox.enableRepositoryCache`. Nothing is mounted here: an approved command on an unsandboxed host already
-   * runs as the connector user, who can read the cache. This only keeps checkouts behind the same re-check.
-   */
-  enableRepositoryCache(): void {
-    if (!this.#repositories.length || this.#cacheObjects.length !== this.#repositories.length) throw new Error("The repository cache is not configured for this session");
-    this.#cacheEnabled = true;
-  }
-
-  /** Archives correspond to the supplied pin order; ready caches never overwrite edits. */
-  async materializeRepositories(repositories: readonly SessionRepository[], archives: readonly Uint8Array[], authorize: SandboxAuthorize): Promise<void> {
-    this.#assertRepositories(repositories);
-    if (!Array.isArray(archives) || archives.length !== repositories.length
-      || archives.some((archive) => !(archive instanceof Uint8Array) || !archive.byteLength || archive.byteLength > repositoryLimits.archiveBytes)) {
-      throw new Error("Repository archives exceed size limits or do not match pins");
-    }
-    const byPath = new Map(repositories.map((repository, index) => [repository.path, Buffer.from(archives[index]!)]));
-    await this.#operation(authorize, () => this.#materialize(this.#repositories.map((repository) => byPath.get(repository.path)!)));
-  }
-
   /** Explicit host-owner-approved execution, serialized with sandbox file/Git operations; never a fallback. */
   async executeHost(operation: HostCommandOperation, authorize: SandboxAuthorize, signal: AbortSignal): Promise<string> {
     if (typeof authorize !== "function") throw new Error("Host command authorization is required");
     return this.#operation(authorize, async () => {
-      await this.#requireCache();
       await authorize();
       const controller = new AbortController();
       const cancel = () => controller.abort();
@@ -292,190 +200,6 @@ export class HostWorkspace {
         });
       } finally { if (this.#cancelActive === cancel) this.#cancelActive = undefined; }
     });
-  }
-
-  head(authorize: SandboxAuthorize): Promise<string> {
-    return this.#operation(authorize, async () => {
-      await this.#requireCache();
-      const head = (await this.#git(["rev-parse", "--verify", "HEAD"])).stdout.trim();
-      if (!OID.test(head)) throw hostError("session HEAD is not a commit");
-      return head;
-    });
-  }
-
-  /** Rewrites session commits under `path` onto the upstream `base` in a scratch repository (see PushWorkspace). */
-  pushPrepare(id: string, input: { path: string; base: string; commit: string }, pack: AsyncIterable<Uint8Array>, authorize: SandboxAuthorize): Promise<PushPreparation> {
-    const directory = this.#pushDirectory(id);
-    const { path, base, commit } = input;
-    if (!this.#repositories.some(repository => repository.path === path) || !OID.test(base) || !OID.test(commit)) return Promise.reject(hostError("invalid push request"));
-    return this.#operation(authorize, async () => {
-      await this.#requireCache();
-      const gitDirectory = join(this.worktree, ".git");
-      const scratch = join(gitDirectory, "pistead-push");
-      await mkdir(scratch, { mode: 0o700 }).catch(error => { if (errorCode(error) !== "EEXIST") throw error; });
-      if (!(await lstat(scratch)).isDirectory()) throw hostError("push scratch directory is unsafe");
-      // Pushes are serialized per session: any existing scratch repository is an orphan of an interrupted push.
-      for (const name of await readdir(scratch)) {
-        if ((await lstat(join(scratch, name))).isDirectory()) await rm(join(scratch, name), { recursive: true, force: true });
-      }
-      await mkdir(directory, { mode: 0o700 });
-      for (const name of ["objects/info", "objects/pack", "refs/heads", "refs/tags"]) await mkdir(join(directory, name), { recursive: true, mode: 0o700 });
-      await writeFile(join(directory, "HEAD"), "ref: refs/heads/main\n", { flag: "wx", mode: 0o600 });
-      await writeFile(join(directory, "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = true\n", { flag: "wx", mode: 0o600 });
-      await writeFile(join(directory, "objects/info/alternates"), `${join(gitDirectory, "objects")}\n`, { flag: "wx", mode: 0o600 });
-      const git = async (args: string[], stdin?: Buffer | AsyncIterable<Uint8Array>, env?: Record<string, string>) => {
-        const result = await this.#pushSpawn(directory, args, stdin, env).done;
-        if (result.code !== 0) throw hostError("push rewrite failed");
-        return result.stdout;
-      };
-      await git(["index-pack", "--stdin", "--fix-thin"], pack);
-      if ((await this.#pushSpawn(directory, ["cat-file", "-t", base]).done).stdout.toString().trim() !== "commit") throw hostError("pinned commit is missing from the upstream pack");
-      await writeFile(join(directory, "shallow"), `${base}\n`, { flag: "wx", mode: 0o600 });
-      const marker: unknown = JSON.parse(new TextDecoder().decode((await readAt(gitDirectory, CACHE_MARKER, 65536)).data));
-      const baseline = marker && typeof marker === "object" && "baseline" in marker ? marker.baseline : undefined;
-      if (typeof baseline !== "string" || !OID.test(baseline)) throw hostError("invalid repository cache baseline");
-      if ((await this.#pushSpawn(directory, ["cat-file", "-t", commit]).done).stdout.toString().trim() !== "commit"
-        || (await this.#pushSpawn(directory, ["merge-base", "--is-ancestor", baseline, commit]).done).code !== 0) throw hostError("push commit is not a session commit");
-      const sources = (await git(["rev-list", "--reverse", "--first-parent", `${baseline}..${commit}`])).toString().split("\n").filter(Boolean);
-      await git(["read-tree", `${base}^{tree}`]);
-      let previous = base;
-      let previousTree = (await git(["rev-parse", `${base}^{tree}`])).toString().trim();
-      const prefix = new TextEncoder().encode(`${path}/`);
-      const commits: PushPreparation["commits"] = [];
-      for (const source of sources) {
-        if (!OID.test(source)) throw hostError("push rewrite failed");
-        const fields = splitNul(await git(["diff-tree", "-r", "-z", "--raw", "--no-renames", "--full-index", `${source}^1`, source, "--", `${path}/`]));
-        const records: Buffer[] = [];
-        for (let index = 0; index + 1 < fields.length && fields[index]!.length; index += 2) {
-          const meta = new TextDecoder("latin1").decode(fields[index]!).slice(1).split(" ");
-          const name = fields[index + 1]!;
-          if (meta.length !== 5 || !prefix.every((byte, offset) => name[offset] === byte) || name.length === prefix.length) throw hostError("push rewrite failed");
-          const relative = name.subarray(prefix.length);
-          records.push(Buffer.from(meta[4] === "D" ? `0 ${ZERO}\t` : `${meta[1]} ${meta[3]}\t`), relative, Buffer.from([0]));
-        }
-        if (records.length) await git(["update-index", "-z", "--replace", "--index-info"], Buffer.concat(records));
-        const tree = (await git(["write-tree", "--missing-ok"])).toString().trim();
-        if (tree === previousTree) continue;
-        const raw = await git(["cat-file", "commit", source]);
-        const split = raw.findIndex((byte, offset) => byte === 10 && raw[offset + 1] === 10);
-        const header = new TextDecoder().decode(split < 0 ? raw : raw.subarray(0, split)).split("\n");
-        const message = split < 0 ? Buffer.alloc(0) : raw.subarray(split + 2);
-        const ident = (kind: "author" | "committer") => {
-          const match = header.map(line => new RegExp(`^${kind} (.*) <([^<>]*)> ([0-9]+) ([+-][0-9]{4})$`).exec(line)).find(Boolean);
-          if (!match) throw hostError("push rewrite failed");
-          return { name: match[1]!, email: match[2]!, date: `@${match[3]} ${match[4]}` };
-        };
-        const author = ident("author"), committer = ident("committer");
-        const rewritten = (await git(["commit-tree", tree, "-p", previous], message, {
-          GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email, GIT_AUTHOR_DATE: author.date,
-          GIT_COMMITTER_NAME: committer.name, GIT_COMMITTER_EMAIL: committer.email, GIT_COMMITTER_DATE: committer.date,
-        })).toString().trim();
-        if (!OID.test(rewritten)) throw hostError("push rewrite failed");
-        commits.push({ source, rewritten, subject: new TextDecoder().decode(message).split("\n", 1)[0]!.slice(0, 200) });
-        previous = rewritten;
-        previousTree = tree;
-      }
-      if (!commits.length) throw hostError("session commits do not change the repository");
-      return { tip: previous, base, commits };
-    });
-  }
-
-  /** Streams the pack of `tip` minus `exclude` from the scratch repository; the session queue is held until it ends. */
-  async pushPack(id: string, input: { tip: string; exclude: string[] }, authorize: SandboxAuthorize): Promise<AsyncIterable<Uint8Array>> {
-    const directory = this.#pushDirectory(id);
-    if (!OID.test(input.tip) || !Array.isArray(input.exclude) || input.exclude.length > 16 || !input.exclude.every(oid => OID.test(oid))) throw hostError("invalid push request");
-    const started = Promise.withResolvers<PushProcess>();
-    const finished = this.#operation(authorize, async () => {
-      if (!(await lstat(directory)).isDirectory()) throw hostError("push scratch directory is unsafe");
-      const pack = this.#pushSpawn(directory, ["-c", "core.bigFileThreshold=64m", "pack-objects", "--stdout", "--revs", "--delta-base-offset", "-q"],
-        Buffer.from(`${input.tip}\n${input.exclude.map(oid => `^${oid}\n`).join("")}`), undefined, true);
-      this.#pushStreams.set(id, pack.kill);
-      started.resolve(pack);
-      try {
-        if ((await pack.done).code !== 0) throw hostError("push pack failed");
-      } finally { this.#pushStreams.delete(id); }
-    });
-    finished.catch(error => started.reject(error));
-    const pack = await started.promise;
-    return (async function* () {
-      let complete = false;
-      try {
-        for await (const chunk of pack.stdout) yield chunk;
-        await finished;
-        complete = true;
-      } finally {
-        if (!complete) { pack.kill(); await finished.catch(() => undefined); }
-      }
-    })();
-  }
-
-  async pushCleanup(id: string): Promise<void> {
-    const directory = this.#pushDirectory(id);
-    this.#pushStreams.get(id)?.();
-    await this.#exclusive(async () => {
-      const scratch = join(this.worktree, ".git", "pistead-push");
-      if (!await exists(scratch)) return;
-      if (!(await lstat(scratch)).isDirectory()) throw hostError("push scratch directory is unsafe");
-      await rm(directory, { recursive: true, force: true });
-    });
-  }
-
-  #pushDirectory(id: string): string {
-    if (typeof id !== "string" || !PUSH_ID.test(id)) throw hostError("invalid push id");
-    return join(this.worktree, ".git", "pistead-push", id);
-  }
-
-  /** Git in a scratch push repository: clean config, the same hardening flags, no output cap when streaming. */
-  #pushSpawn(directory: string, args: string[], input?: Buffer | AsyncIterable<Uint8Array>, env: Record<string, string> = {}, stream = false): PushProcess {
-    const child = spawn("git", ["--no-pager", "--literal-pathspecs",
-      "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-      "-c", "core.attributesFile=/dev/null", "-c", "core.sshCommand=/usr/bin/false",
-      "-c", "credential.helper=", "-c", "commit.gpgSign=false",
-      "-c", "tag.gpgSign=false", "-c", "protocol.allow=never",
-      "-c", "core.pager=cat", "-c", "core.editor=/usr/bin/false",
-      "-c", "gc.auto=0", "-c", "maintenance.auto=false",
-      "-c", "core.preloadIndex=false", "-c", "index.threads=1",
-      "-c", `safe.directory=${directory}`, `--git-dir=${directory}`, ...args], {
-      cwd: directory, detached: true, stdio: ["pipe", "pipe", "pipe"],
-      env: { ...this.#environment, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_INDEX_FILE: join(directory, "pistead-index"), ...env },
-    });
-    const chunks: Buffer[] = [];
-    let bytes = 0;
-    let failure: unknown;
-    const kill = () => {
-      if (!child.pid) return;
-      try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (errorCode(error) !== "ESRCH") child.kill("SIGKILL"); }
-    };
-    const cancel = () => { failure ??= hostError("push was cancelled"); kill(); };
-    this.#cancelActive = cancel;
-    const timer = setTimeout(() => { failure ??= hostError("push exceeded its time limit"); kill(); }, PUSH_TIMEOUT_MS);
-    if (!stream) {
-      child.stdout.on("data", (chunk: Buffer) => {
-        bytes += chunk.length;
-        if (bytes > PUSH_CAPTURE_BYTES) { failure ??= hostError("push output exceeds its limit"); kill(); } else chunks.push(chunk);
-      });
-    }
-    child.stderr.resume();
-    child.stdin.on("error", () => { /* Early exit closes stdin; the exit status is authoritative. */ });
-    const { promise: done, resolve: resolveResult, reject } = Promise.withResolvers<{ code: number | null; stdout: Buffer }>();
-    child.once("error", () => { clearTimeout(timer); reject(hostError("cannot start git")); });
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      if (this.#cancelActive === cancel) this.#cancelActive = undefined;
-      if (failure || signal) reject(failure ?? hostError("push rewrite failed"));
-      else resolveResult({ code, stdout: Buffer.concat(chunks) });
-    });
-    if (input === undefined || Buffer.isBuffer(input)) child.stdin.end(input ?? "");
-    else {
-      void (async () => {
-        for await (const chunk of input) {
-          if (child.stdin.destroyed) break;
-          if (!child.stdin.write(chunk)) await drained(child.stdin);
-        }
-        child.stdin.end();
-      })().catch(error => { failure ??= error; kill(); });
-    }
-    return { stdout: child.stdout, done, kill: cancel };
   }
 
   async close(): Promise<void> {
@@ -513,16 +237,6 @@ export class HostWorkspace {
     });
   }
 
-  #assertRepositories(repositories: readonly SessionRepository[]): void {
-    if (JSON.stringify(repositoryPins(repositories)) !== JSON.stringify(this.#repositories)) {
-      throw new Error("Repository pins do not match the immutable sandbox binding");
-    }
-  }
-
-  async #requireCache(): Promise<void> {
-    if (this.#repositories.length && (await this.#cacheState()) === "absent") throw hostError("repository cache is not prepared");
-  }
-
   /** Lexical checks, then symlink resolution: the resolved path must stay inside the worktree. */
   async #parts(value: string, writing: boolean): Promise<string[]> {
     if (value.startsWith("/") || value.includes("\\") || /[\x00-\x1f\x7f]/.test(value)) throw hostError("invalid relative path");
@@ -546,157 +260,6 @@ export class HostWorkspace {
     const parts = inside ? inside.split(sep) : [];
     if (writing && parts.some((part) => part.toLowerCase() === ".git")) throw hostError("Git metadata is protected");
     return parts;
-  }
-
-  async #alternates(): Promise<string> {
-    try {
-      return new TextDecoder("utf-8", { fatal: true }).decode((await readAt(join(this.worktree, ".git", "objects", "info"), "alternates", 65536)).data);
-    } catch (error) {
-      if (errorCode(error) === "ENOENT") return "";
-      throw error;
-    }
-  }
-
-  async #cacheState(): Promise<RepositoryCacheState> {
-    const git = join(this.worktree, ".git");
-    let raw: Buffer;
-    try {
-      raw = (await readAt(git, CACHE_MARKER, 65536)).data;
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
-      if (!this.#repositories.length) return "archive";
-      const names = await readdir(this.worktree);
-      if (names.length !== 1 || names[0] !== ".git" || (await this.#capture(["rev-parse", "--verify", "HEAD"])).code === 0) {
-        throw hostError("repository cache is unmarked and nonempty; refusing to overwrite");
-      }
-      if ((await this.#git(["ls-files", "--stage"])).stdout) throw hostError("repository cache has an existing Git index");
-      return "absent";
-    }
-    const marker: unknown = JSON.parse(new TextDecoder().decode(raw));
-    const source = !marker || typeof marker !== "object" || !("version" in marker) ? undefined
-      : marker.version === 1 ? "archive" : marker.version === 2 && "source" in marker && marker.source === "cache" ? "cache" : undefined;
-    if (!source || !marker || typeof marker !== "object" || !("repositories" in marker)
-      || canonicalJson(marker.repositories) !== canonicalJson(this.#repositories)) {
-      throw hostError("repository cache binding does not match immutable pins");
-    }
-    if (source === "cache" && !this.#cacheObjects.length) throw hostError("this session needs the host repository cache; its connector must run with --repo-cache");
-    const expected = source === "cache" ? this.#cacheObjects.map(path => `${path}\n`).join("") : "";
-    if (await this.#alternates() !== expected) throw hostError("repository cache mounts do not match this session");
-    if (!("status" in marker) || marker.status !== "ready") throw hostError("repository cache preparation is incomplete; refusing to overwrite");
-    const baseline = "baseline" in marker ? marker.baseline : undefined;
-    if (typeof baseline !== "string" || !/^[0-9a-f]{40}$/.test(baseline)) throw hostError("invalid repository cache baseline");
-    if ((await this.#git(["cat-file", "-t", baseline])).stdout.trim() !== "commit") throw hostError("repository cache baseline is missing");
-    await this.#git(["merge-base", "--is-ancestor", baseline, "HEAD"]);
-    return source;
-  }
-
-  async #marker(status: "preparing" | "ready", baseline?: string, source: "archive" | "cache" = "archive"): Promise<void> {
-    // Version 2 (cache checkouts): older runners refuse such sessions instead of using them without the cache.
-    const value = source === "cache"
-      ? { version: 2, source, repositories: this.#repositories, status, ...(baseline ? { baseline } : {}) }
-      : { version: 1, repositories: this.#repositories, status, ...(baseline ? { baseline } : {}) };
-    await writeAt(join(this.worktree, ".git"), [CACHE_MARKER], JSON.stringify(value));
-  }
-
-  /** Mirrors the sandbox helper's materialize_from_cache; see the comments there. */
-  async #checkout(): Promise<void> {
-    if ((await this.#cacheState()) !== "absent") return;
-    const env = { GIT_ALTERNATE_OBJECT_DIRECTORIES: this.#cacheObjects.join(":") };
-    const root: TreeNode = new Map();
-    for (const repository of this.#repositories) {
-      const type = await this.#capture(["cat-file", "-t", repository.commit], undefined, { env });
-      const tree = await this.#capture(["rev-parse", "--verify", "--quiet", `${repository.commit}^{tree}`], undefined, { env });
-      if (type.code !== 0 || type.stdout.trim() !== "commit" || tree.code !== 0 || !OID.test(tree.stdout.trim())) {
-        throw hostError("pinned commit is missing from the repository cache");
-      }
-      const parts = repository.path.split("/");
-      let node = root;
-      for (const part of parts.slice(0, -1)) {
-        const next = node.get(part) ?? new Map();
-        if (typeof next === "string") throw hostError("repository paths overlap");
-        node.set(part, next);
-        node = next;
-      }
-      if (node.has(parts.at(-1)!)) throw hostError("repository paths overlap");
-      node.set(parts.at(-1)!, tree.stdout.trim());
-    }
-    await this.#marker("preparing", undefined, "cache");
-    await writeAt(join(this.worktree, ".git"), ["objects", "info", "alternates"], this.#cacheObjects.map(path => `${path}\n`).join(""));
-    const baselineTree = await this.#composeTree(root);
-    const long = { timeoutMs: CHECKOUT_TIMEOUT_MS };
-    await this.#git(["read-tree", baselineTree], undefined, long);
-    await this.#git(["checkout-index", "--all", "--index"], undefined, long);
-    for (const name of (await readdir(this.worktree)).sort()) {
-      if (name !== ".git") await syncTree(join(this.worktree, name), repositoryLimits.checkoutEntries + 1024, repositoryLimits.checkoutBytes, true);
-    }
-    await syncPath(this.worktree);
-    const baseline = (await this.#git(["commit-tree", baselineTree, "-m", "Initialize pinned repository snapshots"])).stdout.trim();
-    await this.#git(["update-ref", "HEAD", baseline]);
-    for (const repository of this.#repositories) {
-      const ref = pinnedRef(repository.path);
-      if (ref) await this.#git(["update-ref", ref, repository.commit]);
-    }
-    await syncTree(join(this.worktree, ".git"), 4096, 256 * repositoryLimits.checkoutEntries + 64 * 1024 * 1024);
-    await this.#marker("ready", baseline, "cache");
-  }
-
-  async #composeTree(node: TreeNode): Promise<string> {
-    const lines: string[] = [];
-    for (const [name, value] of [...node].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
-      lines.push(`040000 tree ${typeof value === "string" ? value : await this.#composeTree(value)}\t${name}\n`);
-    }
-    const tree = (await this.#git(["mktree"], lines.join(""))).stdout.trim();
-    if (!OID.test(tree)) throw hostError("repository baseline tree could not be written");
-    return tree;
-  }
-
-  async #materialize(archives: readonly Buffer[]): Promise<void> {
-    if ((await this.#cacheState()) !== "absent") return;
-    const prepared: { destination: string[]; files: ArchiveFile[]; nodes: Map<string, ArchiveNode> }[] = [];
-    let expanded = 0;
-    let entries = 0;
-    for (const [index, repository] of this.#repositories.entries()) {
-      const data = expandArchive(archives[index]!, repositoryLimits.expandedBytes - expanded);
-      expanded += data.length;
-      const parsed = parseArchive(data, repositoryLimits.entries - entries, repository.path);
-      // Symlink copies occupy disk too; they count against the same aggregate bound.
-      expanded += parsed.copied;
-      if (expanded > repositoryLimits.expandedBytes) throw hostError("repository archives exceed expanded size limit");
-      entries += parsed.count;
-      if (entries > repositoryLimits.entries) throw hostError("repository archives have too many entries");
-      prepared.push({ destination: repository.path.split("/"), files: parsed.files, nodes: parsed.nodes });
-    }
-    // Validate every archive before the first filesystem change. Thereafter a
-    // durable preparing marker makes interruption fail closed, never reset edits.
-    await this.#marker("preparing");
-    const stage = join(this.worktree, `.repository-stage-${randomUUID().replaceAll("-", "")}`);
-    await mkdir(stage, { mode: 0o700 });
-    for (const { destination, files, nodes } of prepared) {
-      const root = await directoryAt(stage, destination, true);
-      const directories = [...nodes].filter(([, kind]) => kind === "directory").map(([key]) => key.split("/"))
-        .sort((a, b) => a.length - b.length || a.join("/").localeCompare(b.join("/")));
-      for (const path of directories) await directoryAt(root, path, true);
-      for (const file of files) {
-        const parent = await directoryAt(root, file.path.slice(0, -1), true);
-        const handle = await open(join(parent, file.path.at(-1)!), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, file.mode);
-        try { await handle.writeFile(file.body); } finally { await handle.close(); }
-      }
-    }
-    await syncTree(stage, repositoryLimits.entries + 2 * this.#repositories.length, repositoryLimits.expandedBytes);
-    for (const owner of await readdir(stage)) {
-      // Serialized operations make this check-then-rename a no-replace promotion.
-      if (await exists(join(this.worktree, owner))) throw hostError("repository destination cannot be promoted");
-      await rename(join(stage, owner), join(this.worktree, owner));
-    }
-    await rmdir(stage);
-    await syncPath(this.worktree);
-    await this.#git(["add", "--force", "--all", "--", "."]);
-    await this.#git(["commit", "--quiet", "--allow-empty", "--no-verify", "--no-gpg-sign", "-m", "Initialize pinned repository snapshots"]);
-    const baseline = (await this.#git(["rev-parse", "--verify", "HEAD"])).stdout.trim();
-    // Loose blobs and trees add at most two objects per imported node, plus Git bookkeeping.
-    await syncTree(join(this.worktree, ".git"), 2 * repositoryLimits.entries + 1024,
-      4 * repositoryLimits.expandedBytes + 1024 * repositoryLimits.entries);
-    await this.#marker("ready", baseline);
   }
 
   #gitArgs(args: string[]): string[] {
@@ -804,13 +367,6 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-function canonicalJson(value: unknown): string {
-  const sorted = (item: unknown): unknown => Array.isArray(item) ? item.map(sorted)
-    : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, entry]) => [key, sorted(entry)]))
-    : item;
-  return JSON.stringify(sorted(value));
-}
-
 /** Walks real directories only: a symlinked or non-directory component is refused. */
 async function directoryAt(root: string, parts: readonly string[], create = false): Promise<string> {
   let current = root;
@@ -885,254 +441,4 @@ async function writeAt(root: string, parts: readonly string[], content: string):
 async function syncPath(path: string): Promise<void> {
   const handle = await open(path, DIRECTORY_FLAGS);
   try { await handle.sync(); } finally { await handle.close(); }
-}
-
-/** `refs/remotes/<path>/pinned` names a pinned commit for the agent, when `<path>` is also a valid ref name. */
-function pinnedRef(path: string): string | null {
-  return path.split("/").every(part => /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(part) && !part.endsWith(".") && !part.endsWith(".lock") && !part.includes(".."))
-    ? `refs/remotes/${path}/pinned` : null;
-}
-
-/**
- * Flushes every regular file and directory beneath root, refusing filesystem crossings and, unless `links` is set,
- * symlinks. Allowed symlinks are never followed; their parent directory's flush makes them durable.
- */
-async function syncTree(root: string, entryLimit: number, byteLimit: number, links = false): Promise<void> {
-  const device = (await lstat(root)).dev;
-  let entries = 0;
-  let size = 0;
-  const visit = async (directory: string, depth: number): Promise<void> => {
-    for (const name of await readdir(directory)) {
-      entries += 1;
-      if (entries > entryLimit || depth >= 64) throw hostError("repository durability traversal limit exceeded");
-      const path = join(directory, name);
-      const info = await lstat(path);
-      if (info.dev !== device) throw hostError("repository durability entry crosses a filesystem");
-      if (info.isDirectory()) {
-        await visit(path, depth + 1);
-        continue;
-      }
-      if (links && info.isSymbolicLink()) continue;
-      regular(info);
-      size += info.size;
-      if (size > byteLimit) throw hostError("repository durability byte limit exceeded");
-      const handle = await open(path, FILE_FLAGS);
-      try { await handle.sync(); } finally { await handle.close(); }
-    }
-    await syncPath(directory);
-  };
-  await visit(root, 0);
-}
-
-/** Exactly one gzip member, bounded before any tar parsing; trailing or concatenated data is refused. */
-function expandArchive(packed: Buffer, budget: number): Buffer {
-  if (!packed.length || packed.length > repositoryLimits.archiveBytes) throw hostError("repository archive exceeds compressed size limit");
-  if (packed.length < 18 || packed[0] !== 0x1f || packed[1] !== 0x8b || packed[2] !== 8 || (packed[3]! & 0xe0)) {
-    throw hostError("invalid repository gzip archive");
-  }
-  const flags = packed[3]!;
-  let offset = 10;
-  const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-  if (flags & 4) offset += 2 + view.getUint16(offset, true);
-  for (const flag of [8, 16]) {
-    if (!(flags & flag)) continue;
-    const end = packed.indexOf(0, offset);
-    if (end < 0) throw hostError("invalid repository gzip archive");
-    offset = end + 1;
-  }
-  if (flags & 2) offset += 2;
-  if (offset > packed.length - 8) throw hostError("invalid repository gzip archive");
-  let inflated: { buffer: Buffer; engine: { bytesWritten: number } };
-  try {
-    // Node returns { buffer, engine } when info is set; its typings only describe the Buffer form.
-    const result: unknown = inflateRawSync(packed.subarray(offset), { maxOutputLength: Math.max(1, budget + 1), info: true });
-    inflated = result as { buffer: Buffer; engine: { bytesWritten: number } };
-  } catch (error) {
-    throw hostError(errorCode(error) === "ERR_BUFFER_TOO_LARGE" ? "repository archives exceed expanded size limit" : "incomplete or corrupt repository gzip archive");
-  }
-  const data = inflated.buffer;
-  if (data.length > budget) throw hostError("repository archives exceed expanded size limit");
-  const trailer = packed.subarray(offset + inflated.engine.bytesWritten);
-  if (trailer.length !== 8 || view.getUint32(packed.length - 8, true) !== crc32(data) || view.getUint32(packed.length - 4, true) !== data.length % 2 ** 32) {
-    throw hostError("incomplete or concatenated repository gzip archive");
-  }
-  return data;
-}
-
-function archiveParts(value: string, directory = false): string[] {
-  const trimmed = directory && value.endsWith("/") ? value.slice(0, -1) : value;
-  if (!trimmed || Buffer.byteLength(trimmed) > 1024 || trimmed.startsWith("/") || trimmed.includes("\\")) throw hostError("invalid repository archive path");
-  const parts = trimmed.split("/");
-  if (parts.length > 64 || parts.some((part) => ["", ".", ".."].includes(part) || Buffer.byteLength(part) > 255)) {
-    throw hostError("repository archive traversal or depth limit");
-  }
-  if (/[\x00-\x1f\x7f]/.test(trimmed) || parts.some((part) => part.includes(":"))) throw hostError("invalid repository archive path");
-  if (parts.some((part) => part.toLowerCase() === ".git")) throw hostError("repository archive contains reserved Git or identity files");
-  return parts;
-}
-
-function tarNumber(raw: Buffer): number {
-  const value = new TextDecoder("latin1").decode(raw).replace(/[\0 ]+$/, "").replace(/^ +/, "");
-  if (!value) return 0;
-  if (!/^[0-7]+$/.test(value)) throw hostError("unsupported repository tar numeric field");
-  return parseInt(value, 8);
-}
-
-function tarText(raw: Buffer): string {
-  const end = raw.indexOf(0);
-  if (end >= 0 && raw.subarray(end).some((byte) => byte !== 0)) throw hostError("invalid repository tar name padding");
-  return new TextDecoder("utf-8", { fatal: true }).decode(end >= 0 ? raw.subarray(0, end) : raw);
-}
-
-function paxFields(data: Buffer, global: boolean): Map<string, string> {
-  const result = new Map<string, string>();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.subarray(offset, Math.min(data.length, offset + 12)).indexOf(0x20);
-    const length = space < 0 ? "" : new TextDecoder("latin1").decode(data.subarray(offset, offset + space));
-    if (space < 0 || !/^[1-9][0-9]*$/.test(length)) throw hostError("invalid repository PAX length");
-    const end = offset + Number(length);
-    const valueStart = offset + space + 1;
-    if (end > data.length || end <= valueStart + 1 || data[end - 1] !== 0x0a) throw hostError("incomplete repository PAX record");
-    const record = data.subarray(valueStart, end - 1);
-    const equals = record.indexOf(0x3d);
-    const key = equals < 0 ? "" : decoder.decode(record.subarray(0, equals));
-    if (equals < 0 || result.has(key)) throw hostError("duplicate or invalid repository PAX key");
-    const value = decoder.decode(record.subarray(equals + 1));
-    // GitHub emits a global commit comment and may use POSIX path metadata.
-    // Size overrides, sparse maps, linkpaths and vendor extensions are unsafe.
-    if (!["comment", "mtime", "atime", "ctime", "uid", "gid", "uname", "gname", "path"].includes(key)) throw hostError("unsupported repository PAX metadata");
-    if (key === "path") {
-      if (global) throw hostError("global repository PAX path is not supported");
-      archiveParts(value, true);
-    }
-    result.set(key, value);
-    offset = end;
-  }
-  return result;
-}
-
-/** Symlinks resolve lexically inside their repository; ".." may never climb above its root. */
-function linkTarget(path: readonly string[], link: string): string[] {
-  if (!link || link.startsWith("/") || link.includes("\\") || /[\x00-\x1f\x7f]/.test(link)) throw hostError("repository symlink target must be a relative path");
-  const parts = path.slice(0, -1);
-  for (const part of link.split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") {
-      if (!parts.length) throw hostError("repository symlink escapes its repository");
-      parts.pop();
-    } else parts.push(part);
-  }
-  if (!parts.length) throw hostError("repository symlink escapes its repository");
-  return parts;
-}
-
-function parseArchive(data: Buffer, budget: number, destination: string): { files: ArchiveFile[]; nodes: Map<string, ArchiveNode>; count: number; copied: number } {
-  if (data.length % 512) throw hostError("incomplete repository tar archive");
-  let offset = 0;
-  let entries = 0;
-  let prefix: string | undefined;
-  let pending: Map<string, string> | undefined;
-  let ended = false;
-  const explicit = new Set<string>();
-  const nodes = new Map<string, ArchiveNode>();
-  const files: ArchiveFile[] = [];
-  const links = new Map<string, { path: string[]; link: string }>();
-  while (offset < data.length) {
-    const header = data.subarray(offset, offset + 512);
-    offset += 512;
-    if (header.every((byte) => byte === 0)) {
-      if (pending || offset + 512 > data.length || data.subarray(offset).some((byte) => byte !== 0)) throw hostError("incomplete repository tar terminator");
-      ended = true;
-      break;
-    }
-    entries += 1;
-    if (entries > budget) throw hostError("repository archives have too many entries");
-    const sum = header.subarray(0, 148).reduce((total, byte) => total + byte, 0) + 8 * 32 + header.subarray(156).reduce((total, byte) => total + byte, 0);
-    if (tarNumber(header.subarray(148, 156)) !== sum) throw hostError("invalid repository tar checksum");
-    const magic = new TextDecoder("latin1").decode(header.subarray(257, 263));
-    if (magic !== "ustar\0" && magic !== "ustar ") throw hostError("unsupported repository tar format");
-    let name = tarText(header.subarray(0, 100));
-    if (magic === "ustar\0") {
-      const parent = tarText(header.subarray(345, 500));
-      if (parent) name = `${parent}/${name}`;
-    }
-    const kind = String.fromCharCode(header[156]!);
-    const size = tarNumber(header.subarray(124, 136));
-    const padded = Math.ceil(size / 512) * 512;
-    if (offset + padded > data.length) throw hostError("incomplete repository tar entry");
-    const body = data.subarray(offset, offset + size);
-    offset += padded;
-    archiveParts(name, kind === "5");
-    if (kind === "x" || kind === "g") {
-      if (pending) throw hostError("conflicting repository PAX headers");
-      const metadata = paxFields(body, kind === "g");
-      if (kind === "x") pending = metadata;
-      continue;
-    }
-    let link = "";
-    if (kind === "2") {
-      // Symlinks become copies of an in-repository regular file; no link is ever created.
-      if (size) throw hostError("repository symlink entries cannot carry data");
-      link = tarText(header.subarray(157, 257));
-    } else if (!["0", "\0", "5"].includes(kind) || header.subarray(157, 257).some((byte) => byte !== 0)) {
-      throw hostError("repository archive links and special files are forbidden");
-    }
-    if (pending) {
-      name = pending.get("path") ?? name;
-      pending = undefined;
-    }
-    const parts = archiveParts(name, kind === "5");
-    prefix ??= parts[0];
-    if (parts[0] !== prefix) throw hostError("repository archive must have one top-level directory");
-    const path = parts.slice(1);
-    if (path.length + 2 > 64 || Buffer.byteLength([destination, ...path].join("/")) > 1024) throw hostError("repository destination exceeds path or depth limit");
-    if (!path.length && kind !== "5") throw hostError("repository archive root must be a directory");
-    const key = path.join("/");
-    if (explicit.has(key)) throw hostError("duplicate repository archive entry");
-    explicit.add(key);
-    for (let depth = 1; depth < path.length; depth++) {
-      const parent = path.slice(0, depth).join("/");
-      if (nodes.get(parent) === "file") throw hostError("conflicting repository archive paths");
-      nodes.set(parent, "directory");
-    }
-    if (kind === "5") {
-      if (size || nodes.get(key) === "file") throw hostError("conflicting repository directory entry");
-      if (path.length) nodes.set(key, "directory");
-    } else if (kind === "2") {
-      if (nodes.has(key)) throw hostError("conflicting repository archive paths");
-      nodes.set(key, "file");
-      links.set(key, { path, link });
-    } else {
-      if (size > repositoryLimits.fileBytes) throw hostError("repository file exceeds size limit");
-      if (nodes.has(key)) throw hostError("conflicting repository archive paths");
-      nodes.set(key, "file");
-      files.push({ path, body, mode: tarNumber(header.subarray(100, 108)) & 0o111 ? 0o700 : 0o600 });
-    }
-    if (nodes.size > repositoryLimits.entries) throw hostError("repository archive has too many filesystem entries");
-  }
-  if (!ended || prefix === undefined) throw hostError("incomplete or empty repository tar archive");
-  const regular = new Map(files.map((file) => [file.path.join("/"), file]));
-  let copied = 0;
-  for (const { path, link } of links.values()) {
-    let target = linkTarget(path, link);
-    for (let hop = 0; hop < 8 && links.has(target.join("/")); hop++) {
-      const next = links.get(target.join("/"))!;
-      target = linkTarget(next.path, next.link);
-    }
-    const file = regular.get(target.join("/"));
-    if (!file) throw hostError("repository symlink must point to a regular file in its repository");
-    copied += file.body.length;
-    files.push({ path, body: file.body, mode: file.mode });
-  }
-  return { files, nodes, count: Math.max(entries, nodes.size), copied };
-}
-
-function splitNul(data: Buffer): Buffer[] {
-  const fields: Buffer[] = [];
-  let start = 0;
-  for (let end = data.indexOf(0); end >= 0; start = end + 1, end = data.indexOf(0, start)) fields.push(data.subarray(start, end));
-  if (start < data.length) fields.push(data.subarray(start));
-  return fields;
 }
