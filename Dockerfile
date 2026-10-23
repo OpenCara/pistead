@@ -3,10 +3,10 @@
 # the SQLite database (override with DATABASE_URL). Session backups are off unless STORAGE_URL names
 # a store, such as file:///data/backups in the same volume.
 
-ARG NODE_IMAGE=node:24-bookworm-slim
+ARG NODE_IMAGE=node:26-bookworm-slim
 FROM ${NODE_IMAGE} AS base
-ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
+# Node 25+ images no longer ship corepack, so pnpm comes from npm at the version packageManager names.
+RUN npm install -g pnpm@10.32.1 && npm cache clean --force
 WORKDIR /app
 
 FROM base AS build
