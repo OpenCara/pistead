@@ -1,14 +1,28 @@
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { AccessMode, ThinkingLevel } from "../../../packages/shared/src/types";
 import {
-  accessLabels, autoApproveWarning, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels, selectModel as pickModel,
-  type ChatSelection,
+  accessLabels, autoApproveWarning, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels,
+  parseChatPreference, selectModel as pickModel, type ChatPreference, type ChatSelection,
 } from "../../../packages/client/src/chat-options";
 import { Icon, type IconName } from "./icons";
 import { Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
-export { accessUnavailable, chatOptionsBody, initialSelection, type ChatSelection } from "../../../packages/client/src/chat-options";
+export { accessUnavailable, chatOptionsBody, initialSelection, preferredSelection, type ChatPreference, type ChatSelection } from "../../../packages/client/src/chat-options";
+
+/** The model and reasoning last chatted with, in this browser; new chats start from them. */
+const LAST_CHAT_KEY = "pistead.lastChat";
+
+export function readChatPreference(): ChatPreference | undefined {
+  try { return parseChatPreference(localStorage.getItem(LAST_CHAT_KEY)); } catch { return undefined; }
+}
+
+/** Remembers the model and reasoning a message just went to `host` with. */
+export function rememberChat(host: ConnectorInfo | undefined, selection: ChatSelection) {
+  const preference = chatPreference(host, selection);
+  if (!preference) return;
+  try { localStorage.setItem(LAST_CHAT_KEY, JSON.stringify(preference)); } catch { /* Private mode: the choice is simply not remembered. */ }
+}
 
 const accessIcons: Record<AccessMode, IconName> = { read: "eye", approval: "shield", auto: "alert" };
 

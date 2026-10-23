@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, 
 import type { AgentVersion, ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { ChatOptionsBar, chatOptionsBody, type ChatSelection } from "./chat-options";
+import { ChatOptionsBar, chatOptionsBody, preferredSelection, readChatPreference, rememberChat, type ChatSelection } from "./chat-options";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
@@ -78,6 +78,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   const [handoff] = useState(() => readStorage(() => sessionStorage, HANDOFF_KEY));
   const [lastStart] = useState(() => readStorage(() => localStorage, LAST_START_KEY));
+  const [lastChat] = useState(readChatPreference);
   useEffect(() => { writeStorage(() => sessionStorage, HANDOFF_KEY, null); }, []);
 
   const [choice, setChoice] = useState("");
@@ -116,14 +117,13 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const host = startKey.startsWith("host:") ? hosts.find(item => item.id === startKey.slice(5)) : connectors?.find(item => item.id === agentModel?.connectorId);
   const hostModel = (wanted?: { provider: string; modelId: string }) => wanted && host && host.models.some(item => sameModel(item, wanted))
     ? modelList?.find(item => item.connectorId === host.id && sameModel(item, wanted)) : undefined;
-  // Picks belong to one start choice; switching starts from its model again: the agent's, else the model last
-  // started on this host, else the host's first model.
+  // Picks belong to one start choice; switching starts from its model again: the agent's, else the model last chatted
+  // with when this host offers it, else the model last started on this host, else the host's first model. Reasoning
+  // starts at the level last chatted with where the model supports it; an agent starts at its model's own level.
   const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
-  const initialModel = version ? agentModel : hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
-  // The level the host's Pi starts that model at, as the session itself will.
-  const initialLevel = initialModel && host?.models.find(item => sameModel(item, initialModel))?.thinkingLevel;
+  const fallbackModel = version ? agentModel : hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
   const selection: ChatSelection = chat?.key === startKey ? chat.value
-    : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "approval" };
+    : preferredSelection(host, version ? undefined : lastChat, fallbackModel, item => Boolean(hostModel(item)));
   // An agent pins its own model; without one, the session starts on the model picked here.
   const model = version ? agentModel : hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);
@@ -154,6 +154,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
       const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, ...from, title: deriveTitle(content, version?.name ?? model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
       const sessionId = result.session.id;
       writeStorage(() => localStorage, LAST_START_KEY, version ? `agent:${version.id}` : `model:${model.id}`);
+      rememberChat(host, selection);
       if (message) {
         try {
           await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}) } });

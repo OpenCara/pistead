@@ -4,7 +4,7 @@ import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResul
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, rememberChat, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -351,6 +351,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
+      // The next new chat starts from the model and reasoning this one went with.
+      if (options) rememberChat(host, selection);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
       request.current = null;
