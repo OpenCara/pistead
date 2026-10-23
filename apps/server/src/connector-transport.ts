@@ -46,9 +46,10 @@ export function connectorPath(action: RunnerAction, sessionId: string, suffix = 
 }
 
 export async function currentConnector(env: Env, connectorId: string): Promise<ConnectorConnection> {
-  const row = await env.DB.query<ConnectorConnection>('SELECT id, credential_hash, connection_hash, revoked_at FROM connectors WHERE id = ?')
-    .bind(connectorId).first();
-  if (!row || row.revoked_at) fail(403, 'connector_revoked', 'The connector is no longer authorized.');
+  // A suspended owner's host stays paired but is refused like a revoked one until the account is restored.
+  const row = await env.DB.query<ConnectorConnection & { suspended_at: string | null }>(`SELECT c.id, c.credential_hash, c.connection_hash, c.revoked_at,
+    u.suspended_at FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.id = ?`).bind(connectorId).first();
+  if (!row || row.revoked_at || row.suspended_at) fail(403, 'connector_revoked', 'The connector is no longer authorized.');
   return row;
 }
 

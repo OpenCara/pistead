@@ -454,6 +454,22 @@ test('revoke is namespace scoped, requires database revocation and drains active
   assert.equal(await f.hub.status('connector', 1000), false);
 });
 
+test('a suspended owner\'s connection closes without revoking the host, and it can\'t connect again', async t => {
+  const f = await fixture(t);
+  const pending = f.rpc(await f.envelope());
+  await f.initial.socket.nextRequest();
+  await f.exec("UPDATE users SET suspended_at = 'suspended' WHERE id = 'host'");
+  assert.equal(await f.hub.status('connector', 1000), false);
+  await f.hub.revoke('connector');
+  assert.equal((await pending).status, 403);
+  assert.deepEqual(await f.initial.socket.closed, { code: 1008, reason: 'Connector revoked' });
+  assert.equal(await f.hub.status('connector', 1000), false);
+  await assert.rejects(f.connect(), { status: 403 });
+  await f.exec("UPDATE users SET suspended_at = NULL WHERE id = 'host'");
+  await f.connect();
+  assert.equal(await f.hub.status('connector', 1000), true);
+});
+
 test('status reports false once the database generation no longer matches or the lookup times out', async t => {
   const f = await fixture(t);
   assert.equal(await f.hub.status('connector', 1000), true);
