@@ -4,7 +4,7 @@ import type { RunnerBinding } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { RestoreInput } from '../../../packages/shared/src/connector.js';
 import type { AppContext, SessionRow, WorkerEnv } from './types.js';
-import { auditStatement, runnerSessionRecord, sessionAccess, sessionRecord } from './db.js';
+import { auditStatement, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, text } from './http.js';
 import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
@@ -70,6 +70,8 @@ export function registerRestoreRoutes(app: Hono<WorkerEnv>): void {
     if (!access) fail(404, 'not_found', 'Source session not found.');
     if (access.row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the original session owner can restore its backups.');
     const source = await sourceAuthority(c, sourceId, ownerId);
+    // A session that pinned its repositories keeps its backups for download, not for restoring.
+    requireUnfrozen(source);
     let job = await c.env.DB.query<RestoreJob>('SELECT * FROM restore_jobs WHERE owner_id = ? AND request_id = ?')
       .bind(ownerId, requestId).first();
     let created = false;

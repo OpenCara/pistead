@@ -6,7 +6,7 @@ import { ChatOptionsBar, chatOptionsBody, type ChatSelection } from "./chat-opti
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
-import { RepositorySnapshotPolicy, useWorkspaceRepositories } from "./repositories";
+import { RepositoryClonePolicy, useWorkspaceRepositories } from "./repositories";
 import { href, navigate } from "./router";
 import { Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, IdentityBadge, InfoTip, LinkButton, Loading, PageLoading, useAction, useResource } from "./ui";
 import { usernameWithId } from "../../../packages/client/src/usernames";
@@ -264,8 +264,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
             <InfoTip label="Repositories for this session">
               <div className="stack">
                 <ul>{repositories.map(repository => <li key={repository.id}><strong>{repository.fullName}</strong> <span className="muted">at <code>{repository.ref}</code></span></li>)}</ul>
-                <p>Repository access uses your connected Git account as session owner, not the host owner's or an admin's. On a sandboxed host that can run your shell commands, the agent clones repositories with plain Git as it works; elsewhere each ref is pinned to a commit before the session runs.</p>
-                <RepositorySnapshotPolicy />
+                <p>Repository access uses your connected Git account as session owner, not the host owner's or an admin's. The agent clones the repositories it needs with Git as it works; where it can't run shell commands, the session starts with an empty worktree.</p>
+                <RepositoryClonePolicy />
               </div>
             </InfoTip>
             <Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh repositories" title="Refresh repositories" onClick={repos.refresh} />

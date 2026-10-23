@@ -2,14 +2,12 @@ import { gitProviderHosts, gitProviderNames, repositoryLimits, type GitAccount, 
 import { segment } from "./api";
 import { useResource } from "./ui";
 
-const mib = (bytes: number) => bytes / 1024 / 1024;
-
-/** Condensed snapshot, access and limit facts for an `info` tip about repositories. */
-export function RepositorySnapshotPolicy() {
+/** Condensed clone, access and host facts for an `info` tip about repositories. */
+export function RepositoryClonePolicy() {
   return <div className="stack">
-    <p>Each new session pins exact commits, resolved with its owner's connected Git account, into a private per-session snapshot (no Git history, submodules or LFS), one folder per repository (<code>owner/repo</code> for GitHub, under the host name for other providers). Existing sessions never follow later changes.</p>
+    <p>Each session starts with an empty worktree, and its agent clones the workspace repositories it needs with Git, through the session's relay: reads use the session owner's connected Git account and pushes go only to the session's own branches. On a host without a sandbox, the host owner's sessions clone with the host's own Git. Sessions created before sessions cloned keep their pinned snapshots, read-only.</p>
     <p>Binding a repository grants teammates no access to your Git accounts. Tokens stay on the server; only a push with your own account, where a workspace's push access uses it, sends yours to your own host. The operator of the host running a session can see its files and prompts, including private source.</p>
-    <p className="muted small">Limits: {repositoryLimits.repositories} repositories; {mib(repositoryLimits.archiveBytes)} MiB compressed per archive, {mib(repositoryLimits.expandedBytes)} MiB expanded per session, {mib(repositoryLimits.fileBytes)} MiB per file, {repositoryLimits.entries.toLocaleString()} entries. Exceeding a limit fails rather than skipping files.</p>
+    <p className="muted small">Limit: {repositoryLimits.repositories} repositories per workspace.</p>
   </div>;
 }
 

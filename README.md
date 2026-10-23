@@ -3,7 +3,7 @@
 Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machines and work on them together with your team. Pistead is a self-hosted control plane: a web app (with iPhone, iPad and Mac apps), a Node.js server, and the `pistead` connector that each host runs to offer its local Pi to a workspace.
 
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
-- **Isolated, pinned work.** Each session works on private snapshots of the workspace's repositories, pinned to exact commits, in a sandbox without network access.
+- **Isolated work.** Each session clones the workspace's repositories into its own sandbox, whose only way out is a proxy that reads them with the session owner's account and follows the workspace's network policy.
 - **People decide.** Shell commands, commits and pushes wait for an approval unless the session owner auto-approves a message; GitHub comments and merges always wait.
 - **Built for teams.** Teammates follow sessions live, ask questions on the side, send messages and approve work, with the permissions each session's owner grants them.
 
@@ -22,7 +22,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
   - [Collaborating on a session](#collaborating-on-a-session)
   - [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)
   - [GitHub issues and pull requests](#github-issues-and-pull-requests)
-  - [Host commands and repinning](#host-commands-and-repinning)
+  - [Host commands](#host-commands)
   - [Backups, restores and exports](#backups-restores-and-exports)
   - [Moving a session to another host](#moving-a-session-to-another-host)
   - [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)
@@ -37,7 +37,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
                                               (control plane)                        (a member's host)
 ```
 
-- The **server** keeps workspaces, members, agents, session records, permissions and approvals. It resolves repository pins and downloads snapshots with the session owner's Git account, issues short-lived push credentials, and acts on GitHub for session owners. It never runs an agent itself.
+- The **server** keeps workspaces, members, agents, session records, permissions and approvals. It relays sessions' Git reads with the session owner's Git account and their session-branch pushes with the workspace's push identity, issues short-lived push credentials, and acts on GitHub for session owners. It never runs an agent itself.
 - A **host** runs the agents. Pi's configuration and model credentials, each session's files and its conversation stay there; the server relays every request to it. While a host is offline, its sessions' conversations can't load and no work runs on them.
 - Everyone watching a session shares the server's reads of it, about one a second, and after the first read the host, the server and the apps send each other only what changed in the conversation.
 - The web app is the complete client; the Mac app shows it in its own window, and the iPhone and iPad app covers sessions (see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)). They all call the same API.
@@ -48,9 +48,9 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
 | Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It is private to the member who paired it until they share it with a workspace. |
 | Model | A Pi model a host offers. Its credentials never leave the host. |
 | Agent | Optional reusable instructions, a model and the tools it may use without asking. Private to its author until published to a workspace. |
-| Session | One agent conversation on one host, over private snapshots of the workspace's repositories pinned when it starts. It always runs as its owner. |
+| Session | One agent conversation on one host, in its own worktree where the agent clones the workspace's repositories. It always runs as its owner. |
 | Shared message, side ask | Shared messages drive the session's work; side asks are read-only questions in separate threads. |
-| Approval | A card for one exact operation (command, commit, push, merge, comment, host command or repin), which runs only once someone allowed to decide it approves it. |
+| Approval | A card for one exact operation (command, push, merge, comment or host command), which runs only once someone allowed to decide it approves it. |
 | Permission request | A card asking the session owner to let a tool call do more than the session allows. |
 
 ## Quick start
@@ -121,18 +121,16 @@ Connect the accounts that can read your repositories under **Settings → Profil
 
 Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
 
-How sessions use them depends on the host. On a sandboxed host with an up-to-date connector that can run the session owner's shell commands (the host's owner's own sessions, or any session when the host has [resource limits](#the-sandbox)), sessions **clone on demand**:
+Sessions **clone on demand**: every new session starts with an empty worktree and pins nothing.
 
-- The session starts with an empty worktree and nothing pinned. The agent clones the repositories it needs with plain Git (`git clone https://github.com/acme/app`), and fetches, switches and creates branches as usual. Git reaches the workspace's repositories through the session's [egress proxy](#network-access), which reads them with the **session owner's own** account; the account never reaches the host.
+- On a sandboxed host, the agent clones the repositories it needs with plain Git (`git clone https://github.com/acme/app`), and fetches, switches and creates branches as usual. Git reaches the workspace's repositories through the session's [egress proxy](#network-access), which reads them with the **session owner's own** account; the account never reaches the host.
 - The agent commits with Git and pushes its work to the session's own branch, `pistead/<session-id>`, with plain `git push`, without approval. Other branches, and pull requests, go through `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
+- On a host its owner runs [without the sandbox](#running-without-the-sandbox), the agent clones, commits and pushes with the host's own Git, network and credentials (its Git credential helpers, such as `gh auth setup-git`), each command with approval. Such a session can't be backed up once it has a clone in its worktree.
+- Cloning needs shell commands: an agent without `bash` (a session started from a model has it), or another member's session on a host without [resource limits](#the-sandbox), works in an empty worktree, and the session says so.
 - Removing a repository from the workspace stops new reads and pushes of it at once, in running sessions too.
+- The host needs a current connector: one from before sessions cloned their repositories can't start new sessions.
 
-Elsewhere, on older connectors, and for agents without `bash` (a session started from a model has it), sessions **pin** their repositories:
-
-- Every new session pins each bound ref to an exact commit, resolved with the **session owner's own** account for that provider. Everyone who starts sessions needs a connected account that can read the workspace's repositories; binding a repository never lends anyone your accounts.
-- The host gets a private snapshot of each repository, one folder per repository in the session's worktree: `owner/repo` for GitHub, under the host name for other providers. Snapshots have no Git history, submodules or LFS files, and the session starts from a single snapshot commit. Existing sessions never follow later changes in the repository or the workspace.
-- Limits: 5 repositories per workspace; 8 MiB compressed per repository archive, 32 MiB expanded per session, 8 MiB per file and 10,000 entries. A snapshot over a limit fails rather than skipping files. A host with the [repository cache](#repository-cache-preview) checks out full history instead.
-- Removing a repository affects new sessions only: existing sessions keep their snapshots, but can no longer push to it.
+Sessions started before this change pinned their repositories to exact commits. They stay **read-only**: their conversation, approvals, backups (to download) and exports remain, but they no longer run messages, approvals, backups, restores or moves. Start a new session to continue their work.
 
 ### Hosts
 
@@ -222,19 +220,16 @@ Pistead labels such a host **Unsandboxed** to everyone who can see it.
 
 #### Repository cache (preview)
 
-By default a host downloads each pinned repository as an archive (within the limits above), and the session sees a single snapshot commit, and each session that clones on demand downloads its clones itself. With `--repo-cache` (connector 0.8.0 or newer), the connector keeps a full clone of each repository on the host, checks pinned sessions out of it, and lets clones borrow from it:
+By default each session downloads its clones itself. With `--repo-cache` (connector 0.8.0 or newer), the connector keeps a full clone of each repository on the host and lets sessions' clones borrow from it:
 
 ```sh
 npx pistead@latest connect --repo-cache                            # one cache for every session on this host
 npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
 ```
 
-- **Sessions that clone on demand:** `git clone` of a workspace repository first brings the host's copy up to date through Pistead, with the session owner's own account like every other read, then borrows its objects (`--reference-if-able`) instead of downloading and storing them again. A clone that doesn't come within 20 seconds goes ahead on its own; clones with `--reference`, `--shared` or `--dissociate` are left alone. A session sees a copy, read-only, only once Pistead has let its owner read the repository, again each time the session is reopened. A copy the session's first command created is visible from its next command on.
-- **Pinned sessions:** the host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead sends no read credential, but checks before each session that its owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
-- The first session waits while a repository is cloned, showing the clone's progress; later sessions fetch only what is new. If the host can't fetch a repository, the session says why and refuses new messages; restart it after fixing the problem.
-- Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
-- `npx pistead@latest cache list` shows each cached repository, its size and how many sessions and pins keep objects in it. `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer than that many days and collects what nothing reaches any more; a clone in such a session loses the objects it borrowed. Pins are kept. Both take `--state-dir`.
-- Still in preview: backups of pinned sessions that use the cache aren't supported yet.
+- `git clone` of a workspace repository first brings the host's copy up to date through Pistead, with the session owner's own account like every other read, then borrows its objects (`--reference-if-able`) instead of downloading and storing them again. A clone that doesn't come within 20 seconds goes ahead on its own; clones with `--reference`, `--shared` or `--dissociate` are left alone. A session sees a copy, read-only, only once Pistead has let its owner read the repository, again each time the session is reopened. A copy the session's first command created is visible from its next command on.
+- Inside the sandbox the cache is read-only.
+- `npx pistead@latest cache list` shows each cached repository, its size and how many sessions keep objects in it. `npx pistead@latest cache prune --older-than 30` forgets sessions idle for longer than that many days and collects what nothing reaches any more; a clone in such a session loses the objects it borrowed. Both take `--state-dir`.
 
 #### Connector options
 
@@ -274,18 +269,15 @@ The tools an agent can use:
 |---|---|---|
 | `identity` | Tells the agent the session owner's identity and `APP_` environment | Nothing |
 | `list_files`, `read_file` | List and read session files; images (PNG, JPEG, GIF, WebP) go to the model as images | Nothing |
-| `git_status` | Local Git status of the session | Nothing |
 | `write_file`, `edit_file` | Write a whole file, or replace exact text in place | Permission in **Read only** messages |
-| `git_commit` | Commit the session's work as its owner | Approval |
 | `bash` | Run a shell command in the sandbox | Approval |
-| `git_push` | Push one repository's session commits to a branch, optionally opening a pull request | Approval |
+| `git_push` | Push a clone's checked-out commit to a branch, optionally opening a pull request | Approval |
 | `github_read` | Read a GitHub issue or pull request | Nothing, during a shared message |
 | `github_comment` | Comment on a GitHub issue or pull request | Approval, always |
 | `github_merge` | Merge a GitHub pull request | Approval, always |
 | `host_bash` | Run a command on the host, outside the sandbox | The host owner's approval |
-| `git_repin` | Start a new session with one repository at another ref | The session owner's approval |
 
-"Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, commits, pushes and repins, and for `host_bash` only on the owner's own host. Side asks offer only the read-only tools.
+"Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands and pushes, and for `host_bash` only on the owner's own host. Side asks offer only the read-only tools.
 
 ### Sessions
 
@@ -298,7 +290,7 @@ Select a workspace in the sidebar (or open **New session** in it):
 - **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only). See [Collaborating on a session](#collaborating-on-a-session).
 - The model, reasoning level and access for the first message (see [Chat options](#chat-options)). The info tips show the host, the model and the repositories the session will pin.
 
-Press Enter to start (Shift+Enter adds a line). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares its snapshots, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).
+Press Enter to start (Shift+Enter adds a line). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares it, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).
 
 #### Shared messages and side asks
 
@@ -325,7 +317,7 @@ Beside the composer you can pick, for each message:
 |---|---|
 | **Read only** | Inspect files; edits, commands and commits ask the session owner first |
 | **Ask before acting** (default) | Edits are automatic; commands, commits, pushes, GitHub comments and merges need approval |
-| **Auto-approve** (session owner only) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host, and repins may create sessions without asking (at most five per message). GitHub comments and merges still need approval. |
+| **Auto-approve** (session owner only) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments and merges still need approval. |
 
 Turning on **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
@@ -337,7 +329,7 @@ The session's menu offers **Copy session ID** and **Open in workspace settings**
 
 The session panel has three tabs:
 
-- **Details**: **Host**, **Repositories** (each pin's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
+- **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
 - **Approvals**: every approval and permission request, pending ones first.
 - **Activity**: the session's audit log, newest 200 entries.
 
@@ -345,15 +337,14 @@ The session panel has three tabs:
 
 #### Approvals
 
-Commands, commits, pushes, GitHub comments and merges, host commands and repins each need an approval: a card above the transcript (and under **Approvals**) that shows the exact operation, such as the command, the commit message, or the repository, branch and commit of a push. **Approve** runs exactly that operation, as the session owner (a host command as the host's OS user); **Deny** drops it.
+Commands, pushes, GitHub comments and merges, and host commands each need an approval: a card above the transcript (and under **Approvals**) that shows the exact operation, such as the command, or the repository, branch and commit of a push. **Approve** runs exactly that operation, as the session owner (a host command as the host's OS user); **Deny** drops it.
 
 | Operation | Who can decide |
 |---|---|
 | Commands, commits, pushes, GitHub comments, merges | Anyone with approve permission on the session (the owner always has it) |
 | Host commands | Only the host's owner, who also needs approve permission on the session |
-| Repins | Only the session owner |
 
-The agent's tool call waits for the decision, and its message waits with it (connector newer than 0.8.0). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Git commit**, **Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
+The agent's tool call waits for the decision, and its message waits with it (connector newer than 0.8.0). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
 #### Permission requests
 
@@ -373,10 +364,10 @@ The call can wait for the answer until an hour after its message was sent, and t
 | `read` | Viewing the session, its side asks, approvals and activity |
 | `ask` | Sending side asks |
 | `write` | Sending shared messages and requesting operations |
-| `approve` | Deciding approvals (host commands need the host's owner; repins and permission requests, the session owner) |
+| `approve` | Deciding approvals (host commands need the host's owner; permission requests, the session owner) |
 | `manage` | Managing the session's grants |
 
-Only the session's owner can rename, archive or restart it, change its visibility or share link, back it up, restore or export it, use **Auto-approve**, and decide repins and permission requests.
+Only the session's owner can rename, archive or restart it, change its visibility or share link, back it up, restore or export it, use **Auto-approve**, and decide permission requests.
 
 #### Share links
 
@@ -388,10 +379,9 @@ Everything Pistead shows people (transcripts, approvals and their output, in eve
 
 ### Commits, pushes and pull requests
 
-Agents commit as the session owner's Git identity: with Git itself in a session that clones on demand, or with `git_commit` in a session with pinned repositories. With `git_push` (connector 0.5.0 or newer) they push committed work to a branch:
+Agents commit with Git itself, as the session owner's Git identity, and push committed work to a branch:
 
-- In a session that clones on demand, the agent pushes the session's own branch `pistead/<session-id>` with plain `git push`, without approval: Pistead checks, as for `git_push`, that the session owner may push to the repository, and pushes with the workspace's push identity (its own Git credentials on the host can't serve here). For any other branch, `git_push {directory, branch}` pushes a clone's checked-out commit as it is to the workspace repository the clone's `origin` names; if the branch moved, the agent fetches and merges or rebases first. To open a pull request from the session branch, the agent calls `git_push` with that branch and a pull request.
-- In a session with pinned repositories, it pushes one repository's committed session work: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so the branch gets only the session's changes.
+- The agent pushes the session's own branch `pistead/<session-id>` with plain `git push`, without approval: Pistead checks, as for `git_push`, that the session owner may push to the repository, and pushes with the workspace's push identity (its own Git credentials on the host can't serve here). For any other branch, `git_push {directory, branch}` pushes a clone's checked-out commit as it is to the workspace repository the clone's `origin` names; if the branch moved, the agent fetches and merges or rebases first. To open a pull request from the session branch, the agent calls `git_push` with that branch and a pull request.
 - The approval shows the repository, the clone's directory if any, the branch and the exact commit.
 - Pushes are fast-forward only and never forced; a branch that moved elsewhere is refused.
 - The agent can also ask for a pull request, which Pistead opens as the session owner with their connected account.
@@ -425,21 +415,17 @@ Pull requests are opened as the session owner with their connected account eithe
 
 The sandbox has no network, so agents read and act on GitHub through Pistead instead, as the session owner and with their GitHub sign-in, which stays on the server (connector 0.7.0 or newer; github.com only):
 
-- `github_read` reads an issue or pull request of a github.com repository pinned in the session: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. It needs no approval, runs only during a shared message (until an hour after it was sent), and each read is recorded in the session's activity. Treat what it returns as untrusted input.
+- `github_read` reads an issue or pull request of one of the workspace's github.com repositories: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. It needs no approval, runs only during a shared message (until an hour after it was sent), and each read is recorded in the session's activity. Treat what it returns as untrusted input.
 - `github_comment` posts a comment once it's approved.
 - `github_merge` merges a pull request at the exact head commit the agent read, with a merge commit, squash or rebase, once it's approved. If the head moved or GitHub refuses, nothing is merged and the agent gets GitHub's reason.
 
 Both always wait for a human decision, even under **Auto-approve**.
 
-### Host commands and repinning
+### Host commands
 
-Both need connector 0.8.0 or newer.
-
-**Host commands.** When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the **host owner's** approval; on a shared host, they also need approve permission on the session. The session owner's **Auto-approve** skips this only on their own host.
+Host commands need connector 0.8.0 or newer. When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the **host owner's** approval; on a shared host, they also need approve permission on the session. The session owner's **Auto-approve** skips this only on their own host.
 
 Host commands run **outside the sandbox, as the connector's OS user**, in the session's worktree: they can read and change host files and credentials, use the network, and run without CPU, memory, process or disk limits. The agent can change the worktree's files and Git configuration, so builds, package scripts and Git hooks there can run its code on the host, even for a command as harmless-looking as `git status`. Approve a host command only if you would run it yourself in that directory. Commands get the host's `PATH` and `HOME`, not the connector's whole environment, and Bash starts without shell profiles.
-
-**Repinning.** A session that clones on demand doesn't need it: the agent switches branches with `git checkout`. In a session with pinned repositories, to work on another branch, tag or commit, ask the agent to use `git_repin` with the repository's worktree path and the ref, for example `{ "repository": "acme/app", "ref": "feature/next" }`. Once the session owner approves, Pistead creates a **new private session** on the same host with the same agent, that repository resolved to the new ref and the other pins unchanged; open it from the approval card and send a message to start it. Nothing is copied: the source session's changes, commits, conversation, grants and backups stay where they are. Refs resolve with the session owner's Git accounts, and every repository of the source session must still be bound to the workspace.
 
 ### Backups, restores and exports
 

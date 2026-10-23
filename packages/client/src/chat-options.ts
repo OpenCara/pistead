@@ -1,5 +1,5 @@
 import type { ConnectorInfo, LocalModelSummary } from "../../shared/src/connector";
-// Declares the host command and repin capabilities on ConnectorCapabilities.
+// Declares the host command capability on ConnectorCapabilities.
 import type {} from "../../shared/src/host-operations";
 import { thinkingLevels, type AccessMode, type ChatOptions, type SessionView, type ThinkingLevel } from "../../shared/src/types";
 
@@ -25,8 +25,7 @@ export function autoApproveWarning(host: Pick<ConnectorInfo, "name" | "capabilit
   return (unsandboxed
     ? `Commands, commits and pushes the agent writes will run immediately on ${host.name}, an UNSANDBOXED host: commands run directly on the owner's machine with their full user permissions and network access, and no resource limits. Tools outside the agent won't ask either. GitHub comments and merges still need approval.`
     : "Commands, commits and pushes the agent writes will run immediately as you, without asking, as will tools outside the agent and commands on a host without resource limits. GitHub comments and merges still need approval.")
-    + (host.capabilities.hostCommands ? " On your own host, host_bash also runs OUTSIDE the sandbox without asking, with access to your host files, credentials and network. On someone else's host it still needs their approval." : "")
-    + (host.capabilities.gitRepin ? " Repinning may create new private sessions without asking." : "");
+    + (host.capabilities.hostCommands ? " On your own host, host_bash also runs OUTSIDE the sandbox without asking, with access to your host files, credentials and network. On someone else's host it still needs their approval." : "");
 }
 
 export const CONNECTOR_UPDATE_HINT = "Update the host's connector (npx pistead@latest connect) to choose model, reasoning and access";

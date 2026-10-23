@@ -1,8 +1,9 @@
 # Design: sessions that use plain Git through a host egress proxy
 
-Status: phases 1 (the egress proxy and Git relay), 2 (clone sessions), 3 (the host cache for clones) and 4 (session-branch
-pushes, and backups and moves of clone sessions) implemented. Phase 5 below is planned. This replaces the pinned
-snapshot model of [repository-cache.md](repository-cache.md); that document is rewritten in phase 5.
+Status: implemented: phases 1 (the egress proxy and Git relay), 2 (clone sessions), 3 (the host cache for clones), 4
+(session-branch pushes, and backups and moves of clone sessions) and 5 (every session clones; pinned sessions are
+read-only, and the pin machinery is gone). This replaced the pinned snapshot model; the host cache it shares is in
+[repository-cache.md](repository-cache.md).
 
 ## Goal
 
@@ -135,13 +136,13 @@ the insert, but resolves nothing with the owner's accounts. The relay checks the
 
 ## Phase 3: the host cache for clone sessions
 
-Hosts started with `--repo-cache` already keep one bare mirror per repository for pinned sessions
-([repository-cache.md](repository-cache.md)). Clone sessions borrow from the same mirrors, but fill them differently.
+Hosts started with `--repo-cache` keep one bare mirror per repository ([repository-cache.md](repository-cache.md)),
+which pinned sessions were checked out of until phase 5. Clone sessions borrow from the same mirrors.
 
 - **Filled through the relay.** `RepositoryCache.refresh` fetches every branch and tag the remote advertises that the
   mirror lacks, with a `GitRemote` whose `fetch` is `relayFetch`: every read goes through the control plane's relay,
-  with the session owner's own account and the relay's checks. Pinned sessions keep fetching with the host's
-  credentials. Refreshes are serialized per repository with the existing lock, and report progress the same way.
+  with the session owner's own account and the relay's checks. Refreshes are serialized per repository with a lock,
+  and report progress.
 - **Asked for by the clone.** Clone sessions' shell commands get a `git` shim first on `PATH`. For `git clone` of a
   URL, it asks the proxy's `/__pistead/mirror?remote=…` (up to 20 seconds), which maps the URL to a workspace
   repository, refreshes its mirror and answers its path in the sandbox; the shim then adds `--reference-if-able`.
@@ -248,3 +249,23 @@ on the forge. Bundles in the backup keep all of that where backups already go.
 - A clone whose origin no longer serves commits its bundle builds on, not even by commit, fails to restore; its bundle
   is kept for the agent to recover from.
 - Clones of repositories outside the workspace, worktrees and submodules (`.git` files) are not restored automatically.
+
+## Phase 5: every session clones, pinned sessions are read-only
+
+- **New sessions** are all clone sessions (`repository_mode = 'clone'`), and pin nothing. The host must advertise
+  `plainGit`; a connector from before can't start one (`connector_update_required`). Every connector of this version
+  advertises `plainGit` (and, unless unsandboxed, `cloneBackups`) whatever its `sandbox` claim says: real connectors
+  advertise `sandbox: false` because isolation is verified per session, and their sessions always run in the sandbox.
+- **Unsandboxed hosts** advertise `plainGit` too. Their clone sessions have no proxy: the agent clones, commits and pushes
+  with the host's own Git, network and credentials, each command with the owner's approval as before. Their Git config
+  gets a credential helper that asks the host user's own helpers with their real HOME (`hostCredentialConfig`), which
+  sessions from before don't (their owner config is immutable). `git_push` is not offered there. Backups keep the
+  worktree as files, so a session with a clone in its worktree can't be backed up: a clone's history has no bound.
+- **Sessions that can't clone.** An agent without `bash`, or another member's session on a host without resource limits
+  (whose shell commands are refused), works in an empty worktree. The session is created anyway, and its record says why
+  (`cloneUnavailable`, on creation and on single-session reads).
+- **Pinned sessions are read-only** (`frozenSession`: not a clone session, with pins). Every runner request but `view`,
+  `events`, `create`, `restart` and `stop` (which open it to show its history, and end work) is refused
+  (`session_frozen`), and so are push credentials, GitHub comments and merges, restores of their backups and moves.
+  Opening one ends whatever it had queued or at work, and the cards waiting on decisions, as `interrupted`. Their transcript, approvals, backups (to download) and exports stay available; the session
+  record says `frozen`, and the web and mobile apps offer nothing that would be refused.

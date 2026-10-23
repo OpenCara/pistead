@@ -124,7 +124,9 @@ function SessionPane({ id }: { id: string }) {
   const canAsk = permissions.includes("ask");
   // Archived sessions are read-only on the server; don't offer decisions that would be refused.
   const archived = session?.status === "archived";
-  const canApprove = permissions.includes("approve") && !archived;
+  // A session that pinned its repositories when it started stays readable only.
+  const frozen = session?.frozen === true;
+  const canApprove = permissions.includes("approve") && !archived && !frozen;
   const isOwner = session?.ownerId === user.id;
   const [renaming, setRenaming] = useState(false);
   const hosts = useConnections(session?.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null);
@@ -144,7 +146,7 @@ function SessionPane({ id }: { id: string }) {
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
   const actions = useSessionActions({
     session, user,
-    backupBlocked: archived || !view || Boolean(live.error) || view.busy || activeQueue.length > 0,
+    backupBlocked: archived || frozen || !view || Boolean(live.error) || view.busy || activeQueue.length > 0,
     onChange: refreshAll,
   });
   const openSession = useCallback((target: string) => { refreshSessions(); navigate({ name: "session", sessionId: target }); }, [refreshSessions]);
@@ -164,7 +166,7 @@ function SessionPane({ id }: { id: string }) {
   if (session && isOwner && !archived) {
     menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
-    menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy,
+    if (!frozen) menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy,
       hint: actions.backupsOff ? "Backups are off" : actions.backupBlocked ? "Session busy" : undefined, onSelect: actions.createBackup });
     menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
   }
@@ -203,7 +205,11 @@ function SessionPane({ id }: { id: string }) {
           <DropdownMenu label="Session actions" items={menu} />
         </>}
       />
-      {(archived || (live.error && !startFailed) || actions.action.error || actions.action.notice) && <div className="session-alerts">
+      {(archived || frozen || session?.cloneUnavailable || (live.error && !startFailed) || actions.action.error || actions.action.notice) && <div className="session-alerts">
+        {frozen && !archived && <Alert title="Read-only">
+          This session pinned its repositories when it started, which sessions no longer do. Its conversation, approvals and backups stay viewable, but it no longer runs. Start a new session to continue the work.
+        </Alert>}
+        {session?.cloneUnavailable && !frozen && <Alert variant="warning" title="Can't clone repositories">{session.cloneUnavailable}</Alert>}
         {archived && <Alert title="Archived" actions={isOwner && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unarchive}>Unarchive</Button>}>
           This session is read-only. {isOwner ? "Unarchive it to continue the work." : "Only its owner can unarchive it."}
         </Alert>}
@@ -298,7 +304,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const canAsk = permissions.includes("ask");
   const actualMode = mode === "ask" && !canAsk ? "write" : mode;
   const archived = session.status === "archived";
-  const permitted = !archived && (actualMode === "write" ? canWrite : canAsk);
+  const frozen = session.frozen === true;
+  const permitted = !archived && !frozen && (actualMode === "write" ? canWrite : canAsk);
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
@@ -411,7 +418,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
           placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
           sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
-          hint={archived ? "Read-only · this session is archived" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
+          hint={archived ? "Read-only · this session is archived" : frozen ? "Read-only · this session pinned its repositories when it started" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
             : actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks"
             : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}
           tools={<>

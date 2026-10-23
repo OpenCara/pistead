@@ -6,7 +6,7 @@ import { useApp } from "../app-context";
 import { useConnections } from "../hosts";
 import { Icon } from "../icons";
 import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
-import { gitAccountLabel, gitProviderLabel, RepositorySnapshotPolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
+import { gitAccountLabel, gitProviderLabel, RepositoryClonePolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
 import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
@@ -130,8 +130,8 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
   const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
   return <Section bare title="Repositories" info={<div className="stack">
     {!admin && <p>Only workspace owners and admins can add or remove repositories.</p>}
-    <p>Changes apply to new sessions only. To change a ref, remove and re-add the repository.</p>
-    <RepositorySnapshotPolicy />
+    <p>Changes apply at once, in running sessions too: a removed repository can no longer be read or pushed. To change a ref, remove and re-add the repository.</p>
+    <RepositoryClonePolicy />
   </div>} action={canAdd && <Button variant="outline" size="sm" icon="plus" disabled={loading || Boolean(error) || action.busy} onClick={() => setPicking(true)}>Add repository</Button>}>
     <div className="stack" id="workspace-repositories">
       <div className="card">

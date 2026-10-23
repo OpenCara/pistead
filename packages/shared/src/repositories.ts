@@ -206,21 +206,11 @@ export function repositoryPath(repository: { provider?: GitProvider; host?: stri
   return parts.join("/");
 }
 
-// Extraction limits are aggregate across all repositories in one session.
 export const repositoryLimits = {
+  // Repositories bound to one workspace.
   repositories: 5,
-  archiveBytes: 8 * 1024 * 1024,
-  expandedBytes: 32 * 1024 * 1024,
-  // Real repositories vendor prebuilt binaries (multi-MiB dylibs/tools); the aggregate bounds above still apply.
-  fileBytes: 8 * 1024 * 1024,
-  entries: 10000,
   // One repository picker listing; larger accounts list their first repositories in provider order.
   pickerRepositories: 3000,
-  // Checkouts from a host repository cache (docs/design/repository-cache.md), aggregate across one session's
-  // repositories. No archive is involved, so these bound only what is written into the session worktree.
-  checkoutEntries: 250_000,
-  checkoutBytes: 8 * 1024 * 1024 * 1024,
-  checkoutFileBytes: 1024 * 1024 * 1024,
 } as const;
 
 /** A clone's directory in a session worktree: relative, without ".", ".." or ".git" components. */

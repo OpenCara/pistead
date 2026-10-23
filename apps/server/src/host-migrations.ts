@@ -3,9 +3,8 @@ import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.j
 import type { RunnerBinding } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities, RestoreInput } from '../../../packages/shared/src/connector.js';
-import type { SessionRepository } from '../../../packages/shared/src/repositories.js';
 import type { AgentRow, AppContext, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, modelDefinition, requireNoMigration, runnerSessionRecord, sessionAccess, sessionRecord } from './db.js';
+import { agentVersion, auditStatement, modelDefinition, requireNoMigration, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text } from './http.js';
 import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
@@ -75,6 +74,7 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   if (!access) fail(404, 'not_found', 'Source session not found.');
   if (access.row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can move it to another host.');
   const source = await sourceAuthority(c, input.sourceId, ownerId);
+  requireUnfrozen(source);
   await requireNoMigration(c.env, source.id);
   const model = await requireModel(c.env, input.modelId, ownerId);
   if (model.workspace_id !== source.workspace_id) fail(404, 'not_found', 'Model not found.');
@@ -91,15 +91,11 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   if (capabilities.hostMigration !== true) {
     fail(409, 'connector_update_required', 'Update the target host\'s connector (npx pistead@latest connect, on Linux) to move sessions to it.');
   }
-  const pins = JSON.parse(source.repositories_json ?? '[]') as SessionRepository[];
-  if (pins.some(pin => 'provider' in pin) && capabilities.gitProviders !== true) {
-    fail(409, 'connector_update_required', 'Update the target host\'s connector (npx pistead@latest connect) to carry this session\'s repositories.');
-  }
   // A clone session has no pins to carry: its successor needs a host where the agent can clone again, and that restores
   // its clones' local work from the snapshot.
-  if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.cloneBackups !== true || capabilities.sandbox !== true || capabilities.unsandboxed
+  if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.cloneBackups !== true || capabilities.unsandboxed
     || (capabilities.productionShell !== true && model.connector_owner_id !== ownerId))) {
-    fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a sandboxed host with an up-to-date connector that can run your shell commands.');
+    fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a host with an up-to-date connector, not running unsandboxed, that can run your shell commands.');
   }
   const sourceAgent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
   if (!sourceAgent) fail(409, 'invalid_binding', 'Session binding is incomplete.');

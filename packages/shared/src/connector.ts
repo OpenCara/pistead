@@ -27,9 +27,8 @@ export interface ConnectorCapabilities {
   /** The connector reads GitHub issues and pull requests and merges pull requests through the control plane (github_read, github_merge). Absent on older connectors. */
   github?: boolean;
   /**
-   * The connector checks pinned repositories out of its host repository cache, fetched with the host's own Git
-   * credentials after the control plane re-authorizes the session owner, instead of downloading archives. Absent on
-   * older connectors and on hosts started with the cache turned off.
+   * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
+   * docs/design/repository-cache.md). Absent on older connectors and on hosts started with the cache turned off.
    */
   repositoryCache?: boolean;
   /**
@@ -38,9 +37,10 @@ export interface ConnectorCapabilities {
    */
   hostMigration?: boolean;
   /**
-   * Sandboxed sessions on this host can start without pinned repositories: the agent clones the workspace's repositories
-   * with plain Git through the session's egress proxy, and git_push pushes a clone's commits. Absent on older connectors
-   * and on hosts without the sandbox.
+   * Sessions on this host start without pinned repositories: the agent clones the workspace's repositories with plain
+   * Git, through the session's egress proxy in the sandbox, or with the host's own Git where its owner runs the host
+   * unsandboxed. Advertised by every connector of this version, whatever `sandbox` says (isolation is verified per
+   * session); absent on older connectors, which can't run new sessions.
    */
   plainGit?: boolean;
   /**

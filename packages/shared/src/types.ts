@@ -5,6 +5,11 @@ export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
 export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash"] as const;
 export type ToolName = (typeof toolNames)[number];
+/**
+ * Tools of sessions that pinned their repositories, which are read-only now: still valid in stored agents and
+ * approvals, but no session offers them (the agent uses Git itself in bash).
+ */
+export const retiredToolNames: readonly ToolName[] = ["git_status", "git_commit", "git_repin"];
 export interface UserProfile {
   id: string;
   githubId: string | null;
@@ -87,6 +92,13 @@ export interface SessionRecord {
    * the host's egress proxy and pushes a clone's commits with git_push. Absent: repositories are pinned at creation.
    */
   repositoryMode?: "clone";
+  /**
+   * The session pinned its repositories when it started, as sessions did before they cloned them: it stays readable,
+   * but runs nothing (no messages, approvals, backups, restores or moves).
+   */
+  frozen?: true;
+  /** Present only on single-session reads of a clone session whose agent can't run shell commands here, so can't clone: why. */
+  cloneUnavailable?: string;
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
   // Present only on single-session reads: the pinned host explicitly runs without isolation.

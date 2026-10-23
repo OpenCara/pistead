@@ -161,39 +161,6 @@ test("restore requires every immutable repository pin to match before paused pre
   await absent(join(f.directory, "sessions", "target"));
 });
 
-test("restore preserves exact repository pins and requires the restored ready marker before publication", linux, async t => {
-  const f = await fixture(t);
-  const pin: SessionRepository = { bindingId: "binding-1", repositoryId: 123, fullName: "alice/project", path: "alice/project", ref: "main", commit: "a".repeat(40) };
-  f.target.session.repositories = [pin];
-  const value = archive();
-  value.binding.session.repositories = [pin];
-  value.manifest.binding = structuredClone(value.binding);
-  value.files.push({ path: "worktree/alice/project/edited.txt", data: Buffer.from("owner edits, not live branch").toString("base64"), mode: 0o600 });
-  const saved = envelope(value);
-  let stagePath = "";
-  fakeInitializer(t, () => stagePath);
-  let ready = false;
-  const probe = t.mock.method(Sandbox.prototype, "repositoryCachesReady", async (repositories: readonly SessionRepository[], authorize: () => Promise<void>) => {
-    assert.deepEqual(repositories, [pin]);
-    await authorize();
-    return ready;
-  });
-  const prepare = async (stage: string, manifest: RestoreManifest) => {
-    stagePath = stage;
-    assert.deepEqual(manifest.binding.session.repositories, [pin]);
-    assert.equal(await readFile(join(stage, "sandbox", "worktree", pin.path, "edited.txt"), "utf8"), "owner edits, not live branch");
-  };
-  const config = { ...f.config, readBackup: async () => saved.bytes };
-  await assert.rejects(restoreSession(config, f.target, saved.descriptor, prepare), /repository cache is not ready/);
-  await absent(join(f.directory, "sessions", "target"));
-  ready = true;
-  await restoreSession(config, f.target, saved.descriptor, prepare);
-  assert.equal(probe.mock.callCount(), 2);
-  assert.equal(await readFile(join(f.directory, "sessions", "target", "sandbox", "worktree", pin.path, "edited.txt"), "utf8"), "owner edits, not live branch");
-  const persisted = JSON.parse(await readFile(join(f.directory, "sessions", "target", "binding.json"), "utf8")) as RunnerBinding;
-  assert.deepEqual(persisted.session.repositories, [pin]);
-});
-
 test("legacy restore treats omitted and empty repository pins equivalently", linux, async t => {
   const f = await fixture(t);
   f.target.session.repositories = [];

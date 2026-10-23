@@ -53,7 +53,7 @@ async function upstream(t: TestContext) {
 
 test("a mirror is filled through the relay, keeps each session's branch tips, and prune drops idle sessions", async t => {
   const u = await upstream(t);
-  const cache = new RepositoryCache({ root: join(u.directory, "cache"), authorization: async () => assert.fail("mirrors never use host credentials") });
+  const cache = new RepositoryCache({ root: join(u.directory, "cache") });
   const first = await cache.refresh({ repository, ownerId: "test:alice", sessionId: "session-1", remote: u.remote() });
   assert.equal(first.fetched, true);
   assert.equal(first.directory, cache.mirrorDirectory(repository, "test:alice"));

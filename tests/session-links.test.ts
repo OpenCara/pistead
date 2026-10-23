@@ -21,7 +21,7 @@ const testSecret = 'session-links-test-secret-not-for-deployment';
 const internalSecret = 'session-links-internal-secret-not-for-deployment';
 const manifest = {
   models: [{ provider: 'local-native', modelId: 'local/model-v1', name: 'Local model' }],
-  capabilities: { platform: 'linux', sandbox: true, productionShell: false },
+  capabilities: { platform: 'linux', sandbox: true, productionShell: false, plainGit: true },
 };
 const token = () => Buffer.from(randomBytes(32)).toString('base64url');
 const changedToken = (value: string) => `${value[0] === 'A' ? 'B' : 'A'}${value.slice(1)}`;

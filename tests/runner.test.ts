@@ -28,7 +28,7 @@ function binding(id: string, ownerId = "test:alice"): RunnerBinding {
   return {
     session: { id, workspaceId: "workspace", ownerId, agentVersionId: "version-1", title: "Test", policyVersion: 1, status: "ready", createdAt: "2026-01-01T00:00:00Z" },
     owner: { id: ownerId, githubId: null, githubLogin: name.toLowerCase(), displayName: name, gitName: name, gitEmail: `${name.toLowerCase()}@example.test`, env: { APP_COLOR: name.toLowerCase() }, githubConnected: false },
-    agent: { id: "version-1", agentId: "shared-agent", authorId: "test:author", workspaceId: "workspace", version: 1, name: "Shared", description: "Tests", instructions: "Use tools.", tools: ["identity", "read_file", "write_file", "list_files", "git_status", "git_commit", "bash", "github_comment"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
+    agent: { id: "version-1", agentId: "shared-agent", authorId: "test:author", workspaceId: "workspace", version: 1, name: "Shared", description: "Tests", instructions: "Use tools.", tools: ["identity", "read_file", "write_file", "list_files", "bash", "github_comment"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
     model: { id: "model-1", workspaceId: "workspace", name: "Explicit faux test provider", provider: "faux", modelId: "faux-1" },
   };
 }
@@ -181,16 +181,16 @@ test("read-only durable ask inherits transcript but cannot write; restart preser
 test("writer cannot self-approve without approve permission; exact authorized operation uses owner git identity", { skip: process.platform !== "linux" }, async t => {
   const { service, grants } = await fixture(t);
   const session = await service.provision(binding("approval-session"), await ticket("approval-session", "create"));
-  await session.sandbox.writeFile("hello.txt", "hello", allowTestOperation);
-  const operation = { kind: "git.commit" as const, message: "Owner identity" };
+  // The session's own Git metadata is read-only to commands; the agent commits in repositories it makes or clones.
+  const operation = { kind: "bash" as const, command: "git init -q app && cd app && echo hello > hello.txt && git add -A && git commit -q -m 'Owner identity'" };
   const approval = await session.createApproval("test:bob", operation);
   await assert.rejects(session.decide(await ticket("approval-session", "approve", "test:bob"), approval.id, { decision: "approve", operation }));
-  await assert.rejects(session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation: { ...operation, message: "tampered" } }));
+  await assert.rejects(session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation: { ...operation, command: "true" } }));
   const result = await session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation });
-  assert.equal(result.status, "executed");
+  assert.equal(result.status, "executed", result.result);
   assert.equal(result.requestedBy, "test:bob");
   assert.equal(result.decidedBy, "test:alice");
-  const log = await session.sandbox.execute({ kind: "bash", command: "git log -1 --format='%an <%ae> / %cn <%ce>'" }, true, allowTestOperation, { allowTestShell: true });
+  const log = await session.sandbox.execute({ kind: "bash", command: "cd app && git log -1 --format='%an <%ae> / %cn <%ce>'" }, true, allowTestOperation, { allowTestShell: true });
   assert.match(log, /Alice <alice@example.test> \/ Alice <alice@example.test>/);
   await assert.rejects(session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation }));
   grants["test:bob"] = ["read"];
@@ -236,7 +236,7 @@ test("owner restore publishes a new idle session, drops old authority and leaves
   const permission = await permissionRequest(source);
   await source.decide(await ticket("restore-source", "approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "session" });
   await idle(source);
-  const approval = await source.createApproval("test:alice", { kind: "git.commit", message: "must not replay" });
+  const approval = await source.createApproval("test:alice", { kind: "bash", command: "echo must-not-replay" });
   const oldTicket = await ticket("restore-source", "operations");
   await source.consumeTicket(oldTicket);
   const backup = await source.backup(await ticket("restore-source", "backup"));
@@ -359,7 +359,7 @@ test("connected writes durably bind Worker admission to every model approval wit
     const faux = fauxProvider({ models: [{ id: model.modelId }] });
     faux.setResponses([
       fauxAssistantMessage([
-        fauxToolCall("git_commit", { message: "Review this commit" }),
+        fauxToolCall("bash", { command: "echo review" }),
         fauxToolCall("bash", { command: "true" }),
         fauxToolCall("github_comment", { repository: "example/repo", issue: 1, body: "Review this comment" }),
       ], { stopReason: "toolUse" }),
@@ -383,7 +383,7 @@ test("connected writes durably bind Worker admission to every model approval wit
   const view = await session.view();
   assert.equal(view.approvals.length, 3);
   assert.ok(view.approvals.every(approval => approval.requestedBy === "test:bob" && approval.admissionId === admissionId));
-  assert.deepEqual(view.approvals.map(approval => approval.operation.kind).sort(), ["bash", "git.commit", "github.comment"]);
+  assert.deepEqual(view.approvals.map(approval => approval.operation.kind).sort(), ["bash", "bash", "github.comment"]);
   assert.ok(view.entries.every(entry => !entry.text.includes(admissionId)), "proof must not appear in user, tool-result, or model transcript content");
   const explicit = await session.createApproval("test:bob", { kind: "github.comment", repository: "example/repo", issue: 2, body: "Explicit operation" });
   assert.equal(explicit.admissionId, undefined, "explicit operations use the Worker's authenticated-request pin instead");

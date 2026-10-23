@@ -41,8 +41,10 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const permissions = session?.permissions ?? [];
   // Archived sessions are read-only on the server; don't offer decisions that would be refused.
+  // Archived sessions, and sessions that pinned their repositories when they started, are read-only on the server.
   const archived = session?.status === "archived";
-  const canApprove = permissions.includes("approve") && !archived;
+  const readOnly = archived || session?.frozen === true;
+  const canApprove = permissions.includes("approve") && !readOnly;
   const isOwner = session?.ownerId === user.id;
   const hosts = useResource<{ connectors: ConnectorInfo[] }>(session?.connectorId ? `/api/workspaces/${segment(session.workspaceId)}/connectors` : null, 10_000);
   const host = hosts.data?.connectors.find(item => item.id === session?.connectorId);
@@ -249,13 +251,13 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
   const actualMode = mode === "ask" && !canAsk ? "write" : mode;
-  const archived = session.status === "archived";
-  const permitted = !archived && (actualMode === "write" ? canWrite : canAsk);
+  const readOnly = session.status === "archived" || session.frozen === true;
+  const permitted = !readOnly && (actualMode === "write" ? canWrite : canAsk);
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
   // Stopping takes the running message and everything queued; hosts that predate it don't offer it.
-  const canStop = Boolean(view.stoppable) && !archived && canWrite && activeQueue.length > 0;
+  const canStop = Boolean(view.stoppable) && session.status !== "archived" && canWrite && activeQueue.length > 0;
   const stopPending = queue.some(item => item.status === "stopping");
   const conversations = view.conversations;
   const sideConversations = conversations.filter(item => item.mode === "ask" && (!item.actorId || item.actorId === user.id));
@@ -361,7 +363,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
         onStop={canStop ? stop : undefined} stopping={stopping.busy}
         placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
         sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
-        hint={archived ? "Read-only · this session is archived" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
+        hint={session.status === "archived" ? "Read-only · this session is archived" : session.frozen ? "Read-only · this session pinned its repositories when it started" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
           : actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks"
           : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}
         tools={(canAsk || permitted) && <>

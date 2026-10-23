@@ -70,9 +70,9 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
     sqlite.prepare('INSERT INTO workspace_repositories (id,workspace_id,provider,host,repository_id,full_name,ref,private,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
       .run(bindingId, 'workspace', provider, host, repositoryId, fullName, 'main', 1, createdAt);
   }
-  sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,repositories_json,connector_id,connector_owner_id) VALUES (?,?,?,?,?,?,?,?,?,?)')
-    .run('session', 'workspace', owner, 'version', 'session', 'ready', createdAt, JSON.stringify([githubPin, bitbucketPin, gitlabPin, giteaPin, azurePin]),
-      host ? 'connector' : null, host?.owner ?? null);
+  // A clone session: it pushes a clone's directory to the workspace repository at the operation's path.
+  sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,repositories_json,connector_id,connector_owner_id,repository_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run('session', 'workspace', owner, 'version', 'session', 'ready', createdAt, '[]', host ? 'connector' : null, host?.owner ?? null, 'clone');
   // The approver may approve but not write; the viewer may only read.
   sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)').run('session', approver, '["read","approve"]', createdAt);
   sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)').run('session', viewer, '["read"]', createdAt);
@@ -184,7 +184,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
       .run(`identity-${provider}-${scope}`, 'workspace', provider, gitHost, scope, kind, owner, createdAt, createdAt);
   }
   const operation = (extra: Record<string, unknown> = {}, repository = githubPin.path) =>
-    ({ kind: 'git.push', repository, branch: 'feature', commit: sessionCommit, ...extra });
+    ({ kind: 'git.push', repository, directory: 'app', branch: 'feature', commit: sessionCommit, ...extra });
   /** A human-approved request: the review row plus the capability minted at approval time. */
   async function approve(approvalId: string, op: Record<string, unknown>, actor = owner, requestedBy = owner): Promise<string> {
     const capability = `capability-${approvalId}`;
@@ -387,23 +387,24 @@ test('a removed workspace binding blocks minting and pull request opening', asyn
   f.sqlite.prepare("DELETE FROM workspace_repositories WHERE id = 'binding-gh'").run();
   const removed = await f.post(credential, { sessionId: 'session', approvalId: 'tool-r-2', actorId: owner, operation: op, admissionId: f.admit('auto') });
   assert.equal(removed.status, 403);
-  assert.equal(await code(removed), 'repository_binding_removed');
+  assert.equal(await code(removed), 'repository_binding_mismatch');
   assert.equal(f.ledger().length, 1);
   assert.equal(f.calls.filter(call => call.url.endsWith('/access_tokens')).length, 1);
   const done = await f.post(complete, { sessionId: 'session', approvalId: 'tool-r-1', credentialId: issued.credentialId, outcome: 'pushed', tip });
   assert.equal(done.status, 403);
-  assert.equal(await code(done), 'repository_binding_removed');
+  assert.equal(await code(done), 'repository_binding_mismatch');
   assert.ok(!f.calls.some(call => call.method === 'POST' && call.url.endsWith('/pulls')));
   assert.equal(f.calls.filter(call => call.method === 'DELETE').length, 1, 'the credential is still revoked');
   assert.equal(f.ledger()[0]!.outcome, 'pushed');
   const [failure] = f.audits('git.push.pull_request_failed') as { metadata_json?: string }[];
   assert.ok(failure);
-  assert.ok(JSON.stringify(failure).includes('repository_binding_removed'));
+  assert.ok(JSON.stringify(failure).includes('repository_binding_mismatch'));
   // A binding re-created for a different repository under the same id does not count either.
   f.sqlite.prepare('INSERT INTO workspace_repositories (id,workspace_id,provider,host,repository_id,full_name,ref,private,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
     .run('binding-gh', 'workspace', 'github', 'github.com', '999', 'owner/repo', 'main', 1, new Date().toISOString());
   const replaced = await f.post(credential, { sessionId: 'session', approvalId: 'tool-r-3', actorId: owner, operation: op, admissionId: f.admit('auto') });
-  assert.equal(await code(replaced), 'repository_binding_removed');
+  assert.equal(await code(replaced), 'repository_identity_changed');
+  assert.equal(f.ledger().length, 1);
 });
 
 test('branch-level owner checks block minting before any ledger row; new branches fall back to the repository check', async t => {
@@ -673,9 +674,6 @@ test('push access with the host\'s Git credentials needs its owner\'s opt-in, th
 
 test('a clone session pushes to the workspace repository at the operation path, with no pins', async t => {
   const f = await fixture(t);
-  // The fixture's session pins its repositories; a clone session pins none.
-  f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
-    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone' WHERE id = 'session'; COMMIT;");
   const op = f.operation({ directory: 'repo' });
   const reordered = { kind: 'git.push', repository: op.repository, directory: 'repo', branch: op.branch, commit: op.commit };
   const capability = await f.approve('approval-clone', reordered);
@@ -694,8 +692,9 @@ test('a clone session pushes to the workspace repository at the operation path, 
   const traversal = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-3', actorId: owner,
     operation: { kind: 'git.push', repository: 'owner/repo', directory: '../repo', branch: 'feature', commit: op.commit }, admissionId: f.admit('auto') });
   assert.equal(traversal.status, 400);
-  // A clone session's pushes name a clone's directory.
-  const pinnedShape = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-4', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') });
+  // A push names a clone's directory.
+  const { directory: _directory, ...withoutDirectory } = f.operation();
+  const pinnedShape = await f.post(credential, { sessionId: 'session', approvalId: 'tool-clone-4', actorId: owner, operation: withoutDirectory, admissionId: f.admit('auto') });
   assert.equal(pinnedShape.status, 400);
 });
 
@@ -783,10 +782,14 @@ test('a clone session pushes its own branch through the egress relay with the pu
   assert.equal(await code(await relay('receive-refs')), 'session_branch_unavailable');
 });
 
-test('a pinned session cannot push a clone directory', async t => {
+test('a session that pinned its repositories is read-only: it gets no push credential', async t => {
   const f = await fixture(t);
+  // Sessions no longer pin, so this one is turned back into one that did.
+  f.sqlite.exec("BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
+    + ` UPDATE sessions SET repositories_json = '${JSON.stringify([githubPin])}', repository_mode = NULL WHERE id = 'session'; COMMIT;`);
   const response = await f.post(credential, { sessionId: 'session', approvalId: 'tool-pinned-1', actorId: owner,
-    operation: f.operation({ directory: 'repo' }), admissionId: f.admit('auto') });
-  assert.equal(response.status, 400);
+    operation: f.operation(), admissionId: f.admit('auto') });
+  assert.equal(response.status, 409);
+  assert.equal(await code(response), 'session_frozen');
   assert.deepEqual(f.ledger(), []);
 });

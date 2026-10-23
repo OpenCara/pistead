@@ -35,7 +35,7 @@ Connector 0.8.0 moved the default state directory from `~/.local/share/opencara/
 
 Run `npx pistead connect --help` for all options.
 
-Workspace repositories can come from GitHub, GitHub Enterprise Server, GitLab (gitlab.com or self-managed), Bitbucket Cloud, Azure DevOps and Gitea/Forgejo. Connect the non-GitHub accounts in the web app under **Settings → Profile → Git accounts** with personal access tokens. The Pistead server downloads pinned snapshots; the connector never receives those tokens. Non-GitHub repositories need connector 0.4.0 or newer.
+Workspace repositories can come from GitHub, GitHub Enterprise Server, GitLab (gitlab.com or self-managed), Bitbucket Cloud, Azure DevOps and Gitea/Forgejo. Connect the non-GitHub accounts in the web app under **Settings → Profile → Git accounts** with personal access tokens. Sessions read the repositories through the Pistead server, which uses those tokens; the connector never receives them.
 
 Model credentials stay in Pi on your host. Pairing keeps the host private to you; sharing it with a workspace is a separate, explicit action in the web app.
 
@@ -51,14 +51,6 @@ Commands run in the session's worktree, whose files and Git configuration the ag
 
 Each exact command and timeout needs the **host owner's** approval in the session. On a shared host, that owner must also have approve access to the session. The session owner's **Auto-approve** skips this decision only when they own the host too; it never authorizes commands on someone else's host. Commands default to a five-minute timeout (`timeout_seconds`, 1-3600); timeout, cancellation and output limits terminate the process group, but cannot contain an unrestricted command that deliberately detaches processes.
 
-## Repinning from chat
-
-Ask the agent to use `git_repin` with the pinned repository's worktree path and a branch, tag or commit, for example `{ "repository": "OpenCara/pistead", "ref": "feature/next" }`. Update the connector to a version advertising `gitRepin` to expose this tool.
-
-A repin creates a **new private session** with the selected repository resolved to that ref and the other repository commits unchanged. Open it from the completed approval card and send a message to start it. The source session is untouched: its local changes, commits, conversation, sharing grants and backups are **not** copied. The successor uses the same agent and host, and downloads its source snapshots when it starts. It does not change the workspace's default repository refs or add newly configured repositories, and it needs every source repository to still be configured in the workspace.
-
-Only the session owner can approve a repin; their **Auto-approve** can skip that decision (at most five new sessions per message). Resolution uses their connected Git accounts, not another member's credentials. Existing sessions can request these tools through the usual missing-tool permission flow; published agents can include `host_bash` and `git_repin` explicitly.
-
 ## macOS and hosts without bubblewrap
 
 The isolated sandbox needs Linux. On macOS, or Linux without bubblewrap, you can opt out of isolation:
@@ -69,32 +61,28 @@ npx pistead@latest connect --unsafe-no-sandbox
 
 This needs only Git on your `PATH` (on macOS: `xcode-select --install` or `brew install git`). The connector prints the risks and asks you to type `unsandboxed` before starting:
 
-- Approved shell commands and commits run directly as your user, with access to your files, credentials (`~/.ssh`, cloud and Git config, Pi's auth) and network, and no CPU, memory or disk limits.
+- Approved shell commands run directly as your user, with access to your files, credentials (`~/.ssh`, cloud and Git config, Pi's auth) and network, and no CPU, memory or disk limits.
 - File tools are confined to each session folder by path checks only.
 - Anyone you share the Pi with, and anyone granted approve permission on a session that runs on it, can cause approved commands to run on your machine.
 
-Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands, commits and pushes run immediately (GitHub comments and merges still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
+Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands and pushes run immediately (GitHub comments and merges still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
 
 ## Repository cache (preview)
 
-By default Pistead downloads each pinned repository as an archive (at most 8 MiB compressed), and the session sees a single snapshot commit. With `--repo-cache`, the connector keeps a full clone of each repository on the host instead, and checks sessions out of it:
+Every session starts with an empty worktree, and its agent clones the workspace repositories it needs. With `--repo-cache`, the connector keeps a full mirror of each repository on the host, so clones borrow its objects instead of downloading everything again:
 
 ```sh
 npx pistead@latest connect --repo-cache                            # one cache for every session on this host
 npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
 ```
 
-- In sessions that clone on demand, `git clone` of a workspace repository borrows the cached objects (`--reference-if-able`) after bringing the cache up to date through Pistead, with the session owner's own account. A session sees a cached repository, read-only, only once Pistead has let its owner read it.
-- For pinned sessions, the host fetches with its own Git credentials, through its credential helpers (for example after `gh auth setup-git`), without prompting. Pistead never sends a read credential.
-- Before a session uses the cache, Pistead checks that the session's owner can still read the repository and its pinned commit with their own account. On a shared host, other members' sessions also fetch with the host owner's credentials.
-- The first session on a host waits while the repository is cloned, and the session shows the clone's progress; later sessions fetch only what is new. Messages sent meanwhile wait in the queue. If the host can't fetch a repository, the session shows why and new messages are refused; restart the session after fixing it.
-- Sessions get the full history up to the pinned commit (for example `git log acme/app/pinned`), real symlinks, and submodules as empty directories. Inside the sandbox the cache is read-only.
-- `npx pistead@latest cache list` shows the cached repositories and their sizes; `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer and collects what nothing reaches any more (their clones lose the objects they borrowed; pins are kept).
-- Preview: backups of pinned sessions that use the cache are not supported yet. It needs a Pistead server that supports the repository cache; older servers refuse the connector's manifest.
+- `git clone` of a workspace repository in a sandboxed session borrows the cached objects (`--reference-if-able`) after bringing the mirror up to date through Pistead, with the session owner's own account. The host uses no Git credential of its own for this. A session sees a mirror, read-only, only while Pistead lets its owner read the repository.
+- `npx pistead@latest cache list` shows the cached repositories and their sizes; `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer and collects what nothing reaches any more (their clones lose the objects they borrowed). Pins of sessions from before every session cloned are kept.
+- It needs a Pistead server that supports the repository cache; older servers refuse the connector's manifest.
 
 ## Pushing commits
 
-In a session that clones on demand, agents push their work to the session's own branch, `pistead/<session-id>`, with plain `git push` and no approval; Pistead pushes it with the workspace's push identity below. Agents with the `git_push` tool push their committed session work to any other branch of a workspace repository (connector 0.5.0 or newer). A push needs an approval that shows the repository, the branch and the exact session commit, unless the session owner chose **Auto-approve** for that message. Pushes are fast-forward only and never forced: the session's commits are replayed onto the pinned upstream commit with their original author, date and message, so files the snapshot left out stay untouched and a later push to the same branch uploads only new objects. The agent can also ask for a pull request; Pistead opens it as the session owner with the owner's connected account (non-GitHub tokens then need write scopes: GitHub Enterprise pull requests write, GitLab `api`, Bitbucket `write:pullrequest:bitbucket`, Azure DevOps Code (Read & write), Gitea `write:repository`).
+In a session that clones on demand, agents push their work to the session's own branch, `pistead/<session-id>`, with plain `git push` and no approval; Pistead pushes it with the workspace's push identity below. Agents with the `git_push` tool push a clone's checked-out commit, as it is, to any other branch of the workspace repository it was cloned from. A push needs an approval that shows the repository, the branch and the exact commit, unless the session owner chose **Auto-approve** for that message. Pushes are fast-forward only and never forced, and send only the objects the branch doesn't have. On a host without the sandbox, the agent pushes with the host's own Git instead, each command with approval. The agent can also ask for a pull request; Pistead opens it as the session owner with the owner's connected account (non-GitHub tokens then need write scopes: GitHub Enterprise pull requests write, GitLab `api`, Bitbucket `write:pullrequest:bitbucket`, Azure DevOps Code (Read & write), Gitea `write:repository`).
 
 For each push, Pistead checks with the session owner's own account that the owner may push to the repository and, where the Git host reports it, to that branch (GitLab, Gitea/Forgejo and Azure DevOps branch permissions; GitHub protected branches are refused). Bitbucket owners need an Atlassian API token connected with their account email for this check. Pistead then issues a credential for that push from the push identity that a workspace owner or admin sets up for the provider under **Settings → Workspaces → Push access**: usually a short-lived token minted from an app or bot, as below. The connector keeps the credential in memory only and talks to the Git host directly, so large files never pass through the Pistead server, and the agent's shell and sandbox never see the credential.
 
@@ -125,8 +113,8 @@ Pull requests are still opened as the session owner, with the owner's connected 
 
 The sandbox has no network, so `gh` and `curl` inside it can't reach GitHub. Agents read and act on GitHub through Pistead instead, as the session owner and with the owner's GitHub sign-in, which stays on the Pistead server: the host and the sandbox never see it. These tools need connector 0.7.0 or newer; an agent whose tools predate them asks the session owner the first time, with the permission card described below. GitHub Enterprise and other providers are not covered.
 
-- `github_read` reads an issue or pull request of a github.com repository pinned in the session and still configured in the workspace: its description and comments, and for a pull request its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. Long threads keep their newest items. Like any repository content, what it returns is untrusted input. A read needs no approval, but only runs during a write message (until an hour after it was sent), and each read is recorded in the session's audit log.
-- `github_merge` merges a pull request of a pinned repository at the exact head commit the agent read, with a merge commit, squash or rebase. It always waits for a human approval, also under **Auto-approve**. If the head moved or GitHub refuses (failing checks, missing reviews, conflicts, a method the repository doesn't allow), nothing is merged and the agent gets GitHub's reason.
+- `github_read` reads an issue or pull request of one of the workspace's github.com repositories: its description and comments, and for a pull request its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. Long threads keep their newest items. Like any repository content, what it returns is untrusted input. A read needs no approval, but only runs during a write message (until an hour after it was sent), and each read is recorded in the session's audit log.
+- `github_merge` merges a pull request of one of those repositories at the exact head commit the agent read, with a merge commit, squash or rebase. It always waits for a human approval, also under **Auto-approve**. If the head moved or GitHub refuses (failing checks, missing reviews, conflicts, a method the repository doesn't allow), nothing is merged and the agent gets GitHub's reason.
 - `github_comment` still posts comments after their approval.
 
 ## Chat options

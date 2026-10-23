@@ -1,5 +1,5 @@
 import type { Hono } from 'hono';
-import { defaultAgentName, toolNames } from '../../../packages/shared/src/types.js';
+import { defaultAgentName, retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
 import type { ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import { agentVersion, auditStatement, modelDefinition, requireMember } from './db.js';
@@ -177,8 +177,8 @@ async function versionBatch(env: Env, statements: Query<AgentRow>[], versionInde
 
 /** New broker and host tools require an explicit connector capability. */
 function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
+  if (retiredToolNames.includes(tool)) return false;
   if (tool === 'host_bash') return capabilities.hostCommands === true;
-  if (tool === 'git_repin') return capabilities.gitRepin === true;
   if (tool === 'git_push') return capabilities.gitPush === true;
   if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
   return true;

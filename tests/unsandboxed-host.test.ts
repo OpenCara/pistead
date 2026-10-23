@@ -1,10 +1,9 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { lstat, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gzipSync } from "node:zlib";
 import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
 import { Sandbox, type SandboxAuthorize } from "../apps/runner/src/sandbox.js";
 import type { SessionRepository } from "../packages/shared/src/repositories.js";
@@ -13,13 +12,12 @@ import type { RunnerBinding } from "../packages/shared/src/types.js";
 // Host mode needs only Git on PATH, so it runs on macOS and Linux alike.
 const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
 const authorize: SandboxAuthorize = async () => {};
-const pin: SessionRepository = { bindingId: "binding-alpha", repositoryId: 101, fullName: "acme/alpha", path: "acme/alpha", ref: "main", commit: "a".repeat(40) };
 
 function binding(id: string, repositories: SessionRepository[] = []): RunnerBinding {
   return {
     session: { id, workspaceId: "workspace", ownerId: "test:alice", agentVersionId: "version-1", title: "Host mode", policyVersion: 1, status: "ready", createdAt: "2026-01-01T00:00:00Z", repositories },
     owner: { id: "test:alice", githubId: null, githubLogin: "alice", displayName: "Alice", gitName: "Alice Owner", gitEmail: "alice@example.test", env: { APP_TEAM: "core" }, githubConnected: false },
-    agent: { id: "version-1", agentId: "agent", authorId: "test:alice", workspaceId: "workspace", version: 1, name: "Agent", description: "", instructions: "Use tools.", tools: ["read_file", "write_file", "git_commit", "bash"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
+    agent: { id: "version-1", agentId: "agent", authorId: "test:alice", workspaceId: "workspace", version: 1, name: "Agent", description: "", instructions: "Use tools.", tools: ["read_file", "write_file", "bash"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
     model: { id: "model-1", workspaceId: "workspace", name: "Model", provider: "openai", modelId: "local" },
   };
 }
@@ -30,25 +28,6 @@ async function hostWorkspace(t: TestContext, repositories: SessionRepository[] =
   t.after(async () => { await workspace.close(); await rm(directory, { recursive: true, force: true }); });
   await workspace.initialize();
   return { workspace, outside: directory };
-}
-
-/** Minimal ustar writer: one header block per entry plus padded body and terminator. */
-function tarGz(entries: { name: string; body?: string | Buffer; type?: "0" | "2" | "5"; link?: string }[]): Uint8Array {
-  const blocks: Buffer[] = [];
-  for (const entry of entries) {
-    const body = Buffer.isBuffer(entry.body) ? entry.body : Buffer.from(entry.body ?? "");
-    const header = Buffer.alloc(512);
-    header.write(entry.name, 0, "utf8");
-    header.write("0000644\0", 100);
-    header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
-    header.write(entry.type ?? "0", 156);
-    if (entry.link) header.write(entry.link, 157, "utf8");
-    header.write("ustar\0" + "00", 257, "latin1");
-    header.fill(32, 148, 156);
-    header.write(`${header.reduce((sum: number, byte: number) => sum + byte, 0).toString(8).padStart(6, "0")}\0 `, 148, "latin1");
-    blocks.push(header, body, Buffer.alloc((512 - (body.length % 512)) % 512));
-  }
-  return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
 }
 
 test("the Linux sandbox never falls back to host execution on other platforms", { skip: process.platform === "linux" }, () => {
@@ -79,7 +58,7 @@ test("approved unsandboxed commands run in the worktree without the connector en
   await assert.rejects(workspace.execute({ kind: "bash", command: "true" }, true, authorize), /read-only/);
   await assert.rejects(workspace.execute({ kind: "bash", command: "exit 3" }, false, authorize), /exit 3/);
   await workspace.writeFile("README.md", "hello", authorize);
-  await workspace.execute({ kind: "git.commit", message: "Owner commit" }, false, authorize);
+  await workspace.execute({ kind: "bash", command: "git add -A && git commit -q -m 'Owner commit'" }, false, authorize);
   const log = await workspace.execute({ kind: "bash", command: "git log -1 --format='%an <%ae>|%cn <%ce>|%s'" }, false, authorize);
   assert.equal(log.trim(), "Alice Owner <alice@example.test>|Alice Owner <alice@example.test>|Owner commit");
   const snapshot = await workspace.snapshot(authorize);
@@ -87,51 +66,29 @@ test("approved unsandboxed commands run in the worktree without the connector en
   assert.ok(snapshot.some(file => file.path === "owner.gitconfig"));
 });
 
-test("unsandboxed repository caches unpack pinned archives once and refuse unsafe archives", hostMode, async t => {
-  const { workspace } = await hostWorkspace(t, [pin]);
-  assert.equal(await workspace.repositoryCachesReady([pin], authorize), false);
-  await assert.rejects(workspace.readFile("acme/alpha/README.md", authorize), /not prepared/);
-  for (const unsafe of [
-    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/../escape.txt", body: "x" }],
-    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/.git/config", body: "x" }],
-    [{ name: "alpha-main/", type: "5" as const }, { name: "other-root/file.txt", body: "x" }],
-    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/escape", type: "2" as const, link: "../../outside.txt" }],
-    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/abs", type: "2" as const, link: "/etc/hosts" }],
-    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/dangling", type: "2" as const, link: "missing.txt" }],
-    [{ name: "alpha-main/", type: "5" as const }, { name: "alpha-main/lib", type: "5" as const }, { name: "alpha-main/dir-link", type: "2" as const, link: "lib" }],
-  ]) {
-    await assert.rejects(workspace.materializeRepositories([pin], [tarGz(unsafe)], authorize));
-    assert.equal(await workspace.repositoryCachesReady([pin], authorize), false, "a rejected archive changes nothing");
-  }
-  // GitHub archives vendor multi-MiB binaries and relative library symlinks (libfoo.5.dylib -> libfoo.5.0.0.dylib).
-  const binary = Buffer.alloc(3 * 1024 * 1024, 7);
-  await workspace.materializeRepositories([pin], [tarGz([
-    { name: "alpha-main/", type: "5" }, { name: "alpha-main/README.md", body: "pinned" }, { name: "alpha-main/src/index.ts", body: "export {};" },
-    { name: "alpha-main/lib/libfoo.5.dylib", type: "2", link: "libfoo.5.0.0.dylib" }, { name: "alpha-main/lib/libfoo.5.0.0.dylib", body: binary },
-    { name: "alpha-main/docs/readme-link", type: "2", link: "../README.md" },
-  ])], authorize);
-  const copy = await lstat(join(workspace.worktree, "acme/alpha/lib/libfoo.5.dylib"));
-  assert.ok(copy.isFile() && !copy.isSymbolicLink() && copy.size === binary.length, "in-repository symlinks become regular file copies");
-  assert.equal(await workspace.readFile("acme/alpha/docs/readme-link", authorize), "pinned");
-  assert.equal(await workspace.repositoryCachesReady([pin], authorize), true);
-  assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "pinned");
-  await workspace.writeFile("acme/alpha/README.md", "edited", authorize);
-  await workspace.materializeRepositories([pin], [tarGz([{ name: "alpha-main/", type: "5" }, { name: "alpha-main/README.md", body: "reset" }])], authorize);
-  assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "edited", "a ready cache never overwrites edits");
-});
-
-test("unsandboxed workspaces materialize deep provider pins under their host directory", hostMode, async t => {
-  const gitlab: SessionRepository = { bindingId: "binding-gitlab", provider: "gitlab", host: "gitlab.example.com", repositoryId: "4242", fullName: "group/sub/project", path: "gitlab.example.com/group/sub/project", ref: "main", commit: "b".repeat(40) };
-  const azure: SessionRepository = { bindingId: "binding-azure", provider: "azure-devops", host: "dev.azure.com", repositoryId: "6f0c1b2a-0d4e-4c5b-9a7e-1d2c3b4a5f60", fullName: "org/My Project/repo", path: "dev.azure.com/org/My-Project/repo", ref: "main", commit: "c".repeat(40) };
-  const { workspace } = await hostWorkspace(t, [gitlab, azure, pin]);
-  const repositories = [pin, azure, gitlab];
-  await workspace.materializeRepositories(repositories, [
-    tarGz([{ name: "alpha-main/", type: "5" }, { name: "alpha-main/README.md", body: "github" }]),
-    tarGz([{ name: "repo/", type: "5" }, { name: "repo/src/main.cs", body: "azure" }]),
-    tarGz([{ name: "project-bbbb/", type: "5" }, { name: "project-bbbb/README.md", body: "gitlab" }]),
-  ], authorize);
-  assert.equal(await workspace.repositoryCachesReady(repositories, authorize), true);
-  assert.equal(await workspace.readFile("gitlab.example.com/group/sub/project/README.md", authorize), "gitlab");
-  assert.equal(await workspace.readFile("dev.azure.com/org/My-Project/repo/src/main.cs", authorize), "azure");
-  assert.equal(await workspace.readFile("acme/alpha/README.md", authorize), "github");
+test("an unsandboxed clone session's Git uses the host user's own credential helpers, and no other session's does", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-credentials-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // The host user's own Git config, in their real HOME (with a quote in its path, to check the helper's quoting).
+  const home = join(directory, "host user's home");
+  await mkdir(home);
+  await writeFile(join(home, ".gitconfig"), "[credential]\n\thelper = \"!f() { test \\\"$1\\\" = get && echo username=host-user && echo password=host-secret; }; f\"\n");
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => { process.env.HOME = previous; });
+  const fill = "printf 'protocol=https\\nhost=forge.example\\n\\n' | git credential fill 2>&1 || true";
+  const clone = binding("host-clone");
+  clone.session.repositoryMode = "clone";
+  const cloned = new HostWorkspace(clone, join(directory, "clone"));
+  t.after(() => cloned.close());
+  await cloned.initialize();
+  assert.match(await cloned.execute({ kind: "bash", command: fill }, false, authorize), /username=host-user\npassword=host-secret/);
+  // A session from before sessions cloned keeps its owner configuration unchanged, without the host's credentials.
+  const plain = new HostWorkspace(binding("host-plain"), join(directory, "plain"));
+  t.after(() => plain.close());
+  await plain.initialize();
+  assert.doesNotMatch(await plain.execute({ kind: "bash", command: fill }, false, authorize), /host-secret/);  // Its backups keep the worktree as files, which a clone's repository has no bound for: they are refused.
+  assert.ok((await cloned.snapshot(authorize)).length > 0);
+  await cloned.execute({ kind: "bash", command: "git init -q app" }, false, authorize);
+  await assert.rejects(cloned.snapshot(authorize), /need a host with the sandbox/);
 });

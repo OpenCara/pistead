@@ -11,7 +11,7 @@ import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
-import { toolNames } from '../packages/shared/src/types.js';
+import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { diffView } from '../packages/shared/src/view-patch.js';
 
@@ -21,7 +21,7 @@ const internalSecret = 'connectors-internal-secret-not-for-deployment';
 const githubToken = 'github-vault-secret-never-in-connector-metadata';
 const manifest = {
   models: [{ provider: 'local-native', modelId: 'local/model-v1', name: 'Local model' }],
-  capabilities: { platform: 'linux', sandbox: true, productionShell: false },
+  capabilities: { platform: 'linux', sandbox: true, productionShell: false, plainGit: true },
 };
 const token = () => Buffer.from(randomBytes(32)).toString('base64url');
 const changedToken = (value: string) => `${value[0] === 'A' ? 'B' : 'A'}${value.slice(1)}`;
@@ -192,8 +192,9 @@ async function sharedSession(f: Fixture, tools?: AgentVersion['tools']) {
     ...setup.input, trustedConnectorId: setup.connector.connectorId,
   }), 201);
   assert.equal(session.status, 'ready');
-  assert.deepEqual(session.repositories, [{ bindingId: 'shared-repository', repositoryId: 7,
-    fullName: 'owner/repo', ref: 'main', commit: 'a'.repeat(40), path: 'owner/repo' }]);
+  // Sessions pin nothing: the agent clones the workspace's repositories.
+  assert.deepEqual(session.repositories, []);
+  assert.equal(session.repositoryMode, 'clone');
   assert.equal(setup.hub.requests.length, 1);
   assert.deepEqual(setup.hub.unexpected, []);
   return { ...setup, session };
@@ -578,10 +579,13 @@ test('foreign-host sessions require exact trust and retain the creator identity 
   for (const secret of [s.connector.token, s.connector.connectionToken, s.connector.pairing.code, githubToken]) assert.ok(!JSON.stringify(envelope).includes(secret));
   await denied(await s.host.request('GET', `/api/sessions/${session.id}`), 404, 'not_found');
   assert.equal((await s.creator.request('GET', `/api/sessions/${session.id}`)).status, 200);
-  // Hosting does not grant this synthetic account the creator's GitHub authority.
-  await denied(await s.host.request('POST', '/api/sessions', s.input), 403, 'github_not_connected');
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 1);
-  assert.equal(s.hub.requests.length, 1);
+  // The host's own session borrows nothing of the creator's: it pins nothing, and its reads go through the relay with
+  // its own owner's accounts.
+  const own = await json<{ session: SessionRecord }>(await s.host.request('POST', '/api/sessions', s.input), 201);
+  assert.equal(own.session.ownerId, s.host.user.id);
+  assert.deepEqual(own.session.repositories, []);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 2);
+  assert.equal(s.hub.requests.length, 2);
   assert.deepEqual(s.hub.unexpected, []);
 });
 
@@ -1724,8 +1728,11 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
   const { session } = await json<{ session: SessionRecord }>(await s.member.request('GET', `/api/sessions/${s.session.id}`));
   assert.deepEqual(session.permissions, ['read']);
   assert.equal(session.visibility, 'workspace');
+  // Only a single-session read says why a session can't clone (its agent has no bash).
+  const { cloneUnavailable, ...summary } = session;
+  assert.match(cloneUnavailable!, /bash tool/);
   const listed = await json<{ sessions: SessionRecord[] }>(await s.member.request('GET', '/api/sessions'));
-  assert.deepEqual(listed.sessions, [session]);
+  assert.deepEqual(listed.sessions, [summary]);
   const requests = rpcHub(f, s.connector, envelope => {
     assert.equal(envelope.request.ticket.action, 'view');
     assert.equal(envelope.request.ticket.actorId, s.member.user.id);
@@ -1743,6 +1750,8 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
 test('a session started from a model gets its own chat agent with every tool its host carries, outside the catalog', async t => {
   const f = await fixture(t); const s = await privateWorkspace(f);
   const start = (client: Client, body: Record<string, unknown>) => client.request('POST', '/api/sessions', { workspaceId: s.team.id, ...body });
+  // Retired tools stay valid in stored agents but are never offered.
+  const offered = toolNames.filter(tool => !retiredToolNames.includes(tool));
   const startedAgent = () => (JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding).agent;
 
   // Exactly one of an agent version and a model; a teammate cannot start on the owner's unshared host.
@@ -1756,7 +1765,7 @@ test('a session started from a model gets its own chat agent with every tool its
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, toolNames.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'git_repin'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // Chat agents stay out of their author's catalog and cannot be revised or published.
@@ -1768,13 +1777,13 @@ test('a session started from a model gets its own chat agent with every tool its
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, toolNames.filter(tool => !['github_read', 'github_merge', 'host_bash', 'git_repin'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash'].includes(tool)));
 
   // A host that also carries GitHub reads and merges gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true, gitRepin: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
-  assert.deepEqual(startedAgent().tools, [...toolNames]);
+  assert.deepEqual(startedAgent().tools, offered);
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {

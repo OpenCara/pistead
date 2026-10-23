@@ -5,8 +5,6 @@ declare module "./connector.js" {
   interface ConnectorCapabilities {
     /** The connector runs host_bash commands outside the sandbox, each approved by the host's owner. Absent on older connectors. */
     hostCommands?: boolean;
-    /** The connector asks the control plane for repinned successor sessions (git_repin). Absent on older connectors. */
-    gitRepin?: boolean;
   }
 }
 

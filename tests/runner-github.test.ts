@@ -6,41 +6,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { gzipSync } from "node:zlib";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { RunnerService } from "../apps/runner/src/server.js";
 import { RunnerError } from "../apps/runner/src/protocol.js";
 import type { RunnerSession } from "../apps/runner/src/session.js";
-import type { SessionRepository } from "../packages/shared/src/repositories.js";
 import type { AuthorizationRequest, GitHubIssueView, GitHubMergeRequest, GitHubReadRequest, RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
 import { sha256 } from "../packages/shared/src/crypto.js";
 
 const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
 const head = "c".repeat(40);
 
-/** A one-file snapshot archive under a single top directory, as the control plane serves it. */
-function archive(): Uint8Array {
-  const entry = (name: string, body: string, type: "0" | "5") => {
-    const content = Buffer.from(body);
-    const header = Buffer.alloc(512);
-    header.write(name, 0, "utf8");
-    header.write("0000644\0", 100);
-    header.write(`${content.length.toString(8).padStart(11, "0")}\0`, 124);
-    header.write(type, 156);
-    header.write("ustar\0" + "00", 257, "latin1");
-    header.fill(32, 148, 156);
-    header.write(`${header.reduce((sum: number, byte: number) => sum + byte, 0).toString(8).padStart(6, "0")}\0 `, 148, "latin1");
-    return [header, content, Buffer.alloc((512 - (content.length % 512)) % 512)];
-  };
-  return gzipSync(Buffer.concat([...entry("alpha-main/", "", "5"), ...entry("alpha-main/README.md", "pinned\n", "0"), Buffer.alloc(1024)]));
-}
-
-const pin: SessionRepository = { bindingId: "binding-alpha", repositoryId: 101, fullName: "acme/alpha", path: "acme/alpha", ref: "main", commit: "a".repeat(40) };
-
 function binding(id: string): RunnerBinding {
   return {
-    session: { id, workspaceId: "workspace", ownerId: "test:alice", agentVersionId: "version-1", title: "GitHub", policyVersion: 1, status: "ready", createdAt: "2026-01-01T00:00:00Z", repositories: [pin] },
+    session: { id, workspaceId: "workspace", ownerId: "test:alice", agentVersionId: "version-1", title: "GitHub", policyVersion: 1, status: "ready", createdAt: "2026-01-01T00:00:00Z", repositories: [], repositoryMode: "clone" },
     owner: { id: "test:alice", githubId: null, githubLogin: "alice", displayName: "Alice", gitName: "Alice Owner", gitEmail: "alice@example.test", env: {}, githubConnected: false },
     agent: { id: "version-1", agentId: "agent", authorId: "test:alice", workspaceId: "workspace", version: 1, name: "Agent", description: "", instructions: "Use tools.", tools: ["read_file", "github_read", "github_merge"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
     model: { id: "model-1", workspaceId: "workspace", name: "Model", provider: "faux", modelId: "faux-1" },
@@ -70,7 +49,7 @@ async function pendingApproval(session: RunnerSession) {
   assert.fail("no pending approval");
 }
 
-test("agents read pinned GitHub pull requests through the broker and merges always wait for a human, failing definitely only on GitHub's refusal", hostMode, async t => {
+test("agents read GitHub pull requests through the broker and merges always wait for a human, failing definitely only on GitHub's refusal", hostMode, async t => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-session-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const reads: GitHubReadRequest[] = [];
@@ -95,9 +74,12 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   const service = new RunnerService({
     dataDir: directory, sharedSecret: "runner-github-test-secret-not-a-production-secret", controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
     authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
-    readRepository: async () => archive(),
     resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
-    githubRead: async request => { reads.push(request); return view; },
+    githubRead: async request => {
+      reads.push(request);
+      if (request.repository.toLowerCase() !== "acme/alpha") throw new RunnerError(403, "acme/beta is not a GitHub repository of this workspace");
+      return view;
+    },
     githubMerge: async request => { merges.push(request); return merge(); },
   });
   await service.initialize();
@@ -109,13 +91,13 @@ test("agents read pinned GitHub pull requests through the broker and merges alwa
   const admissionId = await sha256("github admission");
   await session.submit(await ticket(id, "submit"), { content: "Read the review and merge.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
   await pendingApproval(session);
-  // The pinned repository's canonical name and the message's admission reach the broker; an unpinned one never does.
-  assert.equal(reads.length, 1);
-  assert.deepEqual({ ...reads[0], callId: undefined }, { sessionId: id, actorId: "test:alice", admissionId, callId: undefined, repository: "acme/alpha", issue: 7 });
+  // The name as written and the message's admission reach the broker, which decides whether the workspace has it.
+  assert.equal(reads.length, 2);
+  assert.deepEqual({ ...reads[0], callId: undefined }, { sessionId: id, actorId: "test:alice", admissionId, callId: undefined, repository: "ACME/Alpha", issue: 7 });
   assert.match(reads[0]!.callId, /^[A-Za-z0-9_-]+$/);
   const transcript = (await session.view()).entries.map(entry => entry.text).join("\n");
   assert.match(transcript, /Fix the parser/);
-  assert.match(transcript, /acme\/beta is not pinned in this session; GitHub reads and merges cover acme\/alpha/);
+  assert.match(transcript, /acme\/beta is not a GitHub repository of this workspace/);
   assert.match(transcript, /full 40-character head commit/);
   const approvals = (await session.view()).approvals;
   assert.equal(approvals.length, 1, "an abbreviated head commit never becomes an approval");
@@ -165,7 +147,7 @@ test("host_bash auto-approves only on the session owner's own host; shared hosts
     const service = new RunnerService({
       dataDir: directory, sharedSecret: "host-command-test-secret-not-for-deployment", controlPlaneUrl: "http://127.0.0.1:8787",
       connectorId: "host-connector", allowFaux: true, unsandboxed: true,
-      authorize: async input => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }), readRepository: async () => archive(),
+      authorize: async input => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
       resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
     });
     await service.initialize();
@@ -195,40 +177,4 @@ test("host_bash auto-approves only on the session owner's own host; shared hosts
       await assert.rejects(session.decide(await claims("approve", hostOwner), approval.id, { decision: "approve", operation: approval.operation }), /already been decided/);
     }
   });
-});
-
-test("git_repin from chat delegates to the broker without changing the source binding or files", hostMode, async t => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-repin-command-")));
-  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
-  faux.setResponses([
-    fauxAssistantMessage([fauxToolCall("git_repin", { repository: pin.path, ref: "feature/next" })], { stopReason: "toolUse" }),
-    fauxAssistantMessage("Repin requested."),
-  ]);
-  const models = createModels(); models.setProvider(faux.provider);
-  const target = binding("repin-chat"); target.agent.tools = ["git_repin"];
-  const calls: unknown[] = [];
-  const service = new RunnerService({
-    dataDir: directory, sharedSecret: "repin-chat-test-secret-not-for-deployment", controlPlaneUrl: "http://127.0.0.1:8787",
-    allowFaux: true, unsandboxed: true,
-    authorize: async input => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }), readRepository: async () => archive(),
-    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
-    repin: async request => { calls.push(request); return { sessionId: "successor", path: "/#/s/successor", repositories: [{ ...pin, ref: "feature/next", commit: head }] }; },
-  });
-  await service.initialize();
-  t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
-  const session = await service.provision(target, await ticket(target.session.id, "create"));
-  await session.sandbox.writeFile(`${pin.path}/README.md`, "keep local work", async () => {});
-  await session.submit(await ticket(target.session.id, "submit"), { content: "Repin", requestId: "repin" }, "write");
-  const approval = await pendingApproval(session);
-  assert.equal(approval.status, "pending");
-  assert.equal(calls.length, 0);
-  await assert.rejects(session.decide({ ...await ticket(target.session.id, "approve"), actorId: "test:bob" }, approval.id,
-    { decision: "approve", operation: approval.operation, brokerCapability: "capability" }), /session owner/);
-  await assert.rejects(session.decide(await ticket(target.session.id, "approve"), approval.id, { decision: "approve", operation: approval.operation }), /broker capability/);
-  await session.decide(await ticket(target.session.id, "approve"), approval.id, { decision: "approve", operation: approval.operation, brokerCapability: "capability" });
-  await idle(session);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(session.binding.session.repositories, [pin]);
-  assert.equal(await session.sandbox.readFile(`${pin.path}/README.md`, async () => {}), "keep local work");
-  assert.match((await session.view()).approvals[0]!.result!, /successor/);
 });

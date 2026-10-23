@@ -1,17 +1,17 @@
 import { HTTPException } from 'hono/http-exception';
 import type { GitProvider, SessionRepository } from '../../../../packages/shared/src/repositories.js';
-import { repositoryLimits, repositoryPath } from '../../../../packages/shared/src/repositories.js';
+import { repositoryPath } from '../../../../packages/shared/src/repositories.js';
 import type { GitPushOperation, HostPushCredential, PushCompletionResult, PushCredential, PushOutcome } from '../../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../../packages/shared/src/policy.js';
 import type { AppContext, Env, PushCredentialRow, SessionAccess, SessionRow } from '../types.js';
-import { auditStatement, requireNoMigration, sessionAccess } from '../db.js';
+import { auditStatement, requireNoMigration, requireUnfrozen, sessionAccess } from '../db.js';
 import { fail, id, identifier, jsonObject, now, text, userIdentifier } from '../http.js';
 import { parseOperation } from '../operations.js';
 import { decryptToken, encryptToken } from '../vault.js';
 import { requireCallbackScope } from '../connectors.js';
 import { requireBrokerReview, requireOperationTool } from '../approval-reviews.js';
-import { cloneSessionRepository, recheckAccess, repositoryAccess, validPin } from '../repositories.js';
+import { cloneSessionRepository, recheckAccess, repositoryAccess } from '../repositories.js';
 import { mintPushToken, revokePushToken, type MintedToken, type PushRevocation } from './mint.js';
 import { branchTip, openPullRequest, pushTarget } from './targets.js';
 
@@ -27,25 +27,15 @@ export async function requireNoRestore(c: AppContext, sessionId: string): Promis
 }
 
 /**
- * The pinned repository whose worktree path the operation names; in a clone session, the workspace repository at that
- * path. A clone session's pushes name the clone's directory, and only theirs do.
+ * The workspace repository at the path the operation names, shaped like a pin. Pushes name a clone's directory; a
+ * pinned session is read-only.
  */
 async function pushPin(env: Env, row: SessionRow, operation: GitPushOperation): Promise<SessionRepository> {
   const path = operation.repository;
-  if ((row.repository_mode === 'clone') !== (operation.directory !== undefined)) {
-    fail(400, 'invalid_operation', row.repository_mode === 'clone' ? 'A clone session pushes a clone\'s directory.' : 'Only clone sessions push a clone\'s directory.');
-  }
-  if (row.repository_mode === 'clone') {
-    const repository = await cloneSessionRepository(env, row, binding => repositoryPath({ provider: binding.provider, host: binding.host, fullName: binding.full_name }) === path);
-    if (!repository) fail(403, 'repository_binding_mismatch', 'The push does not name a repository of this workspace.');
-    return repository;
-  }
-  let repositories: SessionRepository[];
-  try { repositories = JSON.parse(row.repositories_json ?? '[]'); } catch { return fail(409, 'invalid_binding', 'Session repository binding is invalid.'); }
-  if (!Array.isArray(repositories) || repositories.length > repositoryLimits.repositories) fail(409, 'invalid_binding', 'Session repository binding is invalid.');
-  const pin = repositories.find(item => item && typeof item === 'object' && item.path === path);
-  if (!pin || !validPin(pin)) fail(403, 'repository_binding_mismatch', 'The push does not name a pinned session repository.');
-  return pin;
+  if (row.repository_mode !== 'clone' || operation.directory === undefined) fail(400, 'invalid_operation', 'A session pushes a clone\'s directory.');
+  const repository = await cloneSessionRepository(env, row, binding => repositoryPath({ provider: binding.provider, host: binding.host, fullName: binding.full_name }) === path);
+  if (!repository) fail(403, 'repository_binding_mismatch', 'The push does not name a repository of this workspace.');
+  return repository;
 }
 function pinProvider(pin: SessionRepository): { provider: GitProvider; host: string } {
   return 'provider' in pin ? { provider: pin.provider, host: pin.host } : { provider: 'github', host: 'github.com' };
@@ -164,6 +154,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
 
   const authority = await authorize();
   const row = authority.row;
+  requireUnfrozen(row);
   await requireNoRestore(c, sessionId);
   const pin = await pushPin(c.env, row, operation);
   const policy = await requireBinding(c, row.workspace_id, pin);
