@@ -1066,7 +1066,7 @@ export class RunnerSession {
     if (!run) throw new RunnerError(403, "Tool has no authorized writable submission");
     const grants = state.grants;
     const needs: PermissionNeed[] = [];
-    if (!this.binding.agent.tools.includes(tool) && !grants?.tools.includes(tool)) needs.push("tool");
+    if (!this.binding.agent.tools.includes(tool) && !(tool !== "host_bash" && grants?.tools.includes(tool))) needs.push("tool");
     if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
     const unbounded = effect.shell === true && !this.shellAllowed();
     if (unbounded) {
@@ -1095,7 +1095,7 @@ export class RunnerSession {
 
   /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
   private coveredBy(request: PermissionRequest, grants: Grants): boolean {
-    return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || grants.tools.includes(request.tool)
+    return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || (request.tool !== "host_bash" && grants.tools.includes(request.tool))
       : need === "write" ? grants.write : grants.unboundedShell);
   }
 
@@ -1297,7 +1297,10 @@ export class RunnerSession {
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
       // GitHub comments and merges need a Worker-minted broker capability, so they always wait for a human decision;
       // automatic pushes mint their credential from the run's owner admission instead.
-      automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
+      // A tool the owner allowed for the rest of the session runs their calls of it as Auto-approve would; host commands
+      // never take a session grant, so each one still asks.
+      const sessionGranted = operation.kind !== "host.bash" && state.grants?.tools.includes(toolName) === true;
+      automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
         && operation.kind !== "github.merge" && (operation.kind !== "git.push" || admissionId !== undefined)
         && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
     }
@@ -1390,6 +1393,8 @@ export class RunnerSession {
           throw new RunnerError(403, "Only the host's owner can allow a shell without resource limits");
         }
         const scope = input.scope ?? "call";
+        // Each host command runs outside the sandbox, so its permission covers that one call only.
+        if (scope === "session" && request.tool === "host_bash") throw new RunnerError(400, "Host commands can only be allowed once");
         await this.mutate(meta => {
           record(meta, input.decision === "approve" ? { status: "approved", decidedBy: ticket.actorId, scope } : { status: "denied", decidedBy: ticket.actorId });
           if (input.decision !== "approve" || scope !== "session") return;

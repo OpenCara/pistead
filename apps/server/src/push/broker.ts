@@ -139,9 +139,13 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
     }
     const admission = await c.env.DB.query<{ session_id: string; actor_id: string; mode: string; access: string | null; expires_at: number }>('SELECT session_id, actor_id, mode, access, expires_at FROM run_admissions WHERE id = ?')
       .bind(admissionId).first();
+    // The owner's Auto-approve message pushes without asking, as does any owner message once the owner allowed git_push
+    // for the rest of the session.
+    const sessionGrant = admission?.access !== 'auto' && await c.env.DB.query(`SELECT 1 AS granted FROM session_tool_grants
+      WHERE session_id = ? AND tool = 'git_push' AND call_id = ''`).bind(sessionId).first();
     if (!admission || admission.session_id !== sessionId || admission.actor_id !== actorId || admission.mode !== 'write' ||
-        admission.access !== 'auto' || admission.expires_at <= Math.floor(Date.now() / 1000)) {
-      fail(403, 'automatic_push_not_admitted', 'Automatic pushes require an unexpired auto-approve write admission from the session owner.');
+        (admission.access !== 'auto' && !sessionGrant) || admission.expires_at <= Math.floor(Date.now() / 1000)) {
+      fail(403, 'automatic_push_not_admitted', 'Automatic pushes require an unexpired write admission from the session owner, sent with auto-approve or after git_push was allowed for the session.');
     }
     await requireCallbackScope(c, owner.row, connectorId);
     await requireOperationTool(c.env, owner.row, operation, approvalId, admission);

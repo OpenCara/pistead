@@ -81,7 +81,7 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
   // The level the host's Pi starts that model at, as the session itself will.
   const initialLevel = initialModel && host?.models.find(item => sameModel(item, initialModel))?.thinkingLevel;
   const selection: ChatSelection = host && chat?.key === host.id ? chat.value
-    : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "approval" };
+    : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "auto" };
   const model = hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);
   const availableModel = Boolean(model && host?.models.some(item => sameModel(item, model)));

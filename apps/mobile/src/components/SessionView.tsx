@@ -125,7 +125,8 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
         </Banner>}
         {permission ? <View style={ui.inline}>
           <Button small variant="primary" label="Allow once" disabled={disabled} onPress={() => void decide(approval, "approve", "call")} />
-          <Button small label="Allow for this session" disabled={disabled} onPress={() => void decide(approval, "approve", "session")} />
+          {/* Each host command asks again: it runs outside the sandbox. */}
+          {!(approval.operation.kind === "permission" && approval.operation.tool === "host_bash") && <Button small label="Allow for this session" disabled={disabled} onPress={() => void decide(approval, "approve", "session")} />}
           <Button small label="Deny" disabled={disabled} onPress={() => void decide(approval, "deny")} />
         </View> : <>
           <View style={ui.inline}>

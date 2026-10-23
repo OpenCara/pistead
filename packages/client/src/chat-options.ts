@@ -68,9 +68,12 @@ export function selectModel(selection: ChatSelection, next: LocalModelSummary): 
   return { ...selection, model: { provider: next.provider, modelId: next.modelId }, thinkingLevel: next.thinkingLevel ?? clampLevel(next.thinkingLevels, selection.thinkingLevel) };
 }
 
-/** Starting selection for an existing session: its current model, reasoning and shared-run access. */
+/**
+ * Starting selection for an existing session: its current model, reasoning and shared-run access. Before its first
+ * shared message, the owner starts on Auto-approve and everyone else on "Ask before acting".
+ */
 export function initialSelection(view: SessionView, owner: boolean): ChatSelection {
-  const access = view.access ?? "approval";
+  const access = view.access ?? (owner ? "auto" : "approval");
   return {
     model: view.agent && { provider: view.agent.provider, modelId: view.agent.modelId },
     thinkingLevel: view.agent?.thinkingLevel,

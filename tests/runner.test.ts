@@ -587,12 +587,21 @@ test("a tool outside the agent waits for its owner, who allows it once or for th
   const again = await permissionRequest(session);
   assert.notEqual(again.id, once.id, "one call's permission doesn't cover the next");
   await session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation, scope: "session" });
-  await deny();
+  // Allowing the tool for the session also runs the owner's commands of it, this one included, without asking.
+  await idle(session);
   await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo granted", requestId: "granted" }, "write");
+  await idle(session);
+  // Someone else's message uses the tool without a permission card, but its command still needs approval.
+  await session.submit(await ticket(id, "submit", "test:bob"), { content: "TEST_BASH echo bob", requestId: "bob" }, "write");
   await deny();
   const view = await session.view();
   assert.equal(view.approvals.filter(approval => approval.operation.kind === "permission").length, 2, "the session grant asks no more");
-  assert.deepEqual((await commands()).map(approval => approval.operation), ["echo once", "echo again", "echo granted"].map(command => ({ kind: "bash", command })));
+  assert.deepEqual((await commands()).map(approval => [approval.operation, approval.status, approval.automatic]), [
+    [{ kind: "bash", command: "echo once" }, "denied", undefined],
+    [{ kind: "bash", command: "echo again" }, "executed", true],
+    [{ kind: "bash", command: "echo granted" }, "executed", true],
+    [{ kind: "bash", command: "echo bob" }, "denied", undefined],
+  ]);
   assert.equal((await session.createApproval("test:alice", { kind: "bash", command: "echo explicit" })).status, "pending");
   await assert.rejects(session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation }), rejectedWith(409, /already been decided/));
 });
@@ -639,10 +648,7 @@ test("allowing a tool for the session lets the round's other waiting calls of it
   }
   assert.equal(requests.length, 2);
   await session.decide(await ticket(id, "approve"), requests[0]!.id, { decision: "approve", operation: requests[0]!.operation, scope: "session" });
-  // Each command then waits on its own approval, decided while the round still runs.
-  for (const command of await operationRequests(session, 2)) {
-    assert.equal((await session.decide(await ticket(id, "approve"), command.id, { decision: "approve", operation: command.operation })).status, "executed");
-  }
+  // Both commands then run without asking: the session grant approves the owner's calls of the tool.
   await idle(session);
   const view = await session.view();
   assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission").map(approval => [approval.status, approval.scope]), [["approved", "session"], ["approved", "session"]]);

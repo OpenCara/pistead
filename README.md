@@ -325,10 +325,10 @@ Beside the composer you can pick, for each message:
 | Access | Effect |
 |---|---|
 | **Read only** | Inspect files; edits, commands and commits ask the session owner first |
-| **Ask before acting** (default) | Edits are automatic; commands, commits, pushes, GitHub comments and merges need approval |
-| **Auto-approve** (session owner only) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments and merges still need approval. |
+| **Ask before acting** (default for everyone but the session owner) | Edits are automatic; commands, commits, pushes, GitHub comments and merges need approval |
+| **Auto-approve** (session owner only; their default) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments and merges still need approval. |
 
-Turning on **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
+Before a session's first shared message, the owner's chat box starts on **Auto-approve** and everyone else's on **Ask before acting**; after it, each starts on the last shared message's access (Auto-approve only for the owner). Switching to **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
 #### Status, menu and panel
 
@@ -359,7 +359,7 @@ The agent's tool call waits for the decision, and its message waits with it (con
 
 When a tool call needs more than the session allows (a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a host without resource limits), the agent asks instead of failing, and the session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. Only the session owner decides these, and only a host's owner can let commands run without resource limits, in their own sessions.
 
-The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits and the rest still need their own approval. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
+The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. **Allow once** lets that call use the tool, but what it does still needs its own approval. **Allow for this session** also approves what the tool does in the session owner's later messages, as **Auto-approve** would: its commands and pushes run without asking, while GitHub comments and merges still wait for a decision, and other people's messages still ask for approval. Host commands (`host_bash`) can only be allowed once, so each one asks again. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
 
 ### Collaborating on a session
 
