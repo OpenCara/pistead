@@ -95,7 +95,7 @@ function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id
       JOIN connector_workspaces cw ON cw.connector_id = c.id AND cw.workspace_id = m.workspace_id
       JOIN workspace_members host ON host.workspace_id = cw.workspace_id AND host.user_id = c.owner_id
       JOIN users host_user ON host_user.id = c.owner_id
-      WHERE c.id = m.connector_id AND c.owner_id = m.connector_owner_id AND c.revoked_at IS NULL
+      WHERE c.id = m.connector_id AND c.owner_id = m.connector_owner_id AND c.revoked_at IS NULL AND host_user.suspended_at IS NULL
         AND (? = 1 OR host_user.auth_kind <> 'test')
         AND (c.owner_id = ${actor} OR EXISTS (SELECT 1 FROM connector_shares sh
           WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
