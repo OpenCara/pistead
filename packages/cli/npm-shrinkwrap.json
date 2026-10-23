@@ -1,12 +1,12 @@
 {
   "name": "pistead",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "pistead",
-      "version": "0.8.0",
+      "version": "0.9.0",
       "license": "MIT",
       "dependencies": {
         "@earendil-works/chord": "1.2.0",
