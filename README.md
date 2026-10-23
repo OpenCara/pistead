@@ -329,7 +329,7 @@ The session's menu offers **Copy session ID** and **Open in workspace settings**
 
 The session panel has three tabs:
 
-- **Details**: **Host**, **Repositories** (each pin's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
+- **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
 - **Approvals**: every approval and permission request, pending ones first.
 - **Activity**: the session's audit log, newest 200 entries.
 
@@ -344,7 +344,7 @@ Commands, pushes, GitHub comments and merges, and host commands each need an app
 | Commands, commits, pushes, GitHub comments, merges | Anyone with approve permission on the session (the owner always has it) |
 | Host commands | Only the host's owner, who also needs approve permission on the session |
 
-The agent's tool call waits for the decision, and its message waits with it (connector newer than 0.8.0). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Git commit**, **Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
+The agent's tool call waits for the decision, and its message waits with it (connector newer than 0.8.0). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
 #### Permission requests
 

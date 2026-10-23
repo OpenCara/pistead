@@ -388,6 +388,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.post('/api/sessions/:id/operations', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
+    requireUnfrozen(row);
     const operation = parseOperation(await jsonObject(c));
     if (operation.kind === 'permission') fail(400, 'invalid_operation', 'Permission requests come only from tool calls.');
     await requireOperationTool(c.env, row, operation);
