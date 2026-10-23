@@ -1017,5 +1017,10 @@ test('a session that pinned its repositories is read-only: it shows, and nothing
   await denied(await s.owner.request('POST', '/api/sessions/pinned-session/submit', { content: 'hello', requestId: 'frozen' }), 409, 'session_frozen');
   await denied(await s.owner.request('POST', '/api/sessions/pinned-session/approvals/approval', { decision: 'approve' }), 409, 'session_frozen');
   assert.equal(s.f.sqlite.prepare("SELECT COUNT(*) AS n FROM run_admissions WHERE session_id = 'pinned-session'").get()!.n, 0);
+  // It still opens to show its history, and can be stopped.
+  for (const action of ['stop', 'restart']) {
+    const response = await s.owner.request('POST', `/api/sessions/pinned-session/${action}`, {});
+    assert.notEqual((await response.json() as { code?: string }).code, 'session_frozen', action);
+  }
   assert.equal(s.provisions.length, provisions);
 });

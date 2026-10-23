@@ -95,7 +95,7 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   // its clones' local work from the snapshot.
   if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.cloneBackups !== true || capabilities.unsandboxed
     || (capabilities.productionShell !== true && model.connector_owner_id !== ownerId))) {
-    fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a sandboxed host with an up-to-date connector that can run your shell commands.');
+    fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a host with an up-to-date connector, not running unsandboxed, that can run your shell commands.');
   }
   const sourceAgent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
   if (!sourceAgent) fail(409, 'invalid_binding', 'Session binding is incomplete.');

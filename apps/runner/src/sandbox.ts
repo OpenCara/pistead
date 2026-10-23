@@ -1071,7 +1071,7 @@ async function placeholder(parent: FileHandle, name: string): Promise<void> {
   }
 }
 
-function quoteGitConfig(value: string): string {
+export function quoteGitConfig(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\t/g, "\\t")}"`;
 }
 

@@ -287,7 +287,7 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
     {isOwner && session.status !== "archived" && !session.frozen && session.connectorId && <MoveHostSection session={session} user={user} hosts={hosts} openSession={openSession} changed={changed} />}
-    {canWrite && session.status !== "archived" && <OperationSection session={session} changed={changed} />}
+    {canWrite && session.status !== "archived" && !session.frozen && <OperationSection session={session} changed={changed} />}
     {isOwner && <ExportSection session={session} />}
     <AccessSection session={session} view={view} user={user} />
   </div>;
@@ -499,26 +499,24 @@ function ExportSection({ session }: { session: SessionRecord }) {
   </Section>;
 }
 
-type ManualKind = "git.commit" | "bash" | "github.comment";
+type ManualKind = "bash" | "github.comment";
 
 function OperationSection({ session, changed }: { session: SessionRecord; changed: () => void }) {
   const form = useAction();
   const [approval, setApproval] = useState<Pick<ApprovalRecord, "id" | "status"> | null>(null);
-  const [kind, setKind] = useState<ManualKind>("git.commit");
-  const [message, setMessage] = useState("");
+  const [kind, setKind] = useState<ManualKind>("bash");
   const [command, setCommand] = useState("");
   const [repository, setRepository] = useState("");
   const [issue, setIssue] = useState("");
   const [body, setBody] = useState("");
   const issueNumber = Number(issue);
-  const operationReady = kind === "git.commit" ? Boolean(message.trim()) : kind === "bash" ? Boolean(command.trim())
+  const operationReady = kind === "bash" ? Boolean(command.trim())
     : /^[^/\s]+\/[^/\s]+$/.test(repository.trim()) && Number.isSafeInteger(issueNumber) && issueNumber > 0 && Boolean(body.trim());
 
   function requestOperation(event: FormEvent) {
     event.preventDefault();
     if (!operationReady || form.busy) return;
-    const operation: Operation = kind === "git.commit" ? { kind, message }
-      : kind === "bash" ? { kind, command }
+    const operation: Operation = kind === "bash" ? { kind, command }
       : { kind, repository: repository.trim(), issue: issueNumber, body };
     setApproval(null);
     void form.run(async () => {
@@ -534,10 +532,9 @@ function OperationSection({ session, changed }: { session: SessionRecord; change
         <fieldset disabled={form.busy} className="stack">
           <Field label="Operation">
             <select className="select" value={kind} onChange={event => setKind(event.target.value as ManualKind)}>
-              <option value="git.commit">Git commit</option><option value="bash">Bash command</option><option value="github.comment">GitHub comment</option>
+              <option value="bash">Bash command</option><option value="github.comment">GitHub comment</option>
             </select>
           </Field>
-          {kind === "git.commit" && <Field label="Commit message"><textarea className="textarea" required autoComplete="off" value={message} onChange={event => setMessage(event.target.value)} /></Field>}
           {kind === "bash" && <Field label="Command"><textarea className="textarea mono" required autoComplete="off" value={command} onChange={event => setCommand(event.target.value)} /></Field>}
           {kind === "github.comment" && <>
             <Field label="Repository" hint="owner/name"><input className="input" required autoComplete="off" value={repository} onChange={event => setRepository(event.target.value)} /></Field>

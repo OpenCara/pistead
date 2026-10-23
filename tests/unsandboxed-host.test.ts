@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
@@ -64,4 +64,31 @@ test("approved unsandboxed commands run in the worktree without the connector en
   const snapshot = await workspace.snapshot(authorize);
   assert.ok(snapshot.some(file => file.path === "worktree/README.md" && Buffer.from(file.data, "base64").toString() === "hello"));
   assert.ok(snapshot.some(file => file.path === "owner.gitconfig"));
+});
+
+test("an unsandboxed clone session's Git uses the host user's own credential helpers, and no other session's does", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-credentials-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // The host user's own Git config, in their real HOME (with a quote in its path, to check the helper's quoting).
+  const home = join(directory, "host user's home");
+  await mkdir(home);
+  await writeFile(join(home, ".gitconfig"), "[credential]\n\thelper = \"!f() { test \\\"$1\\\" = get && echo username=host-user && echo password=host-secret; }; f\"\n");
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => { process.env.HOME = previous; });
+  const fill = "printf 'protocol=https\\nhost=forge.example\\n\\n' | git credential fill 2>&1 || true";
+  const clone = binding("host-clone");
+  clone.session.repositoryMode = "clone";
+  const cloned = new HostWorkspace(clone, join(directory, "clone"));
+  t.after(() => cloned.close());
+  await cloned.initialize();
+  assert.match(await cloned.execute({ kind: "bash", command: fill }, false, authorize), /username=host-user\npassword=host-secret/);
+  // A session from before sessions cloned keeps its owner configuration unchanged, without the host's credentials.
+  const plain = new HostWorkspace(binding("host-plain"), join(directory, "plain"));
+  t.after(() => plain.close());
+  await plain.initialize();
+  assert.doesNotMatch(await plain.execute({ kind: "bash", command: fill }, false, authorize), /host-secret/);  // Its backups keep the worktree as files, which a clone's repository has no bound for: they are refused.
+  assert.ok((await cloned.snapshot(authorize)).length > 0);
+  await cloned.execute({ kind: "bash", command: "git init -q app" }, false, authorize);
+  await assert.rejects(cloned.snapshot(authorize), /need a host with the sandbox/);
 });

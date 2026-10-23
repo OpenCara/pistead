@@ -220,7 +220,6 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     agent ??= await chatAgentVersion(c.env, ownerId, model, capabilities);
     const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone' };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
-    const providerPins = 0;
     const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
     await requireMember(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
@@ -247,7 +246,6 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
             WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
           AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id
           AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
-          AND (? = 0 OR json_type(host.capabilities_json, '$.gitProviders') = 'true')
           AND (? = 0 OR json_type(host.capabilities_json, '$.gitPush') = 'true')
           AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
             WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
@@ -260,7 +258,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
         resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
         JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
         row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
-        testMode(c.env) ? 1 : 0, providerPins, gitPush).first();
+        testMode(c.env) ? 1 : 0, gitPush).first();
     if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
     await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: agent.id }).run();
     try {

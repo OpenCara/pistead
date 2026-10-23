@@ -170,7 +170,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
       : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
-            canRestart={isOwner && !readOnly && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
+            canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
           {session.hostUnsandboxed && (permissions.includes("write") || canApprove) && <Banner tone="danger" title="Unsandboxed host">
             This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.
           </Banner>}
@@ -257,7 +257,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
   // Stopping takes the running message and everything queued; hosts that predate it don't offer it.
-  const canStop = Boolean(view.stoppable) && !readOnly && canWrite && activeQueue.length > 0;
+  const canStop = Boolean(view.stoppable) && session.status !== "archived" && canWrite && activeQueue.length > 0;
   const stopPending = queue.some(item => item.status === "stopping");
   const conversations = view.conversations;
   const sideConversations = conversations.filter(item => item.mode === "ask" && (!item.actorId || item.actorId === user.id));

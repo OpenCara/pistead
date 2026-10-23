@@ -4,10 +4,11 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats, type Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Operation, RunnerBinding } from "../../../packages/shared/src/types.js";
 import {
-  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, ownerGitConfig, pinOwnerConfig, sessionEnvironment, text,
+  MAX_FILE_BYTES, MAX_OUTPUT_BYTES, SandboxProcessError, TIMEOUT_MS, ownerGitConfig, pinOwnerConfig, quoteGitConfig, sessionEnvironment, text,
   type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
 } from "./sandbox.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
@@ -34,6 +35,8 @@ export class HostWorkspace {
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;
   readonly #testProvider: boolean;
+  /** A clone session: the agent clones and pushes with the host's own Git, credentials included. */
+  readonly #clone: boolean;
   #initialization: Promise<void> | undefined;
   #ready = false;
   #closed = false;
@@ -52,6 +55,7 @@ export class HostWorkspace {
     const githubLogin = binding.owner.githubLogin === null ? null : text(binding.owner.githubLogin, "GitHub login", 256);
     this.#root = resolve(root);
     this.#testProvider = binding.model.provider === "faux";
+    this.#clone = binding.session.repositoryMode === "clone";
     this.#identity = Object.freeze({
       ownerId, githubLogin, gitName, gitEmail, home: join(this.#root, "home"), worktree: join(this.#root, "worktree"),
       env: Object.freeze({ ...binding.owner.env }),
@@ -79,7 +83,8 @@ export class HostWorkspace {
           throw new Error("Sandbox storage must be private and owned by the runner user");
         }
       }
-      await (await pinOwnerConfig(join(this.#root, "owner.gitconfig"), ownerGitConfig(this.#identity))).close();
+      const config = ownerGitConfig(this.#identity) + (this.#clone ? hostCredentialConfig(process.env.HOME || homedir()) : "");
+      await (await pinOwnerConfig(join(this.#root, "owner.gitconfig"), config)).close();
       if (!await exists(join(this.worktree, ".git", "HEAD"))) {
         await this.#git(["init", "--quiet", "--template=", "--initial-branch=main", this.worktree]);
       }
@@ -168,6 +173,11 @@ export class HostWorkspace {
         if (names.length > MAX_ENTRIES) throw hostError("directory has too many entries");
         for (const name of names.sort()) {
           if (skip.includes(name)) continue;
+          // A clone in the worktree: its history and objects have no bound a backup could keep. On a host with the
+          // sandbox, backups keep a clone's local work as a bundle instead.
+          if (name === ".git" && prefix.startsWith("worktree/")) {
+            throw hostError("backups of sessions with a clone in the worktree need a host with the sandbox; push the clone's work instead");
+          }
           const info = await lstat(join(directory, name));
           if (info.isDirectory()) await visit(join(directory, name), `${prefix}/${name}`, [], depth + 1);
           else if (info.isFile()) await add(directory, name, `${prefix}/${name}`);
@@ -324,6 +334,18 @@ export class HostWorkspace {
     child.stdin.end(input ?? "");
     return promise;
   }
+}
+
+/**
+ * Lets a clone session's Git use the host user's own credential helpers (gh, the keychain, Git Credential Manager, a
+ * store file), as their own clone or push would, though its commands get a session HOME and Git config. The helper asks
+ * `git credential fill` in the host user's environment, never prompting; it answers only `get`. Only the host's owner
+ * runs commands on an unsandboxed host, so this lends their credentials to nobody else.
+ */
+export function hostCredentialConfig(home: string): string {
+  const shell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const helper = `!f() { test "$1" = get || exit 0; exec env -i PATH="$PATH" HOME=${shell(home)} GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= GCM_INTERACTIVE=never git credential fill; }; f`;
+  return `[credential]\n\thelper = ${quoteGitConfig(helper)}\n`;
 }
 
 function checked(result: Captured): Captured {

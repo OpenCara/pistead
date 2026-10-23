@@ -31,7 +31,8 @@ export async function requireRunnerAccess(c: AppContext, actorId: string, row: S
   }
   if (access.row.status === 'archived' && action !== 'view' && action !== 'events') fail(409, 'session_archived', 'Session is archived.');
   // A session that pinned its repositories stays readable only.
-  if (action !== 'view' && action !== 'events') requireUnfrozen(access.row);
+  // A read-only session still opens (create, restart) to show its history, and can be stopped; nothing new runs in it.
+  if (!['view', 'events', 'create', 'restart', 'stop'].includes(action)) requireUnfrozen(access.row);
   if (['create', 'restart', 'restore', 'backup'].includes(action) && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
   if (action !== 'restore' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');

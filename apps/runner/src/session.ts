@@ -581,6 +581,16 @@ export class RunnerSession {
     // they are ready, and a failure leaves it all suspended, harness included, until the session restarts. Nothing
     // resumes in a read-only session.
     if (this.#repositories.status === "ready" && !this.#frozen) await this.resumeWork();
+    // A read-only session never runs what it had queued or at work when it became read-only: that ends here, as a stop
+    // would, so it doesn't stay busy forever.
+    if (this.#frozen) {
+      await this.mutate(meta => {
+        for (const run of Object.values(meta.runs)) if (["queued", "admitting", "running"].includes(run.status)) run.status = "interrupted";
+        for (const card of Object.values(meta.approvals)) {
+          if (card.status === "pending") Object.assign(card, { status: "interrupted", result: "This session is read-only now; nothing in it runs." });
+        }
+      });
+    }
     // Reported while its repositories are still being prepared too; reopening is also how a report lost with a previous
     // connection or process gets through.
     this.#activity?.start();
@@ -1230,6 +1240,8 @@ export class RunnerSession {
       throw new RunnerError(403, "Host commands require a connected host with a known owner");
     }
     if (operation.kind === "git.push" && !this.#clone) throw new RunnerError(400, "Only clone sessions push a clone's directory");
+    // On a host without the sandbox the agent pushes with the host's own Git: an approved push would only fail.
+    if (operation.kind === "git.push" && !this.#egress) throw new RunnerError(400, "On a host without the sandbox, push with git in bash");
     const toolName = ({ "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "github.merge": "github_merge", "git.push": "git_push", "git.repin": "git_repin", "host.bash": "host_bash" } as const)[operation.kind];
     if (!consent.permitted && !this.binding.agent.tools.includes(toolName) && !(await this.metadata()).grants?.tools.includes(toolName)) {
       throw new RunnerError(403, "Operation not enabled by pinned agent version");
@@ -1543,7 +1555,7 @@ export class RunnerSession {
         const authorize = async () => { await this.authorize(ticket.actorId, "manage"); };
         // A clone session's clones go into the backup as bundles of their local work, not as files: a restore clones them
         // again from their origin.
-        // On an unsandboxed host the worktree, clones included, is kept as files.
+        // On an unsandboxed host the worktree is kept as files, and a session with a clone in it can't be backed up.
         const sandboxed = this.#clone && this.#egress;
         const { clones, found } = sandboxed ? await (this.sandbox as Sandbox).cloneBackup(authorize) : { clones: [], found: [] };
         const files = sandboxed ? await (this.sandbox as Sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);

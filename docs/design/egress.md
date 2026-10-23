@@ -257,12 +257,15 @@ on the forge. Bundles in the backup keep all of that where backups already go.
   advertises `plainGit` (and, unless unsandboxed, `cloneBackups`) whatever its `sandbox` claim says: real connectors
   advertise `sandbox: false` because isolation is verified per session, and their sessions always run in the sandbox.
 - **Unsandboxed hosts** advertise `plainGit` too. Their clone sessions have no proxy: the agent clones, commits and pushes
-  with the host's own Git, network and credentials, each command with the owner's approval as before. `git_push` is not
-  offered there, and backups keep the worktree, clones included, as files.
+  with the host's own Git, network and credentials, each command with the owner's approval as before. Their Git config
+  gets a credential helper that asks the host user's own helpers with their real HOME (`hostCredentialConfig`), which
+  sessions from before don't (their owner config is immutable). `git_push` is not offered there. Backups keep the
+  worktree as files, so a session with a clone in its worktree can't be backed up: a clone's history has no bound.
 - **Sessions that can't clone.** An agent without `bash`, or another member's session on a host without resource limits
   (whose shell commands are refused), works in an empty worktree. The session is created anyway, and its record says why
   (`cloneUnavailable`, on creation and on single-session reads).
-- **Pinned sessions are read-only** (`frozenSession`: not a clone session, with pins). Every runner request but `view` and
-  `events` is refused (`session_frozen`), and so are push credentials, GitHub comments and merges, restores of their
-  backups, moves and repins. Their transcript, approvals, backups (to download) and exports stay available; the session
+- **Pinned sessions are read-only** (`frozenSession`: not a clone session, with pins). Every runner request but `view`,
+  `events`, `create`, `restart` and `stop` (which open it to show its history, and end work) is refused
+  (`session_frozen`), and so are push credentials, GitHub comments and merges, restores of their backups and moves.
+  Opening one ends whatever it had queued or at work, and the cards waiting on decisions, as `interrupted`. Their transcript, approvals, backups (to download) and exports stay available; the session
   record says `frozen`, and the web and mobile apps offer nothing that would be refused.
