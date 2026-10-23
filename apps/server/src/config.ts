@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { adminUserId } from './admin.js';
 import { ConnectorHubRegistry } from './connector-hub.js';
 import { openDatabase } from './db/index.js';
 import { openStorage } from './storage/index.js';
@@ -55,7 +56,7 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   if (env.SESSION_SECRET.length < 32) throw new ConfigurationError('SESSION_SECRET must be at least 32 characters long.');
   if (!env.VAULT_KEY) throw new ConfigurationError('VAULT_KEY is required: set it to a base64url-encoded random 32-byte key.');
   if (!/^(?:[A-Za-z0-9+/]{43}=?|[A-Za-z0-9_-]{43}=?)$/.test(env.VAULT_KEY)) throw new ConfigurationError('VAULT_KEY must be a base64url-encoded 32-byte key.');
-  if (env.ADMIN_USER_IDS && env.ADMIN_USER_IDS.split(',').some(item => !/^github:[1-9][0-9]*$/.test(item.trim()))) {
+  if (env.ADMIN_USER_IDS && env.ADMIN_USER_IDS.split(',').some(item => !adminUserId(env, item.trim()))) {
     throw new ConfigurationError('ADMIN_USER_IDS must list user IDs such as github:12345, separated by commas.');
   }
   const port = Number(processEnv.PORT ?? '8787');

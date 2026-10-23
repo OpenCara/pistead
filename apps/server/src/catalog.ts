@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { defaultAgentName, retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
 import type { ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
-import { agentVersion, auditStatement, modelDefinition, requireMember } from './db.js';
+import { agentVersion, auditAfterChange, auditStatement, modelDefinition, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
 import { ConstraintError, type Query } from './db/types.js';
@@ -119,16 +119,6 @@ async function requireAuthor(env: Env, agentId: string, actorId: string): Promis
   const agent = await env.DB.query<{ id: string }>('SELECT id FROM agents WHERE id = ? AND author_id = ? AND chat = 0')
     .bind(agentId, actorId).first();
   if (!agent) fail(404, 'not_found', 'Agent not found.');
-}
-
-function auditAfterChange(
-  env: Env, actorId: string, action: string, workspaceId: string | null,
-  detail: Record<string, unknown>, auditId = id(),
-): Query<never> {
-  // This must immediately follow a single-row mutation in the same atomic batch.
-  return env.DB.query<never>(`INSERT INTO audit (id, workspace_id, session_id, actor_id, action, detail_json, created_at)
-    SELECT ?, ?, NULL, ?, ?, ?, ? WHERE changes() = 1`)
-    .bind(auditId, workspaceId, actorId, action, JSON.stringify(detail), now());
 }
 
 function privateVersionStatement(

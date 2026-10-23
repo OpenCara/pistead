@@ -115,15 +115,18 @@ test('only the administrators ADMIN_USER_IDS lists reach the admin API, and thei
   assert.deepEqual([...instanceAdmins({ ...f.env, TEST_AUTH_ENABLED: 'false' })], ['github:1']);
 });
 
-test('the server refuses to start with an ADMIN_USER_IDS entry that is not a GitHub user ID', async () => {
+test('the server refuses to start with an ADMIN_USER_IDS entry that is not a GitHub user ID, or a test identity in test mode', async () => {
   const base = { APP_ORIGIN: 'https://pistead.example.com', SESSION_SECRET: 's'.repeat(32), VAULT_KEY: Buffer.alloc(32, 7).toString('base64url'),
     DATABASE_URL: 'sqlite::memory:' };
   for (const value of ['octocat', 'github:1,', 'github:01', 'test:operator']) {
     await assert.rejects(loadConfig({ ...base, ADMIN_USER_IDS: value }), ConfigurationError, value);
   }
-  const config = await loadConfig({ ...base, ADMIN_USER_IDS: 'github:1, github:42' });
-  try { assert.equal(config.env.ADMIN_USER_IDS, 'github:1, github:42'); }
-  finally { await config.env.CONNECTOR_HUB?.close(); await config.env.DB.close(); }
+  const testMode = { TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString() };
+  for (const [settings, value] of [[{}, 'github:1, github:42'], [testMode, 'github:1, test:operator']] as const) {
+    const config = await loadConfig({ ...base, ...settings, ADMIN_USER_IDS: value });
+    try { assert.equal(config.env.ADMIN_USER_IDS, value); }
+    finally { await config.env.CONNECTOR_HUB?.close(); await config.env.DB.close(); }
+  }
 });
 
 test('the admin lists every account, workspace and host, without what anyone works on', async t => {
@@ -206,6 +209,27 @@ test('a suspended session owner\'s sessions are refused on hosts that are still 
   await denied(await self(f, connector, 'network', { sessionId: bobSession.id }), 403, 'connector_unavailable');
   await json(await self(f, connector, 'activity', { sessionId: aliceSession.id, activity: 'working' }));
   await denied(await alice.request('GET', `/api/sessions/${bobSession.id}`), 404, 'not_found');
+});
+
+test('only the request that changes an account\'s suspension records it, also when requests race', async t => {
+  const f = await fixture(t);
+  const operator = await f.client('operator'); const alice = await f.client('alice');
+  const audited = (action: string) => f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE action = ?').get(action)!.n;
+  // Both requests check the account before either writes: each batch waits until the other request reaches its own.
+  const db = f.env.DB;
+  let waiting: (() => void) | null = null;
+  f.env.DB = { ...db, async batch(statements) {
+    if (waiting) { waiting(); waiting = null; } else await new Promise<void>(resolve => { waiting = resolve; });
+    return db.batch(statements);
+  } };
+  for (const action of ['suspend', 'unsuspend'] as const) {
+    const responses = await Promise.all([1, 2].map(() => operator.request('POST', `/api/admin/users/${alice.user.id}/${action}`)));
+    for (const response of responses) await json(response);
+    assert.equal(audited(`user.${action}ed`), 1, action);
+  }
+  f.env.DB = db;
+  await json(await operator.request('POST', `/api/admin/users/${alice.user.id}/unsuspend`));
+  assert.equal(audited('user.unsuspended'), 1, 'unsuspending an active account records nothing');
 });
 
 test('administrators can\'t be suspended, and unknown or malformed accounts are refused', async t => {

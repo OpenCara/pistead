@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { adminListLimit, type AdminHost, type AdminList, type AdminOverview, type AdminUser, type AdminWorkspace } from '../../../packages/shared/src/admin.js';
-import { auditStatement } from './db.js';
+import { auditAfterChange } from './db.js';
 import { fail, now, testMode, userIdentifier } from './http.js';
 import type { Env, WorkerEnv } from './types.js';
 
@@ -10,10 +10,14 @@ import type { Env, WorkerEnv } from './types.js';
  * grants nothing inside workspaces or sessions: no session titles, prompts, repositories or credentials are shown here.
  */
 
-/** The configured administrators. Test identities count only in test mode, where they can sign in at all. */
+/** Whether ADMIN_USER_IDS may list `value`: a GitHub user, or a test identity while test mode lasts, where it can sign in at all. */
+export function adminUserId(env: Env, value: string): boolean {
+  return /^github:[1-9][0-9]*$/.test(value) || (testMode(env) && /^test:[A-Za-z0-9_-]{1,128}$/.test(value));
+}
+
+/** The configured administrators. */
 export function instanceAdmins(env: Env): Set<string> {
-  return new Set((env.ADMIN_USER_IDS ?? '').split(',').map(item => item.trim())
-    .filter(item => /^github:[1-9][0-9]*$/.test(item) || (testMode(env) && /^test:[A-Za-z0-9_-]{1,128}$/.test(item))));
+  return new Set((env.ADMIN_USER_IDS ?? '').split(',').map(item => item.trim()).filter(item => adminUserId(env, item)));
 }
 
 export function isInstanceAdmin(env: Env, userId: string): boolean {
@@ -74,10 +78,8 @@ async function liveHostIds(env: Env, ownerId?: string): Promise<string[]> {
     .bind(ownerId ?? null, ownerId ?? null).all()).map(row => row.id);
 }
 
-async function requireUser(env: Env, userId: string): Promise<{ id: string; suspended_at: string | null }> {
-  const user = await env.DB.query<{ id: string; suspended_at: string | null }>('SELECT id, suspended_at FROM users WHERE id = ?').bind(userId).first();
-  if (!user) fail(404, 'not_found', 'User not found.');
-  return user;
+async function requireUser(env: Env, userId: string): Promise<void> {
+  if (!await env.DB.query('SELECT 1 FROM users WHERE id = ?').bind(userId).first()) fail(404, 'not_found', 'User not found.');
 }
 
 export function registerAdmin(app: Hono<WorkerEnv>): void {
@@ -141,16 +143,15 @@ export function registerAdmin(app: Hono<WorkerEnv>): void {
     const userId = userIdentifier(c.req.param('id'));
     // Covers the actor too: administrators are removed from ADMIN_USER_IDS, never locked out from the panel.
     if (isInstanceAdmin(c.env, userId)) fail(409, 'instance_admin', 'Instance administrators can\'t be suspended. Remove them from ADMIN_USER_IDS first.');
-    const user = await requireUser(c.env, userId);
-    if (!user.suspended_at) {
-      await c.env.DB.batch([
-        c.env.DB.query('UPDATE users SET suspended_at = ? WHERE id = ? AND suspended_at IS NULL').bind(now(), userId),
-        c.env.DB.query('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId),
-        c.env.DB.query('DELETE FROM native_auth_codes WHERE user_id = ?').bind(userId),
-        c.env.DB.query('DELETE FROM connector_pairings WHERE owner_id = ?').bind(userId),
-        auditStatement(c.env, actor, 'user.suspended', null, null, { userId }),
-      ]);
-    }
+    await requireUser(c.env, userId);
+    // Only the request that suspends the account records it; any repeat still signs it out again.
+    await c.env.DB.batch([
+      c.env.DB.query('UPDATE users SET suspended_at = ? WHERE id = ? AND suspended_at IS NULL').bind(now(), userId),
+      auditAfterChange(c.env, actor, 'user.suspended', null, { userId }),
+      c.env.DB.query('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId),
+      c.env.DB.query('DELETE FROM native_auth_codes WHERE user_id = ?').bind(userId),
+      c.env.DB.query('DELETE FROM connector_pairings WHERE owner_id = ?').bind(userId),
+    ]);
     // Their hosts can't reconnect while the account is suspended; this closes the connections they already have.
     for (const hostId of await liveHostIds(c.env, userId)) await c.env.CONNECTOR_HUB?.revoke(hostId).catch(() => undefined);
     return c.json({ user: adminUser(instanceAdmins(c.env), (await adminUsers(c.env, userId))[0]) });
@@ -158,13 +159,11 @@ export function registerAdmin(app: Hono<WorkerEnv>): void {
   app.post('/api/admin/users/:id/unsuspend', async c => {
     const actor = c.get('auth').userId;
     const userId = userIdentifier(c.req.param('id'));
-    const user = await requireUser(c.env, userId);
-    if (user.suspended_at) {
-      await c.env.DB.batch([
-        c.env.DB.query('UPDATE users SET suspended_at = NULL WHERE id = ?').bind(userId),
-        auditStatement(c.env, actor, 'user.unsuspended', null, null, { userId }),
-      ]);
-    }
+    await requireUser(c.env, userId);
+    await c.env.DB.batch([
+      c.env.DB.query('UPDATE users SET suspended_at = NULL WHERE id = ? AND suspended_at IS NOT NULL').bind(userId),
+      auditAfterChange(c.env, actor, 'user.unsuspended', null, { userId }),
+    ]);
     return c.json({ user: adminUser(instanceAdmins(c.env), (await adminUsers(c.env, userId))[0]) });
   });
 }
