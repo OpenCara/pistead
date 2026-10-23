@@ -1377,7 +1377,7 @@ export class RunnerSession {
       await this.authorize(approval.requestedBy, "write");
       // A tool call waiting on this card holds its message, so the operation runs now and the call gets its outcome. Any
       // other card (one requested outside a message) waits for the queue, so it never runs beside the agent.
-      if (!this.#approvalWaiters.has(id) && Object.values(state.runs).some(run => ["queued", "running", "admitting"].includes(run.status)))
+      if (!this.#approvalWaiters.has(id) && Object.values(state.runs).some(holdsQueue))
         throw new RunnerError(409, "Wait for the session queue to finish before approval execution");
       if (["github.comment", "github.merge", "git.push"].includes(approval.operation.kind) && !input.brokerCapability) throw new RunnerError(403, "Missing owner-bound single-use broker capability");
       await this.mutate(meta => { record(meta, { status: "executing", decidedBy: ticket.actorId }); });
