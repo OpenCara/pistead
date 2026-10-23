@@ -128,7 +128,7 @@ Sessions **clone on demand**: every new session starts with an empty worktree an
 - On a host its owner runs [without the sandbox](#running-without-the-sandbox), the agent clones, commits and pushes with the host's own Git, network and credentials (its Git credential helpers, such as `gh auth setup-git`), each command with approval. Such a session can't be backed up once it has a clone in its worktree.
 - Cloning needs shell commands: an agent without `bash` (a session started from a model has it), or another member's session on a host without [resource limits](#the-sandbox), works in an empty worktree, and the session says so.
 - Removing a repository from the workspace stops new reads and pushes of it at once, in running sessions too.
-- The host needs a current connector: one from before sessions cloned their repositories can't start new sessions.
+- The host needs connector 0.9.0 or newer: one from before sessions cloned their repositories can't start new sessions.
 
 Sessions started before this change pinned their repositories to exact commits. They stay **read-only**: their conversation, approvals, backups (to download) and exports remain, but they no longer run messages, approvals, backups, restores or moves. Start a new session to continue their work.
 
@@ -220,7 +220,7 @@ Pistead labels such a host **Unsandboxed** to everyone who can see it.
 
 #### Repository cache (preview)
 
-By default each session downloads its clones itself. With `--repo-cache` (connector 0.8.0 or newer), the connector keeps a full clone of each repository on the host and lets sessions' clones borrow from it:
+By default each session downloads its clones itself. With `--repo-cache` (connector 0.9.0 or newer), the connector keeps a full clone of each repository on the host and lets sessions' clones borrow from it:
 
 ```sh
 npx pistead@latest connect --repo-cache                            # one cache for every session on this host
@@ -303,7 +303,7 @@ Shared messages and side asks share one queue: up to 64 waiting or running, with
 
 #### Stopping the agent
 
-While the agent works, anyone with write permission can press **Stop** (the square beside send) to stop the message running now and every message queued behind it, side asks included (connector newer than 0.8.0). They show as stopped in the queue at once, and the transcript marks where the work stopped and who stopped it. A tool call waiting on a card ends and its card is marked interrupted; a command or push already running finishes, and its card shows the outcome. The queue line reads **Stopping...** until the host has ended the work; messages sent meanwhile wait and then run as usual. A queued message that was stopped never reaches the agent: send it again to run it. A session whose last shared message was stopped shows as **Idle**.
+While the agent works, anyone with write permission can press **Stop** (the square beside send) to stop the message running now and every message queued behind it, side asks included (connector 0.9.0 or newer). They show as stopped in the queue at once, and the transcript marks where the work stopped and who stopped it. A tool call waiting on a card ends and its card is marked interrupted; a command or push already running finishes, and its card shows the outcome. The queue line reads **Stopping...** until the host has ended the work; messages sent meanwhile wait and then run as usual. A queued message that was stopped never reaches the agent: send it again to run it. A session whose last shared message was stopped shows as **Idle**.
 
 #### Chat options
 
@@ -344,7 +344,7 @@ Commands, pushes, GitHub comments and merges, and host commands each need an app
 | Commands, commits, pushes, GitHub comments, merges | Anyone with approve permission on the session (the owner always has it) |
 | Host commands | Only the host's owner, who also needs approve permission on the session |
 
-The agent's tool call waits for the decision, and its message waits with it (connector newer than 0.8.0). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
+The agent's tool call waits for the decision, and its message waits with it (connector 0.9.0 or newer). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
 #### Permission requests
 
