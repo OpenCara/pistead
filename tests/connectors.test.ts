@@ -8,7 +8,7 @@ import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
 import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
-import { fakeHub, testDatabase, type FakeHub } from './helpers/control-plane.js';
+import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
@@ -147,7 +147,8 @@ function rpcHub(f: Fixture, connector: Connected, respond: (envelope: ConnectorR
   return requests;
 }
 
-async function sharedAgent(f: Fixture, tools: AgentVersion['tools'] = ['identity', 'github_comment']) {
+/** A host shared with the workspace, on which another member, the creator, starts sessions from its model. */
+async function sharedHost(f: Fixture) {
   const admin = await f.client('admin'); const host = await f.client('host'); const creator = await f.githubClient();
   const team = await workspace(admin);
   await addMember(admin, team.id, host); await addMember(admin, team.id, creator);
@@ -177,27 +178,31 @@ async function sharedAgent(f: Fixture, tools: AgentVersion['tools'] = ['identity
   const { models } = await json<{ models: ModelDefinition[] }>(await creator.request('GET', `/api/workspaces/${team.id}/models`));
   assert.equal(models.length, 1);
   const model = models[0];
-  const { agent: draft } = await json<{ agent: AgentVersion }>(await host.request('POST', '/api/agents', {
-    name: 'Published local agent', description: '', instructions: '', tools, modelId: model.id,
-  }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await host.request('POST', `/api/agents/${draft.agentId}/publish`, { workspaceId: team.id }), 201);
   const hub = provisionHub(f);
-  const input = { workspaceId: team.id, agentVersionId: agent.id, title: 'Creator session' };
-  return { admin, host, creator, team, connector, model, agent, hub, input };
+  const input = { workspaceId: team.id, modelId: model.id, title: 'Creator session' };
+  return { admin, host, creator, team, connector, model, hub, input };
 }
 
-async function sharedSession(f: Fixture, tools?: AgentVersion['tools']) {
-  const setup = await sharedAgent(f, tools);
-  const { session } = await json<{ session: SessionRecord }>(await setup.creator.request('POST', '/api/sessions', {
+/**
+ * The creator's session on the shared host, as one started from an agent the host published before agents were removed:
+ * it runs `tools` only, and any other tool asks the session owner. The session the creator starts here, from the
+ * host's model, is provisioned as usual; the returned one is its copy that runs the saved agent.
+ */
+async function sharedSession(f: Fixture, tools: AgentVersion['tools'] = ['identity', 'github_comment']) {
+  const setup = await sharedHost(f);
+  const { session: started } = await json<{ session: SessionRecord }>(await setup.creator.request('POST', '/api/sessions', {
     ...setup.input, trustedConnectorId: setup.connector.connectorId,
   }), 201);
-  assert.equal(session.status, 'ready');
+  assert.equal(started.status, 'ready');
   // Sessions pin nothing: the agent clones the workspace's repositories.
-  assert.deepEqual(session.repositories, []);
-  assert.equal(session.repositoryMode, 'clone');
+  assert.deepEqual(started.repositories, []);
+  assert.equal(started.repositoryMode, 'clone');
   assert.equal(setup.hub.requests.length, 1);
   assert.deepEqual(setup.hub.unexpected, []);
-  return { ...setup, session };
+  const agent = seedAgentVersion(f.sqlite, { authorId: setup.host.user.id, workspaceId: setup.team.id, modelId: setup.model.id, tools,
+    name: 'Published local agent' });
+  const session: SessionRecord = { ...started, id: seedSavedAgentSession(f.sqlite, started.id, agent), agentVersionId: agent.id };
+  return { ...setup, agent, session };
 }
 
 async function privateWorkspace(f: Fixture) {
@@ -208,11 +213,9 @@ async function privateWorkspace(f: Fixture) {
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
   assert.equal(models.length, 1);
   const model = models[0];
-  const agentInput = { name: 'Unpublished own agent', description: '', instructions: '', tools: ['identity'], modelId: model.id };
-  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', agentInput), 201);
   const hub = provisionHub(f);
-  const input = { workspaceId: team.id, agentVersionId: agent.id, title: 'Workspace-readable own session' };
-  return { owner, member, outsider, team, connector, model, agent, agentInput, hub, input };
+  const input = { workspaceId: team.id, modelId: model.id, title: 'Workspace-readable own session' };
+  return { owner, member, outsider, team, connector, model, hub, input };
 }
 
 async function privateHostSession(f: Fixture) {
@@ -532,7 +535,7 @@ test('sharing is connector-owner-only with live workspace membership and imports
 });
 
 test('foreign-host sessions require exact trust and retain the creator identity in storage and the provisioning envelope', async t => {
-  const f = await fixture(t); const s = await sharedAgent(f);
+  const f = await fixture(t); const s = await sharedHost(f);
   for (const trustedConnectorId of [undefined, 'another-connector', s.host.user.id]) {
     await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId }), 400, 'connector_trust_required');
   }
@@ -550,7 +553,7 @@ test('foreign-host sessions require exact trust and retain the creator identity 
   assert.equal(session.connectorOwnerId, s.host.user.id);
   const stored = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(session.id)!;
   assert.equal(stored.owner_id, s.creator.user.id);
-  assert.equal(stored.agent_version_id, s.agent.id);
+  assert.equal(stored.agent_version_id, session.agentVersionId);
   assert.equal(stored.connector_id, s.connector.connectorId);
   assert.equal(stored.connector_owner_id, s.host.user.id);
   assert.equal(s.hub.requests.length, 1);
@@ -573,8 +576,9 @@ test('foreign-host sessions require exact trust and retain the creator identity 
   assert.equal(binding.owner.id, s.creator.user.id);
   assert.equal(binding.owner.gitEmail, 'creator@example.test');
   assert.equal(binding.session.ownerId, s.creator.user.id);
-  assert.equal(binding.agent.authorId, s.host.user.id);
-  assert.equal(binding.agent.id, s.agent.id);
+  // The session's agent is the creator's own, not the host owner's.
+  assert.equal(binding.agent.authorId, s.creator.user.id);
+  assert.equal(binding.agent.id, session.agentVersionId);
   assert.deepEqual(binding.model, s.model);
   for (const secret of [s.connector.token, s.connector.connectionToken, s.connector.pairing.code, githubToken]) assert.ok(!JSON.stringify(envelope).includes(secret));
   await denied(await s.host.request('GET', `/api/sessions/${session.id}`), 404, 'not_found');
@@ -842,9 +846,6 @@ test('production session creation rejects a legacy non-connector model even for 
   const { model } = await json<{ model: ModelDefinition }>(await owner.request('POST', `/api/workspaces/${team.id}/models`, {
     name: 'Legacy model', provider: 'openai', modelId: 'legacy-model',
   }), 201);
-  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', {
-    name: 'Legacy agent', description: '', instructions: '', tools: ['identity'], modelId: model.id,
-  }), 201);
   assert.equal(f.sqlite.prepare('SELECT connector_id FROM models WHERE id = ?').get(model.id)!.connector_id, null);
   f.env.TEST_AUTH_ENABLED = 'false';
   f.env.APP_ORIGIN = 'https://workspace.example.test';
@@ -852,7 +853,7 @@ test('production session creation rejects a legacy non-connector model even for 
   const profile = await json<{ user: { id: string } }>(await f.request('GET', `${f.env.APP_ORIGIN}/api/me`, undefined, headers));
   assert.equal(profile.user.id, owner.user.id);
   await denied(await f.request('POST', `${f.env.APP_ORIGIN}/api/sessions`, {
-    workspaceId: team.id, agentVersionId: agent.id, title: 'No legacy provisioning in production',
+    workspaceId: team.id, modelId: model.id, title: 'No legacy provisioning in production',
   }, headers), 400, 'connector_required');
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
 });
@@ -1694,12 +1695,9 @@ test('workspace pairing imports a private connector catalog without granting tea
   assert.deepEqual(await json(await s.member.request('GET', `/api/workspaces/${s.team.id}/connectors`)), { connectors: [] });
   assert.deepEqual(await json(await s.member.request('GET', `/api/workspaces/${s.team.id}/models`)), { models: [] });
   assert.deepEqual(await json(await s.member.request('GET', '/api/connectors')), { connectors: [] });
-  assert.deepEqual(await json(await s.member.request('GET', '/api/agents')), { agents: [] });
-  assert.deepEqual(await json(await s.member.request('GET', `/api/workspaces/${s.team.id}/agents`)), { agents: [] });
-  await denied(await s.member.request('POST', '/api/agents', s.agentInput), 404, 'not_found');
   await denied(await s.member.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: s.connector.connectorId }), 404, 'not_found');
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n, 1);
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_versions').get()!.n, 1);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n, 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_versions').get()!.n, 0);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
   assert.equal(s.hub.requests.length, 0);
   await denied(await s.outsider.request('GET', `/api/workspaces/${s.team.id}/connectors`), 404, 'not_found');
@@ -1711,9 +1709,8 @@ test('workspace pairing imports a private connector catalog without granting tea
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares').get()!.n, 0);
 });
 
-test('owner runs an unpublished agent on an unshared host and the default session is listed and readable only as read by members', async t => {
+test('owner runs a session on an unshared host and the default session is listed and readable only as read by members', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
-  assert.equal(s.agent.workspaceId, null);
   assert.equal(s.session.visibility, 'workspace');
   assert.equal(f.sqlite.prepare('SELECT visibility FROM sessions WHERE id = ?').get(s.session.id)!.visibility, 'workspace');
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_grants').get()!.n, 0);
@@ -1722,7 +1719,8 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
   assert.equal(s.hub.requests.length, 1);
   const binding = JSON.parse(s.hub.requests[0].request.body) as RunnerBinding;
   assert.equal(binding.owner.id, s.owner.user.id);
-  assert.equal(binding.agent.id, s.agent.id);
+  assert.equal(binding.agent.id, s.session.agentVersionId);
+  assert.equal(binding.agent.authorId, s.owner.user.id);
   assert.equal(binding.agent.workspaceId, null);
   assert.equal(binding.model.id, s.model.id);
   assert.equal(binding.session.visibility, undefined);
@@ -1731,11 +1729,10 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
   const { session } = await json<{ session: SessionRecord }>(await s.member.request('GET', `/api/sessions/${s.session.id}`));
   assert.deepEqual(session.permissions, ['read']);
   assert.equal(session.visibility, 'workspace');
-  // Only a single-session read says why a session can't clone (its agent has no bash).
-  const { cloneUnavailable, ...summary } = session;
-  assert.match(cloneUnavailable!, /bash tool/);
+  // The owner runs shell commands on their own host, so the session clones.
+  assert.equal(session.cloneUnavailable, undefined);
   const listed = await json<{ sessions: SessionRecord[] }>(await s.member.request('GET', '/api/sessions'));
-  assert.deepEqual(listed.sessions, [summary]);
+  assert.deepEqual(listed.sessions, [session]);
   const requests = rpcHub(f, s.connector, envelope => {
     assert.equal(envelope.request.ticket.action, 'view');
     assert.equal(envelope.request.ticket.actorId, s.member.user.id);
@@ -1750,16 +1747,19 @@ test('owner runs an unpublished agent on an unshared host and the default sessio
   assert.equal(requests.length, 1);
 });
 
-test('a session started from a model gets its own chat agent with every tool its host carries, outside the catalog', async t => {
+test('a session starts from a model and gets its own chat agent with every tool its host carries', async t => {
   const f = await fixture(t); const s = await privateWorkspace(f);
   const start = (client: Client, body: Record<string, unknown>) => client.request('POST', '/api/sessions', { workspaceId: s.team.id, ...body });
   // Retired tools stay valid in stored agents but are never offered.
   const offered = toolNames.filter(tool => !retiredToolNames.includes(tool));
   const startedAgent = () => (JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding).agent;
 
-  // Exactly one of an agent version and a model; a teammate cannot start on the owner's unshared host.
+  // A model, and no agent version; a teammate cannot start on the owner's unshared host.
   await denied(await start(s.owner, {}), 400, 'invalid_input');
-  await denied(await start(s.owner, { agentVersionId: s.agent.id, modelId: s.model.id }), 400, 'invalid_input');
+  const saved = seedAgentVersion(f.sqlite, { authorId: s.owner.user.id, modelId: s.model.id, tools: ['identity'] });
+  for (const body of [{ agentVersionId: saved.id }, { agentVersionId: saved.id, modelId: s.model.id }]) {
+    await denied(await start(s.owner, body), 400, 'invalid_input');
+  }
   await denied(await start(s.member, { modelId: s.model.id, trustedConnectorId: s.connector.connectorId }), 404, 'not_found');
   assert.equal(s.hub.requests.length, 0);
 
@@ -1771,9 +1771,9 @@ test('a session started from a model gets its own chat agent with every tool its
   assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
-  // Chat agents stay out of their author's catalog and cannot be revised or published.
-  assert.deepEqual((await json<{ agents: AgentVersion[] }>(await s.owner.request('GET', '/api/agents'))).agents.map(item => item.id), [s.agent.id]);
-  await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/versions`, s.agentInput), 404, 'not_found');
+  // There is no agent catalog: agents can't be listed, revised or published.
+  await denied(await s.owner.request('GET', '/api/agents'), 404, 'not_found');
+  await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/versions`, { tools: ['identity'], modelId: s.model.id }), 404, 'not_found');
   await denied(await s.owner.request('POST', `/api/agents/${agent.agentId}/publish`, { workspaceId: s.team.id }), 404, 'not_found');
 
   // Once the host carries pushes, the next session's own chat agent offers git_push, but GitHub tools still need the host's github capability.
@@ -2072,9 +2072,9 @@ for (const mutation of ['privacy', 'membership'] as const) {
 
 test('opt-in sharing admits a teammate runtime; unshare blocks foreign sessions but preserves workspace views of the owner session; revoke blocks all runtimes', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
-  const { agent } = await json<{ agent: AgentVersion }>(await s.owner.request('POST', `/api/agents/${s.agent.agentId}/publish`, { workspaceId: s.team.id }), 201);
-  const input = { workspaceId: s.team.id, agentVersionId: agent.id, trustedConnectorId: s.connector.connectorId };
-  await denied(await s.member.request('POST', '/api/sessions', input), 403, 'connector_unavailable');
+  const input = { workspaceId: s.team.id, modelId: s.model.id, trustedConnectorId: s.connector.connectorId };
+  // Until the owner shares the host, its model isn't one the member can start on.
+  await denied(await s.member.request('POST', '/api/sessions', input), 404, 'not_found');
   assert.equal(s.hub.requests.length, 1);
   const sharePath = `/api/connectors/${s.connector.connectorId}/shares/${s.team.id}`;
   await json(await s.owner.request('PUT', sharePath));
@@ -2101,7 +2101,7 @@ test('opt-in sharing admits a teammate runtime; unshare blocks foreign sessions 
   const beforeDenied = requests.length;
   await denied(await s.member.request('GET', `/api/sessions/${foreign.id}/view`), 403, 'connector_unavailable');
   await denied(await self(f, s.connector, 'authorize', authorization(foreign)), 403, 'connector_unavailable');
-  await denied(await s.member.request('POST', '/api/sessions', input), 403, 'connector_unavailable');
+  await denied(await s.member.request('POST', '/api/sessions', input), 404, 'not_found');
   assert.equal(requests.length, beforeDenied);
   assert.deepEqual((await json<{ view: SessionView }>(await s.member.request('GET', `/api/sessions/${s.session.id}/view`))).view, s.view);
   assert.equal((await json<{ allowed: boolean }>(await self(f, s.connector, 'authorize', authorization(s.session)))).allowed, true);
@@ -2117,7 +2117,7 @@ test('opt-in sharing admits a teammate runtime; unshare blocks foreign sessions 
     }
     await denied(await self(f, s.connector, 'authorize', authorization(session)), 401, 'connector_authentication_required');
   }
-  await denied(await s.owner.request('POST', '/api/sessions', s.input), 403, 'connector_unavailable');
+  await denied(await s.owner.request('POST', '/api/sessions', s.input), 404, 'not_found');
   assert.deepEqual(await json(await s.owner.request('GET', `/api/workspaces/${s.team.id}/models`)), { models: [] });
   assert.deepEqual(await json(await s.owner.request('GET', `/api/workspaces/${s.team.id}/connectors`)), { connectors: [] });
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 2);

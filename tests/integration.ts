@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256 } from "../packages/shared/src/crypto.js";
-import type { AgentVersion, ApprovalRecord, ModelDefinition, SessionRecord, SessionView, SubmitResult, UserProfile, Workspace } from "../packages/shared/src/types.js";
+import type { ApprovalRecord, ModelDefinition, SessionRecord, SessionView, SubmitResult, UserProfile, Workspace } from "../packages/shared/src/types.js";
 import type { ConnectorInfo, ConnectorPairing } from "../packages/shared/src/connector.js";
 import { createConnector } from "../apps/runner/src/connector.js";
 import { createFauxLocalModels } from "../apps/runner/src/local-pi.js";
@@ -79,7 +79,6 @@ const bob = new Client("Bob");
 const eve = new Client("Eve");
 let workspace: Workspace;
 let model: ModelDefinition;
-let published: AgentVersion;
 let aliceSession: SessionRecord;
 let bobSession: SessionRecord;
 let requestId = "";
@@ -155,7 +154,7 @@ await check("unauthenticated APIs fail closed; test accounts are explicit and is
 
 await check("workspace membership is required before associating a private Pi", async () => {
   workspace = (await alice.request("POST", "/api/workspaces", { name: `Integration ${run}` })).workspace;
-  await bob.request("GET", `/api/workspaces/${workspace.id}/agents`, undefined, [403, 404]);
+  await bob.request("GET", `/api/workspaces/${workspace.id}/models`, undefined, [403, 404]);
   await alice.request("POST", `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: "member" });
 });
 
@@ -167,21 +166,14 @@ if (connectedRuntime) {
     const owned = (await bob.request("GET", "/api/connectors")).connectors as ConnectorInfo[];
     assert.ok(!owned.some(connection => connection.id === aliceConnector!.id));
   });
-  await check("private Pi runs an unpublished agent while teammates can only view its default workspace session", async () => {
+  await check("private Pi runs its owner's session while teammates can only view it, as workspace sessions are by default", async () => {
     const ownModels: ModelDefinition[] = (await alice.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
     const ownModel = ownModels.find(item => item.connectorId === aliceConnector!.id)!;
     assert.ok(ownModel, "owner can select their private Pi model");
     const peerModels: ModelDefinition[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
     assert.ok(!peerModels.some(item => item.connectorId === aliceConnector!.id));
-    await bob.request("POST", "/api/agents", {
-      name: "Guessed private model", description: "Unauthorized model selection", instructions: "Use private model", tools: ["identity"], modelId: ownModel.id,
-    }, [403, 404]);
-    const own: AgentVersion = (await alice.request("POST", "/api/agents", {
-      name: "Private local agent", description: "Owner-only local agent", instructions: "Use the session owner's identity.", tools: ["identity"], modelId: ownModel.id,
-    })).agent;
-    assert.equal(own.workspaceId, null);
     workspaceVisibleSession = (await alice.request("POST", "/api/sessions", {
-      workspaceId: workspace.id, agentVersionId: own.id, title: "Local run, workspace view",
+      workspaceId: workspace.id, modelId: ownModel.id, title: "Local run, workspace view",
     })).session;
     const sessionId = workspaceVisibleSession!.id;
     assert.equal(workspaceVisibleSession!.visibility, "workspace");
@@ -207,18 +199,17 @@ if (connectedRuntime) {
     await bob.request("GET", `/api/sessions/${sessionId}/backups`, undefined, [403]);
     await bob.request("PATCH", `/api/sessions/${sessionId}`, { visibility: "private" }, [403]);
     await bob.request("POST", "/api/sessions", {
-      workspaceId: workspace.id, agentVersionId: own.id, title: "No private agent use", trustedConnectorId: aliceConnector!.id,
+      workspaceId: workspace.id, modelId: ownModel.id, title: "No private model use", trustedConnectorId: aliceConnector!.id,
     }, [403, 404]);
   });
-  await check("a session started from a model runs on the owner's Pi without choosing an agent", async () => {
+  await check("each session started from a model runs on the owner's Pi with an agent of its own", async () => {
     const ownModel = ((await alice.request("GET", `/api/workspaces/${workspace.id}/models`)).models as ModelDefinition[])
       .find(item => item.connectorId === aliceConnector!.id)!;
     const session: SessionRecord = (await alice.request("POST", "/api/sessions", {
       workspaceId: workspace.id, modelId: ownModel.id, title: "Chat without an agent",
     })).session;
     assert.equal(session.connectorId, aliceConnector!.id);
-    const agents: AgentVersion[] = (await alice.request("GET", "/api/agents")).agents;
-    assert.ok(!agents.some(item => item.id === session.agentVersionId), "the session's own chat agent stays out of the catalog");
+    assert.notEqual(session.agentVersionId, workspaceVisibleSession!.agentVersionId);
     await alice.submit(session.id, "TEST_IDENTITY");
     await alice.settled(session.id, "alice-test");
     await bob.request("POST", "/api/sessions", {
@@ -288,21 +279,16 @@ await check("repository setup stays workspace-scoped and synthetic sign-in grant
   await bob.request("DELETE", `/api/workspaces/${workspace.id}/repositories/00000000-0000-4000-8000-000000000001`, undefined, [403]);
 });
 
-await check("private agents remain private; publishing exposes definition, not author environment", async () => {
-  const own: AgentVersion = (await alice.request("POST", "/api/agents", { name: `Reviewer ${run}`, description: "Shared identity-neutral integration fixture", instructions: "Use the connected session owner's identity. Never change identity configuration.", tools: ["identity", "list_files", "read_file", "write_file", "bash", "github_comment"], modelId: model.id })).agent;
-  await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: own.id, title: "Forbidden private use" }, [403, 404]);
-  published = (await alice.request("POST", `/api/agents/${own.agentId}/publish`, { workspaceId: workspace.id })).agent;
-  assert.equal(published.authorId, alice.user.id);
-  assert.equal(published.workspaceId, workspace.id);
-  const catalog: AgentVersion[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/agents`)).agents;
-  assert.ok(catalog.some((item) => item.id === published.id));
-  assert.equal("env" in published, false);
-  assert.equal("githubToken" in published, false);
+await check("there is no agent catalog: sessions start from a model", async () => {
+  await alice.request("GET", "/api/agents", undefined, [404]);
+  await alice.request("GET", `/api/workspaces/${workspace.id}/agents`, undefined, [404]);
+  await alice.request("POST", "/api/agents", { name: `Reviewer ${run}`, tools: ["identity"], modelId: model.id }, [404]);
+  await alice.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: crypto.randomUUID(), title: "From an agent" }, [400]);
 });
 
 await check("session repositories are assigned by the server, not the session caller", async () => {
   await alice.request("POST", "/api/sessions", {
-    workspaceId: workspace.id, agentVersionId: published.id, title: "Forbidden repository injection",
+    workspaceId: workspace.id, modelId: model.id, title: "Forbidden repository injection",
     repositories: [{
       bindingId: "00000000-0000-4000-8000-000000000001", repositoryId: 1,
       fullName: "example/private-repository", ref: "main", commit: "a".repeat(40), path: "../../host",
@@ -310,13 +296,13 @@ await check("session repositories are assigned by the server, not the session ca
   }, [400]);
 });
 
-await check("the same published agent starts distinct owner-bound sessions", async () => {
-  aliceSession = (await alice.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Alice's session", visibility: "private" })).session;
+await check("the same model starts distinct owner-bound sessions", async () => {
+  aliceSession = (await alice.request("POST", "/api/sessions", { workspaceId: workspace.id, modelId: model.id, title: "Alice's session", visibility: "private" })).session;
   if (connectedRuntime) {
-    await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Missing host trust" }, [400, 403]);
+    await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, modelId: model.id, title: "Missing host trust" }, [400, 403]);
   }
   bobSession = (await bob.request("POST", "/api/sessions", {
-    workspaceId: workspace.id, agentVersionId: published.id, title: "Bob's session", visibility: "private",
+    workspaceId: workspace.id, modelId: model.id, title: "Bob's session", visibility: "private",
     ...(connectedRuntime ? { trustedConnectorId: aliceConnector!.id } : {}),
   })).session;
   if (connectedRuntime) {
@@ -325,7 +311,8 @@ await check("the same published agent starts distinct owner-bound sessions", asy
   }
   assert.equal(aliceSession.ownerId, alice.user.id);
   assert.equal(bobSession.ownerId, bob.user.id);
-  assert.equal(aliceSession.agentVersionId, bobSession.agentVersionId);
+  // Each session has an agent of its own, authored by its owner.
+  assert.notEqual(aliceSession.agentVersionId, bobSession.agentVersionId);
   await alice.submit(aliceSession.id, "TEST_IDENTITY");
   await bob.submit(bobSession.id, "TEST_IDENTITY");
   const av = await alice.settled(aliceSession.id, "alice-test");
@@ -356,15 +343,9 @@ if (connectedRuntime) {
   });
 }
 
-await check("publishing an update cannot silently change existing sessions or grant author access", async () => {
-  await bob.request("POST", `/api/agents/${published.agentId}/versions`, { name: "Hijack", description: "", instructions: "Replace another author's agent", tools: ["identity"], modelId: model.id }, [403, 404]);
-  const next: AgentVersion = (await alice.request("POST", `/api/agents/${published.agentId}/versions`, { name: `Reviewer revised ${run}`, description: "Explicit next version", instructions: "A new version must not hot-replace active sessions.", tools: ["identity"], modelId: model.id })).agent;
-  assert.ok(next.version > published.version);
-  const nextPublished: AgentVersion = (await alice.request("POST", `/api/agents/${published.agentId}/publish`, { workspaceId: workspace.id })).agent;
-  assert.notEqual(nextPublished.id, published.id);
-  assert.equal((await bob.request("GET", `/api/sessions/${bobSession.id}`)).session.agentVersionId, published.id);
+await check("session ownership is assigned by the server, not the session caller", async () => {
+  await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, modelId: model.id, title: "Spoofed owner", ownerId: alice.user.id }, [400]);
   await alice.request("GET", `/api/sessions/${bobSession.id}/view`, undefined, [403, 404]);
-  await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, agentVersionId: published.id, title: "Spoofed owner", ownerId: alice.user.id }, [400]);
 });
 
 await check("read-only sharing cannot prompt, ask, approve, manage, or cross workspace boundaries", async () => {
@@ -574,12 +555,8 @@ if (connectedRuntime) {
     const models: ModelDefinition[] = (await bob.request("GET", `/api/workspaces/${workspace.id}/models`)).models;
     const localModel = models.find(item => item.connectorId === bobConnector!.id)!;
     assert.ok(localModel);
-    const privateAgent: AgentVersion = (await bob.request("POST", "/api/agents", {
-      name: "Bob local fixture", description: "", instructions: "Use the owner's identity.", tools: ["identity"], modelId: localModel.id,
-    })).agent;
-    const shared: AgentVersion = (await bob.request("POST", `/api/agents/${privateAgent.agentId}/publish`, { workspaceId: workspace.id })).agent;
     bobLocalSession = (await bob.request("POST", "/api/sessions", {
-      workspaceId: workspace.id, agentVersionId: shared.id, title: "Bob's separate host", visibility: "private",
+      workspaceId: workspace.id, modelId: localModel.id, title: "Bob's separate host", visibility: "private",
     })).session;
     assert.ok(bobLocalSession);
     const headers = { authorization: `Bearer ${aliceConnector!.token}`, "x-connection-token": aliceConnector!.connectionToken, "content-type": "application/json" };

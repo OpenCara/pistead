@@ -53,6 +53,11 @@ export interface ModelDefinition {
   connectorId?: string;
   connectorOwnerId?: string;
 }
+/**
+ * A session's agent: the model it started on and the tools it uses without asking. Each new session gets its own, with
+ * every tool its host carries and no instructions; sessions started from a saved agent, before agents were removed, keep
+ * theirs, and moving a session copies its agent to the new host.
+ */
 export interface AgentVersion {
   id: string;
   agentId: string;
@@ -66,8 +71,6 @@ export interface AgentVersion {
   modelId: string;
   createdAt: string;
 }
-/** Stored when an agent version is saved without a name; name, description and instructions are optional. */
-export const defaultAgentName = "Untitled agent";
 /**
  * What a session's agent is doing. `working`: a message is queued or running, or an approved operation runs.
  * `waiting`: a card (a permission request or an operation's approval) awaits a decision, holding the message whose call asked for it.

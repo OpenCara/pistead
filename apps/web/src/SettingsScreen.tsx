@@ -2,7 +2,6 @@ import { useApp } from "./app-context";
 import { Icon, type IconName } from "./icons";
 import { href, type SettingsSection } from "./router";
 import { AdminSettings } from "./settings/AdminSettings";
-import { AgentsSettings } from "./settings/AgentsSettings";
 import { AppearanceSettings } from "./settings/AppearanceSettings";
 import { HostsSettings } from "./settings/HostsSettings";
 import { ProfileSettings } from "./settings/ProfileSettings";
@@ -13,7 +12,6 @@ const sections: { id: SettingsSection; label: string; icon: IconName; admin?: tr
   { id: "profile", label: "Profile", icon: "user" },
   { id: "hosts", label: "Hosts", icon: "server" },
   { id: "workspaces", label: "Workspaces", icon: "users" },
-  { id: "agents", label: "Agents", icon: "bot" },
   { id: "appearance", label: "Appearance", icon: "palette" },
   // Only the server's administrators (ADMIN_USER_IDS) see this; the API refuses everyone else.
   { id: "admin", label: "Administration", icon: "shield", admin: true },
@@ -37,7 +35,6 @@ export function SettingsScreen({ section, id }: { section: SettingsSection; id?:
         {current.id === "profile" ? <ProfileSettings />
           : current.id === "hosts" ? <HostsSettings id={id} />
           : current.id === "workspaces" ? <WorkspacesSettings id={id} />
-          : current.id === "agents" ? <AgentsSettings id={id} />
           : current.id === "admin" ? <AdminSettings />
           : <AppearanceSettings />}
       </div>

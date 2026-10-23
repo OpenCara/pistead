@@ -16,7 +16,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
   - [Workspaces and members](#workspaces-and-members)
   - [Repositories and Git accounts](#repositories-and-git-accounts)
   - [Hosts](#hosts)
-  - [Models and agents](#models-and-agents)
+  - [Models and tools](#models-and-tools)
   - [Sessions](#sessions)
   - [Approvals and permission requests](#approvals-and-permission-requests)
   - [Collaborating on a session](#collaborating-on-a-session)
@@ -37,17 +37,17 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
                                               (control plane)                        (a member's host)
 ```
 
-- The **server** keeps workspaces, members, agents, session records, permissions and approvals. It relays sessions' Git reads with the session owner's Git account and their session-branch pushes with the workspace's push identity, issues short-lived push credentials, and acts on GitHub for session owners. It never runs an agent itself.
+- The **server** keeps workspaces, members, session records, permissions and approvals. It relays sessions' Git reads with the session owner's Git account and their session-branch pushes with the workspace's push identity, issues short-lived push credentials, and acts on GitHub for session owners. It never runs an agent itself.
 - A **host** runs the agents. Pi's configuration and model credentials, each session's files and its conversation stay there; the server relays every request to it. While a host is offline, its sessions' conversations can't load and no work runs on them.
 - Everyone watching a session shares the server's reads of it, about one a second, and after the first read the host, the server and the apps send each other only what changed in the conversation.
 - The web app is the complete client; the Mac app shows it in its own window, and the iPhone and iPad app covers sessions (see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)). They all call the same API.
 
 | Concept | What it is |
 |---|---|
-| Workspace | A team's shared home: members, repositories, published agents, push access and sessions. Each member is its owner, an admin or a member. |
+| Workspace | A team's shared home: members, repositories, push access and sessions. Each member is its owner, an admin or a member. |
 | Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It is private to the member who paired it until they share it with a workspace. |
 | Model | A Pi model a host offers. Its credentials never leave the host. |
-| Agent | Optional reusable instructions, a model and the tools it may use without asking. Private to its author until published to a workspace. |
+| Agent | The Pi agent that works in a session, on the model it started from, with every tool its host supports. Each session has its own. |
 | Session | One agent conversation on one host, in its own worktree where the agent clones the workspace's repositories. It always runs as its owner. |
 | Shared message, side ask | Shared messages drive the session's work; side asks are read-only questions in separate threads. |
 | Approval | A card for one exact operation (command, push, merge, comment or host command), which runs only once someone allowed to decide it approves it. |
@@ -64,7 +64,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
    npx pistead@latest connect --server https://pistead.example.com --pairing-id PAIRING_ID
    ```
 
-5. **Start a session**: select the workspace in the sidebar, choose your host in **Host or agent**, describe the task and press Enter.
+5. **Start a session**: select the workspace in the sidebar, choose your host in **Host**, describe the task and press Enter.
 6. **Approve** commands and commits as their cards appear above the transcript.
 
 To bring in teammates, they sign in once and send you their **User ID** from **Settings → Profile**; add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
@@ -93,7 +93,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 
 | | Owner | Admin | Member |
 |---|:-:|:-:|:-:|
-| Start sessions, use published agents, view workspace-visible sessions | ✓ | ✓ | ✓ |
+| Start sessions, view workspace-visible sessions | ✓ | ✓ | ✓ |
 | Bind and remove repositories, set their push policy | ✓ | ✓ | |
 | Manage push identities | ✓ | ✓ | |
 | Set network access | ✓ | ✓ | |
@@ -258,17 +258,9 @@ npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate 
 
 The Mac app's **This Mac** runs the same connector; see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps). [`packages/cli/README.md`](packages/cli/README.md) is the connector's own guide.
 
-### Models and agents
+### Models and tools
 
-You can use the models of your own hosts and of hosts shared with the workspace. A session doesn't need an agent: start it from a host and one of its models, and it gets every tool that host supports, with no extra instructions.
-
-Agents are for reusable instructions and tool sets. Create one under **Settings → Agents → New agent**:
-
-- **Name**, **Description** and **Instructions** (its purpose, approach and boundaries), all optional.
-- **Model**: one advertised by a host you can use in the current workspace.
-- **Tools**: the tools it uses without asking. It can still call any other tool; each such call first asks the session owner with a [permission request](#permission-requests).
-
-Each save creates a new version, and sessions stay on the version they started with. **Publish to** *workspace* shares the latest version's instructions, tools and model reference with that workspace's members, never your hosts, identity, environment or history; a later edit shows **Unpublished changes** until you publish again. Members find published agents under **Published in** *workspace* and start sessions from them with **Start session**. An agent runs on the host its model belongs to, so others can run it only while that host is shared with the workspace.
+You can use the models of your own hosts and of hosts shared with the workspace. A session starts from a host and one of its models, and its agent gets every tool that host supports, with no extra instructions. The access you choose for each message (see [Chat options](#chat-options)) decides what runs without asking.
 
 The tools an agent can use:
 
@@ -286,6 +278,8 @@ The tools an agent can use:
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands and pushes, and for `host_bash` only on the owner's own host. Side asks offer only the read-only tools.
 
+Sessions started from a saved agent, before agents were removed, keep that agent's instructions and tools; any other tool they call first asks the session owner with a [permission request](#permission-requests).
+
 ### Sessions
 
 #### Starting a session
@@ -293,7 +287,7 @@ The tools an agent can use:
 Select a workspace in the sidebar (or open **New session** in it):
 
 - **Describe the task**: the first message. Its first line becomes the session's title.
-- **Host or agent**: one of your hosts, a host shared with the workspace, or an agent you can run.
+- **Host**: one of your hosts, or a host shared with the workspace.
 - **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only). See [Collaborating on a session](#collaborating-on-a-session).
 - The model, reasoning level and access for the first message (see [Chat options](#chat-options)). The info tips show the host, the model and the repositories the session will pin.
 
@@ -454,7 +448,7 @@ Exports are JSON records without secrets; a session's conversation is in its bac
 
 While both hosts are connected, a session's owner can move it to a model on another host in its workspace (session panel → **Move to another host**, or `POST /api/sessions/:id/migrate` with `requestId` and `modelId`). The source host's live snapshot, the same one a backup takes, goes straight to the new host, so no `STORAGE_URL` is needed:
 
-- The new host restores it into a new session with the same conversation, files, repository pins, visibility and title (or a new title), running that host's model. Its agent keeps the original's name and instructions, with the tools the new host can carry. Session grants, and approvals given for the rest of the session, aren't copied.
+- The new host restores it into a new session with the same conversation, files, repository pins, visibility and title (or a new title), running that host's model. Its agent keeps the original's tools that the new host can carry. Session grants, and approvals given for the rest of the session, aren't copied.
 - Once the new host confirms, the original session is archived: its history stays readable and its owner can unarchive it.
 - A session that clones on demand moves as its backups restore: each clone is cloned again on the new host and its local work put back. It needs a sandboxed new host with a current connector (`cloneBackups` capability).
 - The session must be idle. Until the move finishes, both sessions only accept reads, so nothing sent after the snapshot is lost. The control plane holds the snapshot until then; retrying with the same `requestId` needs only the new host, and `POST /api/sessions/:id/migrations/:migrationId/cancel` gives up on the move, archiving the unfinished copy.

@@ -12,7 +12,7 @@ import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { REDACTED } from '../packages/shared/src/redaction.js';
 import type { SessionLink, SharedSession, SharedSessionView } from '../packages/shared/src/sharing.js';
-import type { AgentVersion, ApprovalRecord, EntryView, ModelDefinition, SessionRecord, SessionView, ToolName } from '../packages/shared/src/types.js';
+import type { ApprovalRecord, EntryView, ModelDefinition, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 
 // Share links and secret redaction, end to end through the control plane. The fixture is the one connectors.test.ts
 // uses for a session on its owner's own host.
@@ -129,7 +129,7 @@ function rpcHub(f: Fixture, connector: Connected, respond: (envelope: ConnectorR
   return requests;
 }
 
-async function privateWorkspace(f: Fixture, tools: ToolName[] = ['identity']) {
+async function privateWorkspace(f: Fixture) {
   const owner = await f.client('private-owner'); const member = await f.client('private-member');
   const outsider = await f.client('private-outsider'); const team = await workspace(owner);
   await addMember(owner, team.id, member);
@@ -137,15 +137,14 @@ async function privateWorkspace(f: Fixture, tools: ToolName[] = ['identity']) {
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
   assert.equal(models.length, 1);
   const model = models[0];
-  const agentInput = { name: 'Unpublished own agent', description: '', instructions: '', tools, modelId: model.id };
-  const { agent } = await json<{ agent: AgentVersion }>(await owner.request('POST', '/api/agents', agentInput), 201);
   const hub = provisionHub(f);
-  const input = { workspaceId: team.id, agentVersionId: agent.id, title: 'Workspace-readable own session' };
-  return { owner, member, outsider, team, connector, model, agent, agentInput, hub, input };
+  const input = { workspaceId: team.id, modelId: model.id, title: 'Workspace-readable own session' };
+  return { owner, member, outsider, team, connector, model, hub, input };
 }
 
-async function privateHostSession(f: Fixture, tools?: ToolName[]) {
-  const setup = await privateWorkspace(f, tools);
+/** A session on its owner's own host, started from its model: the agent has every tool the host carries, bash included. */
+async function privateHostSession(f: Fixture) {
+  const setup = await privateWorkspace(f);
   const { session } = await json<{ session: SessionRecord }>(await setup.owner.request('POST', '/api/sessions', setup.input), 201);
   assert.equal(session.status, 'ready');
   const view: SessionView = {
@@ -223,7 +222,7 @@ test('share links show anyone who has one the shared conversation, and nothing e
   assert.equal(requests.length, 1);
   const serialized = JSON.stringify([metadata, seen]);
   for (const hidden of [sideAsk, 'approval-only-command', 'queue-only-receipt', 'owner-private@example.test', s.member.user.id, s.owner.user.id,
-    s.session.id, s.team.id, s.connector.connectorId, s.agent.id, s.model.id]) {
+    s.session.id, s.team.id, s.connector.connectorId, s.session.agentVersionId, s.model.id]) {
     assert.ok(!serialized.includes(hidden), `A share link must not reveal ${hidden}`);
   }
 
@@ -334,7 +333,7 @@ test('turning link sharing on answers a concurrent request with the same link an
 
 test('no viewer ever receives a secret, while approvals still review, decide and run the exact operation', async t => {
   // The owner requests and approves; the member reads through workspace visibility.
-  const f = await fixture(t); const s = await privateHostSession(f, ['identity', 'bash']);
+  const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
   const secret = `ghp_${'a1B2'.repeat(9)}`;
   const operation = { kind: 'bash' as const, command: `curl -H "Authorization: Bearer ${secret}" https://api.github.com/user` };

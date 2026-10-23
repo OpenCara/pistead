@@ -1,8 +1,8 @@
 import type { Hono } from 'hono';
-import { defaultAgentName, retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
+import { retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
 import type { ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
-import { agentVersion, auditAfterChange, auditStatement, modelDefinition, requireMember } from './db.js';
+import { auditAfterChange, auditStatement, modelDefinition, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
 import { ConstraintError, type Query } from './db/types.js';
@@ -32,24 +32,6 @@ function nameInput(value: unknown): string {
   const result = text(value, 'name', 200).trim();
   if (!result) fail(400, 'invalid_input', 'Invalid name.');
   return result;
-}
-
-function agentInput(body: Record<string, unknown>): AgentInput {
-  onlyFields(body, ['name', 'description', 'instructions', 'tools', 'modelId']);
-  const tools = body.tools;
-  if (!Array.isArray(tools) || tools.length > toolNames.length ||
-      !tools.every(tool => typeof tool === 'string' && toolNames.some(known => known === tool)) ||
-      new Set(tools).size !== tools.length) {
-    fail(400, 'invalid_input', 'Invalid tools.');
-  }
-  return {
-    // Name, description and instructions may be omitted; a blank name stores the default.
-    name: text(body.name ?? '', 'name', 200, 0).trim() || defaultAgentName,
-    description: text(body.description ?? '', 'description', 4000, 0),
-    instructions: text(body.instructions ?? '', 'instructions', 32000, 0),
-    toolsJson: JSON.stringify(tools),
-    modelId: identifier(body.modelId, 'modelId'),
-  };
 }
 
 function membersStatement(env: Env, workspaceId: string, actorId: string): Query<SafeMember> {
@@ -114,13 +96,6 @@ export async function requireModel(env: Env, modelId: string, actorId: string): 
   return model;
 }
 
-async function requireAuthor(env: Env, agentId: string, actorId: string): Promise<void> {
-  // Chat agents belong to one session each: never revised or published.
-  const agent = await env.DB.query<{ id: string }>('SELECT id FROM agents WHERE id = ? AND author_id = ? AND chat = 0')
-    .bind(agentId, actorId).first();
-  if (!agent) fail(404, 'not_found', 'Agent not found.');
-}
-
 function privateVersionStatement(
   env: Env, actorId: string, agentId: string, versionId: string, input: AgentInput, createdAt: string,
 ): Query<AgentRow> {
@@ -175,9 +150,9 @@ function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
 }
 
 /**
- * The agent of a session started from a model instead of a chosen agent: every tool the host can carry, since the
- * message's access mode still gates writes, commands and pushes, and no instructions beyond the runner's own context.
- * Each such session gets its own chat agent, which stays out of the author's catalog.
+ * The agent of a new session, which starts from a model: every tool the host can carry, since the message's access mode
+ * still gates writes, commands and pushes, and no instructions beyond the runner's own context. Each session gets its
+ * own chat agent.
  */
 export async function chatAgentVersion(env: Env, ownerId: string, model: ModelRow, capabilities: ConnectorCapabilities): Promise<AgentRow> {
   const agentId = id();
@@ -196,8 +171,8 @@ export async function chatAgentVersion(env: Env, ownerId: string, model: ModelRo
 
 /**
  * The agent of a session moved to another host: the source agent's name, description and instructions on a model of the
- * new host, with the tools that host can carry. Like a chat agent it belongs to that one session and stays out of the
- * author's catalog, so moving never revises or publishes anyone's agent.
+ * new host, with the tools that host can carry. Like a chat agent it belongs to that one session. Only sessions started
+ * from a saved agent, before agents were removed, have instructions or fewer tools; moving keeps them as they were.
  */
 export async function migratedAgentVersion(env: Env, ownerId: string, source: AgentRow, model: ModelRow, capabilities: ConnectorCapabilities): Promise<AgentRow> {
   const agentId = id();
@@ -346,99 +321,5 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     const model = result[0].results[0];
     if (!model) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');
     return c.json({ model: modelDefinition(model) }, 201);
-  });
-
-  app.get('/api/agents', async c => {
-    const result = await c.env.DB.query<AgentRow>(`SELECT v.* FROM agent_versions v
-      INNER JOIN agents a ON a.id = v.agent_id AND a.author_id = v.author_id
-      WHERE a.author_id = ? AND a.chat = 0 ORDER BY v.created_at DESC, v.agent_id, v.version DESC`)
-      .bind(c.get('auth').userId).all();
-    return c.json({ agents: result.map(agentVersion) });
-  });
-
-  app.get('/api/workspaces/:id/agents', async c => {
-    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
-    const actorId = c.get('auth').userId;
-    await requireMember(c.env, workspaceId, actorId);
-    const result = await c.env.DB.query<AgentRow>(`SELECT v.* FROM agent_versions v
-      INNER JOIN workspace_members member ON member.workspace_id = v.workspace_id AND member.user_id = ?
-      WHERE v.workspace_id = ? ORDER BY v.created_at DESC, v.agent_id, v.version DESC`)
-      .bind(actorId, workspaceId).all();
-    return c.json({ agents: result.map(agentVersion) });
-  });
-
-  app.post('/api/agents', async c => {
-    const actorId = c.get('auth').userId;
-    const input = agentInput(await jsonObject(c));
-    await requireModel(c.env, input.modelId, actorId);
-    const agentId = id();
-    const versionId = id();
-    const createdAt = now();
-    const row = await versionBatch(c.env, [
-      c.env.DB.query<never>(`INSERT INTO agents (id, author_id, created_at)
-        SELECT ?, ?, ? FROM models m
-        INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
-        WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
-        .bind(agentId, actorId, createdAt, actorId, input.modelId, testMode(c.env) ? 1 : 0, testMode(c.env) ? 1 : 0),
-      privateVersionStatement(c.env, actorId, agentId, versionId, input, createdAt),
-      auditAfterChange(c.env, actorId, 'agent.create', null, { agentId, agentVersionId: versionId }),
-    ], 1);
-    return c.json({ agent: agentVersion(row) }, 201);
-  });
-
-  app.post('/api/agents/:id/versions', async c => {
-    const agentId = identifier(c.req.param('id'), 'agentId');
-    const actorId = c.get('auth').userId;
-    await requireAuthor(c.env, agentId, actorId);
-    const input = agentInput(await jsonObject(c));
-    await requireModel(c.env, input.modelId, actorId);
-    const versionId = id();
-    const row = await versionBatch(c.env, [
-      privateVersionStatement(c.env, actorId, agentId, versionId, input, now()),
-      auditAfterChange(c.env, actorId, 'agent.version.create', null, { agentId, agentVersionId: versionId }),
-    ], 0);
-    return c.json({ agent: agentVersion(row) }, 201);
-  });
-
-  app.post('/api/agents/:id/publish', async c => {
-    const agentId = identifier(c.req.param('id'), 'agentId');
-    const actorId = c.get('auth').userId;
-    await requireAuthor(c.env, agentId, actorId);
-    const body = await jsonObject(c);
-    onlyFields(body, ['workspaceId']);
-    const workspaceId = identifier(body.workspaceId, 'workspaceId');
-    await requireMember(c.env, workspaceId, actorId);
-    const source = await c.env.DB.query<AgentRow>(`SELECT * FROM agent_versions
-      WHERE agent_id = ? AND author_id = ? AND workspace_id IS NULL
-      ORDER BY version DESC LIMIT 1`).bind(agentId, actorId).first();
-    if (!source) fail(404, 'not_found', 'Private agent version not found.');
-    const model = await requireModel(c.env, source.model_id, actorId);
-    if (model.workspace_id !== workspaceId) {
-      fail(400, 'model_workspace_mismatch', 'The agent model must belong to the publishing workspace.');
-    }
-    const versionId = id();
-    const row = await versionBatch(c.env, [
-      c.env.DB.query<AgentRow>(`INSERT INTO agent_versions
-          (id, agent_id, author_id, workspace_id, version, name, description, instructions, tools_json, model_id, created_at)
-        SELECT ?, a.id, a.author_id, target.workspace_id,
-          (SELECT COALESCE(MAX(version), 0) + 1 FROM agent_versions WHERE agent_id = a.id),
-          source.name, source.description, source.instructions, source.tools_json, source.model_id, ?
-        FROM agents a
-        INNER JOIN agent_versions source ON source.agent_id = a.id AND source.author_id = a.author_id
-        INNER JOIN models m ON m.id = source.model_id
-        INNER JOIN workspace_members model_member ON model_member.workspace_id = m.workspace_id
-          AND model_member.user_id = a.author_id
-        INNER JOIN workspace_members target ON target.workspace_id = ? AND target.user_id = a.author_id
-        WHERE a.id = ? AND a.author_id = ? AND source.id = ? AND source.workspace_id IS NULL
-          AND m.workspace_id = target.workspace_id
-          AND ${modelAccessSQL('a.author_id')}
-          AND source.id = (SELECT id FROM agent_versions WHERE agent_id = a.id AND workspace_id IS NULL
-            ORDER BY version DESC LIMIT 1)
-        RETURNING *`).bind(versionId, now(), workspaceId, agentId, actorId, source.id,
-          testMode(c.env) ? 1 : 0, testMode(c.env) ? 1 : 0),
-      auditAfterChange(c.env, actorId, 'agent.publish', workspaceId,
-        { agentId, agentVersionId: versionId, sourceVersionId: source.id }),
-    ], 0);
-    return c.json({ agent: agentVersion(row) }, 201);
   });
 }
