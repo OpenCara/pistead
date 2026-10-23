@@ -46,6 +46,8 @@ type Run = {
    * (see writeInputs), never here, as every change rewrites this ledger whole. `bytes` is their base64 length.
    */
   images?: { count: number; bytes: number };
+  /** Its images were gone or unreadable on the host when it was to run, so it ended without reaching Pi (see endLostInputs). */
+  inputsLost?: true;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
   failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
   /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
@@ -642,7 +644,7 @@ export class RunnerSession {
       if (run.submissionId === undefined) {
         const content = await this.runInput(run);
         if (content === undefined) {
-          await this.mutate(meta => { meta.runs[run.key]!.status = "interrupted"; });
+          await this.endLostInputs(run.key);
           continue;
         }
         await this.applyOptions(conversation, run);
@@ -858,7 +860,7 @@ export class RunnerSession {
         }
         const content = await this.runInput(run);
         if (content === undefined) {
-          await this.mutate(meta => { meta.runs[run.key]!.status = "interrupted"; });
+          await this.endLostInputs(run.key);
           continue;
         }
         const conversation = await this.harness.conversation(run.conversationId as ConversationId, context);
@@ -962,7 +964,8 @@ export class RunnerSession {
   private async requireImageModel(options: ChatOptions | undefined): Promise<void> {
     const target = options?.model ?? (await this.root.agent(context)).model ?? this.modelRef;
     const model = this.models.getModel(target.provider, target.modelId);
-    if (model && !model.input.includes("image")) throw new RunnerError(422, "The model doesn't accept images");
+    // A model that doesn't say what it takes is left to its provider.
+    if (model && Array.isArray(model.input) && !model.input.includes("image")) throw new RunnerError(422, "The model doesn't accept images");
   }
 
   /** Where queued messages' prepared images wait, outside the sandbox and the backups, until their messages reach Pi. */
@@ -1022,9 +1025,16 @@ export class RunnerSession {
     await Promise.all(names.filter(name => !waiting(name)).map(name => rm(join(this.inputsDirectory, name), { force: true }).catch(() => {})));
   }
 
+  /** Ends a run whose images are gone or unreadable, saying so in the ledger, and removes whatever is left of them. */
+  private async endLostInputs(key: string): Promise<void> {
+    await this.mutate(meta => { Object.assign(meta.runs[key]!, { status: "interrupted", inputsLost: true }); });
+    await this.discardInputs([key]);
+  }
+
   /**
    * What a run gives Pi: its text, then the images it was sent with. Undefined when its images are gone, and the run
-   * then ends instead of running its text without them.
+   * then ends instead of running its text without them. Text of only whitespace is left out: providers refuse a text
+   * block without any.
    */
   private async runInput(run: Run) {
     if (!run.images) return run.content;
@@ -1665,7 +1675,7 @@ export class RunnerSession {
       busy: Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
-        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.status })),
+        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.inputsLost ? "images lost" : run.status })),
       stoppable: true,
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),

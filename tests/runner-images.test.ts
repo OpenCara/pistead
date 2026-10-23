@@ -210,6 +210,16 @@ test("a queued message's images wait on the host, outside the run ledger, until 
   assert.equal((await session.stop(await ticket("images", "submit"))).stopped, 2);
   assert.deepEqual(await waiting(session), []);
   await settle(session);
+
+  // Images the host no longer has (or can't read) when their message's turn comes: it ends, saying why, rather than
+  // running its text without them.
+  await send(session, { content: "TEST_HOLD 3000" });
+  const lost = await send(session, { content: "Lost", images: [{ mimeType: "image/png", data: base64(small) }] });
+  await writeFile(join(session.directory, "inputs", `${lost.submissionId}.json`), "{");
+  const ended = await settle(session);
+  assert.equal(ended.queue!.find(item => item.submissionId === lost.submissionId)!.status, "images lost");
+  assert.equal(ended.entries.some(entry => entry.role === "user" && entry.text === "Lost"), false);
+  assert.deepEqual(await waiting(session), []);
 });
 
 test("sandboxed read_file gives the model images by signature, prepared to fit, and keeps other files text", linux, t => readsImagesAsTheModelSeesThem(t, false));

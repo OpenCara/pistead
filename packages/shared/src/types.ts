@@ -478,7 +478,8 @@ export interface SessionView {
   busy: boolean;
   /**
    * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host
-   * still ends its work, which holds the queue until it is done.
+   * still ends its work, which holds the queue until it is done. `images lost` marks one that never ran because the host
+   * no longer had the images it was sent with.
    */
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
   /** The host can stop the session's work: the message running and those queued behind it. Absent from older runners. */
