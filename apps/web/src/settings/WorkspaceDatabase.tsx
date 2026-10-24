@@ -94,7 +94,7 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
     : owner ? `No database connected, so ${fallback}`
     : `No database connected, so ${fallback}. Only the workspace owner can connect one`;
   return <Section title="Session database" info={<div className="stack">
-    <p>The workspace owner can connect a Postgres database of their own. Backups of this workspace's sessions are then saved there, with each session's details, instead of in the server's backup storage, and downloads and restores read them back from it.</p>
+    <p>The workspace owner can connect a Postgres database of their own. Backups of this workspace's sessions are then saved there, with each session's details, instead of in the server's own backup storage (if it has any), and downloads and restores read them back from it.</p>
     <p>Whoever can read that database can read the sessions saved there, private ones and their owners' personal environment values included. Other members confirm the database before each of their backups goes there, and again after it is pointed at another database.</p>
     <p>The owner can also import a session or workspace export into it, adding session details and activity. Pistead creates the tables <code>pistead_workspaces</code>, <code>pistead_sessions</code>, <code>pistead_session_backups</code> and <code>pistead_audit</code> when they are missing. The password is write-only: it is never shown again after saving.</p>
   </div>} action={owner && data?.available && !database && <Button variant="outline" size="sm" icon="plus" onClick={() => setEditing(true)}>Connect database</Button>}>
