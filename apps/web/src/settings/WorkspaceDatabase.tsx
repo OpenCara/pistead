@@ -34,6 +34,12 @@ function withoutDatabase(backupStorage: boolean): string {
     : "this server keeps no session backups, as it has no backup storage of its own (STORAGE_URL)";
 }
 
+/** Where backups go without a workspace database, as the end of a sentence. */
+function withoutDatabase(backupStorage: boolean): string {
+  return backupStorage ? "session backups are kept in the server's backup storage"
+    : "this server keeps no session backups, as it has no backup storage of its own (STORAGE_URL)";
+}
+
 /** What the server reports after importing a dump into the workspace database. */
 interface ImportSummary {
   format: "session" | "workspace";

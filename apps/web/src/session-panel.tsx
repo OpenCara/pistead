@@ -1,5 +1,5 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { permissions, type ApprovalRecord, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { permissions, type ApprovalRecord, type EntryView, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
 import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
 import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
@@ -139,6 +139,18 @@ export function ApprovalStatus({ approval }: { approval: ApprovalRecord }) {
   </>;
 }
 
+/** Marks a transcript entry's tool calls whose commands ran under auto-approve, which have no approval card. */
+export function AutoApprovedMarks({ calls }: { calls?: EntryView["autoApproved"] }) {
+  if (!Array.isArray(calls) || !calls.length) return null;
+  return <span className="approval-marks" title="Ran under the owner's auto-approve access, without a per-command decision">
+    <StatusBadge tone="warning">Auto-approved</StatusBadge>
+    {calls.some(call => call.unbounded) && <StatusBadge tone="warning">No resource limits</StatusBadge>}
+    {/* Executed is the usual outcome; anything else (still running, failed, interrupted) is worth a look. */}
+    {calls.filter(call => call.status !== "executed").map((call, index) =>
+      <StatusBadge key={index} tone={approvalTone[call.status] ?? "neutral"} dot={call.status === "executing"}>{calls.length > 1 ? `${call.tool}: ${call.status}` : call.status}</StatusBadge>)}
+  </span>;
+}
+
 /** An audit detail as indented JSON, with the user IDs in it written as "username(id)". */
 function detailText(detail: unknown, person: (id: string) => Person): string {
   let value = detail;
@@ -182,8 +194,11 @@ export function SessionPanel(props: PanelProps) {
     <div className="session-panel-body">
       {tab === "details" && <PanelDetails key={JSON.stringify([props.session.id, props.session.ownerId, props.user.id, props.session.permissions])} {...props} />}
       {tab === "approvals" && (approvals.length
-        ? <div className="stack">{[...approvals].sort((a, b) => Number(b.status === "pending") - Number(a.status === "pending")).map(approval => <ApprovalCard key={approval.id} approval={approval} />)}</div>
-        : view ? <EmptyState title="No approvals" /> : <Loading />)}
+        ? <div className="stack">
+          {[...approvals].sort((a, b) => Number(b.status === "pending") - Number(a.status === "pending")).map(approval => <ApprovalCard key={approval.id} approval={approval} />)}
+          {!!view?.olderApprovals && <p className="muted small">{olderApprovalsText(view.olderApprovals)}</p>}
+        </div>
+        : view ? <EmptyState title="No approvals">{AUTO_APPROVED_NOTE}</EmptyState> : <Loading />)}
       {tab === "activity" && <Section title="Audit log" action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh activity" title="Refresh" disabled={audit.loading} onClick={audit.refresh} />} bare>
         <ResourceState {...audit} retry={audit.refresh}>
           {!audit.data?.events.length ? <EmptyState title="No activity" /> : <div className="card">
@@ -197,12 +212,20 @@ export function SessionPanel(props: PanelProps) {
   </aside>;
 }
 
+/** Commands auto-approve ran have no card; the transcript marks their calls. */
+const AUTO_APPROVED_NOTE = "Commands that ran under auto-approve are marked on their tool calls in the conversation.";
+function olderApprovalsText(count: number): string {
+  return `${count} older settled ${count === 1 ? "approval isn't" : "approvals aren't"} listed. ${AUTO_APPROVED_NOTE}`;
+}
+
 /** One approval record; decision controls, when allowed, come in as children. */
 export function ApprovalCard({ approval, children }: { approval: ApprovalRecord; children?: ReactNode }) {
   const { operation } = approval;
+  const allowed = (decidedBy: string, scope: ApprovalRecord["scope"]) =>
+    <> · Allowed by <Username id={decidedBy} /> {scope === "session" ? "for the rest of the session" : "for this call"}</>;
   const decision = operation.kind === "permission" && approval.status === "approved" && approval.decidedBy
-    ? <> · Allowed by <Username id={approval.decidedBy} /> {approval.scope === "session" ? "for the rest of the session" : "for this call"}</>
-    : approval.decidedBy && <> · Decision by <Username id={approval.decidedBy} /></>;
+    ? allowed(approval.decidedBy, approval.scope)
+    : <>{approval.permission && allowed(approval.permission.decidedBy, approval.permission.scope)}{approval.decidedBy && <> · Decision by <Username id={approval.decidedBy} /></>}</>;
   return <article className="approval-card card">
     <div className="approval-head">
       <span className="approval-kind">{operation.kind === "permission" ? "Permission" : operation.kind}</span><span className="spacer" />

@@ -23,6 +23,16 @@ function ToolDetails({ icon, label, text }: { icon: IconName; label: string; tex
   </View>;
 }
 
+/**
+ * " · Auto-approved" for an entry whose tool calls ran their commands under auto-approve, which have no approval card,
+ * with any outcome other than the usual "executed" (still running, failed, interrupted).
+ */
+function autoApprovedSuffix(calls: EntryView["autoApproved"]): string {
+  if (!Array.isArray(calls) || !calls.length) return "";
+  const notes = calls.filter(call => call.status !== "executed").map(call => calls.length > 1 ? `${call.tool}: ${call.status}` : call.status);
+  return ` · Auto-approved${calls.some(call => call.unbounded) ? " · No resource limits" : ""}${notes.map(note => ` · ${note}`).join("")}`;
+}
+
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
 export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
   const palette = usePalette();
@@ -42,7 +52,7 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined ? ` · ${formatDuration(entry.durationMs)}` : "";
-    return <ToolDetails icon={toolLabel ? "construct-outline" : "terminal-outline"} label={`${label}${took}${actor ? ` · ${actor}` : ""}`} text={entry.text} />;
+    return <ToolDetails icon={toolLabel ? "construct-outline" : "terminal-outline"} label={`${label}${took}${actor ? ` · ${actor}` : ""}${autoApprovedSuffix(entry.autoApproved)}`} text={entry.text} />;
   }
   if (entry.error) {
     return <View style={styles.entry}>
@@ -61,7 +71,7 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
   const took = entry.durationMs !== undefined ? formatDuration(entry.durationMs) : "";
   return <View style={styles.entry}>
     {prose.trim() !== "" && <Markdown text={prose} />}
-    {toolLabel && <ToolDetails icon="construct-outline" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
+    {toolLabel && <ToolDetails icon="construct-outline" label={`${toolLabel}${autoApprovedSuffix(entry.autoApproved)}`} text={calls.map(call => call.line).join("\n")} />}
     {(actor || took) && <Text style={meta}>{[actor && `by ${actor}`, took].filter(Boolean).join(" · ")}</Text>}
   </View>;
 });

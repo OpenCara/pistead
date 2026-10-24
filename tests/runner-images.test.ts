@@ -2,14 +2,15 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { crc32, deflateSync } from "node:zlib";
 import { sha256 } from "../packages/shared/src/crypto.js";
-import type { AuthorizationRequest, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
+import type { AuthorizationRequest, RunnerBinding, RunnerTicket, SubmitInput } from "../packages/shared/src/types.js";
 import { RunnerService } from "../apps/runner/src/server.js";
+import { RunnerError } from "../apps/runner/src/protocol.js";
 import type { RunnerSession } from "../apps/runner/src/session.js";
 
 const SECRET = "runner-images-test-secret-not-a-production-secret";
@@ -121,5 +122,104 @@ async function readsImagesAsTheModelSeesThem(t: TestContext, unsandboxed: boolea
 }
 
 test("host read_file gives the model images by signature, prepared to fit, and keeps other files text", hostMode, t => readsImagesAsTheModelSeesThem(t, true));
+
+const base64 = (bytes: Buffer) => bytes.toString("base64");
+const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+/** Sends a shared message as the owner. */
+async function send(session: RunnerSession, input: Omit<SubmitInput, "requestId"> & { requestId?: string }) {
+  return session.submit(await ticket("images", "submit"), { requestId: randomUUID(), ...input }, "write");
+}
+async function settle(session: RunnerSession) {
+  for (let count = 0; count < 500 && (await session.view()).busy; count++) await delay(20);
+  const view = await session.view();
+  assert.equal(view.busy, false, "runner did not settle");
+  return view;
+}
+/** The images of queued messages that wait on the host. */
+const waiting = (session: RunnerSession) => readdir(join(session.directory, "inputs")).catch(() => [] as string[]);
+const refused = (status: number, message: RegExp) => (error: unknown) => error instanceof RunnerError && error.status === status && message.test(error.message);
+
+test("pasted images reach the model after the message's text, prepared to fit, and the transcript only notes them", hostMode, async t => {
+  const session = await service(t, true);
+  const small = png(3, 2);
+  const wide = png(2400, 30);
+  await send(session, { content: "What do these show?", images: [{ mimeType: "image/png", data: base64(small) }, { mimeType: "image/png", data: base64(wide) }] });
+  const view = await settle(session);
+  const seen = view.entries.findLast(entry => entry.role === "assistant")!.text.split("\n");
+  // Within the limits the model gets these exact bytes; beyond them, the image prepared to fit.
+  assert.deepEqual(seen.slice(0, 3), ["Deterministic test provider saw:", "What do these show?", `image image/png sha256:${digest(small)}`]);
+  assert.match(seen[3]!, /^image image\/png sha256:[0-9a-f]{64}$/);
+  assert.notEqual(seen[3], `image image/png sha256:${digest(wide)}`);
+  assert.equal(seen.length, 4);
+  assert.equal(view.entries.findLast(entry => entry.role === "user")!.text, "What do these show?\n[image image/png]\n[image image/png]");
+  assert.equal(JSON.stringify(view).includes(base64(small)), false, "image data must not reach the web view");
+  // Pi's transcript holds them once the message reached it.
+  assert.deepEqual(await waiting(session), []);
+
+  // A message can be images alone.
+  await send(session, { content: "", images: [{ mimeType: "image/png", data: base64(small) }] });
+  const alone = await settle(session);
+  assert.deepEqual(alone.entries.findLast(entry => entry.role === "assistant")!.text.split("\n"), ["Deterministic test provider saw:", `image image/png sha256:${digest(small)}`]);
+  assert.equal(alone.entries.findLast(entry => entry.role === "user")!.text, "[image image/png]");
+});
+
+test("pasted images the host can't read or take are refused before anything is queued, and a request ID binds its images", hostMode, async t => {
+  const session = await service(t, true);
+  const image = { mimeType: "image/png" as const, data: base64(png(3, 2)) };
+  // The host decodes every image itself: a broken one, or one whose bytes aren't the type it names, gets a reason for its sender.
+  await assert.rejects(send(session, { content: "Broken", images: [{ mimeType: "image/png", data: base64(Buffer.concat([PNG_SIGNATURE, header(3, 2)])) }] }), refused(422, /cannot be decoded/));
+  await assert.rejects(send(session, { content: "Mislabelled", images: [{ mimeType: "image/jpeg", data: image.data }] }), refused(422, /cannot be decoded/));
+  await assert.rejects(send(session, { content: "Mislabelled", images: [{ mimeType: "image/gif", data: image.data }] }), refused(422, /cannot be decoded/));
+  for (const images of [Array(5).fill(image), [{ ...image, mimeType: "image/bmp" }], [{ ...image, data: "not base64!" }], [{ ...image, name: "screenshot.png" }], {}]) {
+    await assert.rejects(send(session, { content: "Invalid", images: images as never }), refused(400, /images/));
+  }
+  await assert.rejects(send(session, { content: " ", images: [] }), refused(400, /Invalid submission/));
+  assert.deepEqual((await session.view()).queue, []);
+  assert.deepEqual(await waiting(session), []);
+
+  const requestId = randomUUID();
+  const first = await send(session, { content: "Same", images: [image], requestId });
+  assert.equal((await send(session, { content: "Same", images: [image], requestId })).submissionId, first.submissionId);
+  await assert.rejects(send(session, { content: "Same", images: [{ mimeType: "image/png", data: base64(png(2, 3)) }], requestId }), refused(409, /different content/));
+  await assert.rejects(send(session, { content: "Same", requestId }), refused(409, /different content/));
+  await settle(session);
+});
+
+test("a queued message's images wait on the host, outside the run ledger, until it runs, and go when it is stopped", hostMode, async t => {
+  const session = await service(t, true);
+  const small = png(3, 2);
+  // The first image a process prepares starts its image worker; later ones are quick.
+  await send(session, { content: "Warm up", images: [{ mimeType: "image/png", data: base64(small) }] });
+  await settle(session);
+
+  await send(session, { content: "TEST_HOLD 3000" });
+  const later = png(4, 2);
+  const queued = await send(session, { content: "Later", images: [{ mimeType: "image/png", data: base64(later) }] });
+  assert.deepEqual(await waiting(session), [`${queued.submissionId}.json`]);
+  // Every change rewrites the run ledger whole, so a queued message's images are kept out of the database until it runs.
+  const database = await Promise.all(["session.sqlite", "session.sqlite-wal"].map(name => readFile(join(session.directory, name)).catch(() => Buffer.alloc(0))));
+  assert.equal(database.some(bytes => bytes.includes(base64(later))), false, "queued images stay out of the session database");
+  const view = await settle(session);
+  assert.equal(view.entries.findLast(entry => entry.role === "assistant")!.text, `Deterministic test provider saw:\nLater\nimage image/png sha256:${digest(later)}`);
+  assert.deepEqual(await waiting(session), []);
+
+  await send(session, { content: "TEST_HOLD 3000" });
+  await send(session, { content: "Never", images: [{ mimeType: "image/png", data: base64(small) }] });
+  assert.equal((await waiting(session)).length, 1);
+  assert.equal((await session.stop(await ticket("images", "submit"))).stopped, 2);
+  assert.deepEqual(await waiting(session), []);
+  await settle(session);
+
+  // Images the host no longer has (or can't read) when their message's turn comes: it ends, saying why, rather than
+  // running its text without them.
+  await send(session, { content: "TEST_HOLD 3000" });
+  const lost = await send(session, { content: "Lost", images: [{ mimeType: "image/png", data: base64(small) }] });
+  await writeFile(join(session.directory, "inputs", `${lost.submissionId}.json`), "{");
+  const ended = await settle(session);
+  assert.equal(ended.queue!.find(item => item.submissionId === lost.submissionId)!.status, "images lost");
+  assert.equal(ended.entries.some(entry => entry.role === "user" && entry.text === "Lost"), false);
+  assert.deepEqual(await waiting(session), []);
+});
 
 test("sandboxed read_file gives the model images by signature, prepared to fit, and keeps other files text", linux, t => readsImagesAsTheModelSeesThem(t, false));
