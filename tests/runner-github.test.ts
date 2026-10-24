@@ -11,7 +11,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { RunnerService } from "../apps/runner/src/server.js";
 import { RunnerError } from "../apps/runner/src/protocol.js";
 import type { RunnerSession } from "../apps/runner/src/session.js";
-import type { AuthorizationRequest, GitHubIssueView, GitHubMergeRequest, GitHubReadRequest, RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
+import type { AuthorizationRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubReadRequest, RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
 import { sha256 } from "../packages/shared/src/crypto.js";
 
 const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
@@ -129,6 +129,111 @@ test("agents read GitHub pull requests through the broker and merges always wait
     await idle(session);
   }
   assert.equal(merges.length, 3);
+});
+
+test("agents open GitHub issues through the broker, always after a human approves the exact title and body", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-issue-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const issues: GitHubIssueRequest[] = [];
+  let open = async (): Promise<GitHubIssueResult> => ({ number: 63, url: "https://github.com/acme/alpha/issues/63" });
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Two\nlines", body: "x" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "https://github.com/acme/alpha", title: "A URL", body: "x" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "NUL", body: "a\0b" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Sandbox has no CA certificates", body: "## Summary\n\nHTTPS fails." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Issue requested."),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Again", body: "" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Issue requested."),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Once more", body: "" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Issue requested."),
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: "runner-github-test-secret-not-a-production-secret", controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
+    authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    githubIssue: async request => { issues.push(request); return open(); },
+  });
+  await service.initialize();
+  t.after(() => service.close());
+  const id = "github-issue-session";
+  const base = binding(id);
+  const session = await service.provision({ ...base, agent: { ...base.agent, tools: [...base.agent.tools, "github_issue"] } }, await ticket(id, "create"));
+
+  // Even an auto-approve message only asks to open the issue; a multi-line title or a URL never becomes a card.
+  const admissionId = await sha256("github issue admission");
+  await session.submit(await ticket(id, "submit"), { content: "File the bug.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
+  const pending = await pendingApproval(session);
+  const transcript = (await session.view()).entries.map(entry => entry.text).join("\n");
+  assert.match(transcript, /title must be one non-empty line/);
+  assert.match(transcript, /repository must be a github\.com owner\/name/);
+  assert.match(transcript, /must not contain NUL characters/);
+  assert.equal((await session.view()).approvals.length, 1);
+  assert.equal(pending.automatic, undefined);
+  assert.deepEqual(pending.operation, { kind: "github.issue", repository: "acme/alpha", title: "Sandbox has no CA certificates", body: "## Summary\n\nHTTPS fails." });
+  assert.deepEqual(Object.keys(pending.operation), ["kind", "repository", "title", "body"]);
+  assert.deepEqual(issues, []);
+
+  await assert.rejects(session.decide(await ticket(id, "approve"), pending.id, { decision: "approve", operation: pending.operation }), /broker capability/);
+  const executed = await session.decide(await ticket(id, "approve"), pending.id, { decision: "approve", operation: pending.operation, brokerCapability: "capability-1" });
+  assert.equal(executed.status, "executed");
+  assert.deepEqual(JSON.parse(executed.result!), { number: 63, url: "https://github.com/acme/alpha/issues/63" });
+  assert.deepEqual(issues, [{ sessionId: id, actorId: "test:alice", approvalId: pending.id, capability: "capability-1", repository: "acme/alpha",
+    title: "Sandbox has no CA certificates", body: "## Summary\n\nHTTPS fails." }]);
+  await idle(session);
+  assert.ok((await session.view()).entries.some(entry => entry.role === "toolResult" && entry.text.includes("issues/63")), "the agent learns the issue's URL");
+
+  // GitHub's refusal is definite, so the agent sees its reason; any other failure leaves the outcome open.
+  for (const [requestId, failure, status, result] of [
+    ["refused", new RunnerError(422, "GitHub did not open an issue in acme/alpha: Issues are disabled for this repo."), "failed", "GitHub did not open an issue in acme/alpha: Issues are disabled for this repo."],
+    ["unknown", new RunnerError(502, "GitHub could not confirm the outcome."), "interrupted", "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited."],
+  ] as const) {
+    open = async () => { throw failure; };
+    await session.submit(await ticket(id, "submit"), { content: "File another.", requestId, admissionId }, "write");
+    const card = await pendingApproval(session);
+    const decided = await session.decide(await ticket(id, "approve"), card.id, { decision: "approve", operation: card.operation, brokerCapability: `capability-${requestId}` });
+    assert.deepEqual([decided.status, decided.result], [status, result]);
+    await idle(session);
+  }
+  assert.equal(issues.length, 3);
+});
+
+test("allowing github_issue for the rest of the session still leaves every issue to a human", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-issue-grant-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const issues: GitHubIssueRequest[] = [];
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  const call = (title: string) => fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title, body: "" })], { stopReason: "toolUse" });
+  faux.setResponses([call("First"), fauxAssistantMessage("Issue requested."), call("Second"), fauxAssistantMessage("Issue requested.")]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: "runner-github-test-secret-not-a-production-secret", controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
+    authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    githubIssue: async request => { issues.push(request); return { number: 1, url: "https://github.com/acme/alpha/issues/1" }; },
+  });
+  await service.initialize();
+  t.after(() => service.close());
+  const id = "github-issue-grant";
+  // The agent lacks github_issue, so its first call asks the owner, who allows it for the rest of the session.
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  const admissionId = await sha256("github issue grant admission");
+  await session.submit(await ticket(id, "submit"), { content: "File it.", requestId: "first", admissionId }, "write");
+  const permission = await pendingApproval(session);
+  assert.equal(permission.operation.kind, "permission");
+  await session.decide(await ticket(id, "approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "session" });
+  for (const title of ["First", "Second"]) {
+    if (title === "Second") await session.submit(await ticket(id, "submit"), { content: "File another.", requestId: "second", admissionId, options: { access: "auto" } }, "write");
+    const card = await pendingApproval(session);
+    assert.deepEqual([card.operation.kind, card.automatic], ["github.issue", undefined], `${title} waits for a human`);
+    assert.equal((card.operation as { title: string }).title, title);
+    await session.decide(await ticket(id, "approve"), card.id, { decision: "deny", operation: card.operation });
+    await idle(session);
+  }
+  assert.deepEqual(issues, []);
 });
 
 test("host_bash auto-approves only on the session owner's own host; shared hosts require their owner's exact decision", hostMode, async t => {

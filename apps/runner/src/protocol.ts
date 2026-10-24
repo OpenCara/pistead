@@ -2,7 +2,7 @@ import { validHostOperation } from "../../../packages/shared/src/host-operations
 import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
-import { githubMergeMethods, permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
+import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, githubMergeMethods, permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
 import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validCloneDirectory, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
@@ -116,6 +116,9 @@ export function validateOperation(value: unknown): Operation {
   if (op.kind === "github.merge" && githubRepository(op.repository) && Number.isSafeInteger(op.pull) && op.pull > 0
     && typeof op.sha === "string" && /^[0-9a-f]{40}$/.test(op.sha) && githubMergeMethods.includes(op.method)
     && Object.keys(op).length === 5) return op;
+  // The same bounds as the control plane's parseOperation: a one-line title, a body that may be empty.
+  if (op.kind === "github.issue" && githubRepository(op.repository) && text(op.title, GITHUB_ISSUE_TITLE_LIMIT) && !/[\r\n]/.test(op.title)
+    && typeof op.body === "string" && op.body.length <= GITHUB_ISSUE_BODY_LIMIT && !op.body.includes("\0") && Object.keys(op).length === 4) return op;
   if (op.kind === "git.push") {
     const keys = Object.keys(op);
     const request = op.pullRequest as Record<string, unknown> | undefined;

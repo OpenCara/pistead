@@ -4,7 +4,7 @@ import type { ChatImage } from "./chat-images.js";
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**
  * Tools of sessions that pinned their repositories, which are read-only now: still valid in stored agents and
@@ -195,6 +195,34 @@ export interface GitHubMergeOperation {
   sha: string;
   method: GitHubMergeMethod;
 }
+/** Bounds of a GitHub issue the agent opens, the same in the runner and the control plane. */
+export const GITHUB_ISSUE_TITLE_LIMIT = 256;
+export const GITHUB_ISSUE_BODY_LIMIT = 60000;
+/**
+ * Opens an issue with exactly this title and body in a github.com repository (`owner/name`) of the workspace, as the
+ * session owner. The title is one line; the body may be empty. Key order is canonical: kind, repository, title, body.
+ */
+export interface GitHubIssueOperation {
+  kind: "github.issue";
+  repository: string;
+  title: string;
+  body: string;
+}
+/** Runner -> control plane: open one human-approved issue with the capability minted when it was approved. */
+export interface GitHubIssueRequest {
+  sessionId: string;
+  actorId: string;
+  approvalId: string;
+  capability: string;
+  repository: string;
+  title: string;
+  body: string;
+}
+/** The issue GitHub opened: its number and page. */
+export interface GitHubIssueResult {
+  number: number;
+  url: string;
+}
 /** Runs outside isolation as the connector user; only the host owner may approve. */
 export interface HostCommandOperation {
   kind: "host.bash";
@@ -225,6 +253,7 @@ export type Operation =
   | { kind: "bash"; command: string }
   | { kind: "github.comment"; repository: string; issue: number; body: string }
   | GitHubMergeOperation
+  | GitHubIssueOperation
   | GitPushOperation
   | GitRepinOperation
   | HostCommandOperation

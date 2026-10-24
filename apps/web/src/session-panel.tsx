@@ -262,7 +262,7 @@ const permissionNeedText: Record<PermissionNeed, string> = {
   "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk.",
 };
 /** Tools whose effect gets its own approval card after the permission, unless the message auto-approves. */
-const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge", "host_bash", "git_repin"];
+const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge", "github_issue", "host_bash", "git_repin"];
 
 function PermissionSummary({ request, pending }: { request: PermissionRequest; pending: boolean }) {
   return <>

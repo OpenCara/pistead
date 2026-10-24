@@ -12,7 +12,7 @@ type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: st
 /** What decides whether an admission is the session owner's Auto-approve message. */
 type AdmissionAccess = Pick<AdmissionRow, 'session_id' | 'actor_id' | 'mode' | 'access'>;
 const operationTools: Record<Exclude<Operation['kind'], 'permission'>, ToolName> = {
-  'github.comment': 'github_comment', 'github.merge': 'github_merge', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push', 'git.repin': 'git_repin', 'host.bash': 'host_bash',
+  'github.comment': 'github_comment', 'github.merge': 'github_merge', 'github.issue': 'github_issue', 'git.commit': 'git_commit', bash: 'bash', 'git.push': 'git_push', 'git.repin': 'git_repin', 'host.bash': 'host_bash',
 };
 const statuses: readonly string[] = ['pending', 'approved', 'denied', 'executing', 'executed', 'interrupted', 'failed'];
 
@@ -27,8 +27,8 @@ export function permissionCall(approvalId: string): string | undefined {
 }
 /**
  * Whether `admission` is a message the session owner sent with Auto-approve access. Its tool calls use any tool without
- * a permission card, as the runner lets them; what those calls do still follows its own rules (comments and merges wait
- * for a human, a command without limits runs only on the owner's host).
+ * a permission card, as the runner lets them; what those calls do still follows its own rules (comments, merges and
+ * issues wait for a human, a command without limits runs only on the owner's host).
  */
 function ownerAuto(row: SessionRow, admission: AdmissionAccess | undefined): boolean {
   return admission?.access === 'auto' && admission.mode === 'write' && admission.actor_id === row.owner_id && admission.session_id === row.id;
@@ -114,10 +114,10 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       createdAt: text(raw.createdAt, 'createdAt', 64),
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
       ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
-    // Only the owner's own commands, commits, pushes and repins may auto-approve, never a GitHub comment or merge.
+    // Only the owner's own commands, commits, pushes and repins may auto-approve, never a GitHub comment, merge or issue.
     if (raw.automatic !== undefined) {
       if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id || approval.status === 'pending'
-        || operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
+        || operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'github.issue' || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
       if (operation.kind === 'host.bash' && row.connector_owner_id !== row.owner_id) fail(502, 'invalid_runner_response', 'Only the host owner can auto-approve host commands.');
       approval.automatic = true;
     }

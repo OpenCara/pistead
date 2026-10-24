@@ -102,6 +102,11 @@ test("path IDs, exact operations and composite dedup keys cannot collide", async
   assert.notEqual(await requestKey("alice", "write", "id"), await requestKey("alice", "ask", "id"));
   assert.throws(() => validateOperation({ kind: "git.commit", message: "ok", hidden: true }));
   assert.throws(() => validateOperation({ kind: "github.comment", repository: "../escape/repo", issue: 1, body: "x" }));
+  // Issues: a one-line title, a body that may be empty, and nothing else (labels, assignees) to approve unseen.
+  const issue = { kind: "github.issue", repository: "owner/repo", title: "Bug", body: "" };
+  assert.deepEqual(validateOperation(issue), issue);
+  for (const invalid of [{ ...issue, title: "Two\nlines" }, { ...issue, title: " " }, { ...issue, title: "x".repeat(257) }, { ...issue, body: "x".repeat(60001) },
+    { ...issue, body: "nul\0" }, { ...issue, repository: "https://github.com/owner/repo" }, { ...issue, labels: ["bug"] }]) assert.throws(() => validateOperation(invalid));
   assert.throws(() => validateBinding({ ...binding("a"), owner: { ...binding("a").owner, env: { APP_TOKEN: "no" } } }, "a"));
   assert.equal(stableJson({ b: 2, a: 1 }), stableJson({ a: 1, b: 2 }));
   const native = binding("native");
