@@ -54,5 +54,6 @@ jobs:
             -e SESSION_SECRET=ci-session-secret-ci-session-secret-ci -e VAULT_KEY=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=') pistead:ci
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health && break; sleep 1; done
           curl -fsS http://127.0.0.1:8787/api/health | grep -q '"databaseProvider":"sqlite"'
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"workspaceDatabasesConfigured":true'
           curl -fsS http://127.0.0.1:8787/ | grep -qi '<!doctype html'
           docker rm -f pistead

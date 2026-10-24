@@ -1,0 +1,175 @@
+name: Release iOS
+# Pushing an ios-v1.2.3 tag (ios-v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then archives the iOS app
+# (apps/mobile) and uploads it to TestFlight. Its version is the tag's without a prerelease suffix (CFBundleShortVersionString
+# takes only digits), and its build number is this run's, run_number.run_attempt. Every tag goes to TestFlight;
+# submitting a build for App Store review stays manual.
+#
+# Signing, in the `release` environment (README.md, "Releasing"): IOS_CERTIFICATE_P12 (base64 Apple Distribution .p12),
+# IOS_CERTIFICATE_PASSWORD, IOS_PROVISIONING_PROFILE (base64 App Store profile for com.pistead.app), the variable
+# APPLE_TEAM_ID, and for the upload APP_STORE_CONNECT_API_KEY (the .p8's contents), APP_STORE_CONNECT_API_KEY_ID and
+# APP_STORE_CONNECT_API_ISSUER_ID. Without any of them the app is archived unsigned, to check it builds, and nothing is
+# uploaded; with only some of them the job fails.
+on:
+  push:
+    tags: ["ios-v*.*.*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    uses: ./.github/workflows/release-check.yml
+    with:
+      prefix: ios-
+
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+
+  ios:
+    needs: [check, ci]
+    runs-on: macos-latest
+    timeout-minutes: 60
+    environment: release
+    # Each secret reaches only the step that uses it: actions, and the packages prebuild runs, see none of them.
+    env:
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+    steps:
+      # Only whether each one is set, not its value.
+      - name: Signing configured
+        id: signing
+        env:
+          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 != '' }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD != '' }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE != '' }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY != '' }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID != '' }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID != '' }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID != '' }}
+        run: |
+          missing=()
+          for name in APPLE_TEAM_ID IOS_CERTIFICATE_P12 IOS_CERTIFICATE_PASSWORD IOS_PROVISIONING_PROFILE APP_STORE_CONNECT_API_KEY APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_API_ISSUER_ID; do
+            [ "${!name}" = true ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ ${#missing[@]} -eq 7 ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::iOS signing is not configured: the app is archived unsigned to check the build, and nothing is uploaded to TestFlight."
+          else
+            echo "::error::iOS signing is partly configured; missing: ${missing[*]}."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The build number grows with every run, and with every re-run of one, as App Store Connect requires.
+      - name: Set the version from the tag
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          IOS_BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+        run: node scripts/set-release-version.mjs "$VERSION" mobile
+      # ios/ is generated from app.json and never checked in (apps/mobile/README.md); prebuild also installs the pods.
+      - name: Generate the native project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform ios --clean
+      - name: Install the signing certificate and profile
+        if: steps.signing.outputs.configured == 'true'
+        id: profile
+        env:
+          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          printf '%s' "$IOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/distribution.p12" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/distribution.p12"
+
+          profile="$RUNNER_TEMP/profile.mobileprovision"
+          printf '%s' "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+          uuid=$(security cms -D -i "$profile" | plutil -extract UUID raw -)
+          # Xcode 16 reads UserData; older ones MobileDevice.
+          for dir in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+            mkdir -p "$dir" && cp "$profile" "$dir/$uuid.mobileprovision"
+          done
+          echo "uuid=$uuid" >> "$GITHUB_OUTPUT"
+
+          # Manual signing on the app target only: command-line build settings would reach the pods' targets too.
+          ruby -rxcodeproj -e '
+            project = Xcodeproj::Project.open("apps/mobile/ios/Pistead.xcodeproj")
+            target = project.targets.find { |t| t.name == "Pistead" } or abort "No Pistead target in the generated project"
+            target.build_configurations.select { |c| c.name == "Release" }.each do |config|
+              config.build_settings["CODE_SIGN_STYLE"] = "Manual"
+              config.build_settings["DEVELOPMENT_TEAM"] = ENV.fetch("APPLE_TEAM_ID")
+              config.build_settings["CODE_SIGN_IDENTITY"] = "Apple Distribution"
+              config.build_settings["CODE_SIGN_IDENTITY[sdk=iphoneos*]"] = "Apple Distribution"
+              config.build_settings["PROVISIONING_PROFILE_SPECIFIER"] = ARGV[0]
+            end
+            project.save
+          ' "$uuid"
+      - name: Archive
+        working-directory: apps/mobile/ios
+        env:
+          SIGNED: ${{ steps.signing.outputs.configured }}
+        run: |
+          signing=(CODE_SIGNING_ALLOWED=NO)
+          [ "$SIGNED" = true ] && signing=()
+          xcodebuild archive -workspace Pistead.xcworkspace -scheme Pistead -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Pistead.xcarchive" \
+            "${signing[@]}" -quiet
+      - name: Export the IPA
+        if: steps.signing.outputs.configured == 'true'
+        env:
+          PROFILE_UUID: ${{ steps.profile.outputs.uuid }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>com.pistead.app</key><string>$PROFILE_UUID</string></dict>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Pistead.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" -quiet
+          ls "$RUNNER_TEMP/export"/*.ipa
+      # altool's upload still works; xcodebuild -exportArchive with destination upload would replace it.
+      - name: Upload to TestFlight
+        if: steps.signing.outputs.configured == 'true'
+        env:
+          API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s\n' "$API_KEY" > "$HOME/.appstoreconnect/private_keys/AuthKey_$API_KEY_ID.p8"
+          xcrun altool --upload-app --type ios --file "$(ls "$RUNNER_TEMP/export"/*.ipa)" \
+            --apiKey "$API_KEY_ID" --apiIssuer "$API_ISSUER_ID"
+      - name: Remove the signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -rf "$HOME/.appstoreconnect/private_keys" "$RUNNER_TEMP/profile.mobileprovision"

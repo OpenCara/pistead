@@ -75,6 +75,12 @@ blocks them elsewhere (right-click › Open, or `xattr -dr com.apple.quarantine 
    `APPLE_TEAM_ID`), then run `pnpm --filter @pistead/desktop dist`. electron-builder signs the app and the connector's
    files, submits it to Apple's notary service and staples the ticket.
 
+The desktop release workflow (`.github/workflows/release-desktop.yml`, started by a `desktop-v1.2.3` tag) does all of
+this without editing `electron-builder.yml`: once `MAC_CERTIFICATE_P12` and the notarization key are configured (the
+root README, "Releasing", lists them), it overrides the identity, hardened runtime and notarization on the command
+line. It then attaches the DMG and zip to the tag's GitHub release, and without those secrets it releases the ad-hoc
+signed build. Windows and Linux builds will join the same release as one more job each.
+
 Check the result with `codesign --verify --deep --strict --verbose=2 dist/release/mac-arm64/Pistead.app` and
 `spctl --assess --type execute --verbose dist/release/mac-arm64/Pistead.app`.
 

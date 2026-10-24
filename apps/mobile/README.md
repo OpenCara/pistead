@@ -59,8 +59,9 @@ as attachments.
 
 ## Not done yet
 
-- **App Store and TestFlight**: no signing team, provisioning, EAS configuration or release process yet; the app runs
-  as a development build on simulators.
+- **App Store**: the iOS release workflow (`.github/workflows/release-ios.yml`) uploads each `ios-v1.2.3` tag to
+  TestFlight once its signing secrets are configured (the root README, "Releasing", lists them). Submitting a build for App
+  Store review is manual.
 - **Android**: `app.json` already has the package name and adaptive icon, and the code keeps platform differences
   behind explicit `Platform` checks: keyboard avoidance and keyboard events (`lib/layout.ts`, the session and sign-in
   screens), the option sheet's iOS dismissal timing (`components/ui.tsx`) and the monospace font (`theme.ts`). Nothing
