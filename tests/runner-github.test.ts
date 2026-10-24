@@ -140,6 +140,7 @@ test("agents open GitHub issues through the broker, always after a human approve
   faux.setResponses([
     fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Two\nlines", body: "x" })], { stopReason: "toolUse" }),
     fauxAssistantMessage([fauxToolCall("github_issue", { repository: "https://github.com/acme/alpha", title: "A URL", body: "x" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "NUL", body: "a\0b" })], { stopReason: "toolUse" }),
     fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Sandbox has no CA certificates", body: "## Summary\n\nHTTPS fails." })], { stopReason: "toolUse" }),
     fauxAssistantMessage("Issue requested."),
     fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Again", body: "" })], { stopReason: "toolUse" }),
@@ -168,6 +169,7 @@ test("agents open GitHub issues through the broker, always after a human approve
   const transcript = (await session.view()).entries.map(entry => entry.text).join("\n");
   assert.match(transcript, /title must be one non-empty line/);
   assert.match(transcript, /repository must be a github\.com owner\/name/);
+  assert.match(transcript, /must not contain NUL characters/);
   assert.equal((await session.view()).approvals.length, 1);
   assert.equal(pending.automatic, undefined);
   assert.deepEqual(pending.operation, { kind: "github.issue", repository: "acme/alpha", title: "Sandbox has no CA certificates", body: "## Summary\n\nHTTPS fails." });
