@@ -13,7 +13,7 @@ import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { RepositoryPreparationCard } from "./repository-preparation";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
-import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
+import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
 import {
   Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
@@ -66,9 +66,9 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
 }
 
 /** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
-function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconName; label: ReactNode; text: string }) {
+function ToolDetails({ role, icon, label, text, badges }: { role?: string; icon: IconName; label: ReactNode; text: string; badges?: ReactNode }) {
   return <details className="entry-tool" data-role={role}>
-    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span><Icon name="chevron-right" size={14} /></summary>
+    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span>{badges}<Icon name="chevron-right" size={14} /></summary>
     <pre>{text}</pre>
   </details>;
 }
@@ -85,7 +85,8 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined
       && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
-    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text} />;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text}
+      badges={<AutoApprovedMarks calls={entry.autoApproved} />} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -102,7 +103,7 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
-    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} />}
     {(actor || took) && <div className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</div>}
   </div>;
 }

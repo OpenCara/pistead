@@ -170,7 +170,9 @@ async function fetchSnapshot(c: AppContext, row: SessionRow, base: Snapshot | un
   if (raw.sessionId !== row.id || raw.owner?.id !== row.owner_id) fail(502, 'invalid_runner_response', 'The runner returned an inconsistent session binding.');
   const approvals = await presentApprovals(c, row, raw.approvals);
   // Secrets are hidden from everyone; approvals keep the review hash committed to the real operation.
-  const view: SessionView = { ...raw, entries: raw.entries.map(redactedEntry), approvals: approvals.map(redactApproval) };
+  const { olderApprovals, ...rest } = raw;
+  const view: SessionView = { ...rest, entries: raw.entries.map(redactedEntry), approvals: approvals.map(redactApproval),
+    ...(Number.isSafeInteger(olderApprovals) && olderApprovals! > 0 ? { olderApprovals } : {}) };
   return { ...result, view };
 }
 

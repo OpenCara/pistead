@@ -1261,6 +1261,38 @@ test('automatic approvals are shown only for the owner\'s own decided commands, 
   }
 });
 
+test('a folded permission, older approvals and auto-approved calls reach people only in their exact shapes', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const owner = s.creator.user.id;
+  const command: ApprovalRecord = { id: 'tool-1', sessionId: s.session.id, requestedBy: owner, decidedBy: owner, permission: { decidedBy: owner, scope: 'session' },
+    operation: { kind: 'bash', command: 'npm test' }, status: 'denied', createdAt: new Date().toISOString() };
+  let advertised: Record<string, unknown> = command as unknown as Record<string, unknown>;
+  let olderApprovals: unknown = 7;
+  const entry = { id: '1:2', kind: 'message', role: 'assistant', text: 'bash({"command":"ls"})', conversationId: '1', autoApproved: [{ tool: 'bash', status: 'executed' }] };
+  rpcHub(f, s.connector, () => Response.json({ view: {
+    sessionId: s.session.id,
+    owner: { id: owner, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+    entries: [entry], approvals: [advertised], olderApprovals, conversations: [{ id: '1', mode: 'write' }], busy: false,
+  } }));
+  const path = `/api/sessions/${s.session.id}/view`;
+  let { view } = await json<{ view: SessionView }>(await s.creator.request('GET', path));
+  assert.deepEqual(view.approvals[0]!.permission, { decidedBy: owner, scope: 'session' });
+  assert.equal(view.olderApprovals, 7);
+  assert.deepEqual(view.entries[0]!.autoApproved, [{ tool: 'bash', status: 'executed' }]);
+  for (const value of [-1, 1.5, '7', null]) {
+    olderApprovals = value;
+    ({ view } = await json<{ view: SessionView }>(await s.creator.request('GET', path)));
+    assert.equal(view.olderApprovals, undefined, String(value));
+  }
+  for (const permission of [null, 'yes', { decidedBy: owner, scope: 'forever' }, { decidedBy: owner, extra: true }, { decidedBy: 'not an id!' }]) {
+    advertised = { ...command, permission };
+    await denied(await s.creator.request('GET', path), 502, 'invalid_runner_response');
+  }
+  // A permission request is never folded into another one.
+  advertised = { ...command, id: 'permission-1', operation: { kind: 'permission', tool: 'bash', target: 'npm test', needs: ['tool'] } };
+  await denied(await s.creator.request('GET', path), 502, 'invalid_runner_response');
+});
+
 for (const invalid of ['ask', 'expired', 'foreign-session', 'foreign-actor'] as const) {
   test(`${invalid} admission cannot authorize a model review while history remains readable`, async t => {
     const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);

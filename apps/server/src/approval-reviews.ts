@@ -125,6 +125,16 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       if ((raw.scope !== 'call' && raw.scope !== 'session') || operation.kind !== 'permission' || approval.status !== 'approved') fail(502, 'invalid_runner_response', 'The runtime returned an invalid permission scope.');
       approval.scope = raw.scope;
     }
+    // The permission its tool call was given, folded into the operation's card; a host lists it as its own card otherwise.
+    if (raw.permission !== undefined) {
+      const permission = raw.permission as unknown;
+      if (!permission || typeof permission !== 'object' || operation.kind === 'permission' || explicit) fail(502, 'invalid_runner_response', 'The runtime returned an invalid permission.');
+      const { decidedBy, scope, ...rest } = permission as Record<string, unknown>;
+      let decider: string | undefined;
+      try { decider = userIdentifier(decidedBy, 'decidedBy'); } catch { /* Refused below as the host's error, not the caller's. */ }
+      if (!decider || Object.keys(rest).length || (scope !== undefined && scope !== 'call' && scope !== 'session')) fail(502, 'invalid_runner_response', 'The runtime returned an invalid permission.');
+      approval.permission = { decidedBy: decider, ...(scope ? { scope } : {}) };
+    }
     if (raw.unbounded !== undefined) {
       if (raw.unbounded !== true || operation.kind !== 'bash') fail(502, 'invalid_runner_response', 'The runtime returned an invalid unbounded command.');
       approval.unbounded = true;

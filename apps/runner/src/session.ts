@@ -25,6 +25,7 @@ import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
+import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
 import { egressPushService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
@@ -50,7 +51,7 @@ type Run = {
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 /** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
 type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
-type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
+type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, StoredApproval>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string; callId?: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
 /** One JSON string that every change replaces, so each change is stored whole: a delta would be as large and only lengthen replay. */
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
 /** Tools that never change files or run commands: the whole toolset of side asks. */
@@ -61,10 +62,6 @@ const readOnlyTools = ["identity", "read_file", "list_files"];
  * decided: the call fails instead of holding the session.
  */
 const DECISION_WAIT_MS = 60 * 60 * 1000;
-/** Whether a tool call waiting on `approval` can go on: a permission request once decided, an operation once it ran, failed or was denied. */
-function settled(approval: ApprovalRecord): boolean {
-  return approval.operation.kind === "permission" ? approval.status !== "pending" : !["pending", "approved", "executing"].includes(approval.status);
-}
 /** Whether `run` keeps the session busy: it is queued or at work, or a stop of it is still ending its work. */
 function holdsQueue(run: Run): boolean {
   return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
@@ -1031,7 +1028,8 @@ export class RunnerSession {
     await api.commit(async tx => {
       const current = await tx.doc(RunnerState);
       const meta: Metadata = JSON.parse(current.json);
-      meta.toolActors[String(api.taskId)] ??= { initiatedBy: run.initiatedBy, ownerId: run.ownerId, runKey: run.key };
+      // The model's id of the call links its approval card to the transcript entry that made it.
+      meta.toolActors[String(api.taskId)] ??= { initiatedBy: run.initiatedBy, ownerId: run.ownerId, runKey: run.key, callId: api.callId };
       current.json = JSON.stringify(meta);
     }, context);
     return { initiatedBy: run.initiatedBy, actingAs: run.ownerId, mode: run.mode };
@@ -1129,7 +1127,7 @@ export class RunnerSession {
 
   private sessionTools(): ToolRegistration[] {
     const text = (value: unknown) => ({ output: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
-    const approvalText = (approval: ApprovalRecord) => text({ ...approval, admissionId: undefined });
+    const approvalText = (approval: StoredApproval) => text({ ...approval, admissionId: undefined, callId: undefined });
     return [
       defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api, call) => {
         const attribution = await this.toolActor(api, false);
@@ -1286,10 +1284,12 @@ export class RunnerSession {
     }
     await this.authorize(actorId, "write");
     let admissionId: string | undefined;
+    let callId: string | undefined;
     let automatic = false;
     if (toolTaskId !== undefined) {
       const state = await this.metadata();
       const attribution = state.toolActors[toolTaskId];
+      callId = attribution?.callId;
       const run = attribution && state.runs[attribution.runKey];
       if (!run || run.initiatedBy !== actorId || run.ownerId !== this.binding.owner.id || run.mode !== "write"
         || !["admitting", "running"].includes(run.status)) throw new RunnerError(403, "Approval has no active originating write");
@@ -1302,9 +1302,9 @@ export class RunnerSession {
         && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
-    const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
+    const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
       ...(automatic ? { status: "executing", decidedBy: this.binding.owner.id, automatic: true } : { status: "pending" }),
-      ...(consent.unbounded && operation.kind === "bash" ? { unbounded: true } : {}) };
+      ...(consent.unbounded && operation.kind === "bash" ? { unbounded: true } : {}), ...(callId ? { callId } : {}) };
     if (admissionId !== undefined) approval.admissionId = admissionId;
     let created = false;
     // The tool call waits on its card: registered first, so a decision never finds the card without its call.
@@ -1506,6 +1506,8 @@ export class RunnerSession {
     }
     // Every admission is committed before its entries: read attribution after transcript snapshots.
     const state = await this.metadata();
+    const stored = Object.values(state.approvals);
+    const autoApproved = autoApprovedCalls(stored);
     const entries: SessionView["entries"] = [];
     for (const snapshot of snapshots) {
       let previous: Run | undefined;
@@ -1514,7 +1516,7 @@ export class RunnerSession {
         const ending = run !== previous && previous && this.endView(previous, snapshot.branch.id);
         if (ending) entries.push(ending);
         previous = run;
-        entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy));
+        entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy, autoApproved));
       }
       const ending = previous && this.endView(previous, snapshot.branch.id);
       if (ending) entries.push(ending);
@@ -1524,8 +1526,9 @@ export class RunnerSession {
     const access = latestWrite?.options?.access;
     const repositories = this.repositoryView();
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
+    const { approvals, olderApprovals } = viewApprovals(stored);
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
-      approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
+      approvals, ...(olderApprovals ? { olderApprovals } : {}), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
       busy: Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
@@ -1540,8 +1543,13 @@ export class RunnerSession {
     };
   }
 
-  private entryView(entry: EntryRecord, branch: number, actorId?: string): SessionView["entries"][number] {
+  private entryView(entry: EntryRecord, branch: number, actorId?: string, autoApproved?: ReturnType<typeof autoApprovedCalls>): SessionView["entries"][number] {
     const messages = entry.model ?? [];
+    // Commands auto-approve ran have no card in the view: their calls say so instead.
+    const marks = messages.flatMap(message => message.role !== "assistant" ? [] : message.content.flatMap(block => {
+      const mark = block.type === "toolCall" ? autoApproved?.get(block.id) : undefined;
+      return mark && block.type === "toolCall" ? [{ tool: block.name, ...mark }] : [];
+    }));
     const text = messages.flatMap(message => {
       if (typeof message.content === "string") return [message.content];
       // Image data stays on the host; the transcript only notes that the model saw one.
@@ -1557,7 +1565,7 @@ export class RunnerSession {
     const durations = messages.flatMap(message => (message.role === "assistant" || message.role === "toolResult") && message.durationMs !== undefined ? [message.durationMs] : []);
     const durationMs = durations.length ? durations.reduce((total, value) => total + value, 0) : undefined;
     return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch),
-      ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}) };
+      ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}), ...(marks.length ? { autoApproved: marks } : {}) };
   }
 
   /** What follows a run's entries: its failed model turn, who stopped it, or that its host's crashes ended it. */
