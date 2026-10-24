@@ -14,6 +14,7 @@ import { parsePushCommands, pushRejection, readPushCommands, sessionBranchRefusa
 import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
+import { CA_BUNDLE, CA_BUNDLE_VARIABLES, trustedCertificates } from "../apps/runner/src/trust-store.js";
 
 const repository = { bindingId: "binding-app", provider: "github", host: "github.com", repositoryId: "1701", fullName: "acme/app" } as const;
 
@@ -101,6 +102,22 @@ test("sandboxed commands get the proxy and Git rewrites, without credentials", (
   assert.deepEqual(rewrites[0], ["url.http://127.0.0.1:41080/git/.insteadOf", "https://"]);
   assert.ok(rewrites.some(([key, value]) => key === "url.http://127.0.0.1:41080/git/github.com/.insteadOf" && value === "git@github.com:"));
   assert.ok(!Object.values(env).some(value => /token|password|authorization/i.test(value)));
+  // HTTPS clients find the host's certificates where the sandbox mounts them (#63).
+  for (const name of ["SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"]) assert.equal(env[name], CA_BUNDLE);
+  assert.equal(CA_BUNDLE_VARIABLES.length, 5);
+});
+
+test("the sandbox's certificates are the host's system store, else Node's bundled one, plus NODE_EXTRA_CA_CERTS", () => {
+  const pem = (name: string) => `-----BEGIN CERTIFICATE-----\n${name}\n-----END CERTIFICATE-----`;
+  const store = (stores: Partial<Record<"system" | "bundled" | "extra", string[]>>) => (type: "system" | "bundled" | "extra") => stores[type] ?? [];
+  assert.equal(trustedCertificates(store({ system: [pem("system")], bundled: [pem("bundled")], extra: [pem("company")] })),
+    `${pem("system")}\n${pem("company")}\n`);
+  // A host without a system store gets Node's bundled roots; duplicates and anything but certificates are dropped.
+  assert.equal(trustedCertificates(store({ system: [], bundled: [pem("bundled"), `${pem("bundled")}\n`], extra: ["not a certificate"] })), `${pem("bundled")}\n`);
+  // A store that can't be read counts as empty, and the bundle is never empty.
+  const certificates = trustedCertificates(() => { throw new Error("unreadable"); });
+  assert.ok(certificates.split("-----BEGIN CERTIFICATE-----").length > 50);
+  assert.ok(trustedCertificates().includes("-----BEGIN CERTIFICATE-----"));
 });
 
 test("Git reads of workspace repositories go to the relay; pushes and other repositories are refused", async t => {
@@ -305,6 +322,11 @@ test("a sandboxed git clone of a workspace repository goes through the proxy and
   t.after(() => sandbox.close());
   await sandbox.initialize();
   const shell = (command: string) => sandbox.execute({ kind: "bash", command }, false, async () => {}, { allowTestShell: true });
+
+  // Shell commands see the host's certificates and nothing else of its /etc, and OpenSSL loads them (#63).
+  await shell(`test "$(ls -A /etc)" = ssl && test "$(ls -A /etc/ssl/certs)" = ca-certificates.crt && test "$SSL_CERT_FILE" = ${CA_BUNDLE}`);
+  await shell("python3 -c \"import ssl, sys; sys.exit(0 if ssl.create_default_context().cert_store_stats()['x509_ca'] > 0 else 1)\"");
+  await assert.rejects(shell("echo changed > /etc/ssl/certs/ca-certificates.crt"), /Read-only|Permission denied/);
 
   await shell("git clone -q https://github.com/acme/app.git clones/app");
   assert.equal(await sandbox.readFile("clones/app/README.md", async () => {}), "from upstream\n");
