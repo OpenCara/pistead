@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import { validCloneDirectory } from "../../../packages/shared/src/repositories.js";
@@ -1259,10 +1259,13 @@ export class Sandbox {
         }
         // Beside the shim, out of the sandbox's reach; written at every open, so the host's current store applies.
         if (this.#egressSocket !== undefined) {
+          // Replaced in one step, so no command ever finds the file missing or half written.
           const bundle = join(this.#root, CA_BUNDLE_FILE);
-          await rm(bundle, { force: true });
-          await writeFile(bundle, trustedCertificates(), { mode: 0o400 });
-          await chmod(bundle, 0o400);
+          const staged = `${bundle}.new`;
+          await rm(staged, { force: true });
+          await writeFile(staged, trustedCertificates(), { mode: 0o400 });
+          await chmod(staged, 0o400);
+          await rename(staged, bundle);
         }
         opened.push(config);
         this.#mounts = { root, home, worktree, git, config };
@@ -1470,7 +1473,8 @@ export class Sandbox {
       "--ro-bind-fd", "6", `${this.home}/.gitconfig`,
       // Only shell commands reach the network, and only through the session's proxy. A missing socket (the session is
       // not open) is skipped; requests then fail to connect.
-      ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET, "--ro-bind-try", join(this.#root, CA_BUNDLE_FILE), CA_BUNDLE] : []),
+      // The certificates are written whenever there is a proxy, so a missing file is an error, not a skipped mount.
+      ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET, "--ro-bind", join(this.#root, CA_BUNDLE_FILE), CA_BUNDLE] : []),
       ...(egress && this.#mirrors ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY] : []),
       ...mirrors.flatMap(({ source, target }) => ["--ro-bind-try", source, target]),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
