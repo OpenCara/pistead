@@ -77,7 +77,9 @@ jobs:
             echo "::warning::MAC_CERTIFICATE_P12 is not set: the macOS app is ad-hoc signed and not notarized, so Gatekeeper blocks it on other Macs."
           fi
           pnpm exec electron-builder "${args[@]}"
-          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+      - name: Remove the notarization key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
       - name: Check the signature
         working-directory: apps/desktop
         env:

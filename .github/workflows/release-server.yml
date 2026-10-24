@@ -39,8 +39,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # The tag (server-v1.2.3) is not itself semver, so the version comes from the check. {{major}}.{{minor}} is
-      # skipped for a prerelease, and latest is set only for a release.
+      # The tag (server-v1.2.3) is not itself semver, so the version comes from the check. A prerelease gets only its
+      # full version: metadata-action already skips {{major}}.{{minor}} for one, and the guards say so explicitly.
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -48,7 +48,7 @@ jobs:
           flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ needs.check.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.version }},enable=${{ needs.check.outputs.prerelease == 'false' }}
             type=raw,value=latest,enable=${{ needs.check.outputs.prerelease == 'false' }}
       - uses: docker/build-push-action@v6
         with:
