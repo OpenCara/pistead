@@ -43,17 +43,19 @@ function minutesLater(from: number, minutes: number): string {
  */
 async function asSessionOwner<T>(env: Env, row: SessionRow, work: (c: AppContext) => Promise<T>): Promise<T> {
   const app = new Hono<WorkerEnv>();
-  let outcome: { value: T } | { error: unknown } | undefined;
+  // A holder rather than a `let`: TypeScript doesn't see assignments made inside the handler.
+  const result: { outcome?: { value: T } | { error: unknown } } = {};
   app.post('/', async c => {
     c.set('auth', { userId: row.owner_id, tokenHash: 'automatic-backup', csrfToken: '', client: 'native' });
     try {
-      outcome = { value: await work(c) };
+      result.outcome = { value: await work(c) };
     } catch (error) {
-      outcome = { error };
+      result.outcome = { error };
     }
     return c.body(null, 204);
   });
   await app.request('/', { method: 'POST' }, env);
+  const { outcome } = result;
   if (!outcome) throw new Error('The automatic backup did not run.');
   if ('error' in outcome) throw outcome.error;
   return outcome.value;
