@@ -11,6 +11,7 @@ import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepo
 import { egressPushService, hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
 import { RunnerError } from "./protocol.js";
+import { CA_BUNDLE, CA_BUNDLE_VARIABLES } from "./trust-store.js";
 
 /** Where sandboxed commands reach the proxy: a loopback port the sandbox helper relays to this session's socket. */
 export const EGRESS_PORT = 41080;
@@ -78,6 +79,8 @@ export function egressEnvironment(sessionBranch?: string): Record<string, string
     HTTPS_PROXY: proxy, https_proxy: proxy, HTTP_PROXY: proxy, http_proxy: proxy,
     NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1",
     NODE_USE_ENV_PROXY: "1",
+    // The host's trusted certificates, mounted read-only at CA_BUNDLE, for HTTPS through the proxy's tunnels.
+    ...Object.fromEntries(CA_BUNDLE_VARIABLES.map(name => [name, CA_BUNDLE])),
     PISTEAD_EGRESS_STATUS: `${proxy}/__pistead/status`,
     ...(sessionBranch ? { PISTEAD_SESSION_BRANCH: sessionBranch } : {}),
     ...config,

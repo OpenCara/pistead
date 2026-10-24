@@ -49,7 +49,12 @@ and the sandbox helper relays the loopback port `127.0.0.1:41080` to it byte for
   `NODE_USE_ENV_PROXY=1`;
 - `GIT_CONFIG_COUNT` entries rewriting `https://` remotes, and SSH remotes of github.com, gitlab.com and
   bitbucket.org, to `http://127.0.0.1:41080/git/<host>/<path>`;
-- `PISTEAD_EGRESS_STATUS`, the proxy's status endpoint.
+- `PISTEAD_EGRESS_STATUS`, the proxy's status endpoint;
+- the host's trusted certificates (`trust-store.ts`), bound read-only at `/etc/ssl/certs/ca-certificates.crt` and named
+  by `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`. The sandbox has
+  no `/etc`, so without them only clients with a store of their own (Node) could verify a tunnel's host (#63). The
+  runner writes them into the session's private root at each open, from the host's system store (Node's bundled store
+  where it has none) plus its `NODE_EXTRA_CA_CERTS`; no other file of the host's `/etc` is mounted.
 
 None of this is a boundary: a command that ignores it has no network at all. File tools, commits and the other helper
 steps get neither the socket nor the variables.
