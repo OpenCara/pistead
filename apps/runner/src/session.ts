@@ -853,8 +853,9 @@ export class RunnerSession {
         if (!run) return;
         try { await this.authorize(run.initiatedBy, run.mode === "ask" ? "ask" : "write"); }
         catch {
-          await this.mutate(meta => { meta.runs[run.key]!.status = "interrupted"; });
+          // Its images go first, as in endLostInputs: once the ledger ends the run, nothing of it is left on the host.
           if (run.images) await this.discardInputs([run.key]);
+          await this.mutate(meta => { meta.runs[run.key]!.status = "interrupted"; });
           continue;
         }
         const content = await this.runInput(run);
@@ -1024,10 +1025,14 @@ export class RunnerSession {
     await Promise.all(names.filter(name => !waiting(name)).map(name => rm(join(this.inputsDirectory, name), { force: true }).catch(() => {})));
   }
 
-  /** Ends a run whose images are gone or unreadable, saying so in the ledger, and removes whatever is left of them. */
+  /**
+   * Ends a run whose images are gone or unreadable, saying so in the ledger, after removing whatever is left of them:
+   * the ledger ending it is what makes the session idle, so nothing of the run is left on the host by then. A host
+   * that stops in between finds the run still queued without its images when it reopens, and ends it here again.
+   */
   private async endLostInputs(key: string): Promise<void> {
-    await this.mutate(meta => { Object.assign(meta.runs[key]!, { status: "interrupted", inputsLost: true }); });
     await this.discardInputs([key]);
+    await this.mutate(meta => { Object.assign(meta.runs[key]!, { status: "interrupted", inputsLost: true }); });
   }
 
   /**

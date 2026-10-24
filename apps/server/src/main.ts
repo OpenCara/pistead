@@ -1,6 +1,4 @@
 import { createReadStream } from 'node:fs';
-import type { IncomingMessage } from 'node:http';
-import type { TLSSocket } from 'node:tls';
 import { createAdaptorServer } from '@hono/node-server';
 import { ConfigurationError, defaultDatabaseUrl, loadConfig } from './config.js';
 import { rejectUpgrade } from './connector-hub.js';
@@ -8,6 +6,7 @@ import { connectorError } from './connector-transport.js';
 import { authenticateConnectorSocket } from './connectors.js';
 import { exportSession, exportWorkspace } from './data-export.js';
 import { openDatabase } from './db/index.js';
+import { requestUrl, trustForwardedHeaders } from './forwarded.js';
 import type { Database } from './db/types.js';
 import { app } from './index.js';
 import { createStaticHandler } from './static.js';
@@ -16,16 +15,6 @@ import { runAutomaticBackups } from './automatic-backups.js';
 import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
 import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
 import { WorkspaceDatabaseError } from './workspace-databases/types.js';
-
-/** The request URL as the client sees it: forwarded scheme/host only when the operator trusts the proxy. */
-function requestUrl(request: IncomingMessage, trustProxy: boolean): URL {
-  const forwarded = (name: string) => trustProxy ? String(request.headers[name] ?? '').split(',')[0]!.trim() : '';
-  const proto = forwarded('x-forwarded-proto');
-  const scheme = proto === 'https' || proto === 'http' ? proto : (request.socket as TLSSocket).encrypted ? 'https' : 'http';
-  const host = forwarded('x-forwarded-host') || request.headers.host;
-  if (!host) throw new Error('Missing host header');
-  return new URL(`${scheme}://${host}${request.url ?? '/'}`);
-}
 
 /** The `code` of a Node or pg error, looking one `cause` deep (pg wraps socket errors). */
 function errorCode(error: unknown): string | undefined {
@@ -217,14 +206,7 @@ app.notFound(async c => {
 
 const server = createAdaptorServer({
   overrideGlobalObjects: false,
-  fetch: (request, bindings) => {
-    if (trustProxy) {
-      // createAdaptorServer defaults to node:http, so the incoming message is always HTTP/1.
-      const url = requestUrl(bindings.incoming as IncomingMessage, true);
-      if (url.href !== request.url) request = new Request(url, request);
-    }
-    return app.fetch(request, env);
-  },
+  fetch: trustProxy ? trustForwardedHeaders(request => app.fetch(request, env)) : request => app.fetch(request, env),
 });
 
 server.on('upgrade', (request, socket, head) => {
