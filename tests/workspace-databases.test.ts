@@ -10,6 +10,8 @@ import type { Env, WorkerEnv } from '../apps/server/src/types.js';
 import type { RunnerBinding, WorkspaceDatabase } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { registerBackups } from '../apps/server/src/backups.js';
+import { runAutomaticBackups } from '../apps/server/src/automatic-backups.js';
+import { markSessionChanged } from '../apps/server/src/session-changes.js';
 import { exportSession, exportWorkspace } from '../apps/server/src/data-export.js';
 import { decryptToken } from '../apps/server/src/vault.js';
 import type { ImportSummary } from '../apps/server/src/workspace-databases/import.js';
@@ -186,7 +188,8 @@ test('only the workspace owner connects, replaces and disconnects the session da
     assert.equal(view.status, 200);
     const text = await view.text();
     assert.ok(!text.includes(password) && !text.includes(ciphertext));
-    assert.deepEqual(JSON.parse(text), { available: true, privateHosts: false, database });
+    assert.deepEqual(JSON.parse(text), { available: true, privateHosts: false, backupStorage: true, database,
+      automaticBackups: { minutes: null, consented: false } });
   }
   assert.equal((await f.request('GET', databasePath, 'test:outsider')).status, 404);
   // New credentials or TLS for the same database keep its id, which members' confirmations name; another database gets a new one.
@@ -336,6 +339,8 @@ test('without backup storage the server saves no backup, and its listings say so
   assert.equal(await code(refused), 'backup_unavailable');
   assert.equal(runner.calls, 0);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
+  // The session database settings say so too, so they don't promise storage the server lacks.
+  assert.equal(((await (await f.request('GET', databasePath, 'test:member')).json()) as { backupStorage: boolean }).backupStorage, false);
 });
 
 test('without backup storage a workspace database still takes the backups of its sessions', async t => {
@@ -710,4 +715,167 @@ test('the Postgres provider provisions, saves and reads back snapshots in a real
   // A Pistead control plane's own database is never used as a workspace database.
   await inspect.query('CREATE TABLE workspace_databases (id TEXT); CREATE TABLE schema_migrations (name TEXT); CREATE TABLE auth_sessions (token_hash TEXT)');
   await assert.rejects(provider.verify(target), failed('pistead_database'));
+});
+
+const schedulePath = `${databasePath}/automatic-backups`;
+const consentPath = `${databasePath}/consent`;
+type AutomaticListing = { backups: { id: string; automatic?: boolean }[]; workspaceDatabase?: { confirm: boolean };
+  automaticBackups?: { minutes: number; included: boolean; attemptedAt: string | null; backupId: string | null; error: string | null; pending: boolean } };
+
+test('only the workspace owner schedules automatic backups, and only into a connected database', async t => {
+  const f = await fixture(t);
+  const refused = await f.request('PUT', schedulePath, 'test:owner', { minutes: 60 });
+  assert.equal(refused.status, 409);
+  assert.equal(await code(refused), 'workspace_database_required');
+  assert.equal((await f.request('PUT', databasePath, 'test:owner', settings)).status, 201);
+  for (const user of ['test:admin', 'test:member']) {
+    const response = await f.request('PUT', schedulePath, user, { minutes: 60 });
+    assert.equal(response.status, 403);
+    assert.equal(await code(response), 'owner_required');
+  }
+  for (const body of [{ minutes: 0 }, { minutes: 30 }, { minutes: '60' }, {}, { minutes: 60, keep: 3 }]) {
+    const response = await f.request('PUT', schedulePath, 'test:owner', body);
+    assert.equal(response.status, 400, JSON.stringify(body));
+    assert.equal(await code(response), 'invalid_input');
+  }
+  assert.deepEqual(await (await f.request('PUT', schedulePath, 'test:owner', { minutes: 60 })).json(), { automaticBackups: { minutes: 60 } });
+  const view = async () => (await (await f.request('GET', databasePath, 'test:member')).json() as
+    { automaticBackups: { minutes: number | null; consented: boolean } | null }).automaticBackups;
+  assert.deepEqual(await view(), { minutes: 60, consented: false });
+  // New credentials for the same database keep the schedule; disconnecting the database ends it.
+  assert.equal((await f.request('PUT', databasePath, 'test:owner', { ...settings, password: 'rotated-password' })).status, 201);
+  assert.equal((await view())?.minutes, 60);
+  assert.deepEqual(await (await f.request('PUT', schedulePath, 'test:owner', { minutes: null })).json(), { automaticBackups: { minutes: null } });
+  assert.equal((await view())?.minutes, null);
+  assert.equal((await f.request('PUT', schedulePath, 'test:owner', { minutes: 1440 })).status, 200);
+  assert.equal((await f.request('DELETE', databasePath, 'test:owner')).status, 204);
+  assert.equal(await view(), null);
+  const audits = f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'workspace.database.automatic_backups' ORDER BY rowid").all()
+    .map(row => (JSON.parse(String(row.detail_json)) as { minutes: number | null }).minutes);
+  assert.deepEqual(audits, [60, null, 1440]);
+});
+
+test('automatic backups save changed, idle sessions into the workspace database, once per change and interval', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.request('PUT', databasePath, 'test:owner', settings)).status, 201);
+  const runner = f.runner();
+  await markSessionChanged(f.env, 'owner-session');
+  assert.deepEqual(await runAutomaticBackups(f.env), [], 'No schedule, no automatic backups');
+  assert.equal((await f.request('PUT', schedulePath, 'test:owner', { minutes: 15 })).status, 200);
+  f.sqlite.prepare("UPDATE sessions SET activity = 'working' WHERE id = 'owner-session'").run();
+  assert.deepEqual(await runAutomaticBackups(f.env), [], 'A working session waits until it is idle');
+  f.sqlite.prepare("UPDATE sessions SET activity = 'idle' WHERE id = 'owner-session'").run();
+  assert.equal(runner.calls, 0);
+
+  const at = Date.now();
+  const first = await runAutomaticBackups(f.env, at);
+  assert.equal(first.length, 1);
+  const outcome = first[0]!;
+  assert.ok('backupId' in outcome, JSON.stringify(outcome));
+  assert.equal(outcome.sessionId, 'owner-session');
+  assert.equal(runner.calls, 1);
+  assert.equal(f.databases.saved.get(outcome.backupId)?.session.id, 'owner-session');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM workspace_database_backups WHERE backup_id = ?').get(outcome.backupId)!.n, 1,
+    'Saved in the workspace database, not the server storage');
+  assert.deepEqual({ ...f.sqlite.prepare('SELECT automatic FROM backups WHERE id = ?').get(outcome.backupId) }, { automatic: 1 });
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE action = 'backup.created'").get()!;
+  assert.equal(audit.actor_id, 'test:owner');
+  assert.equal((JSON.parse(String(audit.detail_json)) as { automatic?: boolean }).automatic, true);
+
+  // Nothing changed since: nothing to save, however long it waits.
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 24 * 3600_000), []);
+  // Changed again: saved once the interval since the last attempt has passed.
+  await markSessionChanged(f.env, 'owner-session');
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 5 * 60_000), []);
+  assert.equal((await runAutomaticBackups(f.env, at + 15 * 60_000)).length, 1);
+  assert.equal(runner.calls, 2);
+
+  const listing = await (await f.request('GET', '/api/sessions/owner-session/backups', 'test:owner')).json() as AutomaticListing;
+  assert.equal(listing.backups.length, 2);
+  assert.ok(listing.backups.every(backup => backup.automatic === true));
+  assert.equal(listing.automaticBackups?.minutes, 15);
+  assert.equal(listing.automaticBackups?.included, true);
+  assert.equal(listing.automaticBackups?.pending, false);
+  assert.equal(listing.automaticBackups?.error, null);
+  // A manual backup isn't marked automatic.
+  const manual = await (await f.request('POST', '/api/sessions/owner-session/backup', 'test:owner')).json() as { backup: { automatic?: boolean } };
+  assert.equal(manual.backup.automatic, undefined);
+});
+
+test('a failed automatic backup keeps the change and is retried later; with databases off or disconnected nothing runs', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.request('PUT', databasePath, 'test:owner', settings)).status, 201);
+  assert.equal((await f.request('PUT', schedulePath, 'test:owner', { minutes: 60 })).status, 200);
+  const runner = f.runner();
+  await markSessionChanged(f.env, 'owner-session');
+  f.databases.failure = new WorkspaceDatabaseError('unreachable', { cause: new Error('connect ECONNREFUSED 10.0.0.7:5432') });
+  const at = Date.now();
+  assert.deepEqual(await runAutomaticBackups(f.env, at), [{ sessionId: 'owner-session', error: 'workspace_database_unavailable' }]);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
+  const listing = await (await f.request('GET', '/api/sessions/owner-session/backups', 'test:owner')).json() as AutomaticListing;
+  assert.equal(listing.automaticBackups?.error, 'workspace_database_unavailable');
+  assert.equal(listing.automaticBackups?.pending, true);
+  f.databases.failure = null;
+  // Retried after 15 minutes: not on every sweep, and not only after the workspace's hour.
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 60_000), []);
+  const retried = await runAutomaticBackups(f.env, at + 15 * 60_000);
+  assert.equal(retried.length, 1);
+  assert.ok('backupId' in retried[0]!);
+  assert.equal((await (await f.request('GET', '/api/sessions/owner-session/backups', 'test:owner')).json() as AutomaticListing).automaticBackups?.error, null);
+  assert.equal(runner.calls, 2);
+
+  await markSessionChanged(f.env, 'owner-session');
+  const databases = f.env.WORKSPACE_DATABASES;
+  delete f.env.WORKSPACE_DATABASES;
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 3 * 3600_000), []);
+  f.env.WORKSPACE_DATABASES = databases;
+  assert.equal((await f.request('DELETE', databasePath, 'test:owner')).status, 204);
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 3 * 3600_000), [], 'Never into the server storage instead');
+  assert.equal(runner.calls, 2);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 1);
+});
+
+test("a member's sessions are backed up automatically only once they confirm that same database", async t => {
+  const f = await fixture(t);
+  const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
+  assert.equal((await f.request('PUT', schedulePath, 'test:owner', { minutes: 60 })).status, 200);
+  const runner = f.runner();
+  await markSessionChanged(f.env, 'session');
+  assert.deepEqual(await runAutomaticBackups(f.env), [], 'Not without the member confirming the database');
+  const before = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as AutomaticListing;
+  assert.equal(before.automaticBackups?.included, false);
+  assert.equal(before.automaticBackups?.pending, true);
+
+  assert.equal((await f.request('PUT', consentPath, 'test:outsider', { databaseId: database.id })).status, 404);
+  const stale = await f.request('PUT', consentPath, 'test:member', { databaseId: randomUUID() });
+  assert.equal(stale.status, 409);
+  assert.equal(await code(stale), 'workspace_database_changed');
+  assert.equal((await f.request('PUT', consentPath, 'test:member', { databaseId: database.id, keep: true })).status, 400);
+  assert.deepEqual(await (await f.request('PUT', consentPath, 'test:member', { databaseId: database.id })).json(), { consented: true });
+  assert.equal((await (await f.request('GET', databasePath, 'test:member')).json() as { automaticBackups: { consented: boolean } }).automaticBackups.consented, true);
+  const after = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as AutomaticListing;
+  assert.equal(after.automaticBackups?.included, true);
+  assert.equal(after.workspaceDatabase?.confirm, false, 'Manual backups no longer ask each time either');
+
+  const at = Date.now();
+  const [outcome] = await runAutomaticBackups(f.env, at);
+  assert.ok(outcome && 'backupId' in outcome, JSON.stringify(outcome));
+  assert.equal(f.databases.saved.get(outcome.backupId)?.session.ownerId, 'test:member');
+  assert.equal((await f.request('POST', '/api/sessions/session/backup', 'test:member')).status, 201);
+
+  // Pointing the connection at another database asks again, for automatic and manual backups alike.
+  const moved = (await (await f.request('PUT', databasePath, 'test:owner', { ...settings, host: 'db2.example.com' })).json() as { database: WorkspaceDatabase }).database;
+  assert.notEqual(moved.id, database.id);
+  await markSessionChanged(f.env, 'session');
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 2 * 3600_000), []);
+  assert.equal(await code(await f.request('POST', '/api/sessions/session/backup', 'test:member')), 'workspace_database_trust_required');
+  assert.equal((await f.request('PUT', consentPath, 'test:member', { databaseId: moved.id })).status, 200);
+  assert.equal((await runAutomaticBackups(f.env, at + 2 * 3600_000)).length, 1);
+  // Withdrawing ends it.
+  assert.equal((await f.request('DELETE', consentPath, 'test:member')).status, 204);
+  await markSessionChanged(f.env, 'session');
+  assert.deepEqual(await runAutomaticBackups(f.env, at + 4 * 3600_000), []);
+  assert.equal(runner.calls, 3);
+  const actions = f.sqlite.prepare("SELECT action FROM audit WHERE action LIKE 'workspace.database.consent%' ORDER BY rowid").all().map(row => String(row.action));
+  assert.deepEqual(actions, ['workspace.database.consented', 'workspace.database.consented', 'workspace.database.consent_withdrawn']);
 });

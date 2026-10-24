@@ -1212,7 +1212,7 @@ export class RunnerSession {
     if (!run) throw new RunnerError(403, "Tool has no authorized writable submission");
     const grants = state.grants;
     const needs: PermissionNeed[] = [];
-    if (!this.binding.agent.tools.includes(tool) && !grants?.tools.includes(tool)) needs.push("tool");
+    if (!this.binding.agent.tools.includes(tool) && !(tool !== "host_bash" && grants?.tools.includes(tool))) needs.push("tool");
     if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
     const unbounded = effect.shell === true && !this.shellAllowed();
     if (unbounded) {
@@ -1241,7 +1241,7 @@ export class RunnerSession {
 
   /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
   private coveredBy(request: PermissionRequest, grants: Grants): boolean {
-    return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || grants.tools.includes(request.tool)
+    return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || (request.tool !== "host_bash" && grants.tools.includes(request.tool))
       : need === "write" ? grants.write : grants.unboundedShell);
   }
 
@@ -1435,7 +1435,9 @@ export class RunnerSession {
     // On a host without the sandbox the agent pushes with the host's own Git: an approved push would only fail.
     if (operation.kind === "git.push" && !this.#egress) throw new RunnerError(400, "On a host without the sandbox, push with git in bash");
     const toolName = ({ "git.commit": "git_commit", bash: "bash", "github.comment": "github_comment", "github.merge": "github_merge", "github.issue": "github_issue", "git.push": "git_push", "git.repin": "git_repin", "host.bash": "host_bash" } as const)[operation.kind];
-    if (!consent.permitted && !this.binding.agent.tools.includes(toolName) && !(await this.metadata()).grants?.tools.includes(toolName)) {
+    // Host commands never take a session grant (see `permit`), so a session-wide one left from before doesn't enable them.
+    if (!consent.permitted && !this.binding.agent.tools.includes(toolName)
+      && !(toolName !== "host_bash" && (await this.metadata()).grants?.tools.includes(toolName))) {
       throw new RunnerError(403, "Operation not enabled by pinned agent version");
     }
     await this.authorize(actorId, "write");
@@ -1453,7 +1455,10 @@ export class RunnerSession {
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
       // GitHub comments, merges and issues need a Worker-minted broker capability, so they always wait for a human
       // decision; automatic pushes mint their credential from the run's owner admission instead.
-      automatic = run.options?.access === "auto" && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
+      // A tool the owner allowed for the rest of the session runs their calls of it as Auto-approve would; host commands
+      // never take a session grant, so each one still asks.
+      const sessionGranted = operation.kind !== "host.bash" && state.grants?.tools.includes(toolName) === true;
+      automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
         && operation.kind !== "github.merge" && operation.kind !== "github.issue" && (operation.kind !== "git.push" || admissionId !== undefined)
         && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
     }
@@ -1546,6 +1551,8 @@ export class RunnerSession {
           throw new RunnerError(403, "Only the host's owner can allow a shell without resource limits");
         }
         const scope = input.scope ?? "call";
+        // Each host command runs outside the sandbox, so its permission covers that one call only.
+        if (scope === "session" && request.tool === "host_bash") throw new RunnerError(400, "Host commands can only be allowed once");
         await this.mutate(meta => {
           record(meta, input.decision === "approve" ? { status: "approved", decidedBy: ticket.actorId, scope } : { status: "denied", decidedBy: ticket.actorId });
           if (input.decision !== "approve" || scope !== "session") return;
@@ -1686,7 +1693,9 @@ export class RunnerSession {
     }
     const agent = await this.root.agent(context);
     const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
-    const access = latestWrite?.options?.access;
+    // Every shared message ran at some access ("approval" when it named none), so the view says which; only a session
+    // without one leaves it out, and the owner's chat box then starts on Auto-approve.
+    const access = latestWrite && (latestWrite.options?.access ?? "approval");
     const repositories = this.repositoryView();
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     const { approvals, olderApprovals } = viewApprovals(stored);
@@ -1698,7 +1707,7 @@ export class RunnerSession {
         .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.inputsLost ? "images lost" : run.status })),
       stoppable: true,
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
-      ...(access && access !== "approval" ? { access } : {}),
+      ...(access ? { access } : {}),
       ...(repositories ? { repositories } : {}),
       activity: repositories ? (repositories.status === "preparing" ? "working" : "failed")
         : sessionActivity(Object.values(state.runs), Object.values(state.approvals),

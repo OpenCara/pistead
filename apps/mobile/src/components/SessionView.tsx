@@ -125,7 +125,8 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
         </Banner>}
         {permission ? <View style={ui.inline}>
           <Button small variant="primary" label="Allow once" disabled={disabled} onPress={() => void decide(approval, "approve", "call")} />
-          <Button small label="Allow for this session" disabled={disabled} onPress={() => void decide(approval, "approve", "session")} />
+          {/* Each host command asks again: it runs outside the sandbox. */}
+          {!(approval.operation.kind === "permission" && approval.operation.tool === "host_bash") && <Button small label="Allow for this session" disabled={disabled} onPress={() => void decide(approval, "approve", "session")} />}
           <Button small label="Deny" disabled={disabled} onPress={() => void decide(approval, "deny")} />
         </View> : <>
           <View style={ui.inline}>
@@ -233,6 +234,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode;
 }) {
   const { api } = useSession();
+  const { rememberChat } = useAppData();
   const palette = usePalette();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardVisible();
@@ -305,6 +307,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
+      // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
+      if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
       request.current = null;

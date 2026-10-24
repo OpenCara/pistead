@@ -1181,7 +1181,8 @@ test('only the session owner answers a permission request, for one call or the s
   const command = pending('tool-call-1', { kind: 'bash', command: 'npm test' });
   const otherCommand = pending('tool-call-4', { kind: 'bash', command: 'npm test' });
   const commit = pending('tool-call-5', { kind: 'git.commit', message: 'Fix it' });
-  let approvals = [once, always, unlimited, unnamed, command, otherCommand, commit];
+  const hostCommand = pending('permission-call-6', { kind: 'permission', tool: 'host_bash', target: 'dotnet --info', needs: ['tool'] });
+  let approvals = [once, always, unlimited, unnamed, command, otherCommand, commit, hostCommand];
   const decisions: unknown[] = [];
   rpcHub(f, s.connector, envelope => {
     const action = envelope.request.ticket.action;
@@ -1215,6 +1216,8 @@ test('only the session owner answers a permission request, for one call or the s
   await denied(await decide(s.creator, once.id, { scope: 'forever' }), 400, 'invalid_decision');
   // The creator's session runs on the host's machine, and only the host's owner can lift the limits it lacks.
   await denied(await decide(s.creator, unlimited.id, {}), 403, 'host_owner_required');
+  // A host command runs outside the sandbox, so each one is allowed for its own call only.
+  await denied(await decide(s.creator, hostCommand.id, { scope: 'session' }), 400, 'invalid_decision');
   assert.deepEqual(decisions, []);
   const allowed = await json<{ approval: ApprovalRecord }>(await decide(s.creator, once.id, { scope: 'call' }));
   assert.equal(allowed.approval.status, 'approved');
@@ -2098,8 +2101,14 @@ test('hosts report what the agent of each session they serve is doing; lists sho
   const audits = () => f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE session_id = ?').get(s.session.id)!.n;
   const audited = audits();
   assert.equal((await listed()).activity, undefined, 'unknown until the host reports it');
+  const changedAt = () => (f.sqlite.prepare('SELECT changed_at FROM automatic_backups WHERE session_id = ?').get(s.session.id) as
+    { changed_at: string | null } | undefined)?.changed_at ?? null;
+  assert.equal(changedAt(), null);
   assert.deepEqual(await json(await report('working')), { ok: true });
   assert.equal((await listed()).activity, 'working');
+  // An agent at work marks the session changed for automatic backups, and later reports keep the first time.
+  const firstChange = changedAt();
+  assert.ok(firstChange);
   assert.equal((await listed(s.member)).activity, 'working', 'readers see what the owner sees');
   assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', path))).session.activity, 'working');
   for (const activity of ['busy', '', null, 3, ['done']]) await denied(await report(activity), 400, 'invalid_activity');
@@ -2111,6 +2120,9 @@ test('hosts report what the agent of each session they serve is doing; lists sho
   assert.equal((await listed()).activity, 'working');
 
   // Display state only: no policy version, no audit entry, and never part of the binding the host is sent.
+  await json(await report('failed'));
+  await json(await report('working'));
+  assert.equal(changedAt(), firstChange);
   await json(await report('failed'));
   assert.deepEqual({ ...f.sqlite.prepare('SELECT activity, policy_version FROM sessions WHERE id = ?').get(s.session.id) },
     { activity: 'failed', policy_version: s.session.policyVersion });

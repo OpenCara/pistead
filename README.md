@@ -328,10 +328,10 @@ Beside the composer you can pick, for each message:
 | Access | Effect |
 |---|---|
 | **Read only** | Inspect files; edits, commands and commits ask the session owner first |
-| **Ask before acting** (default) | Edits are automatic; commands, commits, pushes, GitHub comments, merges and issues need approval |
-| **Auto-approve** (session owner only) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments, merges and issues still need approval. |
+| **Ask before acting** (default for everyone but the session owner) | Edits are automatic; commands, commits, pushes, GitHub comments, merges and issues need approval |
+| **Auto-approve** (session owner only; their default) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments, merges and issues still need approval. |
 
-Turning on **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
+Before a session's first shared message, the owner's chat box starts on **Auto-approve** and everyone else's on **Ask before acting**; after it, each starts on the last shared message's access (Auto-approve only for the owner). Switching to **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
 The **Approvals** list keeps to what people decide. Shell and host commands that ran under **Auto-approve** get no card there: the conversation marks their tool calls **Auto-approved** (with their outcome when it isn't the usual "executed"), and each call's result holds the command's output. Automatic commits, pushes and repins keep their cards. The list shows every approval still in play and the newest 50 settled ones, each with the start and end of its result; the host keeps them all. Hosts running an older connector list every approval.
 
@@ -364,7 +364,7 @@ The agent's tool call waits for the decision, and its message waits with it (con
 
 When a tool call needs more than the session allows (a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a host without resource limits), the agent asks instead of failing, and the session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. Only the session owner decides these, and only a host's owner can let commands run without resource limits, in their own sessions.
 
-The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits and the rest still need their own approval. Once allowed, the permission shows on that operation's card instead of a card of its own. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
+The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. **Allow once** lets that call use the tool, but what it does still needs its own approval; the permission then shows on that operation's card instead of a card of its own. **Allow for this session** also approves what the tool does in the session owner's later messages, as **Auto-approve** would: its commands and pushes run without asking, while GitHub comments, merges and issues still wait for a decision, and other people's messages still ask for approval. Host commands (`host_bash`) can only be allowed once, so each one asks again. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
 
 ### Collaborating on a session
 
@@ -553,6 +553,15 @@ With `WORKSPACE_DATABASES=true`, a workspace owner can connect a Postgres databa
 - Only the owner connects, replaces or disconnects it; the password is vault-encrypted and write-only. Whoever can read that database can read the sessions saved there, including their owners' personal environment values, so other members confirm the database before each of their backups is saved there. Pointing the connection at another database asks them again; new credentials for the same one don't. A database is named by its host, port and database name: where that host name resolves is up to whoever controls it, normally the owner.
 - Connections use TLS that verifies the server certificate (against the public roots, or a CA certificate the owner pastes), or TLS without verification if the owner chooses it. Hosts must resolve to public addresses; `WORKSPACE_DATABASE_PRIVATE_HOSTS=true` also allows private networks, and unencrypted connections to them.
 - If the operator turns the feature off, that workspace's backups stop (they never fall back to `STORAGE_URL`) until its owner disconnects the database.
+
+#### Automatic backups
+
+The owner can also have sessions backed up into the database on their own, under **Session database → Automatic backups**: every 15 minutes, hour, 6 hours or day at most (`PUT /api/workspaces/:id/database/automatic-backups` with `minutes` of `15`, `60`, `360`, `1440` or `null`). Replacing the connection keeps the schedule; disconnecting the database ends it.
+
+- A session is backed up when it changed since its last automatic backup (its host reported its agent working), it is idle, and the interval since the last attempt has passed. The server checks every minute and takes at most 10 backups each time, oldest change first. A failed attempt is retried 15 minutes later, and the session's **Details → Backups** shows why it failed.
+- Automatic backups go only into the workspace database, never into `STORAGE_URL` instead, and are marked **Automatic** in the backup list and as `automatic: true` in the `backup.created` activity.
+- The workspace owner's own sessions take part as soon as the schedule is on. Another member's sessions take part only once that member confirms the database under **Session database → Your sessions** (`PUT /api/workspaces/:id/database/consent` with the `databaseId` they were shown; `DELETE` withdraws it). That confirmation also stops manual backups asking each time. It names the database, so it lapses when the owner points the connection at another one or disconnects it, and when the member leaves the workspace.
+- Nothing deletes old automatic backups yet: the database keeps every one, so choose an interval the database has room for.
 
 ### Dumps and imports
 

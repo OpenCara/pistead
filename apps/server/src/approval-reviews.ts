@@ -27,8 +27,8 @@ export function permissionCall(approvalId: string): string | undefined {
 }
 /**
  * Whether `admission` is a message the session owner sent with Auto-approve access. Its tool calls use any tool without
- * a permission card, as the runner lets them; what those calls do still follows its own rules (comments and merges wait
- * for a human, a command without limits runs only on the owner's host).
+ * a permission card, as the runner lets them; what those calls do still follows its own rules (comments, merges and
+ * issues wait for a human, a command without limits runs only on the owner's host).
  */
 function ownerAuto(row: SessionRow, admission: AdmissionAccess | undefined): boolean {
   return admission?.access === 'auto' && admission.mode === 'write' && admission.actor_id === row.owner_id && admission.session_id === row.id;
@@ -46,7 +46,8 @@ async function sessionTools(env: Env, row: SessionRow): Promise<(operation: Oper
     if (operation.kind === 'permission') return permissionCall(approvalId) !== undefined;
     const tool = operationTools[operation.kind];
     const call = approvalId.startsWith('tool-') ? approvalId.slice('tool-'.length) : undefined;
-    return agentTools.includes(tool) || grants.some(grant => grant.tool === tool && (grant.call_id === '' || grant.call_id === call))
+    // Host commands never take a session grant: each one is allowed for its own call.
+    return agentTools.includes(tool) || grants.some(grant => grant.tool === tool && ((grant.call_id === '' && tool !== 'host_bash') || grant.call_id === call))
       || (call !== undefined && ownerAuto(row, admission));
   };
 }

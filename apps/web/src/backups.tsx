@@ -5,22 +5,45 @@ import { Button, Feedback, Field, LinkButton, Loading, Row, Timestamp, Alert } f
 import { Icon } from "./icons";
 
 /** `unavailable`: listed, but saved in a store this server can't read now, so it can't be downloaded or restored. */
-export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation; unavailable?: boolean };
+export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation; unavailable?: boolean;
+  /** Taken on the workspace's schedule rather than by its owner. */
+  automatic?: boolean };
 
-/** "Workspace database" for backups saved in the database the workspace owner connected. */
+/** "Workspace database" for backups saved in the database the workspace owner connected; "Automatic" for scheduled ones. */
 export function backupLocationLabel(backup: Backup): string {
-  return backup.location === "workspace-database" ? " · Workspace database" : "";
+  return `${backup.location === "workspace-database" ? " · Workspace database" : ""}${backup.automatic ? " · Automatic" : ""}`;
 }
 
-/** The database the workspace's owner connected, where new backups of its sessions go; `confirm`: ask before each backup. */
-export type BackupDatabase = { id: string; host: string; port: number; database: string; confirm: boolean };
+/**
+ * The database the workspace's owner connected, where new backups of its sessions go. `confirm`: ask before each backup;
+ * `consented`: you confirmed it once for all your backups in the workspace settings.
+ */
+export type BackupDatabase = { id: string; host: string; port: number; database: string; confirm: boolean; consented?: boolean };
+
+/** The workspace's automatic backups and this session's part in them; `included`: its owner confirmed the database. */
+export type AutomaticBackups = { minutes: number; included: boolean; attemptedAt: string | null; backupId: string | null; error: string | null; pending: boolean };
 
 export function backupDatabaseLabel(database: BackupDatabase): string {
   return `${database.host.includes(":") ? `[${database.host}]` : database.host}:${database.port}/${database.database}`;
 }
 
 /** What `GET /api/sessions/:id/backups` returns: the session's backups, where a new one goes and whether it can be saved. */
-export type BackupListing = { backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase; enabled?: boolean };
+export type BackupListing = { backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase; enabled?: boolean;
+  automaticBackups?: AutomaticBackups };
+
+function everyLabel(minutes: number): string {
+  return minutes === 15 ? "every 15 minutes" : minutes === 60 ? "every hour" : minutes === 360 ? "every 6 hours" : minutes === 1440 ? "every day" : `every ${minutes} minutes`;
+}
+
+/** What the workspace's schedule does for this session, and how its last automatic attempt went. */
+function automaticHint(automatic: AutomaticBackups): string {
+  if (!automatic.included) {
+    return `The workspace backs up changed sessions ${everyLabel(automatic.minutes)}, but not yours until you confirm its database under Settings → Workspaces → Session database`;
+  }
+  const last = automatic.error ? `The last attempt failed (${automatic.error}); it is retried within 15 minutes`
+    : automatic.pending ? "Changed since the last one: it is saved once the session is idle and due" : "Up to date";
+  return `Saved ${everyLabel(automatic.minutes)} when the session changed. ${last}`;
+}
 /** The owner's backup listing, loaded once per session screen and shared by its header menu and panel. */
 export type BackupListingResource = { data: BackupListing | null; loading: boolean; error: string; refresh: () => void };
 
@@ -165,11 +188,16 @@ export function BackupList({ sourceId, ownerId, backups, latestBackup, refreshKe
     title="Saved to the workspace database"
     hint={target.confirm
       ? `New backups of this session go to ${backupDatabaseLabel(target)}, which the workspace owner connected. Whoever can read it can read them, including your personal environment values; you confirm before each backup`
-      : `New backups of this session go to ${backupDatabaseLabel(target)}, the database you connected for this workspace`}
+      : target.consented
+        ? `New backups of this session go to ${backupDatabaseLabel(target)}, which the workspace owner connected and you confirmed. Whoever can read it can read them, including your personal environment values`
+        : `New backups of this session go to ${backupDatabaseLabel(target)}, the database you connected for this workspace`}
   />;
-  if (!list.length) return <>{destination}{enabled && <Row title="No backups yet" hint="Listing and downloading work while the host is offline" />}</>;
+  const automatic = enabled && backups.data?.automaticBackups;
+  const schedule = automatic && <Row leading={<Icon name={automatic.error ? "info" : "refresh"} size={16} />} title="Automatic backups" hint={automaticHint(automatic)} />;
+  if (!list.length) return <>{destination}{schedule}{enabled && <Row title="No backups yet" hint="Listing and downloading work while the host is offline" />}</>;
   return <>
     {destination}
+    {schedule}
     {list.map(backup => <div key={backup.id} className="backup-item">
       <Row
         leading={<Icon name="archive" size={16} />}

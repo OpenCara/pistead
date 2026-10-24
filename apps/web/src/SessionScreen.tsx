@@ -6,7 +6,7 @@ import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction"
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
-import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, rememberChat, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -240,7 +240,8 @@ function SessionPane({ id }: { id: string }) {
                 {!approval.reviewHash && <Alert variant="warning" title="No verified review commitment" actions={<Button variant="outline" size="sm" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</Button>}>Refresh before deciding; the server must bind the displayed operation and requester.</Alert>}
                 {permission ? <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "call")}>Allow once</Button>
-                  <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "session")}>Allow for this session</Button>
+                  {/* Each host command asks again: it runs outside the sandbox. */}
+                  {!(approval.operation.kind === "permission" && approval.operation.tool === "host_bash") && <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "session")} title="Also runs this tool's commands and pushes without asking for the rest of the session; GitHub comments and merges still ask">Allow for this session</Button>}
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
                 </div> : <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve")}>Approve</Button>
@@ -361,6 +362,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST",
         body: { content: sent, requestId: pending.id, ...(options ? { options } : {}), ...(images.length ? { images } : {}) } });
       setReceipt(result);
+      // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
+      if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
       attachments.sent(pasted);

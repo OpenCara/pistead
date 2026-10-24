@@ -198,6 +198,42 @@ test("agents open GitHub issues through the broker, always after a human approve
   assert.equal(issues.length, 3);
 });
 
+test("allowing github_issue for the rest of the session still leaves every issue to a human", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-issue-grant-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const issues: GitHubIssueRequest[] = [];
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  const call = (title: string) => fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title, body: "" })], { stopReason: "toolUse" });
+  faux.setResponses([call("First"), fauxAssistantMessage("Issue requested."), call("Second"), fauxAssistantMessage("Issue requested.")]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: "runner-github-test-secret-not-a-production-secret", controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
+    authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    githubIssue: async request => { issues.push(request); return { number: 1, url: "https://github.com/acme/alpha/issues/1" }; },
+  });
+  await service.initialize();
+  t.after(() => service.close());
+  const id = "github-issue-grant";
+  // The agent lacks github_issue, so its first call asks the owner, who allows it for the rest of the session.
+  const session = await service.provision(binding(id), await ticket(id, "create"));
+  const admissionId = await sha256("github issue grant admission");
+  await session.submit(await ticket(id, "submit"), { content: "File it.", requestId: "first", admissionId }, "write");
+  const permission = await pendingApproval(session);
+  assert.equal(permission.operation.kind, "permission");
+  await session.decide(await ticket(id, "approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "session" });
+  for (const title of ["First", "Second"]) {
+    if (title === "Second") await session.submit(await ticket(id, "submit"), { content: "File another.", requestId: "second", admissionId, options: { access: "auto" } }, "write");
+    const card = await pendingApproval(session);
+    assert.deepEqual([card.operation.kind, card.automatic], ["github.issue", undefined], `${title} waits for a human`);
+    assert.equal((card.operation as { title: string }).title, title);
+    await session.decide(await ticket(id, "approve"), card.id, { decision: "deny", operation: card.operation });
+    await idle(session);
+  }
+  assert.deepEqual(issues, []);
+});
+
 test("host_bash auto-approves only on the session owner's own host; shared hosts require their owner's exact decision", hostMode, async t => {
   for (const hostOwner of ["test:alice", "test:bob"]) await t.test(hostOwner, async t => {
     const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-command-")));
@@ -246,4 +282,48 @@ test("host_bash auto-approves only on the session owner's own host; shared hosts
       await assert.rejects(session.decide(await claims("approve", hostOwner), approval.id, { decision: "approve", operation: approval.operation }), /already been decided/);
     }
   });
+});
+
+test("host commands outside the agent are allowed one call at a time, never for the session", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-permission-")));
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("host_bash", { command: "printf first", timeout_seconds: 10 })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("host_bash", { command: "printf second", timeout_seconds: 10 })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Done."),
+  ]);
+  const models = createModels(); models.setProvider(faux.provider);
+  const target = binding("host-permission");
+  target.agent.tools = ["identity"];
+  target.session.connectorId = target.model.connectorId = "host-connector";
+  target.session.connectorOwnerId = target.model.connectorOwnerId = "test:alice";
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: "host-permission-test-secret-not-for-deployment", controlPlaneUrl: "http://127.0.0.1:8787",
+    connectorId: "host-connector", allowFaux: true, unsandboxed: true,
+    authorize: async input => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+  });
+  await service.initialize();
+  t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
+  const claims = async (action: RunnerAction) => ({ ...await ticket(target.session.id, action), connectorId: "host-connector" });
+  const session = await service.provision(target, await claims("create"));
+  await session.submit(await claims("submit"), { content: "Run on host twice", requestId: "host", admissionId: await sha256("host-permission-admission"), options: { access: "approval" } }, "write");
+  for (const command of ["printf first", "printf second"]) {
+    const permission = await pendingApproval(session);
+    assert.deepEqual(permission.operation, { kind: "permission", tool: "host_bash", target: command, needs: ["tool"] });
+    await assert.rejects(session.decide(await claims("approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "session" }),
+      (error: unknown) => error instanceof RunnerError && error.status === 400 && /only be allowed once/.test(error.message));
+    await session.decide(await claims("approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "call" });
+    // The command itself still waits on the host owner's exact decision.
+    const approval = await pendingApproval(session);
+    assert.deepEqual(approval.operation, { kind: "host.bash", command, timeoutSeconds: 10 });
+    await session.decide(await claims("approve"), approval.id, { decision: "deny", operation: approval.operation });
+  }
+  await idle(session);
+  // Each host command asked again: its own one-call permission shows on its card, and none ran on its own.
+  const approvals = (await session.view()).approvals;
+  assert.deepEqual(approvals.map(approval => [approval.operation.kind, approval.status, approval.permission, approval.automatic]), [
+    ["host.bash", "denied", { decidedBy: "test:alice", scope: "call" }, undefined],
+    ["host.bash", "denied", { decidedBy: "test:alice", scope: "call" }, undefined],
+  ]);
 });

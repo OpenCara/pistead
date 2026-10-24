@@ -77,7 +77,7 @@ async function fixture(t: TestContext, connected = false, repositories: SessionR
   const key = 'sessions/test:owner/source/backup.json';
   let raw = JSON.stringify(snapshot);
   objects.set(key, new TextEncoder().encode(raw));
-  sqlite.prepare('INSERT INTO backups VALUES (?,?,?,?,?,?,?)').run('backup', 'source', 'test:owner', key, await sha256(raw), Buffer.byteLength(raw), '2026-01-01');
+  sqlite.prepare('INSERT INTO backups (id,session_id,owner_id,object_key,sha256,size,created_at) VALUES (?,?,?,?,?,?,?)').run('backup', 'source', 'test:owner', key, await sha256(raw), Buffer.byteLength(raw), '2026-01-01');
   const app = new Hono<WorkerEnv>();
   // Cookie/CSRF are covered by control-plane tests; this seam supplies an authenticated actor.
   app.use('/api/sessions/*', async (c, next) => {
