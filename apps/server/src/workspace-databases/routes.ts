@@ -4,6 +4,8 @@ import { auditStatement, requireMember } from '../db.js';
 import { fail, id, identifier, jsonObject, now } from '../http.js';
 import { assertVaultConfigured, encryptToken } from '../vault.js';
 import { DumpImportError, importDump, maxUploadedDumpBytes, type ImportSummary } from './import.js';
+import { databaseConsented } from '../backups.js';
+import { isAutomaticBackupInterval } from '../automatic-backups.js';
 import { databaseSettings, maxCaCertificateLength } from './settings.js';
 import {
   databaseSecretContext, publicWorkspaceDatabase, workspaceDatabaseFailure, workspaceDatabaseRow, type WorkspaceDatabaseRow,
@@ -34,8 +36,63 @@ export function registerWorkspaceDatabases(app: Hono<WorkerEnv>): void {
     const row = await workspaceDatabaseRow(c.env, workspaceId);
     const provider = c.env.WORKSPACE_DATABASES;
     // backupStorage says whether backups have anywhere to go without a database, so the settings don't promise storage the server lacks.
+    // automaticBackups: the owner's schedule, and whether the caller gave their standing confirmation of this database.
+    const automaticBackups = row ? { minutes: row.automatic_backup_minutes ?? null,
+      consented: await databaseConsented(c.env, row.id, c.get('auth').userId) } : null;
     return c.json({ available: !!provider, privateHosts: provider?.privateHosts ?? false, backupStorage: !!c.env.BUCKET,
-      database: row ? publicWorkspaceDatabase(row) : null });
+      database: row ? publicWorkspaceDatabase(row) : null, automaticBackups });
+  });
+
+  // The owner chooses how often the workspace's sessions are backed up into its database on their own: 15, 60, 360 or
+  // 1440 minutes, or null for never. Members' sessions take part only once their owner confirms the database.
+  app.put('/api/workspaces/:id/database/automatic-backups', async c => {
+    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
+    const actor = c.get('auth').userId;
+    await requireWorkspaceOwner(c.env, workspaceId, actor);
+    const input = await jsonObject(c, 1024);
+    const minutes = input.minutes === null ? null : isAutomaticBackupInterval(input.minutes) ? input.minutes : undefined;
+    if (minutes === undefined || Object.keys(input).some(key => key !== 'minutes')) {
+      fail(400, 'invalid_input', 'Automatic backups take minutes: 15, 60, 360, 1440 or null.');
+    }
+    const row = await c.env.DB.query<Pick<WorkspaceDatabaseRow, 'id' | 'automatic_backup_minutes'>>(`UPDATE workspace_databases
+      SET automatic_backup_minutes = ? WHERE workspace_id = ? AND ${ownerSql} RETURNING id, automatic_backup_minutes`)
+      .bind(minutes, workspaceId, workspaceId, actor).first();
+    if (!row) fail(409, 'workspace_database_required', 'Connect a database to this workspace before scheduling backups into it.');
+    await auditStatement(c.env, actor, 'workspace.database.automatic_backups', workspaceId, null, { databaseId: row.id, minutes }).run();
+    return c.json({ automaticBackups: { minutes: row.automatic_backup_minutes ?? null } });
+  });
+
+  // A member confirms the workspace database once for every backup of the sessions they own, automatic ones included.
+  // databaseId names the database they were shown; another database (after the owner pointed the connection elsewhere)
+  // is refused, so they confirm what they saw.
+  app.put('/api/workspaces/:id/database/consent', async c => {
+    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
+    const actor = c.get('auth').userId;
+    await requireMember(c.env, workspaceId, actor);
+    const input = await jsonObject(c, 1024);
+    if (Object.keys(input).some(key => key !== 'databaseId')) fail(400, 'invalid_input', 'Consent takes only databaseId.');
+    const databaseId = identifier(input.databaseId, 'databaseId');
+    const row = await workspaceDatabaseRow(c.env, workspaceId);
+    if (!row) fail(404, 'not_found', 'No database is connected to this workspace.');
+    if (row.id !== databaseId) fail(409, 'workspace_database_changed', 'The workspace database changed. Review it and confirm again.');
+    await c.env.DB.batch([
+      c.env.DB.query(`INSERT INTO workspace_database_consents (database_id, workspace_id, user_id, created_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT (database_id, user_id) DO NOTHING`).bind(row.id, workspaceId, actor, now()),
+      auditStatement(c.env, actor, 'workspace.database.consented', workspaceId, null,
+        { databaseId: row.id, host: row.host, port: row.port, database: row.database_name }),
+    ]);
+    return c.json({ consented: true });
+  });
+
+  app.delete('/api/workspaces/:id/database/consent', async c => {
+    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
+    const actor = c.get('auth').userId;
+    await requireMember(c.env, workspaceId, actor);
+    await c.env.DB.batch([
+      c.env.DB.query('DELETE FROM workspace_database_consents WHERE workspace_id = ? AND user_id = ?').bind(workspaceId, actor),
+      auditStatement(c.env, actor, 'workspace.database.consent_withdrawn', workspaceId, null, {}),
+    ]);
+    return c.body(null, 204);
   });
 
   app.put('/api/workspaces/:id/database', async c => {
@@ -112,8 +169,12 @@ export function registerWorkspaceDatabases(app: Hono<WorkerEnv>): void {
     const removed = await c.env.DB.query<Pick<WorkspaceDatabaseRow, 'id' | 'host' | 'port' | 'database_name'>>(`DELETE FROM workspace_databases
       WHERE workspace_id = ? AND ${ownerSql} RETURNING id, host, port, database_name`).bind(workspaceId, workspaceId, actor).first();
     if (!removed) fail(404, 'not_found', 'No database is connected to this workspace.');
-    await auditStatement(c.env, actor, 'workspace.database.disconnected', workspaceId, null,
-      { databaseId: removed.id, host: removed.host, port: removed.port, database: removed.database_name }).run();
+    // Confirmations name that database; connecting it again gives it a new id, which members confirm again.
+    await c.env.DB.batch([
+      c.env.DB.query('DELETE FROM workspace_database_consents WHERE workspace_id = ?').bind(workspaceId),
+      auditStatement(c.env, actor, 'workspace.database.disconnected', workspaceId, null,
+        { databaseId: removed.id, host: removed.host, port: removed.port, database: removed.database_name }),
+    ]);
     return c.body(null, 204);
   });
 }
