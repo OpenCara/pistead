@@ -69,5 +69,12 @@ jobs:
           fi
           tag=$(printf '%s\n' "$tags" | grep -x -F -B1 -e "$GITHUB_REF_NAME" | head -n1)
           [ "$tag" = "$GITHUB_REF_NAME" ] && tag=""
+          # A line's first release follows on from the plain v1.2.3 tags that released npm and the image together
+          # before the lines were split: the latest of those reachable (only releases, for a release).
+          if [ -z "$tag" ]; then
+            legacy=$(git -c versionsort.suffix=- tag --merged "$GITHUB_SHA" --list 'v[0-9]*' --sort=v:refname)
+            [ "$PRERELEASE" = true ] || legacy=$(printf '%s\n' "$legacy" | grep -v -e '-' || true)
+            tag=$(printf '%s\n' "$legacy" | tail -n1)
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Previous ${PREFIX}v tag: ${tag:-none}"
