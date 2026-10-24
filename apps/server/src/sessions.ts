@@ -447,7 +447,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       await reviewedApproval(c, row, approvalId, input.reviewHash);
       const fresh = await requireSession(c, row.id, 'approve');
       if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
-      if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'git.push') {
+      if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'github.issue' || operation.kind === 'git.push') {
         const existing = await c.env.DB.query('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');
         brokerCapability = randomToken();

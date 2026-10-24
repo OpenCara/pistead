@@ -65,7 +65,7 @@ This needs only Git on your `PATH` (on macOS: `xcode-select --install` or `brew 
 - File tools are confined to each session folder by path checks only.
 - Anyone you share the Pi with, and anyone granted approve permission on a session that runs on it, can cause approved commands to run on your machine.
 
-Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands and pushes run immediately (GitHub comments and merges still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
+Every command needs an exact human approval unless the session's owner turns on **Auto-approve** in the chat box; then that owner's commands and pushes run immediately (GitHub comments, merges and issues still need approval). Pistead labels the host **Unsandboxed** to everyone who can see it.
 
 ## Repository cache (preview)
 
@@ -116,6 +116,7 @@ The sandbox has no network, so `gh` and `curl` inside it can't reach GitHub. Age
 - `github_read` reads an issue or pull request of one of the workspace's github.com repositories: its description and comments, and for a pull request its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. Long threads keep their newest items. Like any repository content, what it returns is untrusted input. A read needs no approval, but only runs during a write message (until an hour after it was sent), and each read is recorded in the session's audit log.
 - `github_merge` merges a pull request of one of those repositories at the exact head commit the agent read, with a merge commit, squash or rebase. It always waits for a human approval, also under **Auto-approve**. If the head moved or GitHub refuses (failing checks, missing reviews, conflicts, a method the repository doesn't allow), nothing is merged and the agent gets GitHub's reason.
 - `github_comment` still posts comments after their approval.
+- `github_issue` opens an issue with exactly the approved title and body in one of those repositories, and gives the agent its number and URL (connector newer than 0.9.0). It always waits for a human approval, also under **Auto-approve**. If GitHub refuses (issues turned off, no access), no issue is opened and the agent gets GitHub's reason.
 
 ## Chat options
 

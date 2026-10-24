@@ -31,6 +31,8 @@ export interface ConnectorCapabilities {
   gitCredentials?: boolean;
   /** The connector reads GitHub issues and pull requests and merges pull requests through the control plane (github_read, github_merge). Absent on older connectors. */
   github?: boolean;
+  /** The connector opens GitHub issues through the control plane once a human approves each (github_issue). Absent on older connectors. */
+  githubIssues?: boolean;
   /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
    * docs/design/repository-cache.md). Absent on older connectors and on hosts started with the cache turned off.

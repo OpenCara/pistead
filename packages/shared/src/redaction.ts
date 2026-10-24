@@ -274,6 +274,7 @@ export function redactOperation(operation: Operation): Operation {
     case "permission": return { ...operation, target: redactSecrets(operation.target, { command: true }) };
     case "git.commit": return { ...operation, message: redactSecrets(operation.message) };
     case "github.comment": return { ...operation, body: redactSecrets(operation.body) };
+    case "github.issue": return { ...operation, title: redactSecrets(operation.title), body: redactSecrets(operation.body) };
     case "git.push": return operation.pullRequest
       ? { ...operation, pullRequest: { ...operation.pullRequest, title: redactSecrets(operation.pullRequest.title), body: redactSecrets(operation.pullRequest.body) } }
       : operation;

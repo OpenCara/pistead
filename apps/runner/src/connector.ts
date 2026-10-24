@@ -175,15 +175,15 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
   // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
   // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, gives the
-  // model a message's pasted images, pushes, and reads and merges on GitHub through the control plane.
+  // model a message's pasted images, pushes, and reads, merges and opens issues on GitHub through the control plane.
   // So does the owner's choice to keep a repository cache on this host. Every session clones its repositories with plain
   // Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait for
   // `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
   const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, plainGit: true, ...credentials };
+    github: true, githubIssues: true, plainGit: true, ...credentials };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, plainGit: true, cloneBackups: true, ...credentials };
+    github: true, githubIssues: true, plainGit: true, cloneBackups: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {
@@ -465,6 +465,16 @@ export class LocalConnector {
           return z.object({
             sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/merge", payload));
+        },
+        // Like merges, an issue GitHub refused comes back with its reason.
+        githubIssue: async request => {
+          const payload = {
+            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, capability: request.capability,
+            repository: request.repository, title: request.title, body: request.body,
+          };
+          return z.object({
+            number: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+$/),
+          }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/issue", payload));
         },
         // Minting can take several upstream calls, so push callbacks get the full RPC budget.
         pushCredential: async request => {

@@ -1,6 +1,6 @@
 import { validHostOperation } from '../../../packages/shared/src/host-operations.js';
 import type { GitHubMergeMethod, Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
-import { githubMergeMethods, permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
+import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, githubMergeMethods, permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
 import { validCloneDirectory, validPushBranch } from '../../../packages/shared/src/repositories.js';
 import { fail, text } from './http.js';
 
@@ -56,6 +56,13 @@ export function parseOperation(input: unknown): Operation {
       if (!githubMergeMethods.includes(value.method as GitHubMergeMethod)) fail(400, 'invalid_operation', 'Expected the merge, squash or rebase method.');
       // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
       return { kind: value.kind, repository, pull: Number(value.pull), sha: value.sha, method: value.method as GitHubMergeMethod };
+    }
+    case 'github.issue': {
+      const repository = githubRepositoryName(value.repository);
+      const title = text(value.title, 'issue title', GITHUB_ISSUE_TITLE_LIMIT);
+      if (!title.trim() || /[\r\n]/.test(title)) fail(400, 'invalid_operation', 'Expected a one-line issue title.');
+      // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
+      return { kind: value.kind, repository, title, body: text(value.body, 'issue body', GITHUB_ISSUE_BODY_LIMIT, 0) };
     }
     case 'git.push': {
       if (!validRepositoryPath(value.repository)) fail(400, 'invalid_operation', 'Expected a pinned repository path.');
