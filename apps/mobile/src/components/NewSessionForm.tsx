@@ -1,4 +1,4 @@
-import { chatOptionsBody, segment, type ChatSelection } from "@pistead/client";
+import { chatOptionsBody, preferredSelection, segment, type ChatSelection } from "@pistead/client";
 import * as Crypto from "expo-crypto";
 import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
@@ -48,7 +48,7 @@ export function NewSessionForm({ onStarted }: { onStarted: (sessionId: string) =
 
 function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (sessionId: string) => void }) {
   const { user, api } = useSession();
-  const { refreshSessions, setLastWorkspaceId } = useAppData();
+  const { refreshSessions, setLastWorkspaceId, lastChat, rememberChat } = useAppData();
   const palette = usePalette();
   const workspacePath = `/api/workspaces/${segment(workspace.id)}`;
   const models = useResource<{ models: ModelDefinition[] }>(`${workspacePath}/models`);
@@ -72,16 +72,15 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
     return (connectors ?? []).filter(host => offering.has(host.id) && !host.revokedAt)
       .sort((a, b) => Number(b.ownerId === user.id) - Number(a.ownerId === user.id));
   }, [connectors, modelList, user.id]);
-  const host = hosts.find(item => item.id === choice) ?? hosts.find(item => item.online) ?? hosts[0];
+  // The host picked here, else the one last chatted on, else the first online one.
+  const host = hosts.find(item => item.id === choice) ?? hosts.find(item => item.id === lastChat?.connectorId) ?? hosts.find(item => item.online) ?? hosts[0];
   const hostModel = (wanted?: { provider: string; modelId: string }) => wanted && host && host.models.some(item => sameModel(item, wanted))
     ? modelList?.find(item => item.connectorId === host.id && sameModel(item, wanted)) : undefined;
-  // Picks belong to one host; switching starts from that host's first model again.
+  // Picks belong to one host; switching starts again from the model last chatted with when that host offers it, else
+  // its first model, at the reasoning last chatted with where the model supports it.
   const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
-  const initialModel = host?.models.map(item => hostModel(item)).find(Boolean);
-  // The level the host's Pi starts that model at, as the session itself will.
-  const initialLevel = initialModel && host?.models.find(item => sameModel(item, initialModel))?.thinkingLevel;
   const selection: ChatSelection = host && chat?.key === host.id ? chat.value
-    : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "approval" };
+    : preferredSelection(host, lastChat, host?.models.map(item => hostModel(item)).find(Boolean), item => Boolean(hostModel(item)));
   const model = hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);
   const availableModel = Boolean(model && host?.models.some(item => sameModel(item, model)));
@@ -103,6 +102,7 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
       } });
       const sessionId = result.session.id;
       setLastWorkspaceId(workspace.id);
+      rememberChat(host, selection);
       if (message) {
         try {
           await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: Crypto.randomUUID(), ...(options ? { options } : {}) } });

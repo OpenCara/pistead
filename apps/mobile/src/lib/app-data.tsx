@@ -1,6 +1,12 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { chatPreference, parseChatPreference, type ChatPreference, type ChatSelection } from "@pistead/client";
+import * as SecureStore from "expo-secure-store";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
 import type { SessionActivity, SessionRecord, Workspace } from "../../../../packages/shared/src/types";
 import { useResource } from "./resource";
+
+/** The model and reasoning last chatted with on this device; new chats start from them. */
+const LAST_CHAT_KEY = "pistead.lastChat";
 
 /** What the open session's live view says its agent is doing; fresher than the list's last fetch. */
 export interface LiveActivity {
@@ -23,6 +29,10 @@ interface AppData {
   /** The workspace the last session was started in; new sessions default to it. */
   lastWorkspaceId: string;
   setLastWorkspaceId: (id: string) => void;
+  /** The model and reasoning last chatted with; new sessions start from them where the host offers them. */
+  lastChat: ChatPreference | undefined;
+  /** Remembers the model and reasoning a message just went to `host` with; unset picks are the conversation's `current` ones. */
+  rememberChat: (host: ConnectorInfo | undefined, selection: ChatSelection, current?: Parameters<typeof chatPreference>[2]) => void;
   liveActivity: LiveActivity | null;
   setLiveActivity: (value: LiveActivity | null) => void;
 }
@@ -43,6 +53,19 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const sessions = useResource<{ sessions: SessionRecord[] }>("/api/sessions", fast ? 10_000 : 30_000);
   const workspaces = useResource<{ workspaces: Workspace[] }>("/api/workspaces");
   const [lastWorkspaceId, setLastWorkspaceId] = useState("");
+  const [lastChat, setLastChat] = useState<ChatPreference | undefined>(undefined);
+  useEffect(() => {
+    let current = true;
+    // A choice made before the stored one loads is newer, so it wins.
+    SecureStore.getItemAsync(LAST_CHAT_KEY).then(raw => { if (current) setLastChat(stored => stored ?? parseChatPreference(raw)); }, () => undefined);
+    return () => { current = false; };
+  }, []);
+  const rememberChat = useCallback((host: ConnectorInfo | undefined, selection: ChatSelection, current?: Parameters<typeof chatPreference>[2]) => {
+    const preference = chatPreference(host, selection, current);
+    if (!preference) return;
+    setLastChat(preference);
+    SecureStore.setItemAsync(LAST_CHAT_KEY, JSON.stringify(preference)).catch(() => undefined);
+  }, []);
   const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
   const working = liveActivity?.activity === "working"
     || (sessions.data?.sessions ?? []).some(session => session.status !== "archived" && session.activity === "working");
@@ -61,6 +84,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     refreshWorkspaces: workspaces.refresh,
     lastWorkspaceId,
     setLastWorkspaceId,
+    lastChat,
+    rememberChat,
     liveActivity,
     setLiveActivity,
   };
