@@ -156,7 +156,7 @@ test('pairing posts only to the fixed origin and strips extra model/capability s
   assert.equal(request.redirect, 'error');
   assert.equal(request.credentials, 'omit');
   assert.equal(request.headers.get('authorization'), null);
-  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, github: true, plainGit: true, cloneBackups: true, hostCommands: true, ...hostMigration } });
+  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, plainGit: true, cloneBackups: true, hostCommands: true, ...hostMigration } });
   for (const secret of [providerSecret, credentials.token, 'fixture_pairing_code']) assert.equal(request.url.includes(secret), false);
 });
 
@@ -504,7 +504,7 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   socket.welcome();
   const call = await fixture.workerCalls.next();
   assert.equal(call.request.url, `${origin}/api/connectors/self/manifest`);
-  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, github: true, plainGit: true, cloneBackups: true, hostCommands: true, ...hostMigration } });
+  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, plainGit: true, cloneBackups: true, hostCommands: true, ...hostMigration } });
   assert.equal(call.request.headers.get('x-connection-token'), connectionToken);
   assert.equal(fixture.runtimes.length, 1);
   assert.equal(ready, false);
@@ -536,7 +536,7 @@ test('the owner\'s --git-credentials opt-in is advertised and lets push credenti
   const fixture = await connectorFixture(t, { gitCredentials: true, pushCredential: () => Response.json(issued) });
   await startFixture(fixture);
   const manifest = fixture.allCalls.find(call => call.request.url === `${origin}/api/connectors/self/manifest`)!;
-  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...publicCapabilities, chatOptions: true, gitProviders: true, gitPush: true, github: true, plainGit: true, cloneBackups: true, hostCommands: true, ...hostMigration, gitCredentials: true });
+  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, plainGit: true, cloneBackups: true, hostCommands: true, ...hostMigration, gitCredentials: true });
   const config = fixture.runtimes[0]!.config;
   assert.equal(typeof config.hostGitCredential, 'function');
   const request = { sessionId: 'session', approvalId: 'tool-push', actorId: 'owner', admissionId: 'admission',

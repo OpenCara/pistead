@@ -2,7 +2,8 @@ import type { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionView, SubmitResult } from '../../../packages/shared/src/types.js';
 import { accessModes, permissions, thinkingLevels } from '../../../packages/shared/src/types.js';
-import type { ConnectorCapabilities, LocalModelSummary } from '../../../packages/shared/src/connector.js';
+import { connectorLimits, type ConnectorCapabilities, type LocalModelSummary } from '../../../packages/shared/src/connector.js';
+import { parseChatImages, type ChatImage } from '../../../packages/shared/src/chat-images.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
@@ -11,6 +12,7 @@ import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './ty
 import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
+import { connectorUtf8Bytes } from './connector-transport.js';
 import { parseOperation } from './operations.js';
 import { requireConnectorSession } from './connectors.js';
 import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
@@ -60,6 +62,25 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
     options.access = input.access as ChatOptions['access'];
   }
   return options;
+}
+
+/**
+ * The images pasted into a message, in the shape and within the bounds every host takes. Only a host that gives them to
+ * the model gets them: an older connector would drop them and run the text alone. An empty list is the same as none.
+ */
+async function chatImages(c: AppContext, row: SessionRow, value: unknown): Promise<ChatImage[] | undefined> {
+  if (value === undefined) return undefined;
+  const parsed = parseChatImages(value);
+  if ('error' in parsed) fail(400, 'invalid_images', parsed.error);
+  if (!parsed.images.length) return undefined;
+  if (!row.connector_id) fail(400, 'images_unsupported', 'This session\'s runner cannot take images.');
+  const host = await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ? AND revoked_at IS NULL')
+    .bind(row.connector_id).first();
+  if (!host) fail(409, 'connector_unavailable', 'The session\'s host is no longer available.');
+  if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).chatImages !== true) {
+    fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to send images.');
+  }
+  return parsed.images;
 }
 
 export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
@@ -352,16 +373,26 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       const { row } = await requireSession(c, identifier(c.req.param('id')), mode === 'ask' ? 'ask' : 'write');
       // Before an admission is issued: a read-only session runs nothing.
       requireUnfrozen(row);
-      const input = await jsonObject(c);
+      // Pasted images make a message about as large as its host takes in one request; a little more is read, so a message
+      // just over that is told why below rather than refused unread.
+      const input = await jsonObject(c, connectorLimits.requestBytes + 256 * 1024);
       if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
-      const content = text(input.content, 'content', 60000);
+      const images = await chatImages(c, row, input.images);
+      // A message of images alone has no text.
+      const content = text(input.content, 'content', 60000, images ? 0 : 1);
       const requestId = text(input.requestId, 'requestId', 128);
       const options = await chatOptions(c, row, mode, input.options);
-      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access) : undefined;
-      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}) }));
+      // Said before an admission is issued, in words the sender can act on; the host request is checked again as it goes.
+      if (images && connectorUtf8Bytes(JSON.stringify({ content, requestId, admissionId: 'x'.repeat(43), options, images })) > connectorLimits.requestBytes) {
+        fail(413, 'message_too_large', 'This message and its images are too large to send together. Remove an image or shorten the message.');
+      }
+      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access, images) : undefined;
+      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}),
+        ...(images ? { images } : {}) }));
       invalidateSessionView(c, row.id);
       if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
-      await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}) }).run();
+      await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}),
+        ...(images ? { images: images.length } : {}) }).run();
       return c.json(result, 202);
     });
   }

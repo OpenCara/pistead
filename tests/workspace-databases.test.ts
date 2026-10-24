@@ -186,7 +186,7 @@ test('only the workspace owner connects, replaces and disconnects the session da
     assert.equal(view.status, 200);
     const text = await view.text();
     assert.ok(!text.includes(password) && !text.includes(ciphertext));
-    assert.deepEqual(JSON.parse(text), { available: true, privateHosts: false, database });
+    assert.deepEqual(JSON.parse(text), { available: true, privateHosts: false, backupStorage: true, database });
   }
   assert.equal((await f.request('GET', databasePath, 'test:outsider')).status, 404);
   // New credentials or TLS for the same database keep its id, which members' confirmations name; another database gets a new one.
@@ -336,6 +336,8 @@ test('without backup storage the server saves no backup, and its listings say so
   assert.equal(await code(refused), 'backup_unavailable');
   assert.equal(runner.calls, 0);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM backups').get()!.n, 0);
+  // The session database settings say so too, so they don't promise storage the server lacks.
+  assert.equal(((await (await f.request('GET', databasePath, 'test:member')).json()) as { backupStorage: boolean }).backupStorage, false);
 });
 
 test('without backup storage a workspace database still takes the backups of its sessions', async t => {

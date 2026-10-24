@@ -1,4 +1,5 @@
 import type { GitProvider, SessionRepository } from "./repositories.js";
+import type { ChatImage } from "./chat-images.js";
 
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
@@ -434,6 +435,21 @@ export interface ApprovalRecord {
   scope?: "call" | "session";
   /** A shell command the host's owner allowed to run without resource limits, which this host lacks. */
   unbounded?: boolean;
+  /**
+   * The permission someone gave this operation's tool call first. Its own card is folded into this one in a view, as
+   * the operation shows what the permission let through.
+   */
+  permission?: { decidedBy: string; scope?: "call" | "session" };
+}
+/**
+ * A tool call whose shell command ran under the owner's auto-approve access. A view lists no card for it: the call and
+ * its result are in the transcript, and this marks the call.
+ */
+export interface AutoApprovedCall {
+  tool: string;
+  status: ApprovalRecord["status"];
+  /** It ran without resource limits, on the owner's own host. */
+  unbounded?: true;
 }
 export interface EntryView {
   id: string;
@@ -446,6 +462,8 @@ export interface EntryView {
   error?: { provider?: string; modelId?: string; status?: number };
   /** How long the model took to write this reply, or the tool to run; absent for entries recorded before Pi 1.1.0. */
   durationMs?: number;
+  /** This entry's tool calls whose commands ran under auto-approve, in call order; absent from older runners. */
+  autoApproved?: AutoApprovedCall[];
 }
 /**
  * Phases of preparing one pinned repository on a host with a repository cache (connect --repo-cache): its turn, the
@@ -477,19 +495,29 @@ export interface SessionView {
   sessionId: string;
   owner: Pick<UserProfile, "id" | "displayName" | "gitName" | "gitEmail" | "githubLogin">;
   entries: EntryView[];
+  /**
+   * Approvals people decide or follow: every one still in play and the newest settled ones. Commands that ran under
+   * auto-approve are marked on their transcript entries instead (`EntryView.autoApproved`). Older runners list them all.
+   */
   approvals: ApprovalRecord[];
+  /** How many older settled approvals `approvals` leaves out; the host keeps them. */
+  olderApprovals?: number;
   conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
   busy: boolean;
   /**
    * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host
-   * still ends its work, which holds the queue until it is done.
+   * still ends its work, which holds the queue until it is done. `images lost` marks one that never ran because the host
+   * no longer had the images it was sent with.
    */
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
   /** The host can stop the session's work: the message running and those queued behind it. Absent from older runners. */
   stoppable?: boolean;
   /** The shared conversation's current model and reasoning level. */
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
-  /** Access mode of the latest shared-conversation submission; absent means "approval". */
+  /**
+   * Access mode of the latest shared-conversation submission ("approval" when it named none). Absent before the first
+   * one; older runners also leave it out when the latest one asked before acting.
+   */
   access?: AccessMode;
   /** Repository preparation on a cache host; absent once the repositories are ready, and on every other host. */
   repositories?: RepositoryPreparationView;
@@ -508,10 +536,13 @@ export interface ChatOptions {
   access?: AccessMode;
 }
 export interface SubmitInput {
+  /** May be empty only when the message carries images. */
   content: string;
   requestId: string;
   admissionId?: string;
   options?: ChatOptions;
+  /** Images pasted into the message, which the model gets after its text; only hosts with `chatImages` take them. */
+  images?: ChatImage[];
 }
 export interface SubmitResult {
   submissionId: string;

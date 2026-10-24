@@ -141,10 +141,10 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
       .bind(admissionId).first();
     // The owner's Auto-approve message pushes without asking, as does any owner message once the owner allowed git_push
     // for the rest of the session.
-    const sessionGrant = admission?.access !== 'auto' && await c.env.DB.query(`SELECT 1 AS granted FROM session_tool_grants
+    const sessionGrant = async () => !!await c.env.DB.query(`SELECT 1 AS granted FROM session_tool_grants
       WHERE session_id = ? AND tool = 'git_push' AND call_id = ''`).bind(sessionId).first();
     if (!admission || admission.session_id !== sessionId || admission.actor_id !== actorId || admission.mode !== 'write' ||
-        (admission.access !== 'auto' && !sessionGrant) || admission.expires_at <= Math.floor(Date.now() / 1000)) {
+        admission.expires_at <= Math.floor(Date.now() / 1000) || (admission.access !== 'auto' && !await sessionGrant())) {
       fail(403, 'automatic_push_not_admitted', 'Automatic pushes require an unexpired write admission from the session owner, sent with auto-approve or after git_push was allowed for the session.');
     }
     await requireCallbackScope(c, owner.row, connectorId);

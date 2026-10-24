@@ -178,7 +178,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
           {approvals.filter(approval => approval.status === "pending").map(pendingApprovalCard)}
           <Feedback error={approvalAction.error} notice={approvalAction.notice} />
         </>} />}
-    <ApprovalsSheet visible={approvalsOpen} approvals={approvals} onClose={() => setApprovalsOpen(false)}
+    <ApprovalsSheet visible={approvalsOpen} approvals={approvals} olderApprovals={view?.olderApprovals} onClose={() => setApprovalsOpen(false)}
       onOpenSession={target => { refreshSessions(); openSession(target); }} />
   </KeyboardAvoidingView></PeopleProvider>;
 }
@@ -195,11 +195,14 @@ function SessionPeople({ session, host }: { session: SessionRecord; host: Connec
   </Text>;
 }
 
+/** Commands auto-approve ran have no card; the transcript marks their calls. */
+const AUTO_APPROVED_NOTE = "Commands that ran under auto-approve are marked on their tool calls in the conversation.";
+
 /**
  * Every approval of the session, pending first, with what each decided one did. On iOS a repinned session opens once
  * the sheet has gone, so the navigation is not hidden behind (or dropped by) the closing modal.
  */
-function ApprovalsSheet({ visible, approvals, onClose, onOpenSession }: { visible: boolean; approvals: ApprovalRecord[]; onClose: () => void; onOpenSession: (id: string) => void }) {
+function ApprovalsSheet({ visible, approvals, olderApprovals, onClose, onOpenSession }: { visible: boolean; approvals: ApprovalRecord[]; olderApprovals?: number; onClose: () => void; onOpenSession: (id: string) => void }) {
   const palette = usePalette();
   const opening = useRef<string | null>(null);
   const sorted = [...approvals].sort((a, b) => Number(b.status === "pending") - Number(a.status === "pending"));
@@ -221,7 +224,8 @@ function ApprovalsSheet({ visible, approvals, onClose, onOpenSession }: { visibl
       </View>
       {sorted.length ? <ScrollView contentContainerStyle={styles.sheetList}>
         {sorted.map(approval => <ApprovalCard key={approval.id} approval={approval} onOpenSession={open} />)}
-      </ScrollView> : <EmptyState title="No approvals">Commands, commits, pushes and GitHub actions that need a decision appear here.</EmptyState>}
+        {!!olderApprovals && <Text style={[ui.small, { color: palette.muted }]}>{`${olderApprovals} older settled ${olderApprovals === 1 ? "approval isn't" : "approvals aren't"} listed. ${AUTO_APPROVED_NOTE}`}</Text>}
+      </ScrollView> : <EmptyState title="No approvals">{`Commands, commits, pushes and GitHub actions that need a decision appear here. ${AUTO_APPROVED_NOTE}`}</EmptyState>}
     </View>
   </Modal>;
 }
@@ -230,6 +234,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode;
 }) {
   const { api } = useSession();
+  const { rememberChat } = useAppData();
   const palette = usePalette();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardVisible();
@@ -302,6 +307,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
       setReceipt(result);
+      // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
+      if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
       request.current = null;

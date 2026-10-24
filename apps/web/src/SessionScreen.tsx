@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
+import type { ChatImage } from "../../../packages/shared/src/chat-images";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, rememberChat, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -13,7 +15,7 @@ import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { RepositoryPreparationCard } from "./repository-preparation";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
-import { ApprovalCard, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
+import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
 import {
   Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
@@ -66,9 +68,9 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
 }
 
 /** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
-function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconName; label: ReactNode; text: string }) {
+function ToolDetails({ role, icon, label, text, badges }: { role?: string; icon: IconName; label: ReactNode; text: string; badges?: ReactNode }) {
   return <details className="entry-tool" data-role={role}>
-    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span><Icon name="chevron-right" size={14} /></summary>
+    <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span>{badges}<Icon name="chevron-right" size={14} /></summary>
     <pre>{text}</pre>
   </details>;
 }
@@ -85,7 +87,8 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined
       && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
-    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text} />;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text}
+      badges={<AutoApprovedMarks calls={entry.autoApproved} />} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -102,7 +105,7 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
-    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} />}
     {(actor || took) && <div className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</div>}
   </div>;
 }
@@ -291,11 +294,14 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [content, setContent] = useState(() => {
     try { return sessionStorage.getItem(`pistead.draft.${id}`) ?? ""; } catch { return ""; }
   });
+  // So are its images, which the new-session screen keeps in memory.
+  const attachments = useAttachments(imagesUnavailable(host), () => handedOverImages(id));
   useEffect(() => {
     try { sessionStorage.removeItem(`pistead.draft.${id}`); } catch { /* Storage unavailable: nothing to clear. */ }
+    forgetHandedOverImages(id);
   }, [id]);
   const [conversationId, setConversationId] = useState("");
-  const request = useRef<{ key: string; id: string } | null>(null);
+  const request = useRef<{ key: string; id: string; images?: ChatImage[] } | null>(null);
   const submission = useAction();
   const stopping = useAction();
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
@@ -337,23 +343,30 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
 
   function submit(event?: FormEvent) {
     event?.preventDefault();
-    if (!permitted || !content.trim() || submission.busy) return;
+    const pasted = attachments.images;
+    if (!permitted || (!content.trim() && !pasted.length) || submission.busy) return;
     setReceipt(null);
     const sent = content;
     const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
-    // Changing the options is a different request, so it needs a new idempotency key.
-    const key = `${actualMode}:${JSON.stringify(options ?? null)}:${sent}`;
+    // Changing the options or the images is a different request, so it needs a new idempotency key.
+    const key = `${actualMode}:${JSON.stringify(options ?? null)}:${pasted.map(image => image.id).join(",")}:${sent}`;
     // Retry the same failed submission with the same idempotency key, not a duplicate turn.
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
-    const requestId = request.current.id;
+    const pending = request.current;
     stick.current = true;
     const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
     void submission.run(async () => {
       if (unavailable) throw new Error(unavailable);
-      const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
+      // Encoded once per request, so a retry sends the same bytes under the same key.
+      const images = pending.images ??= await encodeImages(pasted);
+      const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST",
+        body: { content: sent, requestId: pending.id, ...(options ? { options } : {}), ...(images.length ? { images } : {}) } });
       setReceipt(result);
+      // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
+      if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
+      attachments.sent(pasted);
       request.current = null;
       refresh();
     });
@@ -413,6 +426,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           value={content}
           onChange={setContent}
           onSubmit={submit}
+          attachments={attachments}
           busy={submission.busy}
           disabled={!permitted}
           onStop={canStop ? stop : undefined}
@@ -441,10 +455,12 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
 
 /** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. */
 /** `onStop`, while the agent works and the person may stop it, shows a stop button beside send; messages can still be queued. */
-function ComposerInput({ value, onChange, onSubmit, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
-  value: string; onChange: (value: string) => void; onSubmit: () => void; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
+/** With `attachments`, images pasted into it go with the message, which may then have no text. */
+function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
+  value: string; onChange: (value: string) => void; onSubmit: () => void; attachments?: Attachments; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
   label: string; placeholder: string; sendLabel: string; hint: ReactNode; tools?: ReactNode;
 }) {
+  const sendable = Boolean(value.trim() || attachments?.images.length);
   const input = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const element = input.current;
@@ -454,20 +470,22 @@ function ComposerInput({ value, onChange, onSubmit, onStop, stopping, busy, disa
   }, [value]);
   function submit(event?: FormEvent) {
     event?.preventDefault();
-    if (!disabled && !busy && value.trim()) onSubmit();
+    if (!disabled && !busy && sendable) onSubmit();
   }
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event);
   }
   return <form className="composer" onSubmit={submit}>
-    <textarea ref={input} rows={1} required value={value} disabled={busy || disabled} aria-label={label} placeholder={placeholder}
-      onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} />
+    {attachments && <AttachmentStrip attachments={attachments} disabled={busy || disabled} />}
+    <textarea ref={input} rows={1} required={!attachments?.images.length} value={value} disabled={busy || disabled} aria-label={label} placeholder={placeholder}
+      onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments?.paste} />
+    {attachments?.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
     <div className="composer-toolbar">
       {tools}
       <span className="composer-hint">{hint}</span>
       <span className="composer-actions">
         {onStop && <Button variant="outline" size="sm" icon="stop" className="composer-stop" aria-label={stopping ? "Stopping..." : "Stop"} title="Stop the running message and those queued" disabled={stopping} onClick={onStop} />}
-        <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !value.trim()} />
+        <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !sendable} />
       </span>
     </div>
   </form>;

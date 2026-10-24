@@ -2,7 +2,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, 
 import type { ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { ChatOptionsBar, chatOptionsBody, type ChatSelection } from "./chat-options";
+import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
+import { ChatOptionsBar, chatOptionsBody, preferredSelection, readChatPreference, rememberChat, type ChatSelection } from "./chat-options";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
@@ -66,6 +67,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repos = useWorkspaceRepositories(workspace.id);
 
   const [lastStart] = useState(() => readStorage(() => localStorage, LAST_START_KEY));
+  const [lastChat] = useState(readChatPreference);
 
   const [choice, setChoice] = useState("");
   const [content, setContent] = useState("");
@@ -89,14 +91,13 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const hostKey = host?.id ?? "";
   const hostModel = (wanted?: { provider: string; modelId: string }) => wanted && host && host.models.some(item => sameModel(item, wanted))
     ? modelList?.find(item => item.connectorId === host.id && sameModel(item, wanted)) : undefined;
-  // Picks belong to one host; switching starts from its model again: the model last started on this host, else the
-  // host's first model.
+  // Picks belong to one host; switching starts from its model again: the model last chatted with when this host offers
+  // it, else the model last started on this host, else the host's first model. Reasoning starts at the level last
+  // chatted with where the model supports it, else at the level the host's Pi starts that model at.
   const [chat, setChat] = useState<{ key: string; value: ChatSelection } | null>(null);
-  const initialModel = hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
-  // The level the host's Pi starts that model at, as the session itself will.
-  const initialLevel = initialModel && host?.models.find(item => sameModel(item, initialModel))?.thinkingLevel;
+  const fallbackModel = hostModel(remembered) ?? host?.models.map(item => hostModel(item)).find(Boolean);
   const selection: ChatSelection = chat?.key === hostKey ? chat.value
-    : { model: initialModel && { provider: initialModel.provider, modelId: initialModel.modelId }, thinkingLevel: initialLevel, access: "auto" };
+    : preferredSelection(host, lastChat, fallbackModel, item => Boolean(hostModel(item)));
   // The session starts on the model picked here, one the host offers.
   const model = hostModel(selection.model);
   const foreign = Boolean(host && host.ownerId !== user.id);
@@ -105,6 +106,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
+  const attachments = useAttachments(imagesUnavailable(host));
 
   // A trust acknowledgement covers one host against one repository set.
   useEffect(() => { setTrustedHost(""); }, [hostKey, host?.ownerId, repositories]);
@@ -120,17 +122,23 @@ function Composer({ workspace }: { workspace: Workspace }) {
     event?.preventDefault();
     if (!canStart || !model || !host) return;
     const message = content.trim();
+    const pasted = attachments.images;
     const options = chatOptionsBody(host, selection, "submit");
     void action.run(async () => {
+      // Before the session exists: an image that can't be read stops the start instead of leaving a session behind.
+      const images = await encodeImages(pasted);
       const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, modelId: model.id, title: deriveTitle(content, model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
       const sessionId = result.session.id;
       writeStorage(() => localStorage, LAST_START_KEY, `model:${model.id}`);
-      if (message) {
+      rememberChat(host, selection);
+      if (message || images.length) {
         try {
-          await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}) } });
+          await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}),
+            ...(images.length ? { images } : {}) } });
         } catch {
-          // The session exists; keep the unsent text for its composer instead of failing the start.
+          // The session exists; keep the unsent text and images for its composer instead of failing the start.
           writeStorage(() => sessionStorage, `pistead.draft.${sessionId}`, message);
+          handOverImages(sessionId, pasted);
         }
       }
       refreshSessions();
@@ -183,7 +191,9 @@ function Composer({ workspace }: { workspace: Workspace }) {
     {blockingAlert()}
     <form className="composer-card" onSubmit={start} aria-busy={action.busy}>
       <fieldset disabled={action.busy}>
-        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} placeholder="Describe the task" aria-label="First message" autoFocus />
+        <AttachmentStrip attachments={attachments} disabled={action.busy} />
+        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message" autoFocus />
+        {attachments.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
         <div className="composer-toolbar">
           <Combobox label="Host" placeholder={models.loading || connections.loading ? "Loading..." : "Choose a host"} disabled={!hosts.length} value={hostKey}
             options={hosts.map(item => ({ value: item.id, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` }))}

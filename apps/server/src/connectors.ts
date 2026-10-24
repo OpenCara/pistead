@@ -48,11 +48,12 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');
   const cap = value as Record<string, unknown>;
-  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'gitProviders', 'gitPush', 'gitCredentials', 'github', 'repositoryCache', 'hostMigration', 'plainGit', 'cloneBackups']);
+  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'chatImages', 'gitProviders', 'gitPush', 'gitCredentials', 'github', 'repositoryCache', 'hostMigration', 'plainGit', 'cloneBackups']);
   const platform = text(cap.platform, 'platform', 40);
   if (!/^[a-zA-Z0-9._-]+$/.test(platform) || typeof cap.sandbox !== 'boolean' || typeof cap.productionShell !== 'boolean' || (cap.productionShell && !cap.sandbox)
     || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)
     || (cap.chatOptions !== undefined && typeof cap.chatOptions !== 'boolean') || (cap.gitProviders !== undefined && typeof cap.gitProviders !== 'boolean')
+    || (cap.chatImages !== undefined && typeof cap.chatImages !== 'boolean')
     || (cap.gitPush !== undefined && typeof cap.gitPush !== 'boolean')
     || (cap.gitCredentials !== undefined && typeof cap.gitCredentials !== 'boolean') || (cap.gitCredentials && !cap.gitPush)
     || (cap.github !== undefined && typeof cap.github !== 'boolean')
@@ -61,7 +62,7 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
     || (cap.plainGit !== undefined && typeof cap.plainGit !== 'boolean')
     || (cap.cloneBackups !== undefined && typeof cap.cloneBackups !== 'boolean') || (cap.cloneBackups && (!cap.plainGit || cap.unsandboxed))) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
-    ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
+    ...(cap.chatImages ? { chatImages: true } : {}), ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
     ...(cap.github ? { github: true } : {}), ...(cap.repositoryCache ? { repositoryCache: true } : {}),
     ...(cap.hostMigration ? { hostMigration: true } : {}), ...(cap.plainGit ? { plainGit: true } : {}), ...(cap.cloneBackups ? { cloneBackups: true } : {}) } };
 }

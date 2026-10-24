@@ -33,7 +33,9 @@ export function registerWorkspaceDatabases(app: Hono<WorkerEnv>): void {
     await requireMember(c.env, workspaceId, c.get('auth').userId);
     const row = await workspaceDatabaseRow(c.env, workspaceId);
     const provider = c.env.WORKSPACE_DATABASES;
-    return c.json({ available: !!provider, privateHosts: provider?.privateHosts ?? false, database: row ? publicWorkspaceDatabase(row) : null });
+    // backupStorage says whether backups have anywhere to go without a database, so the settings don't promise storage the server lacks.
+    return c.json({ available: !!provider, privateHosts: provider?.privateHosts ?? false, backupStorage: !!c.env.BUCKET,
+      database: row ? publicWorkspaceDatabase(row) : null });
   });
 
   app.put('/api/workspaces/:id/database', async c => {

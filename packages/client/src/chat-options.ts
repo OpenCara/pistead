@@ -68,12 +68,70 @@ export function selectModel(selection: ChatSelection, next: LocalModelSummary): 
   return { ...selection, model: { provider: next.provider, modelId: next.modelId }, thinkingLevel: next.thinkingLevel ?? clampLevel(next.thinkingLevels, selection.thinkingLevel) };
 }
 
+/** The model and reasoning last chatted with, remembered so the next new chat starts from them. */
+export interface ChatPreference {
+  /** The host it ran on. */
+  connectorId: string;
+  provider: string;
+  modelId: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+/**
+ * What to remember after a message goes to `host` with `selection`: the model and the reasoning it actually ran at.
+ * Unset picks keep the conversation's `current` model and reasoning, so those are what it ran with.
+ */
+export function chatPreference(
+  host: ConnectorInfo | undefined,
+  selection: ChatSelection,
+  current?: { provider: string; modelId: string; thinkingLevel?: ThinkingLevel },
+): ChatPreference | undefined {
+  const model = host?.capabilities.chatOptions ? findModel(host, selection.model ?? current) : undefined;
+  if (!host || !model) return undefined;
+  const thinkingLevel = effectiveLevel(model, selection.thinkingLevel ?? (selection.model ? undefined : current?.thinkingLevel));
+  return { connectorId: host.id, provider: model.provider, modelId: model.modelId, ...(thinkingLevel ? { thinkingLevel } : {}) };
+}
+
+/** A stored preference, or undefined when it is missing or not one. */
+export function parseChatPreference(raw: string | null | undefined): ChatPreference | undefined {
+  if (!raw) return undefined;
+  try {
+    const value = JSON.parse(raw) as Partial<ChatPreference> | null;
+    if (!value || typeof value.connectorId !== "string" || typeof value.provider !== "string" || typeof value.modelId !== "string") return undefined;
+    const thinkingLevel = (thinkingLevels as readonly string[]).includes(value.thinkingLevel as string) ? value.thinkingLevel : undefined;
+    return { connectorId: value.connectorId, provider: value.provider, modelId: value.modelId, ...(thinkingLevel ? { thinkingLevel } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Starting selection for a new chat on `host`: the remembered model when the host offers it (`usable` says whether this
+ * workspace may use a model there), else `fallback`; at the remembered reasoning when that model supports it, else at
+ * the level the host's Pi starts the model at.
+ */
+export function preferredSelection(
+  host: ConnectorInfo | undefined,
+  preference: ChatPreference | undefined,
+  fallback: { provider: string; modelId: string } | undefined,
+  usable: (model: { provider: string; modelId: string }) => boolean = () => true,
+): ChatSelection {
+  const remembered = preference && findModel(host, preference);
+  const model = remembered && usable(remembered) ? remembered : findModel(host, fallback);
+  // A new chat is its owner's, so it starts on Auto-approve.
+  if (!model) return { access: "auto" };
+  const thinkingLevel = model.thinkingLevels?.length ? effectiveLevel(model, preference?.thinkingLevel) : model.thinkingLevel;
+  return { model: { provider: model.provider, modelId: model.modelId }, thinkingLevel, access: "auto" };
+}
+
 /**
  * Starting selection for an existing session: its current model, reasoning and shared-run access. Before its first
- * shared message, the owner starts on Auto-approve and everyone else on "Ask before acting".
+ * message, the owner starts on Auto-approve and everyone else on "Ask before acting". Older runners leave the
+ * access out after a message that asked before acting too, so a conversation with messages but none says "approval".
  */
 export function initialSelection(view: SessionView, owner: boolean): ChatSelection {
-  const access = view.access ?? (owner ? "auto" : "approval");
+  const fresh = !view.entries?.some(entry => entry.role === "user");
+  const access = view.access ?? (owner && fresh ? "auto" : "approval");
   return {
     model: view.agent && { provider: view.agent.provider, modelId: view.agent.modelId },
     thinkingLevel: view.agent?.thinkingLevel,
