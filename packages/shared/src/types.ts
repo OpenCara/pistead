@@ -1,4 +1,5 @@
 import type { GitProvider, SessionRepository } from "./repositories.js";
+import type { ChatImage } from "./chat-images.js";
 
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
@@ -505,7 +506,8 @@ export interface SessionView {
   busy: boolean;
   /**
    * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host
-   * still ends its work, which holds the queue until it is done.
+   * still ends its work, which holds the queue until it is done. `images lost` marks one that never ran because the host
+   * no longer had the images it was sent with.
    */
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
   /** The host can stop the session's work: the message running and those queued behind it. Absent from older runners. */
@@ -531,10 +533,13 @@ export interface ChatOptions {
   access?: AccessMode;
 }
 export interface SubmitInput {
+  /** May be empty only when the message carries images. */
   content: string;
   requestId: string;
   admissionId?: string;
   options?: ChatOptions;
+  /** Images pasted into the message, which the model gets after its text; only hosts with `chatImages` take them. */
+  images?: ChatImage[];
 }
 export interface SubmitResult {
   submissionId: string;

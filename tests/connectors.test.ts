@@ -435,6 +435,7 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'starting level the model lacks', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevels: ['low', 'high'], thinkingLevel: 'medium' }] }, code: 'invalid_manifest' },
     { name: 'unknown starting level', value: { ...manifest, models: [{ ...manifest.models[0], thinkingLevel: 'extreme' }] }, code: 'invalid_manifest' },
     { name: 'non-boolean chat options', value: { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: 'true' } }, code: 'invalid_manifest' },
+    { name: 'non-boolean chat images', value: { ...manifest, capabilities: { ...manifest.capabilities, chatImages: 'true' } }, code: 'invalid_manifest' },
     { name: 'non-boolean git providers', value: { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: 1 } }, code: 'invalid_manifest' },
     { name: 'git credentials without pushes', value: { ...manifest, capabilities: { ...manifest.capabilities, gitCredentials: true } }, code: 'invalid_manifest' },
   ];
@@ -1234,6 +1235,47 @@ test('per-message chat options are checked against the session host, mode and ow
   await json(await s.creator.request('POST', `${path}/ask`, { content: 'Hi', requestId: 'ask-model', options: { model, thinkingLevel: 'off' } }), 202);
   assert.equal(requests.at(-1)!.request.ticket.action, 'ask');
   assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { model, thinkingLevel: 'off' });
+});
+
+test('pasted images are checked and go only to a host whose connector gives them to the model', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
+  const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
+  const path = `/api/sessions/${s.session.id}`;
+  const image = { mimeType: 'image/png', data: 'iVBORw0KGgo=' };
+  // An older connector would drop them and run the text alone.
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Look', requestId: 'outdated', images: [image] }), 409, 'connector_update_required');
+  // No images is the same as none, so it still works against an outdated host.
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'none', images: [] }), 202);
+  assert.equal(Object.hasOwn(JSON.parse(requests.at(-1)!.request.body), 'images'), false);
+  await json(await self(f, s.connector, 'manifest', { models: manifest.models, capabilities: { ...manifest.capabilities, chatImages: true } }));
+  const before = requests.length;
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Look', requestId: 'svg', images: [{ ...image, mimeType: 'image/svg+xml' }] }), 400, 'invalid_images');
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Look', requestId: 'many', images: Array(5).fill(image) }), 400, 'invalid_images');
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Look', requestId: 'large', images: [{ ...image, data: 'A'.repeat(512 * 1024 + 4) }] }), 400, 'invalid_images');
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: '', requestId: 'empty' }), 400, 'invalid_input');
+  // Within each bound, but too large with the text to reach the host in one request.
+  const third = 'A'.repeat(240 * 1024);
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: '\u0001'.repeat(60000), requestId: 'too-large',
+    images: [{ ...image, data: third }, { ...image, data: third }, { ...image, data: third }] }), 413, 'message_too_large');
+  assert.equal(requests.length, before, 'refused images never reach the host');
+  // A message can be images alone, in a shared message or a side ask.
+  await json(await s.creator.request('POST', `${path}/submit`, { content: '', requestId: 'alone', images: [image] }), 202);
+  const sent = JSON.parse(requests.at(-1)!.request.body);
+  assert.equal(sent.content, '');
+  assert.deepEqual(sent.images, [image]);
+  assert.match(sent.admissionId, /^[A-Za-z0-9_-]{43}$/);
+  await json(await s.creator.request('POST', `${path}/ask`, { content: 'What is this?', requestId: 'ask', images: [image, image] }), 202);
+  assert.equal(requests.at(-1)!.request.ticket.action, 'ask');
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).images, [image, image]);
+  // A request ID's admission binds its images as it binds its text.
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Same', requestId: 'same', images: [image] }), 202);
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Same', requestId: 'same', images: [image] }), 202);
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Same', requestId: 'same', images: [{ ...image, data: 'AAAA' }] }), 409, 'admission_conflict');
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Same', requestId: 'same' }), 409, 'admission_conflict');
+  // The audit counts a message's images: none, the images alone, then the same message twice.
+  const audit = f.sqlite.prepare(`SELECT detail_json FROM audit WHERE session_id = ? AND action = 'session.submit'`).all(s.session.id) as { detail_json: string }[];
+  assert.deepEqual(audit.map(row => JSON.parse(row.detail_json).images ?? 0).sort(), [0, 1, 1, 1]);
 });
 
 test('automatic approvals are shown only for the owner\'s own decided commands, never comments or pending work', async t => {
