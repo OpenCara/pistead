@@ -115,9 +115,9 @@ function azureSegment(segment: string): string {
   }
   return hex;
 }
-/** The branch security token; permissions set on the repository or project reach new branches through inheritance. */
-function azureBranchToken(projectId: string, repositoryId: string, branch: string): string {
-  return `repoV2/${projectId}/${repositoryId}/refs/heads/${branch.split('/').map(azureSegment).join('/')}`;
+/** The branch (or tag) security token; permissions set on the repository or project reach new refs through inheritance. */
+function azureBranchToken(projectId: string, repositoryId: string, branch: string, kind: 'heads' | 'tags' = 'heads'): string {
+  return `repoV2/${projectId}/${repositoryId}/refs/${kind}/${branch.split('/').map(azureSegment).join('/')}`;
 }
 
 /** A branch read as the owner: its JSON when it exists, null when it does not (a new branch). */
@@ -182,11 +182,56 @@ async function ownerCanPush(target: Api, pin: SessionRepository, branch: string)
   }
 }
 
-/** Confirms the binding identity, the owner's write access to the branch, the default branch and the credential-free remote. */
-export async function pushTarget(access: RepositoryAccess, pin: SessionRepository, branch: string): Promise<PushTarget> {
+/**
+ * Whether the owner may create a tag. No branch moves, so branch protection doesn't apply; tag rules on the forge (GitHub
+ * rulesets, GitLab and Gitea protected tags) still bind the push identity when it pushes. Azure DevOps is asked for
+ * CreateTag (32) on the tag's own token.
+ */
+async function ownerCanTag(target: Api, pin: SessionRepository, tag: string): Promise<{ canPush: boolean; azureProjectId?: string }> {
+  const id = encodeURIComponent(String(pin.repositoryId));
+  switch (target.provider) {
+    case 'github':
+    case 'github-enterprise': {
+      const repository = target.provider === 'github'
+        ? await read(target, `${target.base}/repos/${pin.fullName}`)
+        : await read(target, `${target.base}/repositories/${id}`);
+      return { canPush: object(target, repository.permissions).push === true };
+    }
+    case 'gitea':
+      return { canPush: object(target, (await read(target, `${target.base}/repositories/${id}`)).permissions).push === true };
+    case 'gitlab': {
+      // Developer (30) creates tags that no protected-tag rule covers; GitLab applies those rules to the push itself.
+      const permissions = object(target, (await read(target, `${target.base}/projects/${id}`)).permissions);
+      const level = (value: unknown): number => {
+        const item = value && typeof value === 'object' ? (value as Record<string, unknown>).access_level : undefined;
+        return typeof item === 'number' ? item : 0;
+      };
+      return { canPush: Math.max(level(permissions.project_access), level(permissions.group_access)) >= 30 };
+    }
+    case 'bitbucket':
+      // Repository-level write, as for a branch (Bitbucket's check doesn't depend on the branch).
+      return ownerCanPush(target, pin, tag);
+    case 'azure-devops': {
+      const repository = await read(target, `${target.base}/_apis/git/repositories/${id}?api-version=7.1`);
+      const projectId = object(target, repository.project).id;
+      if (typeof projectId !== 'string' || !/^[0-9a-fA-F-]{36}$/.test(projectId)) unavailable(target.provider);
+      const tokens = encodeURIComponent(azureBranchToken(projectId, String(pin.repositoryId), tag, 'tags'));
+      const result = await call(target, `${target.base}/_apis/permissions/2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87/32?tokens=${tokens}&api-version=7.1`);
+      if (result.status !== 200) unverifiable(target.provider, 'the connected token cannot read repository permissions.');
+      const value = array(target, object(target, result.body).value);
+      return { canPush: value[0] === true, azureProjectId: projectId };
+    }
+  }
+}
+
+/**
+ * Confirms the binding identity, the owner's write access to the branch (or, with `tag`, to create that tag), the default
+ * branch and the credential-free remote.
+ */
+export async function pushTarget(access: RepositoryAccess, pin: SessionRepository, branch: string, tag?: string): Promise<PushTarget> {
   const target = api(access, pin);
   const metadata = await verifyRepository(access, { repositoryId: String(pin.repositoryId), fullName: pin.fullName });
-  const permission = await ownerCanPush(target, pin, branch);
+  const permission = tag === undefined ? await ownerCanPush(target, pin, branch) : await ownerCanTag(target, pin, tag);
   return { canPush: permission.canPush, defaultBranch: metadata.defaultBranch, remote: repositoryRemote(pin),
     ...(permission.azureProjectId ? { azureProjectId: permission.azureProjectId } : {}) };
 }

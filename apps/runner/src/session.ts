@@ -9,7 +9,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
-import { bindingRemote, repositoryPath, validCloneDirectory } from "../../../packages/shared/src/repositories.js";
+import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
 import { messageHash, parseChatImages, type ChatImage } from "../../../packages/shared/src/chat-images.js";
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
@@ -523,7 +523,10 @@ export class RunnerSession {
         instructions += "\ngit_push publishes a clone's checked-out commit, as it is, to another branch of the workspace repository it was cloned from, "
           + "with approval: git_push {directory, branch}, where directory is the clone's path in the worktree. Pushes are fast-forward only (never forced); "
           + "if the branch moved, fetch and merge or rebase first. Optionally request a pull request with pull_request {title, body, base?}; "
-          + `to open one from the session branch once you pushed it, call git_push with branch ${branch}.`;
+          + `to open one from the session branch once you pushed it, call git_push with branch ${branch}. `
+          + "To tag a commit that is already on a branch (a release tag on main, say), check it out in the clone and call "
+          + "git_push {directory, branch, tag}: it creates that tag at the commit and moves no branch. Tags are never moved; "
+          + "plain git push of tags is refused.";
     }
     if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
     if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files; any change to files, command or other effect waits for the session owner to allow it.";
@@ -1259,19 +1262,22 @@ export class RunnerSession {
 
   private clonePushTool(): ToolRegistration {
     const text = (value: unknown) => ({ output: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
-    return defineTool({ name: "git_push", description: "Push the checked-out commit of a clone in the worktree (its directory, such as app) as it is to a branch of the workspace repository it was cloned from, fast-forward only, optionally opening a pull request as the owner. Commit with git first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
-      directory: Type.String(), branch: Type.String(),
+    return defineTool({ name: "git_push", description: "Push the checked-out commit of a clone in the worktree (its directory, such as app) as it is to a branch of the workspace repository it was cloned from, fast-forward only, optionally opening a pull request as the owner. With tag, push no branch: create that tag at the checked-out commit, which must already be on the remote's branch (such as a release tag on main); tags are never moved. Commit with git first. Waits for an exact human approval unless the owner enabled auto-approve for this request.", parameters: Type.Object({
+      directory: Type.String(), branch: Type.String(), tag: Type.Optional(Type.String()),
       pull_request: Type.Optional(Type.Object({ title: Type.String(), body: Type.String(), base: Type.Optional(Type.String()) })),
     }), execute: async (args, api, call) => {
       const attribution = await this.toolActor(api, true);
-      await this.permit(api, call, "git_push", `${args.directory} → ${args.branch}`, { write: true });
+      await this.permit(api, call, "git_push", args.tag === undefined ? `${args.directory} → ${args.branch}` : `${args.directory} → tag ${args.tag} on ${args.branch}`, { write: true });
       if (!validCloneDirectory(args.directory)) throw new RunnerError(400, "directory must be a clone's path in the worktree, such as app or src/app");
+      if (args.tag !== undefined && !validPushTag(args.tag)) throw new RunnerError(400, "tag must be a plain tag name, such as v1.2.3, not refs/tags/v1.2.3");
+      if (args.tag !== undefined && args.pull_request) throw new RunnerError(400, "a tag push opens no pull request");
       const head = await (this.sandbox as Sandbox).cloneHead(args.directory, () => this.recheckTool(attribution));
       if (!head.origin) throw new RunnerError(400, `${args.directory} has no origin remote; push only clones of this workspace's repositories`);
       const repository = repositoryForRemote((await this.#egress!.grant()).repositories, head.origin);
       if (!repository) throw new RunnerError(403, `${args.directory} was cloned from ${head.origin.slice(0, 200)}, which is not one of this workspace's repositories`);
       const request = args.pull_request;
-      const operation: GitPushOperation = { kind: "git.push", repository: repositoryPath(repository), directory: args.directory, branch: args.branch, commit: head.commit,
+      const operation: GitPushOperation = { kind: "git.push", repository: repositoryPath(repository), directory: args.directory, branch: args.branch,
+        ...(args.tag !== undefined ? { tag: args.tag } : {}), commit: head.commit,
         ...(request ? { pullRequest: { title: request.title, body: request.body, ...(request.base !== undefined ? { base: request.base } : {}) } } : {}) };
       const approval = await this.operationOutcome(await this.createApproval(attribution.initiatedBy, operation, String(api.taskId), { permitted: true }), call);
       return text({ ...approval, admissionId: undefined });

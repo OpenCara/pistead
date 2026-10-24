@@ -133,6 +133,11 @@ export function validPushBranch(value: unknown): value is string {
     && !value.endsWith("/") && !value.split("/").some(part => !part || part.startsWith(".") || part.endsWith(".lock"));
 }
 
+/** A tag name `git_push` may create, as refs/tags/<tag>: the same rules as a branch name (cli-v1.2.3, release/2026-10). */
+export function validPushTag(value: unknown): value is string {
+  return validPushBranch(value);
+}
+
 /**
  * Push identity kinds each provider supports, its app or bot identity first. Gitea/Forgejo hosts use an OAuth app, or a
  * Forgejo Authorized Integration. Every provider can also push with the session owner's account or the host's Git credentials.

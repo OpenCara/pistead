@@ -3,7 +3,7 @@ import { sha256, verifyToken } from "../../../packages/shared/src/crypto.js";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, githubMergeMethods, permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
-import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validCloneDirectory, validGitHost, validPushBranch, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
+import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validCloneDirectory, validGitHost, validPushBranch, validPushTag, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
 
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -131,8 +131,9 @@ export function validateOperation(value: unknown): Operation {
       && !op.repository.split("/").some(part => [".", "..", ".git"].includes(part.toLowerCase()))
       && (op.directory === undefined || validCloneDirectory(op.directory))
       && validPushBranch(op.branch) && typeof op.commit === "string" && /^[0-9a-f]{40}$/.test(op.commit)
-      && keys.every(key => ["kind", "repository", "directory", "branch", "commit", "pullRequest"].includes(key))
-      && keys.length === 4 + (request === undefined ? 0 : 1) + (op.directory === undefined ? 0 : 1) && validRequest) return op;
+      && (op.tag === undefined || (validPushTag(op.tag) && request === undefined))
+      && keys.every(key => ["kind", "repository", "directory", "branch", "tag", "commit", "pullRequest"].includes(key))
+      && keys.length === 4 + (request === undefined ? 0 : 1) + (op.directory === undefined ? 0 : 1) + (op.tag === undefined ? 0 : 1) && validRequest) return op;
   }
   if (op.kind === "permission") {
     const keys = Object.keys(op);

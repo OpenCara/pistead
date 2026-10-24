@@ -154,7 +154,8 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
       if (url.origin === 'https://dev.azure.com' && url.pathname === `/contoso/_apis/git/repositories/${azureRepositoryId}`) {
         return Response.json({ id: azureRepositoryId, name: 'repo', defaultBranch: 'refs/heads/main', project: { id: azureProjectId, name: 'Project', visibility: 'private' } });
       }
-      if (url.origin === 'https://dev.azure.com' && url.pathname === '/contoso/_apis/permissions/2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87/4') {
+      // GenericContribute (4) for branches, CreateTag (32) for tags.
+      if (url.origin === 'https://dev.azure.com' && /^\/contoso\/_apis\/permissions\/2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87\/(?:4|32)$/.test(url.pathname)) {
         return Response.json({ count: 1, value: [state.azureAllow] });
       }
       return undefined;
@@ -320,6 +321,48 @@ test('repository path, owner permission and default-branch policy gate minting',
   const feature = await f.post(credential, { sessionId: 'session', approvalId: 'tool-p-4', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') });
   assert.equal(feature.status, 200);
   assert.equal(f.ledger().length, 1);
+});
+
+test('a tag push creates a tag for a commit on the default branch: no branch checks, no default-branch policy, no pull request', async t => {
+  const f = await fixture(t);
+  // main is protected and the workspace forbids pushes to it; a tag moves neither.
+  f.sqlite.prepare('INSERT INTO repository_push_policies (binding_id,workspace_id,forbid_default_branch,updated_by,updated_at) VALUES (?,?,?,?,?)')
+    .run('binding-gh', 'workspace', 1, owner, new Date().toISOString());
+  f.state.githubBranch = { name: 'main', protected: true };
+  // Canonical key order: tag after branch.
+  const op = { kind: 'git.push', repository: githubPin.path, directory: 'app', branch: 'main', tag: 'cli-v1.2.0', commit: sessionCommit };
+  const issued = await f.post(credential, { sessionId: 'session', approvalId: 'tool-tag-1', actorId: owner, operation: op, admissionId: f.admit('auto') });
+  assert.equal(issued.status, 200);
+  assert.ok(!f.calls.some(call => call.url.includes('/branches/')), 'branch protection is not consulted for a tag');
+  assert.equal(f.calls.find(call => call.url === 'https://api.github.com/repos/owner/repo')!.authorization, 'Bearer owner-oauth-token');
+  assert.equal(f.ledger()[0]!.operation_json, JSON.stringify(op));
+  assert.ok(JSON.stringify(f.audits('git.push.credential_issued')).includes('cli-v1.2.0'));
+  // An approval of the same push with the keys in another order is the same operation.
+  const reordered = { kind: 'git.push', repository: githubPin.path, directory: 'app', branch: 'main', commit: sessionCommit, tag: 'cli-v1.2.0' };
+  const capability = await f.approve('approval-tag', op);
+  assert.equal((await f.post(credential, { sessionId: 'session', approvalId: 'approval-tag', actorId: owner, operation: reordered, capability })).status, 200);
+
+  const refused = async (approvalId: string, operation: Record<string, unknown>, status: number, expected?: string) => {
+    const before = f.ledger().length;
+    const response = await f.post(credential, { sessionId: 'session', approvalId, actorId: owner, operation, admissionId: f.admit('auto') });
+    assert.equal(response.status, status, approvalId);
+    if (expected) assert.equal(await code(response), expected);
+    assert.equal(f.ledger().length, before);
+  };
+  await refused('tool-tag-2', { ...op, tag: 'cli-v1.2.1', pullRequest: { title: 'Release', body: '' } }, 400, 'invalid_operation');
+  await refused('tool-tag-3', { ...op, tag: 'refs/tags/cli-v1.2.1' }, 400, 'invalid_operation');
+  await refused('tool-tag-4', { ...op, tag: 'bad..tag' }, 400, 'invalid_operation');
+  f.state.canPush = false;
+  await refused('tool-tag-5', { ...op, tag: 'cli-v1.2.1' }, 403, 'push_permission_required');
+  assert.ok(!f.calls.some(call => call.url.includes('/branches/')));
+
+  // Azure DevOps answers for the tag itself: CreateTag (32) on refs/tags/<tag>.
+  const azure = await f.post(credential, { sessionId: 'session', approvalId: 'tool-tag-6', actorId: owner,
+    operation: { kind: 'git.push', repository: azurePin.path, directory: 'repo', branch: 'main', tag: 'v1', commit: sessionCommit }, admissionId: f.admit('auto') });
+  assert.notEqual(await code(azure.clone()).catch(() => ''), 'push_permission_required');
+  const permission = new URL(f.calls.find(call => call.url.includes('/_apis/permissions/'))!.url);
+  assert.match(permission.pathname, /\/32$/);
+  assert.equal(permission.searchParams.get('tokens'), `repoV2/${azureProjectId}/${azureRepositoryId}/refs/tags/76003100`);
 });
 
 test('completion revokes the GitHub token, verifies the tip and opens the pull request as the owner', async t => {

@@ -132,6 +132,13 @@ the insert, but resolves nothing with the owner's accounts. The relay checks the
   commit, and the new commits; a branch that moved is refused (fetch and merge or rebase first); the pack
   (`clone-push-pack`) excludes what the present tips reach. Git runs in the clone read-only, with its own config but the
   hardened flags, inside the sandbox.
+- `git_push {directory, branch, tag}` creates a lightweight tag instead, and moves no branch (`performTagPush`). The
+  operation carries `tag`, so the approval names it. The remote's `refs/heads/<branch>` must exist, and the clone must have
+  its tip and count no commits between it and the clone's commit (`clone-push-prepare` with that tip as the only tip), so
+  the commit is already on the branch. A tag already at another object is refused, one at the commit is up to date, and
+  the pack is empty. In the control plane, tag pushes check the owner's repository-level push permission (Azure DevOps:
+  CreateTag on the tag's token) instead of the branch's, skip the default-branch policy, take no pull request, and mint
+  with the `ref` claim `refs/tags/<tag>`. Through the proxy, tags are refused like any ref but the session branch.
 
 ### Not in phase 2
 

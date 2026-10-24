@@ -169,6 +169,8 @@ test("push requests are parsed up to their first flush, and only the session bra
 
   assert.equal(sessionBranchRefusal(parsed.commands, "pistead/s1"), undefined);
   assert.match(sessionBranchRefusal([{ old: zero, new: tip, ref: "refs/heads/main" }], "pistead/s1")!, /not main; use the git_push tool/);
+  assert.match(sessionBranchRefusal([{ old: zero, new: tip, ref: "refs/tags/v1.0.0" }], "pistead/s1")!, /^Tags can't be pushed without approval, not v1\.0\.0; use the git_push tool with a tag/);
+  assert.match(sessionBranchRefusal([...parsed.commands, { old: zero, new: tip, ref: "refs/tags/v1.0.0" }], "pistead/s1")!, /^Tags can't be pushed/);
   assert.match(sessionBranchRefusal([{ old: tip, new: zero, ref: "refs/heads/pistead/s1" }], "pistead/s1")!, /can't be deleted/);
   assert.match(sessionBranchRefusal([...parsed.commands, ...parsed.commands], "pistead/s1")!, /once per push/);
 
@@ -403,6 +405,37 @@ test("a clone's commit is pushed as it is, fast-forward only", { skip: !sandboxe
   const next = await sandbox.cloneHead("app", authorize);
   await assert.rejects(performClonePush({ workspace: sandbox, operation: { ...operation, commit: next.commit }, credential, authorize }),
     (error: Error) => error instanceof PushError && /fetch and merge or rebase/.test(error.message));
+
+  // A tag for a commit already on main: created at it, with no branch moved; up to date once there.
+  const mainTip = git(["rev-parse", "refs/heads/main"], bare);
+  const featureTip = git(["rev-parse", "refs/heads/feature"], bare);
+  await shell("cd app && git switch -q main");
+  const tagged = (await sandbox.cloneHead("app", authorize)).commit;
+  assert.equal(tagged, mainTip);
+  const tag = { kind: "git.push" as const, repository: "acme/app", directory: "app", branch: "main", tag: "cli-v1.0.0", commit: tagged };
+  const created = await performClonePush({ workspace: sandbox, operation: tag, credential, authorize });
+  assert.equal(created.outcome, "pushed");
+  assert.equal(git(["rev-parse", "refs/tags/cli-v1.0.0"], bare), mainTip);
+  assert.equal(git(["rev-parse", "refs/heads/main"], bare), mainTip);
+  assert.equal(git(["rev-parse", "refs/heads/feature"], bare), featureTip);
+  assert.match(pushSummary(created), /^Created tag cli-v1\.0\.0 at [0-9a-f]{12}, on main \(at [0-9a-f]{12}\)\.$/);
+  assert.equal((await performClonePush({ workspace: sandbox, operation: tag, credential, authorize })).outcome, "up-to-date");
+  // A commit main doesn't reach is refused, and so is moving a tag.
+  await assert.rejects(performClonePush({ workspace: sandbox, operation: { ...tag, tag: "cli-v1.0.1", commit: next.commit }, credential, authorize }),
+    (error: Error) => error instanceof PushError && /is not on main/.test(error.message));
+  await assert.rejects(performClonePush({ workspace: sandbox, operation: { ...tag, commit: next.commit }, credential, authorize }),
+    (error: Error) => error instanceof PushError && /already exists .*never moved/.test(error.message));
+  await assert.rejects(performClonePush({ workspace: sandbox, operation: { ...tag, branch: "missing", tag: "cli-v1.0.1" }, credential, authorize }),
+    (error: Error) => error instanceof PushError && /Remote branch missing does not exist/.test(error.message));
+  // main moved on upstream: the clone has to fetch its tip before tagging.
+  git(["switch", "-q", "main"], work);
+  await writeFile(join(work, "later.txt"), "later\n");
+  git(["add", "later.txt"], work);
+  git(["commit", "-q", "-m", "Later"], work);
+  git(["push", "-q", bare, "main"], work);
+  await assert.rejects(performClonePush({ workspace: sandbox, operation: { ...tag, tag: "cli-v1.0.1" }, credential, authorize }),
+    (error: Error) => error instanceof PushError && /fetch it first/.test(error.message));
+  assert.equal(spawnSync("git", ["rev-parse", "--verify", "--quiet", "refs/tags/cli-v1.0.1"], { cwd: bare }).status, 1);
   await assert.rejects(sandbox.cloneHead("missing", authorize));
   await assert.rejects(sandbox.cloneHead("../escape", authorize), /Invalid clone directory/);
 });

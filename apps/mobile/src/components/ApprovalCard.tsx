@@ -67,7 +67,8 @@ function GitPushSummary({ operation }: { operation: GitPushOperation }) {
   const pull = operation.pullRequest;
   return <View style={styles.details}>
     <Detail label="Repository">{operation.repository}</Detail>
-    <Detail label="Branch">{operation.branch}</Detail>
+    {operation.tag !== undefined && <Detail label="New tag">{operation.tag}</Detail>}
+    <Detail label={operation.tag !== undefined ? "On branch (not moved)" : "Branch"}>{operation.branch}</Detail>
     <Detail label="Commit">{operation.commit.slice(0, 12)}</Detail>
     {pull && <Detail label="Pull request">
       <Text selectable style={[styles.body, { color: palette.text }]}>{pull.title}{pull.base ? <> → <Text style={styles.code}>{pull.base}</Text></> : " → default branch"}</Text>

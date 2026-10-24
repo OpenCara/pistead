@@ -14,6 +14,8 @@ import { ownerGitAuthorization } from './targets.js';
 export interface MintTarget {
   workspaceId: string; sessionId: string;
   provider: GitProvider; host: string; fullName: string; repositoryId: string; branch: string;
+  /** A tag push: the token is for creating refs/tags/<tag>, not for moving `branch`. */
+  tag?: string;
   /** The session owner, and the host running the session with its owner; both null on the control plane's own runner. */
   ownerId: string; connectorId: string | null; hostOwnerId: string | null;
   /** The session owner's own account for the repository, already checked for push permission. */
@@ -319,7 +321,7 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
     case 'forgejo-integration': {
       const expiry = expiresAt(undefined, 600);
       const jwt = await issuerAssertion(env, { subject: workspaceSubject(target.workspaceId), audience: config.audience!, ttlSeconds: 600,
-        claims: { repository: target.fullName, ref: `refs/heads/${target.branch}`, session: target.sessionId } });
+        claims: { repository: target.fullName, ref: target.tag === undefined ? `refs/heads/${target.branch}` : `refs/tags/${target.tag}`, session: target.sessionId } });
       return { kind: row.kind, identityId: row.id, authorization: `Bearer ${jwt}`, expiresAt: expiry };
     }
     case 'owner-account': {

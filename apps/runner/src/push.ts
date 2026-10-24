@@ -23,6 +23,8 @@ export class PushError extends Error {
 export interface PushResult {
   outcome: "pushed" | "up-to-date";
   branch: string;
+  /** Tag pushes: the tag created at `tip`, a commit on `branch`. */
+  tag?: string;
   tip: string;
   base: string;
   previous: string | null;
@@ -51,13 +53,14 @@ export async function performClonePush(options: {
   const { workspace, operation, credential, authorize } = options;
   const directory = operation.directory;
   if (directory === undefined || !OID.test(operation.commit)) throw new PushError("Push target does not name a clone");
-  const ref = `refs/heads/${operation.branch}`;
   let remote: GitRemote;
   try {
     remote = new GitRemote({ url: credential.remote, authorization: credential.authorization, fetch: options.fetch, signal: options.signal });
   } catch (error) {
     throw new PushError(error instanceof GitRemoteError ? error.message : "Git remote is invalid");
   }
+  if (operation.tag !== undefined) return performTagPush({ ...options, remote, directory, tag: operation.tag });
+  const ref = `refs/heads/${operation.branch}`;
   let advertised: { refs: Map<string, string>; capabilities: Set<string> };
   let prepared: ClonePushPreparation;
   let previous = ZERO_OID;
@@ -96,8 +99,74 @@ export async function performClonePush(options: {
   return { outcome: "pushed", ...result };
 }
 
+/**
+ * Creates refs/tags/<tag> at the operation's commit, which the remote's branch must already reach, so no branch moves and
+ * the pack carries no objects. A tag is never moved: one at another object is refused, one at this commit is up to date.
+ */
+async function performTagPush(options: {
+  workspace: ClonePushWorkspace; operation: GitPushOperation; authorize: SandboxAuthorize; remote: GitRemote; directory: string; tag: string;
+}): Promise<PushResult> {
+  const { workspace, operation, authorize, remote, directory, tag } = options;
+  const ref = `refs/tags/${tag}`;
+  let advertised: { refs: Map<string, string>; capabilities: Set<string> };
+  let base: string;
+  let existing: string | undefined;
+  let prepared: ClonePushPreparation;
+  try {
+    advertised = await remote.receivePackAdvertisement();
+    const tip = advertised.refs.get(`refs/heads/${operation.branch}`);
+    if (!tip || tip === ZERO_OID || !OID.test(tip)) throw new PushError(`Remote branch ${operation.branch} does not exist; a tag is pushed only for a commit already on it`);
+    base = tip;
+    existing = advertised.refs.get(ref);
+    if (existing !== undefined && existing !== operation.commit) {
+      throw new PushError(`Tag ${tag} already exists at ${existing.slice(0, 12)}; tags are never moved or replaced`);
+    }
+    // Only the branch's tip as a tip: the commits the clone counts are then exactly those the branch doesn't reach.
+    try {
+      prepared = await workspace.clonePushPrepare(directory, { commit: operation.commit, old: null, tips: [base] }, authorize);
+    } catch (error) {
+      throw new PushError(`The clone could not be prepared for push${workspaceReason(error)}`);
+    }
+  } catch (error) {
+    if (error instanceof PushError) throw error;
+    if (error instanceof GitRemoteError) throw new PushError(error.message);
+    throw new PushError("Git remote request failed");
+  }
+  const result = { branch: operation.branch, tag, tip: operation.commit, base, previous: null, commits: [], total: 0 };
+  if (existing === operation.commit) return { outcome: "up-to-date", ...result };
+  if (!prepared.present.includes(base)) {
+    throw new PushError(`The clone doesn't have the tip of ${operation.branch} (${base.slice(0, 12)}); fetch it first`);
+  }
+  if (prepared.total !== 0) {
+    throw new PushError(`Commit ${operation.commit.slice(0, 12)} is not on ${operation.branch}; push or merge it there first, as a tag is pushed only for a commit already on its branch`);
+  }
+  let pack: AsyncIterable<Uint8Array>;
+  try {
+    // Everything the tag names is already on the remote: the pack is empty.
+    pack = await workspace.clonePushPack(directory, { commit: operation.commit, exclude: [base] }, authorize);
+  } catch (error) {
+    throw new PushError(`Push pack could not be created${workspaceReason(error)}`);
+  }
+  const report = await remote.push({ ref, old: ZERO_OID, new: operation.commit }, pack, advertised.capabilities);
+  if (report.status !== "ok") {
+    // The tag may have been created at this very commit since the advertisement (another push of the same release):
+    // that is the outcome asked for, so it is up to date rather than refused.
+    let now: string | undefined;
+    try { now = (await remote.receivePackAdvertisement()).refs.get(ref); } catch { /* report the rejection */ }
+    if (now === operation.commit) return { outcome: "up-to-date", ...result };
+    const reason = (report.reason ?? "").replace(/[^\x20-\x7e]/g, " ").trim().slice(0, 200);
+    throw new PushError(`Git remote rejected the tag${reason ? ` (${reason})` : ""}`);
+  }
+  return { outcome: "pushed", ...result };
+}
+
 /** Human- and agent-readable outcome; never includes credentials. */
 export function pushSummary(result: PushResult, pullRequest?: { url: string; number: number; created: boolean }): string {
+  if (result.tag !== undefined) {
+    return result.outcome === "up-to-date"
+      ? `Tag ${result.tag} already exists at ${result.tip}.`
+      : `Created tag ${result.tag} at ${result.tip.slice(0, 12)}, on ${result.branch} (at ${result.base.slice(0, 12)}).`;
+  }
   const lines = [result.outcome === "up-to-date"
     ? `Branch ${result.branch} is already up to date at ${result.tip}.`
     : `Pushed ${result.total ?? result.commits.length} commit${(result.total ?? result.commits.length) === 1 ? "" : "s"} to ${result.branch} (${result.previous ? `${result.previous.slice(0, 12)}..` : "new branch at "}${result.tip.slice(0, 12)})${result.base ? `, based on ${result.base.slice(0, 12)}` : ""}.`];

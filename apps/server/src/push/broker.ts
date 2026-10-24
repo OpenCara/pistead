@@ -164,11 +164,14 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
   const policy = await requireBinding(c, row.workspace_id, pin);
   const { provider, host } = pinProvider(pin);
   const access = await repositoryAccess(c.env, row.owner_id, provider, host, pin.fullName);
-  const target = await pushTarget(access, pin, operation.branch);
+  const target = await pushTarget(access, pin, operation.branch, operation.tag);
   if (!target.canPush) fail(403, 'push_permission_required', 'The session owner cannot push to this repository.');
-  if (policy.forbid_default_branch === 1 && operation.branch === target.defaultBranch) {
+  // A tag push moves no branch: it only creates a tag at a commit already on `branch`, which the runner checks against
+  // the remote before it pushes. The default-branch policy is about moving that branch.
+  if (operation.tag === undefined && policy.forbid_default_branch === 1 && operation.branch === target.defaultBranch) {
     fail(403, 'default_branch_push_forbidden', 'This workspace forbids pushes to the repository default branch.');
   }
+  if (operation.tag !== undefined && operation.pullRequest) fail(400, 'invalid_pull_request', 'A tag push opens no pull request.');
   if (operation.pullRequest && (operation.pullRequest.base ?? target.defaultBranch) === operation.branch) {
     fail(400, 'invalid_pull_request', 'The pull request base must differ from the pushed branch.');
   }
@@ -207,7 +210,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
   let minted: MintedToken;
   try {
     minted = await mintPushToken(c.env, { workspaceId: row.workspace_id, sessionId, provider, host, fullName: pin.fullName,
-      repositoryId: String(pin.repositoryId), branch: operation.branch,
+      repositoryId: String(pin.repositoryId), branch: operation.branch, ...(operation.tag === undefined ? {} : { tag: operation.tag }),
       ownerId: row.owner_id, connectorId: row.connector_id ?? null, hostOwnerId: row.connector_owner_id ?? null, owner: access });
   } catch (error) {
     await closeFailed();
@@ -219,6 +222,7 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
       .bind(minted.kind, minted.identityId, minted.expiresAt, revocation, credentialId).run();
     await auditStatement(c.env, actorId, 'git.push.credential_issued', row.workspace_id, sessionId, {
       approvalId, credentialId, requestedBy, actingAs: row.owner_id, automatic, kind: minted.kind, branch: operation.branch,
+      ...(operation.tag === undefined ? {} : { tag: operation.tag }),
     }).run();
     const latest = await authorize();
     if (latest.row.policy_version !== row.policy_version || latest.row.repositories_json !== row.repositories_json) {

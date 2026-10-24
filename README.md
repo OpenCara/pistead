@@ -272,7 +272,7 @@ The tools an agent can use:
 | `list_files`, `read_file` | List and read session files; images (PNG, JPEG, GIF, WebP) go to the model as images | Nothing |
 | `write_file`, `edit_file` | Write a whole file, or replace exact text in place | Permission in **Read only** messages |
 | `bash` | Run a shell command in the sandbox | Approval |
-| `git_push` | Push a clone's checked-out commit to a branch, optionally opening a pull request | Approval |
+| `git_push` | Push a clone's checked-out commit to a branch, optionally opening a pull request, or tag a commit already on a branch | Approval |
 | `github_read` | Read a GitHub issue or pull request | Nothing, during a shared message |
 | `github_comment` | Comment on a GitHub issue or pull request | Approval, always |
 | `github_merge` | Merge a GitHub pull request | Approval, always |
@@ -396,10 +396,11 @@ Everything Pistead shows people (transcripts, approvals and their output, in eve
 Agents commit with Git itself, as the session owner's Git identity, and push committed work to a branch:
 
 - The agent pushes the session's own branch `pistead/<session-id>` with plain `git push`, without approval: Pistead checks, as for `git_push`, that the session owner may push to the repository, and pushes with the workspace's push identity (its own Git credentials on the host can't serve here). For any other branch, `git_push {directory, branch}` pushes a clone's checked-out commit as it is to the workspace repository the clone's `origin` names; if the branch moved, the agent fetches and merges or rebases first. To open a pull request from the session branch, the agent calls `git_push` with that branch and a pull request.
-- The approval shows the repository, the clone's directory if any, the branch and the exact commit.
+- To tag a release, the agent checks out a commit that is already on a branch (main, say) and calls `git_push {directory, branch, tag}`. That creates the lightweight tag `refs/tags/<tag>` at the commit and moves no branch. Before pushing, Pistead confirms against the remote that the branch reaches the commit, and that the tag doesn't exist yet. Tags are never moved or replaced, a tag push opens no pull request, and the default-branch setting below doesn't apply because no branch moves. Plain `git push` of a tag is refused, like any ref other than the session branch.
+- The approval shows the repository, the clone's directory if any, the branch, the tag if any and the exact commit.
 - Pushes are fast-forward only and never forced; a branch that moved elsewhere is refused.
 - The agent can also ask for a pull request, which Pistead opens as the session owner with their connected account.
-- Before each push, Pistead checks with the session owner's own account that they may push to the repository and, where the Git host reports it, to that branch; GitHub protected branches are refused. Owners and admins can forbid pushes to a repository's default branch by clearing **Allow agent pushes to the default branch**.
+- Before each push, Pistead checks with the session owner's own account that they may push to the repository and, where the Git host reports it, to that branch; GitHub protected branches are refused. For a tag, it checks that they may push to the repository (on Azure DevOps, that they may create that tag); tag rules on the Git host (GitHub rulesets, GitLab and Gitea protected tags) apply to the push identity's push, and its bypass list too. Owners and admins can forbid pushes to a repository's default branch by clearing **Allow agent pushes to the default branch**.
 - The connector holds the push credential in memory only and talks to the Git host directly; the sandbox never sees it.
 
 #### Push access
