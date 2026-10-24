@@ -6,7 +6,7 @@ import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction"
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
-import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, type ChatSelection } from "./chat-options";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, rememberChat, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -361,6 +361,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST",
         body: { content: sent, requestId: pending.id, ...(options ? { options } : {}), ...(images.length ? { images } : {}) } });
       setReceipt(result);
+      // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
+      if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
       setContent(current => current === sent ? "" : current);
       attachments.sent(pasted);
