@@ -256,6 +256,22 @@ test('explicit pushes require an approving approver and a writing requester', as
   assert.equal(f.calls.length, 0);
 });
 
+test('allowing git_push for the session lets the owner\'s messages push automatically, and only theirs', async t => {
+  const f = await fixture(t, { tools: ['bash'] });
+  const op = f.operation();
+  const grant = (callId: string) => f.sqlite.prepare('INSERT INTO session_tool_grants (session_id,tool,call_id,approval_id,granted_by,created_at) VALUES (?,?,?,?,?,?)')
+    .run('session', 'git_push', callId, `permission-${callId || 'all'}`, owner, new Date().toISOString());
+  // A one-call grant lets that call ask for approval, but never pushes without it.
+  grant('grant-once');
+  assert.equal(await code(await f.post(credential, { sessionId: 'session', approvalId: 'tool-grant-once', actorId: owner, operation: op, admissionId: f.admit('approval') })), 'automatic_push_not_admitted');
+  grant('');
+  assert.equal((await f.post(credential, { sessionId: 'session', approvalId: 'tool-grant-1', actorId: approver, operation: op, admissionId: f.admit('approval', approver) })).status, 403,
+    'non-owners cannot push automatically');
+  const issued = await f.post(credential, { sessionId: 'session', approvalId: 'tool-grant-2', actorId: owner, operation: op, admissionId: f.admit('approval') });
+  assert.equal(issued.status, 200);
+  assert.equal(f.ledger()[0]!.automatic, 1);
+});
+
 test('automatic pushes require an unexpired auto-approve admission from the owner', async t => {
   const f = await fixture(t);
   const op = f.operation();

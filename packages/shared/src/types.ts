@@ -514,7 +514,10 @@ export interface SessionView {
   stoppable?: boolean;
   /** The shared conversation's current model and reasoning level. */
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
-  /** Access mode of the latest shared-conversation submission; absent means "approval". */
+  /**
+   * Access mode of the latest shared-conversation submission ("approval" when it named none). Absent before the first
+   * one; older runners also leave it out when the latest one asked before acting.
+   */
   access?: AccessMode;
   /** Repository preparation on a cache host; absent once the repositories are ready, and on every other host. */
   repositories?: RepositoryPreparationView;

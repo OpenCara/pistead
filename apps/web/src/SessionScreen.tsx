@@ -240,7 +240,8 @@ function SessionPane({ id }: { id: string }) {
                 {!approval.reviewHash && <Alert variant="warning" title="No verified review commitment" actions={<Button variant="outline" size="sm" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</Button>}>Refresh before deciding; the server must bind the displayed operation and requester.</Alert>}
                 {permission ? <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "call")}>Allow once</Button>
-                  <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "session")}>Allow for this session</Button>
+                  {/* Each host command asks again: it runs outside the sandbox. */}
+                  {!(approval.operation.kind === "permission" && approval.operation.tool === "host_bash") && <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "session")} title="Also runs this tool's commands and pushes without asking for the rest of the session; GitHub comments and merges still ask">Allow for this session</Button>}
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
                 </div> : <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve")}>Approve</Button>

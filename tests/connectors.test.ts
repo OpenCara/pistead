@@ -1154,7 +1154,8 @@ test('only the session owner answers a permission request, for one call or the s
   const command = pending('tool-call-1', { kind: 'bash', command: 'npm test' });
   const otherCommand = pending('tool-call-4', { kind: 'bash', command: 'npm test' });
   const commit = pending('tool-call-5', { kind: 'git.commit', message: 'Fix it' });
-  let approvals = [once, always, unlimited, unnamed, command, otherCommand, commit];
+  const hostCommand = pending('permission-call-6', { kind: 'permission', tool: 'host_bash', target: 'dotnet --info', needs: ['tool'] });
+  let approvals = [once, always, unlimited, unnamed, command, otherCommand, commit, hostCommand];
   const decisions: unknown[] = [];
   rpcHub(f, s.connector, envelope => {
     const action = envelope.request.ticket.action;
@@ -1188,6 +1189,8 @@ test('only the session owner answers a permission request, for one call or the s
   await denied(await decide(s.creator, once.id, { scope: 'forever' }), 400, 'invalid_decision');
   // The creator's session runs on the host's machine, and only the host's owner can lift the limits it lacks.
   await denied(await decide(s.creator, unlimited.id, {}), 403, 'host_owner_required');
+  // A host command runs outside the sandbox, so each one is allowed for its own call only.
+  await denied(await decide(s.creator, hostCommand.id, { scope: 'session' }), 400, 'invalid_decision');
   assert.deepEqual(decisions, []);
   const allowed = await json<{ approval: ApprovalRecord }>(await decide(s.creator, once.id, { scope: 'call' }));
   assert.equal(allowed.approval.status, 'approved');

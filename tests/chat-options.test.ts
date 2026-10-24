@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ConnectorInfo } from "../packages/shared/src/connector.js";
-import { accessUnavailable, chatOptionsBody, chatPreference, parseChatPreference, preferredSelection, type ChatSelection } from "../packages/client/src/chat-options.js";
+import type { SessionView } from "../packages/shared/src/types.js";
+import { accessUnavailable, chatOptionsBody, chatPreference, initialSelection, parseChatPreference, preferredSelection, type ChatSelection } from "../packages/client/src/chat-options.js";
 
 const host = { capabilities: { chatOptions: true }, models: [] } as unknown as ConnectorInfo;
 const auto: ChatSelection = { access: "auto" };
@@ -37,17 +38,17 @@ test("the last chatted model and reasoning start the next new chat where the hos
   assert.equal(chatPreference(remembering, { model: { provider: "p", modelId: "gone" }, access: "approval" }), undefined);
   assert.equal(chatPreference({ ...remembering, capabilities: {} } as unknown as ConnectorInfo, { model: fast, access: "approval" }), undefined);
 
-  // A new chat starts on it, with the default access rather than the remembered run's.
-  assert.deepEqual(preferredSelection(remembering, preference, fast), { model: { provider: "p", modelId: "deep" }, thinkingLevel: "high", access: "approval" });
+  // A new chat starts on it, on Auto-approve (the chat is its owner's) rather than the remembered run's access.
+  assert.deepEqual(preferredSelection(remembering, preference, fast), { model: { provider: "p", modelId: "deep" }, thinkingLevel: "high", access: "auto" });
   // Where the model isn't offered or usable, the fallback runs at the remembered level when it supports it...
   const elsewhere = { ...preference!, modelId: "gone" };
-  assert.deepEqual(preferredSelection(remembering, elsewhere, fast), { model: fast, thinkingLevel: "high", access: "approval" });
-  assert.deepEqual(preferredSelection(remembering, preference, fast, model => model.modelId !== "deep"), { model: fast, thinkingLevel: "high", access: "approval" });
+  assert.deepEqual(preferredSelection(remembering, elsewhere, fast), { model: fast, thinkingLevel: "high", access: "auto" });
+  assert.deepEqual(preferredSelection(remembering, preference, fast, model => model.modelId !== "deep"), { model: fast, thinkingLevel: "high", access: "auto" });
   // ...else at the level the host's Pi starts it at.
-  assert.deepEqual(preferredSelection(remembering, { ...preference!, thinkingLevel: "max" }, fast, () => false), { model: fast, thinkingLevel: "low", access: "approval" });
+  assert.deepEqual(preferredSelection(remembering, { ...preference!, thinkingLevel: "max" }, fast, () => false), { model: fast, thinkingLevel: "low", access: "auto" });
   // Nothing remembered: the fallback at its own level.
-  assert.deepEqual(preferredSelection(remembering, undefined, fast), { model: fast, thinkingLevel: "low", access: "approval" });
-  assert.deepEqual(preferredSelection(undefined, preference, fast), { access: "approval" });
+  assert.deepEqual(preferredSelection(remembering, undefined, fast), { model: fast, thinkingLevel: "low", access: "auto" });
+  assert.deepEqual(preferredSelection(undefined, preference, fast), { access: "auto" });
 
   // Stored junk is ignored, and an unknown level is dropped.
   assert.equal(parseChatPreference(null), undefined);
@@ -67,4 +68,15 @@ test("a message sent without picking a model remembers the conversation's curren
   assert.deepEqual(chatPreference(host, { thinkingLevel: "off", access: "approval" }, current), { connectorId: "host-a", provider: "p", modelId: "deep", thinkingLevel: "off" });
   // Without either, there is nothing to remember.
   assert.equal(chatPreference(host, { access: "approval" }), undefined);
+});
+
+test("the owner's chat box starts on Auto-approve before the first shared message, then keeps that message's access", () => {
+  const view = (access?: SessionView["access"], entries: SessionView["entries"] = []) => ({ entries, ...(access ? { access } : {}) }) as SessionView;
+  assert.equal(initialSelection(view(), true).access, "auto");
+  // An older runner leaves "approval" out of the view; a conversation with messages then keeps asking before acting.
+  assert.equal(initialSelection(view(undefined, [{ id: "1", kind: "message", role: "user", text: "Hi" }]), true).access, "approval");
+  assert.equal(initialSelection(view(), false).access, "approval");
+  assert.equal(initialSelection(view("approval"), true).access, "approval");
+  assert.equal(initialSelection(view("read"), true).access, "read");
+  assert.equal(initialSelection(view("auto"), false).access, "approval", "only the owner can auto-approve");
 });

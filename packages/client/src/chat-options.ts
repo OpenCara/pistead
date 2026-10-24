@@ -118,14 +118,20 @@ export function preferredSelection(
 ): ChatSelection {
   const remembered = preference && findModel(host, preference);
   const model = remembered && usable(remembered) ? remembered : findModel(host, fallback);
-  if (!model) return { access: "approval" };
+  // A new chat is its owner's, so it starts on Auto-approve.
+  if (!model) return { access: "auto" };
   const thinkingLevel = model.thinkingLevels?.length ? effectiveLevel(model, preference?.thinkingLevel) : model.thinkingLevel;
-  return { model: { provider: model.provider, modelId: model.modelId }, thinkingLevel, access: "approval" };
+  return { model: { provider: model.provider, modelId: model.modelId }, thinkingLevel, access: "auto" };
 }
 
-/** Starting selection for an existing session: its current model, reasoning and shared-run access. */
+/**
+ * Starting selection for an existing session: its current model, reasoning and shared-run access. Before its first
+ * message, the owner starts on Auto-approve and everyone else on "Ask before acting". Older runners leave the
+ * access out after a message that asked before acting too, so a conversation with messages but none says "approval".
+ */
 export function initialSelection(view: SessionView, owner: boolean): ChatSelection {
-  const access = view.access ?? "approval";
+  const fresh = !view.entries?.some(entry => entry.role === "user");
+  const access = view.access ?? (owner && fresh ? "auto" : "approval");
   return {
     model: view.agent && { provider: view.agent.provider, modelId: view.agent.modelId },
     thinkingLevel: view.agent?.thinkingLevel,

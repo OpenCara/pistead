@@ -438,6 +438,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       if (operation.needs.includes('unbounded-shell') && row.connector_owner_id !== row.owner_id) {
         fail(403, 'host_owner_required', 'Only the host\'s owner can allow a shell without resource limits.');
       }
+      // Each host command runs outside the sandbox, so its permission covers that one call only.
+      if (input.scope === 'session' && operation.tool === 'host_bash') fail(400, 'invalid_decision', 'Host commands can only be allowed once.');
     } else if (input.scope !== undefined) fail(400, 'invalid_decision', 'Only permission requests take a scope.');
     const scope = operation.kind === 'permission' ? (input.scope === 'session' ? 'session' : 'call') : undefined;
     let brokerCapability: string | undefined;

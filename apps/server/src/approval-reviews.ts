@@ -46,7 +46,8 @@ async function sessionTools(env: Env, row: SessionRow): Promise<(operation: Oper
     if (operation.kind === 'permission') return permissionCall(approvalId) !== undefined;
     const tool = operationTools[operation.kind];
     const call = approvalId.startsWith('tool-') ? approvalId.slice('tool-'.length) : undefined;
-    return agentTools.includes(tool) || grants.some(grant => grant.tool === tool && (grant.call_id === '' || grant.call_id === call))
+    // Host commands never take a session grant: each one is allowed for its own call.
+    return agentTools.includes(tool) || grants.some(grant => grant.tool === tool && ((grant.call_id === '' && tool !== 'host_bash') || grant.call_id === call))
       || (call !== undefined && ownerAuto(row, admission));
   };
 }
