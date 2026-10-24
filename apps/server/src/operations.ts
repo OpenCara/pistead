@@ -1,7 +1,7 @@
 import { validHostOperation } from '../../../packages/shared/src/host-operations.js';
 import type { GitHubMergeMethod, Operation, PermissionNeed, PullRequestRequest, ToolName } from '../../../packages/shared/src/types.js';
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, githubMergeMethods, permissionNeeds, toolNames } from '../../../packages/shared/src/types.js';
-import { validCloneDirectory, validPushBranch } from '../../../packages/shared/src/repositories.js';
+import { validCloneDirectory, validPushBranch, validPushTag } from '../../../packages/shared/src/repositories.js';
 import { fail, text } from './http.js';
 
 /** A pinned repository's worktree path, as produced by repositoryPath(): 2-64 safe segments. */
@@ -69,9 +69,11 @@ export function parseOperation(input: unknown): Operation {
       if (!validPushBranch(value.branch)) fail(400, 'invalid_operation', 'Invalid branch name.');
       if (typeof value.commit !== 'string' || !/^[0-9a-f]{40}$/.test(value.commit)) fail(400, 'invalid_operation', 'Expected a 40-character session commit.');
       if (value.directory !== undefined && !validCloneDirectory(value.directory)) fail(400, 'invalid_operation', 'Invalid clone directory.');
+      if (value.tag !== undefined && !validPushTag(value.tag)) fail(400, 'invalid_operation', 'Invalid tag name.');
+      if (value.tag !== undefined && value.pullRequest !== undefined) fail(400, 'invalid_operation', 'A tag push opens no pull request.');
       // Canonical key order: approval review and broker hashes are computed over JSON.stringify of this value.
       return { kind: value.kind, repository: value.repository, ...(value.directory === undefined ? {} : { directory: value.directory as string }),
-        branch: value.branch, commit: value.commit,
+        branch: value.branch, ...(value.tag === undefined ? {} : { tag: value.tag as string }), commit: value.commit,
         ...(value.pullRequest === undefined ? {} : { pullRequest: pullRequest(value.pullRequest) }) };
     }
     case 'permission': {

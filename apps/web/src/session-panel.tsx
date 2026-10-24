@@ -283,7 +283,9 @@ function GitPushSummary({ operation }: { operation: GitPushOperation }) {
   return <dl className="small">
     <dt className="muted">Repository</dt><dd><code>{operation.repository}</code></dd>
     {operation.directory && <><dt className="muted">Clone</dt><dd><code>{operation.directory}/</code></dd></>}
-    <dt className="muted">Branch</dt><dd><code>{operation.branch}</code></dd>
+    {operation.tag !== undefined
+      ? <><dt className="muted">New tag</dt><dd><code>{operation.tag}</code></dd><dt className="muted">On branch</dt><dd><code>{operation.branch}</code> (not moved)</dd></>
+      : <><dt className="muted">Branch</dt><dd><code>{operation.branch}</code></dd></>}
     <dt className="muted">Commit</dt><dd><code title={operation.commit}>{operation.commit.slice(0, 12)}</code></dd>
     {operation.pullRequest && <><dt className="muted">Pull request</dt><dd>{operation.pullRequest.title}{operation.pullRequest.base ? <> → <code>{operation.pullRequest.base}</code></> : " → default branch"}</dd></>}
   </dl>;

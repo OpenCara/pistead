@@ -156,7 +156,10 @@ export interface PullRequestRequest {
 /**
  * Pushes the session commits of one pinned repository, up to `commit`, to `branch` on its Git provider.
  * `repository` is the pin's worktree path; `commit` is the exact session commit that was approved.
- * Key order is canonical: kind, repository, branch, commit, pullRequest (title, body, base).
+ * With `tag`, no branch moves: the push creates the lightweight tag refs/tags/<tag> at `commit`, which must already be on
+ * the remote's `branch` (a release tag on main, say). A tag is only ever created, never moved or deleted, and takes no
+ * pull request.
+ * Key order is canonical: kind, repository, directory, branch, tag, commit, pullRequest (title, body, base).
  */
 export interface GitPushOperation {
   kind: "git.push";
@@ -165,6 +168,8 @@ export interface GitPushOperation {
   /** Clone sessions only: the clone's directory in the worktree, whose commit is pushed as it is. */
   directory?: string;
   branch: string;
+  /** Tag pushes only: the tag to create at `commit`, a commit already on `branch`. */
+  tag?: string;
   commit: string;
   pullRequest?: PullRequestRequest;
 }
@@ -395,7 +400,7 @@ export interface PushCompleteRequest {
   approvalId: string;
   credentialId: string;
   outcome: PushOutcome;
-  /** The commit now at refs/heads/<branch>; required unless the outcome is "failed". */
+  /** The commit now at refs/heads/<branch> (refs/tags/<tag> for a tag push); required unless the outcome is "failed". */
   tip?: string;
 }
 /**
