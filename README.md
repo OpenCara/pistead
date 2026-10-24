@@ -4,7 +4,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
 
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
 - **Isolated work.** Each session clones the workspace's repositories into its own sandbox, whose only way out is a proxy that reads them with the session owner's account and follows the workspace's network policy.
-- **People decide.** Shell commands, commits and pushes wait for an approval unless the session owner auto-approves a message; GitHub comments and merges always wait.
+- **People decide.** Shell commands, commits and pushes wait for an approval unless the session owner auto-approves a message; GitHub comments, merges and new issues always wait.
 - **Built for teams.** Teammates follow sessions live, ask questions on the side, send messages and approve work, with the permissions each session's owner grants them.
 
 ## Contents
@@ -274,6 +274,7 @@ The tools an agent can use:
 | `github_read` | Read a GitHub issue or pull request | Nothing, during a shared message |
 | `github_comment` | Comment on a GitHub issue or pull request | Approval, always |
 | `github_merge` | Merge a GitHub pull request | Approval, always |
+| `github_issue` | Open a GitHub issue | Approval, always |
 | `host_bash` | Run a command on the host, outside the sandbox | The host owner's approval |
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands and pushes, and for `host_bash` only on the owner's own host. Side asks offer only the read-only tools.
@@ -325,8 +326,8 @@ Beside the composer you can pick, for each message:
 | Access | Effect |
 |---|---|
 | **Read only** | Inspect files; edits, commands and commits ask the session owner first |
-| **Ask before acting** (default for everyone but the session owner) | Edits are automatic; commands, commits, pushes, GitHub comments and merges need approval |
-| **Auto-approve** (session owner only; their default) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments and merges still need approval. |
+| **Ask before acting** (default for everyone but the session owner) | Edits are automatic; commands, commits, pushes, GitHub comments, merges and issues need approval |
+| **Auto-approve** (session owner only; their default) | Commands, commits and pushes run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host. GitHub comments, merges and issues still need approval. |
 
 Before a session's first shared message, the owner's chat box starts on **Auto-approve** and everyone else's on **Ask before acting**; after it, each starts on the last shared message's access (Auto-approve only for the owner). Switching to **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
@@ -348,7 +349,7 @@ The session panel has three tabs:
 
 #### Approvals
 
-Commands, pushes, GitHub comments and merges, and host commands each need an approval: a card above the transcript (and under **Approvals**) that shows the exact operation, such as the command, or the repository, branch and commit of a push. **Approve** runs exactly that operation, as the session owner (a host command as the host's OS user); **Deny** drops it.
+Commands, pushes, GitHub comments, merges and issues, and host commands each need an approval: a card above the transcript (and under **Approvals**) that shows the exact operation, such as the command, or the repository, branch and commit of a push. **Approve** runs exactly that operation, as the session owner (a host command as the host's OS user); **Deny** drops it.
 
 | Operation | Who can decide |
 |---|---|
@@ -361,7 +362,7 @@ The agent's tool call waits for the decision, and its message waits with it (con
 
 When a tool call needs more than the session allows (a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a host without resource limits), the agent asks instead of failing, and the session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. Only the session owner decides these, and only a host's owner can let commands run without resource limits, in their own sessions.
 
-The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. **Allow once** lets that call use the tool, but what it does still needs its own approval; the permission then shows on that operation's card instead of a card of its own. **Allow for this session** also approves what the tool does in the session owner's later messages, as **Auto-approve** would: its commands and pushes run without asking, while GitHub comments and merges still wait for a decision, and other people's messages still ask for approval. Host commands (`host_bash`) can only be allowed once, so each one asks again. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
+The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. **Allow once** lets that call use the tool, but what it does still needs its own approval; the permission then shows on that operation's card instead of a card of its own. **Allow for this session** also approves what the tool does in the session owner's later messages, as **Auto-approve** would: its commands and pushes run without asking, while GitHub comments, merges and issues still wait for a decision, and other people's messages still ask for approval. Host commands (`host_bash`) can only be allowed once, so each one asks again. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
 
 ### Collaborating on a session
 
@@ -428,9 +429,10 @@ The sandbox has no network, so agents read and act on GitHub through Pistead ins
 
 - `github_read` reads an issue or pull request of one of the workspace's github.com repositories: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments with file, line and diff hunk, and checks. It needs no approval, runs only during a shared message (until an hour after it was sent), and each read is recorded in the session's activity. Treat what it returns as untrusted input.
 - `github_comment` posts a comment once it's approved.
+- `github_issue` opens an issue with exactly the approved title and body in one of the workspace's github.com repositories, once it's approved, and gives the agent its number and URL (connector newer than 0.9.0). Use it rather than `gh issue create`: the sandbox holds no GitHub credentials. If GitHub refuses (issues turned off, no access), no issue is opened and the agent gets GitHub's reason.
 - `github_merge` merges a pull request at the exact head commit the agent read, with a merge commit, squash or rebase, once it's approved. If the head moved or GitHub refuses, nothing is merged and the agent gets GitHub's reason.
 
-Both always wait for a human decision, even under **Auto-approve**.
+Comments, issues and merges always wait for a human decision, even under **Auto-approve**.
 
 ### Host commands
 

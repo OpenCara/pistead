@@ -146,6 +146,7 @@ function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
   if (tool === 'host_bash') return capabilities.hostCommands === true;
   if (tool === 'git_push') return capabilities.gitPush === true;
   if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
+  if (tool === 'github_issue') return capabilities.githubIssues === true;
   return true;
 }
 

@@ -282,6 +282,33 @@ function mergeFetch(t: TestContext, merge: () => Response) {
   return calls;
 }
 
+async function issuePayload(f: Fixture, session: SessionRecord, repository = 'owner/repo') {
+  // Canonical key order, as parseOperation returns it.
+  const operation = { kind: 'github.issue' as const, repository, title: 'Sandbox has no CA certificates', body: 'Exactly approved **text**' };
+  return { ...await approvedOperation(f, session, operation, session.ownerId, session.ownerId),
+    repository, title: operation.title, body: operation.body };
+}
+
+/** An issue as the session owner: the repository's identity check, then the issue POST, answered by `open`. Records each call. */
+function issueFetch(t: TestContext, open: () => Response) {
+  const calls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    assert.equal(init?.redirect, 'manual');
+    assert.equal(new Headers(init?.headers).get('authorization'), `Bearer ${githubToken}`);
+    if (url === 'https://api.github.com/repos/owner/repo') {
+      assert.equal(init?.method ?? 'GET', 'GET');
+      return Response.json({ id: 7, full_name: 'owner/repo', default_branch: 'main', private: true });
+    }
+    assert.equal(url, 'https://api.github.com/repos/owner/repo/issues');
+    assert.equal(init?.method, 'POST');
+    assert.deepEqual(JSON.parse(String(init?.body)), { title: 'Sandbox has no CA certificates', body: 'Exactly approved **text**' });
+    return open();
+  });
+  return calls;
+}
+
 /** A run admission of `actorId` in the session, as a write (or ask) message mints it. */
 function admit(f: Fixture, sessionId: string, actorId: string, options: { expiresAt?: number; mode?: 'write' | 'ask' } = {}) {
   const id = token();
@@ -465,11 +492,11 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
   await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
-  for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/github/read', '/api/internal/github/merge',
+  for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/github/read', '/api/internal/github/merge', '/api/internal/github/issue',
     '/api/internal/restores/unknown/download']) {
     await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
   }
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
     await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
     await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
     await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
@@ -480,7 +507,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const oldConnection = connector.connectionToken;
   connector.connectionToken = token();
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
     await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
   }
   await json(await self(f, connector, 'manifest', manifest));
@@ -1500,6 +1527,58 @@ test('github merges need a pinned repository, consume their capability once, and
   assert.ok(!JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all()).includes(githubToken));
 });
 
+test('github issues need a workspace repository, consume their capability once, and tell GitHub refusals apart from unknown outcomes', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_issue']);
+  let answer = () => Response.json({ number: 63, html_url: 'https://github.com/owner/repo/issues/63', title: 'Sandbox has no CA certificates' }, { status: 201 });
+  const calls = issueFetch(t, () => answer());
+  const consumed = async (capability: string) =>
+    f.sqlite.prepare('SELECT consumed_at FROM broker_capabilities WHERE token_hash = ?').get(await sha256(capability))!.consumed_at;
+  const audits = (action: string) => Number(f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE action = ?').get(action)!.n);
+
+  // An approved issue in a repository outside the workspace stops before GitHub and keeps its capability.
+  const outside = await issuePayload(f, s.session, 'owner/other');
+  await denied(await self(f, s.connector, 'github/issue', outside), 403, 'repository_not_pinned');
+  assert.deepEqual(calls, []);
+  assert.equal(await consumed(outside.capability), null);
+  // A title or body other than the approved one is a different operation.
+  const altered = await issuePayload(f, s.session);
+  await denied(await self(f, s.connector, 'github/issue', { ...altered, body: 'Something else' }), 403, 'invalid_capability');
+  await denied(await self(f, s.connector, 'github/issue', { ...altered, title: 'Two\nlines' }), 400, 'invalid_operation');
+  await denied(await self(f, s.connector, 'github/issue', { ...altered, labels: ['bug'] }), 400, 'invalid_input');
+  assert.deepEqual(calls, []);
+
+  const payload = await issuePayload(f, s.session);
+  assert.deepEqual(await json(await self(f, s.connector, 'github/issue', payload)), { number: 63, url: 'https://github.com/owner/repo/issues/63' });
+  assert.deepEqual(calls, ['GET https://api.github.com/repos/owner/repo', 'POST https://api.github.com/repos/owner/repo/issues']);
+  assert.ok(await consumed(payload.capability));
+  assert.equal(audits('github.issue.attempted'), 1);
+  assert.equal(audits('github.issue.completed'), 1);
+  await denied(await self(f, s.connector, 'github/issue', payload), 409, 'capability_consumed');
+  assert.equal(calls.length, 2);
+
+  // GitHub's refusal is definite and carries its reason; the capability stays consumed.
+  answer = () => Response.json({ message: 'Issues are disabled for this repo' }, { status: 410 });
+  const refused = await issuePayload(f, s.session);
+  const refusal = await json<{ code: string; error: string }>(await self(f, s.connector, 'github/issue', refused), 422);
+  assert.equal(refusal.code, 'github_issue_refused');
+  assert.ok(refusal.error.includes('Issues are disabled for this repo'), refusal.error);
+  assert.ok(refusal.error.includes('owner/repo'), refusal.error);
+  assert.ok(await consumed(refused.capability));
+  assert.equal(audits('github.issue.failed'), 1);
+  assert.equal(calls.length, 4);
+
+  // A server error, or a created issue without a number, leaves the outcome unknown, never a refusal.
+  for (const unclear of [() => Response.json({ message: 'Server Error' }, { status: 502 }), () => Response.json({}, { status: 201 })]) {
+    answer = unclear;
+    const unknown = await issuePayload(f, s.session);
+    await denied(await self(f, s.connector, 'github/issue', unknown), 502, 'github_outcome_unknown');
+    assert.ok(await consumed(unknown.capability));
+  }
+  assert.equal(audits('github.issue.ambiguous'), 2);
+  assert.equal(calls.length, 8);
+  assert.ok(!JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all()).includes(githubToken));
+});
+
 test('github reads need the requester\'s live write admission, the github_read tool or the owner\'s grant, and a pinned repository before any GitHub call', async t => {
   const f = await fixture(t); const s = await sharedSession(f, ['identity']);
   const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('GitHub must not be called'); });
@@ -1842,7 +1921,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // There is no agent catalog: agents can't be listed, revised or published.
@@ -1854,13 +1933,21 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
 
-  // A host that also carries GitHub reads and merges gets every tool.
+  // A host that also carries GitHub reads and merges offers those; opening issues needs its own capability, which
+  // connectors from before github_issue don't advertise.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue'));
+
+  // A current host gets every tool.
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, hostCommands: true } }));
+  const { session: fourth } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
+  assert.notEqual(fourth.agentVersionId, third.agentVersionId);
   assert.deepEqual(startedAgent().tools, offered);
+  assert.ok(offered.includes('github_issue'));
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {

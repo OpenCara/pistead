@@ -163,6 +163,8 @@ test('views and approvals keep their shape, review hash and structural fields; o
   assert.deepEqual(redactApproval(merge), merge);
   assert.deepEqual(redactOperation({ kind: 'git.commit', message: `Add ${github}` }), { kind: 'git.commit', message: 'Add ghp_[redacted]' });
   assert.deepEqual(redactOperation({ kind: 'github.comment', repository: 'o/r', issue: 1, body: 'TOKEN=abc123' }), { kind: 'github.comment', repository: 'o/r', issue: 1, body: 'TOKEN=[redacted]' });
+  assert.deepEqual(redactOperation({ kind: 'github.issue', repository: 'o/r', title: `Leaked ${github}`, body: 'TOKEN=abc123' }),
+    { kind: 'github.issue', repository: 'o/r', title: 'Leaked ghp_[redacted]', body: 'TOKEN=[redacted]' });
   // Commands and permission targets are redacted word by word only.
   assert.deepEqual(redactOperation({ kind: 'bash', command: pem('', keyBody) }), { kind: 'bash', command: pem('', keyBody) });
   assert.deepEqual(redactOperation({ kind: 'permission', tool: 'bash', target: `GH_TOKEN=${github} gh pr list`, needs: ['tool'] }),

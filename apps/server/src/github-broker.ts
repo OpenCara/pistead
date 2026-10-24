@@ -1,6 +1,6 @@
 import type { GitHubSessionRepository } from '../../../packages/shared/src/repositories.js';
 import type {
-  GitHubCommentView, GitHubIssueView, GitHubMergeResult, GitHubPullRequestView, GitHubReviewCommentView, GitHubReviewView, Operation,
+  GitHubCommentView, GitHubIssueResult, GitHubIssueView, GitHubMergeResult, GitHubPullRequestView, GitHubReviewCommentView, GitHubReviewView, Operation,
 } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
@@ -16,7 +16,8 @@ import { requireBinding, requireNoRestore } from './push/broker.js';
 
 /*
  * Agents reach GitHub only through these brokers, as the session owner: the owner's token stays in the control plane's
- * vault, and the sandbox stays offline. Comments and merges need a human approval each; reads need a live write message.
+ * vault, and the sandbox stays offline. Comments, merges and new issues need a human approval each; reads need a live
+ * write message.
  */
 
 const githubApi = 'https://api.github.com';
@@ -71,7 +72,7 @@ type ApprovalInput = { sessionId: string; actorId: string; approvalId: string; c
  * authority checks are repeated after consuming, since the audit write is an await boundary too.
  */
 async function approvedEffect<T>(c: AppContext, connectorId: string | null, approval: ApprovalInput, operation: Operation,
-  action: 'github.comment' | 'github.merge', prepare: (row: SessionRow, github: GitHubAccess) => Promise<T>): Promise<{ row: SessionRow; github: GitHubAccess; prepared: T }> {
+  action: 'github.comment' | 'github.merge' | 'github.issue', prepare: (row: SessionRow, github: GitHubAccess) => Promise<T>): Promise<{ row: SessionRow; github: GitHubAccess; prepared: T }> {
   const { sessionId, actorId, approvalId } = approval;
   const tokenHash = await sha256(approval.capability);
   const stored = await c.env.DB.query<{
@@ -224,6 +225,57 @@ export async function githubMerge(c: AppContext, connectorId: string | null): Pr
   // GitHub's own reason, as one bounded line: it names what blocks the merge, never a credential.
   const reason = typeof result?.message === 'string' ? result.message.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 300).replace(/\.+$/, '') : '';
   return fail(422, 'github_merge_refused', `GitHub did not merge ${pin.fullName}#${operation.pull}: ${reason || `HTTP ${response.status}`}.`);
+}
+
+/**
+ * Opens one human-approved issue, with exactly the approved title and body, in a github.com repository of the session's
+ * workspace. GitHub's refusal (issues turned off, no access, a rate limit, an invalid title) is definite: no issue was
+ * opened, so it comes back as 422 with GitHub's reason; anything else is ambiguous.
+ */
+export async function githubIssue(c: AppContext, connectorId: string | null): Promise<Response> {
+  // Room for a body at its character limit in any script, and JSON's escapes.
+  const input = await jsonObject(c, 512 * 1024);
+  if (Object.keys(input).some(key => !['sessionId', 'actorId', 'approvalId', 'capability', 'repository', 'title', 'body'].includes(key))) {
+    fail(400, 'invalid_input', 'Unexpected GitHub issue field.');
+  }
+  const approval: ApprovalInput = { sessionId: identifier(input.sessionId, 'sessionId'), actorId: userIdentifier(input.actorId, 'actorId'),
+    approvalId: identifier(input.approvalId, 'approvalId'), capability: text(input.capability, 'capability', 128) };
+  const operation = parseOperation({ kind: 'github.issue', repository: input.repository, title: input.title, body: input.body });
+  if (operation.kind !== 'github.issue') fail(400, 'invalid_operation', 'Only GitHub issues are supported.');
+  const { sessionId, actorId, approvalId } = approval;
+  const { row, github, prepared: pin } = await approvedEffect(c, connectorId, approval, operation, 'github.issue', async (session, access) => {
+    const pinned = await pinnedGitHubRepository(c, session, operation.repository);
+    await verifyPin(c.env, access, pinned);
+    return pinned;
+  });
+  const detail = { approvalId, repository: pin.fullName };
+  const ambiguous = async (): Promise<never> => {
+    await auditStatement(c.env, actorId, 'github.issue.ambiguous', row.workspace_id, sessionId, detail).run();
+    return fail(502, 'github_outcome_unknown', `GitHub could not confirm the outcome. The capability remains consumed; look for the issue in ${pin.fullName} before requesting another.`);
+  };
+  let response: Response;
+  try {
+    response = await fetch(`${githubApi}/repos/${pin.fullName}/issues`, { method: 'POST', redirect: 'manual',
+      signal: AbortSignal.timeout(remoteTimeout), headers: { ...githubHeaders(github.token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: operation.title, body: operation.body }) });
+  } catch { return ambiguous(); }
+  let result: Record<string, unknown> | null = null;
+  try {
+    const value = await boundedJson(response, 1024 * 1024);
+    if (value && typeof value === 'object' && !Array.isArray(value)) result = value as Record<string, unknown>;
+  } catch { /* An unreadable answer leaves only its status. */ }
+  if (response.status === 201) {
+    const number = result?.number;
+    if (!Number.isSafeInteger(number) || (number as number) < 1) return ambiguous();
+    await auditStatement(c.env, actorId, 'github.issue.completed', row.workspace_id, sessionId, { ...detail, issue: number, actingAs: github.userId }).run();
+    // Never return the upstream body, headers, vault ciphertext, or plaintext credentials.
+    return c.json({ number: number as number, url: `https://github.com/${pin.fullName}/issues/${number}` } satisfies GitHubIssueResult);
+  }
+  if (response.status < 400 || response.status >= 500) return ambiguous();
+  await auditStatement(c.env, actorId, 'github.issue.failed', row.workspace_id, sessionId, { ...detail, status: response.status }).run();
+  // GitHub's own reason, as one bounded line: it names what blocks the issue, never a credential.
+  const reason = typeof result?.message === 'string' ? result.message.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 300).replace(/\.+$/, '') : '';
+  return fail(422, 'github_issue_refused', `GitHub did not open an issue in ${pin.fullName}: ${reason || `HTTP ${response.status}`}.`);
 }
 
 /** One GitHub API read as the session owner: its JSON, and the last page its Link header names. */
