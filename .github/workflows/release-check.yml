@@ -5,7 +5,8 @@ name: Release check
 #   desktop-v1.2.3  release-desktop.yml  desktop app on a GitHub release (macOS today)
 #   ios-v1.2.3      release-ios.yml      iOS app on TestFlight
 # A suffix such as -beta.1 makes a prerelease. This checks the tag is on main, reads the version from it and finds the
-# line's previous tag, from which release notes start.
+# line's previous tag, from which release notes start; a line's first release starts from the latest plain v1.2.3 tag,
+# which released npm and the image together before the lines were split.
 on:
   workflow_call:
     inputs:
@@ -19,7 +20,7 @@ on:
       prerelease:
         value: ${{ jobs.check.outputs.prerelease }}
       previous-tag:
-        description: The line's previous version's tag reachable from this one (a release's skips prereleases), or empty for its first release.
+        description: The line's previous version's tag reachable from this one (a release's skips prereleases); for the line's first release, the latest plain v tag reachable; empty when there is neither.
         value: ${{ jobs.check.outputs.previous-tag }}
 permissions:
   contents: read
@@ -69,5 +70,12 @@ jobs:
           fi
           tag=$(printf '%s\n' "$tags" | grep -x -F -B1 -e "$GITHUB_REF_NAME" | head -n1)
           [ "$tag" = "$GITHUB_REF_NAME" ] && tag=""
+          # A line's first release follows on from the plain v1.2.3 tags that released npm and the image together
+          # before the lines were split: the latest of those reachable (only releases, for a release).
+          if [ -z "$tag" ]; then
+            legacy=$(git -c versionsort.suffix=- tag --merged "$GITHUB_SHA" --list 'v[0-9]*' --sort=v:refname)
+            [ "$PRERELEASE" = true ] || legacy=$(printf '%s\n' "$legacy" | grep -v -e '-' || true)
+            tag=$(printf '%s\n' "$legacy" | tail -n1)
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Previous ${PREFIX}v tag: ${tag:-none}"
+          echo "Release notes start from: ${tag:-the beginning (no earlier ${PREFIX}v or v tag)}"
