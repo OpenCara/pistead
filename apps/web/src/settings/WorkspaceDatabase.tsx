@@ -11,6 +11,21 @@ interface WorkspaceDatabaseResponse {
   /** The server has backup storage of its own (STORAGE_URL) for workspaces without a database. */
   backupStorage: boolean;
   database: WorkspaceDatabase | null;
+  /** With a database: the owner's schedule (minutes, null for never), and whether you confirmed this database. */
+  automaticBackups: { minutes: number | null; consented: boolean } | null;
+}
+
+/** The schedules the server accepts for automatic backups, in minutes. */
+const automaticIntervals: { minutes: number | null; label: string }[] = [
+  { minutes: null, label: "Off" },
+  { minutes: 15, label: "Every 15 minutes" },
+  { minutes: 60, label: "Every hour" },
+  { minutes: 360, label: "Every 6 hours" },
+  { minutes: 1440, label: "Every day" },
+];
+
+function intervalLabel(minutes: number | null): string {
+  return automaticIntervals.find(interval => interval.minutes === minutes)?.label ?? `Every ${minutes} minutes`;
 }
 
 /** Where backups go without a workspace database, as the end of a sentence. */
@@ -96,6 +111,7 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
   return <Section title="Session database" info={<div className="stack">
     <p>The workspace owner can connect a Postgres database of their own. Backups of this workspace's sessions are then saved there, with each session's details, instead of in the server's own backup storage (if it has any), and downloads and restores read them back from it.</p>
     <p>Whoever can read that database can read the sessions saved there, private ones and their owners' personal environment values included. Other members confirm the database before each of their backups goes there, and again after it is pointed at another database.</p>
+    <p>The owner can also have changed sessions backed up there on their own, once they're idle, on a schedule. Members' sessions take part once their owner confirms the database for all their backups, which also stops it asking before each one; pointing the connection at another database asks again.</p>
     <p>The owner can also import a session or workspace export into it, adding session details and activity. Pistead creates the tables <code>pistead_workspaces</code>, <code>pistead_sessions</code>, <code>pistead_session_backups</code> and <code>pistead_audit</code> when they are missing. The password is write-only: it is never shown again after saving.</p>
   </div>} action={owner && data?.available && !database && <Button variant="outline" size="sm" icon="plus" onClick={() => setEditing(true)}>Connect database</Button>}>
     <ResourceState {...resource} retry={resource.refresh}>
@@ -105,6 +121,8 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
           {owner && <DropdownMenu label="Actions for the session database" items={items} />}
         </>} />
         : <CardBody><span className="muted">{empty}</span></CardBody>}
+      {database && data?.available && data.automaticBackups && <AutomaticBackups path={path} database={database} owner={owner}
+        state={data.automaticBackups} saved={resource.refresh} />}
       {database && data && !data.available && <CardBody><Alert variant="warning" title="Workspace databases are turned off">
         This server no longer connects to workspace databases, so backups of this workspace's sessions can't be created, downloaded or restored. {!data.backupStorage ? "The server's operator can turn them on again with WORKSPACE_DATABASES=true."
           : owner ? "Disconnect the database to use the server's backup storage again, or ask the server's operator to turn workspace databases on again."
@@ -115,6 +133,51 @@ export function WorkspaceDatabaseSection({ workspace, owner }: { workspace: Work
     {owner && editing && data?.available && <DatabaseSheet path={path} privateHosts={data.privateHosts} existing={database} close={() => setEditing(false)} saved={resource.refresh} />}
     {owner && importing && data?.available && database && <ImportSheet path={path} database={database} close={() => setImporting(false)} />}
   </Section>;
+}
+
+/**
+ * The owner's schedule for automatic backups into the database, and each other member's standing confirmation of it,
+ * without which their sessions aren't backed up automatically.
+ */
+function AutomaticBackups({ path, database, owner, state, saved }: { path: string; database: WorkspaceDatabase; owner: boolean;
+  state: { minutes: number | null; consented: boolean }; saved: () => void }) {
+  const action = useAction();
+  function schedule(value: string) {
+    const minutes = value === "" ? null : Number(value);
+    void action.run(async () => {
+      await api(`${path}/automatic-backups`, { method: "PUT", body: { minutes } });
+      saved();
+    }, minutes === null ? "Automatic backups turned off." : `Changed sessions are now backed up ${intervalLabel(minutes).toLowerCase()} at most.`);
+  }
+  async function consent(next: boolean) {
+    if (next) {
+      const confirmed = await confirmDialog({
+        title: "Confirm this database",
+        message: `Back up your sessions in ${databaseLabel(database)} without asking each time, automatic backups included? Whoever can read it can read them, including your personal environment values. Pistead asks again if the owner points the connection at another database.`,
+        confirmLabel: "Confirm database",
+      });
+      if (!confirmed) return;
+    }
+    void action.run(async () => {
+      await api(`${path}/consent`, next ? { method: "PUT", body: { databaseId: database.id } } : { method: "DELETE" });
+      saved();
+    }, next ? "Database confirmed for your sessions' backups." : "Confirmation withdrawn. Backups of your sessions ask first again, and aren't taken automatically.");
+  }
+  return <>
+    <Row title="Automatic backups" hint={owner
+      ? "Backs up sessions that changed since their last automatic backup, once they're idle. Members' sessions only once they confirm this database"
+      : state.minutes === null ? "Off. The workspace owner chooses the schedule" : `${intervalLabel(state.minutes)}, for sessions that changed, once they're idle`}
+      trailing={owner && <select className="select" aria-label="Automatic backup schedule" value={state.minutes ?? ""} disabled={action.busy}
+        onChange={event => schedule(event.target.value)}>
+        {automaticIntervals.map(interval => <option key={interval.label} value={interval.minutes ?? ""}>{interval.label}</option>)}
+      </select>} />
+    {!owner && <Row title="Your sessions" hint={state.consented
+      ? "You confirmed this database: your backups go there without asking, automatic ones included"
+      : "You confirm this database before each backup, and your sessions aren't backed up automatically"}
+      trailing={<Button variant="outline" size="sm" disabled={action.busy} onClick={() => void consent(!state.consented)}>
+        {state.consented ? "Withdraw" : "Confirm database"}</Button>} />}
+    {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+  </>;
 }
 
 /** Imports an export of this workspace, or of one of its sessions, into the connected database. */

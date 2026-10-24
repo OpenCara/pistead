@@ -12,6 +12,7 @@ import type { Database } from './db/types.js';
 import { app } from './index.js';
 import { createStaticHandler } from './static.js';
 import { settlePushCredentials } from './push/broker.js';
+import { runAutomaticBackups } from './automatic-backups.js';
 import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
 import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
 import { WorkspaceDatabaseError } from './workspace-databases/types.js';
@@ -193,6 +194,17 @@ await migrateWhenReachable(env.DB);
 // Push credentials no completion settled: pushes their host never reported, and owner-token resets to retry.
 const settling = setInterval(() => { void settlePushCredentials(env).catch(() => {}); }, 5 * 60_000);
 settling.unref();
+
+// Automatic backups into workspace databases (automatic-backups.ts); one sweep at a time.
+let sweeping = false;
+const backingUp = setInterval(() => {
+  if (sweeping || !env.WORKSPACE_DATABASES) return;
+  sweeping = true;
+  void runAutomaticBackups(env)
+    .catch(error => { console.error('pistead: automatic backups failed:', error instanceof Error ? error.message : error); })
+    .finally(() => { sweeping = false; });
+}, 60_000);
+backingUp.unref();
 
 const serveStatic = createStaticHandler(staticDir);
 app.notFound(async c => {

@@ -8,6 +8,8 @@ export const MAX_BACKUP_BYTES = 24 * 1024 * 1024;
 export interface BackupRow {
   id: string; session_id: string; owner_id: string; object_key: string;
   sha256: string; size: number; created_at: string;
+  /** 1 when the server took it on the workspace's schedule (automatic-backups.ts); absent in rows read before. */
+  automatic?: number;
 }
 
 export async function boundedSnapshotText(response: Response, expectedSize?: number): Promise<string> {

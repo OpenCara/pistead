@@ -550,6 +550,15 @@ With `WORKSPACE_DATABASES=true`, a workspace owner can connect a Postgres databa
 - Connections use TLS that verifies the server certificate (against the public roots, or a CA certificate the owner pastes), or TLS without verification if the owner chooses it. Hosts must resolve to public addresses; `WORKSPACE_DATABASE_PRIVATE_HOSTS=true` also allows private networks, and unencrypted connections to them.
 - If the operator turns the feature off, that workspace's backups stop (they never fall back to `STORAGE_URL`) until its owner disconnects the database.
 
+#### Automatic backups
+
+The owner can also have sessions backed up into the database on their own, under **Session database → Automatic backups**: every 15 minutes, hour, 6 hours or day at most (`PUT /api/workspaces/:id/database/automatic-backups` with `minutes` of `15`, `60`, `360`, `1440` or `null`). Replacing the connection keeps the schedule; disconnecting the database ends it.
+
+- A session is backed up when it changed since its last automatic backup (its host reported its agent working), it is idle, and the interval since the last attempt has passed. The server checks every minute and takes at most 10 backups each time, oldest change first. A failed attempt is retried 15 minutes later, and the session's **Details → Backups** shows why it failed.
+- Automatic backups go only into the workspace database, never into `STORAGE_URL` instead, and are marked **Automatic** in the backup list and as `automatic: true` in the `backup.created` activity.
+- The workspace owner's own sessions take part as soon as the schedule is on. Another member's sessions take part only once that member confirms the database under **Session database → Your sessions** (`PUT /api/workspaces/:id/database/consent` with the `databaseId` they were shown; `DELETE` withdraws it). That confirmation also stops manual backups asking each time. It names the database, so it lapses when the owner points the connection at another one or disconnects it, and when the member leaves the workspace.
+- Nothing deletes old automatic backups yet: the database keeps every one, so choose an interval the database has room for.
+
 ### Dumps and imports
 
 Operators can dump straight from the database, with every session of a workspace in full:

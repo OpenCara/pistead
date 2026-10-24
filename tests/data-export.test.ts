@@ -40,7 +40,7 @@ async function fixture(t: TestContext) {
     INSERT INTO session_grants VALUES ('owner-private','test:admin','["read"]','2026-01-01'),
       ('member-granted','test:owner','["read","ask"]','2026-01-06');
     INSERT INTO session_tool_grants VALUES ('owner-private','bash','','approval-1','test:owner','2026-01-01');
-    INSERT INTO backups VALUES ('backup-server','owner-private','test:owner','OBJECT-KEY-SERVER','${'s'.repeat(43)}',10,'2026-01-02'),
+    INSERT INTO backups (id,session_id,owner_id,object_key,sha256,size,created_at) VALUES ('backup-server','owner-private','test:owner','OBJECT-KEY-SERVER','${'s'.repeat(43)}',10,'2026-01-02'),
       ('backup-database','owner-private','test:owner','OBJECT-KEY-DATABASE','${'t'.repeat(43)}',20,'2026-01-03');
     INSERT INTO workspace_database_backups VALUES ('backup-database','workspace','2026-01-03');
     INSERT INTO restore_jobs (id,request_id,owner_id,workspace_id,source_session_id,backup_id,target_session_id,request_title,sha256,size,

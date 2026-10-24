@@ -275,6 +275,10 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         AND session_id IN (SELECT id FROM sessions WHERE workspace_id = ?)
         AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
         .bind(targetId, workspaceId, auditId),
+      // A former member's confirmation of the workspace database doesn't outlive the membership.
+      c.env.DB.query(`DELETE FROM workspace_database_consents WHERE workspace_id = ? AND user_id = ?
+        AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, targetId, auditId),
       c.env.DB.query(`UPDATE sessions SET policy_version = policy_version + 1
         WHERE workspace_id = ? AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
         .bind(workspaceId, auditId),

@@ -10,6 +10,8 @@ export interface WorkspaceDatabaseRow {
   id: string; workspace_id: string; host: string; port: number; database_name: string; username: string;
   tls: WorkspaceDatabaseTarget['tls']; ca_certificate: string | null; password_ciphertext: string;
   created_by: string; created_at: string; updated_at: string;
+  /** How often the workspace's sessions are backed up there on their own (automatic-backups.ts); null: never. */
+  automatic_backup_minutes?: number | null;
 }
 
 /** Vault associated data for a workspace database password. */

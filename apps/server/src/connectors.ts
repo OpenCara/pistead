@@ -9,6 +9,7 @@ import type { Query } from './db/types.js';
 import { requireMember } from './db.js';
 import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
 import { authorizeSession } from './internal.js';
+import { markSessionChanged } from './session-changes.js';
 import { githubComment, githubMerge, githubRead } from './github-broker.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
@@ -162,6 +163,8 @@ async function reportSessionActivity(c: AppContext, connectorId: string): Promis
   await requireCallbackScope(c, row, connectorId);
   if (row.activity !== activity) {
     await c.env.DB.query('UPDATE sessions SET activity = ? WHERE id = ? AND connector_id = ?').bind(activity, row.id, connectorId).run();
+    // An agent at work changes the session: the next automatic backup has something new to save.
+    if (activity === 'working') await markSessionChanged(c.env, row.id);
   }
   return c.json({ ok: true });
 }
