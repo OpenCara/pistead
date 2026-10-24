@@ -9,6 +9,7 @@ import type { RestoreDescriptor } from "../packages/shared/src/connector.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 import type { SessionRepository } from "../packages/shared/src/repositories.js";
 import { sha256 } from "../packages/shared/src/crypto.js";
+import { messageHash } from "../packages/shared/src/chat-images.js";
 import { restoreSession, type RestoreConfig, type RestoreManifest } from "../apps/runner/src/restore.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
 
@@ -392,6 +393,16 @@ test("completed metadata still binds every run and approval to the source owner 
     const saved = envelope(value);
     await assert.rejects(restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, prepare), /run binding/);
   }
+  // A message of images alone: its hash binds images the backup doesn't have, so only its form is checked.
+  const imageKey = await sha256("image-receipt-key");
+  const imageRun = { ...run, key: imageKey, content: "", contentHash: await messageHash("", [{ mimeType: "image/png", data: "iVBORw0KGgo=" }]), images: { count: 1, bytes: 12 } };
+  for (const change of [{ images: undefined }, { images: { count: 0, bytes: 12 } }, { images: { count: 5, bytes: 12 } }, { images: { count: 1 } },
+    { images: { count: 1, bytes: 12, data: "iVBORw0KGgo=" } }, { contentHash: "wrong" }]) {
+    const value = archive();
+    value.manifest.runs[imageKey] = { ...imageRun, ...change };
+    const saved = envelope(value);
+    await assert.rejects(restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, prepare), /run binding/);
+  }
   const approval = { id: "approval-1", sessionId: "source", requestedBy: "test:alice", status: "pending",
     operation: { kind: "git.commit", message: "old request" }, createdAt: "2026-01-01T00:00:00Z" };
   for (const change of [{ id: "other" }, { sessionId: "other-session" }, { requestedBy: "" }]) {
@@ -403,6 +414,7 @@ test("completed metadata still binds every run and approval to the source owner 
   assert.equal(prepare.mock.callCount(), 0);
   const value = archive();
   value.manifest.runs[key] = run;
+  value.manifest.runs[imageKey] = imageRun;
   value.manifest.approvals["approval-1"] = approval;
   value.manifest.toolActors["123"] = { ownerId: run.ownerId, initiatedBy: run.initiatedBy, runKey: key };
   const saved = envelope(value);
@@ -411,6 +423,7 @@ test("completed metadata still binds every run and approval to the source owner 
   await restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, async (stage, manifest) => {
     staged = stage;
     assert.deepEqual(manifest.runs[key], run);
+    assert.deepEqual(manifest.runs[imageKey], imageRun);
     assert.deepEqual(manifest.approvals["approval-1"], approval);
   });
 });

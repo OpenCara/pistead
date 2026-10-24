@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, 
 import type { ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
+import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
 import { ChatOptionsBar, chatOptionsBody, preferredSelection, readChatPreference, rememberChat, type ChatSelection } from "./chat-options";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
@@ -105,6 +106,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
+  const attachments = useAttachments(imagesUnavailable(host));
 
   // A trust acknowledgement covers one host against one repository set.
   useEffect(() => { setTrustedHost(""); }, [hostKey, host?.ownerId, repositories]);
@@ -120,18 +122,23 @@ function Composer({ workspace }: { workspace: Workspace }) {
     event?.preventDefault();
     if (!canStart || !model || !host) return;
     const message = content.trim();
+    const pasted = attachments.images;
     const options = chatOptionsBody(host, selection, "submit");
     void action.run(async () => {
+      // Before the session exists: an image that can't be read stops the start instead of leaving a session behind.
+      const images = await encodeImages(pasted);
       const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, modelId: model.id, title: deriveTitle(content, model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
       const sessionId = result.session.id;
       writeStorage(() => localStorage, LAST_START_KEY, `model:${model.id}`);
       rememberChat(host, selection);
-      if (message) {
+      if (message || images.length) {
         try {
-          await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}) } });
+          await api(`/api/sessions/${segment(sessionId)}/submit`, { method: "POST", body: { content: message, requestId: crypto.randomUUID(), ...(options ? { options } : {}),
+            ...(images.length ? { images } : {}) } });
         } catch {
-          // The session exists; keep the unsent text for its composer instead of failing the start.
+          // The session exists; keep the unsent text and images for its composer instead of failing the start.
           writeStorage(() => sessionStorage, `pistead.draft.${sessionId}`, message);
+          handOverImages(sessionId, pasted);
         }
       }
       refreshSessions();
@@ -184,7 +191,9 @@ function Composer({ workspace }: { workspace: Workspace }) {
     {blockingAlert()}
     <form className="composer-card" onSubmit={start} aria-busy={action.busy}>
       <fieldset disabled={action.busy}>
-        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} placeholder="Describe the task" aria-label="First message" autoFocus />
+        <AttachmentStrip attachments={attachments} disabled={action.busy} />
+        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message" autoFocus />
+        {attachments.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
         <div className="composer-toolbar">
           <Combobox label="Host" placeholder={models.loading || connections.loading ? "Loading..." : "Choose a host"} disabled={!hosts.length} value={hostKey}
             options={hosts.map(item => ({ value: item.id, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` }))}

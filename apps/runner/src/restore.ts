@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import type { RunnerBinding } from "../../../packages/shared/src/types.js";
 import { validCloneDirectory, validPushBranch } from "../../../packages/shared/src/repositories.js";
+import { chatImageLimits } from "../../../packages/shared/src/chat-images.js";
 import { assertId, RunnerError, stableJson, validateBinding, validateOperation } from "./protocol.js";
 import { Sandbox } from "./sandbox.js";
 
@@ -125,11 +126,18 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
   }
   for (const [key, run] of Object.entries(manifest.runs)) {
     if (!record(run) || !["settled", "interrupted"].includes(run.status as string)) invalid("Backup requires idle runs");
+    // A message with images can be images alone, and its hash binds them too (messageHash). The backup has no images to
+    // recompute it from (Pi's transcript holds them), so that hash is only checked for its form.
+    const images = run.images;
+    if (images !== undefined && (!record(images) || Object.keys(images).sort().join(",") !== "bytes,count"
+      || !Number.isSafeInteger(images.count) || (images.count as number) < 1 || (images.count as number) > chatImageLimits.count
+      || !Number.isSafeInteger(images.bytes) || (images.bytes as number) < 1)) invalid("Invalid backup run binding or receipt");
     if (run.key !== key || !/^[A-Za-z0-9_-]{43}$/.test(key) || run.ownerId !== source.owner.id
       || typeof run.initiatedBy !== "string" || !run.initiatedBy || run.initiatedBy.length > 256
       || !["write", "ask"].includes(run.mode as string) || !Number.isSafeInteger(run.conversationId)
-      || !branches.has(run.conversationId as number) || typeof run.content !== "string" || !run.content.trim()
-      || run.content.length > 100_000 || typeof run.contentHash !== "string" || run.contentHash !== digest(run.content)
+      || !branches.has(run.conversationId as number) || typeof run.content !== "string" || (images === undefined && !run.content.trim())
+      || run.content.length > 100_000 || typeof run.contentHash !== "string"
+      || (images === undefined ? run.contentHash !== digest(run.content) : !/^[A-Za-z0-9_-]{43}$/.test(run.contentHash))
       || !Number.isSafeInteger(run.startEntry) || (run.startEntry as number) < 0
       || (run.submissionId !== undefined && (!Number.isSafeInteger(run.submissionId) || (run.submissionId as number) < 1))
       || (run.sequence !== undefined && (!Number.isSafeInteger(run.sequence) || (run.sequence as number) < 0))

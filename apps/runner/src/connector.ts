@@ -174,16 +174,16 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
     || typeof result.sandbox !== "boolean" || typeof result.productionShell !== "boolean"
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
   // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
-  // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, pushes, and
-  // reads and merges on GitHub through the control plane.
+  // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, gives the
+  // model a message's pasted images, pushes, and reads and merges on GitHub through the control plane.
   // So does the owner's choice to keep a repository cache on this host. Every session clones its repositories with plain
   // Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait for
   // `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
   const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
-  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, gitProviders: true, gitPush: true, github: true,
-    plainGit: true, ...credentials };
-  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, gitProviders: true, gitPush: true, github: true,
-    plainGit: true, cloneBackups: true, ...credentials };
+  if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
+    github: true, plainGit: true, ...credentials };
+  return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
+    github: true, plainGit: true, cloneBackups: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {

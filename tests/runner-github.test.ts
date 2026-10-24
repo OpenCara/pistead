@@ -155,13 +155,15 @@ test("host_bash auto-approves only on the session owner's own host; shared hosts
     const claims = async (action: RunnerAction, actorId = "test:alice") => ({ ...await ticket(target.session.id, action), actorId, connectorId: "host-connector" });
     const session = await service.provision(target, await claims("create"));
     await session.submit(await claims("submit"), { content: "Run on host", requestId: "host", admissionId: await sha256("host-command-admission"), options: { access: "auto" } }, "write");
-    if (hostOwner === "test:alice") await idle(session);
-    const approval = hostOwner === "test:alice" ? (await session.view()).approvals[0]! : await pendingApproval(session);
     if (hostOwner === "test:alice") {
-      assert.equal(approval.status, "executed");
-      assert.equal(approval.automatic, true);
-      assert.match(approval.result!, /host-command-marker/);
+      await idle(session);
+      // The host's owner auto-approved it: no card, its call is marked and its result is in the transcript.
+      const view = await session.view();
+      assert.deepEqual(view.approvals, []);
+      assert.deepEqual(view.entries.flatMap(entry => entry.autoApproved ?? []), [{ tool: "host_bash", status: "executed" }]);
+      assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes('"automatic":true') && entry.text.includes("host-command-marker")));
     } else {
+      const approval = await pendingApproval(session);
       assert.equal(approval.status, "pending");
       assert.equal(approval.automatic, undefined);
       await assert.rejects(session.decide(await claims("approve"), approval.id, { decision: "approve", operation: approval.operation }), /host owner/);

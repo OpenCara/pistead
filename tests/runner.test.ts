@@ -53,6 +53,13 @@ async function permissionRequest(session: RunnerSession): Promise<ApprovalRecord
   assert.fail("no permission request");
 }
 /** Waits for `count` pending operation cards: the tool calls waiting on a person's decision. */
+/** Commands auto-approve ran have no card: the view marks their tool calls instead (see EntryView.autoApproved). */
+function autoApproved(view: SessionView) {
+  assert.deepEqual(view.approvals.filter(approval => approval.automatic && approval.operation.kind === "bash"), [], "no card repeats an auto-approved command");
+  return view.entries.flatMap(entry => entry.autoApproved ?? []);
+}
+const toolOutput = (view: SessionView, marker: RegExp) => view.entries.some(entry => entry.role === "toolResult" && marker.test(entry.text));
+
 async function operationRequests(session: RunnerSession, count = 1): Promise<ApprovalRecord[]> {
   for (let attempt = 0; attempt < 500; attempt++) {
     const requests = (await session.view()).approvals.filter(approval => approval.operation.kind !== "permission" && approval.status === "pending");
@@ -463,11 +470,8 @@ test("only the host's owner lets a command run without the resource limits the h
   await idle(auto);
   const autoView = await auto.view();
   assert.equal(autoView.approvals.filter(approval => approval.operation.kind === "permission").length, 1, "only the default-access message asked");
-  const automatic = autoView.approvals.find(approval => approval.operation.kind === "bash");
-  assert.equal(automatic?.status, "executed");
-  assert.equal(automatic!.automatic, true);
-  assert.equal(automatic!.unbounded, true);
-  assert.match(automatic!.result ?? "", /auto-unlimited-marker/);
+  assert.deepEqual(autoApproved(autoView), [{ tool: "bash", status: "executed", unbounded: true }]);
+  assert.ok(toolOutput(autoView, /auto-unlimited-marker/));
 });
 
 test("shell commands may reserve address space they never touch, as gh and node do when they start", { skip: process.platform !== "linux" }, async t => {
@@ -522,11 +526,9 @@ test("read access asks the owner before a change, and auto access runs owner com
   await idle(session);
   view = await session.view();
   assert.equal(view.access, "auto");
-  const approval = view.approvals.find(candidate => candidate.operation.kind === "bash");
-  assert.equal(approval?.status, "executed");
-  assert.equal(approval!.automatic, true);
-  assert.equal(approval!.decidedBy, "test:alice");
-  assert.match(approval!.result ?? "", /auto-output-marker/);
+  assert.deepEqual(autoApproved(view), [{ tool: "bash", status: "executed" }]);
+  // The call's result is the whole record: who it ran for, and its output.
+  assert.ok(toolOutput(view, /"automatic":true/) && toolOutput(view, /"decidedBy":"test:alice"/) && toolOutput(view, /auto-output-marker/));
 
   // Without options the next run returns to per-command human approval: the call waits for it, then gets the output.
   await session.submit(await ticket("options-session", "submit"), { content: "TEST_BASH echo pending-marker", requestId: "default" }, "write");
@@ -591,8 +593,13 @@ test("a tool outside the agent waits for its owner, who allows it once or for th
   await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo granted", requestId: "granted" }, "write");
   await deny();
   const view = await session.view();
-  assert.equal(view.approvals.filter(approval => approval.operation.kind === "permission").length, 2, "the session grant asks no more");
-  assert.deepEqual((await commands()).map(approval => approval.operation), ["echo once", "echo again", "echo granted"].map(command => ({ kind: "bash", command })));
+  // Each allowed permission is folded into its command's card, and the session grant asks no more.
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission"), []);
+  assert.deepEqual((await commands()).map(approval => [approval.operation, approval.permission]), [
+    [{ kind: "bash", command: "echo once" }, { decidedBy: "test:alice", scope: "call" }],
+    [{ kind: "bash", command: "echo again" }, { decidedBy: "test:alice", scope: "session" }],
+    [{ kind: "bash", command: "echo granted" }, undefined],
+  ]);
   assert.equal((await session.createApproval("test:alice", { kind: "bash", command: "echo explicit" })).status, "pending");
   await assert.rejects(session.decide(await ticket(id, "approve"), again.id, { decision: "approve", operation: again.operation }), rejectedWith(409, /already been decided/));
 });
@@ -606,10 +613,8 @@ test("auto access runs a tool outside the agent without a permission card", host
   await idle(session);
   const view = await session.view();
   assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission"), [], "auto-approve asks nothing");
-  const command = view.approvals.find(approval => approval.operation.kind === "bash");
-  assert.equal(command?.status, "executed");
-  assert.equal(command!.automatic, true);
-  assert.match(command!.result ?? "", /auto-tool-marker/);
+  assert.deepEqual(autoApproved(view), [{ tool: "bash", status: "executed" }]);
+  assert.ok(toolOutput(view, /auto-tool-marker/));
   // Auto-approve covers its own message only: the next one asks again.
   await session.submit(await ticket(id, "submit"), { content: "TEST_BASH echo after", requestId: "after" }, "write");
   const request = await permissionRequest(session);
@@ -645,9 +650,10 @@ test("allowing a tool for the session lets the round's other waiting calls of it
   }
   await idle(session);
   const view = await session.view();
-  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission").map(approval => [approval.status, approval.scope]), [["approved", "session"], ["approved", "session"]]);
-  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "bash").map(approval => [approval.operation.kind === "bash" && approval.operation.command, approval.status]).sort(),
-    [["echo one", "executed"], ["echo two", "executed"]]);
+  // Both permissions are folded into their commands' cards.
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "permission"), []);
+  assert.deepEqual(view.approvals.filter(approval => approval.operation.kind === "bash").map(approval => [approval.operation.kind === "bash" && approval.operation.command, approval.status, approval.permission?.scope]).sort(),
+    [["echo one", "executed", "session"], ["echo two", "executed", "session"]]);
 });
 
 test("a restart ends a call waiting on its owner, and its card can no longer be decided", hostMode, async t => {

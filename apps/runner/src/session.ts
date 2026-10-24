@@ -1,6 +1,6 @@
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
 import { randomUUID } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
@@ -11,11 +11,12 @@ import { accessModes, githubMergeMethods, thinkingLevels } from "../../../packag
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
+import { messageHash, parseChatImages, type ChatImage } from "../../../packages/shared/src/chat-images.js";
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
 import { MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
-import { prepareImage } from "./images.js";
+import { IMAGE_BUSY, IMAGE_ERROR, imageType, prepareImage } from "./images.js";
 import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
 import { GitRemote, GitRemoteError } from "./git-remote.js";
@@ -25,6 +26,7 @@ import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
+import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
 import { egressPushService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
@@ -40,6 +42,13 @@ type Run = {
   submittedAt?: number;
   /** Worker-signed per-message choices, applied to the conversation when the run starts. */
   options?: ChatOptions;
+  /**
+   * The message carries images, prepared for the model: until it reaches Pi they wait in the session's inputs directory
+   * (see writeInputs), never here, as every change rewrites this ledger whole. `bytes` is their base64 length.
+   */
+  images?: { count: number; bytes: number };
+  /** Its images were gone or unreadable on the host when it was to run, so it ended without reaching Pi (see endLostInputs). */
+  inputsLost?: true;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
   failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
   /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
@@ -50,9 +59,13 @@ type Run = {
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 /** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
 type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
-type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, ApprovalRecord>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
+type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, StoredApproval>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string; callId?: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
 /** One JSON string that every change replaces, so each change is stored whole: a delta would be as large and only lengthen replay. */
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
+/** A message's image as the model gets it: prepared by `prepareImage`, base64. */
+type InputImage = { mimeType: string; data: string };
+/** Prepared images of queued messages that a session holds on disk at once, until their messages reach Pi. */
+const MAX_QUEUED_IMAGE_BYTES = 16 * 1024 * 1024;
 /** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files"];
 /**
@@ -61,10 +74,6 @@ const readOnlyTools = ["identity", "read_file", "list_files"];
  * decided: the call fails instead of holding the session.
  */
 const DECISION_WAIT_MS = 60 * 60 * 1000;
-/** Whether a tool call waiting on `approval` can go on: a permission request once decided, an operation once it ran, failed or was denied. */
-function settled(approval: ApprovalRecord): boolean {
-  return approval.operation.kind === "permission" ? approval.status !== "pending" : !["pending", "approved", "executing"].includes(approval.status);
-}
 /** Whether `run` keeps the session busy: it is queued or at work, or a stop of it is still ending its work. */
 function holdsQueue(run: Run): boolean {
   return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
@@ -604,6 +613,7 @@ export class RunnerSession {
           if (card.status === "pending") Object.assign(card, { status: "interrupted", result: "This session is read-only now; nothing in it runs." });
         }
       });
+      await this.sweepInputs();
     }
     // Reported while its repositories are still being prepared too; reopening is also how a report lost with a previous
     // connection or process gets through.
@@ -629,8 +639,13 @@ export class RunnerSession {
       if (!conversation) throw new Error("Persisted branch is missing");
       let submission;
       if (run.submissionId === undefined) {
+        const content = await this.runInput(run);
+        if (content === undefined) {
+          await this.endLostInputs(run.key);
+          continue;
+        }
         await this.applyOptions(conversation, run);
-        submission = await conversation.submit({ type: "input", content: run.content, requestId: run.key }, context);
+        submission = await conversation.submit({ type: "input", content, requestId: run.key }, context);
       } else submission = await this.harness.submission(run.submissionId as SubmissionId, context);
       if (submission) {
         await this.mutate(meta => { const saved = meta.runs[run.key]!; saved.submissionId = submission.id; saved.status = "running"; });
@@ -639,6 +654,8 @@ export class RunnerSession {
     }
     // A stop the previous open did not finish: its work is aborted before the scheduler can restart it.
     if (Object.values(state.runs).some(run => run.stopped?.pending)) await this.abortStopped();
+    // Images of runs that reached Pi, ended or never committed before this open.
+    await this.sweepInputs();
     this.harness.resume();
     this.drainQueue();
   }
@@ -835,6 +852,12 @@ export class RunnerSession {
         try { await this.authorize(run.initiatedBy, run.mode === "ask" ? "ask" : "write"); }
         catch {
           await this.mutate(meta => { meta.runs[run.key]!.status = "interrupted"; });
+          if (run.images) await this.discardInputs([run.key]);
+          continue;
+        }
+        const content = await this.runInput(run);
+        if (content === undefined) {
+          await this.endLostInputs(run.key);
           continue;
         }
         const conversation = await this.harness.conversation(run.conversationId as ConversationId, context);
@@ -846,11 +869,13 @@ export class RunnerSession {
           meta.runs[run.key]!.startEntry = transcript.entries.at(-1)?.id ?? 0;
         });
         await this.applyOptions(conversation, run);
-        const submission = await conversation.submit({ type: "input", content: run.content, requestId: run.key }, context);
+        const submission = await conversation.submit({ type: "input", content, requestId: run.key }, context);
         await this.mutate(meta => {
           meta.runs[run.key]!.submissionId = submission.id;
           meta.runs[run.key]!.status = "running";
         });
+        // Pi's transcript holds its images now.
+        if (run.images) await this.discardInputs([run.key]);
         this.observeRun(run.key, submission.id);
         return;
       }
@@ -916,6 +941,108 @@ export class RunnerSession {
     return Object.keys(options).length ? options : undefined;
   }
 
+  /** Decodes a message's images and fits them to what the model gets of an image, as read_file does for image files. */
+  private async prepareImages(images: readonly ChatImage[]): Promise<InputImage[]> {
+    const prepared: InputImage[] = [];
+    for (const image of images) {
+      const bytes = Buffer.from(image.data, "base64");
+      // The sender names the type, and an image passed through to a provider under another type than its bytes would
+      // fail every later turn of the conversation: the bytes' signature must say the same.
+      if (imageType(bytes) !== image.mimeType) throw new RunnerError(422, IMAGE_ERROR);
+      const result = await prepareImage(bytes, image.mimeType);
+      // 422 carries this fixed, runner-authored reason through the Worker to the sender.
+      if ("error" in result) throw new RunnerError(422, result.error === IMAGE_BUSY ? "Too many images are being prepared at once. Send the message again shortly" : result.error);
+      prepared.push({ mimeType: result.image.mimeType, data: result.image.data });
+    }
+    return prepared;
+  }
+
+  /** Images go only to a model that takes them; one that doesn't would answer the text without ever seeing them. */
+  private async requireImageModel(options: ChatOptions | undefined): Promise<void> {
+    const target = options?.model ?? (await this.root.agent(context)).model ?? this.modelRef;
+    const model = this.models.getModel(target.provider, target.modelId);
+    // A model that doesn't say what it takes is left to its provider.
+    if (model && Array.isArray(model.input) && !model.input.includes("image")) throw new RunnerError(422, "The model doesn't accept images");
+  }
+
+  /** Where queued messages' prepared images wait, outside the sandbox and the backups, until their messages reach Pi. */
+  private get inputsDirectory(): string {
+    return join(this.directory, "inputs");
+  }
+
+  /** A run's images, by its key: the hash `requestKey` makes, so always a plain file name. */
+  private inputPath(key: string): string {
+    return join(this.inputsDirectory, `${key}.json`);
+  }
+
+  /** Keeps a queued run's prepared images, whole or not at all, until it reaches Pi. */
+  private async writeInputs(key: string, images: readonly InputImage[]): Promise<void> {
+    await mkdir(this.inputsDirectory, { recursive: true, mode: 0o700 });
+    const temporary = join(this.inputsDirectory, `.${key}.${randomUUID()}.tmp`);
+    try {
+      const file = await open(temporary, "wx", 0o600);
+      try {
+        await file.writeFile(JSON.stringify({ images }));
+        await file.sync();
+      } finally { await file.close(); }
+      await rename(temporary, this.inputPath(key));
+    } catch (error) {
+      await rm(temporary, { force: true });
+      throw error;
+    }
+  }
+
+  /** A run's prepared images; undefined when they are gone or unreadable. */
+  private async readInputs(key: string): Promise<InputImage[] | undefined> {
+    try {
+      const images = (JSON.parse(await readFile(this.inputPath(key), "utf8")) as { images?: unknown }).images;
+      if (!Array.isArray(images) || !images.length
+        || images.some(image => typeof image?.mimeType !== "string" || typeof image.data !== "string")) return undefined;
+      return images as InputImage[];
+    } catch { return undefined; }
+  }
+
+  private async discardInputs(keys: readonly string[]): Promise<void> {
+    await Promise.all(keys.map(key => rm(this.inputPath(key), { force: true }).catch(() => {})));
+  }
+
+  /**
+   * Removes the images of every run that no longer waits to reach Pi, and those a run that never committed left. Called
+   * only where no submission can be writing its images: in the session's turn, or while it opens.
+   */
+  private async sweepInputs(): Promise<void> {
+    let names: string[];
+    try { names = await readdir(this.inputsDirectory); }
+    catch { return; }
+    const runs = (await this.metadata()).runs;
+    const waiting = (name: string) => {
+      const run = name.endsWith(".json") ? runs[name.slice(0, -".json".length)] : undefined;
+      return run !== undefined && run.submissionId === undefined && ["queued", "admitting", "running"].includes(run.status);
+    };
+    await Promise.all(names.filter(name => !waiting(name)).map(name => rm(join(this.inputsDirectory, name), { force: true }).catch(() => {})));
+  }
+
+  /** Ends a run whose images are gone or unreadable, saying so in the ledger, and removes whatever is left of them. */
+  private async endLostInputs(key: string): Promise<void> {
+    await this.mutate(meta => { Object.assign(meta.runs[key]!, { status: "interrupted", inputsLost: true }); });
+    await this.discardInputs([key]);
+  }
+
+  /**
+   * What a run gives Pi: its text, then the images it was sent with. Undefined when its images are gone, and the run
+   * then ends instead of running its text without them. Text of only whitespace is left out: providers refuse a text
+   * block without any.
+   */
+  private async runInput(run: Run) {
+    if (!run.images) return run.content;
+    const images = await this.readInputs(run.key);
+    if (!images) return undefined;
+    return [
+      ...(run.content.trim() ? [{ type: "text" as const, text: run.content }] : []),
+      ...images.map(image => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
+    ];
+  }
+
   /** A session that pinned its repositories is read-only: nothing new runs, is decided or backed up in it. */
   private requireUnfrozen(): void {
     if (this.#frozen) throw new RunnerError(409, "This session pinned its repositories when it started, which sessions no longer do; it is read-only");
@@ -924,11 +1051,17 @@ export class RunnerSession {
   async submit(ticket: RunnerTicket, input: SubmitInput, mode: "write" | "ask"): Promise<SubmitResult> {
     this.assertTicket(ticket);
     this.requireUnfrozen();
-    if (typeof input?.content !== "string" || input.content.length > 100_000 || !input.content.trim()
+    const parsed: ReturnType<typeof parseChatImages> = input?.images === undefined ? { images: [] } : parseChatImages(input.images);
+    if ("error" in parsed) throw new RunnerError(400, "Invalid submission images");
+    const images = parsed.images;
+    // A message of images alone has no text.
+    if (typeof input?.content !== "string" || input.content.length > 100_000 || (!input.content.trim() && !images.length)
       || typeof input.requestId !== "string" || !input.requestId || input.requestId.length > 200) throw new RunnerError(400, "Invalid submission");
     if ((input.admissionId !== undefined && (mode !== "write" || typeof input.admissionId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(input.admissionId)))
       || (this.config.connectorId && mode === "write" && input.admissionId === undefined))
       throw new RunnerError(400, "Invalid or missing Worker write admission");
+    // Decoded and fitted before the session's turn, as that can take a while: what is queued is what the model gets.
+    const prepared = images.length ? await this.prepareImages(images) : [];
     return this.exclusive(async () => {
       if (this.closing) throw new RunnerError(503, "Session is closing");
       // Messages queue while repositories are prepared; once that failed, say why instead of queueing forever.
@@ -936,8 +1069,9 @@ export class RunnerSession {
       if (preparation.status === "failed") throw new RunnerError(502, preparationFailure(preparation.reason));
       await this.authorize(ticket.actorId, mode === "ask" ? "ask" : "write", ticket.policyVersion);
       const options = await this.chatOptions(input.options, mode, ticket.actorId);
+      if (prepared.length) await this.requireImageModel(options);
       const key = await requestKey(ticket.actorId, mode, input.requestId);
-      const hash = await sha256(input.content);
+      const hash = await messageHash(input.content, images);
       const state = await this.metadata();
       const existing = state.runs[key];
       if (existing) {
@@ -954,6 +1088,12 @@ export class RunnerSession {
       if (Object.values(state.runs).reduce((total, run) => total + Buffer.byteLength(run.content, "utf8"), 0) + Buffer.byteLength(input.content, "utf8") > 32 * 1024 * 1024)
         throw new RunnerError(429, "Session durable request content limit exceeded");
       if (Object.keys(state.runs).length >= 10_000) throw new RunnerError(429, "Session durable request ledger is full");
+      const imageBytes = prepared.reduce((total, image) => total + image.data.length, 0);
+      if (imageBytes && Object.values(state.runs).filter(run => run.submissionId === undefined && ["queued", "running", "admitting"].includes(run.status))
+        .reduce((total, run) => total + (run.images?.bytes ?? 0), 0) + imageBytes > MAX_QUEUED_IMAGE_BYTES) throw new RunnerError(429, "Session queued image limit exceeded");
+      // On disk before the run is committed, so a queued run with images always finds them; a run that never commits
+      // leaves them for sweepInputs.
+      if (prepared.length) await this.writeInputs(key, prepared);
       let conversation = this.root;
       if (mode === "ask") {
         const transcript = await this.root.context(context);
@@ -969,6 +1109,7 @@ export class RunnerSession {
       const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0, submittedAt: Date.now() };
       if (input.admissionId !== undefined) run.admissionId = input.admissionId;
       if (options) run.options = options;
+      if (prepared.length) run.images = { count: prepared.length, bytes: imageBytes };
       await this.mutate(meta => {
         meta.runs[key] = run;
         meta.nextSequence = (meta.nextSequence ?? 0) + 1;
@@ -1003,6 +1144,8 @@ export class RunnerSession {
           }
         }
       });
+      // Stopped messages that never reached Pi never will.
+      await this.discardInputs(runs.filter(run => run.images && run.submissionId === undefined).map(run => run.key));
       return runs;
     });
     if (stopped.some(run => run.status !== "queued")) void this.abortStopped().catch(() => { /* Reopening aborts what is left (see resumeWork). */ });
@@ -1031,7 +1174,8 @@ export class RunnerSession {
     await api.commit(async tx => {
       const current = await tx.doc(RunnerState);
       const meta: Metadata = JSON.parse(current.json);
-      meta.toolActors[String(api.taskId)] ??= { initiatedBy: run.initiatedBy, ownerId: run.ownerId, runKey: run.key };
+      // The model's id of the call links its approval card to the transcript entry that made it.
+      meta.toolActors[String(api.taskId)] ??= { initiatedBy: run.initiatedBy, ownerId: run.ownerId, runKey: run.key, callId: api.callId };
       current.json = JSON.stringify(meta);
     }, context);
     return { initiatedBy: run.initiatedBy, actingAs: run.ownerId, mode: run.mode };
@@ -1129,7 +1273,7 @@ export class RunnerSession {
 
   private sessionTools(): ToolRegistration[] {
     const text = (value: unknown) => ({ output: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value) }] });
-    const approvalText = (approval: ApprovalRecord) => text({ ...approval, admissionId: undefined });
+    const approvalText = (approval: StoredApproval) => text({ ...approval, admissionId: undefined, callId: undefined });
     return [
       defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api, call) => {
         const attribution = await this.toolActor(api, false);
@@ -1286,10 +1430,12 @@ export class RunnerSession {
     }
     await this.authorize(actorId, "write");
     let admissionId: string | undefined;
+    let callId: string | undefined;
     let automatic = false;
     if (toolTaskId !== undefined) {
       const state = await this.metadata();
       const attribution = state.toolActors[toolTaskId];
+      callId = attribution?.callId;
       const run = attribution && state.runs[attribution.runKey];
       if (!run || run.initiatedBy !== actorId || run.ownerId !== this.binding.owner.id || run.mode !== "write"
         || !["admitting", "running"].includes(run.status)) throw new RunnerError(403, "Approval has no active originating write");
@@ -1302,9 +1448,9 @@ export class RunnerSession {
         && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
-    const approval: ApprovalRecord = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
+    const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
       ...(automatic ? { status: "executing", decidedBy: this.binding.owner.id, automatic: true } : { status: "pending" }),
-      ...(consent.unbounded && operation.kind === "bash" ? { unbounded: true } : {}) };
+      ...(consent.unbounded && operation.kind === "bash" ? { unbounded: true } : {}), ...(callId ? { callId } : {}) };
     if (admissionId !== undefined) approval.admissionId = admissionId;
     let created = false;
     // The tool call waits on its card: registered first, so a decision never finds the card without its call.
@@ -1506,6 +1652,8 @@ export class RunnerSession {
     }
     // Every admission is committed before its entries: read attribution after transcript snapshots.
     const state = await this.metadata();
+    const stored = Object.values(state.approvals);
+    const autoApproved = autoApprovedCalls(stored);
     const entries: SessionView["entries"] = [];
     for (const snapshot of snapshots) {
       let previous: Run | undefined;
@@ -1514,7 +1662,7 @@ export class RunnerSession {
         const ending = run !== previous && previous && this.endView(previous, snapshot.branch.id);
         if (ending) entries.push(ending);
         previous = run;
-        entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy));
+        entries.push(this.entryView(entry, snapshot.branch.id, run?.initiatedBy, autoApproved));
       }
       const ending = previous && this.endView(previous, snapshot.branch.id);
       if (ending) entries.push(ending);
@@ -1524,12 +1672,13 @@ export class RunnerSession {
     const access = latestWrite?.options?.access;
     const repositories = this.repositoryView();
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
+    const { approvals, olderApprovals } = viewApprovals(stored);
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
-      approvals: Object.values(state.approvals), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
+      approvals, ...(olderApprovals ? { olderApprovals } : {}), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
       busy: Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
-        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.status })),
+        .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.inputsLost ? "images lost" : run.status })),
       stoppable: true,
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access && access !== "approval" ? { access } : {}),
@@ -1540,8 +1689,13 @@ export class RunnerSession {
     };
   }
 
-  private entryView(entry: EntryRecord, branch: number, actorId?: string): SessionView["entries"][number] {
+  private entryView(entry: EntryRecord, branch: number, actorId?: string, autoApproved?: ReturnType<typeof autoApprovedCalls>): SessionView["entries"][number] {
     const messages = entry.model ?? [];
+    // Commands auto-approve ran have no card in the view: their calls say so instead.
+    const marks = messages.flatMap(message => message.role !== "assistant" ? [] : message.content.flatMap(block => {
+      const mark = block.type === "toolCall" ? autoApproved?.get(block.id) : undefined;
+      return mark && block.type === "toolCall" ? [{ tool: block.name, ...mark }] : [];
+    }));
     const text = messages.flatMap(message => {
       if (typeof message.content === "string") return [message.content];
       // Image data stays on the host; the transcript only notes that the model saw one.
@@ -1557,7 +1711,7 @@ export class RunnerSession {
     const durations = messages.flatMap(message => (message.role === "assistant" || message.role === "toolResult") && message.durationMs !== undefined ? [message.durationMs] : []);
     const durationMs = durations.length ? durations.reduce((total, value) => total + value, 0) : undefined;
     return { id: `${branch}:${entry.id}`, kind: entry.kind, role: messages[0]?.role ?? "system", text, ...(actorId ? { actorId } : {}), conversationId: String(branch),
-      ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}) };
+      ...(error ? { error } : {}), ...(durationMs !== undefined ? { durationMs } : {}), ...(marks.length ? { autoApproved: marks } : {}) };
   }
 
   /** What follows a run's entries: its failed model turn, who stopped it, or that its host's crashes ended it. */
