@@ -33,7 +33,8 @@ export function forwardedRequest(request: Request, incoming: IncomingMessage): R
 /**
  * Wraps the app's fetch for the node adaptor so that it sees forwarded URLs. A request that can't be rebuilt (a
  * malformed X-Forwarded-Host, say) gets a 400: an error thrown here is outside the app's error handler and would
- * otherwise reach the client as a bare, unlogged 500.
+ * otherwise reach the client as a bare, unlogged 500. The error is logged, so one that isn't the client's fault (a
+ * runtime that rejects the rebuilt request, as Node 26 did in #71) shows up rather than as silent 400s.
  */
 export function trustForwardedHeaders(
   fetch: (request: Request) => Response | Promise<Response>,
@@ -41,7 +42,8 @@ export function trustForwardedHeaders(
   return (request, bindings) => {
     let forwarded: Request;
     // createAdaptorServer defaults to node:http, so the incoming message is always HTTP/1.
-    try { forwarded = forwardedRequest(request, bindings.incoming as IncomingMessage); } catch {
+    try { forwarded = forwardedRequest(request, bindings.incoming as IncomingMessage); } catch (error) {
+      console.error('pistead: could not rebuild a forwarded request:', error instanceof Error ? error.message : error);
       return Response.json({ error: 'Invalid request.', code: 'invalid_request' }, { status: 400 });
     }
     return fetch(forwarded);

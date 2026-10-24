@@ -94,11 +94,14 @@ test("the forwarded request still aborts when the client goes away", async () =>
   } finally { await server.close(); }
 });
 
-test("a malformed forwarded host is a 400, not a bare 500", async () => {
+test("a malformed forwarded host is a logged 400, not a bare 500", async t => {
+  const logged = t.mock.method(console, "error", () => {});
   const server = await serve(echo);
   try {
     const response = await fetch(`${server.origin}/`, { headers: { "x-forwarded-host": "bad host[" } });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), { error: "Invalid request.", code: "invalid_request" });
+    assert.equal(logged.mock.callCount(), 1);
+    assert.match(String(logged.mock.calls[0]!.arguments[0]), /could not rebuild a forwarded request/);
   } finally { await server.close(); }
 });
