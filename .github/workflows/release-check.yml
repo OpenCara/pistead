@@ -1,0 +1,68 @@
+name: Release check
+# Shared by the release workflows, one per release line, each started by its own tag:
+#   cli-v1.2.3      release.yml          `pistead` connector on npm
+#   server-v1.2.3   release-server.yml   server image (web and backend) on GHCR, and a GitHub release
+#   desktop-v1.2.3  release-desktop.yml  desktop app on a GitHub release (macOS today)
+#   ios-v1.2.3      release-ios.yml      iOS app on TestFlight
+# A suffix such as -beta.1 makes a prerelease. This checks the tag is on main, reads the version from it and finds the
+# line's previous tag, from which release notes start.
+on:
+  workflow_call:
+    inputs:
+      prefix:
+        description: The release line's tag prefix, such as server- for server-v1.2.3.
+        required: true
+        type: string
+    outputs:
+      version:
+        value: ${{ jobs.check.outputs.version }}
+      prerelease:
+        value: ${{ jobs.check.outputs.prerelease }}
+      previous-tag:
+        description: The line's nearest earlier tag on main (a release's ignores prereleases), or empty for its first release.
+        value: ${{ jobs.check.outputs.previous-tag }}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      previous-tag: ${{ steps.previous.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main."
+            exit 1
+          fi
+      - name: Version from the tag
+        id: version
+        env:
+          PREFIX: ${{ inputs.prefix }}
+        run: |
+          version="${GITHUB_REF_NAME#"${PREFIX}v"}"
+          if [ "$version" = "$GITHUB_REF_NAME" ] || ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME is not a version (${PREFIX}v1.2.3, or ${PREFIX}v1.2.3-beta.1 for a prerelease)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;; esac
+      # A release's notes cover everything since the previous release, its own prereleases included; a prerelease's
+      # start from the previous tag of either kind.
+      - name: Previous tag of this line
+        id: previous
+        env:
+          PREFIX: ${{ inputs.prefix }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          exclude=()
+          [ "$PRERELEASE" = true ] || exclude=(--exclude "${PREFIX}v*-*")
+          tag=$(git describe --tags --abbrev=0 --match "${PREFIX}v*" "${exclude[@]}" "$GITHUB_SHA^" 2>/dev/null || true)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Previous ${PREFIX}v tag: ${tag:-none}"

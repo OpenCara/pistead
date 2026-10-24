@@ -1,6 +1,7 @@
 # Copy apps/server/.env.example to .env next to this file and fill in APP_ORIGIN, SESSION_SECRET and VAULT_KEY.
 # By default the server keeps SQLite in the pistead-data volume and stores no session backups; to keep backups in that
-# volume too, set STORAGE_URL=file:///data/backups in .env. For Postgres, run
+# volume too, set STORAGE_URL=file:///data/backups in .env. The image lets workspace owners connect a Postgres database
+# of their own for their backups; WORKSPACE_DATABASES=false in .env turns that off. For Postgres, run
 # `docker compose --profile postgres up` and set in .env:
 #   DATABASE_URL=postgres://pistead:change-me@postgres:5432/pistead
 services:

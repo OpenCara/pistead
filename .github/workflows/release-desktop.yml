@@ -1,0 +1,127 @@
+name: Release desktop
+# Pushing a desktop-v1.2.3 tag (desktop-v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then builds the
+# desktop app (apps/desktop) at the tag's version and attaches it to the tag's GitHub release, which is marked latest
+# unless it is a prerelease. Every platform is built from the same tag: macOS (arm64 DMG and zip) today. Windows and
+# Linux, declared in electron-builder.yml, become one more job each uploading a desktop-<platform> artifact, listed in
+# github-release's needs.
+#
+# The app bundles the connector from packages/cli at the tagged commit, whatever version npm has.
+#
+# macOS signing, in the `release` environment (README.md, "Releasing"): MAC_CERTIFICATE_P12 (base64 Developer ID
+# Application .p12), MAC_CERTIFICATE_PASSWORD, the variable MAC_SIGNING_IDENTITY (the certificate's name, e.g.
+# "OpenCara (TEAMID)"), and for notarization APP_STORE_CONNECT_API_KEY (the .p8's contents),
+# APP_STORE_CONNECT_API_KEY_ID and APP_STORE_CONNECT_API_ISSUER_ID. Without the certificate the app is ad-hoc signed,
+# as `pnpm --filter @pistead/desktop dist` builds it, and Gatekeeper blocks it on other Macs.
+on:
+  push:
+    tags: ["desktop-v*.*.*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    uses: ./.github/workflows/release-check.yml
+    with:
+      prefix: desktop-
+
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+
+  macos:
+    needs: [check, ci]
+    runs-on: macos-latest # Apple silicon: the app is built for arm64 only.
+    timeout-minutes: 45
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Set the version from the tag
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: node scripts/set-release-version.mjs "$VERSION" desktop
+      - run: pnpm --filter @pistead/desktop build
+      - name: Stage the connector
+        working-directory: apps/desktop
+        run: node scripts/stage-connector.mjs
+      # Developer ID signing, hardened runtime and notarization when the certificate is configured; otherwise the
+      # ad-hoc signature of electron-builder.yml. electron-builder imports CSC_LINK into a temporary keychain.
+      - name: Package
+        working-directory: apps/desktop
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTIFICATE_P12 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_SIGNING_IDENTITY: ${{ vars.MAC_SIGNING_IDENTITY }}
+          API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          args=(--mac --publish never)
+          if [ -n "$CSC_LINK" ]; then
+            if [ -z "$MAC_SIGNING_IDENTITY" ] || [ -z "$API_KEY" ] || [ -z "$APPLE_API_KEY_ID" ] || [ -z "$APPLE_API_ISSUER" ]; then
+              echo "::error::MAC_CERTIFICATE_P12 is set, so signing also needs the MAC_SIGNING_IDENTITY variable and the APP_STORE_CONNECT_API_KEY, APP_STORE_CONNECT_API_KEY_ID and APP_STORE_CONNECT_API_ISSUER_ID secrets to notarize."
+              exit 1
+            fi
+            export APPLE_API_KEY="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
+            printf '%s\n' "$API_KEY" > "$APPLE_API_KEY"
+            args+=("-c.mac.identity=$MAC_SIGNING_IDENTITY" -c.mac.hardenedRuntime=true -c.mac.notarize=true)
+          else
+            unset CSC_LINK CSC_KEY_PASSWORD
+            echo "::warning::MAC_CERTIFICATE_P12 is not set: the macOS app is ad-hoc signed and not notarized, so Gatekeeper blocks it on other Macs."
+          fi
+          pnpm exec electron-builder "${args[@]}"
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+      - name: Check the signature
+        working-directory: apps/desktop
+        env:
+          SIGNED: ${{ secrets.MAC_CERTIFICATE_P12 != '' }}
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/release/mac-arm64/Pistead.app
+          if [ "$SIGNED" = true ]; then
+            spctl --assess --type execute --verbose dist/release/mac-arm64/Pistead.app
+            xcrun stapler validate dist/release/mac-arm64/Pistead.app
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos
+          path: |
+            apps/desktop/dist/release/*.dmg
+            apps/desktop/dist/release/*.zip
+          if-no-files-found: error
+
+  # One release for every platform's files; a re-run replaces them.
+  github-release:
+    needs: [check, macos]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: assets
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+          PREVIOUS_TAG: ${{ needs.check.outputs.previous-tag }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            exit 0
+          fi
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease --latest=false); else flags+=(--latest); fi
+          [ -n "$PREVIOUS_TAG" ] && flags+=(--notes-start-tag "$PREVIOUS_TAG")
+          gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Pistead desktop $VERSION" --generate-notes "${flags[@]}"

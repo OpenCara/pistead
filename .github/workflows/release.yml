@@ -1,12 +1,13 @@
-name: Release
-# Pushing a version tag (v1.2.3, or v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then publishes the
-# `pistead` connector from packages/cli to npm and the server image to ghcr.io/opencara/pistead. The tag decides the
-# published version: the npm job sets it in packages/cli/package.json and npm-shrinkwrap.json before building, so no
-# version bump needs committing first. npm auth: a trusted publisher for this workflow on npmjs.com, or an NPM_TOKEN
-# repository secret.
+name: Release pistead (npm)
+# Pushing a cli-v1.2.3 tag (cli-v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then publishes the
+# `pistead` connector from packages/cli to npm, a prerelease to the `next` dist-tag. The tag decides the version:
+# scripts/set-release-version.mjs sets it in package.json and npm-shrinkwrap.json before building, so no version bump
+# needs committing first. The other release lines are in release-check.yml.
+# npm auth: a trusted publisher on npmjs.com for this workflow file (release.yml, keep its name) and environment
+# `release`, or an NPM_TOKEN secret.
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["cli-v*.*.*"]
 permissions:
   contents: read
 concurrency:
@@ -14,31 +15,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      prerelease: ${{ steps.version.outputs.prerelease }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Tagged commit is on main
-        run: |
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main."
-            exit 1
-          fi
-      - name: Version from the tag
-        id: version
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME is not a version (v1.2.3, or v1.2.3-beta.1 for a prerelease)."
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          case "$version" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;; esac
+    uses: ./.github/workflows/release-check.yml
+    with:
+      prefix: cli-
 
   ci:
     needs: check
@@ -62,23 +41,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # The tag's version, in the manifest and the shrinkwrap alike (prepublishOnly checks they agree); the build bundles it.
       - name: Set the connector version from the tag
-        working-directory: packages/cli
         env:
           VERSION: ${{ needs.check.outputs.version }}
-        run: |
-          node -e '
-            const fs = require("node:fs");
-            const version = process.env.VERSION;
-            // Only the version field changes; the manifest keeps its own formatting.
-            const manifest = fs.readFileSync("package.json", "utf8").replace(/^(  "version": )"[^"]*"/m, (_, key) => key + JSON.stringify(version));
-            if (JSON.parse(manifest).version !== version) throw new Error("package.json has no top-level version field");
-            fs.writeFileSync("package.json", manifest);
-            const shrinkwrap = JSON.parse(fs.readFileSync("npm-shrinkwrap.json", "utf8"));
-            shrinkwrap.version = version;
-            shrinkwrap.packages[""].version = version;
-            fs.writeFileSync("npm-shrinkwrap.json", JSON.stringify(shrinkwrap, null, 2) + "\n");
-          '
-          node -p '"Publishing pistead@" + require("./package.json").version'
+        run: node scripts/set-release-version.mjs "$VERSION" cli
       # prepublishOnly checks the shrinkwrap and builds dist.
       - name: Publish pistead
         working-directory: packages/cli
@@ -86,40 +51,3 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DIST_TAG: ${{ needs.check.outputs.prerelease == 'true' && 'next' || 'latest' }}
         run: npm publish --provenance --access public --tag "$DIST_TAG"
-
-  docker:
-    needs: [check, ci]
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Image name
-        id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      # 1.2.3, 1.2 and latest for a release; only the full version for a prerelease.
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.image.outputs.name }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

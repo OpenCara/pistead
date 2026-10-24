@@ -1,0 +1,88 @@
+name: Release server
+# Pushing a server-v1.2.3 tag (server-v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then publishes the
+# server image, the web app and the backend in one, to ghcr.io/opencara/pistead (1.2.3, 1.2 and latest; only the full
+# version for a prerelease) and creates the tag's GitHub release, with notes since the previous server-v tag.
+on:
+  push:
+    tags: ["server-v*.*.*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    uses: ./.github/workflows/release-check.yml
+    with:
+      prefix: server-
+
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+
+  docker:
+    needs: [check, ci]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The tag (server-v1.2.3) is not itself semver, so the version comes from the check. {{major}}.{{minor}} is
+      # skipped for a prerelease, and latest is set only for a release.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.check.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.check.outputs.prerelease == 'false' }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    needs: [check, docker]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+          PREVIOUS_TAG: ${{ needs.check.outputs.previous-tag }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "The release $GITHUB_REF_NAME already exists."
+            exit 0
+          fi
+          # Only the desktop release is marked latest: it's the one with downloads.
+          flags=(--latest=false)
+          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+          [ -n "$PREVIOUS_TAG" ] && flags+=(--notes-start-tag "$PREVIOUS_TAG")
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Server $VERSION" --generate-notes "${flags[@]}" \
+            --notes "Image: \`docker pull ${IMAGE,,}:$VERSION\`"
