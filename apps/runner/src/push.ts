@@ -149,6 +149,11 @@ async function performTagPush(options: {
   }
   const report = await remote.push({ ref, old: ZERO_OID, new: operation.commit }, pack, advertised.capabilities);
   if (report.status !== "ok") {
+    // The tag may have been created at this very commit since the advertisement (another push of the same release):
+    // that is the outcome asked for, so it is up to date rather than refused.
+    let now: string | undefined;
+    try { now = (await remote.receivePackAdvertisement()).refs.get(ref); } catch { /* report the rejection */ }
+    if (now === operation.commit) return { outcome: "up-to-date", ...result };
     const reason = (report.reason ?? "").replace(/[^\x20-\x7e]/g, " ").trim().slice(0, 200);
     throw new PushError(`Git remote rejected the tag${reason ? ` (${reason})` : ""}`);
   }
