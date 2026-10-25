@@ -78,7 +78,11 @@ const DECISION_WAIT_MS = 60 * 60 * 1000;
 function holdsQueue(run: Run): boolean {
   return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
 }
-/** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
+/**
+ * The control plane rejects approval results above 8192 characters, so the approval record keeps the start and the
+ * (usually decisive) end of a longer one. The tool call waiting on it still returns the whole output to the agent
+ * (see `RunnerSession.#wholeResults`).
+ */
 function boundedResult(value: string): string {
   if (value.length <= 8000) return value;
   return `${value.slice(0, 2000)}\n… ${value.length - 7500} characters omitted …\n${value.slice(-5500)}`;
@@ -184,6 +188,12 @@ export class RunnerSession {
   #recovery: Promise<void> | undefined;
   /** Tool calls waiting on a card, by approval id, until it settles (see `settled`); `mutate` hands them the card. */
   #approvalWaiters = new Map<string, PromiseWithResolvers<ApprovalRecord>>();
+  /**
+   * The whole result of an operation whose record keeps only an excerpt, by approval id, until the tool call waiting
+   * on it returns it to the agent. Held in memory only: backups, views and the control plane get the bounded record,
+   * and a call that outlives its runner process is interrupted anyway.
+   */
+  #wholeResults = new Map<string, string>();
   /**
    * Cloning a restored session's clones again can take minutes, far longer than the control plane waits for `create`.
    * It runs in the background; runs are held until it is done (see drainQueue).
@@ -782,12 +792,28 @@ export class RunnerSession {
   private async operationOutcome(approval: ApprovalRecord, waiting: Context): Promise<ApprovalRecord> {
     if (settled(approval)) {
       this.#approvalWaiters.delete(approval.id);
-      return approval;
+      return this.whole(approval);
     }
     const state = await this.metadata();
     const actor = state.toolActors[approval.id.slice("tool-".length)];
     const run = actor && state.runs[actor.runKey];
-    return this.awaitCard(approval.id, waiting, (run?.submittedAt ?? Date.now()) + DECISION_WAIT_MS);
+    return this.whole(await this.awaitCard(approval.id, waiting, (run?.submittedAt ?? Date.now()) + DECISION_WAIT_MS));
+  }
+
+  /** `result` as the approval record keeps it; the whole of a longer one waits for the tool call (see `whole`). */
+  private kept(id: string, result: string): string {
+    const bounded = boundedResult(result);
+    if (bounded === result) this.#wholeResults.delete(id);
+    else this.#wholeResults.set(id, result);
+    return bounded;
+  }
+
+  /** `approval` with its whole result, for the tool call returning it to the agent; the result is then let go. */
+  private whole(approval: ApprovalRecord): ApprovalRecord {
+    const result = this.#wholeResults.get(approval.id);
+    if (result === undefined || !settled(approval)) return approval;
+    this.#wholeResults.delete(approval.id);
+    return { ...approval, result };
   }
 
   /** What the agent is doing now (see SessionActivity). */
@@ -1398,7 +1424,7 @@ export class RunnerSession {
         result = error instanceof SandboxProcessError ? `${error.message}${error.stdout ? `\n${error.stdout}` : ""}`
           : refused ? (error as RunnerError).message : "Effect interrupted or outcome unknown. Inspect the session list or host before requesting another operation.";
       }
-      if (generation === this.generation) await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: boundedResult(result) }); });
+      if (generation === this.generation) await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: this.kept(id, result) }); });
     })().catch(() => { /* Durable executing records become interrupted on reopen. */ }).finally(() => {
       this.pushes.delete(entry);
       if (generation === this.generation && !this.closing) this.drainQueue();
@@ -1506,7 +1532,7 @@ export class RunnerSession {
       const entry = { controller: new AbortController(), done: Promise.resolve() };
       const settled = (async () => {
         const outcome = await this.runPush(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); }, entry.controller.signal);
-        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: boundedResult(outcome.result) }); });
+        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: this.kept(id, outcome.result) }); });
       })();
       entry.done = settled.then(() => undefined, () => undefined);
       this.pushes.add(entry);
@@ -1525,7 +1551,7 @@ export class RunnerSession {
       if (error instanceof SandboxProcessError) { status = "failed"; result = `${error.message}${error.stdout ? `\n${error.stdout}` : ""}`; }
       else { status = "interrupted"; result = "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited."; }
     }
-    await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: boundedResult(result) }); });
+    await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: this.kept(id, result) }); });
     return (await this.metadata()).approvals[id]!;
   }
 
@@ -1614,7 +1640,7 @@ export class RunnerSession {
             await this.authorize(ticket.actorId, "approve");
           }, controller.signal);
           if (generation !== this.generation) return;
-          await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: boundedResult(outcome.result) }); });
+          await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: outcome.status, result: this.kept(id, outcome.result) }); });
         })().catch(() => { /* Reopening marks a still-executing approval interrupted; never retry the push. */ })
           .finally(() => {
             this.pushes.delete(entry);
@@ -1651,11 +1677,11 @@ export class RunnerSession {
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
         }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true });
-        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executed", result: boundedResult(result) }); });
+        await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executed", result: this.kept(id, result) }); });
       } catch (error) {
         // GitHub said why it didn't merge or open the issue: nothing changed, so the agent can act on the reason.
         const outcome = error instanceof RunnerError && error.status === 422 && (approval.operation.kind === "github.merge" || approval.operation.kind === "github.issue")
-          ? { status: "failed" as const, result: boundedResult(error.message) }
+          ? { status: "failed" as const, result: this.kept(id, error.message) }
           : { status: "interrupted" as const, result: "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited." };
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, outcome); });
       }
@@ -1798,6 +1824,7 @@ export class RunnerSession {
 
   async close({ abortPushes = true }: { abortPushes?: boolean } = {}): Promise<void> {
     this.closing = true;
+    this.#wholeResults.clear();
     // A long fetch stops at once; a checkout already under way finishes in the sandbox and the next open finds it ready.
     const preparation = this.#repositories;
     if (preparation.status === "preparing") preparation.controller.abort();
