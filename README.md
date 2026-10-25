@@ -91,7 +91,7 @@ Create a workspace with **New workspace** in the sidebar or on the home screen; 
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Below the owner there are four tiers:
 
-- **Viewer**: follows workspace-visible sessions read-only and can't start (or restore) sessions. A session grant can't give a viewer more than read.
+- **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session grant can't give a viewer more than read.
 - **Member**: starts sessions, and follows other people's workspace-visible sessions read-only unless their owner grants more.
 - **Collaborator**: starts sessions, and can send messages and side asks to any workspace-visible session.
 - **Admin**: everything a collaborator can do, plus managing the workspace.
