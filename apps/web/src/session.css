@@ -222,6 +222,7 @@
 
   @media (max-width: 600px) {
     .session-badges > .badge:not(:first-child) { display: none; }
+    .session-pull-link > .icon:last-child { display: none; }
     .chat-column { padding: 0 var(--space-3); }
   }
 }

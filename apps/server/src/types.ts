@@ -78,6 +78,8 @@ export interface SessionRow {
   archived_status?: 'provisioning' | 'ready' | 'error' | null;
   /** What its agent is doing, as its host last reported it; display state only, never part of the runner binding. */
   activity?: SessionActivity | null;
+  /** Only on rows read through session access: the newest pull request a push from this session opened or found. */
+  pull_request_url?: string | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;
