@@ -1,5 +1,4 @@
 import type { ApprovalRecord, Operation, ToolName } from '../../../packages/shared/src/types.js';
-import { MAX_APPROVAL_RESULT } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow } from './types.js';
 import { fail, identifier, now, text, userIdentifier } from './http.js';
@@ -114,7 +113,7 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
     const approval: ApprovalRecord = { id: approvalId, sessionId: row.id, requestedBy, operation, status: raw.status,
       createdAt: text(raw.createdAt, 'createdAt', 64),
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
-      ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', MAX_APPROVAL_RESULT, 0) }) };
+      ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
     // Only the owner's own commands, commits, pushes and repins may auto-approve, never a GitHub comment, merge or issue.
     if (raw.automatic !== undefined) {
       if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id || approval.status === 'pending'

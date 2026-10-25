@@ -1,14 +1,6 @@
 import type { GitProvider, SessionRepository } from "./repositories.js";
 import type { ChatImage } from "./chat-images.js";
 
-/** The most a command may print, stdout and stderr together, before it is stopped. */
-export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
-/**
- * The longest approval result: a command's whole output, and room for the failure note before it. Results are not
- * truncated, so this only has to hold everything a command may print.
- */
-export const MAX_APPROVAL_RESULT = MAX_OUTPUT_BYTES + 64 * 1024;
-
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
 export type WorkspaceRole = "owner" | "admin" | "member";

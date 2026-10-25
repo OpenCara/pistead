@@ -1,6 +1,4 @@
-import { MAX_OUTPUT_BYTES } from "../../../packages/shared/src/types.js";
-
-export { MAX_OUTPUT_BYTES };
+export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 export class SandboxProcessError extends Error {
   readonly exitCode: number | null;

@@ -511,6 +511,28 @@ async function hostFixture(t: { after: (fn: () => Promise<void>) => void }, extr
   return { service, grants };
 }
 
+test("the agent gets a command's whole output; the approval record and the control plane keep an excerpt", hostMode, async t => {
+  const { service } = await hostFixture(t);
+  const session = await service.provision(binding("long-output"), await ticket("long-output", "create"));
+  const command = "printf start-marker; head -c 20000 /dev/zero | tr '\\0' x; printf end-marker";
+  const whole = new RegExp(`start-marker${"x".repeat(20000)}end-marker`);
+
+  await session.submit(await ticket("long-output", "submit"), { content: `TEST_BASH ${command}`, requestId: "auto", options: { access: "auto" } }, "write");
+  await idle(session);
+  assert.ok(toolOutput(await session.view(), whole), "an auto-approved command's whole output reaches the agent");
+
+  await session.submit(await ticket("long-output", "submit"), { content: `TEST_BASH ${command}`, requestId: "approved" }, "write");
+  const [pending] = await operationRequests(session);
+  const ran = await session.decide(await ticket("long-output", "approve"), pending!.id, { decision: "approve", operation: pending!.operation });
+  assert.equal(ran.status, "executed");
+  assert.ok(ran.result!.length <= 8192, "the control plane gets an excerpt it accepts");
+  assert.match(ran.result!, /^start-marker[\s\S]*characters omitted[\s\S]*end-marker$/);
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.entries.filter(entry => entry.role === "toolResult" && whole.test(entry.text)).length, 2, "an approved command's whole output reaches the agent too");
+  assert.ok(view.approvals.every(approval => (approval.result?.length ?? 0) <= 1000));
+});
+
 test("read access asks the owner before a change, and auto access runs owner commands immediately", hostMode, async t => {
   const { service } = await hostFixture(t);
   const session = await service.provision(binding("options-session"), await ticket("options-session", "create"));
