@@ -234,7 +234,9 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     const targetId = userIdentifier(body.userId);
     const role = body.role;
     if (typeof role !== 'string' || !(assignableWorkspaceRoles as readonly string[]).includes(role)) fail(400, 'invalid_input', 'Invalid role.');
-    await requireMemberManagement(c.env, workspaceId, actorId, targetId, role as AssignableWorkspaceRole);
+    const previous = await requireMemberManagement(c.env, workspaceId, actorId, targetId, role as AssignableWorkspaceRole);
+    // Saving a member with the role they hold changes nothing, so it neither writes nor disturbs the workspace's sessions.
+    if (previous === role) return c.json({ members: await membersStatement(c.env, workspaceId, actorId).all() });
     const user = await c.env.DB.query<{ id: string }>('SELECT id FROM users WHERE id = ?').bind(targetId).first();
     if (!user) fail(404, 'not_found', 'User not found.');
     const auditId = id();
@@ -248,14 +250,16 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         WHERE w.id = ? AND u.id <> w.owner_id AND (target.role IS NULL OR target.role <> 'owner')
           AND ((actor.role = 'owner' AND actor.user_id = w.owner_id)
             OR (actor.role = 'admin' AND ? IN (${adminManagedRoles.map(item => `'${item}'`).join(', ')}) AND (target.role IS NULL OR target.role IN (${adminManagedRoles.map(item => `'${item}'`).join(', ')}))))
-        ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = excluded.role`)
-        .bind(role, now(), actorId, targetId, workspaceId, role),
+        ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = excluded.role
+          WHERE workspace_members.role = ?`)
+        // Only from the role authorized above: a concurrent change (or a racing add, '') leaves no row changed.
+        .bind(role, now(), actorId, targetId, workspaceId, role, previous ?? ''),
       auditAfterChange(c.env, actorId, 'workspace.member.upsert', workspaceId, { userId: targetId, role }, auditId),
-      // A role decides what its member can do in the workspace's sessions, so a change invalidates tickets and
-      // capabilities issued under the previous one, as a removal does.
+      // A role decides what its member can do in the workspace's sessions, so changing an existing member's role
+      // invalidates tickets and capabilities issued under the previous one, as a removal does. A new member loses nothing.
       c.env.DB.query<never>(`UPDATE sessions SET policy_version = policy_version + 1
-        WHERE workspace_id = ? AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
-        .bind(workspaceId, auditId),
+        WHERE workspace_id = ? AND ? = 1 AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, previous ? 1 : 0, auditId),
       membersStatement(c.env, workspaceId, actorId),
     ]);
     if (result[0].changes !== 1) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');

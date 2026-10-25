@@ -663,8 +663,16 @@ test('workspace roles: viewers read and create nothing, members read, collaborat
   assert.equal((await admin.request('POST', members, { userId: other.user.id, role: 'admin' })).status, 403);
   assert.equal((await admin.request('POST', members, { userId: admin.user.id, role: 'member' })).status, 403);
   assert.equal((await collaborator.request('POST', members, { userId: other.user.id, role: 'member' })).status, 403);
-  // A role change takes effect at once and invalidates what was issued under the previous one.
-  const before = (f.sqlite.prepare("SELECT policy_version FROM sessions WHERE id = 'roles-shared'").get() as { policy_version: number }).policy_version;
+  // A role change takes effect at once and invalidates what was issued under the previous one; re-saving a member's
+  // current role, or adding someone new, takes nothing away and leaves the workspace's sessions alone.
+  const version = () => (f.sqlite.prepare("SELECT policy_version FROM sessions WHERE id = 'roles-shared'").get() as { policy_version: number }).policy_version;
+  const before = version();
+  const resaved = await admin.request('POST', members, { userId: collaborator.user.id, role: 'collaborator' });
+  assert.equal(resaved.status, 200);
+  assert.ok((await resaved.json() as { members: { userId: string; role: string }[] }).members.some(item => item.userId === collaborator.user.id && item.role === 'collaborator'));
+  const newcomer = await f.client('roles-newcomer');
+  assert.equal((await admin.request('POST', members, { userId: newcomer.user.id, role: 'member' })).status, 200);
+  assert.equal(version(), before);
   assert.equal((await admin.request('POST', members, { userId: collaborator.user.id, role: 'member' })).status, 200);
   assert.deepEqual(await held(collaborator, 'roles-shared'), ['read']);
   assert.equal((f.sqlite.prepare("SELECT policy_version FROM sessions WHERE id = 'roles-shared'").get() as { policy_version: number }).policy_version, before + 1);

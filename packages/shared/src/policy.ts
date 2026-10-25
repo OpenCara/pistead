@@ -44,15 +44,19 @@ export const adminManagedRoles: readonly WorkspaceRole[] = ["collaborator", "mem
  * admins and the owner send messages (write) and side asks; members and viewers follow it read-only.
  */
 export function workspaceSessionPermissions(role: WorkspaceRole): Permission[] {
-  return role === "owner" || role === "admin" || role === "collaborator" ? ["read", "ask", "write"] : ["read"];
+  return sharedSessionWriterRoles.includes(role) ? ["read", "ask", "write"] : ["read"];
 }
+/** Roles that send messages to any session shared with the workspace (see workspaceSessionPermissions). */
+export const sharedSessionWriterRoles: readonly WorkspaceRole[] = ["owner", "admin", "collaborator"];
+/** Roles whose explicit session grants are capped at read (see roleSessionCeiling). */
+export const readOnlyRoles: readonly WorkspaceRole[] = ["viewer"];
 
 /**
  * A role's ceiling on any session it doesn't own, whatever its explicit grants: a viewer only ever reads.
  * Null means no ceiling beyond the grants themselves.
  */
 export function roleSessionCeiling(role: WorkspaceRole): readonly Permission[] | null {
-  return role === "viewer" ? ["read"] : null;
+  return readOnlyRoles.includes(role) ? ["read"] : null;
 }
 
 /** Whether a role may start sessions; a workspace listing without a role (an older server) counts as a member. */

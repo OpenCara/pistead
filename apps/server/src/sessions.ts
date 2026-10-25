@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
-import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionView, SubmitResult } from '../../../packages/shared/src/types.js';
+import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionView, SubmitResult, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { accessModes, permissions, thinkingLevels } from '../../../packages/shared/src/types.js';
 import { connectorLimits, type ConnectorCapabilities, type LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { parseChatImages, type ChatImage } from '../../../packages/shared/src/chat-images.js';
@@ -478,11 +478,17 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.get('/api/sessions/:id/grants', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
-    const result = await c.env.DB.query<{ user_id: string; permissions_json: string }>(`SELECT g.user_id, g.permissions_json FROM session_grants g
+    const result = await c.env.DB.query<{ user_id: string; permissions_json: string; role: WorkspaceRole }>(`SELECT g.user_id, g.permissions_json, m.role
+      FROM session_grants g
       INNER JOIN workspace_members m ON m.workspace_id = ? AND m.user_id = g.user_id WHERE g.session_id = ?`)
       .bind(row.workspace_id, row.id).all();
+    // A grant shows what it allows: a viewer's (one demoted after it was granted) is capped at read, as sessionAccess caps it.
+    const effective = (grant: { permissions_json: string; role: WorkspaceRole }) => {
+      const ceiling = roleSessionCeiling(grant.role);
+      return normalizePermissions(JSON.parse(grant.permissions_json)).filter(permission => !ceiling || ceiling.includes(permission));
+    };
     return c.json({ grants: [{ userId: row.owner_id, permissions: [...permissions] }, ...result.filter(g => g.user_id !== row.owner_id)
-      .map(g => ({ userId: g.user_id, permissions: normalizePermissions(JSON.parse(g.permissions_json)) }))] });
+      .map(g => ({ userId: g.user_id, permissions: effective(g) }))] });
   });
   app.post('/api/sessions/:id/grants', async c => {
     const access = await requireSession(c, identifier(c.req.param('id')), 'manage');
