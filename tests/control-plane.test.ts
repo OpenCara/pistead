@@ -679,3 +679,61 @@ test('workspace roles: viewers read and create nothing, members read, collaborat
   assert.equal((await admin.request('DELETE', `${members}/${other.user.id}`)).status, 204);
   assert.equal((await owner.request('POST', members, { userId: admin.user.id, role: 'collaborator' })).status, 200);
 });
+
+test('session roles: an owner gives a member one of four tiers, capped by their workspace role and the giver\'s own access', async t => {
+  const f = await fixture(t);
+  const owner = await f.client('tiers-owner');
+  const [viewer, member, collaborator, manager] = await Promise.all(['tiers-viewer', 'tiers-member', 'tiers-collaborator', 'tiers-manager'].map(name => f.client(name)));
+  const workspace = (await (await owner.request('POST', '/api/workspaces', { name: 'tiers' })).json() as { workspace: { id: string } }).workspace;
+  const members = `/api/workspaces/${workspace.id}/members`;
+  for (const [client, role] of [[viewer, 'viewer'], [member, 'member'], [collaborator, 'collaborator'], [manager, 'member']] as const) {
+    assert.equal((await owner.request('POST', members, { userId: client.user.id, role })).status, 200);
+  }
+  const model = (await (await owner.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'tiers', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
+  const agent = seedAgentVersion(f.sqlite, { authorId: owner.user.id, modelId: model.id, tools: ['identity'] });
+  f.sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,visibility) VALUES (?,?,?,?,?,?,?,?)')
+    .run('tiers-private', workspace.id, owner.user.id, agent.id, 'private', 'ready', new Date().toISOString(), 'private');
+  const grants = '/api/sessions/tiers-private/grants';
+  const held = async (client: { user: { id: string } }) => (await sessionAccess(f.env, 'tiers-private', client.user.id))?.permissions ?? null;
+  const code = async (response: Response) => (await response.json() as { code: string }).code;
+
+  // Each tier is the permissions of the one below it and more.
+  const tiers = [['viewer', ['read']], ['member', ['read', 'ask']], ['collaborator', ['read', 'ask', 'write']], ['admin', ['read', 'ask', 'write', 'approve', 'manage']]] as const;
+  for (const [role, permissions] of tiers) {
+    const saved = await owner.request('POST', grants, { userId: member.user.id, role });
+    assert.equal(saved.status, 200, role);
+    assert.deepEqual((await saved.json() as { grant: unknown }).grant, { userId: member.user.id, permissions, workspaceRole: 'member', sessionRole: role });
+    assert.deepEqual(await held(member), permissions, role);
+  }
+  // A role or permissions, never both or neither; an unknown tier is refused.
+  for (const body of [{ userId: member.user.id }, { userId: member.user.id, role: 'viewer', permissions: ['read'] }, { userId: member.user.id, role: 'owner' }, { userId: member.user.id, role: 1 }]) {
+    assert.equal((await owner.request('POST', grants, body)).status, 400, JSON.stringify(body));
+  }
+  assert.deepEqual(await held(member), ['read', 'ask', 'write', 'approve', 'manage']);
+
+  // A workspace viewer can only be a session viewer.
+  assert.equal((await owner.request('POST', grants, { userId: viewer.user.id, role: 'viewer' })).status, 200);
+  const refused = await owner.request('POST', grants, { userId: viewer.user.id, role: 'member' });
+  assert.equal(refused.status, 400);
+  assert.equal(await code(refused), 'viewer_role');
+  assert.deepEqual(await held(viewer), ['read']);
+
+  // A session admin who isn't its owner can't give a tier above what it holds.
+  f.sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)')
+    .run('tiers-private', manager.user.id, JSON.stringify(['read', 'ask', 'manage']), new Date().toISOString());
+  assert.equal((await manager.request('POST', grants, { userId: collaborator.user.id, role: 'member' })).status, 200);
+  const escalated = await manager.request('POST', grants, { userId: collaborator.user.id, role: 'collaborator' });
+  assert.equal(escalated.status, 403);
+  assert.equal(await code(escalated), 'grant_escalation');
+
+  // The listing names each grantee's workspace role and tier; a grant matching no tier is custom (null).
+  const listed = (await (await owner.request('GET', grants)).json() as { grants: { userId: string; sessionRole: string | null; workspaceRole?: string }[] }).grants;
+  const tier = (client: { user: { id: string } }) => listed.find(grant => grant.userId === client.user.id);
+  assert.deepEqual(tier(owner), { userId: owner.user.id, permissions: ['read', 'ask', 'write', 'approve', 'manage'], sessionRole: 'admin' });
+  assert.equal(tier(member)?.sessionRole, 'admin');
+  assert.equal(tier(viewer)?.sessionRole, 'viewer');
+  assert.equal(tier(viewer)?.workspaceRole, 'viewer');
+  assert.equal(tier(collaborator)?.sessionRole, 'member');
+  assert.equal(tier(collaborator)?.workspaceRole, 'collaborator');
+  assert.equal(tier(manager)?.sessionRole, null);
+});

@@ -102,7 +102,7 @@ Create a workspace with **New workspace** in the sidebar or on the home screen; 
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Below the owner there are four tiers:
 
-- **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session grant can't give a viewer more than read.
+- **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session role can't give a viewer more than session viewer (read).
 - **Member**: starts sessions, and follows other people's workspace-visible sessions read-only unless their owner grants more.
 - **Collaborator**: starts sessions, and can send messages and side asks to any workspace-visible session.
 - **Admin**: everything a collaborator can do, plus managing the workspace.
@@ -390,7 +390,7 @@ The call can wait for the answer until an hour after its message was sent, and t
 
 ### Collaborating on a session
 
-A session is a chat that can be shared. Teammates watch it live, ask side questions, send messages that drive the work, and approve its commands and pushes. Each person gets only the permissions the session's owner and their workspace role allow. Everything still runs as the session owner, whoever sends the message.
+A session is a chat that can be shared. Teammates watch it live, ask side questions, send messages that drive the work, and approve its commands and pushes. Each person gets only what their session role, given by the session's owner, and their workspace role allow. Everything still runs as the session owner, whoever sends the message.
 
 A typical day, with Alice's shared host from [Sharing a host](#sharing-a-host):
 
@@ -399,8 +399,8 @@ sequenceDiagram
     autonumber
     actor Alice as Alice (host owner)
     actor Bob as Bob (session owner)
-    actor Carol as Carol (write, approve)
-    actor Dan as Dan (ask)
+    actor Carol as Carol (session admin)
+    actor Dan as Dan (session member)
     participant P as Pistead
     participant H as Alice's host (Pi + subscription)
 
@@ -418,18 +418,19 @@ sequenceDiagram
     P-->>Bob: Read-only link for anyone, no sign-in needed
 ```
 
-#### Visibility and grants
+#### Visibility and session roles
 
 - **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. Collaborators and admins can also send them messages. **Private** sessions only by the owner and people with a grant. Only the owner changes visibility; making a session private keeps explicit grants but can't recall what was already seen.
-- Grants (**Details → People → Grants**) give a workspace member permissions on one session. Each includes read, you can grant only what you hold, and the owner's own access can't be changed. Revoking a grant doesn't take away what a member's role gives on a workspace-visible session (viewing, and for collaborators and admins messaging); making it private does. A viewer can only be granted read.
+- Session roles (**Details → People → Session roles**) give a workspace member one of four tiers of access to one session, named after the workspace roles. Each tier includes everything in the tiers below it. You can only give a tier whose permissions you hold, and the owner's own access can't be changed. A workspace viewer can only be a session viewer. Removing someone's session role doesn't take away what their workspace role gives them on a workspace-visible session (viewing, and for collaborators and admins messaging); making the session private does.
 
-| Permission | Allows |
-|---|---|
-| `read` | Viewing the session, its side asks, approvals and activity |
-| `ask` | Sending side asks |
-| `write` | Sending shared messages and requesting operations |
-| `approve` | Deciding approvals (host commands need the host's owner; permission requests, the session owner) |
-| `manage` | Managing the session's grants |
+| Session role | Permissions | Allows |
+|---|---|---|
+| **Viewer** | `read` | Viewing the session, its side asks, approvals and activity |
+| **Member** | `read`, `ask` | Also sending side asks |
+| **Collaborator** | `read`, `ask`, `write` | Also sending shared messages, stopping work and requesting operations |
+| **Admin** | `read`, `ask`, `write`, `approve`, `manage` | Also deciding approvals (host commands need the host's owner; permission requests, the session owner) and managing who has a session role |
+
+The API takes a tier (`POST /api/sessions/:id/grants` with `{ userId, role }`) or, as before, an explicit permission list (`{ userId, permissions }`). A grant that matches no tier, such as one made before tiers existed, shows as **Custom** until someone chooses a tier for it.
 
 Only the session's owner can rename, archive or restart it, change its visibility or share link, back it up, restore or export it, use **Auto-approve**, and decide permission requests.
 
