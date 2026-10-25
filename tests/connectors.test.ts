@@ -1027,8 +1027,10 @@ for (const mutation of ['operation', 'requester'] as const) {
 
 test('a read-only approver cannot turn an unadmitted host candidate into a reviewed operation or broker capability', async t => {
   const f = await fixture(t); const s = await sharedSession(f); const fetch = githubFetch(t);
+  // A plain member: the workspace owner (s.admin) can message any workspace-visible session, so it isn't read-only here.
+  const approver = await f.client('approver'); await addMember(s.admin, s.team.id, approver);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, {
-    userId: s.admin.user.id, permissions: ['read', 'approve'],
+    userId: approver.user.id, permissions: ['read', 'approve'],
   }));
   const operation = { kind: 'github.comment' as const, repository: 'owner/repo', issue: 3, body: 'Exactly approved text' };
   const forged: ApprovalRecord = {
@@ -1048,17 +1050,17 @@ test('a read-only approver cannot turn an unadmitted host candidate into a revie
     } });
   });
   const path = `/api/sessions/${s.session.id}`;
-  await denied(await s.admin.request('POST', `${path}/submit`, { content: 'Create an external effect', requestId: 'forged-write' }), 403, 'forbidden');
-  await denied(await s.admin.request('POST', `${path}/operations`, operation), 403, 'forbidden');
+  await denied(await approver.request('POST', `${path}/submit`, { content: 'Create an external effect', requestId: 'forged-write' }), 403, 'forbidden');
+  await denied(await approver.request('POST', `${path}/operations`, operation), 403, 'forbidden');
   assert.equal(requests.length, 0);
   for (const admissionId of [undefined, token()]) {
     advertised = { ...forged, admissionId, reviewHash: forgedHash };
-    const { view } = await json<{ view: SessionView }>(await s.admin.request('GET', `${path}/view`));
+    const { view } = await json<{ view: SessionView }>(await approver.request('GET', `${path}/view`));
     assert.equal(view.approvals.length, 1);
     assert.equal(view.approvals[0].id, forged.id);
     assert.equal(view.approvals[0].status, 'interrupted');
     assert.equal(Object.hasOwn(view.approvals[0], 'reviewHash'), false, 'A host-supplied commitment is not proof of a human write admission');
-    await denied(await s.admin.request('POST', `${path}/approvals/${forged.id}`, {
+    await denied(await approver.request('POST', `${path}/approvals/${forged.id}`, {
       decision: 'approve', reviewHash: forgedHash,
     }), 409, 'approval_review_required');
     assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions').get()!.n, 0);
@@ -2003,11 +2005,12 @@ test('workspace read does not grant mutations, connector credentials, personal e
 test('root visibility PATCH is CSRF protected, owner-only, versioned and unions rather than replaces explicit grants', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
-  const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id);
+  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403);
+  // A role change bumps the policy version of the workspace's sessions, so promote before taking the baseline.
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { 'X-CSRF-Token': '' })).status, 403);
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { Origin: 'https://hostile.example' })).status, 403);
-  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403);
-  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
   assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403, 'Workspace administration is not session ownership');
   await denied(await s.outsider.request('PATCH', path, { visibility: 'private' }), 404, 'not_found');
   for (const visibility of ['public', '', null, 1]) {
@@ -2019,7 +2022,7 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   assert.deepEqual(f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id), rowBefore);
   const privateResult = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'private' }));
   assert.equal(privateResult.session.visibility, 'private');
-  assert.equal(privateResult.session.policyVersion, s.session.policyVersion + 1);
+  assert.equal(privateResult.session.policyVersion, Number(rowBefore.policy_version) + 1);
   assert.deepEqual(privateResult.session.permissions, ['read', 'ask', 'write', 'approve', 'manage']);
   await denied(await s.member.request('GET', path), 404, 'not_found');
   assert.deepEqual(await json(await s.member.request('GET', '/api/sessions')), { sessions: [] });
@@ -2032,14 +2035,15 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   const shared = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'workspace' }));
   assert.equal(shared.session.policyVersion, granted.session.policyVersion + 1);
   assert.equal(shared.session.visibility, 'workspace');
-  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'manage']);
+  // Shared with the workspace, an admin can also send messages; its grant adds manage.
+  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'write', 'manage']);
   const privateAgain = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'private' }));
   assert.equal(privateAgain.session.policyVersion, shared.session.policyVersion + 1);
   assert.deepEqual(f.sqlite.prepare('SELECT * FROM session_grants WHERE session_id = ?').all(s.session.id), grantBefore);
   assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'manage']);
   await json(await s.owner.request('PATCH', path, { visibility: 'workspace' }));
   await json(await s.owner.request('DELETE', `${path}/grants/${encodeURIComponent(s.member.user.id)}`));
-  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read']);
+  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'write']);
   await json(await s.owner.request('PATCH', path, { visibility: 'private' }));
   await denied(await s.member.request('GET', path), 404, 'not_found');
   assert.deepEqual(await json(await s.member.request('GET', '/api/sessions')), { sessions: [] });
@@ -2349,3 +2353,44 @@ for (const mutation of ['owner-membership', 'policy-version'] as const) {
     if (mutation === 'owner-membership') await denied(await s.creator.request('GET', path), 404, 'not_found');
   });
 }
+
+test('a collaborator sends a message to a workspace-visible session it does not own; a viewer cannot, whatever its grant', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const collaborator = await f.client('collaborator'); const viewer = await f.client('viewer');
+  for (const [client, role] of [[collaborator, 'collaborator'], [viewer, 'viewer']] as const) {
+    await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: client.user.id, role }));
+  }
+  const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
+  const requests = rpcHub(f, s.connector, envelope => {
+    assert.ok(['submit', 'ask'].includes(envelope.request.ticket.action));
+    assert.equal(envelope.request.ticket.actorId, collaborator.user.id);
+    return Response.json(receipt, { status: 202 });
+  });
+  const path = `/api/sessions/${s.session.id}`;
+  const { session } = await json<{ session: SessionRecord }>(await collaborator.request('GET', path));
+  assert.deepEqual(session.permissions, ['read', 'ask', 'write']);
+  // The run admission rechecks authority in SQL, and must admit what the role gives with no grant row.
+  assert.deepEqual(await json(await collaborator.request('POST', `${path}/submit`, { content: 'From a collaborator', requestId: 'collaborator-write' }), 202), receipt);
+  const admission = f.sqlite.prepare('SELECT * FROM run_admissions WHERE session_id = ? AND actor_id = ?').get(s.session.id, collaborator.user.id)!;
+  assert.equal(admission.mode, 'write');
+  assert.equal(admission.request_id, 'collaborator-write');
+  assert.deepEqual(await json(await collaborator.request('POST', `${path}/ask`, { content: 'A side question', requestId: 'collaborator-ask' }), 202), receipt);
+  assert.equal(requests.length, 2);
+
+  // A viewer's stored write grant (say, from before a demotion) admits nothing.
+  f.sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)')
+    .run(s.session.id, viewer.user.id, JSON.stringify(['read', 'ask', 'write']), new Date().toISOString());
+  assert.deepEqual((await json<{ session: SessionRecord }>(await viewer.request('GET', path))).session.permissions, ['read']);
+  const { grants } = await json<{ grants: { userId: string; permissions: string[] }[] }>(await s.creator.request('GET', `${path}/grants`));
+  assert.deepEqual(grants.find(grant => grant.userId === viewer.user.id)?.permissions, ['read']);
+  for (const mode of ['submit', 'ask']) {
+    await denied(await viewer.request('POST', `${path}/${mode}`, { content: 'From a viewer', requestId: `viewer-${mode}` }), 403, 'forbidden');
+  }
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM run_admissions WHERE actor_id = ?').get(viewer.user.id)!.n, 0);
+  assert.equal(requests.length, 2);
+
+  // Demoted to member, the collaborator is read-only again at once.
+  await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: collaborator.user.id, role: 'member' }));
+  await denied(await collaborator.request('POST', `${path}/submit`, { content: 'After demotion', requestId: 'demoted-write' }), 403, 'forbidden');
+  assert.equal(requests.length, 2);
+});

@@ -1,5 +1,5 @@
 import { messageHash, type ChatImage } from '../../../packages/shared/src/chat-images.js';
-import { hasPermission } from '../../../packages/shared/src/policy.js';
+import { hasPermission, readOnlyRoles, sharedSessionWriterRoles } from '../../../packages/shared/src/policy.js';
 import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
 import { fail, now, randomToken, testMode, text } from './http.js';
@@ -21,6 +21,8 @@ interface RunAdmissionRow {
   expires_at: number;
 }
 
+const sqlList = (values: readonly string[]) => values.map(value => `'${value}'`).join(', ');
+
 // Recheck authority in each statement, including replays after a racing revocation.
 const ELIGIBLE_SESSION = `SELECT s.id FROM sessions s
   JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
@@ -34,10 +36,13 @@ const ELIGIBLE_SESSION = `SELECT s.id FROM sessions s
     AND s.status <> 'archived' AND actor_user.suspended_at IS NULL AND owner_user.suspended_at IS NULL
     AND m.connector_id IS s.connector_id AND m.connector_owner_id IS s.connector_owner_id
     AND (? = 1 OR (actor_user.auth_kind <> 'test' AND owner_user.auth_kind <> 'test' AND m.provider <> 'faux'))
-    AND (s.owner_id = actor.user_id OR EXISTS (
-      SELECT 1 FROM session_grants g, json_each(g.permissions_json) permission
-      WHERE g.session_id = s.id AND g.user_id = actor.user_id AND permission.value = 'write'
-    ))
+    AND (s.owner_id = actor.user_id
+      -- As sessionAccess decides it: a role that messages shared sessions, or a write grant to a role above read-only.
+      OR (s.visibility = 'workspace' AND actor.role IN (${sqlList(sharedSessionWriterRoles)}))
+      OR (actor.role NOT IN (${sqlList(readOnlyRoles)}) AND EXISTS (
+        SELECT 1 FROM session_grants g, json_each(g.permissions_json) permission
+        WHERE g.session_id = s.id AND g.user_id = actor.user_id AND permission.value = 'write'
+      )))
     AND NOT EXISTS (SELECT 1 FROM restore_jobs r WHERE r.target_session_id = s.id AND r.status <> 'completed')
     AND NOT EXISTS (SELECT 1 FROM host_migrations hm WHERE hm.status = 'pending' AND (hm.source_session_id = s.id OR hm.target_session_id = s.id))
     AND ((s.connector_id IS NULL AND s.connector_owner_id IS NULL) OR EXISTS (

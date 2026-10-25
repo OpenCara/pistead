@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { ModelDefinition, SessionRecord, Workspace } from "../../../packages/shared/src/types";
+import { canCreateSessions } from "../../../packages/shared/src/policy";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
@@ -54,6 +55,9 @@ export function NewSession({ workspaceId }: { workspaceId: string }) {
     if (workspacesLoading) return <PageLoading />;
     if (workspacesError) return <div className="new-session"><Alert variant="error" title="Unable to load workspaces" actions={<Button variant="outline" size="sm" onClick={refreshWorkspaces}>Retry</Button>}>{workspacesError}</Alert></div>;
     return <div className="new-session"><EmptyState title="Workspace not found" action={<LinkButton variant="ghost" href={href({ name: "sessions" })}>View sessions</LinkButton>}>You may no longer be a member of this workspace.</EmptyState></div>;
+  }
+  if (!canCreateSessions(workspace.role)) {
+    return <div className="new-session"><EmptyState title="You're a viewer in this workspace" action={<LinkButton variant="ghost" href={href({ name: "sessions" })}>View sessions</LinkButton>}>Viewers follow the workspace's shared sessions read-only and can't start sessions. Ask a workspace owner or admin for the member role.</EmptyState></div>;
   }
   // Keyed so host, trust and repository state never carry across workspaces.
   return <Composer key={workspace.id} workspace={workspace} />;
@@ -201,7 +205,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
           <DropdownMenu label="Visibility" align="start" items={visibilityItems} trigger={<><Icon name={visibility === "workspace" ? "globe" : "lock"} size={14} />{visibility === "workspace" ? "Workspace" : "Private"}</>} />
           <InfoTip label="Who can see and do what">
             <div className="stack">
-              <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Asking the agent, invoking tools, or controlling the session needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
+              <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators and admins can also send messages to it; anything more (approving tool calls, managing the session) needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
               <p>You are the session owner; the host owner is a separate role. Viewing never grants access to your Git accounts, and visibility does not share your Pi host or local models.</p>
             </div>
           </InfoTip>

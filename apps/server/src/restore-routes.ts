@@ -4,7 +4,7 @@ import type { RunnerBinding } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { RestoreInput } from '../../../packages/shared/src/connector.js';
 import type { AppContext, SessionRow, WorkerEnv } from './types.js';
-import { auditStatement, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord } from './db.js';
+import { auditStatement, requireSessionCreator, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionCreatorSQL, sessionRecord } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, text } from './http.js';
 import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
@@ -69,6 +69,8 @@ export function registerRestoreRoutes(app: Hono<WorkerEnv>): void {
     const access = await sessionAccess(c.env, sourceId, ownerId);
     if (!access) fail(404, 'not_found', 'Source session not found.');
     if (access.row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the original session owner can restore its backups.');
+    // A restore creates a new session, which a viewer can't.
+    await requireSessionCreator(c.env, access.row.workspace_id, ownerId);
     const source = await sourceAuthority(c, sourceId, ownerId);
     // A session that pinned its repositories keeps its backups for download, not for restoring.
     requireUnfrozen(source);
@@ -94,16 +96,17 @@ export function registerRestoreRoutes(app: Hono<WorkerEnv>): void {
         c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
           connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode)
           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private', ?
-          WHERE NOT EXISTS (SELECT 1 FROM restore_jobs WHERE owner_id = ? AND request_id = ?)`)
+          WHERE NOT EXISTS (SELECT 1 FROM restore_jobs WHERE owner_id = ? AND request_id = ?) AND ${sessionCreatorSQL('?')}`)
           .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
             target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
-            target.repository_mode ?? null, ownerId, requestId),
+            target.repository_mode ?? null, ownerId, requestId, target.workspace_id, ownerId),
         c.env.DB.query(`INSERT INTO restore_jobs (id, request_id, owner_id, workspace_id, source_session_id,
           backup_id, target_session_id, request_title, sha256, size, binding_json, created_at)
           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-          WHERE NOT EXISTS (SELECT 1 FROM restore_jobs WHERE owner_id = ? AND request_id = ?)`)
+          WHERE NOT EXISTS (SELECT 1 FROM restore_jobs WHERE owner_id = ? AND request_id = ?)
+            AND EXISTS (SELECT 1 FROM sessions WHERE id = ?)`)
           .bind(restoreId, requestId, ownerId, source.workspace_id, sourceId, backupId, target.id, title,
-            backup.sha256, backup.size, JSON.stringify(binding), target.created_at, ownerId, requestId),
+            backup.sha256, backup.size, JSON.stringify(binding), target.created_at, ownerId, requestId, target.id),
       ]);
       job = await c.env.DB.query<RestoreJob>('SELECT * FROM restore_jobs WHERE owner_id = ? AND request_id = ?')
         .bind(ownerId, requestId).first();

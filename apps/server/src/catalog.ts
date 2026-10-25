@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
-import { retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
-import type { ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import { assignableWorkspaceRoles, retiredToolNames, toolNames } from '../../../packages/shared/src/types.js';
+import type { AssignableWorkspaceRole, ToolName, Workspace, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import { adminManagedRoles } from '../../../packages/shared/src/policy.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import { auditAfterChange, auditStatement, modelDefinition, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
@@ -45,7 +46,7 @@ function membersStatement(env: Env, workspaceId: string, actorId: string): Query
 }
 
 async function requireMemberManagement(
-  env: Env, workspaceId: string, actorId: string, targetId: string, role?: 'member' | 'admin',
+  env: Env, workspaceId: string, actorId: string, targetId: string, role?: AssignableWorkspaceRole,
 ): Promise<WorkspaceRole | null> {
   const authority = await env.DB.query<{ ownerId: string; actorRole: WorkspaceRole; targetRole: WorkspaceRole | null }>(`SELECT w.owner_id AS ownerId, actor.role AS actorRole,
       target.role AS targetRole
@@ -62,7 +63,8 @@ async function requireMemberManagement(
   if (targetId === authority.ownerId || authority.targetRole === 'owner') {
     fail(403, 'forbidden', 'The workspace owner membership cannot be changed or removed.');
   }
-  if (!owner && (role === 'admin' || authority.targetRole === 'admin')) {
+  // Admins manage collaborators, members and viewers; only the owner assigns, changes or removes an admin.
+  if (!owner && ((role && !adminManagedRoles.includes(role)) || (authority.targetRole && !adminManagedRoles.includes(authority.targetRole)))) {
     fail(403, 'forbidden', 'Only the workspace owner can manage administrators.');
   }
   return authority.targetRole;
@@ -231,10 +233,13 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     onlyFields(body, ['userId', 'role']);
     const targetId = userIdentifier(body.userId);
     const role = body.role;
-    if (role !== 'member' && role !== 'admin') fail(400, 'invalid_input', 'Invalid role.');
-    await requireMemberManagement(c.env, workspaceId, actorId, targetId, role);
+    if (typeof role !== 'string' || !(assignableWorkspaceRoles as readonly string[]).includes(role)) fail(400, 'invalid_input', 'Invalid role.');
+    const previous = await requireMemberManagement(c.env, workspaceId, actorId, targetId, role as AssignableWorkspaceRole);
+    // Saving a member with the role they hold changes nothing, so it neither writes nor disturbs the workspace's sessions.
+    if (previous === role) return c.json({ members: await membersStatement(c.env, workspaceId, actorId).all() });
     const user = await c.env.DB.query<{ id: string }>('SELECT id FROM users WHERE id = ?').bind(targetId).first();
     if (!user) fail(404, 'not_found', 'User not found.');
+    const auditId = id();
     const result = await c.env.DB.batch<SafeMember>([
       c.env.DB.query<never>(`INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
         SELECT w.id, u.id, ?, ?
@@ -244,14 +249,21 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         LEFT JOIN workspace_members target ON target.workspace_id = w.id AND target.user_id = u.id
         WHERE w.id = ? AND u.id <> w.owner_id AND (target.role IS NULL OR target.role <> 'owner')
           AND ((actor.role = 'owner' AND actor.user_id = w.owner_id)
-            OR (actor.role = 'admin' AND ? = 'member' AND (target.role IS NULL OR target.role = 'member')))
-        ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = excluded.role`)
-        .bind(role, now(), actorId, targetId, workspaceId, role),
-      auditAfterChange(c.env, actorId, 'workspace.member.upsert', workspaceId, { userId: targetId, role }),
+            OR (actor.role = 'admin' AND ? IN (${adminManagedRoles.map(item => `'${item}'`).join(', ')}) AND (target.role IS NULL OR target.role IN (${adminManagedRoles.map(item => `'${item}'`).join(', ')}))))
+        ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = excluded.role
+          WHERE workspace_members.role = ?`)
+        // Only from the role authorized above: a concurrent change (or a racing add, '') leaves no row changed.
+        .bind(role, now(), actorId, targetId, workspaceId, role, previous ?? ''),
+      auditAfterChange(c.env, actorId, 'workspace.member.upsert', workspaceId, { userId: targetId, role }, auditId),
+      // A role decides what its member can do in the workspace's sessions, so changing an existing member's role
+      // invalidates tickets and capabilities issued under the previous one, as a removal does. A new member loses nothing.
+      c.env.DB.query<never>(`UPDATE sessions SET policy_version = policy_version + 1
+        WHERE workspace_id = ? AND ? = 1 AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, previous ? 1 : 0, auditId),
       membersStatement(c.env, workspaceId, actorId),
     ]);
     if (result[0].changes !== 1) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');
-    return c.json({ members: result[2].results });
+    return c.json({ members: result[3].results });
   });
 
   app.delete('/api/workspaces/:id/members/:userId', async c => {
@@ -268,7 +280,7 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
             INNER JOIN workspace_members actor ON actor.workspace_id = w.id AND actor.user_id = ?
             WHERE w.id = workspace_members.workspace_id AND w.owner_id <> workspace_members.user_id
               AND ((actor.role = 'owner' AND actor.user_id = w.owner_id)
-                OR (actor.role = 'admin' AND workspace_members.role = 'member')))`)
+                OR (actor.role = 'admin' AND workspace_members.role IN (${adminManagedRoles.map(item => `'${item}'`).join(', ')}))))`)
         .bind(workspaceId, targetId, actorId),
       auditAfterChange(c.env, actorId, 'workspace.member.remove', workspaceId, { userId: targetId }, auditId),
       // The audit marker gates cleanup on a successful, authorized removal in this transaction.

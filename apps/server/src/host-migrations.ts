@@ -4,7 +4,7 @@ import type { RunnerBinding } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities, RestoreInput } from '../../../packages/shared/src/connector.js';
 import type { AgentRow, AppContext, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, modelDefinition, requireNoMigration, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord } from './db.js';
+import { agentVersion, auditStatement, modelDefinition, requireNoMigration, requireSessionCreator, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionCreatorSQL, sessionRecord } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text } from './http.js';
 import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
@@ -73,6 +73,8 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   const access = await sessionAccess(c.env, input.sourceId, ownerId);
   if (!access) fail(404, 'not_found', 'Source session not found.');
   if (access.row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can move it to another host.');
+  // A move creates the successor session, which a viewer can't.
+  await requireSessionCreator(c.env, access.row.workspace_id, ownerId);
   const source = await sourceAuthority(c, input.sourceId, ownerId);
   requireUnfrozen(source);
   await requireNoMigration(c.env, source.id);
@@ -127,8 +129,9 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   // even under Postgres READ COMMITTED: there is at most one move in flight and never an orphan successor.
   const admissible = `NOT EXISTS (SELECT 1 FROM host_migrations WHERE owner_id = ? AND request_id = ?)
     AND NOT EXISTS (SELECT 1 FROM host_migrations WHERE status = 'pending' AND (source_session_id = ? OR target_session_id = ?))
-    AND EXISTS (SELECT 1 FROM sessions source WHERE source.id = ? AND source.owner_id = ? AND source.policy_version = ? AND source.status <> 'archived')`;
-  const admissibleValues = [ownerId, input.requestId, source.id, source.id, source.id, ownerId, source.policy_version];
+    AND EXISTS (SELECT 1 FROM sessions source WHERE source.id = ? AND source.owner_id = ? AND source.policy_version = ? AND source.status <> 'archived')
+    AND ${sessionCreatorSQL('?')}`;
+  const admissibleValues = [ownerId, input.requestId, source.id, source.id, source.id, ownerId, source.policy_version, source.workspace_id, ownerId];
   try {
     await c.env.DB.batch([
       c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,

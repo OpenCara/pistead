@@ -44,7 +44,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
 
 | Concept | What it is |
 |---|---|
-| Workspace | A team's shared home: members, repositories, push access and sessions. Each member is its owner, an admin or a member. |
+| Workspace | A team's shared home: members, repositories, push access and sessions. Each member is its owner, an admin, a collaborator, a member or a viewer. |
 | Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It is private to the member who paired it until they share it with a workspace. |
 | Model | A Pi model a host offers. Its credentials never leave the host. |
 | Agent | The Pi agent that works in a session, on the model it started from, with every tool its host supports. Each session has its own. |
@@ -89,18 +89,27 @@ Pistead signs people in with GitHub only, and asks GitHub for the `read:user use
 
 Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
-Owners and admins add people with **Members → Add member**, entering the person's **User ID** and the role **Member** or **Admin**; saving an existing member changes their role.
+Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Below the owner there are four tiers:
 
-| | Owner | Admin | Member |
-|---|:-:|:-:|:-:|
-| Start sessions, view workspace-visible sessions | ✓ | ✓ | ✓ |
-| Bind and remove repositories, set their push policy | ✓ | ✓ | |
-| Manage push identities | ✓ | ✓ | |
-| Set network access | ✓ | ✓ | |
-| Add members, remove members | ✓ | ✓ | |
-| Add, promote or remove admins | ✓ | | |
-| Connect the session database, import dumps | ✓ | | |
-| Export the workspace | ✓ | ✓ | |
+- **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session grant can't give a viewer more than read.
+- **Member**: starts sessions, and follows other people's workspace-visible sessions read-only unless their owner grants more.
+- **Collaborator**: starts sessions, and can send messages and side asks to any workspace-visible session.
+- **Admin**: everything a collaborator can do, plus managing the workspace.
+
+| | Owner | Admin | Collaborator | Member | Viewer |
+|---|:-:|:-:|:-:|:-:|:-:|
+| View workspace-visible sessions | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Start sessions | ✓ | ✓ | ✓ | ✓ | |
+| Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
+| Bind and remove repositories, set their push policy | ✓ | ✓ | | | |
+| Manage push identities | ✓ | ✓ | | | |
+| Set network access | ✓ | ✓ | | | |
+| Add, change or remove collaborators, members and viewers | ✓ | ✓ | | | |
+| Add, change or remove admins | ✓ | | | | |
+| Connect the session database, import dumps | ✓ | | | | |
+| Export the workspace | ✓ | ✓ | | | |
+
+Approving tool calls, and managing or opening someone else's private session, still take an explicit grant from the session's owner, whatever the role.
 
 Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
 
@@ -370,8 +379,8 @@ The call can wait for the answer until an hour after its message was sent, and t
 
 #### Visibility and grants
 
-- **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. **Private** sessions only by the owner and people with a grant. Only the owner changes visibility; making a session private keeps explicit grants but can't recall what was already seen.
-- Grants (**Details → People → Grants**) give a workspace member permissions on one session. Each includes read, you can grant only what you hold, and the owner's own access can't be changed. Revoking a grant doesn't stop workspace members from viewing a workspace-visible session; making it private does.
+- **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. Collaborators and admins can also send them messages. **Private** sessions only by the owner and people with a grant. Only the owner changes visibility; making a session private keeps explicit grants but can't recall what was already seen.
+- Grants (**Details → People → Grants**) give a workspace member permissions on one session. Each includes read, you can grant only what you hold, and the owner's own access can't be changed. Revoking a grant doesn't take away what a member's role gives on a workspace-visible session (viewing, and for collaborators and admins messaging); making it private does. A viewer can only be granted read.
 
 | Permission | Allows |
 |---|---|

@@ -162,7 +162,8 @@ test('a workspace export covers its settings, the exporter\'s own sessions in fu
   assert.deepEqual(exported.sessions.map(session => session.session.id), ['owner-private', 'owner-shared', 'owner-restored']);
   assert.deepEqual(exported.sessions[0]!.backups.map(backup => backup.location), ['server', 'workspace-database']);
   assert.deepEqual(exported.otherSessions.map(session => [session.id, session.permissions]),
-    [['member-shared', ['read']], ['member-granted', ['read', 'ask']]]);
+    // The workspace owner can message a workspace-visible session; a private one gives only what its grant says.
+    [['member-shared', ['read', 'ask', 'write']], ['member-granted', ['read', 'ask']]]);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.exported'").get()!.n, 1);
 
   // An admin gets the same settings; the sessions they can view are someone else's, so they come as records only.
@@ -173,7 +174,7 @@ test('a workspace export covers its settings, the exporter\'s own sessions in fu
   const adminExport = JSON.parse(adminText) as WorkspaceExport;
   assert.deepEqual(adminExport.sessions, []);
   assert.deepEqual(adminExport.otherSessions.map(session => [session.id, session.permissions]),
-    [['owner-private', ['read']], ['owner-shared', ['read']], ['member-shared', ['read']]]);
+    [['owner-private', ['read']], ['owner-shared', ['read', 'ask', 'write']], ['member-shared', ['read', 'ask', 'write']]]);
 });
 
 test('the operator dump holds every session of the workspace in full, still without secrets', async t => {
