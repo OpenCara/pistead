@@ -487,7 +487,7 @@ docker compose up -d
 
 The image builds the web app and the bundled server and runs them as a non-root user. The server listens on port 8787 and keeps its SQLite database in the `pistead-data` volume; it stores no session backups unless you set `STORAGE_URL` (see [Database and backup storage](#database-and-backup-storage)). The image sets `WORKSPACE_DATABASES=true`, so workspace owners can keep their sessions' backups in a Postgres database of their own (see [Workspace session databases](#workspace-session-databases)); set `WORKSPACE_DATABASES=false` in `.env` to turn that off. `GET /api/health` reports which providers are configured, and the image's health check uses it. Migrations run automatically at start-up: to upgrade, update the source and run `docker compose up -d --build`.
 
-Each server release (`server-v*` tag) is also published as `ghcr.io/opencara/pistead` (`latest`, `X.Y` and `X.Y.Z`, for linux/amd64 and linux/arm64); to use it instead of building, set `image: ghcr.io/opencara/pistead:latest` and drop `build: .` in `docker-compose.yml`.
+Each server release (`server-v*` tag) is published as `ghcr.io/opencara/pistead` (`latest`, `X.Y` and `X.Y.Z`, for linux/amd64 and linux/arm64); to use it instead of building, set `image: ghcr.io/opencara/pistead:latest` and drop `build: .` in `docker-compose.yml`.
 
 Put a reverse proxy with TLS in front of it (Caddy, nginx, Traefik, a cloud load balancer); the app serves plain HTTP. If the proxy sets `X-Forwarded-Proto`/`X-Forwarded-Host`, set `TRUST_PROXY=true`. The proxy must pass WebSocket upgrades on `/api/connectors/socket`, accept request bodies of 32 MiB for dump imports, and route `/.well-known/` to Pistead if you use `OIDC_SIGNING_KEY`. The server gzips its responses and session event streams itself, and compresses the connector WebSocket for connectors that offer it, so the proxy needs no compression of its own.
 
@@ -619,7 +619,7 @@ await fetch("/api/auth/test", { method: "POST", headers: { Authorization: "Beare
   | Tag | Workflow | Publishes |
   | --- | --- | --- |
   | `cli-v1.2.3` | `release.yml` | `pistead` on npm, with provenance; a prerelease goes to the `next` dist-tag |
-  | `server-v1.2.3` | `release-server.yml` | The server image (web app and backend) to `ghcr.io/opencara/pistead`, and a GitHub release |
+  | `server-v1.2.3` | `release-server.yml` | The server image (web app and backend) to `ghcr.io/opencara/pistead`; no GitHub release |
   | `desktop-v1.2.3` | `release-desktop.yml` | The desktop app on a GitHub release: macOS (arm64 DMG and zip) today, Windows and Linux from the same tag later |
   | `ios-v1.2.3` | `release-ios.yml` | The iOS app to TestFlight |
 
