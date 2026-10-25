@@ -7,6 +7,10 @@ Two things set it apart:
 - **One subscription, the whole team.** Pair a machine where Pi is signed in to your model provider, share it with a workspace, and every teammate can start their own sessions on its models. They never see its API keys or subscription login: those stay on the host. Each session still runs as the member who started it, with their own Git accounts, so the team shares the models and not each other's identities. See [Sharing a host](#sharing-a-host).
 - **Share a chat session, with exactly the permissions you choose.** Every session is a live conversation teammates can follow. Make it visible to the workspace or keep it private, then give people exactly what they need: `read` to watch, `ask` for side questions that don't touch the work, `write` to drive it, `approve` to decide its commands and pushes, `manage` to share it further. A read-only link can show the conversation to anyone, even without signing in. See [Collaborating on a session](#collaborating-on-a-session).
 
+<p align="center">
+  <img src="docs/images/team-collaboration.svg" alt="Alice shares her host, where Pi is signed in to a model provider, with the workspace. Bob starts a session on it that runs as Bob. Carol can write and approve, Dan sends side asks, Erin reads, and anyone with the share link follows the conversation read-only." width="900">
+</p>
+
 And around them:
 
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
@@ -387,6 +391,32 @@ The call can wait for the answer until an hour after its message was sent, and t
 ### Collaborating on a session
 
 A session is a chat that can be shared. Teammates watch it live, ask side questions, send messages that drive the work, and approve its commands and pushes. Each person gets only the permissions the session's owner and their workspace role allow. Everything still runs as the session owner, whoever sends the message.
+
+A typical day, with Alice's shared host from [Sharing a host](#sharing-a-host):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Alice as Alice (host owner)
+    actor Bob as Bob (session owner)
+    actor Carol as Carol (write, approve)
+    actor Dan as Dan (ask)
+    participant P as Pistead
+    participant H as Alice's host (Pi + subscription)
+
+    Alice->>P: Share host with workspace
+    Bob->>P: Start session on Alice's host: "Fix the login redirect" (Ask before acting)
+    P->>H: Run the message as Bob, with Bob's Git account
+    H-->>P: Agent edits code, asks to push fix/login
+    P-->>Carol: Approval card: git push to fix/login
+    Carol->>P: Approve
+    P->>H: Push exactly that commit
+    Dan->>P: Side ask: "Why does it redirect after refresh?"
+    P->>H: Answer in a separate read-only thread
+    H-->>Dan: Answer (the shared work is unchanged)
+    Bob->>P: Create share link
+    P-->>Bob: Read-only link for anyone, no sign-in needed
+```
 
 #### Visibility and grants
 
