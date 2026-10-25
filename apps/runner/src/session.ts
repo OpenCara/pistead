@@ -26,7 +26,7 @@ import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
-import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
+import { autoApprovedCalls, excerpt, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
 import { egressPushService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
@@ -78,10 +78,13 @@ const DECISION_WAIT_MS = 60 * 60 * 1000;
 function holdsQueue(run: Run): boolean {
   return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
 }
-/** The Worker rejects approval results above 8192 characters; keep the start and the (usually decisive) end. */
+/**
+ * How much of an operation's result the host keeps, and so what the tool call that waited on it returns to the model:
+ * the start and the (usually decisive) end. The control plane gets a shorter excerpt (see `forControlPlane`).
+ */
+export const STORED_RESULT = 30_000;
 function boundedResult(value: string): string {
-  if (value.length <= 8000) return value;
-  return `${value.slice(0, 2000)}\n… ${value.length - 7500} characters omitted …\n${value.slice(-5500)}`;
+  return excerpt(value, STORED_RESULT);
 }
 export type RunnerConfig = {
   dataDir: string; controlPlaneUrl: string; sharedSecret: string; allowFaux: boolean; allowTestShell?: boolean; fetch?: typeof fetch;
