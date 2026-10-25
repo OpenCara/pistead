@@ -11,7 +11,6 @@ import { ViewRevisions } from "../../../packages/shared/src/view-patch.js";
 import { assertId, permissionFor, RunnerError, stableJson, validateBinding, verifyRunnerTicket } from "./protocol.js";
 import { RunnerSession, type RunnerConfig } from "./session.js";
 import { restoreSession } from "./restore.js";
-import { forControlPlane } from "./approval-view.js";
 
 function immutable<T>(value: T): T {
   if (value && typeof value === "object") {
@@ -243,11 +242,11 @@ export function createRunnerApp(service: RunnerService): Hono {
     });
     const input = body ? JSON.parse(body) : {};
     if (action === "submit" || action === "ask") return c.json(await session.submit(ticket, input as SubmitInput, action === "ask" ? "ask" : "write"));
-    if (action === "operations") return c.json({ approval: forControlPlane(await session.createApproval(ticket.actorId, input.operation as Operation)) }, 201);
+    if (action === "operations") return c.json({ approval: await session.createApproval(ticket.actorId, input.operation as Operation) }, 201);
     if (action === "stop") return c.json(await session.stop(ticket));
     if (action === "approve") {
       if (input.approvalId !== approval![1]) throw new RunnerError(403, "Approval ticket path mismatch");
-      return c.json({ approval: forControlPlane(await session.decide(ticket, approval![1]!, input)) });
+      return c.json({ approval: await session.decide(ticket, approval![1]!, input) });
     }
     if (action === "restart") {
       if (ticket.actorId !== session.binding.owner.id) throw new RunnerError(403, "Only the owner can restart a session");

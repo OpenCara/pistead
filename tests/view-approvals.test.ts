@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ApprovalRecord } from "../packages/shared/src/types.js";
-import { autoApprovedCalls, CONTROL_PLANE_RESULT, excerpt, forControlPlane, viewApprovals, type StoredApproval } from "../apps/runner/src/approval-view.js";
+import { autoApprovedCalls, viewApprovals, type StoredApproval } from "../apps/runner/src/approval-view.js";
 
 const card = (id: string, status: ApprovalRecord["status"], extra: Partial<StoredApproval> = {}): StoredApproval => ({
   id, sessionId: "s1", requestedBy: "test:alice", operation: { kind: "bash", command: `echo ${id}` }, status, createdAt: "2026-01-01T00:00:00.000Z", ...extra,
@@ -73,20 +73,4 @@ test("a view lists every approval in play and only the newest settled ones, with
   }
   assert.ok(JSON.stringify(approvals).length < 64_000);
   assert.equal(stored[1]!.result, output, "the host keeps every result whole");
-});
-
-test("a long result keeps more for the model than the control plane gets", () => {
-  const output = `start-marker${"x".repeat(40_000)}end-marker`;
-  const kept = excerpt(output, 30_000);
-  assert.equal(excerpt("short", 30_000), "short");
-  assert.ok(kept.length <= 30_000 && kept.length > 29_000);
-  assert.match(kept, /^start-marker/);
-  assert.match(kept, /end-marker$/);
-  const [, head, omitted, tail] = /^([\s\S]*)\n… (\d+) characters omitted …\n([\s\S]*)$/.exec(kept)!;
-  assert.equal(head!.length + Number(omitted) + tail!.length, output.length);
-  const sent = forControlPlane(card("tool-1", "executed", { result: kept }));
-  assert.ok(sent.result!.length <= CONTROL_PLANE_RESULT);
-  assert.match(sent.result!, /^start-marker[\s\S]*end-marker$/);
-  const unfinished = card("tool-2", "executing");
-  assert.equal(forControlPlane(unfinished), unfinished);
 });

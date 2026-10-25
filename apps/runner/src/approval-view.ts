@@ -24,22 +24,9 @@ function inTranscript(approval: ApprovalRecord): boolean {
   return approval.automatic === true && (approval.operation.kind === "bash" || approval.operation.kind === "host.bash");
 }
 
-/** The control plane rejects approval results above 8192 characters; an approval it gets keeps at most this much. */
-export const CONTROL_PLANE_RESULT = 8000;
-
-/**
- * `result` in at most `limit` characters: a quarter of them from its start and the rest from its (usually decisive)
- * end, around a note of how much was left out.
- */
-export function excerpt(result: string, limit = VIEW_SETTLED_RESULT): string {
-  if (result.length <= limit) return result;
-  const room = limit - 100, head = Math.floor(room / 4), tail = room - head;
-  return `${result.slice(0, head)}\n… ${result.length - head - tail} characters omitted …\n${result.slice(-tail)}`;
-}
-
-/** `approval` as the control plane accepts it, with a result short enough for it; the host keeps the longer one. */
-export function forControlPlane<T extends ApprovalRecord>(approval: T): T {
-  return approval.result === undefined ? approval : { ...approval, result: excerpt(approval.result, CONTROL_PLANE_RESULT) };
+function excerpt(result: string): string {
+  if (result.length <= VIEW_SETTLED_RESULT) return result;
+  return `${result.slice(0, 250)}\n… ${result.length - 900} characters omitted …\n${result.slice(-650)}`;
 }
 
 /**
