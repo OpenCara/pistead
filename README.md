@@ -2,10 +2,17 @@
 
 Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machines and work on them together with your team. Pistead is a self-hosted control plane: a web app (with iPhone, iPad and Mac apps), a Node.js server, and the `pistead` connector that each host runs to offer its local Pi to a workspace.
 
+Two things set it apart:
+
+- **One subscription, the whole team.** Pair a machine where Pi is signed in to your model provider, share it with a workspace, and every teammate can start their own sessions on its models. They never see its API keys or subscription login: those stay on the host. Each session still runs as the member who started it, with their own Git accounts, so the team shares the models and not each other's identities. See [Sharing a host](#sharing-a-host).
+- **Share a chat session, with exactly the permissions you choose.** Every session is a live conversation teammates can follow. Make it visible to the workspace or keep it private, then give people exactly what they need: `read` to watch, `ask` for side questions that don't touch the work, `write` to drive it, `approve` to decide its commands and pushes, `manage` to share it further. A read-only link can show the conversation to anyone, even without signing in. See [Collaborating on a session](#collaborating-on-a-session).
+
+And around them:
+
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
 - **Isolated work.** Each session clones the workspace's repositories into its own sandbox, whose only way out is a proxy that reads them with the session owner's account and follows the workspace's network policy.
 - **People decide.** Shell commands, commits and pushes wait for an approval unless the session owner auto-approves a message; GitHub comments, merges and new issues always wait.
-- **Built for teams.** Teammates follow sessions live, ask questions on the side, send messages and approve work, with the permissions each session's owner grants them.
+- **Built for teams.** Workspace roles (viewer, member, collaborator, admin) set what each person can do by default, and session grants add more for one session at a time.
 
 ## Contents
 
@@ -186,6 +193,8 @@ The connector reads these when it starts; restart it after changing them.
 #### Sharing a host
 
 A paired host is private: only you can start sessions on it. Under **Settings → Hosts →** the host **→ Sharing**, **Share** it with a workspace you belong to (one with a bound repository) to let its members run their own sessions on it; **Unshare** stops that at once.
+
+This is how a team shares one model subscription or set of API keys. Sign Pi in once on one machine and share that machine, and everyone in the workspace can pick its models when they start a session. The provider's credentials stay on that machine, and teammates never see or copy them. Revoking the host or unsharing it cuts everyone off at once. Check that your provider's terms allow sharing your plan this way.
 
 - Sessions on a shared host still belong to the members who start them: they run as those members, with their Git accounts, not yours. Agents, session permissions and Git credentials are not shared, and your Pi history is never imported.
 - As the host's operator, you can see the prompts and repository files of every session that runs on it. Members starting a session on someone else's host confirm they trust it (**I trust …'s host**).
@@ -376,6 +385,8 @@ When a tool call needs more than the session allows (a tool its agent doesn't in
 The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. **Allow once** lets that call use the tool, but what it does still needs its own approval; the permission then shows on that operation's card instead of a card of its own. **Allow for this session** also approves what the tool does in the session owner's later messages, as **Auto-approve** would: its commands and pushes run without asking, while GitHub comments, merges and issues still wait for a decision, and other people's messages still ask for approval. Host commands (`host_bash`) can only be allowed once, so each one asks again. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
 
 ### Collaborating on a session
+
+A session is a chat that can be shared. Teammates watch it live, ask side questions, send messages that drive the work, and approve its commands and pushes. Each person gets only the permissions the session's owner and their workspace role allow. Everything still runs as the session owner, whoever sends the message.
 
 #### Visibility and grants
 
