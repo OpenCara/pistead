@@ -612,3 +612,62 @@ test('a client holding a revision gets patches: nothing while nothing changed, t
     assert.deepEqual(next, { event: 'patch', data: { patch: { base: patch.revision, revision: patch.revision } } });
   }
 });
+
+test('workspace roles: viewers read and create nothing, members read, collaborators and admins message shared sessions', async t => {
+  const f = await fixture(t);
+  const owner = await f.client('roles-owner');
+  const [viewer, member, collaborator, admin, other] = await Promise.all(['roles-viewer', 'roles-member', 'roles-collaborator', 'roles-admin', 'roles-other'].map(name => f.client(name)));
+  const workspace = (await (await owner.request('POST', '/api/workspaces', { name: 'roles' })).json() as { workspace: { id: string } }).workspace;
+  const members = `/api/workspaces/${workspace.id}/members`;
+  for (const [client, role] of [[viewer, 'viewer'], [member, 'member'], [collaborator, 'collaborator'], [admin, 'admin']] as const) {
+    assert.equal((await owner.request('POST', members, { userId: client.user.id, role })).status, 200);
+  }
+  assert.equal((await owner.request('POST', members, { userId: other.user.id, role: 'owner' })).status, 400);
+  assert.equal((await owner.request('POST', members, { userId: other.user.id, role: 'editor' })).status, 400);
+  const listed = (await (await viewer.request('GET', '/api/workspaces')).json() as { workspaces: { id: string; role: string }[] }).workspaces;
+  assert.equal(listed.find(item => item.id === workspace.id)?.role, 'viewer');
+
+  const model = (await (await owner.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'roles', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
+  const agent = seedAgentVersion(f.sqlite, { authorId: owner.user.id, modelId: model.id, tools: ['identity'] });
+  const insert = f.sqlite.prepare('INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,visibility) VALUES (?,?,?,?,?,?,?,?)');
+  insert.run('roles-shared', workspace.id, owner.user.id, agent.id, 'shared', 'ready', new Date().toISOString(), 'workspace');
+  insert.run('roles-private', workspace.id, owner.user.id, agent.id, 'private', 'ready', new Date().toISOString(), 'private');
+  const held = async (client: { user: { id: string } }, sessionId: string) => (await sessionAccess(f.env, sessionId, client.user.id))?.permissions ?? null;
+
+  // A shared session: viewers and members follow it read-only; collaborators and admins can also send messages.
+  assert.deepEqual(await held(viewer, 'roles-shared'), ['read']);
+  assert.deepEqual(await held(member, 'roles-shared'), ['read']);
+  assert.deepEqual(await held(collaborator, 'roles-shared'), ['read', 'ask', 'write']);
+  assert.deepEqual(await held(admin, 'roles-shared'), ['read', 'ask', 'write']);
+  // A private session stays private, whatever the role.
+  for (const client of [viewer, member, collaborator, admin]) assert.equal(await held(client, 'roles-private'), null);
+
+  // Members are read-only by default, so they can be granted more; a viewer is read-only whatever it is granted.
+  assert.equal((await owner.request('POST', '/api/sessions/roles-shared/grants', { userId: member.user.id, permissions: ['read', 'write'] })).status, 200);
+  assert.deepEqual(await held(member, 'roles-shared'), ['read', 'write']);
+  const refused = await owner.request('POST', '/api/sessions/roles-shared/grants', { userId: viewer.user.id, permissions: ['read', 'write'] });
+  assert.equal(refused.status, 400);
+  assert.equal((await refused.json() as { code: string }).code, 'viewer_role');
+  f.sqlite.prepare('INSERT INTO session_grants (session_id,user_id,permissions_json,created_at) VALUES (?,?,?,?)')
+    .run('roles-private', viewer.user.id, JSON.stringify(['read', 'ask', 'write', 'approve', 'manage']), new Date().toISOString());
+  assert.deepEqual(await held(viewer, 'roles-private'), ['read']);
+
+  // Viewers can't start sessions; the role check comes before anything about the model or host.
+  const created = await viewer.request('POST', '/api/sessions', { workspaceId: workspace.id, modelId: model.id, title: 'mine' });
+  assert.equal(created.status, 403);
+  assert.equal((await created.json() as { code: string }).code, 'viewer_role');
+
+  // Admins manage collaborators, members and viewers; only the owner manages admins.
+  assert.equal((await admin.request('POST', members, { userId: other.user.id, role: 'collaborator' })).status, 200);
+  assert.equal((await admin.request('POST', members, { userId: other.user.id, role: 'viewer' })).status, 200);
+  assert.equal((await admin.request('POST', members, { userId: other.user.id, role: 'admin' })).status, 403);
+  assert.equal((await admin.request('POST', members, { userId: admin.user.id, role: 'member' })).status, 403);
+  assert.equal((await collaborator.request('POST', members, { userId: other.user.id, role: 'member' })).status, 403);
+  // A role change takes effect at once and invalidates what was issued under the previous one.
+  const before = (f.sqlite.prepare("SELECT policy_version FROM sessions WHERE id = 'roles-shared'").get() as { policy_version: number }).policy_version;
+  assert.equal((await admin.request('POST', members, { userId: collaborator.user.id, role: 'member' })).status, 200);
+  assert.deepEqual(await held(collaborator, 'roles-shared'), ['read']);
+  assert.equal((f.sqlite.prepare("SELECT policy_version FROM sessions WHERE id = 'roles-shared'").get() as { policy_version: number }).policy_version, before + 1);
+  assert.equal((await admin.request('DELETE', `${members}/${other.user.id}`)).status, 204);
+  assert.equal((await owner.request('POST', members, { userId: admin.user.id, role: 'collaborator' })).status, 200);
+});

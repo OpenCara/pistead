@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
-import type { UserProfile, Workspace, WorkspaceRole } from "../../../../packages/shared/src/types";
+import { assignableWorkspaceRoles, type AssignableWorkspaceRole, type UserProfile, type Workspace, type WorkspaceRole } from "../../../../packages/shared/src/types";
+import { adminManagedRoles, canCreateSessions } from "../../../../packages/shared/src/policy";
 import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
@@ -14,7 +15,13 @@ import { NetworkAccess } from "./NetworkAccess";
 import { PushAccess } from "./PushAccess";
 import { WorkspaceDatabaseSection } from "./WorkspaceDatabase";
 
-const roleLabel: Record<WorkspaceRole, string> = { owner: "Owner", admin: "Admin", member: "Member" };
+const roleLabel: Record<WorkspaceRole, string> = { owner: "Owner", admin: "Admin", collaborator: "Collaborator", member: "Member", viewer: "Viewer" };
+const roleHint: Record<AssignableWorkspaceRole, string> = {
+  admin: "Collaborator, and manages the workspace: members, models, repositories and settings",
+  collaborator: "Starts sessions, and sends messages to any session shared with the workspace",
+  member: "Starts sessions, and follows other shared sessions read-only unless granted more",
+  viewer: "Follows shared sessions read-only, and can't start sessions",
+};
 
 export function WorkspacesSettings({ id }: { id?: string }) {
   const { user, workspaces, workspacesLoading, workspacesError, refreshWorkspaces } = useApp();
@@ -64,12 +71,12 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
       <Row title="Name" trailing={<span>{workspace.name}</span>} />
       <Row title="Your role" trailing={<StatusBadge tone={admin ? "success" : "neutral"}>{roleLabel[role]}</StatusBadge>} />
     </Section>
-    <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />
+    {canCreateSessions(role) && <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />}
     <Repositories workspace={workspace} admin={admin} {...repositories} />
     <PushAccess workspace={workspace} admin={admin} />
     <NetworkAccess workspace={workspace} admin={admin} />
     <WorkspaceDatabaseSection workspace={workspace} owner={role === "owner"} />
-    <Members workspace={workspace} admin={admin} />
+    <Members workspace={workspace} admin={admin} owner={role === "owner"} />
     {admin && <DataExport workspace={workspace} />}
   </>;
 }
@@ -217,7 +224,7 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
   </Sheet>;
 }
 
-function Members({ workspace, admin }: { workspace: Workspace; admin: boolean }) {
+function Members({ workspace, admin, owner }: { workspace: Workspace; admin: boolean; owner: boolean }) {
   const path = `/api/workspaces/${segment(workspace.id)}/members`;
   const resource = useResource<{ members: WorkspaceMember[] }>(path);
   const [adding, setAdding] = useState(false);
@@ -233,7 +240,14 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
   return <>
     <Section title="Members" info={<div className="stack">
       {!admin && <p>Only workspace owners and admins can manage membership.</p>}
-      <p>Members can follow workspace-visible sessions read-only, which shows prompts, tool output and repository content in the transcript. Private sessions, and ask, write, approve or manage permissions, require explicit grants.</p>
+      <p>Every role can follow workspace-visible sessions, which shows prompts, tool output and repository content in the transcript.</p>
+      <ul>
+        <li><strong>Viewer</strong>: follows them read-only and can't start sessions, whatever a session grants.</li>
+        <li><strong>Member</strong>: starts sessions, and follows other people's read-only unless they grant more.</li>
+        <li><strong>Collaborator</strong>: starts sessions, and sends messages to any workspace-visible session.</li>
+        <li><strong>Admin</strong>: a collaborator who also manages the workspace. Only the owner manages admins.</li>
+      </ul>
+      <p>Private sessions, and approve or manage permissions, still require explicit grants.</p>
       <p>Membership never grants GitHub access, tool execution, or use of anyone's private Pi host.</p>
     </div>} action={admin && <Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add member</Button>}>
       <ResourceState {...resource} retry={resource.refresh}>
@@ -243,20 +257,22 @@ function Members({ workspace, admin }: { workspace: Workspace; admin: boolean })
             const person = memberPerson(member);
             const name = member.displayName || username(person);
             return <Row key={member.userId} leading={<IdentityBadge name={name} id={member.userId} />} title={name} hint={usernameWithId(person)} trailing={<>
-              <StatusBadge tone={member.role === "member" ? "neutral" : "success"}>{roleLabel[member.role]}</StatusBadge>
-              {admin && member.userId !== workspace.ownerId && <DropdownMenu label={`Actions for ${name}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
+              <StatusBadge tone={member.role === "owner" || member.role === "admin" ? "success" : "neutral"}>{roleLabel[member.role]}</StatusBadge>
+              {admin && member.userId !== workspace.ownerId && (owner || adminManagedRoles.includes(member.role)) && <DropdownMenu label={`Actions for ${name}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
             </>} />;
           })}
         {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
       </ResourceState>
     </Section>
-    {admin && <AddMember open={adding} path={path} close={() => setAdding(false)} saved={resource.refresh} />}
+    {admin && <AddMember open={adding} path={path} owner={owner} close={() => setAdding(false)} saved={resource.refresh} />}
   </>;
 }
 
-function AddMember({ open, path, close, saved }: { open: boolean; path: string; close: () => void; saved: () => void }) {
+function AddMember({ open, path, owner, close, saved }: { open: boolean; path: string; owner: boolean; close: () => void; saved: () => void }) {
   const [userId, setUserId] = useState("");
-  const [role, setRole] = useState<"member" | "admin">("member");
+  const [role, setRole] = useState<AssignableWorkspaceRole>("member");
+  // Admins assign the roles below their own; only the owner makes someone an admin.
+  const roles = assignableWorkspaceRoles.filter(item => owner || adminManagedRoles.includes(item));
   const action = useAction();
   function save(event: FormEvent) {
     event.preventDefault();
@@ -277,10 +293,9 @@ function AddMember({ open, path, close, saved }: { open: boolean; path: string; 
       <Field label="User ID" hint="Copy it from their profile. Saving an existing member updates their role">
         <input className="input" required autoFocus value={userId} onChange={event => setUserId(event.target.value)} placeholder="User ID" autoComplete="off" spellCheck={false} />
       </Field>
-      <Field label="Role">
-        <select className="select" value={role} onChange={event => setRole(event.target.value as "member" | "admin")}>
-          <option value="member">Member</option>
-          <option value="admin">Admin</option>
+      <Field label="Role" hint={roleHint[role]}>
+        <select className="select" value={role} onChange={event => setRole(event.target.value as AssignableWorkspaceRole)}>
+          {roles.map(item => <option key={item} value={item}>{roleLabel[item]}</option>)}
         </select>
       </Field>
       <Feedback error={action.error} />

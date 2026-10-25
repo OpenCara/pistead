@@ -5,6 +5,7 @@ import { Icon, Logo } from "./icons";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { href, type Route } from "./router";
 import { sessionStatus } from "../../../packages/client/src/session-status";
+import { canCreateSessions } from "../../../packages/shared/src/policy";
 import { DropdownMenu, IdentityBadge, Loading, RelativeTime, StatusDot } from "./ui";
 
 const SESSIONS_PER_WORKSPACE = 6;
@@ -26,9 +27,9 @@ function WorkspaceGroup({ workspace, sessions, route, collapsed, toggle, onNavig
         <span className="label">{workspace.name}</span>
       </button>
       <div className="row-actions">
-        <a className="btn ghost xs icon-only" href={newHref} aria-label={`New session in ${workspace.name}`} title="New session" onClick={() => { selectWorkspace(workspace.id); onNavigate(); }}><Icon name="plus" size={14} /></a>
+        {canCreateSessions(workspace.role) && <a className="btn ghost xs icon-only" href={newHref} aria-label={`New session in ${workspace.name}`} title="New session" onClick={() => { selectWorkspace(workspace.id); onNavigate(); }}><Icon name="plus" size={14} /></a>}
         <DropdownMenu label={`${workspace.name} options`} items={[
-          { label: "New session", icon: "plus", onSelect: () => { selectWorkspace(workspace.id); window.location.hash = newHref; onNavigate(); } },
+          ...(canCreateSessions(workspace.role) ? [{ label: "New session", icon: "plus" as const, onSelect: () => { selectWorkspace(workspace.id); window.location.hash = newHref; onNavigate(); } }] : []),
           { label: "Workspace settings", icon: "settings", onSelect: () => { window.location.hash = href({ name: "settings", section: "workspaces", id: workspace.id }); onNavigate(); } },
         ]} />
       </div>
@@ -70,7 +71,7 @@ export function Sidebar({ route, onNavigate }: { route: Route; onNavigate: () =>
       return next;
     });
   }
-  const newSessionHref = currentWorkspace ? href({ name: "new", workspaceId: currentWorkspace.id }) : undefined;
+  const newSessionHref = currentWorkspace && canCreateSessions(currentWorkspace.role) ? href({ name: "new", workspaceId: currentWorkspace.id }) : undefined;
   return <aside className="sidebar" aria-label="Workspaces and sessions">
     <div className="sidebar-top">
       <a className="nav-item" href="#/" onClick={onNavigate}><Logo size={20} /><span className="label" style={{ color: "var(--foreground)", fontWeight: 500 }}>Pistead</span></a>

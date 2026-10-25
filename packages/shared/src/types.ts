@@ -3,7 +3,19 @@ import type { ChatImage } from "./chat-images.js";
 
 export const permissions = ["read", "ask", "write", "approve", "manage"] as const;
 export type Permission = (typeof permissions)[number];
-export type WorkspaceRole = "owner" | "admin" | "member";
+/**
+ * Workspace roles, from most to least authority. Beyond the workspace owner there are four tiers:
+ * - `admin`: everything a collaborator can do, plus workspace management (members, models, repositories, settings).
+ * - `collaborator`: creates sessions and can send messages to (ask, write) any session shared with the workspace.
+ * - `member`: creates sessions, and follows the workspace's shared sessions read-only unless granted more.
+ * - `viewer`: creates no sessions, and follows the workspace's shared sessions read-only, whatever it is granted.
+ * Private sessions stay private: only their owner and explicit grants open them, whatever the role.
+ */
+export const workspaceRoles = ["owner", "admin", "collaborator", "member", "viewer"] as const;
+export type WorkspaceRole = (typeof workspaceRoles)[number];
+/** The roles a workspace owner can assign; admins assign the ones below their own. */
+export const assignableWorkspaceRoles = ["admin", "collaborator", "member", "viewer"] as const satisfies readonly WorkspaceRole[];
+export type AssignableWorkspaceRole = (typeof assignableWorkspaceRoles)[number];
 export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**

@@ -6,10 +6,10 @@ import { connectorLimits, type ConnectorCapabilities, type LocalModelSummary } f
 import { parseChatImages, type ChatImage } from '../../../packages/shared/src/chat-images.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
-import { hasPermission, normalizePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
+import { hasPermission, normalizePermissions, roleSessionCeiling, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import { redactApproval } from '../../../packages/shared/src/redaction.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
+import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, requireSessionCreator, sessionCreatorSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import { connectorUtf8Bytes } from './connector-transport.js';
@@ -192,7 +192,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const title = text(input.title ?? 'Untitled session', 'title', 200);
     const visibility = sessionVisibility(input.visibility === undefined ? 'workspace' : input.visibility);
     const ownerId = c.get('auth').userId;
-    await requireMember(c.env, workspaceId, ownerId);
+    await requireSessionCreator(c.env, workspaceId, ownerId);
     // A live check: a model of the owner's own host here, or of a host shared here.
     const model = await requireModel(c.env, identifier(input.modelId, 'modelId'), ownerId);
     if (model.workspace_id !== workspaceId) fail(404, 'not_found', 'Model not found.');
@@ -222,13 +222,13 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone' };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
-    await requireMember(c.env, workspaceId, ownerId);
+    await requireSessionCreator(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
     // Admit the session only while its workspace's repositories, membership and host are as they were checked.
     const inserted = await c.env.DB.query(`INSERT INTO sessions
       (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
-      WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
+      WHERE ${sessionCreatorSQL('?')}
       AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
       AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
         AND ((? = 1 AND session_owner.auth_kind = 'github') OR (? = 1 AND session_owner.auth_kind = 'test'))
@@ -490,9 +490,12 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const input = await jsonObject(c);
     const userId = userIdentifier(input.userId);
     if (userId === row.owner_id) fail(400, 'owner_grant_immutable', 'The session owner always retains full authority.');
-    await requireMember(c.env, row.workspace_id, userId);
+    const grantee = await requireMember(c.env, row.workspace_id, userId);
     let grants: Permission[];
     try { grants = normalizePermissions(input.permissions); } catch { fail(400, 'invalid_permissions', 'Invalid permissions.'); }
+    // sessionAccess caps a viewer at read whatever it is granted; refusing more here says so rather than storing it.
+    const ceiling = roleSessionCeiling(grantee.role);
+    if (ceiling && grants.some(permission => !ceiling.includes(permission))) fail(400, 'viewer_role', 'Viewers can only be granted read access.');
     if (!grants.length) fail(400, 'empty_grant', 'Use DELETE to revoke a grant.');
     if (grants.some(permission => !hasPermission(access.permissions, permission))) fail(403, 'grant_escalation', 'You cannot grant permissions you do not hold.');
     const result = await c.env.DB.batch([

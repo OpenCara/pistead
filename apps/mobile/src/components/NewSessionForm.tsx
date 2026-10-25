@@ -5,6 +5,7 @@ import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
 import type { WorkspaceRepositoryList } from "../../../../packages/shared/src/repositories";
 import type { ModelDefinition, SessionRecord, Workspace } from "../../../../packages/shared/src/types";
+import { canCreateSessions } from "../../../../packages/shared/src/policy";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
 import { saveDraft } from "../lib/drafts";
@@ -26,13 +27,16 @@ const sameModel = (a: { provider: string; modelId: string }, b: { provider: stri
 
 /** Pick a workspace, then a host and model in it, optionally a first message; like the web's new-session screen. */
 export function NewSessionForm({ onStarted }: { onStarted: (sessionId: string) => void }) {
-  const { workspaces, workspacesLoading, workspacesError, refreshWorkspaces, lastWorkspaceId } = useAppData();
+  const { workspaces: memberships, workspacesLoading, workspacesError, refreshWorkspaces, lastWorkspaceId } = useAppData();
+  // A viewer follows a workspace's sessions but starts none there.
+  const workspaces = memberships.filter(item => canCreateSessions(item.role));
   const palette = usePalette();
   const [chosen, setChosen] = useState("");
   const [picking, setPicking] = useState(false);
   const workspace = workspaces.find(item => item.id === (chosen || lastWorkspaceId)) ?? workspaces[0];
   if (workspacesLoading) return <Loading />;
   if (workspacesError) return <View style={styles.column}><Banner tone="danger" title="Unable to load workspaces" actions={<Button small label="Retry" onPress={refreshWorkspaces} />}>{workspacesError}</Banner></View>;
+  if (!workspace && memberships.length) return <EmptyState title="Viewer only">You're a viewer in every workspace you belong to, so you can follow their shared sessions but not start one. Ask a workspace owner or admin for the member role.</EmptyState>;
   if (!workspace) return <EmptyState title="No workspace yet">Create a workspace on the web, add a repository and pair a host to start your first session.</EmptyState>;
   return <>
     <View style={[styles.workspaceBar, { borderColor: palette.border }]}>

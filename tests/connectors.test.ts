@@ -2003,11 +2003,12 @@ test('workspace read does not grant mutations, connector credentials, personal e
 test('root visibility PATCH is CSRF protected, owner-only, versioned and unions rather than replaces explicit grants', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
-  const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id);
+  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403);
+  // A role change bumps the policy version of the workspace's sessions, so promote before taking the baseline.
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { 'X-CSRF-Token': '' })).status, 403);
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { Origin: 'https://hostile.example' })).status, 403);
-  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403);
-  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
   assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403, 'Workspace administration is not session ownership');
   await denied(await s.outsider.request('PATCH', path, { visibility: 'private' }), 404, 'not_found');
   for (const visibility of ['public', '', null, 1]) {
@@ -2019,7 +2020,7 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   assert.deepEqual(f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id), rowBefore);
   const privateResult = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'private' }));
   assert.equal(privateResult.session.visibility, 'private');
-  assert.equal(privateResult.session.policyVersion, s.session.policyVersion + 1);
+  assert.equal(privateResult.session.policyVersion, Number(rowBefore.policy_version) + 1);
   assert.deepEqual(privateResult.session.permissions, ['read', 'ask', 'write', 'approve', 'manage']);
   await denied(await s.member.request('GET', path), 404, 'not_found');
   assert.deepEqual(await json(await s.member.request('GET', '/api/sessions')), { sessions: [] });
@@ -2032,14 +2033,15 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   const shared = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'workspace' }));
   assert.equal(shared.session.policyVersion, granted.session.policyVersion + 1);
   assert.equal(shared.session.visibility, 'workspace');
-  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'manage']);
+  // Shared with the workspace, an admin can also send messages; its grant adds manage.
+  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'write', 'manage']);
   const privateAgain = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'private' }));
   assert.equal(privateAgain.session.policyVersion, shared.session.policyVersion + 1);
   assert.deepEqual(f.sqlite.prepare('SELECT * FROM session_grants WHERE session_id = ?').all(s.session.id), grantBefore);
   assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'manage']);
   await json(await s.owner.request('PATCH', path, { visibility: 'workspace' }));
   await json(await s.owner.request('DELETE', `${path}/grants/${encodeURIComponent(s.member.user.id)}`));
-  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read']);
+  assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'write']);
   await json(await s.owner.request('PATCH', path, { visibility: 'private' }));
   await denied(await s.member.request('GET', path), 404, 'not_found');
   assert.deepEqual(await json(await s.member.request('GET', '/api/sessions')), { sessions: [] });

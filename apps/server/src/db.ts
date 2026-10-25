@@ -1,6 +1,6 @@
 import type { AgentVersion, ModelDefinition, Permission, SessionRecord, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
-import { hasPermission, normalizePermissions } from '../../../packages/shared/src/policy.js';
+import { hasPermission, normalizePermissions, roleSessionCeiling, sessionCreatorRoles, workspaceSessionPermissions } from '../../../packages/shared/src/policy.js';
 import type { AgentRow, AppContext, Env, MemberRow, ModelRow, SessionAccess, SessionRow, UserRow } from './types.js';
 import { fail, id, now, testMode } from './http.js';
 import type { Query } from './db/types.js';
@@ -60,11 +60,22 @@ export async function requireMember(env: Env, workspaceId: string, userId: strin
   if (roles && !roles.includes(member.role)) fail(403, 'forbidden', 'Workspace administrator access is required.');
   return member;
 }
-type SessionPolicyRow = SessionRow & { grants_json: string | null };
+/** The actor's membership, as long as its role may create sessions there: a viewer only follows other people's. */
+export async function requireSessionCreator(env: Env, workspaceId: string, userId: string): Promise<MemberRow> {
+  const member = await requireMember(env, workspaceId, userId);
+  if (!sessionCreatorRoles.includes(member.role)) fail(403, 'viewer_role', 'Viewers cannot create sessions in this workspace.');
+  return member;
+}
+/** SQL true while `user` (a bound user id) is a member of `workspace` (an SQL expression) whose role creates sessions. */
+export function sessionCreatorSQL(workspace: string): string {
+  return `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ${workspace} AND user_id = ?
+    AND role IN (${sessionCreatorRoles.map(role => `'${role}'`).join(', ')}))`;
+}
+type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: WorkspaceRole };
 
 // Membership, visibility and explicit grants must come from the same policy snapshot. A suspended account opens no
 // session, and nobody opens the sessions it owns, as if it had left the workspace.
-const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json FROM sessions s
+const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role FROM sessions s
   INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
   INNER JOIN workspace_members owner ON owner.workspace_id = s.workspace_id AND owner.user_id = s.owner_id
   INNER JOIN users actor_user ON actor_user.id = actor.user_id
@@ -77,10 +88,15 @@ const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json FROM s
 
 function accessFromSnapshot(snapshot: SessionPolicyRow | null, actorId: string): SessionAccess | null {
   if (!snapshot) return null;
-  const { grants_json, ...row } = snapshot;
+  const { grants_json, actor_role, ...row } = snapshot;
   if (row.owner_id === actorId) return { row, permissions: [...permissions] };
-  const grants = grants_json ? normalizePermissions(JSON.parse(grants_json)) : [];
-  if ((row.visibility === 'workspace' || hasPermission(grants, 'read')) && !grants.includes('read')) grants.unshift('read');
+  // A session shared with the workspace gives each member what its role allows there; explicit grants add to that,
+  // up to the role's ceiling (a viewer only ever reads).
+  const held = new Set<Permission>(grants_json ? normalizePermissions(JSON.parse(grants_json)) : []);
+  if (row.visibility === 'workspace') for (const permission of workspaceSessionPermissions(actor_role)) held.add(permission);
+  if (held.size) held.add('read');
+  const ceiling = roleSessionCeiling(actor_role);
+  const grants = permissions.filter(permission => held.has(permission) && (!ceiling || ceiling.includes(permission)));
   return grants.length ? { row, permissions: grants } : null;
 }
 
