@@ -1,7 +1,7 @@
 name: Release server
 # Pushing a server-v1.2.3 tag (server-v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then publishes the
 # server image, the web app and the backend in one, to ghcr.io/opencara/pistead (1.2.3, 1.2 and latest; only the full
-# version for a prerelease) and creates the tag's GitHub release, with notes since the previous server-v tag.
+# version for a prerelease). It creates no GitHub release: the image is the release.
 on:
   push:
     tags: ["server-v*.*.*"]
@@ -59,30 +59,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  github-release:
-    needs: [check, docker]
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: write
-    steps:
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.check.outputs.version }}
-          PRERELEASE: ${{ needs.check.outputs.prerelease }}
-          PREVIOUS_TAG: ${{ needs.check.outputs.previous-tag }}
-          IMAGE: ghcr.io/${{ github.repository }}
-        run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "The release $GITHUB_REF_NAME already exists."
-            exit 0
-          fi
-          # Only the desktop release is marked latest: it's the one with downloads.
-          flags=(--latest=false)
-          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
-          [ -n "$PREVIOUS_TAG" ] && flags+=(--notes-start-tag "$PREVIOUS_TAG")
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "Server $VERSION" --generate-notes "${flags[@]}" \
-            --notes "Image: \`docker pull ${IMAGE,,}:$VERSION\`"

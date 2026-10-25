@@ -1,12 +1,13 @@
 name: Release check
 # Shared by the release workflows, one per release line, each started by its own tag:
 #   cli-v1.2.3      release.yml          `pistead` connector on npm
-#   server-v1.2.3   release-server.yml   server image (web and backend) on GHCR, and a GitHub release
+#   server-v1.2.3   release-server.yml   server image (web and backend) on GHCR
 #   desktop-v1.2.3  release-desktop.yml  desktop app on a GitHub release (macOS today)
 #   ios-v1.2.3      release-ios.yml      iOS app on TestFlight
 # A suffix such as -beta.1 makes a prerelease. This checks the tag is on main, reads the version from it and finds the
-# line's previous tag, from which release notes start; a line's first release starts from the latest plain v1.2.3 tag,
-# which released npm and the image together before the lines were split.
+# line's previous tag, from which a GitHub release's notes start (only the desktop line creates one today); a line's
+# first release starts from the latest plain v1.2.3 tag, which released npm and the image together before the lines
+# were split.
 on:
   workflow_call:
     inputs:
