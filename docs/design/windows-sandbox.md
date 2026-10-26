@@ -1,6 +1,7 @@
 # Design: a native Windows 11 sandbox for the connector
 
-Status: investigation. Nothing here is implemented. Native Windows is refused today
+Status: investigation. Nothing here is implemented. The cross-platform decision is in
+[Choosing](#choosing-across-windows-linux-and-macos-from-the-requirements-alone). Native Windows is refused today
 (`apps/runner/src/connect-setup.ts`), and Windows hosts run the connector inside WSL2.
 
 This note sets out what a native backend has to guarantee, the Windows primitives that can provide it, how three
@@ -144,7 +145,11 @@ lines of Rust across its Windows crates, tests included), and is now moving to t
 
 ## Recommendation
 
-1. **Back the Windows sandbox with PSEC through MXC, and refuse every weaker tier.** At start-up, call
+WSL2 with the Linux sandbox stays the **default** on Windows: it is the only option that meets every requirement
+today (see [Choosing](#choosing-across-windows-linux-and-macos-from-the-requirements-alone)). The native backend
+below is an add-on for hosts that need Windows-native tools.
+
+1. **Back the native Windows sandbox with PSEC through MXC, and refuse every weaker tier.** At start-up, call
    `getAvailableBackends()` / `probe()` and require `tier === "base-container"`. Set
    `fallback.allowDaclMutation: false` and never use the AppContainer tiers. This follows the existing rule
    "refusing unsandboxed execution" and is the same choice Codex made. One container per session (`containerName`)
@@ -252,44 +257,96 @@ That makes MXC Seatbelt a candidate for a "sandboxed macOS host" mode that is cl
 better than none. It's a separate decision from the Windows backend, but the same runner-process design would serve
 both.
 
-## Choosing: a package, or our own, across Windows, Linux and macOS
+## Choosing across Windows, Linux and macOS, from the requirements alone
 
-Pistead's requirements, which generic agent sandboxes don't share:
+This evaluation deliberately ignores what Pistead already has (`sandbox.ts`, the docs). It scores every option only
+against what a session sandbox has to do.
 
-- **reads denied by default**, because members share hosts;
-- **one boundary per session**;
-- **Pistead's own egress proxy as the only way out**, since it carries the Git relay and the owner's access;
-- **resource limits**;
-- **race-free file tools** that run inside the boundary.
+### Requirements
 
-| Option | Windows | Linux | macOS | Fit |
-|---|---|---|---|---|
-| `@microsoft/mxc-sdk` | **PSEC (best available)**; AppContainer fallbacks must be refused | bubblewrap, weaker than ours (all of `/etc`, path binds, slirp4netns/iptables, no limits) | Seatbelt, deny-by-default, proxy-port-only egress | Good on Windows, fair on macOS, a step back on Linux. 108 MB package, in-process FFI, 1.0 released 2026-10, no resource limits on any platform |
-| `@anthropic-ai/sandbox-runtime` | alpha: one machine-wide `srt-sandbox` user, admin install, WFP for a port range; **no per-session separation** | bwrap + seccomp, **reads allowed everywhere by default** | `sandbox-exec`, same read-allow default | Built for one developer's CLI. Its own filtering proxy would sit in front of ours (`parentProxy`). Wrong trust model for shared hosts |
-| Codex crates | restricted token / dedicated users / MXC | own bwrap | Seatbelt | Not published as a library, and tied to Codex's protocol types. Reference only |
-| All our own | reimplement PSEC (`processmodel.dll` `CreateProcessSecurityEnvironment` + MXC's FlatBuffer spec, with per-build feature probing) or the dedicated-user design (about 38k lines in Codex) | **already done** (`sandbox.ts`) | a Seatbelt profile is a few hundred lines | Too costly on Windows, cheap elsewhere |
+| # | Requirement | Weight |
+|---|---|---|
+| R1 | Reads denied by default: a session sees nothing of the host unless granted | Must, since hosts are shared |
+| R2 | A separate boundary per session, from other sessions and from the host user | Must |
+| R3 | The only way out is our proxy, enforced by the kernel, and the proxy can tell which session is connecting | Must |
+| R4 | CPU, memory, process and disk limits per session | Must on shared hosts |
+| R5 | No admin or root at run time, and little or no install | Should |
+| R6 | Process trees can be killed, with timeouts | Must |
+| R7 | File operations inside the boundary, without symlink races | Must |
+| R8 | Works from a Node connector shipped with npx | Should |
+| R9 | Real tools work (git, bash, node, compilers); GPU optional | Should |
+| R10 | Mature, maintained, permissive license | Should |
+| R11 | Same behaviour on every platform | Nice |
 
-**Decision: own the abstraction, Linux and macOS; borrow only Windows.**
+### Linux
 
-1. **The abstraction is ours: the runner's `Request` protocol.** That's one JSON line in for each of initialize,
-   read, write, list, browse, bash, snapshot and clone-*, run by a per-command helper process the runner launches
-   under that platform's limits. `Sandbox` becomes an interface with one implementation per platform, and
-   `session.ts`, the egress proxy and policy don't change.
-2. **Linux: keep `sandbox.ts`.** It's stronger than every alternative and already in production.
-3. **macOS: write our own Seatbelt profile.** That means `sandbox-exec -p` or a tiny `sandbox_init` launcher, using
-   MXC's documented profile rules as the reference: `(deny default)`, the session root read-write, system paths
-   read-only, `/private/etc` cut down to what tools need, outbound limited to the session's proxy port. It's small,
-   keeps the 108 MB package off Macs, and keeps the profile under our review. MXC's Seatbelt backend is the
-   shortcut if speed matters more.
-4. **Windows: `@microsoft/mxc-sdk`, pinned, PSEC tier only.** It's the only practical way to reach the OS container,
-   used through the per-command runner that sets job limits and refuses other tiers. Don't build the
-   dedicated-account design. Reconsider calling `processmodel.dll` ourselves only if Microsoft documents the PSEC
-   specification and MXC becomes a burden.
-5. **Shared pieces we write once:** per-session proxy ports and peer checks (needed on Windows and macOS, which have no
-   network namespace), platform path rules, and a capability report that says which guarantees each host actually
-   has. A macOS host would report "sandboxed" but without resource limits, and the UI should show that.
+| Option | R1 | R2 | R3 | R4 | R5 | Notes |
+|---|---|---|---|---|---|---|
+| Thin wrapper over bubblewrap (our own) | ✓ | ✓ | ✓ | ◐ with cgroups | ✓ | A per-session Unix socket in an empty network namespace gives proxy peer identity for free |
+| MXC bubblewrap | ◐ (all of `/etc` visible) | ✓ | ◐ | ✗ | ◐ | Proxy over slirp4netns to host loopback: needs `slirp4netns`/`iptables`, and other local processes can reach the proxy too |
+| sandbox-runtime | ✗ by default (reads allowed everywhere) | ✓ | ◐ (its own filtering proxy in front of ours) | ✗ | ✓ | Built for one developer's machine |
 
-### Phases
+The real package on Linux is bubblewrap itself. The wrappers around it add dependencies or looser defaults, and none
+adds limits. **Our own thin wrapper wins even starting from scratch.**
+
+### macOS
+
+| Option | R1 | R2 | R3 | R4 | R5 | Notes |
+|---|---|---|---|---|---|---|
+| MXC Seatbelt | ✓ | ✓ per process tree | ◐ (one localhost port, needs a peer check) | ✗ | ✓ | Maintained by Microsoft, same API as on Windows |
+| Our own Seatbelt profile | ✓ | ✓ | ◐ (same) | ✗ | ✓ | A few hundred lines, fully under our control |
+| sandbox-runtime | ✗ by default | ✓ | ◐ | ✗ | ✓ | |
+
+MXC and our own profile come out nearly even. We lean to **MXC**: one API for macOS and Windows, maintained by
+Microsoft, as long as a 108 MB package and native code loaded through FFI are acceptable. Otherwise, our own
+profile. Neither can give hard memory limits, because macOS has no cgroup equivalent (rlimits only, and
+`RLIMIT_AS` isn't enforced).
+
+### Windows
+
+| Option | R1 | R2 | R3 | R4 | R5 | R9 | Notes |
+|---|---|---|---|---|---|---|---|
+| MXC on PSEC | ✓ | ✓ (container SID per session) | ✓ (per-container network filter to the proxy) | ✗, add job objects | ✓ | ✓ | Only Windows 11 24H2/25H2 builds from August–September 2026 |
+| sandbox-runtime (`srt-win`) | ✗ | ✗ (one shared user) | ◐ | ◐ | ✗ (admin install) | ◐ | Alpha |
+| Dedicated user accounts (Codex style, built ourselves) | ◐ | ◐ (needs an account pool) | ✓ | ◐ | ✗ (admin) | ◐ | About 38k lines in Codex, which is moving away from it |
+| Windows Sandbox VM | ✓ | ✗ (one VM per host) | ✓ | ✓ | ◐ | ✓ | |
+| **WSL2 + the Linux sandbox** | ✓ | ✓ | ✓ | ✓ | ◐ (one-time WSL install) | ✗ for Windows-native tools | Meets every Must today |
+
+**WSL2 is the only option that meets every Must on Windows today.** Native Windows is worth adding only for
+Windows-native tooling, and then MXC on PSEC is the only viable route.
+
+### Gaps no package fills
+
+Whatever we choose, we build these ourselves:
+
+- resource limits on every platform (cgroups, job objects, rlimits on macOS);
+- per-session proxy ports plus a check that a connection comes from that session, on Windows and macOS;
+- disk quotas;
+- one shared request protocol that hides the platform differences.
+
+### Alternative: one VM per session
+
+Starting from scratch, this is a serious alternative to process sandboxes, for example Firecracker on Linux, Apple's
+Virtualization or Containerization framework on macOS, and Hyper-V or WSL on Windows *(unverified; not read in
+this investigation)*.
+
+- **For:** the strongest boundary, because sessions don't share a kernel. That matters on shared hosts, where a
+  kernel exploit breaks every process sandbox. It also gives the same Linux environment everywhere and natural
+  resource limits, and the proxy can be reached over vsock so the connecting session is known.
+- **Against:** boot time and memory per session, images to build and update, nested virtualization limits, and no
+  host-native tools (Xcode, Windows SDKs).
+
+### Decision
+
+| Platform | Choice |
+|---|---|
+| Linux | Our own thin bubblewrap wrapper plus cgroups |
+| macOS | MXC Seatbelt, or our own profile if we'd rather avoid the native dependency; labelled as having no hard memory limit |
+| Windows | WSL2 by default; MXC on PSEC with our job limits for native Windows tools |
+| Everywhere | Our own request protocol, limits, proxy peer checks and capability report |
+| Revisit | VM per session, if shared-host security outweighs start-up cost and native tools |
+
+## Phases (native Windows backend)
 
 1. Run the unsandboxed host on win32: lease, path rules, `HostWorkspace`, `connect-setup` checks.
 2. Prototype the per-command runner on `@microsoft/mxc-sdk`: the koffi job gate, the base-container tier check, bash
