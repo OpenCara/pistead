@@ -207,6 +207,51 @@ Also worth a spike: the `isolation_session` backend ("a freshly provisioned isol
 OS-managed session", available from build .9550) gives each session its own user SID. That would make NTFS per-user
 disk quotas possible, but it's heavier than a ProcessContainer.
 
+## MXC on Linux and macOS
+
+The same SDK and request shape also drive `bubblewrap` (the Linux default; `lxc`, `microvm` and `hyperlight` are
+options) and `seatbelt` on macOS 15 and later. The `process` intent resolves to `processcontainer`, `bubblewrap` or
+`seatbelt` by platform. The npm package ships `libmxc_ffi.so` / `.dylib` for them.
+
+**Linux: keep Pistead's own bubblewrap sandbox.** MXC's backend is looser than ours in the places that matter, and it
+needs more on the host:
+
+| | Pistead `sandbox.ts` | MXC bubblewrap |
+|---|---|---|
+| `/etc` | empty except the CA bundle | all of `/etc` read-only |
+| Mounts | fd-pinned `--bind-fd`, so a swapped symlink can't redirect them | path-based binds |
+| Proxy-only egress | the session's Unix socket bind-mounted into an empty network namespace; nothing else to install | `slirp4netns`, `nsenter`, `ip`, `iptables`/`ip6tables(-restore)` with per-namespace DROP chains |
+| Resource limits | cgroup v2 CPU, memory and pids, plus a disk volume | none |
+| Also | `--disable-userns`, `--die-with-parent`, `.git` read-only except for Git steps, mirrors, GPU | |
+
+Adopting it would mean giving up isolation and adding host dependencies, for no gain. The one thing it could offer is
+a shared request format across platforms, and the runner's own `Request` protocol already serves that purpose.
+
+**macOS: a real option where Pistead has no sandbox today.** macOS hosts now run only `--unsafe-no-sandbox`.
+Seatbelt (`sandbox_init` with a generated profile, the framework under the App Sandbox; no root, no install, macOS
+15+) gives:
+
+- read-only, read-write and denied paths, kernel-enforced and subtree-scoped;
+- outbound network limited to one localhost port (`(allow network-outbound (remote ip "localhost:<port>"))`), so a
+  client that ignores `HTTPS_PROXY` can't get out;
+- UI, clipboard and input-injection lockdown.
+
+The caveats for Pistead:
+
+- `localhost:<port>` also matches the host's non-loopback addresses on that port, and every session shares the host's
+  network stack. So it needs the same per-session proxy port as Windows, and the same peer check. macOS has no job
+  objects, so the check would be by the peer's process ancestry or a per-session proxy credential.
+- The baseline exposes `/private/etc`, `/Library` and `/System` read-only. That's broader than our empty `/etc`, but
+  holds no user data.
+- AF_UNIX `connect()` is allowed throughout `readwritePaths`. Keep the read-write roots to the session's own worktree
+  and home so no host agent sockets fall under them.
+- No resource limits: rlimits only, and macOS doesn't enforce `RLIMIT_AS`.
+- `sandbox_init` is deprecated in the headers, but Chromium, Codex and Claude Code all rely on it.
+
+That makes MXC Seatbelt a candidate for a "sandboxed macOS host" mode that is clearly weaker than Linux but far
+better than none. It's a separate decision from the Windows backend, but the same runner-process design would serve
+both.
+
 ### Phases
 
 1. Run the unsandboxed host on win32: lease, path rules, `HostWorkspace`, `connect-setup` checks.
