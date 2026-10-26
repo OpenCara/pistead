@@ -131,6 +131,16 @@ export interface SessionRecord {
   hostUnsandboxed?: boolean;
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
   activity?: SessionActivity;
+  /**
+   * The pull request its newest git_push with a pull request opened, or found already open; absent until one does.
+   * Display state, like activity: what the push recorded, not the pull request's live state.
+   */
+  pullRequest?: SessionPullRequest;
+}
+export interface SessionPullRequest {
+  url: string;
+  /** Parsed from the URL's last path segment; absent when it has none. */
+  number?: number;
 }
 export interface SessionGrant {
   userId: string;

@@ -72,6 +72,7 @@ export function SessionList({ selectedId, onOpen, onNew }: { selectedId?: string
           <Text style={[styles.title, { color: palette.text }]} numberOfLines={1}>{session.title}</Text>
           <Text style={[ui.small, { color: palette.muted }]} numberOfLines={1}>
             {status.label && <><Text testID={`session-status-${session.id}`} style={[styles.statusLabel, { color: palette.tones[status.tone].text }]}>{status.label}</Text> · </>}
+            {session.pullRequest && <><Text testID={`session-pull-${session.id}`} accessibilityLabel={`Pull request ${session.pullRequest.number ?? ""}`.trim()}>{session.pullRequest.number === undefined ? "PR" : `PR #${session.pullRequest.number}`}</Text> · </>}
             {isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · {relativeTime(session.createdAt)}
           </Text>
         </View>
