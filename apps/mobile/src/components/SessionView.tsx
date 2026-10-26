@@ -16,7 +16,7 @@ import type {} from "../../../../packages/shared/src/sharing";
 import type { ApprovalRecord, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
-import { saveDraft, takeDraft } from "../lib/drafts";
+import { readDraft, saveDraft } from "../lib/drafts";
 import { useKeyboardVisible, useOpenSession } from "../lib/layout";
 import { useLiveSession } from "../lib/live-session";
 import { PeopleProvider, useUsername, useWorkspacePeople } from "../lib/people";
@@ -251,8 +251,10 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   // Initialised once per session (the view remounts per id); view refreshes never reset the user's picks.
   const [selection, setSelection] = useState<ChatSelection>(() => initialSelection(view, owner));
   const [mode, setMode] = useState<"write" | "ask">("write");
-  // A first message that failed to send from the new-session screen is handed over here.
-  const [content, setContent] = useState(() => takeDraft(id));
+  // The unsent text is remembered until it is sent, so switching to another session and back keeps it; a first message
+  // that failed to send from the new-session screen is handed over the same way.
+  const [content, setContent] = useState(() => readDraft(id));
+  useEffect(() => { saveDraft(id, content); }, [id, content]);
   const [conversationId, setConversationId] = useState("");
   const [pickingConversation, setPickingConversation] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
@@ -427,7 +429,8 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
   const palette = usePalette();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardVisible();
-  const [content, setContent] = useState("");
+  const [content, setContent] = useState(() => readDraft(id));
+  useEffect(() => { saveDraft(id, content); }, [id, content]);
   const request = useRef<{ content: string; id: string } | null>(null);
   const action = useAction();
   const failed = session.status === "error" || session.status === "provisioning";
