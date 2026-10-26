@@ -1,4 +1,4 @@
-import { chatPreference, parseChatPreference, type ChatPreference, type ChatSelection } from "@pistead/client";
+import { AUTO_APPROVE_CONFIRMED_KEY, chatPreference, parseChatPreference, type ChatPreference, type ChatSelection } from "@pistead/client";
 import * as SecureStore from "expo-secure-store";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
@@ -33,6 +33,9 @@ interface AppData {
   lastChat: ChatPreference | undefined;
   /** Remembers the model and reasoning a message just went to `host` with; unset picks are the conversation's `current` ones. */
   rememberChat: (host: ConnectorInfo | undefined, selection: ChatSelection, current?: Parameters<typeof chatPreference>[2]) => void;
+  /** Whether the user confirmed, on this device, the Auto-approve warning that names merges (see mustConfirmAutoApprove). */
+  autoApproveConfirmed: boolean;
+  rememberAutoApproveConfirmed: () => void;
   liveActivity: LiveActivity | null;
   setLiveActivity: (value: LiveActivity | null) => void;
 }
@@ -66,6 +69,16 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     setLastChat(preference);
     SecureStore.setItemAsync(LAST_CHAT_KEY, JSON.stringify(preference)).catch(() => undefined);
   }, []);
+  const [autoApproveConfirmed, setAutoApproveConfirmed] = useState(false);
+  useEffect(() => {
+    let current = true;
+    SecureStore.getItemAsync(AUTO_APPROVE_CONFIRMED_KEY).then(raw => { if (current && raw === "1") setAutoApproveConfirmed(true); }, () => undefined);
+    return () => { current = false; };
+  }, []);
+  const rememberAutoApproveConfirmed = useCallback(() => {
+    setAutoApproveConfirmed(true);
+    SecureStore.setItemAsync(AUTO_APPROVE_CONFIRMED_KEY, "1").catch(() => undefined);
+  }, []);
   const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
   const working = liveActivity?.activity === "working"
     || (sessions.data?.sessions ?? []).some(session => session.status !== "archived" && session.activity === "working");
@@ -86,6 +99,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     setLastWorkspaceId,
     lastChat,
     rememberChat,
+    autoApproveConfirmed,
+    rememberAutoApproveConfirmed,
     liveActivity,
     setLiveActivity,
   };

@@ -1,15 +1,34 @@
 import {
-  accessLabels, autoApproveWarning, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels, selectModel,
+  accessLabels, autoApproveMerges, autoApproveWarning, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels, selectModel,
   type ChatSelection,
 } from "@pistead/client";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Text } from "react-native";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
 import type { AccessMode, ThinkingLevel } from "../../../../packages/shared/src/types";
+import { useAppData } from "../lib/app-data";
 import { usePalette } from "../theme";
 import { Chip, confirm, OptionSheet, styles as ui, type IconName } from "./ui";
 
 const accessIcons: Record<AccessMode, IconName> = { read: "eye-outline", approval: "shield-checkmark-outline", auto: "warning-outline" };
+
+/**
+ * Asks the session owner to confirm Auto-approve, with what it does on a host. A confirmed warning that names merges is
+ * remembered on this device, so messages that go with Auto-approve by default don't ask again.
+ */
+export function useConfirmAutoApprove(): (host: ConnectorInfo, unsandboxed: boolean) => Promise<boolean> {
+  const { rememberAutoApproveConfirmed } = useAppData();
+  return useCallback(async (host: ConnectorInfo, unsandboxed: boolean) => {
+    const confirmed = await confirm({
+      title: "Auto-approve commands?",
+      message: autoApproveWarning(host, unsandboxed),
+      confirmLabel: "Enable auto-approve",
+      destructive: true,
+    });
+    if (confirmed && autoApproveMerges(host)) rememberAutoApproveConfirmed();
+    return confirmed;
+  }, [rememberAutoApproveConfirmed]);
+}
 
 /** Model, reasoning and access pickers for a chat box. Renders nothing until the host is known. */
 export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsandboxed }: {
@@ -24,6 +43,7 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
 }) {
   const palette = usePalette();
   const [open, setOpen] = useState<"model" | "level" | "access" | null>(null);
+  const confirmAutoApprove = useConfirmAutoApprove();
   if (!host) return null;
   if (!host.capabilities.chatOptions) return <Text style={[ui.small, { color: palette.muted }]}>{CONNECTOR_UPDATE_HINT}</Text>;
   const model = findModel(host, value.model);
@@ -32,12 +52,7 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
   const close = () => setOpen(null);
 
   async function selectAccess(access: AccessMode) {
-    if (access === "auto" && value.access !== "auto" && !await confirm({
-      title: "Auto-approve commands?",
-      message: autoApproveWarning(host!, unsandboxed),
-      confirmLabel: "Enable auto-approve",
-      destructive: true,
-    })) return;
+    if (access === "auto" && value.access !== "auto" && !await confirmAutoApprove(host!, unsandboxed)) return;
     onChange({ ...value, access });
   }
 

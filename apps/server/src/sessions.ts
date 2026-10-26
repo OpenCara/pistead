@@ -64,12 +64,17 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
     if (input.access === 'auto' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can auto-approve commands.');
     options.access = input.access as ChatOptions['access'];
   }
-  // Auto-approve covers merges too. Hosts that run GitHub effects automatically (`automaticGitHub`) merge without asking
-  // only in a message marked `autoMerge`, as when that was the owner's separate opt-in, and the broker only for an
-  // admission marked so (see issueRunAdmission): every Auto-approve message to such a host is. Older hosts would refuse
-  // the option. Apps from when it was an opt-in still send their choice, which changes nothing.
-  if (input.autoMerge !== undefined && typeof input.autoMerge !== 'boolean') fail(400, 'invalid_options', 'Invalid chat options.');
-  if (options.access === 'auto' && capabilities.automaticGitHub === true) options.autoMerge = true;
+  // Auto-approve covers merges on hosts that run GitHub effects automatically (`automaticGitHub`), which merge without
+  // asking only in a message marked `autoMerge`, as the broker does only for an admission marked so (see
+  // issueRunAdmission). The apps mark each Auto-approve message to such a host, once its owner confirmed there that it
+  // merges; apps from when that was a separate Auto-merge option mark only the messages that chose it. Other hosts would
+  // refuse the mark and ask before every GitHub effect anyway, so it is left off, as when an app's picture of the host is
+  // out of date. `false` is the same as leaving it out.
+  if (input.autoMerge !== undefined) {
+    if (typeof input.autoMerge !== 'boolean') fail(400, 'invalid_options', 'Invalid auto-merge choice.');
+    if (input.autoMerge && options.access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
+    if (input.autoMerge && capabilities.automaticGitHub === true) options.autoMerge = true;
+  }
   return options;
 }
 

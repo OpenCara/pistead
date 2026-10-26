@@ -1,6 +1,6 @@
-import { chatOptionsBody, preferredSelection, segment, type ChatSelection } from "@pistead/client";
+import { chatOptionsBody, mustConfirmAutoApprove, preferredSelection, segment, type ChatSelection } from "@pistead/client";
 import * as Crypto from "expo-crypto";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
 import type { WorkspaceRepositoryList } from "../../../../packages/shared/src/repositories";
@@ -11,7 +11,7 @@ import { useSession } from "../lib/auth";
 import { saveDraft } from "../lib/drafts";
 import { useAction, useResource } from "../lib/resource";
 import { usePalette } from "../theme";
-import { ChatOptionsBar } from "./ChatOptionsBar";
+import { ChatOptionsBar, useConfirmAutoApprove } from "./ChatOptionsBar";
 import { Banner, Button, Chip, EmptyState, Feedback, Loading, OptionSheet, styles as ui } from "./ui";
 
 const TITLE_LIMIT = 80;
@@ -52,7 +52,10 @@ export function NewSessionForm({ onStarted }: { onStarted: (sessionId: string) =
 
 function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (sessionId: string) => void }) {
   const { user, api } = useSession();
-  const { refreshSessions, setLastWorkspaceId, lastChat, rememberChat } = useAppData();
+  const { refreshSessions, setLastWorkspaceId, lastChat, rememberChat, autoApproveConfirmed } = useAppData();
+  const confirmAutoApprove = useConfirmAutoApprove();
+  // Set while the owner decides on Auto-approve, so a second tap can't start a second session.
+  const confirming = useRef(false);
   const palette = usePalette();
   const workspacePath = `/api/workspaces/${segment(workspace.id)}`;
   const models = useResource<{ models: ModelDefinition[] }>(`${workspacePath}/models`);
@@ -96,10 +99,17 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
   // A trust acknowledgement covers one host against one repository set.
   useEffect(() => { setTrustedHost(""); }, [host?.id, host?.ownerId, repositories]);
 
-  function start() {
-    if (!canStart || !model || !host) return;
+  async function start() {
+    if (!canStart || !model || !host || confirming.current) return;
     const message = content.trim();
     const options = chatOptionsBody(host, selection, "submit");
+    // The chat box starts on Auto-approve without asking, and it merges too: the first message that would asks first.
+    if (mustConfirmAutoApprove(options, autoApproveConfirmed)) {
+      confirming.current = true;
+      const confirmed = await confirmAutoApprove(host, Boolean(host.capabilities.unsandboxed)).finally(() => { confirming.current = false; });
+      // Declined, the chat box asks before acting instead, and nothing starts until the owner sends again.
+      if (!confirmed) { setChat({ key: host.id, value: { ...selection, access: "approval" } }); return; }
+    }
     void action.run(async () => {
       const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: {
         workspaceId: workspace.id, modelId: model.id, title: deriveTitle(content, model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}),

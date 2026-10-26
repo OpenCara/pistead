@@ -1025,8 +1025,7 @@ export class RunnerSession {
       if (value.access === "auto" && actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can auto-approve");
       options.access = value.access as ChatOptions["access"];
     }
-    // The control plane marks the owner's Auto-approve messages, and no others, as merging without asking too (see
-    // ChatOptions).
+    // Only an Auto-approve message merges without asking too, as the apps mark each one (see ChatOptions).
     if (value.autoMerge !== undefined) {
       if (typeof value.autoMerge !== "boolean" || (value.autoMerge && options.access !== "auto")) throw invalid("Auto-merge needs Auto-approve");
       if (value.autoMerge) options.autoMerge = true;
@@ -1582,9 +1581,8 @@ export class RunnerSession {
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
       // Automatic pushes and GitHub effects are authorized by the control plane from the run's owner admission, so they
       // need one. GitHub comments, issues and merges run automatically only under the owner's Auto-approve itself, never
-      // a session grant, and merges only in a message the control plane marked `autoMerge`. It marks every Auto-approve
-      // message now; older control planes marked only those whose owner also chose Auto-merge, and refuse (even in a
-      // session's view) an automatic merge of any other.
+      // a session grant, and merges only in a message marked `autoMerge`, as the apps mark Auto-approve messages: the
+      // control plane refuses an automatic merge of any other, even in a session's view.
       // A tool the owner allowed for the rest of the session runs their calls of it as Auto-approve would; host commands
       // never take a session grant, so each one still asks unless the owner holds automatic host commands on this host.
       const github = operation.kind === "github.comment" || operation.kind === "github.merge" || operation.kind === "github.issue";

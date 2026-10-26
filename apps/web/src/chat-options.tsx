@@ -1,14 +1,16 @@
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { AccessMode, ThinkingLevel } from "../../../packages/shared/src/types";
 import {
-  accessLabels, autoApproveWarning, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels,
-  parseChatPreference, selectModel as pickModel, type ChatPreference, type ChatSelection,
+  accessLabels, AUTO_APPROVE_CONFIRMED_KEY, autoApproveMerges, autoApproveWarning, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels,
+  modelKey, offeredLevels, parseChatPreference, selectModel as pickModel, type ChatPreference, type ChatSelection,
 } from "../../../packages/client/src/chat-options";
 import { Icon, type IconName } from "./icons";
 import { Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
-export { accessUnavailable, chatOptionsBody, initialSelection, preferredSelection, type ChatPreference, type ChatSelection } from "../../../packages/client/src/chat-options";
+export {
+  accessUnavailable, chatOptionsBody, initialSelection, mustConfirmAutoApprove, preferredSelection, type ChatPreference, type ChatSelection,
+} from "../../../packages/client/src/chat-options";
 
 /** The model and reasoning last chatted with, in this browser; new chats start from them. */
 const LAST_CHAT_KEY = "pistead.lastChat";
@@ -22,6 +24,33 @@ export function rememberChat(host: ConnectorInfo | undefined, selection: ChatSel
   const preference = chatPreference(host, selection, current);
   if (!preference) return;
   try { localStorage.setItem(LAST_CHAT_KEY, JSON.stringify(preference)); } catch { /* Private mode: the choice is simply not remembered. */ }
+}
+
+/** Set once confirmed on this page, for a browser that keeps nothing (private mode). */
+let autoApproveConfirmedHere = false;
+
+/** Whether this browser's user confirmed the Auto-approve warning that names merges (see mustConfirmAutoApprove). */
+export function autoApproveConfirmed(): boolean {
+  if (autoApproveConfirmedHere) return true;
+  try { return localStorage.getItem(AUTO_APPROVE_CONFIRMED_KEY) === "1"; } catch { return false; }
+}
+
+/**
+ * Asks the session owner to confirm Auto-approve, with what it does on `host`. A confirmed warning that names merges is
+ * remembered in this browser, so messages that go with Auto-approve by default don't ask again.
+ */
+export async function confirmAutoApprove(host: ConnectorInfo, unsandboxed: boolean): Promise<boolean> {
+  const confirmed = await confirmDialog({
+    title: "Auto-approve commands?",
+    message: autoApproveWarning(host, unsandboxed),
+    confirmLabel: "Enable auto-approve",
+    destructive: true,
+  });
+  if (confirmed && autoApproveMerges(host)) {
+    autoApproveConfirmedHere = true;
+    try { localStorage.setItem(AUTO_APPROVE_CONFIRMED_KEY, "1"); } catch { /* Private mode: remembered until the page closes. */ }
+  }
+  return confirmed;
 }
 
 const accessIcons: Record<AccessMode, IconName> = { read: "eye", approval: "shield", auto: "alert" };
@@ -49,12 +78,7 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
   }
 
   async function selectAccess(access: AccessMode) {
-    if (access === "auto" && value.access !== "auto" && !await confirmDialog({
-      title: "Auto-approve commands?",
-      message: autoApproveWarning(host!, unsandboxed),
-      confirmLabel: "Enable auto-approve",
-      destructive: true,
-    })) return;
+    if (access === "auto" && value.access !== "auto" && !await confirmAutoApprove(host!, unsandboxed)) return;
     onChange({ ...value, access });
   }
 

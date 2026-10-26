@@ -77,9 +77,9 @@ function approvalInput(input: Record<string, unknown>): ApprovalInput {
 /**
  * Authorizes one GitHub effect of the session owner's Auto-approve message and consumes its tool call's single attempt
  * before the effect runs: the requester must be the session owner, still able to write, and the admission theirs, for
- * this session, unexpired and sent with Auto-approve (for a merge, also marked `auto_merge`, as every Auto-approve message
- * to a host that runs GitHub effects automatically is). As with approved effects, every check is repeated after each
- * await boundary that precedes the effect.
+ * this session, unexpired and sent with Auto-approve (for a merge, also marked `auto_merge`, as the apps ask for every
+ * Auto-approve message to a host that runs GitHub effects automatically). As with approved effects, every check is
+ * repeated after each await boundary that precedes the effect.
  */
 async function automaticEffect<T>(c: AppContext, connectorId: string | null, approval: ApprovalInput & { admissionId: string }, operation: Operation,
   action: 'github.comment' | 'github.merge' | 'github.issue', prepare: (row: SessionRow, github: GitHubAccess) => Promise<T>): Promise<{ row: SessionRow; github: GitHubAccess; prepared: T }> {

@@ -4,7 +4,9 @@ import { canCreateSessions } from "../../../packages/shared/src/policy";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
-import { ChatOptionsBar, chatOptionsBody, preferredSelection, readChatPreference, rememberChat, type ChatSelection } from "./chat-options";
+import {
+  autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, mustConfirmAutoApprove, preferredSelection, readChatPreference, rememberChat, type ChatSelection,
+} from "./chat-options";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
@@ -112,6 +114,9 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
   const attachments = useAttachments(imagesUnavailable(host));
 
+  // Set while the owner decides on Auto-approve, so a second Enter can't start a second session.
+  const confirming = useRef(false);
+
   // A trust acknowledgement covers one host against one repository set.
   useEffect(() => { setTrustedHost(""); }, [hostKey, host?.ownerId, repositories]);
 
@@ -122,12 +127,19 @@ function Composer({ workspace }: { workspace: Workspace }) {
     element.style.height = `${element.scrollHeight}px`;
   }, [content]);
 
-  function start(event?: FormEvent) {
+  async function start(event?: FormEvent) {
     event?.preventDefault();
-    if (!canStart || !model || !host) return;
+    if (!canStart || !model || !host || confirming.current) return;
     const message = content.trim();
     const pasted = attachments.images;
     const options = chatOptionsBody(host, selection, "submit");
+    // The chat box starts on Auto-approve without asking, and it merges too: the first message that would asks first.
+    if (mustConfirmAutoApprove(options, autoApproveConfirmed())) {
+      confirming.current = true;
+      const confirmed = await confirmAutoApprove(host, Boolean(host.capabilities.unsandboxed)).finally(() => { confirming.current = false; });
+      // Declined, the chat box asks before acting instead, and nothing starts until the owner sends again.
+      if (!confirmed) { setChat({ key: hostKey, value: { ...selection, access: "approval" } }); return; }
+    }
     void action.run(async () => {
       // Before the session exists: an image that can't be read stops the start instead of leaving a session behind.
       const images = await encodeImages(pasted);
@@ -153,7 +165,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      start();
+      void start();
     }
   }
 

@@ -20,10 +20,14 @@ export const accessLabels: Record<AccessMode, { label: string; hint: string }> =
   auto: { label: "Auto-approve", hint: "Commands, commits, pushes, GitHub comments, issues and merges run immediately as the owner, without asking" },
 };
 
+/** Whether Auto-approve on `host` merges pull requests without asking too: older connectors ask before every GitHub effect. */
+export function autoApproveMerges(host: Pick<ConnectorInfo, "capabilities"> | undefined): boolean {
+  return host?.capabilities.automaticGitHub === true;
+}
+
 /** What turning on Auto-approve means on `host`, confirmed before it applies. */
 export function autoApproveWarning(host: Pick<ConnectorInfo, "name" | "capabilities" | "hostCommandAccess">, unsandboxed: boolean): string {
-  // Older connectors still ask before every GitHub effect.
-  const github = host.capabilities.automaticGitHub
+  const github = autoApproveMerges(host)
     ? " GitHub comments and new issues are posted, and pull requests merged, as you without asking too: the agent can merge any pull request of this workspace's github.com repositories that GitHub lets you merge, into its base branch. Branch protection and required checks on GitHub still apply."
     : " GitHub comments and merges still need approval.";
   return (unsandboxed
@@ -167,7 +171,9 @@ export function accessUnavailable(host: ConnectorInfo | undefined, selection: Ch
 
 /**
  * Request options for a selection, or undefined when the host's connector cannot apply them.
- * Only choices the host advertises are sent; access only applies to the shared conversation.
+ * Only choices the host advertises are sent; access only applies to the shared conversation. Auto-approve covers merges
+ * too: hosts that run GitHub effects automatically, and the control plane, merge without asking only in a message that
+ * says so (`autoMerge`), so each Auto-approve message to one does.
  */
 export function chatOptionsBody(host: ConnectorInfo | undefined, selection: ChatSelection, mode: "submit" | "ask"): ChatOptions | undefined {
   if (!host?.capabilities.chatOptions) return undefined;
@@ -177,5 +183,19 @@ export function chatOptionsBody(host: ConnectorInfo | undefined, selection: Chat
   const thinkingLevel = effectiveLevel(model, selection.thinkingLevel);
   if (thinkingLevel) options.thinkingLevel = thinkingLevel;
   if (mode === "submit") options.access = selection.access;
+  if (mode === "submit" && selection.access === "auto" && autoApproveMerges(host)) options.autoMerge = true;
   return options;
+}
+
+/** Where a device remembers that its user confirmed the Auto-approve warning that names merges (see mustConfirmAutoApprove). */
+export const AUTO_APPROVE_CONFIRMED_KEY = "pistead.autoApproveConfirmed";
+
+/**
+ * Whether a message going with `options` must wait for its owner to confirm Auto-approve first: one that would merge
+ * without asking, from a device where they haven't confirmed the warning that says so (`confirmed`). Choosing
+ * Auto-approve from the access menu asks every time, but the owner's chat box also starts on it by default, which never
+ * asked; their first such message asks instead, once per device.
+ */
+export function mustConfirmAutoApprove(options: ChatOptions | undefined, confirmed: boolean): boolean {
+  return options?.autoMerge === true && !confirmed;
 }

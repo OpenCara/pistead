@@ -2403,7 +2403,7 @@ test('a collaborator sends a message to a workspace-visible session it does not 
 
 /**
  * A run admission of `actorId`, as a message sent with `access` mints it; `autoMerge` marks it as merging without asking
- * too, as every Auto-approve message to a host that runs GitHub effects automatically is.
+ * too, as the apps ask for every Auto-approve message to a host that runs GitHub effects automatically.
  */
 function autoAdmission(f: Fixture, sessionId: string, actorId: string, access: string | null = 'auto', autoMerge = false, expiresAt = Math.floor(Date.now() / 1000) + 600) {
   const id = token();
@@ -2412,7 +2412,7 @@ function autoAdmission(f: Fixture, sessionId: string, actorId: string, access: s
   return id;
 }
 
-test('the owner\'s Auto-approve merges without asking on hosts that run GitHub effects automatically, whatever an older app chose', async t => {
+test('an Auto-approve message whose app asks merges without asking, on hosts that run GitHub effects automatically', async t => {
   const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_merge']);
   const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
   const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
@@ -2423,24 +2423,28 @@ test('the owner\'s Auto-approve merges without asking on hosts that run GitHub e
     const admission = f.sqlite.prepare('SELECT id, auto_merge FROM run_admissions WHERE request_id = ?').get(requestId)!;
     return { admissionId: String(admission.id), sent: [JSON.parse(requests.at(-1)!.request.body).options, admission.auto_merge] };
   };
-  // A host that asks before every GitHub effect isn't told: its connector would refuse the option.
+  // A host that asks before every GitHub effect isn't told, even by an app whose picture of it is out of date: its
+  // connector would refuse the option.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: true } }));
-  const olderHost = await send('older-host', { access: 'auto' });
+  const olderHost = await send('older-host', { access: 'auto', autoMerge: true });
   assert.deepEqual(olderHost.sent, [{ access: 'auto' }, 0]);
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: true, automaticGitHub: true } }));
-  const auto = await send('auto', { access: 'auto' });
+  const auto = await send('auto', { access: 'auto', autoMerge: true });
   assert.deepEqual(auto.sent, [{ access: 'auto', autoMerge: true }, 1]);
-  assert.deepEqual((await send('asking', { access: 'approval' })).sent, [{ access: 'approval' }, 0]);
-  // Apps from when Auto-merge was a separate opt-in still send their choice, which changes nothing.
-  assert.deepEqual((await send('chose-off', { access: 'auto', autoMerge: false })).sent, [{ access: 'auto', autoMerge: true }, 1]);
-  assert.deepEqual((await send('chose-on', { access: 'approval', autoMerge: true })).sent, [{ access: 'approval' }, 0]);
+  // A message that doesn't ask keeps merges asking, as from an app of when Auto-merge was a separate option, left off.
+  const unasked = await send('unasked', { access: 'auto' });
+  assert.deepEqual(unasked.sent, [{ access: 'auto' }, 0]);
+  assert.deepEqual((await send('declined', { access: 'auto', autoMerge: false })).sent, [{ access: 'auto' }, 0]);
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'asking', options: { access: 'approval', autoMerge: true } }), 400, 'invalid_options');
   await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'not-boolean', options: { access: 'auto', autoMerge: 'yes' } }), 400, 'invalid_options');
 
-  // The Auto-approve message's merge then runs without a person, as its comments and issues do.
+  // The asking message's merge then runs without a person, as its comments and issues do; the others' wait.
   const calls = mergeFetch(t, () => Response.json({ merged: true, sha: mergedSha }));
   const merge = (approvalId: string, admissionId: string) => ({ sessionId: s.session.id, actorId: s.creator.user.id, approvalId, admissionId,
     repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' });
-  await denied(await self(f, s.connector, 'github/merge', merge('tool-older-host', olderHost.admissionId)), 403, 'automatic_merge_not_admitted');
+  for (const [approvalId, admissionId] of [['tool-older-host', olderHost.admissionId], ['tool-unasked', unasked.admissionId]]) {
+    await denied(await self(f, s.connector, 'github/merge', merge(approvalId!, admissionId!)), 403, 'automatic_merge_not_admitted');
+  }
   assert.deepEqual(calls, []);
   assert.deepEqual(await json(await self(f, s.connector, 'github/merge', merge('tool-merge', auto.admissionId))), { sha: mergedSha, url: 'https://github.com/owner/repo/pull/5' });
   assert.deepEqual(calls, ['GET https://api.github.com/repos/owner/repo', 'PUT https://api.github.com/repos/owner/repo/pulls/5/merge']);
@@ -2484,7 +2488,7 @@ test('automatic GitHub merges need an Auto-approve admission marked to merge, an
   const owner = s.creator.user.id;
   const merge = (approvalId: string, admissionId: string) => ({ sessionId: s.session.id, actorId: owner, approvalId, admissionId,
     repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' });
-  // An unmarked Auto-approve message: one to a host that asks before every GitHub effect, or from an older control plane.
+  // An Auto-approve message that didn't ask, or went to a host that asks before every GitHub effect.
   const autoOnly = autoAdmission(f, s.session.id, owner);
   await denied(await self(f, s.connector, 'github/merge', merge('tool-merge', autoOnly)), 403, 'automatic_merge_not_admitted');
   assert.deepEqual(calls, []);

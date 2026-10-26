@@ -145,6 +145,10 @@ final class PisteadUITests: XCTestCase {
     waitForExpectations(timeout: 10)
     shot("08-new-session")
     start.tap()
+    // A new session starts on Auto-approve, which merges pull requests too: the first message that would asks once on this
+    // device.
+    let enable = app.alerts.buttons["Enable auto-approve"]
+    if enable.waitForExistence(timeout: 5) { enable.tap() }
     // The new session opens with its first message, which runs: the faux model answers with the tool's result.
     wait(app.staticTexts["TEST_IDENTITY"], 90)
     wait(app.staticTexts["Live"], 60)

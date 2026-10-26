@@ -1,4 +1,6 @@
-import { accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, preparingRepositories, segment, type ChatSelection } from "@pistead/client";
+import {
+  accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
+} from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import { Stack } from "expo-router";
@@ -20,7 +22,7 @@ import { PeopleProvider, useUsername, useWorkspacePeople } from "../lib/people";
 import { useAction, useResource } from "../lib/resource";
 import { usePalette } from "../theme";
 import { ApprovalCard } from "./ApprovalCard";
-import { ChatOptionsBar } from "./ChatOptionsBar";
+import { ChatOptionsBar, useConfirmAutoApprove } from "./ChatOptionsBar";
 import { Composer } from "./Composer";
 import { RepositoryPreparationCard } from "./RepositoryPreparation";
 import { TranscriptEntry } from "./TranscriptEntry";
@@ -234,7 +236,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode;
 }) {
   const { api } = useSession();
-  const { rememberChat } = useAppData();
+  const { rememberChat, autoApproveConfirmed } = useAppData();
+  const confirmAutoApprove = useConfirmAutoApprove();
   const palette = usePalette();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardVisible();
@@ -248,6 +251,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [pickingConversation, setPickingConversation] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
   const request = useRef<{ key: string; id: string } | null>(null);
+  // Set while the owner decides on Auto-approve, so a second tap can't send the message twice.
+  const confirming = useRef(false);
   const submission = useAction();
   const stopping = useAction();
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
@@ -259,6 +264,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const actualMode = mode === "ask" && !canAsk ? "write" : mode;
   const readOnly = session.status === "archived" || session.frozen === true;
   const permitted = !readOnly && (actualMode === "write" ? canWrite : canAsk);
+  const unsandboxed = Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed);
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
@@ -291,11 +297,19 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     stick.current = contentSize.height - contentOffset.y - layoutMeasurement.height < 80;
   }, []);
 
-  function submit() {
-    if (!permitted || !content.trim() || submission.busy) return;
+  async function submit() {
+    if (!permitted || !content.trim() || submission.busy || confirming.current) return;
+    const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
+    // The owner's chat box can start on Auto-approve without asking, and it merges too: the first message that would asks
+    // first.
+    if (host && mustConfirmAutoApprove(options, autoApproveConfirmed)) {
+      confirming.current = true;
+      const confirmed = await confirmAutoApprove(host, unsandboxed).finally(() => { confirming.current = false; });
+      // Declined, the chat box asks before acting instead, and nothing is sent until the owner sends again.
+      if (!confirmed) { setSelection(current => ({ ...current, access: "approval" })); return; }
+    }
     setReceipt(null);
     const sent = content;
-    const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
     // Changing the options is a different request, so it needs a new idempotency key.
     const key = `${actualMode}:${JSON.stringify(options ?? null)}:${sent}`;
     // Retry the same failed submission with the same idempotency key, not a duplicate turn.
@@ -382,7 +396,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             </Pressable>)}
           </View>}
           {actualMode === "ask" && sideConversations.length > 0 && <Chip label={sideIndex < 0 ? "All my side asks" : `Side ask ${sideIndex + 1}`} onPress={() => setPickingConversation(true)} />}
-          {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
+          {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={unsandboxed} />}
         </>} />
       {draftHasSecret && <Text testID="draft-secret" style={[ui.small, { color: palette.muted }]} accessibilityLiveRegion="polite">
         This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.

@@ -416,9 +416,8 @@ test("the owner's Auto-approve posts comments, opens issues and merges at once w
   const session = await service.provision(target, await ticket(target.session.id, "create"));
 
   const admissionId = await sha256("github auto admission");
-  // Unmarked, as an older control plane sends Auto-approve unless its owner also chose Auto-merge (and would refuse an
-  // automatic merge): the comment and the issue ran at once, authorized by the message's admission, never a capability;
-  // the merge waits.
+  // Unmarked, as from an app of when Auto-merge was a separate option, left off: the comment and the issue ran at once,
+  // authorized by the message's admission, never a capability; the merge waits.
   await session.submit(await ticket(target.session.id, "submit"), { content: "Comment, file and merge.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
   const card = await pendingApproval(session);
   assert.equal(card.operation.kind, "github.merge");
@@ -437,7 +436,7 @@ test("the owner's Auto-approve posts comments, opens issues and merges at once w
   await idle(session);
   assert.equal(merges.length, 0);
 
-  // Marked, as the control plane now marks every Auto-approve message to a host like this one, the merge runs at once too.
+  // Marked, as the apps mark every Auto-approve message to a host like this one, the merge runs at once too.
   const mergeAdmission = await sha256("github auto-merge admission");
   await session.submit(await ticket(target.session.id, "submit"), { content: "Merge it.", requestId: "auto-merge", admissionId: mergeAdmission, options: { access: "auto", autoMerge: true } }, "write");
   await idle(session);

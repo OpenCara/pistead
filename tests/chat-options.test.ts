@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ConnectorInfo } from "../packages/shared/src/connector.js";
 import type { SessionView } from "../packages/shared/src/types.js";
-import { accessUnavailable, autoApproveWarning, chatOptionsBody, chatPreference, initialSelection, parseChatPreference, preferredSelection, type ChatSelection } from "../packages/client/src/chat-options.js";
+import {
+  accessUnavailable, autoApproveMerges, autoApproveWarning, chatOptionsBody, chatPreference, initialSelection, mustConfirmAutoApprove, parseChatPreference, preferredSelection,
+  type ChatSelection,
+} from "../packages/client/src/chat-options.js";
 
 const host = { capabilities: { chatOptions: true }, models: [] } as unknown as ConnectorInfo;
 const auto: ChatSelection = { access: "auto" };
@@ -81,10 +84,20 @@ test("the owner's chat box starts on Auto-approve before the first shared messag
   assert.equal(initialSelection(view("auto"), false).access, "approval", "only the owner can auto-approve");
 });
 
-test("Auto-approve needs no separate auto-merge choice: a message sends only its access, on any host", () => {
+test("Auto-approve merges too, on hosts that run GitHub effects automatically, once its owner confirmed that on the device", () => {
   const automatic = { capabilities: { chatOptions: true, automaticGitHub: true }, models: [] } as unknown as ConnectorInfo;
-  assert.deepEqual(chatOptionsBody(automatic, auto, "submit"), { access: "auto" }, "the control plane marks its merges for the host");
+  const merging = chatOptionsBody(automatic, auto, "submit");
+  assert.deepEqual(merging, { access: "auto", autoMerge: true });
+  assert.deepEqual(chatOptionsBody(host, auto, "submit"), { access: "auto" }, "an older connector is never sent it");
+  assert.deepEqual(chatOptionsBody(automatic, { access: "approval" }, "submit"), { access: "approval" });
   assert.deepEqual(chatOptionsBody(automatic, auto, "ask"), {});
+  assert.deepEqual([autoApproveMerges(automatic), autoApproveMerges(host), autoApproveMerges(undefined)], [true, false, false]);
+  // The owner's chat box starts on Auto-approve without asking, so its first message that would merge asks first.
+  assert.equal(mustConfirmAutoApprove(merging, false), true);
+  assert.equal(mustConfirmAutoApprove(merging, true), false, "confirmed on this device");
+  assert.equal(mustConfirmAutoApprove(chatOptionsBody(host, auto, "submit"), false), false, "nothing merges without asking there");
+  assert.equal(mustConfirmAutoApprove(chatOptionsBody(automatic, { access: "approval" }, "submit"), false), false);
+  assert.equal(mustConfirmAutoApprove(undefined, false), false);
 });
 
 test("the Auto-approve warning says what runs without asking on this host", () => {
