@@ -240,11 +240,14 @@ function SessionPane({ id }: { id: string }) {
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={refreshAll} />}
-          {session.hostUnsandboxed && (canWrite || canApprove) && <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>}
+          {session.hostUnsandboxed && (canWrite || canApprove) && (session.hostEnvironment
+            ? <Alert variant="error" title="Runs on the host">This session runs directly on its host, without the sandbox. Approved commands and commits execute on the host owner's machine with their full user permissions, network access and no resource limits; only the host owner, or members they granted host commands, decide them.</Alert>
+            : <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>)}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
             // Only the session owner can let a call do more than the session allows.
-            const hostCommand = approval.operation.kind === "host.bash";
+            // A session that runs on its host runs its commands there, as host commands: decided the same way.
+            const hostCommand = approval.operation.kind === "host.bash" || (approval.operation.kind === "bash" && session.hostEnvironment === true);
             const ownerOnly = permission || approval.operation.kind === "git.repin";
             const decides = canApprove && (hostCommand ? session.connectorOwnerId === user.id : !ownerOnly || isOwner);
             const disabled = approvalAction.busy || !approval.reviewHash;

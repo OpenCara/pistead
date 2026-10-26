@@ -31,16 +31,25 @@ export interface HostConfig {
    * effect when the connector next connects.
    */
   repositoryCache: RepositoryCacheMode;
+  /**
+   * The host's owner may start sessions that run directly on the host's own environment, without the sandbox
+   * (SessionRecord.hostEnvironment): their commands run as the connector's OS user, with its files, credentials,
+   * network and GPU. Turning it off stops those sessions' commands at once.
+   */
+  hostSessions: boolean;
 }
 
 export const hostConfigLimits = Object.freeze({ commandTimeoutSeconds: Object.freeze({ min: 30, max: 3600 }) });
 
 export const defaultHostConfig: Readonly<HostConfig> = Object.freeze({
-  commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off",
+  commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false,
 });
 
-/** Only the host's owner changes these: they decide whose Git credentials the host uses. Its admins change the rest. */
-export const ownerOnlyHostConfig: readonly (keyof HostConfig)[] = Object.freeze(["gitCredentials", "repositoryCache"]);
+/**
+ * Only the host's owner changes these: they decide whose Git credentials the host uses, and whether anything runs on it
+ * without the sandbox. Its admins change the rest.
+ */
+export const ownerOnlyHostConfig: readonly (keyof HostConfig)[] = Object.freeze(["gitCredentials", "repositoryCache", "hostSessions"]);
 
 /** A whole configuration, as the web app sends it and the control plane reports it; anything else is refused. */
 export function parseHostConfig(value: unknown): HostConfig {
@@ -58,5 +67,19 @@ export function parseHostConfig(value: unknown): HostConfig {
   if (typeof input.gpu !== "boolean") throw new Error("Invalid GPU setting");
   if (typeof input.gitCredentials !== "boolean") throw new Error("Invalid Git credentials setting");
   if (!repositoryCacheModes.includes(input.repositoryCache as RepositoryCacheMode)) throw new Error("Invalid repository cache setting");
-  return { commandTimeoutSeconds: timeout, gpu: input.gpu, gitCredentials: input.gitCredentials, repositoryCache: input.repositoryCache as RepositoryCacheMode };
+  if (typeof input.hostSessions !== "boolean") throw new Error("Invalid host sessions setting");
+  return { commandTimeoutSeconds: timeout, gpu: input.gpu, gitCredentials: input.gitCredentials, repositoryCache: input.repositoryCache as RepositoryCacheMode,
+    hostSessions: input.hostSessions };
+}
+
+/**
+ * A configuration as a connector reads it from the control plane: settings it doesn't know (from a newer control plane)
+ * are left out, and ones the control plane doesn't send (an older one) keep their defaults. What it does read must be
+ * valid, or none of it is used.
+ */
+export function readHostConfig(value: unknown): HostConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid host configuration");
+  const input = value as Record<string, unknown>;
+  const known = Object.fromEntries(Object.keys(defaultHostConfig).filter(key => Object.hasOwn(input, key)).map(key => [key, input[key]]));
+  return parseHostConfig({ ...defaultHostConfig, ...known });
 }

@@ -26,7 +26,7 @@ const cacheHints: Record<RepositoryCacheMode, string> = {
 };
 
 const configInfo = <div className="stack">
-  <p>How this host runs sessions. Its owner and admins change the command time limit and the GPU; only its owner decides whether it uses its Git credentials or keeps a repository cache.</p>
+  <p>How this host runs sessions. Its owner and admins change the command time limit and the GPU; only its owner decides whether it uses its Git credentials, keeps a repository cache or runs their sessions without the sandbox.</p>
   <p>Running sessions pick up a change within a minute. A repository cache change applies when the host's connector next connects.</p>
   <p>A longer time limit also lifts the per-process limits of short commands (25 seconds of CPU, 64 MiB files, 256 open files) so builds fit. Without provisioned resource limits on the host (connect --resources), a command can use the whole machine for that long.</p>
 </div>;
@@ -37,7 +37,7 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
   const [config, setConfig] = useState<HostConfig>(saved);
   const action = useAction();
   // Status refreshes every few seconds: only a change of what is saved resets what is being edited.
-  useEffect(() => { setConfig(saved); }, [saved.commandTimeoutSeconds, saved.gpu, saved.gitCredentials, saved.repositoryCache]);
+  useEffect(() => { setConfig(saved); }, [saved.commandTimeoutSeconds, saved.gpu, saved.gitCredentials, saved.repositoryCache, saved.hostSessions]);
   const changed = (Object.keys(defaultHostConfig) as (keyof HostConfig)[]).some(key => config[key] !== saved[key]);
   const editable = !connector.revokedAt && !action.busy;
   const { unsandboxed, gpu } = connector.capabilities;
@@ -55,6 +55,11 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
         title: "Keep a repository cache on this host?",
         message: `${connector.name} will keep a full mirror of each repository its sessions clone, in its state directory, and their clones will borrow objects from it. Clone sessions fill it through Pistead with their owner's own access; sessions that pinned their repositories fetch with this machine's Git credentials.`,
         confirmLabel: "Keep a cache",
+      })) return;
+      if (config.hostSessions && !saved.hostSessions && !await confirmDialog({
+        title: "Let your sessions run directly on this host?",
+        message: `When you start a session on ${connector.name}, you'll be able to run it without the sandbox. Its commands then run as that machine's user, with its files, credentials, network and GPU, and no resource limits, and only you, or members you granted host commands, decide them. Other members' sessions stay in the sandbox, and so do yours unless you choose otherwise when you start one.`,
+        confirmLabel: "Allow", destructive: true,
       })) return;
       if (config.gpu && !saved.gpu && !await confirmDialog({
         title: "Lend this host's GPU to sandboxed commands?",
@@ -91,6 +96,13 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
           ? <SegmentedControl label="Repository cache" value={config.repositoryCache} onChange={value => setConfig({ ...config, repositoryCache: value })}
             options={(["off", "host", "owner"] as const).map(value => ({ value, label: cacheLabels[value], hint: cacheHints[value] }))} />
           : <StatusBadge tone={saved.repositoryCache === "off" ? "neutral" : "success"}>{cacheLabels[saved.repositoryCache]}</StatusBadge>} />
+      <Row title="Sessions on the host" hint={unsandboxed ? "This host runs every session without the sandbox"
+        : owner ? "You may start sessions that run directly on this machine, without the sandbox, as its user. Turning it off stops their commands within half a minute" : "Only the host's owner changes this"}
+        trailing={unsandboxed ? <StatusBadge tone="danger">Every session</StatusBadge>
+          : owner
+          ? <label className="check-row small"><input type="checkbox" className="checkbox" checked={config.hostSessions} disabled={!editable}
+            onChange={event => setConfig({ ...config, hostSessions: event.target.checked })} /><span>Allow my sessions</span></label>
+          : <StatusBadge tone={saved.hostSessions ? "danger" : "neutral"}>{saved.hostSessions ? "Owner's sessions" : "Off"}</StatusBadge>} />
       {!connector.capabilities.hostConfig && <Row title="Update the host's connector" hint="This host's connector predates configuration in Pistead and keeps its connect options until it is updated (npx pistead@latest connect). What you save here applies then." />}
       {(changed || action.error || action.notice) && <CardBody>
         <div className="stack">

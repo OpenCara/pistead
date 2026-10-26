@@ -4,22 +4,32 @@ import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultHostConfig, parseHostConfig } from "../packages/shared/src/host-config.js";
+import { defaultHostConfig, parseHostConfig, readHostConfig } from "../packages/shared/src/host-config.js";
 import { commandLimits, detectGpu, gpuMounts, HostConfigSource } from "../apps/runner/src/host-config.js";
 import { movedOptionsNotice } from "../apps/runner/src/connect-cli.js";
 
 const MiB = 1024 * 1024;
 
 test("a host configuration is whole and within bounds, or refused", () => {
-  const config = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner" };
+  const config = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true };
   assert.deepEqual(parseHostConfig(config), config);
-  assert.deepEqual(parseHostConfig({ ...defaultHostConfig }), { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off" });
+  assert.deepEqual(parseHostConfig({ ...defaultHostConfig }), { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false });
   for (const invalid of [undefined, null, [], "config", { ...config, commandTimeoutSeconds: 29 }, { ...config, commandTimeoutSeconds: 3601 },
     { ...config, commandTimeoutSeconds: 60.5 }, { ...config, commandTimeoutSeconds: "60" }, { ...config, gpu: 1 }, { ...config, gitCredentials: "true" },
-    { ...config, repositoryCache: "shared" }, { ...config, extra: true }, { commandTimeoutSeconds: 60, gpu: false, gitCredentials: false },
+    { ...config, repositoryCache: "shared" }, { ...config, hostSessions: "true" }, { ...config, extra: true },
+    { commandTimeoutSeconds: 60, gpu: false, gitCredentials: false, repositoryCache: "off" },
     { ...config, toString: "x" }]) {
     assert.throws(() => parseHostConfig(invalid), /host configuration|time limit|setting/, JSON.stringify(invalid));
   }
+});
+
+test("a connector reads what it knows of a configuration: newer settings are left out, missing ones keep their defaults", () => {
+  const sent = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "host", hostSessions: true };
+  assert.deepEqual(readHostConfig({ ...sent, someLaterSetting: "on" }), sent);
+  assert.deepEqual(readHostConfig({ commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "host" }), { ...sent, hostSessions: false });
+  assert.deepEqual(readHostConfig({}), defaultHostConfig);
+  // What it does read must hold, or none of it is used.
+  for (const invalid of [undefined, null, [], { ...sent, hostSessions: "yes" }, { ...sent, commandTimeoutSeconds: 5 }]) assert.throws(() => readHostConfig(invalid));
 });
 
 test("a longer command time limit gives builds room; the default keeps the short-command limits", () => {
@@ -44,7 +54,7 @@ test("the host's configuration is asked for again only after a while, and its la
     if (answer instanceof Error) throw answer;
     return answer;
   }, { now: () => now, ttlMs: 30_000, staleMs: 300_000 });
-  const first = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "off" };
+  const first = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "off", hostSessions: false };
   const second = { ...first, commandTimeoutSeconds: 1800 };
   answers.push(first);
   assert.deepEqual(await source.current(), first);

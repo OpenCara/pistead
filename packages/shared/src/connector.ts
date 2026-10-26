@@ -144,6 +144,11 @@ export interface ConnectorInfo {
   /** How the host runs its sessions; listed to its owner and admins. */
   config?: HostConfig;
   /**
+   * Listed to its owner only: sessions they start on it may run directly on the host, without the sandbox (its
+   * configuration accepts them and its connector runs them; see SessionRecord.hostEnvironment).
+   */
+  hostSessions?: true;
+  /**
    * Models it advertises that its owner or an admin disabled (see HostModelSettings): no session starts from one and no
    * message switches to one. Listed to its owner and admins, who can enable them again.
    */

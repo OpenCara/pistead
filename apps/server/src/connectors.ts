@@ -194,6 +194,14 @@ type ConnectorInfoRow = ConnectorRow & { owner_name?: string; workspace_ids?: st
  * admins; `workspaceId` adds the viewer's own host command authority there. Everyone is shown only the models it offers.
  */
 type InfoViewer = { userId: string; role?: 'owner' | 'admin'; workspaceId?: string };
+
+/**
+ * Whether a host's connector runs a session directly on the host when its binding asks (SessionRecord.hostEnvironment):
+ * one that takes its configuration from Pistead, on a sandboxed host. An unsandboxed host runs every session that way.
+ */
+export function hostSessionsSupported(capabilities: ConnectorCapabilities): boolean {
+  return capabilities.hostConfig === true && capabilities.unsandboxed !== true;
+}
 async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewer): Promise<ConnectorInfo> {
   const ownerName = row.owner_name ?? (await env.DB.query<{ display_name: string }>('SELECT display_name FROM users WHERE id = ?')
     .bind(row.owner_id).first())?.display_name ?? '';
@@ -211,11 +219,13 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
       online = await env.CONNECTOR_HUB.status(row.id, 2000);
     } catch { /* Offline is safe metadata; do not expose transport errors. */ }
   }
+  // The host's owner learns, in every listing, whether their sessions may run directly on it.
+  const owner = viewer?.userId === row.owner_id;
   const [admins, grants, disabled, config, hostCommandAccess, memberships] = await Promise.all([
     viewer?.role ? connectorAdmins(env, row.id) : undefined,
     viewer?.role ? connectorHostGrants(env, row.id) : undefined,
     disabledModelKeys(env, row.id),
-    viewer?.role ? connectorHostConfig(env, row.id) : undefined,
+    viewer?.role || owner ? connectorHostConfig(env, row.id) : undefined,
     viewer?.workspaceId ? viewerHostCommands(env, row, viewer.workspaceId, viewer.userId) : undefined,
     // An admin sees the owner's workspaces only where they are a member too.
     viewer?.role === 'admin' ? env.DB.query<{ workspace_id: string }>('SELECT workspace_id FROM workspace_members WHERE user_id = ?')
@@ -224,10 +234,13 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
   const visible = (workspaceId: string) => !memberships || memberships.has(workspaceId);
   const hostGrants = grants?.filter(grant => visible(grant.workspaceId));
   const { models, disabledModels } = hostModelSettings(JSON.parse(row.models_json), disabled);
+  const capabilities = JSON.parse(row.capabilities_json) as ConnectorCapabilities;
+  const hostSessions = owner && !row.revoked_at && config?.hostSessions === true && hostSessionsSupported(capabilities);
   return { id: row.id, ownerId: row.owner_id, ownerName, name: row.name,
     createdAt: row.created_at, revokedAt: row.revoked_at, online, models,
-    workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities: JSON.parse(row.capabilities_json),
-    ...(viewer?.role ? { role: viewer.role, admins, hostGrants, disabledModels, config } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}) };
+    workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities,
+    ...(viewer?.role ? { role: viewer.role, admins, hostGrants, disabledModels, config } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}),
+    ...(hostSessions ? { hostSessions: true as const } : {}) };
 }
 
 async function connectorInfos(env: Env, rows: ConnectorInfoRow[], viewer?: (row: ConnectorInfoRow) => InfoViewer): Promise<ConnectorInfo[]> {

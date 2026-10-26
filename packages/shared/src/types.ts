@@ -127,8 +127,15 @@ export interface SessionRecord {
   cloneUnavailable?: string;
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
-  // Present only on single-session reads: the pinned host explicitly runs without isolation.
+  // Present only on single-session reads: the pinned host explicitly runs without isolation, or this session runs on it
+  // directly (hostEnvironment).
   hostUnsandboxed?: boolean;
+  /**
+   * The session runs directly on its host's own environment, without the sandbox: chosen when its owner, the host's
+   * owner, started it on a host whose configuration accepts that (HostConfig.hostSessions), and fixed for its life.
+   * Its commands run as the host's OS user; deciding them needs host command authority, as host commands do.
+   */
+  hostEnvironment?: true;
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
   activity?: SessionActivity;
   /**

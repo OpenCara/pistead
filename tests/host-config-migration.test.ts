@@ -40,8 +40,13 @@ test('hosts started with --git-credentials or --repo-cache keep them once config
     { connector_id: 'cache', command_timeout_seconds: 30, gpu: 0, git_credentials: 0, repository_cache: 'host', updated_by: null, updated_at: '2026-01-01' },
     { connector_id: 'credentials', command_timeout_seconds: 30, gpu: 0, git_credentials: 1, repository_cache: 'off', updated_by: null, updated_at: '2026-02-01' },
   ]);
+  // Nothing runs on a host without the sandbox until its owner turns that on.
+  assert.deepEqual(sqlite.prepare('SELECT DISTINCT host_sessions FROM connector_configs').all().map(row => row.host_sessions), [0]);
+  // Every session, existing or new, runs in the sandbox unless it was started on the host.
+  assert.deepEqual(sqlite.prepare(`SELECT name, dflt_value, "notnull" FROM pragma_table_info('sessions') WHERE name = 'host_environment'`).all().map(row => ({ ...row })),
+    [{ name: 'host_environment', dflt_value: '0', notnull: 1 }]);
   // The table holds only what the web app can set.
-  for (const [column, value] of [['command_timeout_seconds', 29], ['command_timeout_seconds', 3601], ['gpu', 2], ['repository_cache', 'shared']] as const) {
+  for (const [column, value] of [['command_timeout_seconds', 29], ['command_timeout_seconds', 3601], ['gpu', 2], ['repository_cache', 'shared'], ['host_sessions', 2]] as const) {
     assert.throws(() => sqlite.prepare(`INSERT INTO connector_configs (connector_id, ${column}, updated_at) VALUES ('plain', ?, '2026-04-01')`).run(value), /CHECK constraint/);
   }
 });

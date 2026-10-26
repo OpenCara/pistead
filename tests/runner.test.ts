@@ -19,6 +19,8 @@ import { RunnerError, assertId, requestKey, stableJson, validateBinding, validat
 import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
 import { RunnerSession } from "../apps/runner/src/session.js";
 import { commandLimits, type CommandLimits } from "../apps/runner/src/host-config.js";
+import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
+import { defaultHostConfig } from "../packages/shared/src/host-config.js";
 import { acquireRunnerLease } from "../apps/runner/src/lease.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 
@@ -553,6 +555,47 @@ test("only the host's owner lets a command run without the resource limits the h
   assert.equal(autoView.approvals.filter(approval => approval.operation.kind === "permission").length, 1, "only the default-access message asked");
   assert.deepEqual(autoApproved(autoView), [{ tool: "bash", status: "executed", unbounded: true }]);
   assert.ok(toolOutput(autoView, /auto-unlimited-marker/));
+});
+
+test("a session its host's owner started on the host runs there while the host accepts that, and only host command authority decides it", { skip: process.platform !== "linux" }, async t => {
+  const { service, grants } = await fixture(t);
+  // May approve the session's work, but holds no host command authority.
+  grants["test:carol"] = ["read", "ask", "write", "approve"];
+  const connectorId = "host-sessions-connector";
+  let accepted = true;
+  const runner = new RunnerService({ ...service.config, connectorId, allowTestShell: false, hostConfig: async () => ({ ...defaultHostConfig, hostSessions: accepted }) });
+  await runner.initialize();
+  t.after(() => runner.close());
+  const admissionId = await sha256("host session write admission");
+  const onHost = (id: string, hostOwner: string) => {
+    const value = binding(id);
+    value.session.connectorId = value.model.connectorId = connectorId;
+    value.session.connectorOwnerId = value.model.connectorOwnerId = hostOwner;
+    value.session.hostEnvironment = true;
+    return value;
+  };
+  // Only its owner's own sessions run on a host itself.
+  await assert.rejects(runner.provision(onHost("host-foreign", "test:host"), { ...await ticket("host-foreign", "create"), connectorId }),
+    rejectedWith(403, /host's owner's sessions run directly on the host/));
+  const session = await runner.provision(onHost("host-own", "test:alice"), { ...await ticket("host-own", "create"), connectorId });
+  assert.ok(session.sandbox instanceof HostWorkspace, "no sandbox is created for it");
+  await session.submit({ ...await ticket("host-own", "submit"), connectorId }, { content: "TEST_BASH pwd", requestId: "host-own", admissionId }, "write");
+  const [command] = await operationRequests(session);
+  assert.equal(command!.operation.kind, "bash");
+  await assert.rejects(session.decide({ ...await ticket("host-own", "approve", "test:carol"), connectorId }, command!.id, { decision: "approve", operation: command!.operation }),
+    rejectedWith(403, /runs directly on its host/));
+  await session.decide({ ...await ticket("host-own", "approve"), connectorId }, command!.id, { decision: "approve", operation: command!.operation });
+  const ran = await settledCard(session, command!.id);
+  assert.equal(ran.status, "executed", ran.result);
+  assert.ok(ran.result?.includes(join(service.config.dataDir, "sessions", "host-own")), `it ran in the session's own worktree on the host: ${ran.result}`);
+  await idle(session);
+  // Once its host stops accepting that, the session's next command stops before any card asks anyone.
+  accepted = false;
+  await session.submit({ ...await ticket("host-own", "submit"), connectorId }, { content: "TEST_BASH echo never-ran", requestId: "host-own-off", admissionId }, "write");
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.approvals.filter(approval => approval.status === "pending").length, 0);
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("no longer runs sessions directly on it")));
 });
 
 test("shell commands may reserve address space they never touch, as gh and node do when they start", { skip: process.platform !== "linux" }, async t => {

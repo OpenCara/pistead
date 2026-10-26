@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { join, relative, sep } from "node:path";
-import { defaultHostConfig, hostConfigLimits, parseHostConfig, type GpuKind, type HostConfig } from "../../../packages/shared/src/host-config.js";
+import { defaultHostConfig, hostConfigLimits, readHostConfig, type GpuKind, type HostConfig } from "../../../packages/shared/src/host-config.js";
 
 /** How long the host's configuration is used before the control plane is asked again: changes reach commands within it. */
 const CONFIG_TTL_MS = 30_000;
@@ -23,7 +23,7 @@ export class HostConfigSource {
     const cached = this.#cached;
     if (cached && now() - cached.at < (this.options.ttlMs ?? CONFIG_TTL_MS)) return cached.value;
     this.#refresh ??= this.load().then(value => {
-      const config = parseHostConfig(value);
+      const config = readHostConfig(value);
       this.#cached = { value: config, at: now() };
       return config;
     }).finally(() => { this.#refresh = undefined; });

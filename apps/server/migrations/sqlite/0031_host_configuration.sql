@@ -7,6 +7,7 @@ CREATE TABLE connector_configs (
   gpu INTEGER NOT NULL DEFAULT 0 CHECK (gpu IN (0, 1)),
   git_credentials INTEGER NOT NULL DEFAULT 0 CHECK (git_credentials IN (0, 1)),
   repository_cache TEXT NOT NULL DEFAULT 'off' CHECK (repository_cache IN ('off', 'host', 'owner')),
+  host_sessions INTEGER NOT NULL DEFAULT 0 CHECK (host_sessions IN (0, 1)),
   -- Null for a configuration carried over from a host's connect options, below.
   updated_by TEXT REFERENCES users(id),
   updated_at TEXT NOT NULL
@@ -21,3 +22,8 @@ INSERT INTO connector_configs (connector_id, git_credentials, repository_cache, 
     NULL, COALESCE(last_seen_at, created_at)
   FROM connectors
   WHERE json_extract(capabilities_json, '$.gitCredentials') = 1 OR json_extract(capabilities_json, '$.repositoryCache') = 1;
+
+-- A session that runs directly on its host's own environment, without the sandbox: only its host's owner starts one,
+-- where the host's configuration accepts it (host_sessions). Fixed for the session's life; restored and moved copies
+-- start in the sandbox.
+ALTER TABLE sessions ADD COLUMN host_environment INTEGER NOT NULL DEFAULT 0 CHECK (host_environment IN (0, 1));

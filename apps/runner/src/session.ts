@@ -244,6 +244,17 @@ export class RunnerSession {
    * resumes or runs in it.
    */
   readonly #frozen: boolean;
+  /**
+   * The session runs directly on the host's own environment, with no sandbox: every session of an unsandboxed host, or
+   * one its owner started that way on a host that accepts it (`#hostSession`).
+   */
+  readonly #onHost: boolean;
+  /**
+   * A session its host's owner started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise
+   * sandboxes its sessions: it runs commands only while the host's configuration still accepts that
+   * (HostConfig.hostSessions), and deciding them needs host command authority, as host commands do.
+   */
+  readonly #hostSession: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
   /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
@@ -265,7 +276,14 @@ export class RunnerSession {
     const cache = config.repositoryCache;
     this.#clone = binding.session.repositoryMode === "clone";
     this.#frozen = !this.#clone && (binding.session.repositories ?? []).length > 0;
-    if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
+    this.#hostSession = binding.session.hostEnvironment === true && config.unsandboxed !== true;
+    this.#onHost = config.unsandboxed === true || this.#hostSession;
+    // Only the host's owner's own sessions ever run on the host itself; the control plane admits no other, and neither
+    // does the host.
+    if (this.#hostSession && (!binding.session.connectorOwnerId || binding.session.connectorOwnerId !== binding.owner.id)) {
+      throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
+    }
+    if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
       this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { egressSocket: this.#egress.socketPath,
@@ -1291,9 +1309,23 @@ export class RunnerSession {
     await this.authorize(attribution.initiatedBy, attribution.mode === "ask" ? "ask" : "write");
   }
 
-  /** Whether shell commands may run here: within provisioned limits, on an owner-consented unsandboxed host, or as a faux test shell. */
+  /**
+   * Whether shell commands may run here: within provisioned limits, on the host itself (an owner-consented unsandboxed
+   * host, or the owner's session on a host that accepts it), or as a faux test shell.
+   */
   private shellAllowed(): boolean {
-    return !!this.config.resources || this.config.unsandboxed === true || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+    return !!this.config.resources || this.#onHost || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+  }
+
+  /**
+   * A session its owner started directly on the host runs commands only while the host's configuration still accepts
+   * that: its owner turning it off stops the session's next command (within the configuration's 30-second refresh).
+   */
+  private async requireHostEnvironment(): Promise<void> {
+    if (this.#hostSession && !(await this.hostConfig()).hostSessions) {
+      throw new RunnerError(403, "This host no longer runs sessions directly on it: its owner turned that off in Pistead (Settings → Hosts → the host → Configuration). "
+        + "Nothing ran. Start a new session to work in the sandbox.");
+    }
   }
 
   /** The host's configuration, as Pistead reports it to the connector; the defaults on a runner without one. */
@@ -1400,7 +1432,9 @@ export class RunnerSession {
         await this.permit(api, call, "identity", "");
         const config = await this.hostConfig();
         // How shell commands run here, as the host's owner and admins configured it.
-        const commands = { timeoutSeconds: commandLimits(config.commandTimeoutSeconds).seconds, gpu: config.gpu && !this.config.unsandboxed };
+        // On the host itself there is no sandbox to lend the GPU to: commands have it already, with everything else there.
+        const commands = { timeoutSeconds: commandLimits(config.commandTimeoutSeconds).seconds, gpu: config.gpu && !this.#onHost,
+          ...(this.#onHost ? { onHost: true } : {}) };
         return text({ ...await this.sandbox.identity(() => this.recheckTool(attribution)), commands, ...attribution });
       } }),
       defineTool({ name: "read_file", description: "Read a confined worktree file. PNG, JPEG, GIF and WebP images are returned as images, scaled to fit.", parameters: Type.Object({ path: Type.String() }), execute: async (args, api, call) => {
@@ -1440,6 +1474,8 @@ export class RunnerSession {
         } }),
       defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output. It stops at the host's command time limit, which identity reports (commands.timeoutSeconds).", parameters: Type.Object({ command: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
+        // Before any card: a session on a host that no longer accepts that asks nobody for anything.
+        await this.requireHostEnvironment();
         const { unbounded } = await this.permit(api, call, "bash", args.command, { write: true, shell: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }, call.abortSignal), call));
       } }),
@@ -1707,6 +1743,7 @@ export class RunnerSession {
     try {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation, approval.unbounded === true);
+        await this.requireHostEnvironment();
         await this.authorize(actorId, "write");
       }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true,
         ...await this.commandOptions(), signal });
@@ -1742,6 +1779,10 @@ export class RunnerSession {
       };
       if (approval.operation.kind === "host.bash" && !await this.hostCommandLevel(ticket.actorId, "approve")) {
         throw new RunnerError(403, "Only the host owner, or a member granted host commands on this host, can decide a host command");
+      }
+      // A command of a session that runs directly on the host runs there, as a host command does: so is it decided.
+      if (approval.operation.kind === "bash" && this.#hostSession && !await this.hostCommandLevel(ticket.actorId, "approve")) {
+        throw new RunnerError(403, "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands");
       }
       if (approval.operation.kind === "git.repin" && ticket.actorId !== this.binding.owner.id) {
         throw new RunnerError(403, "Only the session owner can decide a repin");
@@ -1799,8 +1840,13 @@ export class RunnerSession {
         const operation = approval.operation;
         void this.startShellOperation(id, operation, approval.unbounded === true, async () => {
           this.requireShellCapability(operation, approval.unbounded === true);
+          await this.requireHostEnvironment();
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
+          // Its decider's host command authority, as it stands when the command starts.
+          if (this.#hostSession && !await this.hostCommandLevel(ticket.actorId, "approve")) {
+            throw new RunnerError(403, "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands");
+          }
         });
         return (await this.metadata()).approvals[id]!;
       }

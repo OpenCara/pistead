@@ -338,6 +338,8 @@ function HostSection({ session, user, hosts }: { session: SessionRecord; user: U
         hint={<>Hosted by {host?.ownerName ?? (session.connectorOwnerId ? <Username id={session.connectorOwnerId} /> : "unknown")}{session.connectorOwnerId === user.id ? " (you)" : ""}</>}
         trailing={hosts.loading ? <Loading>Checking</Loading> : host ? <ConnectionStatus connector={host} /> : session.hostUnsandboxed && <StatusBadge tone="danger">Unsandboxed</StatusBadge>}
       />
+      {session.hostEnvironment && <Row leading={<Icon name="server" size={16} />} title="Runs on the host"
+        hint="No sandbox: its commands run on the host owner's machine, as its user" trailing={<StatusBadge tone="danger">On host</StatusBadge>} />}
       {host && <HostCapabilities connector={host} />}
       {!hosts.loading && !host && !hosts.error && <Row title="Host not in your list" hint="It may be private to its owner, unshared, or revoked. Viewing a session doesn't let you use its host" />}
       <Row title="Connection ID" hint={<code>{session.connectorId}</code>} />

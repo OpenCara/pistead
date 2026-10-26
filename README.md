@@ -244,12 +244,24 @@ How a host runs its sessions is set on its page, under **Configuration**, rather
 | **GPU** | Sandboxed commands get the host's GPU render device for rendering and compute: `/dev/dxg` on WSL2, or Linux DRM render nodes with their sysfs entries. Never the screen, windows, input or display (`card`) nodes, so the agent renders offscreen, for example to image files it reads back. Offered only where the connector found such a device. On WSL2, Mesa's `vulkan-dzn` on the host gives Vulkan over the Windows driver | Owner and admins |
 | **Git credentials** | Pushes in the owner's own sessions may use the credentials Git on the host would use (see [push access](#push-access)) | Owner |
 | **Repository cache** | Off, or a full mirror of each repository on the host for every session (**Shared**) or one per session owner (**Per owner**); see [Repository cache](#repository-cache-preview) | Owner |
+| **Sessions on the host** | The owner may start sessions that run directly on the host, without the sandbox; see [Sessions on the host](#sessions-on-the-host) | Owner |
 
 Running sessions pick up a change within a minute, and the agent finds the time limit and GPU in `identity` (`commands`); a repository cache change applies when the connector next connects. Turning on Git credentials, the cache or the GPU asks first, and every change is recorded in the audit log (`host.config.updated`).
 
 - A command approved by hand no longer holds the approval until it ends: its card shows it running and settles with its outcome, as host commands do. Stopping the message, or the session closing, stops a running command.
 - Without provisioned resource limits (`--resources`), a command can use the whole machine for its time limit.
 - A host started with `--git-credentials` or `--repo-cache` keeps those settings here; current connectors ignore the options. A connector that predates host configuration keeps its options until it is updated, and the page says so.
+
+#### Sessions on the host
+
+A sandboxed host can also run some of its owner's sessions directly on the machine, for work the sandbox doesn't allow: an app or game that opens windows or uses the GPU and the machine's drivers as installed, or tools and SDKs the sandbox can't see. Turn on **Sessions on the host** in the host's [configuration](#host-configuration) (owner only; it asks first), then choose **Where it runs → On this host** when you start a session on it. Each session keeps the choice it started with; restored and moved copies start in the sandbox.
+
+Such a session runs like one on an [unsandboxed host](#running-without-the-sandbox): commands run as the connector's OS user, in the session's own folder, with your files, credentials and network and no resource limits, and the workspace's network access doesn't apply. They start with the connector's `PATH`, the session's own `HOME` and no display: set `DISPLAY` to open windows (for example `DISPLAY=:0` under WSLg). The host's command time limit still applies. Clones use the host's own Git and credentials, so push with `git` itself rather than `git_push`. In addition:
+
+- Only the host's owner starts one, and only on their own host; members it is shared with always get the sandbox.
+- Its commands are decided like [host commands](#host-commands): only by the host's owner, or a member they granted host commands. Approve permission on the session isn't enough.
+- Turning **Sessions on the host** off stops the next command of every such session (within half a minute) before it runs; nothing else of theirs changes.
+- Everyone who can see the session is warned that it runs without a sandbox (**Runs on the host**).
 
 #### The sandbox
 
@@ -353,6 +365,7 @@ Select a workspace in the sidebar (or open **New session** in it):
 - **Describe the task**: the first message. Its first line becomes the session's title.
 - **Host**: one of your hosts, or a host shared with the workspace.
 - **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only). See [Collaborating on a session](#collaborating-on-a-session).
+- **Where it runs** (on your own host, once its [configuration](#host-configuration) allows **Sessions on the host**): **Sandbox** (the default) or **On this host**, without the sandbox. See [Sessions on the host](#sessions-on-the-host).
 - The model, reasoning level and access for the first message (see [Chat options](#chat-options)). The info tips show the host, the model and the repositories the session will pin.
 
 Press Enter to start (Shift+Enter adds a line). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares it, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).

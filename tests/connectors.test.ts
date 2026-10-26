@@ -2609,7 +2609,7 @@ test('host owners add admins who manage sharing and host command grants, and gra
 test('host owners and admins configure how the host runs sessions, and only the owner decides whose credentials it uses', async t => {
   const f = await fixture(t); const s = await sharedHost(f); const outsider = await f.client('outsider');
   const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
-  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off' };
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
   const listed = async (client: Client) => (await json<{ connectors: ConnectorInfo[] }>(await client.request('GET', '/api/connectors'))).connectors
     .find(item => item.id === id)?.config;
   // Its owner and the connector itself read it; members of a workspace it is shared with neither see nor change it.
@@ -2623,11 +2623,11 @@ test('host owners and admins configure how the host runs sessions, and only the 
   // Only a whole, valid configuration.
   for (const invalid of [{ ...defaults, commandTimeoutSeconds: 29 }, { ...defaults, commandTimeoutSeconds: 3601 }, { ...defaults, commandTimeoutSeconds: 60.5 },
     { ...defaults, commandTimeoutSeconds: '60' }, { ...defaults, gpu: 'yes' }, { ...defaults, gitCredentials: 1 }, { ...defaults, repositoryCache: 'shared' },
-    { ...defaults, unknown: true }, { commandTimeoutSeconds: 60 }, []]) {
+    { ...defaults, hostSessions: 1 }, { ...defaults, unknown: true }, { commandTimeoutSeconds: 60 }, []]) {
     await denied(await host.request('PUT', path, invalid), 400, 'invalid_host_config');
   }
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_configs').get()!.n, 0);
-  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner' };
+  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true };
   assert.deepEqual(await json(await host.request('PUT', path, owned)), { config: owned });
   assert.deepEqual(await listed(host), owned);
   assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: owned });
@@ -2639,6 +2639,7 @@ test('host owners and admins configure how the host runs sessions, and only the 
   assert.deepEqual(await listed(creator), owned);
   await denied(await creator.request('PUT', path, { ...owned, gitCredentials: false }), 403, 'host_owner_required');
   await denied(await creator.request('PUT', path, { ...owned, repositoryCache: 'host' }), 403, 'host_owner_required');
+  await denied(await creator.request('PUT', path, { ...owned, hostSessions: false }), 403, 'host_owner_required');
   const tuned = { ...owned, commandTimeoutSeconds: 3600, gpu: false };
   assert.deepEqual(await json(await creator.request('PUT', path, tuned)), { config: tuned });
   assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: tuned });
@@ -2655,10 +2656,10 @@ test('an admin\'s first configuration of a host leaves the owner\'s settings at 
   const f = await fixture(t); const s = await sharedHost(f);
   const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
   await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.creator.user.id}`));
-  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off' };
+  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
   assert.deepEqual(await json(await s.creator.request('PUT', path, config)), { config });
-  assert.deepEqual({ ...f.sqlite.prepare('SELECT git_credentials, repository_cache, updated_by FROM connector_configs WHERE connector_id = ?').get(id) },
-    { git_credentials: 0, repository_cache: 'off', updated_by: s.creator.user.id });
+  assert.deepEqual({ ...f.sqlite.prepare('SELECT git_credentials, repository_cache, host_sessions, updated_by FROM connector_configs WHERE connector_id = ?').get(id) },
+    { git_credentials: 0, repository_cache: 'off', host_sessions: 0, updated_by: s.creator.user.id });
 });
 
 test('a host\'s owner and admins disable its models for everyone: a disabled model is neither listed, started from nor chosen', async t => {
@@ -2826,4 +2827,60 @@ test('the Files tab reads the session worktree through its host, for collaborato
   await json(await files('.', s.host));
   assert.equal(requests.at(-1)!.request.ticket.actorId, s.host.user.id);
   assert.equal(requests.length, before + 1);
+});
+
+test('a host\'s owner starts a session directly on the host only where its configuration accepts that, and its binding says so', async t => {
+  const f = await fixture(t); const s = await privateWorkspace(f);
+  const id = s.connector.connectorId; const config = `/api/connectors/${id}/config`;
+  const accept = (hostSessions: boolean) => s.owner.request('PUT', config, { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions });
+  const start = (body: Record<string, unknown>) => s.owner.request('POST', '/api/sessions', { ...s.input, ...body });
+  const listed = async () => (await json<{ connectors: ConnectorInfo[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors.find(item => item.id === id);
+
+  await denied(await start({ hostEnvironment: 'yes' }), 400, 'invalid_input');
+  // A connector that predates host configuration can't run one there.
+  await json(await accept(true));
+  await denied(await start({ hostEnvironment: true }), 409, 'connector_update_required');
+  assert.equal((await listed())?.hostSessions, undefined);
+  // A current one, on a sandboxed host that accepts it, runs it; nobody but its owner learns the host accepts that.
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: true } }));
+  assert.equal((await listed())?.hostSessions, true);
+  const memberView = (await json<{ connectors: ConnectorInfo[] }>(await s.member.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
+  assert.equal(memberView.find(item => item.id === id)?.hostSessions, undefined);
+  const before = s.hub.requests.length;
+  const { session } = await json<{ session: SessionRecord }>(await start({ hostEnvironment: true }), 201);
+  assert.equal(session.hostEnvironment, true);
+  const binding = JSON.parse(s.hub.requests[before]!.request.body) as RunnerBinding;
+  assert.equal(binding.session.hostEnvironment, true, 'the host learns it from the immutable binding');
+  assert.equal(f.sqlite.prepare('SELECT host_environment FROM sessions WHERE id = ?').get(session.id)!.host_environment, 1);
+  const read = (await json<{ session: SessionRecord }>(await s.owner.request('GET', `/api/sessions/${session.id}`))).session;
+  assert.equal(read.hostEnvironment, true);
+  assert.equal(read.hostUnsandboxed, true, 'everyone who reads it learns it runs without isolation');
+  const audit = f.sqlite.prepare(`SELECT detail_json FROM audit WHERE action = 'session.created' AND session_id = ?`).get(session.id)!;
+  assert.equal(JSON.parse(String(audit.detail_json)).hostEnvironment, true);
+  // Without the toggle, or with it off, a session stays in the sandbox.
+  for (const body of [{}, { hostEnvironment: false }]) {
+    const sandboxed = (await json<{ session: SessionRecord }>(await start(body), 201)).session;
+    assert.equal(sandboxed.hostEnvironment, undefined);
+    assert.equal(JSON.parse(s.hub.requests.at(-1)!.request.body).session.hostEnvironment, undefined);
+  }
+  // Turned off, the host accepts no new one; sessions already on it keep what they were started as.
+  await json(await accept(false));
+  await denied(await start({ hostEnvironment: true }), 409, 'host_sessions_off');
+  assert.equal((await listed())?.hostSessions, undefined);
+  assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', `/api/sessions/${session.id}`))).session.hostEnvironment, true);
+  // An unsandboxed host runs every session that way already.
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { platform: 'darwin', sandbox: false, productionShell: false, unsandboxed: true, plainGit: true, hostConfig: true } }));
+  await json(await accept(true));
+  await denied(await start({ hostEnvironment: true }), 400, 'host_unsandboxed');
+});
+
+test('only a host\'s owner starts sessions directly on it, never a member it is shared with', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  const id = s.connector.connectorId;
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: true } }));
+  await json(await s.host.request('PUT', `/api/connectors/${id}/config`, { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: true }));
+  const shared = (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
+  assert.equal(shared.find(item => item.id === id)?.hostSessions, undefined);
+  await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true }), 403, 'host_owner_required');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n, 0);
 });
