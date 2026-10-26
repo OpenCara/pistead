@@ -66,6 +66,8 @@ export interface SandboxOptions {
    * clones of the workspace's repositories borrow from them (see GIT_SHIM).
    */
   mirrors?: () => Promise<readonly MirrorMount[]>;
+  /** Where the host's / is when shell commands look for its GPU (see gpuMounts): the host's own, unless a test gives a stand-in. */
+  gpuRoot?: string;
 }
 
 export interface MirrorMount { source: string; target: string }
@@ -1320,6 +1322,7 @@ export class Sandbox {
   readonly #egressSocket: string | undefined;
   readonly #sessionBranch: string | undefined;
   readonly #mirrors: (() => Promise<readonly MirrorMount[]>) | undefined;
+  readonly #gpuRoot: string;
   /** Whether shell commands get the `git` shim: on a cache host, or where git-lfs is installed, in sessions with a proxy. */
   readonly #shim: boolean;
   #initialization: Promise<void> | undefined;
@@ -1350,6 +1353,7 @@ export class Sandbox {
     this.#egressSocket = options.egressSocket;
     this.#sessionBranch = options.sessionBranch;
     this.#mirrors = options.mirrors;
+    this.#gpuRoot = options.gpuRoot ?? "/";
     this.#shim = options.egressSocket !== undefined && (options.mirrors !== undefined || hostGitLfs() !== undefined);
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
@@ -1628,7 +1632,7 @@ export class Sandbox {
     const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
     const egress = request.kind === "bash" || request.kind === "clone-restore" ? this.#egressSocket : undefined;
     // Only shell commands get the GPU, and only its render device; it is looked up again for each one.
-    const gpu = request.kind === "bash" && command.gpu ? gpuMounts() : undefined;
+    const gpu = request.kind === "bash" && command.gpu ? gpuMounts(this.#gpuRoot) : undefined;
     const limits = request.kind === "bash" ? command.limits : undefined;
     const args = [
       "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",

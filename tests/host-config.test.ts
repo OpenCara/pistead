@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,8 +8,40 @@ import test from "node:test";
 import { defaultHostConfig, parseHostConfig, parseHostConfigChange, readHostConfig } from "../packages/shared/src/host-config.js";
 import { commandLimits, detectGpu, gpuMounts, HostConfigSource } from "../apps/runner/src/host-config.js";
 import { movedOptionsNotice } from "../apps/runner/src/connect-cli.js";
+import { Sandbox } from "../apps/runner/src/sandbox.js";
+import type { RunnerBinding } from "../packages/shared/src/types.js";
 
 const MiB = 1024 * 1024;
+const sandboxed = process.platform === "linux" && spawnSync("bwrap", ["--version"]).status === 0;
+
+/** The sysfs directory of the stand-in GPU below a test's root, as the host's /sys/devices names it. */
+const GPU_DEVICE = "sys/devices/pci0000:00/0000:00:02.0";
+
+/**
+ * A Linux GPU below `root` as gpuMounts finds one: DRM nodes in /dev/dri (a KMS card0; renderD128 with its sysfs entry,
+ * renderD129 without one) and the /sys/class/drm link to renderD128's entry in its device's sysfs directory.
+ */
+async function standInGpu(root: string): Promise<void> {
+  await mkdir(join(root, "dev/dri"), { recursive: true });
+  for (const name of ["card0", "renderD128", "renderD129"]) await writeFile(join(root, "dev/dri", name), "");
+  await mkdir(join(root, GPU_DEVICE, "drm/renderD128"), { recursive: true });
+  await writeFile(join(root, GPU_DEVICE, "drm/renderD128/dev"), "226:128\n");
+  await symlink("../../../0000:00:02.0", join(root, GPU_DEVICE, "drm/renderD128/device"));
+  await mkdir(join(root, "sys/class/drm"), { recursive: true });
+  await symlink("../../devices/pci0000:00/0000:00:02.0/drm/renderD128", join(root, "sys/class/drm/renderD128"));
+}
+
+function fauxBinding(id: string): RunnerBinding {
+  return {
+    session: { id, workspaceId: "workspace", ownerId: "test:alice", agentVersionId: "version-1", title: "GPU test", policyVersion: 1,
+      status: "ready", createdAt: "2026-01-01T00:00:00Z", repositories: [] },
+    owner: { id: "test:alice", githubId: null, githubLogin: "alice", displayName: "Alice", gitName: "Alice Owner",
+      gitEmail: "alice@example.test", env: {}, githubConnected: false },
+    agent: { id: "version-1", agentId: "agent", authorId: "test:template-author", workspaceId: "workspace", version: 1, name: "GPU agent",
+      description: "Test", instructions: "Use tools.", tools: ["bash"], modelId: "model-1", createdAt: "2026-01-01T00:00:00Z" },
+    model: { id: "model-1", workspaceId: "workspace", name: "Explicit faux test provider", provider: "faux", modelId: "gpu-faux" },
+  };
+}
 
 test("a host configuration is whole and within bounds, or refused", () => {
   const config = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true };
@@ -99,14 +132,8 @@ test("a GPU is lent as its render device only: WSL's /dev/dxg, or DRM render nod
   assert.equal(gpuMounts(join(root, "missing")), undefined);
 
   // Linux: render nodes, never card (KMS) nodes; a node whose sysfs entry is missing is left out.
-  const device = "sys/devices/pci0000:00/0000:00:02.0";
-  await mkdir(join(root, "dev/dri"), { recursive: true });
-  for (const name of ["card0", "renderD128", "renderD129"]) await writeFile(join(root, "dev/dri", name), "");
-  await mkdir(join(root, device, "drm/renderD128"), { recursive: true });
-  await writeFile(join(root, device, "drm/renderD128/dev"), "226:128\n");
-  await symlink("../../../0000:00:02.0", join(root, device, "drm/renderD128/device"));
-  await mkdir(join(root, "sys/class/drm"), { recursive: true });
-  await symlink("../../devices/pci0000:00/0000:00:02.0/drm/renderD128", join(root, "sys/class/drm/renderD128"));
+  const device = GPU_DEVICE;
+  await standInGpu(root);
   assert.deepEqual(gpuMounts(root), { kind: "render", env: {}, args: [
     "--dev-bind", join(base, "dev/dri/renderD128"), "/dev/dri/renderD128",
     "--ro-bind", join(base, device), `/${device}`,
@@ -126,6 +153,27 @@ test("a GPU is lent as its render device only: WSL's /dev/dxg, or DRM render nod
   await mkdir(join(root, "usr/lib/wsl/lib"), { recursive: true });
   assert.deepEqual(gpuMounts(root), { kind: "dxg", args: ["--dev-bind", join(base, "dev/dxg"), "/dev/dxg"], env: { LD_LIBRARY_PATH: "/usr/lib/wsl/lib" } });
   assert.equal(detectGpu(root), "dxg");
+});
+
+test("a sandboxed command lent the GPU finds its render node, the node's sysfs device and the /sys/dev/char link that names it", { skip: !sandboxed }, async t => {
+  const base = realpathSync(await mkdtemp(join(tmpdir(), "pistead-gpu-sandbox-")));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  await standInGpu(join(base, "host"));
+  const sandbox = new Sandbox(fauxBinding("gpu-sandbox"), join(base, "session"), undefined, { gpuRoot: join(base, "host") });
+  t.after(() => sandbox.close());
+  await sandbox.initialize();
+  const shell = async (command: string, gpu: boolean) =>
+    (await sandbox.execute({ kind: "bash", command }, true, async () => {}, { allowTestShell: true, gpu })).trim().split("\n");
+  const device = `/${GPU_DEVICE}`;
+  // Nothing else makes /sys/dev/char in the sandbox: bubblewrap creates the link's missing parents, as it does for
+  // every mount's. The link leads through the read-only sysfs directory to the node's entry and back to its device.
+  assert.deepEqual(await shell([
+    "readlink /sys/dev/char/226:128", "cat /sys/dev/char/226:128/dev", "(cd -P /sys/dev/char/226:128/device && pwd)",
+    "test -e /dev/dri/renderD128 && echo render-node", "test -e /dev/dri/card0 || echo no-card-node",
+    "test -e /dev/dri/renderD129 || echo no-node-without-sysfs", `touch ${device}/written 2>/dev/null || echo read-only`,
+  ].join("; "), true), [`${device}/drm/renderD128`, "226:128", device, "render-node", "no-card-node", "no-node-without-sysfs", "read-only"]);
+  // A command not lent the GPU has none of it.
+  assert.deepEqual(await shell("if [ ! -e /sys/dev/char ] && [ ! -e /sys/devices ] && [ ! -e /dev/dri ]; then echo none; fi", false), ["none"]);
 });
 
 test("connect options that moved to Pistead are named, and ignored, rather than refused", () => {
