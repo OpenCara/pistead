@@ -430,7 +430,7 @@ test("the owner's Auto-approve posts comments and opens issues at once with its 
     "automatic GitHub effects keep their cards, with their outcome");
   await session.decide(await ticket(target.session.id, "approve"), card.id, { decision: "deny", operation: card.operation });
   await idle(session);
-  assert.deepEqual(merges, []);
+  assert.equal(merges.length, 0);
 
   // With auto-merge as well, the merge runs at once too.
   const mergeAdmission = await sha256("github auto-merge admission");
