@@ -266,6 +266,41 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     return c.json({ members: result[3].results });
   });
 
+  // Changes an existing member's role, never adds one: a change racing the member's removal fails rather than re-adding them.
+  app.patch('/api/workspaces/:id/members/:userId', async c => {
+    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
+    const targetId = userIdentifier(c.req.param('userId'));
+    const actorId = c.get('auth').userId;
+    const body = await jsonObject(c);
+    onlyFields(body, ['role']);
+    const role = body.role;
+    if (typeof role !== 'string' || !(assignableWorkspaceRoles as readonly string[]).includes(role)) fail(400, 'invalid_input', 'Invalid role.');
+    const previous = await requireMemberManagement(c.env, workspaceId, actorId, targetId, role as AssignableWorkspaceRole);
+    if (!previous) fail(404, 'not_found', 'Membership not found.');
+    if (previous === role) return c.json({ members: await membersStatement(c.env, workspaceId, actorId).all() });
+    const managed = adminManagedRoles.map(item => `'${item}'`).join(', ');
+    const auditId = id();
+    const result = await c.env.DB.batch<SafeMember>([
+      c.env.DB.query<never>(`UPDATE workspace_members SET role = ?
+        WHERE workspace_id = ? AND user_id = ? AND role = ? AND role <> 'owner'
+          AND EXISTS (SELECT 1 FROM workspaces w
+            INNER JOIN workspace_members actor ON actor.workspace_id = w.id AND actor.user_id = ?
+            WHERE w.id = workspace_members.workspace_id AND w.owner_id <> workspace_members.user_id
+              AND ((actor.role = 'owner' AND actor.user_id = w.owner_id)
+                OR (actor.role = 'admin' AND ? IN (${managed}) AND workspace_members.role IN (${managed}))))`)
+        // Only from the role authorized above: a concurrent change or removal leaves no row changed.
+        .bind(role, workspaceId, targetId, previous, actorId, role),
+      auditAfterChange(c.env, actorId, 'workspace.member.role', workspaceId, { userId: targetId, from: previous, role }, auditId),
+      // Tickets and capabilities issued under the previous role no longer hold.
+      c.env.DB.query<never>(`UPDATE sessions SET policy_version = policy_version + 1
+        WHERE workspace_id = ? AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, auditId),
+      membersStatement(c.env, workspaceId, actorId),
+    ]);
+    if (result[0].changes !== 1) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');
+    return c.json({ members: result[3].results });
+  });
+
   app.delete('/api/workspaces/:id/members/:userId', async c => {
     const workspaceId = identifier(c.req.param('id'), 'workspaceId');
     const targetId = userIdentifier(c.req.param('userId'));
