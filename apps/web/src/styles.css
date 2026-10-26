@@ -233,7 +233,7 @@
   .input:focus-visible, .select:focus-visible, .textarea:focus-visible { border-color: var(--foreground-muted); outline: none; }
   .input::placeholder, .textarea::placeholder { color: var(--foreground-muted); }
   .input:disabled, .select:disabled, .textarea:disabled { opacity: 0.5; cursor: not-allowed; }
-  .checkbox { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .checkbox, .radio { width: 16px; height: 16px; flex: none; accent-color: var(--accent); cursor: pointer; }
 
   .field { display: grid; gap: 6px; }
   .field > .field-label { font-weight: var(--weight-medium); }
@@ -241,7 +241,7 @@
   .field-error { color: var(--status-danger); font-size: var(--font-xs); }
   .field-notice { color: var(--status-success); font-size: var(--font-xs); }
   .check-row { display: flex; align-items: flex-start; gap: var(--space-2); cursor: pointer; }
-  .check-row > .checkbox { margin-top: 2px; }
+  .check-row > .checkbox, .check-row > .radio { margin-top: 2px; }
 
   /* Settings-style section: medium label above one bordered card of rows. */
   .section { display: grid; gap: var(--space-2); }

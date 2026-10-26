@@ -1,12 +1,12 @@
 import type { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
-import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionView, SubmitResult, WorkspaceRole } from '../../../packages/shared/src/types.js';
-import { accessModes, permissions, thinkingLevels } from '../../../packages/shared/src/types.js';
+import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionRole, SessionView, SubmitResult, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import { accessModes, permissions, sessionRoles, thinkingLevels } from '../../../packages/shared/src/types.js';
 import { connectorLimits, type ConnectorCapabilities, type LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { parseChatImages, type ChatImage } from '../../../packages/shared/src/chat-images.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
-import { hasPermission, normalizePermissions, roleSessionCeiling, validateUserEnv } from '../../../packages/shared/src/policy.js';
+import { hasPermission, normalizePermissions, roleSessionCeiling, sessionRoleOf, sessionRolePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import { redactApproval } from '../../../packages/shared/src/redaction.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
 import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, requireSessionCreator, sessionCreatorSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
@@ -478,17 +478,23 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.get('/api/sessions/:id/grants', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
-    const result = await c.env.DB.query<{ user_id: string; permissions_json: string; role: WorkspaceRole }>(`SELECT g.user_id, g.permissions_json, m.role
-      FROM session_grants g
-      INNER JOIN workspace_members m ON m.workspace_id = ? AND m.user_id = g.user_id WHERE g.session_id = ?`)
-      .bind(row.workspace_id, row.id).all();
+    // The grantees and the owner, with each one's workspace role, read together.
+    const rows = await c.env.DB.query<{ user_id: string; permissions_json: string | null; role: WorkspaceRole }>(`SELECT m.user_id, g.permissions_json, m.role
+      FROM workspace_members m
+      LEFT JOIN session_grants g ON g.session_id = ? AND g.user_id = m.user_id
+      WHERE m.workspace_id = ? AND (g.user_id IS NOT NULL OR m.user_id = ?)`)
+      .bind(row.id, row.workspace_id, row.owner_id).all();
+    const ownerRole = rows.find(g => g.user_id === row.owner_id)?.role;
+    const result = rows.filter((g): g is typeof g & { permissions_json: string } => g.permissions_json !== null);
     // A grant shows what it allows: a viewer's (one demoted after it was granted) is capped at read, as sessionAccess caps it.
     const effective = (grant: { permissions_json: string; role: WorkspaceRole }) => {
       const ceiling = roleSessionCeiling(grant.role);
       return normalizePermissions(JSON.parse(grant.permissions_json)).filter(permission => !ceiling || ceiling.includes(permission));
     };
-    return c.json({ grants: [{ userId: row.owner_id, permissions: [...permissions] }, ...result.filter(g => g.user_id !== row.owner_id)
-      .map(g => ({ userId: g.user_id, permissions: effective(g) }))] });
+    // Each grant also names the grantee's workspace role and the session tier it is, so a client offers only the tiers
+    // that fit; a grant that matches no tier (one from before tiers) is custom (null).
+    return c.json({ grants: [{ userId: row.owner_id, permissions: [...permissions], ...(ownerRole ? { workspaceRole: ownerRole } : {}), sessionRole: sessionRoleOf(permissions) }, ...result.filter(g => g.user_id !== row.owner_id)
+      .map(g => { const held = effective(g); return { userId: g.user_id, permissions: held, workspaceRole: g.role, sessionRole: sessionRoleOf(held) }; })] });
   });
   app.post('/api/sessions/:id/grants', async c => {
     const access = await requireSession(c, identifier(c.req.param('id')), 'manage');
@@ -497,8 +503,15 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const userId = userIdentifier(input.userId);
     if (userId === row.owner_id) fail(400, 'owner_grant_immutable', 'The session owner always retains full authority.');
     const grantee = await requireMember(c.env, row.workspace_id, userId);
+    // A grant is either one of the four session tiers (`role`) or, as before tiers, an explicit permission list.
+    if ((input.role === undefined) === (input.permissions === undefined)) fail(400, 'invalid_grant', 'Give either a session role or permissions.');
     let grants: Permission[];
-    try { grants = normalizePermissions(input.permissions); } catch { fail(400, 'invalid_permissions', 'Invalid permissions.'); }
+    if (input.role !== undefined) {
+      if (typeof input.role !== 'string' || !(sessionRoles as readonly string[]).includes(input.role)) fail(400, 'invalid_session_role', 'Invalid session role.');
+      grants = [...sessionRolePermissions[input.role as SessionRole]];
+    } else {
+      try { grants = normalizePermissions(input.permissions); } catch { fail(400, 'invalid_permissions', 'Invalid permissions.'); }
+    }
     // sessionAccess caps a viewer at read whatever it is granted; refusing more here says so rather than storing it.
     const ceiling = roleSessionCeiling(grantee.role);
     if (ceiling && grants.some(permission => !ceiling.includes(permission))) fail(400, 'viewer_role', 'Viewers can only be granted read access.');
@@ -514,7 +527,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       auditStatement(c.env, c.get('auth').userId, 'grant.updated', row.workspace_id, row.id, { userId, permissions: grants }),
     ]);
     if (!result[0].changes) fail(409, 'policy_changed', 'Session membership or permissions changed; reload and retry.');
-    return c.json({ grant: { userId, permissions: grants } });
+    return c.json({ grant: { userId, permissions: grants, workspaceRole: grantee.role, sessionRole: sessionRoleOf(grants) } });
   });
   app.delete('/api/sessions/:id/grants/:userId', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');

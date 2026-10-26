@@ -1,4 +1,4 @@
-import { permissions, type Permission, type WorkspaceRole } from "./types.js";
+import { permissions, sessionRoles, type Permission, type SessionRole, type WorkspaceRole } from "./types.js";
 
 export function hasPermission(grants: readonly Permission[], required: Permission): boolean {
   return grants.includes(required) || (required === "read" && grants.some((grant) => permissions.includes(grant)));
@@ -62,4 +62,41 @@ export function roleSessionCeiling(role: WorkspaceRole): readonly Permission[] |
 /** Whether a role may start sessions; a workspace listing without a role (an older server) counts as a member. */
 export function canCreateSessions(role: WorkspaceRole | undefined): boolean {
   return sessionCreatorRoles.includes(role ?? "member");
+}
+
+/**
+ * The four tiers of access a session's owner (or anyone who manages it) gives one workspace member, named after the
+ * workspace roles they mirror. Each tier holds the permissions of the tiers below it:
+ * - `viewer`: follows the session (read).
+ * - `member`: also asks side questions (ask), without sending messages to the agent.
+ * - `collaborator`: also sends messages and stops work (write), as a workspace collaborator does on shared sessions.
+ * - `admin`: also decides approvals and manages the session's people (approve, manage).
+ * A grant is stored as its permissions, so a grant from before tiers that matches none shows as custom.
+ */
+export const sessionRolePermissions: Readonly<Record<SessionRole, readonly Permission[]>> = {
+  viewer: ["read"],
+  member: ["read", "ask"],
+  collaborator: ["read", "ask", "write"],
+  admin: ["read", "ask", "write", "approve", "manage"],
+};
+
+/** The tier a grant's permissions are exactly, or null for a custom grant that matches none. */
+export function sessionRoleOf(grants: readonly Permission[]): SessionRole | null {
+  const held = new Set<Permission>(grants);
+  if (held.size) held.add("read");
+  return sessionRoles.find((role) => {
+    const tier = sessionRolePermissions[role];
+    return tier.length === held.size && tier.every((permission) => held.has(permission));
+  }) ?? null;
+}
+
+/** Whether a member with this workspace role can hold a session tier: a viewer is capped at read (roleSessionCeiling). */
+export function sessionRoleAllowed(role: SessionRole, workspaceRole: WorkspaceRole | undefined): boolean {
+  const ceiling = workspaceRole ? roleSessionCeiling(workspaceRole) : null;
+  return !ceiling || sessionRolePermissions[role].every((permission) => ceiling.includes(permission));
+}
+
+/** Whether someone holding `held` on a session can give a tier: nobody grants a permission they don't hold. */
+export function sessionRoleGrantable(role: SessionRole, held: readonly Permission[]): boolean {
+  return sessionRolePermissions[role].every((permission) => hasPermission(held, permission));
 }

@@ -1,5 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { permissions, type ApprovalRecord, type EntryView, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type Permission, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionView, type UserProfile } from "../../../packages/shared/src/types";
+import { sessionRoles, type ApprovalRecord, type EntryView, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionRole, type SessionView, type UserProfile, type WorkspaceRole } from "../../../packages/shared/src/types";
+import { sessionRoleAllowed, sessionRoleGrantable, sessionRoleOf, sessionRolePermissions, workspaceSessionPermissions } from "../../../packages/shared/src/policy";
 import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
 import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
@@ -366,6 +367,26 @@ function RepositoriesSection({ session, refresh }: { session: SessionRecord; ref
   </Section>;
 }
 
+const sessionRoleLabel: Record<SessionRole, string> = { viewer: "Viewer", member: "Member", collaborator: "Collaborator", admin: "Admin" };
+const sessionRoleHint: Record<SessionRole, string> = {
+  viewer: "Follows the session: prompts, output and side asks",
+  member: "Viewer, and asks side questions without messaging the agent",
+  collaborator: "Member, and sends messages to the agent and stops its work",
+  admin: "Collaborator, and decides approvals and manages who has access",
+};
+const workspaceRoleLabel: Record<WorkspaceRole, string> = { owner: "workspace owner", admin: "workspace admin", collaborator: "workspace collaborator", member: "workspace member", viewer: "workspace viewer" };
+
+/** The session tier a grant is, or null for a custom grant from before tiers; an older server leaves it to compute. */
+function grantRole(grant: SessionGrant): SessionRole | null {
+  return grant.sessionRole === undefined ? sessionRoleOf(grant.permissions) : grant.sessionRole;
+}
+
+/** A grant's label: its session tier, or its permissions when it is a custom grant. */
+function grantLabel(grant: SessionGrant): string {
+  const role = grantRole(grant);
+  return role ? sessionRoleLabel[role] : `Custom (${grant.permissions.join(", ") || "none"})`;
+}
+
 function PeopleSection({ session, user, actions, changed }: { session: SessionRecord; user: UserProfile; actions: SessionActions; changed: () => void }) {
   const form = useAction();
   const people = usePeople();
@@ -373,7 +394,8 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
   const isOwner = session.ownerId === user.id;
   const visibility = session.visibility ?? "private";
   const viewerOnly = !isOwner && !ownPermissions.some(permission => permission !== "read");
-  const grantable = permissions.filter(permission => ownPermissions.includes(permission) || (permission === "read" && ownPermissions.length > 0));
+  // The tier of what you hold here, from your session role and, on a workspace-visible session, your workspace role.
+  const ownRole = sessionRoleOf(ownPermissions);
   const canManage = ownPermissions.includes("manage");
   // An archived session admits only read requests, so its grants can't be loaded or changed until it is unarchived.
   const archived = session.status === "archived";
@@ -381,38 +403,57 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
   const grants = useResource<{ grants: SessionGrant[] }>(canManage && !archived ? `${base}/grants` : null);
   // The member field takes a username, "username(id)" or a user ID; `target` is the user ID it names.
   const [member, setMember] = useState("");
-  const [selected, setSelected] = useState<Permission[]>([]);
+  const [selected, setSelected] = useState<SessionRole | null>(null);
   const target = userIdFromInput(member, people.list);
   const targetName = usernameWithId(people.person(target));
   const ownerSelected = target === session.ownerId;
   const existing = grants.data?.grants.find(grant => grant.userId === target);
-  const grantReady = canManage && !ownerSelected && Boolean(target) && selected.length > 0
-    && selected.every(permission => grantable.includes(permission));
+  const existingRole = existing ? grantRole(existing) : null;
+  // The grantee's workspace role, from their grant or the workspace's members; unknown for someone typed by a user ID
+  // that isn't listed, whom the server checks.
+  const targetRole: WorkspaceRole | undefined = existing?.workspaceRole ?? people.person(target).role;
+  /** Why a tier can't be given to this member, or null when it can. */
+  function tierBlocked(role: SessionRole): string | null {
+    if (!sessionRoleGrantable(role, ownPermissions)) return "needs permissions you don't hold";
+    if (!sessionRoleAllowed(role, targetRole)) return "workspace viewers can only be session viewers";
+    return null;
+  }
+  // What their workspace role already gives them here while the session is shared with the workspace.
+  const fromWorkspace = visibility === "workspace" && targetRole && !ownerSelected ? sessionRoleOf(workspaceSessionPermissions(targetRole)) : null;
+  const grantReady = canManage && !ownerSelected && Boolean(target) && selected !== null && !tierBlocked(selected)
+    && selected !== existingRole;
+
+  /** Who the typed value names, when it isn't what was typed, and their workspace role. */
+  function memberHint(): string | undefined {
+    const named = targetName !== target && member.trim() !== targetName ? targetName : null;
+    return [named, targetRole ? workspaceRoleLabel[targetRole] : null].filter(Boolean).join(" · ") || undefined;
+  }
 
   function chooseGrant(value: string) {
     setMember(value);
     const userId = userIdFromInput(value, people.list);
-    setSelected([...(grants.data?.grants.find(grant => grant.userId === userId)?.permissions ?? [])]);
+    const grant = grants.data?.grants.find(item => item.userId === userId);
+    setSelected(grant ? grantRole(grant) : null);
   }
 
   function saveGrant(event: FormEvent) {
     event.preventDefault();
-    if (!grantReady || form.busy) return;
+    if (!grantReady || !selected || form.busy) return;
     void form.run(async () => {
-      await api(`${base}/grants`, { method: "POST", body: { userId: target, permissions: selected } });
+      await api(`${base}/grants`, { method: "POST", body: { userId: target, role: selected } });
       grants.refresh();
       changed();
-    }, "Session grant saved");
+    }, `${targetName} is now a session ${sessionRoleLabel[selected].toLowerCase()}`);
   }
 
   async function revoke() {
     if (!canManage || ownerSelected || !existing || form.busy) return;
     const confirmed = await confirmDialog({
-      title: "Revoke session grant?",
+      title: "Remove session access?",
       message: visibility === "workspace"
-        ? `Revoke the explicit grant for ${targetName}? They can still view prompts and output as a workspace member while this session is workspace-visible. Only the owner can make it private to remove workspace viewing.`
-        : `Revoke the explicit session grant for ${targetName}?`,
-      confirmLabel: "Revoke grant",
+        ? `Remove ${targetName}'s session role? They keep what their workspace role gives them while this session is workspace-visible. Only the owner can make it private to remove that.`
+        : `Remove ${targetName}'s session role? They will no longer be able to open this private session.`,
+      confirmLabel: "Remove access",
       destructive: true,
     });
     if (!confirmed) return;
@@ -421,7 +462,7 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
       chooseGrant("");
       grants.refresh();
       changed();
-    }, visibility === "workspace" ? "Explicit grant revoked. Workspace members can still view this session until the owner makes it private." : "Session grant revoked");
+    }, visibility === "workspace" ? "Session role removed. Workspace members can still view this session until the owner makes it private." : "Session role removed");
   }
 
   const sharing = useSessionLink({ session, user, action: actions.action, onChange: changed });
@@ -429,10 +470,10 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
   // The owner's loaded link is current; until it loads, and for everyone else, the session says whether one exists.
   const linkShared = isOwner && link !== undefined ? link !== null : Boolean(session.linkShared);
 
-  return <Section title="People" info={<><p>The server checks every request. Workspace visibility only allows viewing; ask, write, approve and manage are separate grants that each include read. Grantees must be workspace members, and you can only grant permissions you hold. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else.</p></>}>
+  return <Section title="People" info={<><p>The server checks every request. You give a workspace member one of four session roles: a viewer follows the session; a member also asks side questions; a collaborator also sends messages to the agent; an admin also decides approvals and manages who has access. You can only give a role whose permissions you hold, and workspace viewers can only be session viewers. On a workspace-visible session, people also keep what their workspace role gives them there. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else.</p></>}>
     <Row
       leading={<Icon name="user" size={16} />}
-      title={isOwner ? "Owner" : viewerOnly ? "Viewer" : "Collaborator"}
+      title={isOwner ? "Owner" : ownRole ? `Session ${sessionRoleLabel[ownRole].toLowerCase()}` : "Custom access"}
       hint={<>Your permissions: {ownPermissions.join(", ") || "none"}{viewerOnly ? ". You can follow committed work but can't ask, submit, approve, manage grants, change visibility, or use backups" : ""}</>}
     />
     <Row
@@ -458,39 +499,46 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     />}
     {isOwner && link && <CardBody><Field label="Share link" hint={<>Created <RelativeTime value={link.createdAt} /></>}><CopyField value={link.url} label="Copy share link" /></Field></CardBody>}
     {isOwner && sharing.linkError && <CardBody><Feedback error={sharing.linkError} /></CardBody>}
-    {canManage && !archived ? <Collapsible title="Grants" hint={grants.data ? `${grants.data.grants.length} explicit grant${grants.data.grants.length === 1 ? "" : "s"}` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh grants" title="Refresh grants" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
+    {canManage && !archived ? <Collapsible title="Session roles" hint={grants.data ? `${grants.data.grants.length} ${grants.data.grants.length === 1 ? "person" : "people"} with access` : undefined} leading={<Icon name="users" size={16} />} trailing={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh session roles" title="Refresh session roles" disabled={grants.loading} onClick={event => { event.preventDefault(); grants.refresh(); }} />}>
       <ResourceState {...grants} retry={grants.refresh}>
         {grants.data && <form onSubmit={saveGrant}>
           <fieldset disabled={form.busy} className="stack">
-            <Field label="Existing member grant" hint={grants.data.grants.length ? undefined : "No explicit member grants"}>
+            <Field label="People with access" hint={grants.data.grants.length > 1 ? undefined : "Nobody else has a session role yet"}>
               <select className="select" value={existing ? target : ""} onChange={event => chooseGrant(event.target.value && usernameWithId(people.person(event.target.value)))}>
-                <option value="">New grant</option>
+                <option value="">Add someone</option>
                 {grants.data.grants.map(grant => <option key={grant.userId} value={grant.userId}>
-                  {usernameWithId(people.person(grant.userId))}{grant.userId === session.ownerId ? " (owner, immutable)" : ""}: {grant.permissions.join(", ") || "None"}
+                  {usernameWithId(people.person(grant.userId))}: {grant.userId === session.ownerId ? "Owner (immutable)" : grantLabel(grant)}
                 </option>)}
               </select>
             </Field>
-            {/* Shows who a typed username or user ID names before anything is granted. */}
-            <Field label="Workspace member" hint={ownerSelected ? "The owner's grant is immutable" : targetName !== target && member.trim() !== targetName ? targetName : undefined}>
+            {/* Shows who a typed username or user ID names, and their workspace role, before anything is given. */}
+            <Field label="Workspace member" hint={ownerSelected ? "The owner's access is immutable" : target ? memberHint() : undefined}>
               <input className="input" required autoComplete="off" spellCheck={false} placeholder="Username or user ID" value={member} onChange={event => chooseGrant(event.target.value)} />
             </Field>
             <fieldset disabled={ownerSelected} className="stack session-permissions">
-              <legend className="small muted">Grant permissions</legend>
-              {permissions.map(permission => <label className="check-row" key={permission}>
-                <input className="checkbox" type="checkbox" checked={selected.includes(permission)} disabled={!grantable.includes(permission)}
-                  onChange={event => setSelected(current => event.target.checked ? [...current, permission] : current.filter(value => value !== permission))} />
-                <span>{permission}{!grantable.includes(permission) && <span className="muted"> (not yours to grant)</span>}</span>
-              </label>)}
+              <legend className="small muted">Session role</legend>
+              {sessionRoles.map(role => {
+                const blocked = tierBlocked(role);
+                return <label className="check-row" key={role}>
+                  <input className="radio" type="radio" name="session-role" value={role} checked={selected === role} disabled={Boolean(blocked)} onChange={() => setSelected(role)} />
+                  <span>
+                    {sessionRoleLabel[role]}{existingRole === role && <span className="muted"> (current)</span>}{blocked && <span className="muted"> ({blocked})</span>}
+                    <span className="muted small session-role-hint">{sessionRoleHint[role]} · {sessionRolePermissions[role].join(", ")}</span>
+                  </span>
+                </label>;
+              })}
             </fieldset>
+            {existing && !ownerSelected && !existingRole && <p className="muted small">{targetName} has a custom grant ({existing.permissions.join(", ")}) from before session roles. Choose a role to replace it.</p>}
+            {fromWorkspace && fromWorkspace !== "viewer" && targetRole && <p className="muted small">As a {workspaceRoleLabel[targetRole]}, {targetName} already has {sessionRolePermissions[fromWorkspace].join(", ")} on this workspace-visible session; a session role adds to that.</p>}
             <div className="inline">
-              <Button type="submit" variant="secondary" size="sm" disabled={!grantReady}>{form.busy ? "Saving..." : "Save grant"}</Button>
-              {existing && !ownerSelected && <Button variant="outline" size="sm" onClick={() => void revoke()}>Revoke grant</Button>}
+              <Button type="submit" variant="secondary" size="sm" disabled={!grantReady}>{form.busy ? "Saving..." : existing ? "Change role" : "Give role"}</Button>
+              {existing && !ownerSelected && <Button variant="outline" size="sm" onClick={() => void revoke()}>Remove access</Button>}
             </div>
-            {visibility === "workspace" && <p className="muted small">Revoking a grant doesn't stop workspace members from viewing; make the session private for that.</p>}
+            {visibility === "workspace" && <p className="muted small">Removing someone's session role doesn't stop workspace members from viewing; make the session private for that.</p>}
           </fieldset>
         </form>}
       </ResourceState>
-    </Collapsible> : <Row leading={<Icon name="users" size={16} />} title="Grants" hint={canManage ? "Unarchive the session to manage grants" : "Managing grants requires manage permission"} />}
+    </Collapsible> : <Row leading={<Icon name="users" size={16} />} title="Session roles" hint={canManage ? "Unarchive the session to manage session roles" : "Managing session roles takes the session admin role"} />}
     {(form.error || form.notice) && <CardBody><Feedback {...form} /></CardBody>}
   </Section>;
 }

@@ -16,6 +16,9 @@ export type WorkspaceRole = (typeof workspaceRoles)[number];
 /** The roles a workspace owner can assign; admins assign the ones below their own. */
 export const assignableWorkspaceRoles = ["admin", "collaborator", "member", "viewer"] as const satisfies readonly WorkspaceRole[];
 export type AssignableWorkspaceRole = (typeof assignableWorkspaceRoles)[number];
+/** The four tiers of access to one session given to one member, least first; sessionRolePermissions (policy.ts) defines them. */
+export const sessionRoles = ["viewer", "member", "collaborator", "admin"] as const;
+export type SessionRole = (typeof sessionRoles)[number];
 export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**
@@ -127,6 +130,10 @@ export interface SessionRecord {
 export interface SessionGrant {
   userId: string;
   permissions: Permission[];
+  /** The grantee's workspace role (for the first entry, the session owner's); absent from older servers. */
+  workspaceRole?: WorkspaceRole;
+  /** The session tier the permissions are exactly (see sessionRoles in policy.ts); null for a custom grant. Absent from older servers. */
+  sessionRole?: SessionRole | null;
 }
 export interface RunnerBinding {
   session: SessionRecord;
