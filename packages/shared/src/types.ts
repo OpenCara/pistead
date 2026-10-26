@@ -133,14 +133,21 @@ export interface SessionRecord {
   activity?: SessionActivity;
   /**
    * The pull request its newest git_push with a pull request opened, or found already open; absent until one does.
-   * Display state, like activity: what the push recorded, not the pull request's live state.
+   * Display state, like activity: what the push recorded, and the state the control plane last read for it.
    */
   pullRequest?: SessionPullRequest;
 }
+/**
+ * A pull request's state as the control plane last read it with the session owner's account: merged and closed win,
+ * then draft, then work to do (changes requested by a reviewer, then failed CI), otherwise open.
+ */
+export type PullRequestState = "draft" | "open" | "failing" | "changes_requested" | "merged" | "closed";
 export interface SessionPullRequest {
   url: string;
   /** Parsed from the URL's last path segment; absent when it has none. */
   number?: number;
+  /** Absent until it has been read (github.com pull requests only, so far). */
+  state?: PullRequestState;
 }
 export interface SessionGrant {
   userId: string;
