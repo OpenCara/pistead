@@ -2577,3 +2577,56 @@ test('host owners add admins who manage sharing and host command grants, and gra
   assert.equal((await creator.request('DELETE', `${admins}/${creator.user.id}`)).status, 204);
   await denied(await creator.request('PUT', `/api/connectors/${id}/shares/${s.team.id}`), 404, 'not_found');
 });
+
+test('the Files tab reads the session worktree through its host, for collaborators, with secrets hidden', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const files = (path: string, client = s.creator) => client.request('GET', `/api/sessions/${s.session.id}/files?path=${encodeURIComponent(path)}`);
+  const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ';
+  const requests = rpcHub(f, s.connector, envelope => {
+    const { path } = JSON.parse(envelope.request.body) as { path: string };
+    if (path === 'huge') return Response.json({ files: { path, type: 'file', size: 300000, truncated: true, text: 'x'.repeat(300000) } });
+    if (path === 'other') return Response.json({ files: { path: 'elsewhere', type: 'file', size: 1, truncated: false, text: 'x' } });
+    return Response.json({ files: path === '.'
+      ? { path, type: 'directory', entries: [{ name: 'src', type: 'directory' }, { name: '.env', type: 'file', size: 60 }], total: 2, truncated: false }
+      : { path, type: 'file', size: 60, truncated: false, text: `API_KEY=${secret}\n` } });
+  });
+  // A connector that doesn't advertise the file browser isn't asked.
+  await denied(await files('.'), 409, 'files_unsupported');
+  assert.equal(requests.length, 0);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, fileBrowser: true } }));
+
+  const listing = await json<{ files: { type: string; entries: unknown[] } }>(await files('.'));
+  assert.deepEqual(listing.files, { path: '.', type: 'directory', entries: [{ name: 'src', type: 'directory' }, { name: '.env', type: 'file', size: 60 }], total: 2, truncated: false });
+  const request = requests.at(-1)!.request;
+  assert.equal(request.method, 'POST');
+  assert.equal(request.path, `/v1/sessions/${s.session.id}/files`);
+  assert.equal(request.ticket.action, 'files');
+  assert.deepEqual(JSON.parse(request.body), { path: '.' });
+
+  // What looks like a secret is hidden, as in the transcript.
+  const preview = await json<{ files: { text: string; redacted?: boolean } }>(await files('./.env'));
+  assert.equal(JSON.parse(requests.at(-1)!.request.body).path, '.env');
+  assert.equal(preview.files.redacted, true);
+  assert.ok(!preview.files.text.includes(secret));
+
+  // A host's answer is held to the runner's own limits, and must be for the path asked for.
+  await denied(await files('huge'), 502, 'invalid_runner_response');
+  await denied(await files('other'), 502, 'invalid_runner_response');
+
+  // Only relative worktree paths reach the host.
+  const before = requests.length;
+  for (const path of ['/etc/passwd', '../outside', 'src/../../outside', 'a//b']) await denied(await files(path), 400, 'invalid_path');
+  assert.equal(requests.length, before);
+
+  // New sessions are workspace-visible: a workspace member follows the conversation, but doesn't browse its files.
+  await denied(await files('.', s.host), 403, 'forbidden');
+  // Private, they can't see the session at all; as a session viewer they follow only the conversation; a collaborator browses.
+  await json(await s.creator.request('PATCH', `/api/sessions/${s.session.id}`, { visibility: 'private' }));
+  await denied(await files('.', s.host), 404, 'not_found');
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.host.user.id, role: 'viewer' }));
+  await denied(await files('.', s.host), 403, 'forbidden');
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.host.user.id, role: 'collaborator' }));
+  await json(await files('.', s.host));
+  assert.equal(requests.at(-1)!.request.ticket.actorId, s.host.user.id);
+  assert.equal(requests.length, before + 1);
+});

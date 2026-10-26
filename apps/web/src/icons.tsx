@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 export type IconName =
   | "plus" | "settings" | "more" | "chevron-right" | "chevron-down" | "chevron-left" | "x" | "check" | "copy"
-  | "folder" | "message" | "terminal" | "tool" | "send" | "panel-right" | "menu" | "info" | "alert" | "shield"
+  | "folder" | "file" | "message" | "terminal" | "tool" | "send" | "panel-right" | "menu" | "info" | "alert" | "shield"
   | "server" | "users" | "user" | "palette" | "sun" | "moon" | "monitor" | "logout" | "archive"
   | "git-branch" | "git-pull-request" | "github" | "lock" | "globe" | "refresh" | "search" | "eye" | "trash" | "external" | "history" | "pencil" | "link" | "stop";
 
@@ -18,6 +18,7 @@ const paths: Record<Exclude<IconName, "github">, ReactNode> = {
   check: <path d="M20 6 9 17l-5-5" />,
   copy: <><rect x="8" y="8" width="13" height="13" rx="2" /><path d="M4 16V5a2 2 0 0 1 2-2h11" /></>,
   folder: <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />,
+  file: <><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path d="M14 2v4a2 2 0 0 0 2 2h4" /></>,
   message: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" />,
   terminal: <><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></>,
   tool: <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9Z" />,

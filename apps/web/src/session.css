@@ -162,9 +162,101 @@
   .session-role-hint { display: block; }
   .check-row:has(> .radio:disabled) { cursor: default; opacity: .6; }
   .session-scrim { display: none; }
+  /* Files tab: a path bar above one directory's entries or one file's preview. */
+  .file-browser { display: grid; gap: var(--space-3); min-width: 0; }
+  .file-browser-bar { display: flex; align-items: center; gap: var(--space-1); min-width: 0; }
+  .file-breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-width: 0; font-family: var(--mono); font-size: var(--font-sm); }
+  .file-crumb-item { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+  .file-crumb {
+    min-width: 0;
+    padding: 2px var(--space-1);
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--foreground);
+    font: inherit;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+  .file-crumb:hover:not(:disabled) { background: var(--surface2); }
+  .file-crumb:disabled { cursor: default; font-weight: var(--weight-medium); }
+  .file-list .row-title { font-family: var(--mono); font-size: var(--font-sm); }
+  .file-name { overflow-wrap: anywhere; }
+  /* Code: one scroll box holding the line numbers and the text, so they scroll together; the numbers stay put sideways. */
+  .code-view {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    max-height: 70vh;
+    overflow: auto;
+    border-radius: var(--radius-lg);
+    background: var(--code-background);
+    font-size: var(--font-sm);
+    line-height: 1.55;
+  }
+  .code-view > pre { margin: 0; padding: var(--space-3); overflow: visible; border-radius: 0; background: none; font-size: inherit; line-height: inherit; white-space: pre; overflow-wrap: normal; tab-size: 4; }
+  .code-gutter {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    padding-right: var(--space-2);
+    border-right: 1px solid var(--border);
+    background: var(--code-background);
+    color: var(--foreground-muted);
+    text-align: right;
+    user-select: none;
+  }
+  .code-text > code { font-size: inherit; }
+  /* Token colors, after GitHub's light and dark themes. */
+  .code-view {
+    --syntax-comment: #6e7781; --syntax-keyword: #cf222e; --syntax-string: #0a3069; --syntax-number: #0550ae;
+    --syntax-title: #8250df; --syntax-type: #953800; --syntax-attr: #0550ae; --syntax-tag: #116329; --syntax-meta: #57606a;
+    --syntax-addition: #116329; --syntax-addition-bg: #dafbe1; --syntax-deletion: #82071e; --syntax-deletion-bg: #ffebe9;
+  }
+  [data-theme="dark"] .code-view {
+    --syntax-comment: #8b949e; --syntax-keyword: #ff7b72; --syntax-string: #a5d6ff; --syntax-number: #79c0ff;
+    --syntax-title: #d2a8ff; --syntax-type: #ffa657; --syntax-attr: #79c0ff; --syntax-tag: #7ee787; --syntax-meta: #8b949e;
+    --syntax-addition: #aff5b4; --syntax-addition-bg: #033a16; --syntax-deletion: #ffdcd7; --syntax-deletion-bg: #67060c;
+  }
+  .code-text .hljs-comment, .code-text .hljs-quote { color: var(--syntax-comment); font-style: italic; }
+  .code-text .hljs-keyword, .code-text .hljs-selector-tag, .code-text .hljs-built_in, .code-text .hljs-doctag,
+  .code-text .hljs-template-tag, .code-text .hljs-template-variable { color: var(--syntax-keyword); }
+  .code-text .hljs-string, .code-text .hljs-regexp, .code-text .hljs-meta .hljs-string, .code-text .hljs-char.escape_ { color: var(--syntax-string); }
+  .code-text .hljs-number, .code-text .hljs-literal, .code-text .hljs-variable.constant_, .code-text .hljs-symbol, .code-text .hljs-bullet,
+  .code-text .hljs-link { color: var(--syntax-number); }
+  .code-text .hljs-title, .code-text .hljs-title.function_, .code-text .hljs-section { color: var(--syntax-title); }
+  .code-text .hljs-type, .code-text .hljs-title.class_, .code-text .hljs-title.class_.inherited__, .code-text .hljs-params,
+  .code-text .hljs-variable.language_ { color: var(--syntax-type); }
+  .code-text .hljs-attr, .code-text .hljs-attribute, .code-text .hljs-property, .code-text .hljs-selector-attr,
+  .code-text .hljs-selector-class, .code-text .hljs-selector-id, .code-text .hljs-selector-pseudo, .code-text .hljs-operator { color: var(--syntax-attr); }
+  .code-text .hljs-tag, .code-text .hljs-name, .code-text .hljs-selector-tag { color: var(--syntax-tag); }
+  .code-text .hljs-meta, .code-text .hljs-meta .hljs-keyword { color: var(--syntax-meta); }
+  .code-text .hljs-addition { color: var(--syntax-addition); background: var(--syntax-addition-bg); }
+  .code-text .hljs-deletion { color: var(--syntax-deletion); background: var(--syntax-deletion-bg); }
+  .code-text .hljs-emphasis { font-style: italic; }
+  .code-text .hljs-strong { font-weight: var(--weight-medium); }
+  /* Images: fit to the panel, or at actual size in a scroll box; a checkerboard shows transparency. */
+  .file-image-view { display: grid; gap: var(--space-2); margin: 0; }
+  .file-image-frame {
+    display: block;
+    max-height: 70vh;
+    padding: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background-color: var(--surface1);
+    background-image: conic-gradient(var(--surface3) 25%, transparent 0 50%, var(--surface3) 0 75%, transparent 0);
+    background-size: 16px 16px;
+    cursor: zoom-in;
+  }
+  .file-image-frame.actual { cursor: zoom-out; }
+  .file-image { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+  .file-image-frame:not(.actual) .file-image { max-height: calc(70vh - 2px); object-fit: contain; }
+  .file-image-frame.actual .file-image { max-width: none; margin: 0; }
 
   @media (min-width: 1100px) {
     .session-screen.panel-open { grid-template-columns: minmax(0, 1fr) 360px; }
+    /* The Files tab shows file contents, so it takes more room. */
+    .session-screen.panel-open.panel-wide { grid-template-columns: minmax(0, 1fr) min(560px, 45%); }
   }
   @media (max-width: 1099px) {
     .session-panel {
@@ -172,6 +264,9 @@
       inset: 0 0 0 auto;
       z-index: 30;
       width: min(360px, 100%);
+    }
+    .session-screen.panel-wide .session-panel {
+      width: min(560px, 100%);
       box-shadow: var(--shadow);
     }
     .session-scrim {

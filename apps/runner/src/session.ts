@@ -6,7 +6,7 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
@@ -1917,6 +1917,30 @@ export class RunnerSession {
           createdAt: new Date().toISOString() };
       } finally { await this.open(); }
     });
+  }
+
+  /**
+   * The session panel's file browser: one worktree path, read-only, as `write` sees it, since a collaborator could already
+   * have the agent read any file. Not exclusive with runs: it waits only for the sandbox's own queue, like a file tool.
+   */
+  async browse(ticket: RunnerTicket, path: string): Promise<SessionFiles> {
+    this.assertTicket(ticket);
+    await this.authorize(ticket.actorId, "write", ticket.policyVersion);
+    const authorize = async () => { await this.authorize(ticket.actorId, "write", ticket.policyVersion); };
+    try {
+      return { path, ...await this.sandbox.browse(path, authorize) };
+    } catch (error) {
+      if (error instanceof RunnerError) throw error;
+      // Fixed reasons only (the control plane shows a 422's): never a host path or raw sandbox output.
+      const message = error instanceof Error ? `${error.message}\n${(error as { stderr?: string }).stderr ?? ""}`.toLowerCase() : "";
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR" || /no such file or directory|not a directory/.test(message)) throw new RunnerError(422, "That path is not in the worktree");
+      if (/path escapes the worktree/.test(message)) throw new RunnerError(422, "That path leads outside the worktree");
+      if (/invalid relative path|absolute paths|path traversal|path component is not a real directory/.test(message)) throw new RunnerError(422, "Invalid worktree path");
+      if (/too many entries/.test(message)) throw new RunnerError(422, "That directory has too many entries to list");
+      if (code === "EACCES" || code === "ELOOP" || /permission denied|symlinks are not followed|too many levels of symbolic links/.test(message)) throw new RunnerError(422, "That path can't be read");
+      throw error;
+    }
   }
 
   async close({ abortPushes = true }: { abortPushes?: boolean } = {}): Promise<void> {
