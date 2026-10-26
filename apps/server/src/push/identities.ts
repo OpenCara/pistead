@@ -3,12 +3,12 @@ import type { GitProvider } from '../../../../packages/shared/src/repositories.j
 import { gitProviders, pushIdentityKindsByProvider } from '../../../../packages/shared/src/repositories.js';
 import type { PushIdentity, PushIdentityKind } from '../../../../packages/shared/src/types.js';
 import { sha256 } from '../../../../packages/shared/src/crypto.js';
-import type { PushIdentityRow, RepositoryRow, WorkerEnv } from '../types.js';
+import type { PushIdentityRow, WorkerEnv } from '../types.js';
 import { auditStatement, requireMember } from '../db.js';
 import { appOrigin, fail, id, identifier, jsonObject, now, randomToken } from '../http.js';
 import { assertVaultConfigured, decryptToken, encryptToken } from '../vault.js';
 import { gitHost } from '../git/accounts.js';
-import { publicRepository } from '../repositories.js';
+import { publicRepository, repositorySettingsSelect, type RepositorySettingsRow } from '../repositories.js';
 import { workspaceSubject } from './oidc.js';
 import {
   exchangeAuthorizationCode, githubInstallUrl, identitySecretContext, oauthEndpoints, oauthRedirectUri, oauthSecret, verifyIdentity,
@@ -213,8 +213,7 @@ export function registerPushIdentities(app: Hono<WorkerEnv>): void {
       RETURNING binding_id`)
       .bind(bindingId, workspaceId, input.forbidDefaultBranch ? 1 : 0, actor, now(), bindingId, workspaceId, workspaceId, actor).first();
     if (!saved) fail(404, 'not_found', 'Repository not found.');
-    const repository = await c.env.DB.query<RepositoryRow & { forbid_default_branch: number | null }>(`SELECT r.*, p.forbid_default_branch FROM workspace_repositories r
-      LEFT JOIN repository_push_policies p ON p.binding_id = r.id WHERE r.id = ? AND r.workspace_id = ?`)
+    const repository = await c.env.DB.query<RepositorySettingsRow>(`${repositorySettingsSelect} WHERE r.id = ? AND r.workspace_id = ?`)
       .bind(bindingId, workspaceId).first();
     if (!repository) fail(404, 'not_found', 'Repository not found.');
     await auditStatement(c.env, actor, 'repository.push_policy.updated', workspaceId, null,

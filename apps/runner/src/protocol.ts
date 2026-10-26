@@ -4,6 +4,7 @@ import { validateUserEnv } from "../../../packages/shared/src/policy.js";
 import type { RunnerAction, RunnerBinding, RunnerTicket, Operation, Permission } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, githubMergeMethods, permissionNeeds, toolNames } from "../../../packages/shared/src/types.js";
 import { gitProviderHosts, gitProviders, repositoryLimits, repositoryPath, validCloneDirectory, validGitHost, validPushBranch, validPushTag, validRepositoryId, validRepositoryName, type SessionRepository, type TokenGitProvider } from "../../../packages/shared/src/repositories.js";
+import { validSessionBranch } from "../../../packages/shared/src/git-push.js";
 
 export class RunnerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -100,6 +101,8 @@ export function validateBinding(value: unknown, id: string, allowNativeModels = 
   validateRepositories(b.session.repositories);
   if (b.session.repositoryMode !== undefined && (b.session.repositoryMode !== "clone" || b.session.repositories?.length))
     throw new RunnerError(400, "Invalid session repository mode");
+  if (b.session.branch !== undefined && (b.session.repositoryMode !== "clone" || !validSessionBranch(b.session.branch, b.session.id)))
+    throw new RunnerError(400, "Invalid session branch");
   b.owner.env = validateUserEnv(b.owner.env ?? {});
   return JSON.parse(JSON.stringify(b));
 }

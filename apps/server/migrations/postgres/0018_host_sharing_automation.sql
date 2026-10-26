@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0024_host_sharing_automation.sql.
+-- Postgres translation of sqlite/0025_host_sharing_automation.sql.
 
 -- A message sent with Auto-approve may also merge without asking: a separate opt-in, recorded with its admission.
 ALTER TABLE run_admissions ADD COLUMN auto_merge BIGINT NOT NULL DEFAULT 0 CHECK (auto_merge IN (0, 1));

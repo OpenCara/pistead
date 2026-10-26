@@ -2,6 +2,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import type { SessionRecord } from "../../../packages/shared/src/types";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
+import { PullRequestTag } from "./pull-request";
 import { href, navigate } from "./router";
 import { sessionStatus } from "../../../packages/client/src/session-status";
 import { Button, EmptyState, Feedback, Field, IdentityBadge, InfoTip, LinkButton, PageLoading, RelativeTime, Row, ScreenHeader, Section, Sheet, StatusDot, useAction } from "./ui";
@@ -65,7 +66,7 @@ export function SessionsScreen() {
             return <Row key={session.id} href={href({ name: "session", sessionId: session.id })} chevron
               leading={<StatusDot tone={status.tone} label={status.label ? undefined : session.status} />}
               title={<span className="truncate">{session.title}</span>}
-              hint={<>{status.label && <><span className={`session-status ${status.tone}`}>{status.label}</span> · </>}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
+              hint={<>{status.label && <><span className={`session-status ${status.tone}`}>{status.label}</span> · </>}{session.pullRequest && <><PullRequestTag pull={session.pullRequest} /> · </>}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
           })}
           {group.sessions.length > limit && <div className="sessions-more"><Button variant="ghost" size="sm" block onClick={() => setLimits(current => ({ ...current, [group.id]: limit + PAGE_SIZE }))}>Load more</Button></div>}
         </Section>;

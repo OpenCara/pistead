@@ -57,6 +57,11 @@ export interface ConnectorCapabilities {
    */
   cloneBackups?: boolean;
   /**
+   * The connector pushes a clone session's own branch under the name its binding carries (session.branch, named for the
+   * session's work), not only `pistead/<session-id>`. Absent on older connectors, whose sessions keep the old name.
+   */
+  sessionBranches?: boolean;
+  /**
    * The connector runs the session owner's GitHub comments and issues under Auto-approve, and merges when the message
    * also chose auto-merge, through the control plane with the message's admission. Absent on older connectors, which
    * still ask for each.

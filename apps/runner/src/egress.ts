@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
-import { egressPushService, hostAllowed, parseNetworkPolicy, type EgressGitService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize, type EgressGitService, type EgressGrant,
+  type EgressRepository, type LfsBatchResult } from "../../../packages/shared/src/network.js";
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
 import { RunnerError } from "./protocol.js";
 import { CA_BUNDLE, CA_BUNDLE_VARIABLES } from "./trust-store.js";
@@ -28,6 +29,9 @@ const CONNECT_TIMEOUT_MS = 10_000;
 /** A grant the control plane can't refresh stays in use this long, so a brief outage doesn't cut running commands off. */
 const GRANT_STALE_MS = 5 * 60_000;
 const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
+/** git-lfs's batch requests name up to 100 objects by default; this leaves room for whatever else it sends with them. */
+const LFS_BATCH_BYTES = 1024 * 1024;
+const LFS_TYPE = "application/vnd.git-lfs+json";
 const LOG_ENTRIES = 200;
 
 /**
@@ -55,7 +59,7 @@ export interface EgressOptions {
    */
   mirror?: (repository: EgressRepository) => Promise<string>;
   /**
-   * The branch this session may push without approval (a clone session's `pistead/<session-id>`); pushes of it are
+   * The branch this session may push without approval (a clone session's own branch, see sessionBranch); pushes of it are
    * relayed to the control plane, which pushes with the workspace's push identity. Without it, every push is refused.
    */
   sessionBranch?: string;
@@ -125,6 +129,55 @@ function repositoryKey(hostAndPath: string): string {
   let value = hostAndPath;
   try { value = decodeURIComponent(value); } catch { /* compared as written */ }
   return value.toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "");
+}
+
+/**
+ * A git-lfs request: its endpoint for a remote is `<remote>/info/lfs` (git-lfs adds `.git` first where the remote has
+ * none), so the proxy sees the batch API below a rewritten remote, and object downloads where its own batch answers
+ * point them. Anything else there (locks, uploads' verify) is `other`.
+ */
+function lfsRequest(path: string): { target: string; kind: "batch" | "object" | "other"; oid?: string } | undefined {
+  const match = /^(.+)\/info\/lfs((?:\/(?:objects|locks)(?:\/[^/]*)*)?)$/.exec(path);
+  if (!match) return undefined;
+  const [, target, rest] = match as unknown as [string, string, string];
+  if (rest === "/objects/batch") return { target, kind: "batch" };
+  const object = /^\/objects\/([0-9a-f]{64})$/.exec(rest);
+  if (object) return { target, kind: "object", oid: object[1]! };
+  return { target, kind: "other" };
+}
+
+function json(value: unknown): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
+}
+
+/** The status a relay refusal is passed on with: the control plane's own, else a gateway error. */
+function relayStatus(error: unknown): number {
+  return error instanceof RunnerError && error.status >= 400 && error.status < 600 ? error.status : 502;
+}
+
+/** The control plane's answer to an `lfs-batch` of `count` objects; anything else is refused. */
+export function parseLfsBatchResult(value: unknown, count: number): LfsBatchResult {
+  const objects = (value as { objects?: unknown } | null)?.objects;
+  if (!Array.isArray(objects) || objects.length !== count) throw new RunnerError(502, "Invalid Git LFS answer from the control plane");
+  return {
+    objects: objects.map((item: unknown) => {
+      const object = item as Record<string, unknown> | null;
+      const error = object?.error as { code?: unknown; message?: unknown } | undefined;
+      if (!object || !validLfsOid(object.oid) || !validLfsSize(object.size) || typeof object.download !== "boolean"
+        || (error !== undefined && (!Number.isInteger(error.code) || typeof error.message !== "string" || !/^[\x20-\x7e]{1,300}$/.test(error.message)))) {
+        throw new RunnerError(502, "Invalid Git LFS answer from the control plane");
+      }
+      return { oid: object.oid, size: object.size, download: object.download,
+        ...(error ? { error: { code: error.code as number, message: error.message as string } } : {}) };
+    }),
+  };
+}
+
+/** git-lfs shows a JSON error's message to the user. */
+function refuseLfs(response: ServerResponse, status: number, message: string): void {
+  if (response.headersSent) { response.destroy(); return; }
+  response.writeHead(status, { "Content-Type": LFS_TYPE, "Cache-Control": "no-store", Connection: "close" });
+  response.end(`${JSON.stringify({ message })}\n`);
 }
 
 function gitRequest(path: string, search: string): { target: string; service: EgressGitService } | undefined {
@@ -331,6 +384,7 @@ export class EgressProxy {
       }
       if (url.pathname === "/__pistead/status" && request.method === "GET") return await this.#status(response);
       if (url.pathname === "/__pistead/mirror" && request.method === "GET") return await this.#mirror(response, url.searchParams.get("remote") ?? "");
+      if (url.pathname === "/__pistead/lfs" && request.method === "GET") return await this.#lfsEnabled(response, url.searchParams.get("remote") ?? "");
       if (url.pathname.startsWith("/git/")) return await this.#git(request, response, url);
       return refuse(response, 404, "Unknown Pistead egress endpoint");
     } catch (error) {
@@ -348,6 +402,7 @@ export class EgressProxy {
       network: grant?.policy ?? null,
       ...(error ? { error } : {}),
       repositories: grant?.repositories.map(repository => bindingRemote(repository)) ?? [],
+      lfs: grant?.repositories.filter(repository => repository.lfs).map(repository => bindingRemote(repository)) ?? [],
       gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`
         + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : ""),
       sessionBranch: this.#options.sessionBranch ?? null,
@@ -372,9 +427,20 @@ export class EgressProxy {
     response.end(`${JSON.stringify({ path })}\n`);
   }
 
+  /** Whether clones of `remote` should download Git LFS objects: asked by the `git` shim before a clone. */
+  async #lfsEnabled(response: ServerResponse, remote: string): Promise<void> {
+    const repository = repositoryForRemote((await this.#currentGrant()).repositories, remote.slice(0, 2048));
+    response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    response.end(`${JSON.stringify({ lfs: repository?.lfs === true })}\n`);
+  }
+
   async #git(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     const parsed = gitRequest(url.pathname.slice("/git/".length), url.search);
-    if (!parsed) return refuse(response, 404, "Not a Git smart-HTTP request");
+    if (!parsed) {
+      const lfs = lfsRequest(url.pathname.slice("/git/".length));
+      if (lfs) return this.#lfs(request, response, url, lfs);
+      return refuse(response, 404, "Not a Git smart-HTTP request");
+    }
     // https://user@host/... remotes (as Azure DevOps and Bitbucket show them) name the same repository.
     const target = parsed.target.replace(/^[^@/]*@/, "");
     const key = repositoryKey(target);
@@ -441,6 +507,84 @@ export class EgressProxy {
     try { await pushed; } finally { this.#pushes.delete(pushed); }
   }
 
+  /**
+   * git-lfs downloads of a workspace repository whose workspace turned LFS on. The batch request goes to the control
+   * plane, which asks the provider with the session owner's credential and answers only which objects exist; the proxy
+   * then points each download at itself, and relays it to the control plane, which downloads the object. The provider's
+   * download URLs and the tokens in their headers never reach the host, and uploads are refused.
+   */
+  async #lfs(request: IncomingMessage, response: ServerResponse, url: URL, lfs: NonNullable<ReturnType<typeof lfsRequest>>): Promise<void> {
+    const target = lfs.target.replace(/^[^@/]*@/, "");
+    const label = repositoryKey(target).slice(0, 300);
+    const deny = (status: number, reason: string) => {
+      this.#record({ kind: "git", target: label, outcome: "refused", reason: `lfs: ${reason}` });
+      refuseLfs(response, status, reason);
+    };
+    const repository = (await this.#currentGrant()).repositories.find(item => repositoryKey(bindingRemote(item).replace(/^https:\/\//, "")) === repositoryKey(target));
+    if (!repository) return deny(403, `${target.slice(0, 300)} is not one of this workspace's repositories; Git LFS goes only to them`);
+    if (!repository.lfs) {
+      return deny(403, `Git LFS is off for ${repository.fullName} in this workspace; a workspace owner or admin can turn it on in the workspace's repository settings`);
+    }
+    if (lfs.kind === "other") return deny(403, "Only Git LFS downloads go through the Pistead egress proxy; uploads and locks are not supported in sessions");
+    if (lfs.kind === "object") {
+      if (request.method !== "GET") return deny(405, "Git LFS downloads use GET");
+      const size = Number(url.searchParams.get("size"));
+      if (!/^\d{1,16}$/.test(url.searchParams.get("size") ?? "") || !validLfsSize(size)) return deny(400, "Invalid Git LFS object size");
+      return this.#relayLfs(response, repository, label, "lfs-object", { oid: lfs.oid!, size }, deny);
+    }
+    if (request.method !== "POST") return deny(405, "The Git LFS batch API uses POST");
+    let input: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await boundedBody(request, LFS_BATCH_BYTES)));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      input = parsed as Record<string, unknown>;
+    } catch (error) {
+      return deny(error instanceof RunnerError ? error.status : 400, error instanceof RunnerError ? error.message : "Invalid Git LFS batch request");
+    }
+    if (input.operation !== "download") return deny(403, "Git LFS uploads are not supported in Pistead sessions; only downloads go through the egress proxy");
+    if (input.transfers !== undefined && (!Array.isArray(input.transfers) || !input.transfers.includes("basic"))) {
+      return deny(422, "Only the basic Git LFS transfer is supported");
+    }
+    if (input.hash_algo !== undefined && input.hash_algo !== "sha256") return deny(422, "Only sha256 Git LFS objects are supported");
+    const ref = (input.ref as { name?: unknown } | undefined)?.name;
+    let batch;
+    try {
+      batch = parseLfsBatchRequest({
+        objects: Array.isArray(input.objects) ? input.objects.map(item => ({ oid: (item as { oid?: unknown })?.oid, size: (item as { size?: unknown })?.size })) : input.objects,
+        // The ref only scopes the provider's answer; one the relay wouldn't accept is left out.
+        ...(typeof ref === "string" && /^refs\/[\x21-\x7e]{1,250}$/.test(ref) ? { ref } : {}),
+      });
+    } catch (error) {
+      return deny(input.objects && Array.isArray(input.objects) && input.objects.length > lfsLimits.batchObjects ? 413 : 422,
+        error instanceof Error ? error.message : "Invalid Git LFS batch request");
+    }
+    let upstream: Response;
+    try { upstream = await this.#options.relay({ bindingId: repository.bindingId, service: "lfs-batch", contentType: "application/json", body: json(batch) }); }
+    catch (error) { return deny(relayStatus(error), error instanceof RunnerError ? error.message : "The control plane could not relay the request"); }
+    let result: LfsBatchResult;
+    try { result = parseLfsBatchResult(await upstream.json(), batch.objects.length); }
+    catch { return deny(502, "The control plane returned an invalid Git LFS answer"); }
+    // Downloads come back to this proxy, under the same path, so they are the same repository's and checked again.
+    const base = `${EGRESS_GIT_BASE}${target}/info/lfs/objects/`;
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `lfs batch (${result.objects.length} objects)` });
+    response.writeHead(200, { "Content-Type": LFS_TYPE, "Cache-Control": "no-store" });
+    response.end(`${JSON.stringify({
+      transfer: "basic", hash_algo: "sha256",
+      objects: result.objects.map(object => object.download
+        ? { oid: object.oid, size: object.size, authenticated: true, actions: { download: { href: `${base}${object.oid}?size=${object.size}` } } }
+        : { oid: object.oid, size: object.size, error: object.error ?? { code: 404, message: "Object does not exist on the server" } }),
+    })}\n`);
+  }
+
+  async #relayLfs(response: ServerResponse, repository: EgressRepository, label: string, service: "lfs-object", object: { oid: string; size: number },
+    deny: (status: number, reason: string) => void): Promise<void> {
+    let upstream: Response;
+    try { upstream = await this.#options.relay({ bindingId: repository.bindingId, service, contentType: "application/json", body: json(object) }); }
+    catch (error) { return deny(relayStatus(error), error instanceof RunnerError ? error.message : "The control plane could not relay the request"); }
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `lfs object ${object.oid.slice(0, 12)}` });
+    return this.#stream(response, upstream, "application/octet-stream");
+  }
+
   async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string,
     stream?: ReadableStream<Uint8Array>): Promise<void> {
     const header = (name: string) => { const value = request.headers[name]; return typeof value === "string" ? value : undefined; };
@@ -456,10 +600,15 @@ export class EgressProxy {
     } catch (error) {
       const reason = error instanceof RunnerError ? error.message : "The control plane could not relay the request";
       this.#record({ kind: "git", target: label, outcome: "refused", reason });
-      return refuse(response, error instanceof RunnerError && error.status >= 400 && error.status < 600 ? error.status : 502, reason);
+      return refuse(response, relayStatus(error), reason);
     }
     this.#record({ kind: "git", target: label, outcome: "allowed", reason: service === "receive-pack" ? `push ${this.#options.sessionBranch}` : service });
-    response.writeHead(200, { "Content-Type": upstream.headers.get("content-type") ?? "application/octet-stream", "Cache-Control": "no-store" });
+    return this.#stream(response, upstream, upstream.headers.get("content-type") ?? "application/octet-stream");
+  }
+
+  /** Streams the control plane's answer to the sandbox, as fast as the sandbox reads it. */
+  async #stream(response: ServerResponse, upstream: Response, contentType: string): Promise<void> {
+    response.writeHead(200, { "Content-Type": contentType, "Cache-Control": "no-store" });
     if (!upstream.body) return void response.end();
     const reader = upstream.body.getReader();
     response.once("close", () => { void reader.cancel().catch(() => {}); });
@@ -512,9 +661,10 @@ export function parseEgressGrant(value: unknown): EgressGrant {
     const repository = item as Partial<EgressRepository> | null;
     if (!repository || typeof repository.bindingId !== "string" || !IDENTIFIER.test(repository.bindingId)
       || !gitProviders.includes(repository.provider as GitProvider) || !validGitHost(repository.host) || (repository.repositoryId !== undefined && !validRepositoryId(repository.repositoryId))
-      || !validRepositoryName(repository.provider!, repository.fullName)) throw new RunnerError(502, "Invalid repositories from the control plane");
+      || !validRepositoryName(repository.provider!, repository.fullName)
+      || (repository.lfs !== undefined && typeof repository.lfs !== "boolean")) throw new RunnerError(502, "Invalid repositories from the control plane");
     return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
-      ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}) };
+      ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}), ...(repository.lfs ? { lfs: true } : {}) };
   });
   return { policy, repositories };
 }

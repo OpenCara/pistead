@@ -4,7 +4,7 @@ import type { RunnerBinding } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities, RestoreInput } from '../../../packages/shared/src/connector.js';
 import type { AgentRow, AppContext, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, modelDefinition, requireNoMigration, requireSessionCreator, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionCreatorSQL, sessionRecord } from './db.js';
+import { agentVersion, auditStatement, modelDefinition, requireNoMigration, requireSessionCreator, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionCreatorSQL, sessionRecord, successorBranch } from './db.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text } from './http.js';
 import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
@@ -118,6 +118,7 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
     connector_id: model.connector_id, connector_owner_id: model.connector_owner_id, title: input.title ?? source.title,
     repositories_json: source.repositories_json ?? '[]', repository_mode: source.repository_mode ?? null, visibility: source.visibility ?? 'private', policy_version: 1,
     status: 'provisioning', created_at: now() };
+  target.branch = successorBranch(target, capabilities);
   await requireConnectorSession(c.env, model.connector_id, target);
   const binding: RunnerBinding = { session: runnerSessionRecord(target), owner: sourceBinding.owner, agent: agentVersion(agent), model: modelDefinition(model) };
   const digest = await sha256(snapshot);
@@ -135,11 +136,11 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   try {
     await c.env.DB.batch([
       c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
-        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
+        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode, branch)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
         .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
           target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
-          target.visibility ?? 'private', target.repository_mode ?? null, ...admissibleValues),
+          target.visibility ?? 'private', target.repository_mode ?? null, target.branch ?? null, ...admissibleValues),
       c.env.DB.query(`INSERT INTO host_migrations (id, request_id, owner_id, workspace_id, source_session_id, source_connector_id,
         target_session_id, target_connector_id, target_model_id, request_title, sha256, size, snapshot, binding_json, created_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)`)

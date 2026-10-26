@@ -3,6 +3,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { app } from '../apps/server/src/index.js';
+import { listSessionAccess, runnerSessionRecord, sessionAccess, sessionPullRequest, sessionRecord } from '../apps/server/src/db.js';
 import { settlePushCredentials } from '../apps/server/src/push/broker.js';
 import type { Env } from '../apps/server/src/types.js';
 import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
@@ -403,6 +404,36 @@ test('completion revokes the GitHub token, verifies the tip and opens the pull r
   const third = await (await f.post(credential, { sessionId: 'session', approvalId: 'tool-c-3', actorId: owner, operation: op2, admissionId: f.admit('auto') })).json() as { credentialId: string };
   const existing = await f.post(complete, { sessionId: 'session', approvalId: 'tool-c-3', credentialId: third.credentialId, outcome: 'up-to-date', tip });
   assert.deepEqual(await existing.json(), { pullRequest: { url: 'https://github.com/owner/repo/pull/4', number: 4, created: false } });
+});
+
+test('session lists and reads show the newest pull request a push from the session opened, outside the runner binding', async t => {
+  const f = await fixture(t);
+  const listed = async () => (await listSessionAccess(f.env, owner)).find(access => access.row.id === 'session')!;
+  assert.equal(sessionRecord((await listed()).row).pullRequest, undefined, 'none before a push opens one');
+
+  const push = async (approvalId: string, githubPullExists: boolean) => {
+    f.state.githubTip = tip;
+    f.state.githubPullExists = githubPullExists;
+    const issued = await (await f.post(credential, { sessionId: 'session', approvalId, actorId: owner,
+      operation: f.operation({ pullRequest: { title: 'Add feature', body: 'Details' } }), admissionId: f.admit('auto') })).json() as { credentialId: string };
+    assert.equal((await f.post(complete, { sessionId: 'session', approvalId, credentialId: issued.credentialId, outcome: 'pushed', tip })).status, 200);
+  };
+  await push('tool-l-1', true);
+  assert.deepEqual(sessionRecord((await listed()).row).pullRequest, { url: 'https://github.com/owner/repo/pull/4', number: 4 });
+  // A plain push afterwards opens none and keeps the one already shown.
+  const plain = await (await f.post(credential, { sessionId: 'session', approvalId: 'tool-l-2', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') })).json() as { credentialId: string };
+  await f.post(complete, { sessionId: 'session', approvalId: 'tool-l-2', credentialId: plain.credentialId, outcome: 'pushed', tip });
+  await push('tool-l-3', false);
+  const access = (await sessionAccess(f.env, 'session', owner))!;
+  assert.deepEqual(sessionRecord(access.row).pullRequest, { url: 'https://github.com/owner/repo/pull/5', number: 5 }, 'the newest one');
+  assert.deepEqual(sessionRecord((await listed()).row).pullRequest, { url: 'https://github.com/owner/repo/pull/5', number: 5 });
+  assert.equal('pullRequest' in runnerSessionRecord(access.row), false, 'not part of the immutable runner binding');
+
+  assert.deepEqual(sessionPullRequest('https://gitlab.com/group/project/-/merge_requests/12'), { url: 'https://gitlab.com/group/project/-/merge_requests/12', number: 12 });
+  assert.deepEqual(sessionPullRequest('https://dev.azure.com/contoso/Project/_git/repo/pullrequest/3'), { url: 'https://dev.azure.com/contoso/Project/_git/repo/pullrequest/3', number: 3 });
+  assert.deepEqual(sessionPullRequest('https://example.test/review'), { url: 'https://example.test/review' });
+  assert.equal(sessionPullRequest('javascript:alert(1)'), undefined);
+  assert.equal(sessionPullRequest(null), undefined);
 });
 
 test('token providers mint from the workspace identity and open pull requests with the owner account', async t => {
@@ -839,6 +870,35 @@ test('a clone session pushes its own branch through the egress relay with the pu
   // Pinned sessions push only with git_push.
   f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = 'session'").run();
   assert.equal(await code(await relay('receive-refs')), 'session_branch_unavailable');
+});
+
+test('a clone session with a branch named for its work pushes that branch, not pistead/<session-id>', async t => {
+  const f = await fixture(t);
+  f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
+    + " DROP TRIGGER sessions_branch_immutable;"
+    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone', branch = 'pistead/fix-login-e00000000000' WHERE id = 'session'; COMMIT;");
+  const report = pkt(`\x01${pkt('unpack ok\n')}${pkt('ok refs/heads/pistead/fix-login-e00000000000\n')}0000`) + '0000';
+  const forge: string[] = [];
+  const mocked = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (!url.startsWith('https://github.com/owner/repo.git/')) return mocked(input, init);
+    forge.push(init.body ? Buffer.from(await new Response(init.body as BodyInit).arrayBuffer()).toString('latin1') : '');
+    return new Response(report, { headers: { 'Content-Type': 'application/x-git-receive-pack-result' } });
+  };
+  t.after(() => { globalThis.fetch = mocked; });
+  const relay = (body: string) => app.request('/api/internal/git/relay/binding-gh/receive-pack?sessionId=session', { method: 'POST',
+    headers: { Authorization: `Bearer ${internalSecret}`, 'Content-Type': 'application/x-git-receive-pack-request' }, body }, f.env);
+  const command = (ref: string) => pkt(`${'0'.repeat(40)} ${tip} ${ref}\0report-status side-band-64k agent=git/2.43.0\n`) + '0000';
+
+  const refused = await relay(command('refs/heads/pistead/session'));
+  assert.equal(refused.status, 403);
+  assert.equal(await code(refused), 'session_branch_only');
+  const pushed = await relay(command('refs/heads/pistead/fix-login-e00000000000') + 'PACK-DATA');
+  assert.equal(pushed.status, 200);
+  assert.deepEqual(forge, [command('refs/heads/pistead/fix-login-e00000000000') + 'PACK-DATA']);
+  const audit = f.audits('git.push.session_branch') as { detail_json: string }[];
+  assert.equal(JSON.parse(audit.at(-1)!.detail_json).branch, 'pistead/fix-login-e00000000000');
 });
 
 test('a session that pinned its repositories is read-only: it gets no push credential', async t => {

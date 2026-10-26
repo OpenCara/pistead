@@ -10,7 +10,7 @@ import { EgressProxy, egressEnvironment, parseEgressGrant, publicAddress, reposi
 import { performClonePush, PushError, pushSummary } from "../apps/runner/src/push.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
 import type { EgressGrant } from "../packages/shared/src/network.js";
-import { parsePushCommands, pushRejection, readPushCommands, sessionBranchRefusal } from "../packages/shared/src/git-push.js";
+import { parsePushCommands, pushRejection, readPushCommands, sessionBranch, sessionBranchName, sessionBranchRefusal, validSessionBranch } from "../packages/shared/src/git-push.js";
 import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
@@ -68,6 +68,25 @@ function tunnel(socketPath: string, target: string): Promise<{ status: number; s
     request.end();
   });
 }
+
+test("session branches are named for the session's work, with a short id", () => {
+  const id = "1A2B3C4D-5e6f-4000-8000-000000000000";
+  assert.equal(sessionBranchName("Add dark mode toggle to settings", id), "pistead/add-dark-mode-toggle-to-settings-1a2b3c4d5e6f");
+  assert.equal(sessionBranchName("  Fix: crash on `pistead connect` (#42)!  ", id), "pistead/fix-crash-on-pistead-connect-42-1a2b3c4d5e6f");
+  assert.equal(sessionBranchName("Résumé café naïve", id), "pistead/resume-cafe-naive-1a2b3c4d5e6f");
+  // Nothing to slug, or the default title: a generic name, still unique.
+  for (const title of ["", "修复登录", "!!!", "Untitled session"]) assert.equal(sessionBranchName(title, id), "pistead/session-1a2b3c4d5e6f");
+  // Long titles are cut at a word boundary.
+  const long = sessionBranchName("Refactor the egress proxy so that pushes of the session branch stream without buffering", id);
+  assert.equal(long, "pistead/refactor-the-egress-proxy-so-that-pushes-of-the-1a2b3c4d5e6f");
+  assert.equal(sessionBranchName("x".repeat(100), id), `pistead/${"x".repeat(48)}-1a2b3c4d5e6f`);
+  for (const title of ["Add dark mode", "", "x".repeat(100), long, "a -- b"]) assert.ok(validSessionBranch(sessionBranchName(title, id), id), title);
+  assert.ok(!validSessionBranch("pistead/add-dark-mode-1a2b3c4d5e6f", "ffffffff-0000-4000-8000-000000000000"));
+  // Sessions without a named branch keep pistead/<session-id>.
+  assert.equal(sessionBranch({ id: "s1" }), "pistead/s1");
+  assert.equal(sessionBranch({ id: "s1", branch: null }), "pistead/s1");
+  assert.equal(sessionBranch({ id: "s1", branch: "pistead/add-dark-mode-1a2b3c4d5e6f" }), "pistead/add-dark-mode-1a2b3c4d5e6f");
+});
 
 test("public addresses exclude the host, its networks and metadata services", () => {
   for (const address of ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "8.8.8.8"]) assert.equal(publicAddress(address), true, address);
@@ -631,6 +650,62 @@ test("a backup keeps a clone's local work as a bundle, and a restore clones it a
   await target.cloneRestore("libs/app", url, null, authorize);
   assert.deepEqual(await target.clonePending(authorize), []);
   await assert.rejects(lstat(join(directory, "target", "worktree", "libs", "app", ".git", "pistead-restored")), { code: "ENOENT" });
+});
+
+test("a backup keeps local changes to LFS-tracked files as their content, not as pointers to objects it doesn't carry", { skip: !sandboxed }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "egress-lfs-backup-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = join(directory, "projects");
+  await mkdir(join(projects, "acme"), { recursive: true });
+  const work = join(directory, "upstream");
+  const environment = { ...process.env, GIT_AUTHOR_NAME: "U", GIT_AUTHOR_EMAIL: "u@example.test", GIT_COMMITTER_NAME: "U", GIT_COMMITTER_EMAIL: "u@example.test" };
+  const git = (args: string[], cwd: string) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: environment });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  await mkdir(work);
+  git(["init", "-q", "-b", "main"], work);
+  await writeFile(join(work, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+  await writeFile(join(work, "model.bin"), "upstream\n");
+  git(["add", ".gitattributes", "model.bin"], work);
+  git(["commit", "-q", "-m", "initial"], work);
+  git(["clone", "-q", "--bare", work, join(projects, "acme", "app.git")], directory);
+  const server = await startGitHttpServer(projects);
+  t.after(() => server.close());
+  const { instance } = await proxy(t, {
+    relay: async request => fetch(request.service === "info-refs"
+      ? `${server.url("acme/app.git")}/info/refs?service=git-upload-pack` : `${server.url("acme/app.git")}/git-upload-pack`, {
+      method: request.body ? "POST" : "GET", body: request.body as BodyInit | undefined,
+      headers: { ...(request.contentType ? { "content-type": request.contentType } : {}), ...(request.gitProtocol ? { "git-protocol": request.gitProtocol } : {}) },
+    }),
+  });
+  const authorize = async () => {};
+  const shell = (sandbox: Sandbox, command: string) => sandbox.execute({ kind: "bash", command }, false, authorize, { allowTestShell: true });
+  const source = new Sandbox(binding("lfs-backup-source"), join(directory, "source"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => source.close());
+  await source.initialize();
+  // A clean filter standing in for git-lfs's: it turns content into a pointer, keeping the content elsewhere in .git, as
+  // git-lfs keeps it in .git/lfs/objects, which backups don't carry.
+  await shell(source, "git clone -q https://github.com/acme/app.git app && cd app"
+    + " && git config filter.lfs.clean \"sh -c 'cat >/dev/null; echo pointer'\" && git config filter.lfs.required true"
+    + " && echo local > model.bin");
+  const { clones } = await source.cloneBackup(authorize);
+  assert.equal(clones.length, 1);
+  assert.notEqual(clones[0]!.bundle, null);
+
+  const target = new Sandbox(binding("lfs-backup-target"), join(directory, "target"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => target.close());
+  await target.initialize();
+  const state = join(directory, "target", "git", "pistead-clones");
+  await mkdir(state, { recursive: true, mode: 0o700 });
+  await writeFile(join(state, "0.bundle"), Buffer.from(clones[0]!.bundle!, "base64"));
+  await writeFile(join(state, "manifest.json"), JSON.stringify({ version: 1, clones: [{ ...clones[0]!, bundle: "0.bundle" }] }));
+  await target.cloneRestore("app", "https://github.com/acme/app.git", null, authorize);
+  // The local change comes back as it was, not as a pointer whose object nothing holds.
+  assert.equal(await target.readFile("app/model.bin", authorize), "local\n");
+  assert.match(await shell(target, "cd app && git status --porcelain"), /^ M model\.bin\n$/);
 });
 
 test("https://user@host remotes are the same repository, and a refused grant ends access at once", async t => {

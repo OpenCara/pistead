@@ -1,7 +1,7 @@
 import type { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { bindingRemote, gitProviderNames } from '../../../packages/shared/src/repositories.js';
-import { defaultNetworkPolicy, egressGitServices, egressPushService, packageRegistryDomains, parseNetworkPolicy,
+import { defaultNetworkPolicy, egressGitServices, egressLfsService, egressPushService, packageRegistryDomains, parseNetworkPolicy,
   type EgressGitService, type EgressGrant, type NetworkPolicy } from '../../../packages/shared/src/network.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
 import type { AppContext, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
@@ -9,7 +9,8 @@ import type { Database } from './db/types.js';
 import { auditStatement, requireMember, sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, now } from './http.js';
 import { authenticateConnector, requireCallbackScope, requireConnectorSession, type ConnectorRow } from './connectors.js';
-import { recheckAccess, repositoryAccess, verifyRepository } from './repositories.js';
+import { recheckAccess, repositoryAccess, repositorySettingsSelect, verifyRepository, type RepositorySettingsRow } from './repositories.js';
+import { lfsRelay, lfsRequestBytes } from './lfs.js';
 import { ownerGitAuthorization } from './push/targets.js';
 import { sessionBranchPush } from './push/session-branch.js';
 
@@ -69,12 +70,12 @@ export async function egressGrant(c: AppContext, connectorId: string | null): Pr
   if (!row) fail(404, 'not_found', 'Session not found.');
   await requireCallbackScope(c, row, connectorId);
   if (row.status === 'archived') fail(403, 'session_archived', 'Archived sessions have no network access.');
-  const repositories = await c.env.DB.query<RepositoryRow>('SELECT * FROM workspace_repositories WHERE workspace_id = ? ORDER BY id')
+  const repositories = await c.env.DB.query<RepositorySettingsRow>(`${repositorySettingsSelect} WHERE r.workspace_id = ? ORDER BY r.id`)
     .bind(row.workspace_id).all();
   const grant: EgressGrant = {
     policy: await workspaceNetworkPolicy(c.env.DB, row.workspace_id),
     repositories: repositories.map(repository => ({ bindingId: repository.id, provider: repository.provider, host: repository.host,
-      repositoryId: repository.repository_id, fullName: repository.full_name })),
+      repositoryId: repository.repository_id, fullName: repository.full_name, lfs: repository.lfs_enabled === 1 })),
   };
   return c.json(grant, 200, { 'Cache-Control': 'private, no-store' });
 }
@@ -132,6 +133,10 @@ export async function gitRelay(c: AppContext, connector: ConnectorRow | null): P
   if (!binding) fail(404, 'repository_not_bound', 'This repository is not bound to the session\'s workspace.');
   const access = await repositoryAccess(c.env, original.owner_id, binding.provider, binding.host, binding.full_name);
   if (egressPushService(service)) return sessionBranchPush(c, { session: original, binding, access, service, authorize });
+  if (egressLfsService(service)) {
+    if (c.req.header('content-type')?.split(';')[0]?.trim().toLowerCase() !== 'application/json') fail(415, 'unsupported_media_type', 'Expected a Git LFS relay request.');
+    return lfsRelay(c, { binding, access, service, body: await boundedRequest(c, lfsRequestBytes), authorize });
+  }
   // Renames and transfers fail closed, on every request: nothing makes a sandboxed client fetch only after an advertisement.
   await verifyRepository(access, { repositoryId: binding.repository_id, fullName: binding.full_name });
   const remote = bindingRemote({ provider: binding.provider, host: binding.host, fullName: binding.full_name });

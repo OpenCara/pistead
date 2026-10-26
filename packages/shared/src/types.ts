@@ -114,6 +114,11 @@ export interface SessionRecord {
    */
   repositoryMode?: "clone";
   /**
+   * A clone session's own branch, named for its work when it was created (`pistead/<title-slug>-<short id>`; see
+   * sessionBranchName). Absent: `pistead/<session-id>`, for sessions from before named branches or on older connectors.
+   */
+  branch?: string;
+  /**
    * The session pinned its repositories when it started, as sessions did before they cloned them: it stays readable,
    * but runs nothing (no messages, approvals, backups, restores or moves).
    */
@@ -126,6 +131,16 @@ export interface SessionRecord {
   hostUnsandboxed?: boolean;
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
   activity?: SessionActivity;
+  /**
+   * The pull request its newest git_push with a pull request opened, or found already open; absent until one does.
+   * Display state, like activity: what the push recorded, not the pull request's live state.
+   */
+  pullRequest?: SessionPullRequest;
+}
+export interface SessionPullRequest {
+  url: string;
+  /** Parsed from the URL's last path segment; absent when it has none. */
+  number?: number;
 }
 export interface SessionGrant {
   userId: string;
