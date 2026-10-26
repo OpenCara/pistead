@@ -2,6 +2,7 @@ import { egressGrant, gitRelay } from './network.js';
 import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
+import { gpuKinds, type GpuKind } from '../../../packages/shared/src/host-config.js';
 import { sessionActivities, thinkingLevels, type SessionActivity, type ThinkingLevel } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
@@ -15,6 +16,7 @@ import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
 import { legacyRepositoryFixture, requireConfiguredWorkspace } from './repositories.js';
 import { connectorAdmins, connectorHostGrants, managedConnector, requireManagedWorkspace, viewerHostCommands } from './host-access.js';
+import { connectorHostConfig } from './host-config.js';
 import { disabledModelKeys, hostModelSettings } from './host-models.js';
 
 export interface ConnectorRow {
@@ -51,7 +53,7 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
   const value = input.capabilities;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_manifest', 'Capabilities are required.');
   const cap = value as Record<string, unknown>;
-  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'chatImages', 'gitProviders', 'gitPush', 'gitCredentials', 'github', 'githubIssues', 'repositoryCache', 'hostMigration', 'plainGit', 'cloneBackups', 'sessionBranches', 'conversationBackups']);
+  onlyFields(cap, ['platform', 'sandbox', 'productionShell', 'unsandboxed', 'chatOptions', 'chatImages', 'gitProviders', 'gitPush', 'gitCredentials', 'github', 'githubIssues', 'repositoryCache', 'hostMigration', 'plainGit', 'cloneBackups', 'sessionBranches', 'conversationBackups', 'hostConfig', 'gpu']);
   const platform = text(cap.platform, 'platform', 40);
   if (!/^[a-zA-Z0-9._-]+$/.test(platform) || typeof cap.sandbox !== 'boolean' || typeof cap.productionShell !== 'boolean' || (cap.productionShell && !cap.sandbox)
     || (cap.unsandboxed !== undefined && typeof cap.unsandboxed !== 'boolean') || (cap.unsandboxed && cap.sandbox)
@@ -66,12 +68,16 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
     || (cap.plainGit !== undefined && typeof cap.plainGit !== 'boolean')
     || (cap.cloneBackups !== undefined && typeof cap.cloneBackups !== 'boolean') || (cap.cloneBackups && (!cap.plainGit || cap.unsandboxed))
     || (cap.sessionBranches !== undefined && typeof cap.sessionBranches !== 'boolean') || (cap.sessionBranches && !cap.plainGit)
-    || (cap.conversationBackups !== undefined && typeof cap.conversationBackups !== 'boolean')) fail(400, 'invalid_manifest', 'Invalid capabilities.');
+    || (cap.conversationBackups !== undefined && typeof cap.conversationBackups !== 'boolean')
+    || (cap.hostConfig !== undefined && typeof cap.hostConfig !== 'boolean')
+    // Unsandboxed commands already run on the host itself; a GPU is lent only to sandboxed ones.
+    || (cap.gpu !== undefined && (!gpuKinds.includes(cap.gpu as GpuKind) || cap.unsandboxed))) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
     ...(cap.chatImages ? { chatImages: true } : {}), ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
     ...(cap.github ? { github: true } : {}), ...(cap.githubIssues ? { githubIssues: true } : {}), ...(cap.repositoryCache ? { repositoryCache: true } : {}),
     ...(cap.hostMigration ? { hostMigration: true } : {}), ...(cap.plainGit ? { plainGit: true } : {}), ...(cap.cloneBackups ? { cloneBackups: true } : {}),
-    ...(cap.sessionBranches ? { sessionBranches: true } : {}), ...(cap.conversationBackups ? { conversationBackups: true } : {}) } };
+    ...(cap.sessionBranches ? { sessionBranches: true } : {}), ...(cap.conversationBackups ? { conversationBackups: true } : {}),
+    ...(cap.hostConfig ? { hostConfig: true } : {}), ...(cap.gpu ? { gpu: cap.gpu as GpuKind } : {}) } };
 }
 
 function requireConnectorTLS(env: Env, url: URL): void {
@@ -188,6 +194,14 @@ type ConnectorInfoRow = ConnectorRow & { owner_name?: string; workspace_ids?: st
  * admins; `workspaceId` adds the viewer's own host command authority there. Everyone is shown only the models it offers.
  */
 type InfoViewer = { userId: string; role?: 'owner' | 'admin'; workspaceId?: string };
+
+/**
+ * Whether a host's connector runs a session directly on the host when its binding asks (SessionRecord.hostEnvironment):
+ * one that takes its configuration from Pistead, on a sandboxed host. An unsandboxed host runs every session that way.
+ */
+export function hostSessionsSupported(capabilities: ConnectorCapabilities): boolean {
+  return capabilities.hostConfig === true && capabilities.unsandboxed !== true;
+}
 async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewer): Promise<ConnectorInfo> {
   const ownerName = row.owner_name ?? (await env.DB.query<{ display_name: string }>('SELECT display_name FROM users WHERE id = ?')
     .bind(row.owner_id).first())?.display_name ?? '';
@@ -205,10 +219,13 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
       online = await env.CONNECTOR_HUB.status(row.id, 2000);
     } catch { /* Offline is safe metadata; do not expose transport errors. */ }
   }
-  const [admins, grants, disabled, hostCommandAccess, memberships] = await Promise.all([
+  // The host's owner learns, in every listing, whether their sessions may run directly on it.
+  const owner = viewer?.userId === row.owner_id;
+  const [admins, grants, disabled, config, hostCommandAccess, memberships] = await Promise.all([
     viewer?.role ? connectorAdmins(env, row.id) : undefined,
     viewer?.role ? connectorHostGrants(env, row.id) : undefined,
     disabledModelKeys(env, row.id),
+    viewer?.role || owner ? connectorHostConfig(env, row.id) : undefined,
     viewer?.workspaceId ? viewerHostCommands(env, row, viewer.workspaceId, viewer.userId) : undefined,
     // An admin sees the owner's workspaces only where they are a member too.
     viewer?.role === 'admin' ? env.DB.query<{ workspace_id: string }>('SELECT workspace_id FROM workspace_members WHERE user_id = ?')
@@ -217,10 +234,13 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
   const visible = (workspaceId: string) => !memberships || memberships.has(workspaceId);
   const hostGrants = grants?.filter(grant => visible(grant.workspaceId));
   const { models, disabledModels } = hostModelSettings(JSON.parse(row.models_json), disabled);
+  const capabilities = JSON.parse(row.capabilities_json) as ConnectorCapabilities;
+  const hostSessions = owner && !row.revoked_at && config?.hostSessions === true && hostSessionsSupported(capabilities);
   return { id: row.id, ownerId: row.owner_id, ownerName, name: row.name,
     createdAt: row.created_at, revokedAt: row.revoked_at, online, models,
-    workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities: JSON.parse(row.capabilities_json),
-    ...(viewer?.role ? { role: viewer.role, admins, hostGrants, disabledModels } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}) };
+    workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities,
+    ...(viewer?.role ? { role: viewer.role, admins, hostGrants, disabledModels, config } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}),
+    ...(hostSessions ? { hostSessions: true as const } : {}) };
 }
 
 async function connectorInfos(env: Env, rows: ConnectorInfoRow[], viewer?: (row: ConnectorInfoRow) => InfoViewer): Promise<ConnectorInfo[]> {
@@ -356,6 +376,9 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/git/push/complete', async c => pushComplete(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/network', async c => egressGrant(c, (await authenticateConnector(c)).id));
+  // How the host runs its sessions, as its owner and admins set it; the connector asks when it connects, then at most
+  // every 30 seconds (HostConfigSource), so a change reaches running sessions within a minute.
+  app.post('/api/connectors/self/config', async c => c.json({ config: await connectorHostConfig(c.env, (await authenticateConnector(c)).id) }));
   app.post('/api/connectors/self/git/relay/:bindingId/:service', async c => gitRelay(c, await authenticateConnector(c)));
 }
 

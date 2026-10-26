@@ -16,7 +16,6 @@ const pairingId = element<HTMLInputElement>("pairing-id");
 const pairingCode = element<HTMLInputElement>("pairing-code");
 const replace = element<HTMLInputElement>("replace");
 const pair = element<HTMLButtonElement>("pair");
-const gitCredentials = element<HTMLInputElement>("git-credentials");
 const openAtLogin = element<HTMLInputElement>("open-at-login");
 let busy = false;
 let current: HostView | undefined;
@@ -60,7 +59,6 @@ function render(view: HostView): void {
   // A saved pairing that can't be read (another server's, a damaged file) can still be replaced with a new code.
   element("replace-row").hidden = !paired && !inspection?.pairingError;
   setText(element("pair-server"), `Pairs with ${view.server}`);
-  gitCredentials.checked = view.gitCredentials;
   element("login-row").hidden = view.openAtLogin === undefined;
   openAtLogin.checked = view.openAtLogin === true;
 
@@ -118,7 +116,6 @@ form.addEventListener("submit", event => {
     if (started) { pairingCode.value = ""; pairingId.value = ""; replace.checked = false; }
   });
 });
-gitCredentials.addEventListener("change", () => { void act(() => bridge.setGitCredentials(gitCredentials.checked)); });
 openAtLogin.addEventListener("change", () => { void act(() => bridge.setOpenAtLogin(openAtLogin.checked)); });
 
 bridge.onUpdate(view => { if (!busy) render(view); else current = view; });

@@ -342,11 +342,16 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
           'egress proxy can\'t use. Push with the git_push tool instead, or ask a workspace owner or admin to change the push identity in Settings → Workspaces.');
       }
       requireOwnHost(target, row.kind);
-      const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ? AND owner_id = ?')
+      const host = await env.DB.query<{ capabilities_json: string; git_credentials: number | null }>(`SELECT c.capabilities_json, cfg.git_credentials
+        FROM connectors c LEFT JOIN connector_configs cfg ON cfg.connector_id = c.id WHERE c.id = ? AND c.owner_id = ?`)
         .bind(target.connectorId, target.ownerId).first();
-      if ((JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).gitCredentials !== true) {
+      const capabilities = JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities;
+      // A connector configured in Pistead offers them once its owner turned them on there; an older one, once started with
+      // --git-credentials.
+      const offered = capabilities.hostConfig ? Number(host?.git_credentials ?? 0) === 1 : capabilities.gitCredentials === true;
+      if (!offered) {
         fail(409, 'host_git_credentials_disabled', `Pushes to ${gitProviderNames[target.provider]} (${target.host}) use the host's Git credentials, which this host doesn't offer. ` +
-          'Restart its connector with --git-credentials (npx pistead@latest connect --git-credentials) to let your sessions on it push with them.');
+          'Its owner can turn them on in Pistead (Settings → Hosts → the host → Configuration), with a current connector (npx pistead@latest connect).');
       }
       return { kind: row.kind, identityId: row.id, authorization: null, expiresAt: expiresAt(undefined, 3600) };
     }

@@ -67,6 +67,7 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     repositories: JSON.parse(row.repositories_json ?? '[]'),
     ...(row.repository_mode === 'clone' ? { repositoryMode: 'clone' as const } : {}),
     ...(row.repository_mode === 'clone' && row.branch ? { branch: row.branch } : {}),
+    ...(Number(row.host_environment ?? 0) === 1 ? { hostEnvironment: true as const } : {}),
     ...(frozenSession(row) ? { frozen: true as const } : {}),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}),

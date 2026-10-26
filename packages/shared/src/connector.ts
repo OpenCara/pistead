@@ -1,4 +1,5 @@
 import type { HostCommandLevel, RunnerBinding, RunnerTicket, ThinkingLevel } from "./types.js";
+import type { GpuKind, HostConfig } from "./host-config.js";
 
 export interface LocalModelSummary {
   provider: string;
@@ -27,7 +28,11 @@ export interface ConnectorCapabilities {
   gitProviders?: boolean;
   /** The connector pushes session commits with control-plane minted credentials (git_push). Absent on older connectors. */
   gitPush?: boolean;
-  /** The host's owner lets pushes in their own sessions use this host's Git credentials (connect --git-credentials). Absent means false. */
+  /**
+   * A connector that predates host configuration was started with --git-credentials: pushes in its owner's own sessions
+   * may use this host's Git credentials. Absent means false. Connectors with `hostConfig` never advertise it: their
+   * owner turns this on in Pistead (HostConfig.gitCredentials).
+   */
   gitCredentials?: boolean;
   /** The connector reads GitHub issues and pull requests and merges pull requests through the control plane (github_read, github_merge). Absent on older connectors. */
   github?: boolean;
@@ -35,7 +40,7 @@ export interface ConnectorCapabilities {
   githubIssues?: boolean;
   /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
-   * docs/design/repository-cache.md). Absent on older connectors and on hosts started with the cache turned off.
+   * docs/design/repository-cache.md). Absent on older connectors and on hosts whose cache is off, for this connection.
    */
   repositoryCache?: boolean;
   /**
@@ -82,6 +87,14 @@ export interface ConnectorCapabilities {
    * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
    */
   fileBrowser?: boolean;
+  /**
+   * The connector runs as its owner and admins configure it in Pistead (HostConfig: command time limit, GPU, Git
+   * credentials, repository cache), read from the control plane, rather than by connect options. Absent on older
+   * connectors, which keep their options.
+   */
+  hostConfig?: boolean;
+  /** The GPU device this host can lend its sandboxed commands (HostConfig.gpu). Absent when it has none, or runs unsandboxed. */
+  gpu?: GpuKind;
 }
 
 /** A member other than the owner who may manage the host's sharing: its workspace shares and host command grants. */
@@ -128,6 +141,13 @@ export interface ConnectorInfo {
   admins?: ConnectorAdmin[];
   /** Listed to its owner and admins. */
   hostGrants?: HostCommandGrant[];
+  /** How the host runs its sessions; listed to its owner and admins. */
+  config?: HostConfig;
+  /**
+   * Listed to its owner only: sessions they start on it may run directly on the host, without the sandbox (its
+   * configuration accepts them and its connector runs them; see SessionRecord.hostEnvironment).
+   */
+  hostSessions?: true;
   /**
    * Models it advertises that its owner or an admin disabled (see HostModelSettings): no session starts from one and no
    * message switches to one. Listed to its owner and admins, who can enable them again.

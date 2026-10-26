@@ -8,7 +8,7 @@ import { monospace, usePalette } from "../theme";
 import { Banner, Button, Card, Feedback, styles as ui } from "./ui";
 
 /**
- * A cache host preparing this session's repositories (connect --repo-cache): one bar per repository while it clones or
+ * A cache host preparing this session's repositories (its configuration keeps a repository cache): one bar per repository while it clones or
  * fetches, checks and checks out. If that failed, its reason, and for the owner a way to try again.
  */
 export function RepositoryPreparationCard({ sessionId, preparation, canRestart, onRestarted }: {

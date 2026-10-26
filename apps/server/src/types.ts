@@ -75,6 +75,8 @@ export interface SessionRow {
   repository_mode?: 'clone' | null;
   /** A clone session's own branch, named when it was created; NULL: pistead/<id>. Immutable. */
   branch?: string | null;
+  /** 1: the session runs directly on its host's own environment, without the sandbox (SessionRecord.hostEnvironment). Immutable. */
+  host_environment?: number | null;
   visibility?: 'private' | 'workspace';
   /** The status before archiving, restored on unarchive. */
   archived_status?: 'provisioning' | 'ready' | 'error' | null;

@@ -15,7 +15,8 @@ import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, use
 import { runnerJSON, runnerRequest } from './runner.js';
 import { connectorUtf8Bytes } from './connector-transport.js';
 import { parseOperation } from './operations.js';
-import { requireConnectorSession } from './connectors.js';
+import { hostSessionsSupported, requireConnectorSession } from './connectors.js';
+import { connectorHostConfig } from './host-config.js';
 import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
@@ -231,6 +232,23 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (session.connector_id && capabilities.plainGit !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
     }
+    // A session may run directly on its host, without the sandbox: only the host's owner starts one, only where the host's
+    // configuration accepts that, and only on a connector that runs it there. Anything else is refused, never quietly
+    // sandboxed, so the owner never believes a session is somewhere it isn't.
+    if (input.hostEnvironment !== undefined && typeof input.hostEnvironment !== 'boolean') fail(400, 'invalid_input', 'hostEnvironment must be true or false.');
+    const onHost = input.hostEnvironment === true;
+    if (onHost) {
+      if (!session.connector_id || session.connector_owner_id !== ownerId) {
+        fail(403, 'host_owner_required', 'Only a host\'s owner starts sessions that run directly on it.');
+      }
+      if (capabilities.unsandboxed === true) fail(400, 'host_unsandboxed', 'This host runs every session without the sandbox already.');
+      if (!hostSessionsSupported(capabilities)) {
+        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to run sessions directly on it.');
+      }
+      if (!(await connectorHostConfig(c.env, session.connector_id)).hostSessions) {
+        fail(409, 'host_sessions_off', 'This host doesn\'t accept sessions that run directly on it. Turn that on under Settings → Hosts → the host → Configuration.');
+      }
+    }
     // Every session starts empty, pinning nothing: its agent clones the workspace's repositories with plain Git, through
     // the host's egress proxy on a sandboxed host or with the host's own Git where its owner runs it unsandboxed. An
     // agent that can't run shell commands there can't clone, and works in an empty worktree (cloneUnavailable says why).
@@ -240,15 +258,16 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const agent = await chatAgentVersion(c.env, ownerId, model, capabilities);
     // Its own branch is named for its work, on a connector that pushes the name its binding carries.
     const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone',
-      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null };
+      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0 };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
     await requireSessionCreator(c.env, workspaceId, ownerId);
     if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
     // Admit the session only while its workspace's repositories, membership and host are as they were checked.
     const inserted = await c.env.DB.query(`INSERT INTO sessions
-      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?
+      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch,
+        host_environment)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE ${sessionCreatorSQL('?')}
       AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
       AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
@@ -271,18 +290,23 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
           AND (? = 0 OR json_type(host.capabilities_json, '$.gitPush') = 'true')
           AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
             WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
-      )) RETURNING id`)
+      ))
+      AND (? = 0 OR EXISTS (SELECT 1 FROM connector_configs accepted WHERE accepted.connector_id = ? AND accepted.host_sessions = 1))
+      RETURNING id`)
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
         row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null, row.branch ?? null,
+        row.host_environment ?? 0,
         workspaceId, ownerId, workspaceId, resolved.bindingIds,
         // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
         ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
         resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
         JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
         row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
-        testMode(c.env) ? 1 : 0, gitPush).first();
+        testMode(c.env) ? 1 : 0, gitPush,
+        // Its host still accepts sessions on its own environment as the write lands.
+        onHost ? 1 : 0, row.connector_id ?? null).first();
     if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
-    await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: agent.id }).run();
+    await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: agent.id, ...(onHost ? { hostEnvironment: true } : {}) }).run();
     try {
       const binding = await bindingForSession(c, row);
       const response = await runnerRequest(c, row, 'create', '', binding);
@@ -304,7 +328,9 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(access.row.connector_id).first()
       : null;
     const capabilities: unknown = host ? JSON.parse(host.capabilities_json) : null;
-    const hostUnsandboxed = typeof capabilities === 'object' && capabilities !== null && 'unsandboxed' in capabilities && capabilities.unsandboxed === true;
+    // A session that runs directly on its host is as unsandboxed as one on an unsandboxed host.
+    const hostUnsandboxed = (typeof capabilities === 'object' && capabilities !== null && 'unsandboxed' in capabilities && capabilities.unsandboxed === true)
+      || Number(access.row.host_environment ?? 0) === 1;
     // A clone session whose agent can't run shell commands on its host learns why it can't clone.
     const agent = access.row.repository_mode === 'clone' && access.row.connector_id && capabilities
       ? await c.env.DB.query<{ tools_json: string }>('SELECT tools_json FROM agent_versions WHERE id = ?').bind(access.row.agent_version_id).first() : null;
@@ -455,6 +481,10 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     // The host's owner decides host commands, as does a member they (or a host admin) granted host commands to.
     if (operation.kind === 'host.bash' && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
       fail(403, 'host_owner_required', 'Only the host owner, or a member granted host commands on this host, can decide host commands. Grant them approve access to this session first.');
+    }
+    // A session that runs directly on its host runs its commands there, as host commands: they are decided the same way.
+    if (operation.kind === 'bash' && Number(row.host_environment ?? 0) === 1 && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
+      fail(403, 'host_owner_required', 'This session runs directly on its host: only the host owner, or a member granted host commands on this host, decides its commands.');
     }
     // A permission request lets a tool call do more than the session allows, so only its owner decides it.
     if (operation.kind === 'permission') {

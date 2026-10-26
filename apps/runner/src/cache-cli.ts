@@ -6,8 +6,8 @@ import { RepositoryCache } from "./repo-cache.js";
 
 const HELP = `Usage: pistead cache <command> [options]
 
-The repository cache of a connector started with --repo-cache: one Git mirror per repository, which clone sessions
-borrow objects from.
+The repository cache of a connector whose host keeps one (Settings > Hosts > the host > Configuration in Pistead):
+one Git mirror per repository, which clone sessions borrow objects from.
 
 Commands:
   list                    Show each cached repository, its size, and how many sessions keep objects in it

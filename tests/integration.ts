@@ -63,6 +63,16 @@ class Client {
     } while (Date.now() < deadline);
     throw new Error(`Session ${sessionId} did not settle${text ? ` with ${text}` : ""}`);
   }
+  /** Waits for card `id` to settle: an approved command runs in the background, so deciding reports it executing. */
+  async settledCard(sessionId: string, id: string): Promise<ApprovalRecord> {
+    const deadline = Date.now() + 30_000;
+    do {
+      const card = (await this.view(sessionId)).approvals.find(approval => approval.id === id);
+      if (card && !["pending", "approved", "executing"].includes(card.status)) return card;
+      await delay(150);
+    } while (Date.now() < deadline);
+    throw new Error(`Card ${id} did not settle`);
+  }
   async submit(sessionId: string, content: string, mode = "submit", requestId: string = crypto.randomUUID()): Promise<SubmitResult> {
     return this.request("POST", `/api/sessions/${sessionId}/${mode}`, { content, requestId });
   }
@@ -396,7 +406,10 @@ await check("write access does not grant approval; approved git commits use owne
   const decided: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${approval.id}`, { decision: "approve", reviewHash: approval.reviewHash })).approval;
   assert.ok(["approved", "executing", "executed"].includes(decided.status));
   const query: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/operations`, { kind: "bash", command: "cd integration && git log -1 --format='%an <%ae>|%cn <%ce>'" })).approval;
-  const inspected: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${query.id}`, { decision: "approve", reviewHash: query.reviewHash })).approval;
+  const approved: ApprovalRecord = (await alice.request("POST", `/api/sessions/${aliceSession.id}/approvals/${query.id}`, { decision: "approve", reviewHash: query.reviewHash })).approval;
+  assert.ok(["executing", "executed"].includes(approved.status));
+  const inspected = await alice.settledCard(aliceSession.id, query.id);
+  assert.equal(inspected.status, "executed", inspected.result);
   assert.ok(inspected.result?.includes("Alice Integration <alice@example.invalid>"), "git commit author and committer must use owner identity");
 });
 

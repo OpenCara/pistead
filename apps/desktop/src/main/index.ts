@@ -142,10 +142,6 @@ function main(): void {
     return input.ok ? controller.start(input.value) : { ok: false, error: input.error };
   });
   handle(channels.hostStop, "host.html", host, () => controller.stop());
-  handle(channels.hostGitCredentials, "host.html", host, payload => {
-    const enabled = parseBoolean(payload);
-    if (enabled.ok) controller.setGitCredentials(enabled.value);
-  });
   handle(channels.hostOpenAtLogin, "host.html", host, payload => {
     const enabled = parseBoolean(payload);
     return enabled.ok ? controller.setOpenAtLogin(enabled.value) : refused;
