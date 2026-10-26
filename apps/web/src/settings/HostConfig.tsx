@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
-import { defaultHostConfig, type HostConfig, type RepositoryCacheMode } from "../../../../packages/shared/src/host-config";
+import { defaultHostConfig, ownerOnlyHostConfig, type HostConfig, type RepositoryCacheMode } from "../../../../packages/shared/src/host-config";
 import { api, segment } from "../api";
 import { Button, CardBody, Combobox, confirmDialog, Feedback, Row, Section, SegmentedControl, StatusBadge, useAction } from "../ui";
 
@@ -17,6 +17,8 @@ function duration(seconds: number): string {
   if (seconds % 60 === 0) return seconds === 60 ? "1 minute" : `${seconds / 60} minutes`;
   return `${seconds} seconds`;
 }
+
+const settings = Object.keys(defaultHostConfig) as (keyof HostConfig)[];
 
 const cacheLabels: Record<RepositoryCacheMode, string> = { off: "Off", host: "Shared", owner: "Per owner" };
 const cacheHints: Record<RepositoryCacheMode, string> = {
@@ -35,10 +37,18 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
   const owner = connector.role !== "admin";
   const saved = connector.config ?? defaultHostConfig;
   const [config, setConfig] = useState<HostConfig>(saved);
+  const shown = useRef<HostConfig>(saved);
   const action = useAction();
-  // Status refreshes every few seconds: only a change of what is saved resets what is being edited.
-  useEffect(() => { setConfig(saved); }, [saved.commandTimeoutSeconds, saved.gpu, saved.gitCredentials, saved.repositoryCache, saved.hostSessions]);
-  const changed = (Object.keys(defaultHostConfig) as (keyof HostConfig)[]).some(key => config[key] !== saved[key]);
+  // Status refreshes every few seconds: a setting saved meanwhile, by anyone, replaces only its own edit.
+  useEffect(() => {
+    const before = shown.current;
+    shown.current = saved;
+    const replaced = settings.filter(key => saved[key] !== before[key]);
+    if (replaced.length) setConfig(current => ({ ...current, ...Object.fromEntries(replaced.map(key => [key, saved[key]])) }));
+  }, [saved.commandTimeoutSeconds, saved.gpu, saved.gitCredentials, saved.repositoryCache, saved.hostSessions]);
+  // A save sends only these, so it never undoes a change someone else saved meanwhile; an admin's never names the owner's.
+  const changes = settings.filter(key => config[key] !== saved[key] && (owner || !ownerOnlyHostConfig.includes(key)));
+  const changed = changes.length > 0;
   const editable = !connector.revokedAt && !action.busy;
   const { unsandboxed, gpu } = connector.capabilities;
   const choices = [...new Set([...timeouts, saved.commandTimeoutSeconds])].sort((a, b) => a - b);
@@ -67,7 +77,7 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
         confirmLabel: "Lend GPU", destructive: true,
       })) return;
       await action.run(async () => {
-        await api(`/api/connectors/${segment(connector.id)}/config`, { method: "PUT", body: config });
+        await api(`/api/connectors/${segment(connector.id)}/config`, { method: "PATCH", body: Object.fromEntries(changes.map(key => [key, config[key]])) });
         refresh();
       }, "Configuration saved. Running sessions pick it up within a minute.");
     })();

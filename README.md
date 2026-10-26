@@ -246,7 +246,7 @@ How a host runs its sessions is set on its page, under **Configuration**, rather
 | **Repository cache** | Off, or a full mirror of each repository on the host for every session (**Shared**) or one per session owner (**Per owner**); see [Repository cache](#repository-cache-preview) | Owner |
 | **Sessions on the host** | The owner may start sessions that run directly on the host, without the sandbox; see [Sessions on the host](#sessions-on-the-host) | Owner |
 
-Running sessions pick up a change within a minute, and the agent finds the time limit and GPU in `identity` (`commands`); a repository cache change applies when the connector next connects. Turning on Git credentials, the cache or the GPU asks first, and every change is recorded in the audit log (`host.config.updated`).
+Running sessions pick up a change within a minute, and the agent finds the time limit and GPU in `identity` (`commands`); a repository cache change applies when the connector next connects. Saving changes only the settings you changed, so it never undoes one someone else saved meanwhile. Turning on Git credentials, the cache or the GPU asks first, and every change is recorded in the audit log (`host.config.updated`).
 
 - A command approved by hand no longer holds the approval until it ends: its card shows it running and settles with its outcome, as host commands do. Stopping the message, or the session closing, stops a running command.
 - Without provisioned resource limits (`--resources`), a command can use the whole machine for its time limit.

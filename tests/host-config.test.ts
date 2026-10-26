@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultHostConfig, parseHostConfig, readHostConfig } from "../packages/shared/src/host-config.js";
+import { defaultHostConfig, parseHostConfig, parseHostConfigChange, readHostConfig } from "../packages/shared/src/host-config.js";
 import { commandLimits, detectGpu, gpuMounts, HostConfigSource } from "../apps/runner/src/host-config.js";
 import { movedOptionsNotice } from "../apps/runner/src/connect-cli.js";
 
@@ -20,6 +20,17 @@ test("a host configuration is whole and within bounds, or refused", () => {
     { commandTimeoutSeconds: 60, gpu: false, gitCredentials: false, repositoryCache: "off" },
     { ...config, toString: "x" }]) {
     assert.throws(() => parseHostConfig(invalid), /host configuration|time limit|setting/, JSON.stringify(invalid));
+  }
+});
+
+test("a change of configuration names one or more valid settings, and only those", () => {
+  assert.deepEqual(parseHostConfigChange({ commandTimeoutSeconds: 120 }), { commandTimeoutSeconds: 120 });
+  assert.deepEqual(parseHostConfigChange({ gpu: true, repositoryCache: "host" }), { gpu: true, repositoryCache: "host" });
+  const whole = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true };
+  assert.deepEqual(parseHostConfigChange(whole), whole);
+  for (const invalid of [undefined, null, [], "config", {}, { commandTimeoutSeconds: 29 }, { commandTimeoutSeconds: "60" }, { gpu: 1 },
+    { repositoryCache: "shared" }, { hostSessions: "true" }, { gpu: true, extra: true }, { toString: "x" }, JSON.parse('{"__proto__": {"gpu": true}}')]) {
+    assert.throws(() => parseHostConfigChange(invalid), /host configuration|time limit|setting/, JSON.stringify(invalid));
   }
 });
 

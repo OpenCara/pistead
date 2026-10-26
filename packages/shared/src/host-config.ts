@@ -51,7 +51,7 @@ export const defaultHostConfig: Readonly<HostConfig> = Object.freeze({
  */
 export const ownerOnlyHostConfig: readonly (keyof HostConfig)[] = Object.freeze(["gitCredentials", "repositoryCache", "hostSessions"]);
 
-/** A whole configuration, as the web app sends it and the control plane reports it; anything else is refused. */
+/** A whole configuration, as the control plane reports it; anything else is refused. */
 export function parseHostConfig(value: unknown): HostConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid host configuration");
   const input = value as Record<string, unknown>;
@@ -70,6 +70,20 @@ export function parseHostConfig(value: unknown): HostConfig {
   if (typeof input.hostSessions !== "boolean") throw new Error("Invalid host sessions setting");
   return { commandTimeoutSeconds: timeout, gpu: input.gpu, gitCredentials: input.gitCredentials, repositoryCache: input.repositoryCache as RepositoryCacheMode,
     hostSessions: input.hostSessions };
+}
+
+/**
+ * A change of configuration, as the host's page sends it (`PATCH /api/connectors/:id/config`): one or more settings, each
+ * valid, and nothing else. The settings it leaves out keep their values, so a form sends only what its user changed and
+ * never undoes someone else's change of another setting.
+ */
+export function parseHostConfigChange(value: unknown): Partial<HostConfig> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid host configuration");
+  const keys = Object.keys(value);
+  if (!keys.length || keys.some(key => !Object.hasOwn(defaultHostConfig, key))) throw new Error("Invalid host configuration");
+  // Each named setting is checked as in a whole configuration; the defaults fill in the rest, and are valid.
+  const whole = parseHostConfig({ ...defaultHostConfig, ...value });
+  return Object.fromEntries(keys.map(key => [key, whole[key as keyof HostConfig]])) as Partial<HostConfig>;
 }
 
 /**
