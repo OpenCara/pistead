@@ -3,7 +3,8 @@ import { fileBrowserLimits, type FileEntry, type SessionFiles, type SessionRecor
 import { REDACTED } from "../../../packages/shared/src/redaction";
 import { segment } from "./api";
 import { Icon, type IconName } from "./icons";
-import { Alert, Button, EmptyState, ResourceState, Row, useResource } from "./ui";
+import { CodeView } from "./code-highlight";
+import { Alert, Button, EmptyState, ResourceState, Row, SegmentedControl, useResource } from "./ui";
 
 /** A worktree path one level down; the worktree's root is ".". */
 function childPath(directory: string, name: string): string {
@@ -115,12 +116,48 @@ function FilePreview({ session, path, onBack, onDirectory }: { session: SessionR
       {files?.type === "file" && <div className="stack">
         <p className="muted small">{formatBytes(files.size)}{files.text !== undefined && files.truncated ? ` · showing the first ${formatBytes(fileBrowserLimits.textBytes)}` : ""}</p>
         {files.redacted && <Alert title="Secret hidden">Something that looks like a secret is shown as <code>{REDACTED}</code>, as in the conversation.</Alert>}
-        {files.text !== undefined && (files.text ? <pre className="file-preview">{files.text}</pre> : <EmptyState title="Empty file" />)}
-        {files.image && <img className="file-image" alt={path} src={`data:${files.image.mimeType};base64,${files.image.data}`} />}
+        {files.text !== undefined && (!files.text ? <EmptyState title="Empty file" />
+          : isSvg(path) && !files.truncated ? <SvgPreview key={path} text={files.text} path={path} />
+          : <CodeView text={files.text} path={path} />)}
+        {files.image && <ImageView key={path} src={`data:${files.image.mimeType};base64,${files.image.data}`} path={path} />}
         {files.binary && <EmptyState title={files.truncated ? "Too large to preview" : "No preview"}>{files.truncated
           ? `Images up to ${formatBytes(fileBrowserLimits.imageBytes)} are shown.`
           : "This isn't a text file or an image."}</EmptyState>}
       </div>}
     </ResourceState>
+  </div>;
+}
+
+const isSvg = (path: string) => /\.svg$/i.test(path);
+
+/**
+ * An image at its natural size when it fits, else scaled to the panel; clicking switches between that and its actual
+ * size. Transparent pixels show over a checkerboard.
+ */
+function ImageView({ src, path }: { src: string; path: string }) {
+  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  const [actual, setActual] = useState(false);
+  const [failed, setFailed] = useState(false);
+  if (failed) return <EmptyState title="Can't show this image">The browser couldn't decode it.</EmptyState>;
+  return <figure className="file-image-view">
+    <button type="button" className={actual ? "file-image-frame actual" : "file-image-frame"} onClick={() => setActual(value => !value)}
+      title={actual ? "Fit to panel" : "Show actual size"} aria-label={actual ? "Fit image to panel" : "Show image at actual size"}>
+      <img className="file-image" alt={path} src={src} draggable={false}
+        onLoad={event => setSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })} onError={() => setFailed(true)} />
+    </button>
+    {size && <figcaption className="muted small">{size.width} × {size.height} px · {actual ? "actual size" : "fit to panel"}</figcaption>}
+  </figure>;
+}
+
+/**
+ * An SVG drawn as an image: in an <img> it runs no scripts and loads nothing else. Its source is a click away. A preview
+ * cut short is shown as source only, as a partial SVG doesn't draw.
+ */
+function SvgPreview({ text, path }: { text: string; path: string }) {
+  const [mode, setMode] = useState<"preview" | "source">("preview");
+  return <div className="stack">
+    <SegmentedControl<"preview" | "source"> size="xs" label="SVG view" value={mode} onChange={setMode}
+      options={[{ value: "preview", label: "Preview" }, { value: "source", label: "Source" }]} />
+    {mode === "preview" ? <ImageView src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`} path={path} /> : <CodeView text={text} path={path} />}
   </div>;
 }

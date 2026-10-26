@@ -182,8 +182,76 @@
   .file-crumb:disabled { cursor: default; font-weight: var(--weight-medium); }
   .file-list .row-title { font-family: var(--mono); font-size: var(--font-sm); }
   .file-name { overflow-wrap: anywhere; }
-  .file-preview { max-height: 70vh; margin: 0; overflow: auto; white-space: pre; tab-size: 4; }
-  .file-image { display: block; max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--background); }
+  /* Code: one scroll box holding the line numbers and the text, so they scroll together; the numbers stay put sideways. */
+  .code-view {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    max-height: 70vh;
+    overflow: auto;
+    border-radius: var(--radius-lg);
+    background: var(--code-background);
+    font-size: var(--font-sm);
+    line-height: 1.55;
+  }
+  .code-view > pre { margin: 0; padding: var(--space-3); overflow: visible; border-radius: 0; background: none; font-size: inherit; line-height: inherit; white-space: pre; overflow-wrap: normal; tab-size: 4; }
+  .code-gutter {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    padding-right: var(--space-2);
+    border-right: 1px solid var(--border);
+    background: var(--code-background);
+    color: var(--foreground-muted);
+    text-align: right;
+    user-select: none;
+  }
+  .code-text > code { font-size: inherit; }
+  /* Token colors, after GitHub's light and dark themes. */
+  .code-view {
+    --syntax-comment: #6e7781; --syntax-keyword: #cf222e; --syntax-string: #0a3069; --syntax-number: #0550ae;
+    --syntax-title: #8250df; --syntax-type: #953800; --syntax-attr: #0550ae; --syntax-tag: #116329; --syntax-meta: #57606a;
+    --syntax-addition: #116329; --syntax-addition-bg: #dafbe1; --syntax-deletion: #82071e; --syntax-deletion-bg: #ffebe9;
+  }
+  [data-theme="dark"] .code-view {
+    --syntax-comment: #8b949e; --syntax-keyword: #ff7b72; --syntax-string: #a5d6ff; --syntax-number: #79c0ff;
+    --syntax-title: #d2a8ff; --syntax-type: #ffa657; --syntax-attr: #79c0ff; --syntax-tag: #7ee787; --syntax-meta: #8b949e;
+    --syntax-addition: #aff5b4; --syntax-addition-bg: #033a16; --syntax-deletion: #ffdcd7; --syntax-deletion-bg: #67060c;
+  }
+  .code-text .hljs-comment, .code-text .hljs-quote { color: var(--syntax-comment); font-style: italic; }
+  .code-text .hljs-keyword, .code-text .hljs-selector-tag, .code-text .hljs-built_in, .code-text .hljs-doctag,
+  .code-text .hljs-template-tag, .code-text .hljs-template-variable { color: var(--syntax-keyword); }
+  .code-text .hljs-string, .code-text .hljs-regexp, .code-text .hljs-meta .hljs-string, .code-text .hljs-char.escape_ { color: var(--syntax-string); }
+  .code-text .hljs-number, .code-text .hljs-literal, .code-text .hljs-variable.constant_, .code-text .hljs-symbol, .code-text .hljs-bullet,
+  .code-text .hljs-link { color: var(--syntax-number); }
+  .code-text .hljs-title, .code-text .hljs-title.function_, .code-text .hljs-section { color: var(--syntax-title); }
+  .code-text .hljs-type, .code-text .hljs-title.class_, .code-text .hljs-title.class_.inherited__, .code-text .hljs-params,
+  .code-text .hljs-variable.language_ { color: var(--syntax-type); }
+  .code-text .hljs-attr, .code-text .hljs-attribute, .code-text .hljs-property, .code-text .hljs-selector-attr,
+  .code-text .hljs-selector-class, .code-text .hljs-selector-id, .code-text .hljs-selector-pseudo, .code-text .hljs-operator { color: var(--syntax-attr); }
+  .code-text .hljs-tag, .code-text .hljs-name, .code-text .hljs-selector-tag { color: var(--syntax-tag); }
+  .code-text .hljs-meta, .code-text .hljs-meta .hljs-keyword { color: var(--syntax-meta); }
+  .code-text .hljs-addition { color: var(--syntax-addition); background: var(--syntax-addition-bg); }
+  .code-text .hljs-deletion { color: var(--syntax-deletion); background: var(--syntax-deletion-bg); }
+  .code-text .hljs-emphasis { font-style: italic; }
+  .code-text .hljs-strong { font-weight: var(--weight-medium); }
+  /* Images: fit to the panel, or at actual size in a scroll box; a checkerboard shows transparency. */
+  .file-image-view { display: grid; gap: var(--space-2); margin: 0; }
+  .file-image-frame {
+    display: block;
+    max-height: 70vh;
+    padding: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background-color: var(--surface1);
+    background-image: conic-gradient(var(--surface3) 25%, transparent 0 50%, var(--surface3) 0 75%, transparent 0);
+    background-size: 16px 16px;
+    cursor: zoom-in;
+  }
+  .file-image-frame.actual { cursor: zoom-out; }
+  .file-image { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+  .file-image-frame:not(.actual) .file-image { max-height: calc(70vh - 2px); object-fit: contain; }
+  .file-image-frame.actual .file-image { max-width: none; margin: 0; }
 
   @media (min-width: 1100px) {
     .session-screen.panel-open { grid-template-columns: minmax(0, 1fr) 360px; }
