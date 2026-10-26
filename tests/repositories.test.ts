@@ -398,7 +398,7 @@ test('a GitHub-connected host\'s owner runs a session on it privately, cloning, 
   assert.equal(s.remote.calls.length, 0);
 });
 
-for (const change of ['association-removed', 'share-removed', 'revoked', 'model-unavailable'] as const) {
+for (const change of ['association-removed', 'share-removed', 'revoked', 'model-unavailable', 'model-disabled'] as const) {
   test(`session admission atomically rechecks connector ${change} in its insert`, async t => {
     const s = await connectedSetup(t);
     const actor = change === 'share-removed' ? s.owner : s.host;
@@ -410,6 +410,10 @@ for (const change of ['association-removed', 'share-removed', 'revoked', 'model-
       if (change === 'share-removed') s.f.sqlite.prepare('DELETE FROM connector_shares WHERE connector_id = ?').run(s.connector.connectorId);
       if (change === 'revoked') s.f.sqlite.prepare("UPDATE connectors SET revoked_at = '2026-01-02' WHERE id = ?").run(s.connector.connectorId);
       if (change === 'model-unavailable') s.f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run(s.model.id);
+      if (change === 'model-disabled') {
+        s.f.sqlite.prepare('INSERT INTO connector_disabled_models (connector_id, provider, model_id, disabled_by, disabled_at) VALUES (?,?,?,?,?)')
+          .run(s.connector.connectorId, s.model.provider, s.model.modelId, s.host.user.id, new Date().toISOString());
+      }
     });
     await denied(await actor.request('POST', '/api/sessions', s.input), 409, 'session_configuration_changed');
     assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);

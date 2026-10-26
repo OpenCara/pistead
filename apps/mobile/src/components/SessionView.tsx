@@ -1,5 +1,5 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
+  accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, modelUnavailable, mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
@@ -300,9 +300,10 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   async function submit() {
     if (!permitted || !content.trim() || submission.busy || confirming.current) return;
     const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit") ?? modelUnavailable(host, selection);
     // The owner's chat box can start on Auto-approve without asking, and it merges too: the first message that would asks
-    // first.
-    if (host && mustConfirmAutoApprove(options, autoApproveConfirmed)) {
+    // first, unless it can't be sent anyway.
+    if (!unavailable && host && mustConfirmAutoApprove(options, autoApproveConfirmed)) {
       confirming.current = true;
       const confirmed = await confirmAutoApprove(host, unsandboxed).finally(() => { confirming.current = false; });
       // Declined, the chat box asks before acting instead, and nothing is sent until the owner sends again.
@@ -316,7 +317,6 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: Crypto.randomUUID() };
     const requestId = request.current.id;
     stick.current = true;
-    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
     void submission.run(async () => {
       if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });

@@ -9,7 +9,7 @@ import { Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
 export {
-  accessUnavailable, chatOptionsBody, initialSelection, mustConfirmAutoApprove, preferredSelection, type ChatPreference, type ChatSelection,
+  accessUnavailable, chatOptionsBody, initialSelection, modelUnavailable, mustConfirmAutoApprove, preferredSelection, type ChatPreference, type ChatSelection,
 } from "../../../packages/client/src/chat-options";
 
 /** The model and reasoning last chatted with, in this browser; new chats start from them. */

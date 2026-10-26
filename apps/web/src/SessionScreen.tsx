@@ -7,7 +7,8 @@ import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
 import {
-  accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, mustConfirmAutoApprove, rememberChat, type ChatSelection,
+  accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, modelUnavailable, mustConfirmAutoApprove, rememberChat,
+  type ChatSelection,
 } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
@@ -361,9 +362,10 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     const pasted = attachments.images;
     if (!permitted || (!content.trim() && !pasted.length) || submission.busy || confirming.current) return;
     const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit") ?? modelUnavailable(host, selection);
     // The owner's chat box can start on Auto-approve without asking, and it merges too: the first message that would asks
-    // first.
-    if (host && mustConfirmAutoApprove(options, autoApproveConfirmed())) {
+    // first, unless it can't be sent anyway.
+    if (!unavailable && host && mustConfirmAutoApprove(options, autoApproveConfirmed())) {
       confirming.current = true;
       const confirmed = await confirmAutoApprove(host, unsandboxed).finally(() => { confirming.current = false; });
       // Declined, the chat box asks before acting instead, and nothing is sent until the owner sends again.
@@ -377,7 +379,6 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
     const pending = request.current;
     stick.current = true;
-    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
     void submission.run(async () => {
       if (unavailable) throw new Error(unavailable);
       // Encoded once per request, so a retry sends the same bytes under the same key.

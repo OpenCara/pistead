@@ -8,11 +8,11 @@ import { auditStatement, requireMember } from './db.js';
 import { fail, identifier, jsonObject, now, text, userIdentifier } from './http.js';
 
 /*
- * A host is its owner's machine. Its owner may let other members manage its sharing (admins), and let members of a
- * workspace it is shared with decide host commands, or run those of their own Auto-approve messages without asking
- * (host command grants). Admins manage shares and grants but hold no host command authority of their own until a grant
- * gives it to them, so each one is visible in the host's grant list. Only the owner adds admins, revokes or removes the
- * host.
+ * A host is its owner's machine. Its owner may let other members manage its sharing and which of its models it offers
+ * (admins, see host-models.ts for the models), and let members of a workspace it is shared with decide host commands, or
+ * run those of their own Auto-approve messages without asking (host command grants). Admins manage shares and grants but
+ * hold no host command authority of their own until a grant gives it to them, so each one is visible in the host's grant
+ * list. Only the owner adds admins, revokes or removes the host.
  */
 
 const maxAdmins = 20;
@@ -21,11 +21,17 @@ const sqlList = (values: readonly string[]) => values.map(value => `'${value}'`)
 
 export type ManagedConnector = ConnectorRow & { role: 'owner' | 'admin' };
 
+/**
+ * SQL true while a user owns connector `c` or is one of its admins, as managedConnectorFor reads it; binds the user's id
+ * twice. Writes that need that authority check it again in their own statement.
+ */
+export const managesConnectorSQL = `(c.owner_id = ? OR EXISTS (SELECT 1 FROM connector_admins a JOIN users u ON u.id = a.user_id
+  WHERE a.connector_id = c.id AND a.user_id = ? AND u.suspended_at IS NULL))`;
+
 /** The connector `id` names, when `userId` owns it or is one of its admins. */
 export async function managedConnectorFor(env: Env, connectorId: string, userId: string): Promise<ManagedConnector | null> {
   const row = await env.DB.query<ConnectorRow>(`SELECT c.* FROM connectors c WHERE c.id = ? AND c.removed_at IS NULL
-    AND (c.owner_id = ? OR EXISTS (SELECT 1 FROM connector_admins a JOIN users u ON u.id = a.user_id
-      WHERE a.connector_id = c.id AND a.user_id = ? AND u.suspended_at IS NULL))`).bind(connectorId, userId, userId).first();
+    AND ${managesConnectorSQL}`).bind(connectorId, userId, userId).first();
   return row ? { ...row, role: row.owner_id === userId ? 'owner' : 'admin' } : null;
 }
 

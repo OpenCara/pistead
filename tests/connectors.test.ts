@@ -9,7 +9,7 @@ import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transp
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
-import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing } from '../packages/shared/src/connector.js';
+import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostModelSettings } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
@@ -2598,6 +2598,120 @@ test('host owners add admins who manage sharing and host command grants, and gra
   assert.equal((await creator.request('DELETE', `${admins}/${creator.user.id}`)).status, 204);
   await denied(await creator.request('PUT', `/api/connectors/${id}/shares/${s.team.id}`), 404, 'not_found');
 });
+
+test('a host\'s owner and admins disable its models for everyone: a disabled model is neither listed, started from nor chosen', async t => {
+  const f = await fixture(t); const s = await sharedSession(f); const outsider = await f.client('outsider');
+  const host = s.host; const creator = s.creator; const id = s.connector.connectorId;
+  const settings = `/api/connectors/${id}/models`;
+  const keys = (models?: { provider: string; modelId: string }[]) => (models ?? []).map(model => `${model.provider}/${model.modelId}`);
+  const first = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  const second = { provider: 'local-native', modelId: 'local/model-v2' };
+  const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
+  const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
+  const message = (client: Client, requestId: string, options?: unknown, mode = 'submit') =>
+    client.request('POST', `/api/sessions/${s.session.id}/${mode}`, { content: 'Hi', requestId, ...(options === undefined ? {} : { options }) });
+  const modelAudits = () => f.sqlite.prepare(`SELECT action, detail_json FROM audit WHERE action LIKE 'connector.model.%' ORDER BY created_at, rowid`).all()
+    .map(row => [row.action, JSON.parse(String(row.detail_json)).modelId]);
+
+  // Only the owner and admins manage the host's models, from the app itself.
+  await denied(await f.request('PATCH', settings, { ...first, enabled: false }, { Cookie: host.cookie }), 403, 'invalid_csrf');
+  await denied(await creator.request('PATCH', settings, { ...first, enabled: false }), 404, 'not_found');
+  await denied(await outsider.request('PATCH', settings, { ...first, enabled: false }), 404, 'not_found');
+  await denied(await host.request('PATCH', settings, first), 400, 'invalid_model_setting');
+  await denied(await host.request('PATCH', settings, { ...first, enabled: 'no' }), 400, 'invalid_model_setting');
+  await denied(await host.request('PATCH', settings, { ...first, enabled: false, name: 'Renamed' }), 400, 'invalid_model_setting');
+  await denied(await host.request('PATCH', settings, { provider: first.provider, modelId: 'not-on-host', enabled: false }), 404, 'model_not_on_host');
+
+  // A host that can't switch models runs every message on the session's own model, so disabling it stops the session.
+  assert.deepEqual(keys((await json<HostModelSettings>(await host.request('PATCH', settings, { ...first, enabled: false }))).models), []);
+  await denied(await message(creator, 'own-model-disabled'), 409, 'model_disabled');
+  assert.equal(requests.length, 0);
+  await json(await host.request('PATCH', settings, { ...first, enabled: true }));
+  await json(await message(creator, 'own-model-enabled'), 202);
+
+  // A host that switches models per message, with a second model to switch to.
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }],
+    capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  const secondRow = f.sqlite.prepare('SELECT id FROM models WHERE workspace_id = ? AND connector_id = ? AND model_id = ?').get(s.team.id, id, second.modelId)!.id;
+  const disabledSecond = await json<HostModelSettings>(await host.request('PATCH', settings, { ...second, enabled: false }));
+  assert.deepEqual([keys(disabledSecond.models), keys(disabledSecond.disabledModels)], [keys([first]), keys([second])]);
+  // Disabling it again changes and audits nothing.
+  await json(await host.request('PATCH', settings, { ...second, enabled: false }));
+  assert.deepEqual(modelAudits(), [['connector.model.disabled', first.modelId], ['connector.model.enabled', first.modelId], ['connector.model.disabled', second.modelId]]);
+
+  // Nobody else is shown it; its owner and admins see it as disabled.
+  const { models } = await json<{ models: ModelDefinition[] }>(await creator.request('GET', `/api/workspaces/${s.team.id}/models`));
+  assert.deepEqual(models.map(model => model.id), [s.model.id]);
+  const shared = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors[0];
+  assert.deepEqual(keys(shared.models), keys([first]));
+  assert.equal(Object.hasOwn(shared, 'disabledModels'), false);
+  const managed = (await json<{ connectors: ConnectorInfo[] }>(await host.request('GET', '/api/connectors'))).connectors[0];
+  assert.deepEqual([keys(managed.models), keys(managed.disabledModels)], [keys([first]), keys([second])]);
+  // It is disabled on the host, for its owner's own use in every workspace too.
+  const own = await workspace(host);
+  assert.deepEqual(keys((await json<{ models: ModelDefinition[] }>(await host.request('GET', `/api/workspaces/${own.id}/models`))).models), keys([first]));
+
+  // No session starts from it, and no message switches to it or runs on a current model it can't see.
+  await denied(await creator.request('POST', '/api/sessions', { ...s.input, modelId: secondRow, trustedConnectorId: id }), 403, 'model_disabled');
+  const before = requests.length;
+  await denied(await message(creator, 'disabled-model', { model: second }), 403, 'model_disabled');
+  await denied(await message(creator, 'no-model'), 409, 'model_required');
+  await denied(await message(creator, 'access-only', { access: 'read' }), 409, 'model_required');
+  await denied(await message(creator, 'ask-no-model', undefined, 'ask'), 409, 'model_required');
+  assert.equal(requests.length, before, 'refused messages never reach the host');
+  await json(await message(creator, 'enabled-model', { model: first }), 202);
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { model: first });
+
+  // An admin enables it again; a session whose own model is disabled goes on with another one.
+  await json(await host.request('PUT', `/api/connectors/${id}/admins/${creator.user.id}`));
+  const enabled = await json<HostModelSettings>(await creator.request('PATCH', settings, { ...second, enabled: true }));
+  assert.deepEqual([keys(enabled.models), keys(enabled.disabledModels)], [keys([first, second]), []]);
+  await json(await creator.request('PATCH', settings, { ...second, enabled: true }));
+  await json(await creator.request('PATCH', settings, { ...first, enabled: false }));
+  assert.deepEqual(modelAudits().slice(3), [['connector.model.enabled', second.modelId], ['connector.model.disabled', first.modelId]]);
+  await json(await message(creator, 'switched-model', { model: second }), 202);
+  await denied(await message(creator, 'current-model'), 409, 'model_required');
+
+  // The setting outlasts the host's advertised list: a model it stops advertising is still disabled when it comes back.
+  await json(await self(f, s.connector, 'manifest', { models: [{ ...second, name: 'Second model' }], capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  const narrowed = (await json<{ connectors: ConnectorInfo[] }>(await host.request('GET', '/api/connectors'))).connectors[0];
+  assert.deepEqual([keys(narrowed.models), keys(narrowed.disabledModels)], [keys([second]), []]);
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }], capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  const restored = (await json<{ connectors: ConnectorInfo[] }>(await host.request('GET', '/api/connectors'))).connectors[0];
+  assert.deepEqual([keys(restored.models), keys(restored.disabledModels)], [keys([second]), keys([first])]);
+
+  // Only someone who could otherwise use a model learns that it is disabled.
+  assert.equal((await host.request('DELETE', `/api/connectors/${id}/shares/${s.team.id}`)).status, 204);
+  await denied(await creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id }), 404, 'not_found');
+
+  // A revoked host's models stay as they were; a removed host's settings go with it.
+  assert.equal((await host.request('DELETE', `/api/connectors/${id}`)).status, 204);
+  await denied(await host.request('PATCH', settings, { ...first, enabled: true }), 409, 'connector_revoked');
+  assert.equal((await host.request('DELETE', `/api/connectors/${id}/permanent`)).status, 204);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_disabled_models WHERE connector_id = ?').get(id)!.n, 0);
+});
+
+for (const enabled of [false, true]) {
+  test(`a host model setting checks again as it writes that its author still manages the host (enabled=${enabled})`, async t => {
+    const f = await fixture(t); const s = await sharedSession(f); const id = s.connector.connectorId;
+    const settings = `/api/connectors/${id}/models`;
+    const model = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+    await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.creator.user.id}`));
+    if (enabled) await json(await s.host.request('PATCH', settings, { ...model, enabled: false }));
+    // The owner removes the admin after the route found them managing the host, before its write runs.
+    let removed = false;
+    f.setBeforeQuery(sql => {
+      if (removed || !/^(INSERT INTO|DELETE FROM) connector_disabled_models\b/.test(sql)) return;
+      removed = true;
+      f.sqlite.prepare('DELETE FROM connector_admins WHERE connector_id = ? AND user_id = ?').run(id, s.creator.user.id);
+    });
+    await denied(await s.creator.request('PATCH', settings, { ...model, enabled }), 404, 'not_found');
+    f.setBeforeQuery();
+    assert.equal(removed, true, 'The admin must lose the host after the route read it and before its write');
+    assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_disabled_models WHERE connector_id = ?').get(id)!.n, enabled ? 1 : 0);
+    assert.equal(f.sqlite.prepare(`SELECT COUNT(*) AS n FROM audit WHERE actor_id = ? AND action LIKE 'connector.model.%'`).get(s.creator.user.id)!.n, 0);
+  });
+}
 
 test('the Files tab reads the session worktree through its host, for collaborators, with secrets hidden', async t => {
   const f = await fixture(t); const s = await sharedSession(f);
