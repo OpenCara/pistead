@@ -22,6 +22,7 @@ import { preparingRepositories } from "../../../packages/client/src/repository-p
 import { navigate } from "./router";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
+import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
 import {
   Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
@@ -97,7 +98,9 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
-      <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>
+      {entry.error.compaction
+        ? <Alert variant="error" title={COMPACTION_FAILED_TITLE}>{compactionFailureText(entry.error.compaction)}</Alert>
+        : <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>}
       {actor && <div className="entry-actor">by {actor}</div>}
     </div>;
   }
