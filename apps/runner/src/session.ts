@@ -8,6 +8,7 @@ import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxD
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
+import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
@@ -27,6 +28,7 @@ import type { RepositoryPreparationItem, RepositoryPreparationView } from "../..
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
+import { compactionFailure, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
@@ -54,7 +56,7 @@ type Run = {
   /** Its images were gone or unreadable on the host when it was to run, so it ended without reaching Pi (see endLostInputs). */
   inputsLost?: true;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
-  failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
+  failure?: { reason: "model_error" | "no_model" | "compaction_failed"; provider?: string; modelId?: string; compaction?: CompactionFailure };
   /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
   stopped?: { by: string; pending?: true };
   /** Pi parked its work after host crashes cut it off again and again, so it ended (see endParkedRuns). */
@@ -131,7 +133,7 @@ export type RunnerConfig = {
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
-  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them. */
+  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them, but for reasoning models' room (see hostCompaction). */
   compaction?: CompactionSettings;
   /** How the host's Pi identifies its requests to providers; pi-durable's default (attributed to pi) without it. */
   identity?: ClientIdentity;
@@ -661,10 +663,12 @@ export class RunnerSession {
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
     this.models = resolved.models;
     const models = this.models;
+    // Reasoning models keep more room for their compaction summary than Pi's default, unless the host's Pi says otherwise.
+    const compaction = hostCompaction(this.config.compaction, models.getModels());
     const storage = await this.openStorage();
     try {
       this.harness = await Harness.open(storage, { models, registry,
-        ...(this.config.compaction ? { settings: { compaction: this.config.compaction } } : {}),
+        ...(compaction ? { settings: { compaction } } : {}),
         ...(this.config.identity ? { identity: this.config.identity } : {}) }, context);
     }
     catch (error) { await storage.close(context); throw error; }
@@ -935,8 +939,9 @@ export class RunnerSession {
       const state = await this.metadata();
       const conversation = await harness.conversation(state.runs[key]!.conversationId as ConversationId, context);
       await conversation?.waitForIdle(context);
+      const compaction = settled.status === "unanswered" && settled.reason === "model_error" ? compactionFailure(settled.detail) : undefined;
       const failure: Run["failure"] = settled.status === "unanswered" && (settled.reason === "model_error" || settled.reason === "no_model")
-        ? { reason: settled.reason, ...(await conversation?.agent(context))?.model } : undefined;
+        ? { reason: compaction ? "compaction_failed" : settled.reason, ...(await conversation?.agent(context))?.model, ...(compaction ? { compaction } : {}) } : undefined;
       await this.exclusive(async () => {
         if (generation !== this.generation || this.closing) return;
         await this.mutate(meta => {
@@ -1987,11 +1992,14 @@ export class RunnerSession {
     return undefined;
   }
 
-  /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
+  /**
+   * A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, and which
+   * fixed compaction failure it was, never Pi's detail.
+   */
   private failureView(run: Run, branch: number): SessionView["entries"][number] {
-    const { provider, modelId } = run.failure!;
+    const { provider, modelId, compaction } = run.failure!;
     return { id: `${branch}:failure:${run.key}`, kind: "workspace.run-failure", role: "assistant", text: "", actorId: run.initiatedBy, conversationId: String(branch),
-      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}) } };
+      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}), ...(compaction ? { compaction } : {}) } };
   }
 
   async restart(): Promise<void> {

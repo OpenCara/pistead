@@ -1,5 +1,5 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
-import { splitToolCalls } from "@pistead/client";
+import { COMPACTION_FAILED_TITLE, compactionFailureText, splitToolCalls } from "@pistead/client";
 import { memo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { EntryView } from "../../../../packages/shared/src/types";
@@ -56,7 +56,9 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
   }
   if (entry.error) {
     return <View style={styles.entry}>
-      <Banner tone="danger" title="Model request failed">{modelFailure(entry.error)}</Banner>
+      {entry.error.compaction
+        ? <Banner tone="danger" title={COMPACTION_FAILED_TITLE}>{compactionFailureText(entry.error.compaction)}</Banner>
+        : <Banner tone="danger" title="Model request failed">{modelFailure(entry.error)}</Banner>}
       {actor && <Text style={meta}>by {actor}</Text>}
     </View>;
   }

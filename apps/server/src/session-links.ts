@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
-import type { EntryView, SessionView } from '../../../packages/shared/src/types.js';
+import { COMPACTION_FAILURES, type EntryView, type SessionView } from '../../../packages/shared/src/types.js';
 import type { SessionLink, SharedSession, SharedSessionView } from '../../../packages/shared/src/sharing.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { redactSecrets } from '../../../packages/shared/src/redaction.js';
@@ -77,6 +77,8 @@ function sharedEntry(entry: EntryView): EntryView {
       ...(error.provider !== undefined ? { provider: error.provider } : {}),
       ...(error.modelId !== undefined ? { modelId: error.modelId } : {}),
       ...(error.status !== undefined ? { status: error.status } : {}),
+      // Only a known fixed code: a newer or misbehaving runner can't put text here.
+      ...(error.compaction !== undefined && COMPACTION_FAILURES.includes(error.compaction) ? { compaction: error.compaction } : {}),
     } } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}) };
 }
