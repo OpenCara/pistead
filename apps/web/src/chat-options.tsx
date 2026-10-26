@@ -8,7 +8,7 @@ import { Icon, type IconName } from "./icons";
 import { Button, Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
-export { accessUnavailable, chatOptionsBody, initialSelection, preferredSelection, type ChatPreference, type ChatSelection } from "../../../packages/client/src/chat-options";
+export { accessUnavailable, chatOptionsBody, initialSelection, modelUnavailable, preferredSelection, type ChatPreference, type ChatSelection } from "../../../packages/client/src/chat-options";
 
 /** The model and reasoning last chatted with, in this browser; new chats start from them. */
 const LAST_CHAT_KEY = "pistead.lastChat";

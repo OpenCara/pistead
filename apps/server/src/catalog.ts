@@ -8,6 +8,7 @@ import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier }
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
 import { ConstraintError, type Query } from './db/types.js';
 import { ownerHostStatements } from './connectors.js';
+import { modelEnabledSQL } from './host-models.js';
 
 interface SafeMember {
   userId: string;
@@ -75,8 +76,9 @@ async function requireMemberManagement(
 }
 
 // Keep discovery and atomic version writes on the same live model authorization.
-// The two bindings are the test-mode flag (provider, then connector owner).
-function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id'): string {
+// The two bindings are the test-mode flag (provider, then connector owner). A model its host's owner or an admin
+// disabled is unavailable, unless `disabled` asks whether it would be available but for that.
+function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id', disabled: 'excluded' | 'included' = 'excluded'): string {
   return `m.available = 1 AND (? = 1 OR m.provider <> 'faux')
     AND (m.connector_id IS NULL OR EXISTS (
       SELECT 1 FROM connectors c
@@ -90,16 +92,20 @@ function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id
         AND EXISTS (SELECT 1 FROM json_each(c.models_json) local_model
           WHERE json_extract(local_model.value, '$.provider') = m.provider
             AND json_extract(local_model.value, '$.modelId') = m.model_id)
+        ${disabled === 'excluded' ? `AND ${modelEnabledSQL('c.id', 'm')}` : ''}
     ))`;
 }
 
 export async function requireModel(env: Env, modelId: string, actorId: string): Promise<ModelRow> {
-  const model = await env.DB.query<ModelRow>(`SELECT m.* FROM models m
+  const usable = (disabled: 'excluded' | 'included') => env.DB.query<ModelRow>(`SELECT m.* FROM models m
     INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
-    WHERE m.id = ? AND ${modelAccessSQL('member.user_id')}`)
+    WHERE m.id = ? AND ${modelAccessSQL('member.user_id', disabled)}`)
     .bind(actorId, modelId, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0).first();
-  if (!model) fail(404, 'not_found', 'Model not found.');
-  return model;
+  const model = await usable('excluded');
+  if (model) return model;
+  // Only someone who could otherwise use the model learns that its host disabled it.
+  if (await usable('included')) fail(403, 'model_disabled', 'This model is disabled on its host. Choose another model.');
+  fail(404, 'not_found', 'Model not found.');
 }
 
 function privateVersionStatement(

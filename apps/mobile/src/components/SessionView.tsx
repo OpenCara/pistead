@@ -1,4 +1,4 @@
-import { accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, preparingRepositories, segment, type ChatSelection } from "@pistead/client";
+import { accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, modelUnavailable, preparingRepositories, segment, type ChatSelection } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import { Stack } from "expo-router";
@@ -302,7 +302,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: Crypto.randomUUID() };
     const requestId = request.current.id;
     stick.current = true;
-    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit") ?? modelUnavailable(host, selection);
     void submission.run(async () => {
       if (unavailable) throw new Error(unavailable);
       const result = await api<SubmitResult>(`/api/sessions/${segment(id)}/${actualMode === "ask" ? "ask" : "submit"}`, { method: "POST", body: { content: sent, requestId, ...(options ? { options } : {}) } });
