@@ -110,6 +110,11 @@ export interface WorkspaceRepository {
   createdAt: string;
   /** Workspace admins may forbid agent pushes to the repository's default branch. */
   forbidDefaultBranchPush: boolean;
+  /**
+   * Workspace admins may let sandboxed sessions download the repository's Git LFS objects, with the session owner's
+   * account; off by default, when clones check out LFS pointer files. Uploads are never relayed.
+   */
+  lfs: boolean;
 }
 
 /** A workspace's repositories, as one member lists them. */

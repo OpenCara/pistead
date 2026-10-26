@@ -14,6 +14,7 @@ import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorPairing } from '../packages/shared/src/connector.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
+import type { LfsBatchResult } from '../packages/shared/src/network.js';
 import { repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type SessionRepository, type WorkspaceRepository, type WorkspaceRepositoryList } from '../packages/shared/src/repositories.js';
 import type { ModelDefinition, RunnerBinding, SessionRecord } from '../packages/shared/src/types.js';
 
@@ -157,6 +158,8 @@ function github(t: TestContext) {
     archive: async (): Promise<Response> => new Response(archiveBytes, { headers: { 'Content-Type': 'application/gzip' } }),
     // Git smart HTTP on github.com itself, which the egress relay reads with the session owner's credential.
     git: async (url: string, _init?: RequestInit): Promise<Response> => new Response(`unexpected ${url}`, { status: 500 }),
+    // Git LFS object storage on other origins, where the provider's download actions point.
+    media: async (url: string, _init?: RequestInit): Promise<Response> => new Response(`unexpected ${url}`, { status: 500 }),
   };
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -171,6 +174,7 @@ function github(t: TestContext) {
         url === `https://api.github.com/repos/${metadata.full_name}/tarball/${commitB}`) return state.redirect();
     if (url.startsWith(`https://codeload.github.com/${metadata.full_name}/legacy.tar.gz/`)) return state.archive();
     if (url.startsWith(`https://github.com/${metadata.full_name}.git/`)) return state.git(url, init);
+    if (url.startsWith('https://lfs-media.githubusercontent.com/') || url.startsWith('https://objects.githubusercontent.com/')) return state.media(url, init);
     unexpected.push(url);
     throw new Error('Unexpected outbound repository request');
   });
@@ -795,7 +799,7 @@ test('account input is validated before any provider request and rejected tokens
 test('token-provider bindings use each actor\'s own account, and sessions borrow none', async t => {
   const s = await providerSetup(t);
   assert.deepEqual({ ...s.repository, id: '', createdAt: '' }, { id: '', workspaceId: s.team.id, provider: 'gitea', host: giteaHost,
-    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '', forbidDefaultBranchPush: false });
+    repositoryId: '42', fullName: 'acme/tools', ref: 'main', private: true, createdAt: '', forbidDefaultBranchPush: false, lfs: false });
   assert.deepEqual((await json<{ repositories: WorkspaceRepository[] }>(await s.owner.request('GET', `/api/workspaces/${s.team.id}/repositories`))).repositories, [s.repository]);
   const session = await s.start();
   assert.deepEqual(session.repositories, []);
@@ -925,6 +929,135 @@ test('egress grants and the Git relay serve only the connector running the sessi
   f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = ?").run(session.id);
   await denied(await relay('info-refs'), 403, 'repository_authority_changed');
   await denied(await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers), 403, 'session_archived');
+});
+
+test('Git LFS is a per-repository switch: off by default, admin-managed, audited, and carried by the egress grant', async t => {
+  const { f, admin, owner, team, repository, connector, start } = await connectedSetup(t);
+  const path = `/api/workspaces/${team.id}/repositories/${repository.id}/lfs`;
+  const listed = async () => (await json<{ repositories: WorkspaceRepository[] }>(await owner.request('GET', `/api/workspaces/${team.id}/repositories`))).repositories[0]!;
+  assert.equal((await listed()).lfs, false);
+  await denied(await owner.request('PUT', path, { enabled: true }), 403, 'forbidden');
+  await denied(await admin.request('PUT', path, { enabled: 'yes' }), 400, 'invalid_lfs_setting');
+  await denied(await admin.request('PUT', path, { enabled: true, ref: 'main' }), 400, 'invalid_lfs_setting');
+  await denied(await admin.request('PUT', `/api/workspaces/${team.id}/repositories/missing-binding/lfs`, { enabled: true }), 404, 'not_found');
+  // A binding of another workspace is not found through this one.
+  const other = await workspace(admin);
+  await denied(await admin.request('PUT', `/api/workspaces/${other.id}/repositories/${repository.id}/lfs`, { enabled: true }), 404, 'not_found');
+
+  const { repository: updated } = await json<{ repository: WorkspaceRepository }>(await admin.request('PUT', path, { enabled: true }));
+  assert.deepEqual([updated.id, updated.lfs, updated.forbidDefaultBranchPush], [repository.id, true, false]);
+  assert.equal((await listed()).lfs, true);
+  const session = await start();
+  const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
+  const grant = async () => (await json<{ repositories: { bindingId: string; lfs?: boolean }[] }>(
+    await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers))).repositories;
+  assert.deepEqual((await grant()).map(item => [item.bindingId, item.lfs]), [[repository.id, true]]);
+  // The push policy and the LFS switch live side by side without touching each other.
+  await json(await admin.request('PUT', `/api/workspaces/${team.id}/repositories/${repository.id}/push-policy`, { forbidDefaultBranch: true }));
+  assert.deepEqual([(await listed()).lfs, (await listed()).forbidDefaultBranchPush], [true, true]);
+  assert.equal((await json<{ repository: WorkspaceRepository }>(await admin.request('PUT', path, { enabled: false }))).repository.lfs, false);
+  assert.deepEqual((await grant()).map(item => [item.bindingId, item.lfs]), [[repository.id, false]]);
+  assert.equal((await listed()).forbidDefaultBranchPush, true);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'repository.lfs.updated'").get()!.n, 2);
+  // The setting goes with its binding.
+  assert.equal((await admin.request('DELETE', `/api/workspaces/${team.id}/repositories/${repository.id}`)).status, 204);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM repository_lfs_settings').get()!.n, 0);
+});
+
+test('Git LFS downloads are relayed with the owner credential only while LFS is on, and never hand the host a provider URL', async t => {
+  const { f, remote, admin, team, repository, connector, start } = await connectedSetup(t);
+  const session = await start();
+  const headers = { Authorization: `Bearer ${connector.token}`, 'X-Connection-Token': connector.connectionToken };
+  const relay = (service: string, body: unknown, contentType = 'application/json') =>
+    app.request(`${origin}/api/connectors/self/git/relay/${repository.id}/${service}?sessionId=${session.id}`, {
+      method: 'POST', headers: { ...headers, 'Content-Type': contentType }, body: JSON.stringify(body) }, f.env);
+  const setLfs = async (enabled: boolean) => json(await admin.request('PUT', `/api/workspaces/${team.id}/repositories/${repository.id}/lfs`, { enabled }));
+  const oid = 'c'.repeat(64), absent = 'd'.repeat(64), local = 'e'.repeat(64);
+  const content = 'large file content';
+  const size = Buffer.byteLength(content);
+  const batches: unknown[] = [];
+  const media: { url: string; signature: string | null; authorization: string | null }[] = [];
+  remote.state.git = async (url, init) => {
+    if (url === `https://github.com/${metadata.full_name}.git/info/lfs/objects/batch`) {
+      const request = new Headers(init?.headers);
+      assert.equal(request.get('accept'), 'application/vnd.git-lfs+json');
+      assert.equal(request.get('content-type'), 'application/vnd.git-lfs+json');
+      const body = JSON.parse(String(init?.body)) as { objects: { oid: string; size: number }[] };
+      batches.push(body);
+      return new Response(JSON.stringify({ transfer: 'basic', objects: body.objects.map(object => object.oid === absent
+        ? { oid: object.oid, size: object.size, error: { code: 404, message: 'Object does not exist' } }
+        // The provider reports the stored object's real size, whatever the request says.
+        : object.oid === local
+          ? { oid: object.oid, size, actions: { download: { href: `https://github.com/${metadata.full_name}.git/info/lfs/objects/${object.oid}` } } }
+          : { oid: object.oid, size, actions: { download: { href: `https://lfs-media.githubusercontent.com/${object.oid}?sig=1`, header: { 'X-Lfs-Signature': 'signed' }, expires_in: 3600 } } }) }),
+      { headers: { 'Content-Type': 'application/vnd.git-lfs+json' } });
+    }
+    if (url === `https://github.com/${metadata.full_name}.git/info/lfs/objects/${local}`) return new Response(content);
+    return new Response(`unexpected ${url}`, { status: 500 });
+  };
+  const recordMedia = (url: string, init?: RequestInit) => {
+    const request = new Headers(init?.headers);
+    media.push({ url, signature: request.get('x-lfs-signature'), authorization: request.get('authorization') });
+  };
+  remote.state.media = async (url, init) => { recordMedia(url, init); return new Response(content, { headers: { 'Content-Length': String(size) } }); };
+
+  // Off by default: refused before anything reaches the provider.
+  await denied(await relay('lfs-batch', { objects: [{ oid, size }] }), 403, 'lfs_disabled');
+  await denied(await relay('lfs-object', { oid, size }), 403, 'lfs_disabled');
+  assert.equal(batches.length, 0);
+  await setLfs(true);
+
+  const verified = () => remote.calls.filter(call => call.url === `https://api.github.com/repos/${metadata.full_name}`).length;
+  const before = verified();
+  const result = await json<LfsBatchResult>(await relay('lfs-batch', { objects: [{ oid, size }, { oid: absent, size: 1 }, { oid: local, size }], ref: 'refs/heads/main' }));
+  assert.deepEqual(result, { objects: [
+    { oid, size, download: true },
+    { oid: absent, size: 1, download: false, error: { code: 404, message: 'Object does not exist' } },
+    { oid: local, size, download: true },
+  ] });
+  assert.equal(verified() - before, 1, 'a batch verifies the bound repository, as every Git read does');
+  assert.deepEqual(batches[0], { operation: 'download', transfers: ['basic'], objects: [{ oid, size }, { oid: absent, size: 1 }, { oid: local, size }],
+    ref: { name: 'refs/heads/main' }, hash_algo: 'sha256' });
+  // Where and how objects are stored never reaches the host.
+  assert.doesNotMatch(JSON.stringify(result), /lfs-media|signed|href|header/);
+
+  const object = await relay('lfs-object', { oid, size });
+  assert.equal(object.status, 200);
+  assert.equal(object.headers.get('content-type'), 'application/octet-stream');
+  assert.equal(await object.text(), content);
+  // The action's own headers go to its storage; the owner's credential never leaves the provider's origin.
+  assert.deepEqual(media, [{ url: `https://lfs-media.githubusercontent.com/${oid}?sig=1`, signature: 'signed', authorization: null }]);
+  // On the provider's own origin, an action without headers is downloaded with the owner's credential (the mock checks it).
+  assert.equal(await (await relay('lfs-object', { oid: local, size })).text(), content);
+  await denied(await relay('lfs-object', { oid: absent, size: 1 }), 404, 'lfs_object_unavailable');
+  await denied(await relay('lfs-object', { oid, size: size + 1 }), 422, 'lfs_object_unavailable');
+  await denied(await relay('lfs-object', { oid: 'not-a-sha256', size }), 400, 'invalid_lfs_request');
+  await denied(await relay('lfs-batch', { objects: [] }), 400, 'invalid_lfs_request');
+  await denied(await relay('lfs-batch', { objects: [{ oid, size }] }, 'text/plain'), 415, 'unsupported_media_type');
+
+  // A redirect to another origin drops the action's headers; one to an address that isn't a public name is never followed.
+  media.length = 0;
+  remote.state.media = async (url, init) => {
+    recordMedia(url, init);
+    return url.startsWith('https://lfs-media.githubusercontent.com/')
+      ? new Response(null, { status: 302, headers: { Location: `https://objects.githubusercontent.com/${oid}` } })
+      : new Response(content);
+  };
+  assert.equal(await (await relay('lfs-object', { oid, size })).text(), content);
+  assert.deepEqual(media.map(item => [item.url, item.signature, item.authorization]),
+    [[`https://lfs-media.githubusercontent.com/${oid}?sig=1`, 'signed', null], [`https://objects.githubusercontent.com/${oid}`, null, null]]);
+  remote.state.media = async () => new Response(null, { status: 302, headers: { Location: 'https://169.254.169.254/latest/meta-data' } });
+  await denied(await relay('lfs-object', { oid, size }), 502, 'lfs_unavailable');
+  // More bytes than the pointer says are never passed on whole.
+  remote.state.media = async () => new Response(`${content} and more`);
+  const long = await relay('lfs-object', { oid, size });
+  if (long.status === 200) await assert.rejects(long.text());
+  else assert.equal(long.status, 502);
+
+  // Turned off, the next request is refused, whatever the host's grant still says.
+  await setLfs(false);
+  await denied(await relay('lfs-batch', { objects: [{ oid, size }] }), 403, 'lfs_disabled');
+  await denied(await relay('lfs-object', { oid, size }), 403, 'lfs_disabled');
 });
 
 test('every session clones: older connectors are refused, and a session whose agent can\'t run shell commands is told why', async t => {

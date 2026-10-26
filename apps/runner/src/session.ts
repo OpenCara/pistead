@@ -15,7 +15,7 @@ import { messageHash, parseChatImages, type ChatImage } from "../../../packages/
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
-import { MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
+import { hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
 import { IMAGE_BUSY, IMAGE_ERROR, imageType, prepareImage } from "./images.js";
 import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
@@ -28,7 +28,7 @@ import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import { egressPushService, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 
 type Run = {
@@ -217,6 +217,8 @@ export class RunnerSession {
   readonly #frozen: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
+  /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
+  #lfsRepositories: string[] = [];
   /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
   #cloneFailures: { path: string; reason: string }[] = [];
   /**
@@ -271,7 +273,8 @@ export class RunnerSession {
         : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
           { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
     } catch (error) {
-      if (!egressPushService(request.service) && refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
+      // Only a refused Git read means the owner lost the repository: a push or a Git LFS download can be refused by policy alone.
+      if (egressReadServices.includes(request.service) && refused(error)) for (const [target, entry] of this.mirrors) if (entry.repository.bindingId === request.bindingId) this.mirrors.delete(target);
       throw error;
     }
   }
@@ -506,6 +509,16 @@ export class RunnerSession {
     return { status: preparation.status, items: preparation.items.map(item => ({ ...item })), ...(preparation.status === "failed" ? { error: preparation.reason } : {}) };
   }
 
+  /** What a sandboxed clone session's agent needs to know about Git LFS, for the repositories the workspace turned it on for. */
+  private lfsInstructions(): string {
+    if (!this.#lfsRepositories.length) return "";
+    const lfs = hostGitLfs();
+    if (!lfs) return `\nGit LFS is on for ${this.#lfsRepositories.join(", ")}, but git-lfs is not installed on this host, so clones check out LFS pointer files.`;
+    return `\nGit LFS is on for ${this.#lfsRepositories.join(", ")}: clones of them check out LFS files' content. In a clone made otherwise, `
+      + `run ${lfs} install --local, then ${lfs} pull. Other repositories check out LFS pointer files. `
+      + "LFS objects are never uploaded from this session, so don't add or change LFS-tracked files in commits you push.";
+  }
+
   private agentInstructions(mode: "write" | "ask" | "read"): string {
     let instructions = this.binding.agent.instructions;
     if (this.#clone && !this.#egress) {
@@ -525,6 +538,7 @@ export class RunnerSession {
         + `This session's own branch is ${branch} (also in $PISTEAD_SESSION_BRANCH): push your work to it with plain git, for example `
         + `git push origin HEAD:${branch}, in any of the workspace's repositories, without approval. Pushes of other branches are refused there.`
         + (this.#cloneRepositories.length ? `\nThis workspace's repositories: ${this.#cloneRepositories.join(", ")}.` : "")
+        + this.lfsInstructions()
         + (this.#cloneFailures.length ? "\nThis session was restored from a backup or moved, and these clones could not be cloned again: "
           + this.#cloneFailures.map(failure => `${failure.path} (${failure.reason})`).join(", ")
           + ". Their backed-up work (branches, and the working tree as a commit) is in Git bundles under .git/pistead-clones, listed in its "
@@ -560,6 +574,7 @@ export class RunnerSession {
     } else if (this.#clone) {
       const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
       this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
+      this.#lfsRepositories = repositories.filter(repository => repository.lfs).map(repository => bindingRemote(repository));
       await this.restoreMirrors(repositories);
       // A restored or moved session clones its clones again before its work resumes.
       this.#cloneFailures = [];

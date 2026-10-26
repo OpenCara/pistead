@@ -66,18 +66,75 @@ export interface EgressRepository {
   bindingId: string; provider: GitProvider; host: string; fullName: string;
   /** The provider's id of the repository, which keys the host cache; absent from older control planes. */
   repositoryId?: string;
+  /**
+   * Whether the workspace lets sessions download this repository's Git LFS objects (a per-repository setting, off by
+   * default). Absent from older control planes, which relay no LFS requests.
+   */
+  lfs?: boolean;
 }
 /** What the control plane lets one session's egress proxy do; the proxy asks again every minute. */
 export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[] }
 /**
- * The Git smart-HTTP requests the relay forwards: a fetch's ref advertisement and the fetch itself, and in clone sessions a
- * push's (`receive-refs`, `receive-pack`), which may only update the session branch.
+ * The Git requests the relay forwards: a fetch's ref advertisement and the fetch itself; in clone sessions a push's
+ * (`receive-refs`, `receive-pack`), which may only update the session branch; and, for repositories with Git LFS on,
+ * LFS downloads (`lfs-batch`, `lfs-object`).
  */
-export const egressGitServices = ["info-refs", "upload-pack", "receive-refs", "receive-pack"] as const;
+export const egressGitServices = ["info-refs", "upload-pack", "receive-refs", "receive-pack", "lfs-batch", "lfs-object"] as const;
 export type EgressGitService = (typeof egressGitServices)[number];
-/** The services that only read. */
+/** The Git smart-HTTP services that only read; a refusal of one of them also ends a session's use of the host's mirror. */
 export const egressReadServices: readonly EgressGitService[] = ["info-refs", "upload-pack"];
 /** A push's services: only a clone session's own branch is pushed this way. */
 export function egressPushService(service: EgressGitService): service is "receive-refs" | "receive-pack" {
-  return !egressReadServices.includes(service);
+  return service === "receive-refs" || service === "receive-pack";
+}
+/** Git LFS downloads; uploads are never relayed. */
+export function egressLfsService(service: EgressGitService): service is "lfs-batch" | "lfs-object" {
+  return service === "lfs-batch" || service === "lfs-object";
+}
+
+/**
+ * Git LFS through the relay. The proxy turns git-lfs's batch API into these requests, and the control plane answers
+ * them with the session owner's own credential; the provider's download URLs and their headers never reach the host.
+ */
+export const lfsLimits = {
+  /** Objects in one batch request: git-lfs asks for 100 at a time by default. */
+  batchObjects: 100,
+  /** One LFS object; GitHub's own limit is 5 GiB on its largest plans. */
+  objectBytes: 8 * 1024 * 1024 * 1024,
+} as const;
+/** One object of an `lfs-batch` request, or the object an `lfs-object` request downloads. */
+export interface LfsObject { oid: string; size: number }
+export interface LfsBatchRequest { objects: LfsObject[]; ref?: string }
+/** The control plane's answer to `lfs-batch`: for each requested object, whether it can be downloaded or why not. */
+export interface LfsBatchResult {
+  objects: (LfsObject & { download: boolean; error?: { code: number; message: string } })[];
+}
+
+/** A Git LFS object id: the SHA-256 of its content, in lowercase hex. */
+export function validLfsOid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+export function validLfsSize(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= lfsLimits.objectBytes;
+}
+/** An `lfs-object` request, or a batch's object; throws on anything else. */
+export function parseLfsObject(value: unknown): LfsObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Git LFS object");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => key !== "oid" && key !== "size") || !validLfsOid(input.oid) || !validLfsSize(input.size)) {
+    throw new Error("Invalid Git LFS object");
+  }
+  return { oid: input.oid, size: input.size };
+}
+/** An `lfs-batch` request; throws on anything else. The ref is only passed on, as git-lfs sends it. */
+export function parseLfsBatchRequest(value: unknown): LfsBatchRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Git LFS batch request");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => key !== "objects" && key !== "ref")) throw new Error("Invalid Git LFS batch request");
+  if (!Array.isArray(input.objects) || !input.objects.length || input.objects.length > lfsLimits.batchObjects) {
+    throw new Error(`A Git LFS batch names 1 to ${lfsLimits.batchObjects} objects`);
+  }
+  const objects = input.objects.map(parseLfsObject);
+  if (input.ref !== undefined && (typeof input.ref !== "string" || !/^refs\/[\x21-\x7e]{1,250}$/.test(input.ref))) throw new Error("Invalid Git LFS ref");
+  return { objects, ...(input.ref !== undefined ? { ref: input.ref } : {}) };
 }

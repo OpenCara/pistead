@@ -1,4 +1,3 @@
-import type { EgressGitService } from '../../../../packages/shared/src/network.js';
 import { gitProviderNames } from '../../../../packages/shared/src/repositories.js';
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, PushRequestError, readPushCommands, sessionBranch, sessionBranchRefusal, type PushCommand } from '../../../../packages/shared/src/git-push.js';
 import type { AppContext, RepositoryRow, SessionRow } from '../types.js';
@@ -44,7 +43,7 @@ function settled(body: ReadableStream<Uint8Array>, done: () => void): ReadableSt
  * checked the session's authority, its connector and the repository binding, and loaded the owner's account.
  */
 export async function sessionBranchPush(c: AppContext, input: {
-  session: SessionRow; binding: RepositoryRow; access: RepositoryAccess; service: Exclude<EgressGitService, 'info-refs' | 'upload-pack'>;
+  session: SessionRow; binding: RepositoryRow; access: RepositoryAccess; service: 'receive-refs' | 'receive-pack';
   authorize: () => Promise<unknown>;
 }): Promise<Response> {
   const { session, binding, access, service, authorize } = input;

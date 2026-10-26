@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import type { GitProvider, ProviderRepository, ProviderRepositoryList, SessionRepository, TokenGitProvider, WorkspaceRepository, WorkspaceRepositoryList } from '../../../packages/shared/src/repositories.js';
 import { gitProviderNames, gitProviders, repositoryLimits, repositoryPath, validRepositoryId, validRepositoryName } from '../../../packages/shared/src/repositories.js';
 import type { Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
-import { getUser, requireMember } from './db.js';
+import { auditStatement, getUser, requireMember } from './db.js';
 import { fail, id, identifier, jsonObject, now, testMode } from './http.js';
 import { decryptToken } from './vault.js';
 import {
@@ -51,13 +51,19 @@ function bindingRepositoryId(provider: GitProvider, value: unknown): string {
   } else if (!validRepositoryId(value)) fail(400, 'invalid_repository', `A ${gitProviderNames[provider]} repository identity is required.`);
   return value;
 }
-export function publicRepository(row: RepositoryRow & { forbid_default_branch?: number | null }): WorkspaceRepository {
+/** A binding with the settings that live beside it (bindings are immutable): its push policy and Git LFS switch. */
+export type RepositorySettingsRow = RepositoryRow & { forbid_default_branch?: number | null; lfs_enabled?: number | null };
+/** Selects `r.*` with its settings; callers add their WHERE and ORDER BY on `r`. */
+export const repositorySettingsSelect = `SELECT r.*, p.forbid_default_branch, l.enabled AS lfs_enabled FROM workspace_repositories r
+  LEFT JOIN repository_push_policies p ON p.binding_id = r.id AND p.workspace_id = r.workspace_id
+  LEFT JOIN repository_lfs_settings l ON l.binding_id = r.id AND l.workspace_id = r.workspace_id`;
+export function publicRepository(row: RepositorySettingsRow): WorkspaceRepository {
   return { id: row.id, workspaceId: row.workspace_id, provider: row.provider, host: row.host, repositoryId: row.repository_id,
-    fullName: row.full_name, ref: row.ref, private: !!row.private, createdAt: row.created_at, forbidDefaultBranchPush: row.forbid_default_branch === 1 };
+    fullName: row.full_name, ref: row.ref, private: !!row.private, createdAt: row.created_at, forbidDefaultBranchPush: row.forbid_default_branch === 1,
+    lfs: row.lfs_enabled === 1 };
 }
 export async function workspaceRepositories(env: Env, workspaceId: string): Promise<WorkspaceRepository[]> {
-  const rows = await env.DB.query<RepositoryRow & { forbid_default_branch: number | null }>(`SELECT r.*, p.forbid_default_branch FROM workspace_repositories r
-    LEFT JOIN repository_push_policies p ON p.binding_id = r.id WHERE r.workspace_id = ? ORDER BY r.id`)
+  const rows = await env.DB.query<RepositorySettingsRow>(`${repositorySettingsSelect} WHERE r.workspace_id = ? ORDER BY r.id`)
     .bind(workspaceId).all();
   return rows.map(publicRepository);
 }
@@ -243,6 +249,28 @@ export function registerRepositories(app: Hono<WorkerEnv>): void {
         ...authority.values, workspaceId, workspaceId, row.provider, row.host, row.repository_id, row.full_name).first();
     if (!inserted) fail(409, 'repository_binding_conflict', 'Repository already configured, limit reached, or workspace authority changed.');
     return c.json({ repository: publicRepository(row) }, 201);
+  });
+  // Whether sandboxed sessions may download the repository's Git LFS objects. Changes reach running sessions with their
+  // next grant (within a minute), and the relay checks the setting again on every LFS request.
+  app.put('/api/workspaces/:id/repositories/:bindingId/lfs', async c => {
+    const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
+    const bindingId = identifier(c.req.param('bindingId'), 'bindingId');
+    await requireMember(c.env, workspaceId, actor, ['owner', 'admin']);
+    const input = await jsonObject(c, 1024);
+    if (Object.keys(input).some(key => key !== 'enabled') || typeof input.enabled !== 'boolean') fail(400, 'invalid_lfs_setting', 'Set enabled to true or false.');
+    const saved = await c.env.DB.query(`INSERT INTO repository_lfs_settings (binding_id, workspace_id, enabled, updated_by, updated_at)
+      SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM workspace_repositories WHERE id = ? AND workspace_id = ?)
+      AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))
+      ON CONFLICT (binding_id) DO UPDATE SET enabled = excluded.enabled, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+        WHERE repository_lfs_settings.workspace_id = excluded.workspace_id
+      RETURNING binding_id`)
+      .bind(bindingId, workspaceId, input.enabled ? 1 : 0, actor, now(), bindingId, workspaceId, workspaceId, actor).first();
+    if (!saved) fail(404, 'not_found', 'Repository not found.');
+    const repository = await c.env.DB.query<RepositorySettingsRow>(`${repositorySettingsSelect} WHERE r.id = ? AND r.workspace_id = ?`)
+      .bind(bindingId, workspaceId).first();
+    if (!repository) fail(404, 'not_found', 'Repository not found.');
+    await auditStatement(c.env, actor, 'repository.lfs.updated', workspaceId, null, { bindingId, enabled: input.enabled }).run();
+    return c.json({ repository: publicRepository(repository) });
   });
   app.delete('/api/workspaces/:id/repositories/:repositoryId', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
