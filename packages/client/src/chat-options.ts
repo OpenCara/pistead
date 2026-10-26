@@ -8,8 +8,6 @@ export interface ChatSelection {
   model?: { provider: string; modelId: string };
   thinkingLevel?: ThinkingLevel;
   access: AccessMode;
-  /** With Auto-approve: the agent's merges run without asking too. Off unless picked. */
-  autoMerge?: boolean;
 }
 
 export const levelLabels: Record<ThinkingLevel, string> = {
@@ -19,14 +17,18 @@ export const levelLabels: Record<ThinkingLevel, string> = {
 export const accessLabels: Record<AccessMode, { label: string; hint: string }> = {
   read: { label: "Read only", hint: "Inspect files; edits, commands and commits ask the session owner first" },
   approval: { label: "Ask before acting", hint: "Edits are automatic; commands, commits, GitHub comments and merges need approval" },
-  auto: { label: "Auto-approve", hint: "Commands, commits, pushes, GitHub comments and issues run immediately as the owner, without asking" },
+  auto: { label: "Auto-approve", hint: "Commands, commits, pushes, GitHub comments, issues and merges run immediately as the owner, without asking" },
 };
+
+/** Whether Auto-approve on `host` merges pull requests without asking too: older connectors ask before every GitHub effect. */
+export function autoApproveMerges(host: Pick<ConnectorInfo, "capabilities"> | undefined): boolean {
+  return host?.capabilities.automaticGitHub === true;
+}
 
 /** What turning on Auto-approve means on `host`, confirmed before it applies. */
 export function autoApproveWarning(host: Pick<ConnectorInfo, "name" | "capabilities" | "hostCommandAccess">, unsandboxed: boolean): string {
-  // Older connectors still ask before every GitHub effect.
-  const github = host.capabilities.automaticGitHub
-    ? " GitHub comments and new issues are posted as you without asking too; merges still need approval unless you also turn on Auto-merge."
+  const github = autoApproveMerges(host)
+    ? " GitHub comments and new issues are posted, and pull requests merged, as you without asking too: the agent can merge any pull request of this workspace's github.com repositories that GitHub lets you merge, into its base branch. Branch protection and required checks on GitHub still apply."
     : " GitHub comments and merges still need approval.";
   return (unsandboxed
     ? `Commands, commits and pushes the agent writes will run immediately on ${host.name}, an UNSANDBOXED host: commands run directly on the owner's machine with their full user permissions and network access, and no resource limits. Tools outside the agent won't ask either.`
@@ -46,14 +48,6 @@ function hostCommandsWarning(host: Pick<ConnectorInfo, "name" | "capabilities" |
   }
   return " On your own host, or one whose owner granted you automatic host commands, host_bash also runs OUTSIDE the sandbox without asking, with access to that host's files, credentials and network. Elsewhere it still needs approval.";
 }
-
-/** Whether the owner may add Auto-merge to `selection` on `host`. */
-export function autoMergeAvailable(host: Pick<ConnectorInfo, "capabilities"> | undefined, selection: ChatSelection, owner: boolean): boolean {
-  return owner && selection.access === "auto" && host?.capabilities.automaticGitHub === true;
-}
-
-/** What turning on Auto-merge means, confirmed before it applies. */
-export const AUTO_MERGE_WARNING = "The agent's GitHub merges will also run immediately as you, without asking: it can merge any pull request of this workspace's github.com repositories that GitHub lets you merge, into its base branch. Branch protection and required checks on GitHub still apply.";
 
 export const CONNECTOR_UPDATE_HINT = "Update the host's connector (npx pistead@latest connect) to choose model, reasoning and access";
 
@@ -191,7 +185,9 @@ export function modelUnavailable(host: ConnectorInfo | undefined, selection: Cha
 
 /**
  * Request options for a selection, or undefined when the host's connector cannot apply them.
- * Only choices the host advertises are sent; access only applies to the shared conversation.
+ * Only choices the host advertises are sent; access only applies to the shared conversation. Auto-approve covers merges
+ * too: hosts that run GitHub effects automatically, and the control plane, merge without asking only in a message that
+ * says so (`autoMerge`), so each Auto-approve message to one does.
  */
 export function chatOptionsBody(host: ConnectorInfo | undefined, selection: ChatSelection, mode: "submit" | "ask"): ChatOptions | undefined {
   if (!host?.capabilities.chatOptions) return undefined;
@@ -201,6 +197,19 @@ export function chatOptionsBody(host: ConnectorInfo | undefined, selection: Chat
   const thinkingLevel = effectiveLevel(model, selection.thinkingLevel);
   if (thinkingLevel) options.thinkingLevel = thinkingLevel;
   if (mode === "submit") options.access = selection.access;
-  if (mode === "submit" && selection.access === "auto" && selection.autoMerge && host.capabilities.automaticGitHub) options.autoMerge = true;
+  if (mode === "submit" && selection.access === "auto" && autoApproveMerges(host)) options.autoMerge = true;
   return options;
+}
+
+/** Where a device remembers that its user confirmed the Auto-approve warning that names merges (see mustConfirmAutoApprove). */
+export const AUTO_APPROVE_CONFIRMED_KEY = "pistead.autoApproveConfirmed";
+
+/**
+ * Whether a message going with `options` must wait for its owner to confirm Auto-approve first: one that would merge
+ * without asking, from a device where they haven't confirmed the warning that says so (`confirmed`). Choosing
+ * Auto-approve from the access menu asks every time, but the owner's chat box also starts on it by default, which never
+ * asked; their first such message asks instead, once per device.
+ */
+export function mustConfirmAutoApprove(options: ChatOptions | undefined, confirmed: boolean): boolean {
+  return options?.autoMerge === true && !confirmed;
 }

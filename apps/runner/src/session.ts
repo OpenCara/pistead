@@ -1025,7 +1025,7 @@ export class RunnerSession {
       if (value.access === "auto" && actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can auto-approve");
       options.access = value.access as ChatOptions["access"];
     }
-    // Auto-merge only adds to the owner's Auto-approve.
+    // Only an Auto-approve message merges without asking too, as the apps mark each one (see ChatOptions).
     if (value.autoMerge !== undefined) {
       if (typeof value.autoMerge !== "boolean" || (value.autoMerge && options.access !== "auto")) throw invalid("Auto-merge needs Auto-approve");
       if (value.autoMerge) options.autoMerge = true;
@@ -1437,7 +1437,7 @@ export class RunnerSession {
         await this.permit(api, call, "github_comment", `${args.repository}#${args.issue}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId), { permitted: true }), call));
       } }),
-      defineTool({ name: "github_merge", description: "Merge a pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase. Waits for a human decision unless the owner chose auto-approve with auto-merge for this message; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
+      defineTool({ name: "github_merge", description: "Merge a pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase, once a human approves it, or at once under the owner's auto-approve. The result carries the outcome; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const repository = this.githubRepository(args.repository);
         if (!/^[0-9a-f]{40}$/.test(args.sha)) throw new RunnerError(400, "sha must be the pull request's full 40-character head commit, as github_read reports it");
@@ -1581,7 +1581,8 @@ export class RunnerSession {
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
       // Automatic pushes and GitHub effects are authorized by the control plane from the run's owner admission, so they
       // need one. GitHub comments, issues and merges run automatically only under the owner's Auto-approve itself, never
-      // a session grant, and merges only when the message also chose auto-merge.
+      // a session grant, and merges only in a message marked `autoMerge`, as the apps mark Auto-approve messages: the
+      // control plane refuses an automatic merge of any other, even in a session's view.
       // A tool the owner allowed for the rest of the session runs their calls of it as Auto-approve would; host commands
       // never take a session grant, so each one still asks unless the owner holds automatic host commands on this host.
       const github = operation.kind === "github.comment" || operation.kind === "github.merge" || operation.kind === "github.issue";

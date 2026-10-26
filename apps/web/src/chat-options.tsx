@@ -1,14 +1,16 @@
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { AccessMode, ThinkingLevel } from "../../../packages/shared/src/types";
 import {
-  accessLabels, AUTO_MERGE_WARNING, autoApproveWarning, autoMergeAvailable, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels,
-  parseChatPreference, selectModel as pickModel, type ChatPreference, type ChatSelection,
+  accessLabels, AUTO_APPROVE_CONFIRMED_KEY, autoApproveMerges, autoApproveWarning, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels,
+  modelKey, offeredLevels, parseChatPreference, selectModel as pickModel, type ChatPreference, type ChatSelection,
 } from "../../../packages/client/src/chat-options";
 import { Icon, type IconName } from "./icons";
-import { Button, Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
+import { Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
-export { accessUnavailable, chatOptionsBody, initialSelection, modelUnavailable, preferredSelection, type ChatPreference, type ChatSelection } from "../../../packages/client/src/chat-options";
+export {
+  accessUnavailable, chatOptionsBody, initialSelection, modelUnavailable, mustConfirmAutoApprove, preferredSelection, type ChatPreference, type ChatSelection,
+} from "../../../packages/client/src/chat-options";
 
 /** The model and reasoning last chatted with, in this browser; new chats start from them. */
 const LAST_CHAT_KEY = "pistead.lastChat";
@@ -22,6 +24,33 @@ export function rememberChat(host: ConnectorInfo | undefined, selection: ChatSel
   const preference = chatPreference(host, selection, current);
   if (!preference) return;
   try { localStorage.setItem(LAST_CHAT_KEY, JSON.stringify(preference)); } catch { /* Private mode: the choice is simply not remembered. */ }
+}
+
+/** Set once confirmed on this page, for a browser that keeps nothing (private mode). */
+let autoApproveConfirmedHere = false;
+
+/** Whether this browser's user confirmed the Auto-approve warning that names merges (see mustConfirmAutoApprove). */
+export function autoApproveConfirmed(): boolean {
+  if (autoApproveConfirmedHere) return true;
+  try { return localStorage.getItem(AUTO_APPROVE_CONFIRMED_KEY) === "1"; } catch { return false; }
+}
+
+/**
+ * Asks the session owner to confirm Auto-approve, with what it does on `host`. A confirmed warning that names merges is
+ * remembered in this browser, so messages that go with Auto-approve by default don't ask again.
+ */
+export async function confirmAutoApprove(host: ConnectorInfo, unsandboxed: boolean): Promise<boolean> {
+  const confirmed = await confirmDialog({
+    title: "Auto-approve commands?",
+    message: autoApproveWarning(host, unsandboxed),
+    confirmLabel: "Enable auto-approve",
+    destructive: true,
+  });
+  if (confirmed && autoApproveMerges(host)) {
+    autoApproveConfirmedHere = true;
+    try { localStorage.setItem(AUTO_APPROVE_CONFIRMED_KEY, "1"); } catch { /* Private mode: remembered until the page closes. */ }
+  }
+  return confirmed;
 }
 
 const accessIcons: Record<AccessMode, IconName> = { read: "eye", approval: "shield", auto: "alert" };
@@ -49,21 +78,8 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
   }
 
   async function selectAccess(access: AccessMode) {
-    if (access === "auto" && value.access !== "auto" && !await confirmDialog({
-      title: "Auto-approve commands?",
-      message: autoApproveWarning(host!, unsandboxed),
-      confirmLabel: "Enable auto-approve",
-      destructive: true,
-    })) return;
-    // Leaving Auto-approve also turns Auto-merge off, so it is chosen afresh with it.
-    onChange({ ...value, access, ...(access === "auto" ? {} : { autoMerge: false }) });
-  }
-
-  async function toggleAutoMerge() {
-    if (!value.autoMerge && !await confirmDialog({
-      title: "Auto-merge pull requests?", message: AUTO_MERGE_WARNING, confirmLabel: "Enable auto-merge", destructive: true,
-    })) return;
-    onChange({ ...value, autoMerge: !value.autoMerge });
+    if (access === "auto" && value.access !== "auto" && !await confirmAutoApprove(host!, unsandboxed)) return;
+    onChange({ ...value, access });
   }
 
   const modes: AccessMode[] = owner ? ["read", "approval", "auto"] : ["read", "approval"];
@@ -80,10 +96,6 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
       options={levels.map(item => ({ value: item, label: levelLabels[item] }))} onChange={thinkingLevel => onChange({ ...value, thinkingLevel })} />}
     {showAccess && <span className={value.access === "auto" ? "chat-access auto" : "chat-access"} title={`Access: ${current.label}`}>
       <DropdownMenu label="Access" align="end" side="above" items={accessItems} trigger={<><Icon name={accessIcons[value.access]} size={14} /><span className="truncate">{current.label}</span></>} />
-    </span>}
-    {showAccess && autoMergeAvailable(host, value, owner) && <span className={value.autoMerge ? "chat-access auto" : "chat-access"}>
-      <Button size="sm" variant="ghost" icon="git-branch" aria-pressed={Boolean(value.autoMerge)} title={value.autoMerge ? "Auto-merge is on: merges run without asking" : "Merges still ask; turn on to auto-merge too"}
-        onClick={() => void toggleAutoMerge()}><span className="truncate">{value.autoMerge ? "Auto-merge on" : "Auto-merge off"}</span></Button>
     </span>}
   </>;
 }

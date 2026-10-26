@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ConnectorInfo } from "../packages/shared/src/connector.js";
 import type { SessionView } from "../packages/shared/src/types.js";
-import { accessUnavailable, autoApproveWarning, autoMergeAvailable, chatOptionsBody, chatPreference, initialSelection, modelUnavailable, parseChatPreference, preferredSelection, type ChatSelection } from "../packages/client/src/chat-options.js";
+import {
+  accessUnavailable, autoApproveMerges, autoApproveWarning, chatOptionsBody, chatPreference, initialSelection, modelUnavailable, mustConfirmAutoApprove, parseChatPreference,
+  preferredSelection, type ChatSelection,
+} from "../packages/client/src/chat-options.js";
 
 const host = { capabilities: { chatOptions: true }, models: [] } as unknown as ConnectorInfo;
 const auto: ChatSelection = { access: "auto" };
@@ -97,23 +100,27 @@ test("the owner's chat box starts on Auto-approve before the first shared messag
   assert.equal(initialSelection(view("auto"), false).access, "approval", "only the owner can auto-approve");
 });
 
-test("auto-merge goes with a message only on top of Auto-approve, to a host that runs GitHub effects automatically", () => {
+test("Auto-approve merges too, on hosts that run GitHub effects automatically, once its owner confirmed that on the device", () => {
   const automatic = { capabilities: { chatOptions: true, automaticGitHub: true }, models: [] } as unknown as ConnectorInfo;
-  const merging: ChatSelection = { access: "auto", autoMerge: true };
-  assert.deepEqual(chatOptionsBody(automatic, merging, "submit"), { access: "auto", autoMerge: true });
-  assert.deepEqual(chatOptionsBody(host, merging, "submit"), { access: "auto" }, "an older connector is never sent it");
-  assert.deepEqual(chatOptionsBody(automatic, { access: "approval", autoMerge: true }, "submit"), { access: "approval" });
-  assert.deepEqual(chatOptionsBody(automatic, merging, "ask"), {});
-  assert.equal(autoMergeAvailable(automatic, auto, true), true);
-  assert.equal(autoMergeAvailable(automatic, auto, false), false, "only the owner chooses it");
-  assert.equal(autoMergeAvailable(automatic, { access: "approval" }, true), false);
-  assert.equal(autoMergeAvailable(host, auto, true), false);
+  const merging = chatOptionsBody(automatic, auto, "submit");
+  assert.deepEqual(merging, { access: "auto", autoMerge: true });
+  assert.deepEqual(chatOptionsBody(host, auto, "submit"), { access: "auto" }, "an older connector is never sent it");
+  assert.deepEqual(chatOptionsBody(automatic, { access: "approval" }, "submit"), { access: "approval" });
+  assert.deepEqual(chatOptionsBody(automatic, auto, "ask"), {});
+  assert.deepEqual([autoApproveMerges(automatic), autoApproveMerges(host), autoApproveMerges(undefined)], [true, false, false]);
+  // The owner's chat box starts on Auto-approve without asking, so its first message that would merge asks first.
+  assert.equal(mustConfirmAutoApprove(merging, false), true);
+  assert.equal(mustConfirmAutoApprove(merging, true), false, "confirmed on this device");
+  assert.equal(mustConfirmAutoApprove(chatOptionsBody(host, auto, "submit"), false), false, "nothing merges without asking there");
+  assert.equal(mustConfirmAutoApprove(chatOptionsBody(automatic, { access: "approval" }, "submit"), false), false);
+  assert.equal(mustConfirmAutoApprove(undefined, false), false);
 });
 
 test("the Auto-approve warning says what runs without asking on this host", () => {
   const base = { name: "Bob's Pi", capabilities: { chatOptions: true, hostCommands: true, hostGrants: true, automaticGitHub: true } } as unknown as ConnectorInfo;
-  assert.match(autoApproveWarning(base, false), /GitHub comments and new issues are posted as you without asking/);
-  assert.match(autoApproveWarning(base, false), /unless you also turn on Auto-merge/);
+  assert.match(autoApproveWarning(base, false), /GitHub comments and new issues are posted, and pull requests merged, as you without asking/);
+  assert.match(autoApproveWarning(base, true), /pull requests merged, as you without asking.*Branch protection and required checks on GitHub still apply/);
+  assert.doesNotMatch(autoApproveWarning(base, false), /Auto-merge/);
   assert.match(autoApproveWarning({ ...base, capabilities: { ...base.capabilities, automaticGitHub: undefined } }, false), /GitHub comments and merges still need approval/);
   assert.match(autoApproveWarning({ ...base, hostCommandAccess: "auto" }, false), /granted you automatic host commands, so host_bash also runs OUTSIDE the sandbox on Bob's Pi/);
   assert.match(autoApproveWarning({ ...base, hostCommandAccess: "owner" }, false), /On someone else's host it still needs their approval/);

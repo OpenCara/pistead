@@ -6,7 +6,10 @@ import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction"
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
-import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, modelUnavailable, rememberChat, type ChatSelection } from "./chat-options";
+import {
+  accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, modelUnavailable, mustConfirmAutoApprove, rememberChat,
+  type ChatSelection,
+} from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -312,6 +315,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   }, [id]);
   const [conversationId, setConversationId] = useState("");
   const request = useRef<{ key: string; id: string; images?: ChatImage[] } | null>(null);
+  // Set while the owner decides on Auto-approve, so a second Enter can't send the message twice.
+  const confirming = useRef(false);
   const submission = useAction();
   const stopping = useAction();
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
@@ -324,6 +329,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const archived = session.status === "archived";
   const frozen = session.frozen === true;
   const permitted = !archived && !frozen && (actualMode === "write" ? canWrite : canAsk);
+  const unsandboxed = Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed);
   const queue = view.queue ?? [];
   const activeQueue = queue.filter(item => activeStatuses.includes(item.status));
   const recentSubmissions = queue.filter(item => !activeStatuses.includes(item.status)).slice(-5).reverse();
@@ -351,20 +357,28 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (element) element.scrollTop = element.scrollHeight;
   }, [actualMode, conversationId]);
 
-  function submit(event?: FormEvent) {
+  async function submit(event?: FormEvent) {
     event?.preventDefault();
     const pasted = attachments.images;
-    if (!permitted || (!content.trim() && !pasted.length) || submission.busy) return;
+    if (!permitted || (!content.trim() && !pasted.length) || submission.busy || confirming.current) return;
+    const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit") ?? modelUnavailable(host, selection);
+    // The owner's chat box can start on Auto-approve without asking, and it merges too: the first message that would asks
+    // first, unless it can't be sent anyway.
+    if (!unavailable && host && mustConfirmAutoApprove(options, autoApproveConfirmed())) {
+      confirming.current = true;
+      const confirmed = await confirmAutoApprove(host, unsandboxed).finally(() => { confirming.current = false; });
+      // Declined, the chat box asks before acting instead, and nothing is sent until the owner sends again.
+      if (!confirmed) { setSelection(current => ({ ...current, access: "approval" })); return; }
+    }
     setReceipt(null);
     const sent = content;
-    const options = chatOptionsBody(host, selection, actualMode === "ask" ? "ask" : "submit");
     // Changing the options or the images is a different request, so it needs a new idempotency key.
     const key = `${actualMode}:${JSON.stringify(options ?? null)}:${pasted.map(image => image.id).join(",")}:${sent}`;
     // Retry the same failed submission with the same idempotency key, not a duplicate turn.
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
     const pending = request.current;
     stick.current = true;
-    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit") ?? modelUnavailable(host, selection);
     void submission.run(async () => {
       if (unavailable) throw new Error(unavailable);
       // Encoded once per request, so a retry sends the same bytes under the same key.
@@ -453,7 +467,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
               { value: "", label: "All my side asks" },
               ...sideConversations.map((conversation, index) => ({ value: conversation.id, label: `Side ask ${index + 1}`, hint: conversation.id.slice(0, 8) })),
             ]} />}
-            {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={Boolean(session.hostUnsandboxed || host?.capabilities.unsandboxed)} />}
+            {permitted && <ChatOptionsBar host={host} value={selection} onChange={setSelection} owner={owner} showAccess={actualMode === "write"} unsandboxed={unsandboxed} />}
           </>}
         />
         {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}

@@ -17,7 +17,7 @@ import { requireBinding, requireNoRestore } from './push/broker.js';
 /*
  * Agents reach GitHub only through these brokers, as the session owner: the owner's token stays in the control plane's
  * vault, and the sandbox stays offline. Comments, merges and new issues need a human approval each, unless the session
- * owner sent the message with Auto-approve (and, for merges, auto-merge); reads need a live write message.
+ * owner sent the message with Auto-approve; reads need a live write message.
  */
 
 const githubApi = 'https://api.github.com';
@@ -77,8 +77,9 @@ function approvalInput(input: Record<string, unknown>): ApprovalInput {
 /**
  * Authorizes one GitHub effect of the session owner's Auto-approve message and consumes its tool call's single attempt
  * before the effect runs: the requester must be the session owner, still able to write, and the admission theirs, for
- * this session, unexpired and sent with Auto-approve (merges: with auto-merge too). As with approved effects, every check
- * is repeated after each await boundary that precedes the effect.
+ * this session, unexpired and sent with Auto-approve (for a merge, also marked `auto_merge`, as the apps ask for every
+ * Auto-approve message to a host that runs GitHub effects automatically). As with approved effects, every check is
+ * repeated after each await boundary that precedes the effect.
  */
 async function automaticEffect<T>(c: AppContext, connectorId: string | null, approval: ApprovalInput & { admissionId: string }, operation: Operation,
   action: 'github.comment' | 'github.merge' | 'github.issue', prepare: (row: SessionRow, github: GitHubAccess) => Promise<T>): Promise<{ row: SessionRow; github: GitHubAccess; prepared: T }> {
@@ -97,7 +98,7 @@ async function automaticEffect<T>(c: AppContext, connectorId: string | null, app
       || admission.expires_at <= Math.floor(Date.now() / 1000)) {
       fail(403, 'automatic_github_not_admitted', 'GitHub effects run without asking only for an unexpired message the session owner sent with Auto-approve.');
     }
-    if (action === 'github.merge' && admission.auto_merge !== 1) fail(403, 'automatic_merge_not_admitted', 'Merges run without asking only when the message also chose auto-merge.');
+    if (action === 'github.merge' && admission.auto_merge !== 1) fail(403, 'automatic_merge_not_admitted', 'Merges run without asking only for an Auto-approve message admitted to merge.');
     await requireCallbackScope(c, owner.row, connectorId);
     await requireOperationTool(c.env, owner.row, operation, approvalId, admission);
     return owner.row;

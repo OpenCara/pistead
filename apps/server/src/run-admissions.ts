@@ -65,7 +65,7 @@ async function admissionStorage<T>(operation: Promise<T>): Promise<T> {
   catch { fail(503, 'admission_unavailable', 'Run admission storage is temporarily unavailable.'); }
 }
 
-/** `autoMerge`: the message also lets Auto-approve merge (only with `access` auto). */
+/** `autoMerge`: the message's merges run without asking too, as the apps ask for every Auto-approve message (only with `access` auto). */
 export async function issueRunAdmission(c: AppContext, row: SessionRow, content: string, requestId: string, access?: AccessMode,
   images?: readonly ChatImage[], autoMerge = false): Promise<string> {
   if (autoMerge && access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
