@@ -187,7 +187,7 @@ async function approvedEffect<T>(c: AppContext, connectorId: string | null, appr
 }
 
 /** An upstream body as JSON, read up to `limit` bytes; larger or malformed bodies throw. */
-async function boundedJson(response: Response, limit: number): Promise<unknown> {
+export async function boundedJson(response: Response, limit: number): Promise<unknown> {
   const reader = response.body?.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;

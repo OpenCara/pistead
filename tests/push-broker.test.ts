@@ -5,6 +5,7 @@ import test from 'node:test';
 import { app } from '../apps/server/src/index.js';
 import { listSessionAccess, runnerSessionRecord, sessionAccess, sessionPullRequest, sessionRecord } from '../apps/server/src/db.js';
 import { settlePushCredentials } from '../apps/server/src/push/broker.js';
+import { refreshPullRequestStates } from '../apps/server/src/pull-request-states.js';
 import type { Env } from '../apps/server/src/types.js';
 import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
@@ -93,7 +94,9 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
   const calls: Call[] = [];
   const state = { canPush: options.canPush ?? true, bitbucketWrite: options.bitbucketWrite ?? true, githubTip: tip, githubPullExists: false, bitbucketPullExists: false,
     githubBranch: null as Record<string, unknown> | null, gitlabBranch: null as Record<string, unknown> | null,
-    giteaBranch: null as Record<string, unknown> | null, azureAllow: true, resetStatus: 200, resetToken: 'owner-oauth-token-2' };
+    giteaBranch: null as Record<string, unknown> | null, azureAllow: true, resetStatus: 200, resetToken: 'owner-oauth-token-2',
+    // Pull requests as GitHub reads them back (pull-request-states.ts), by number; a missing one is a 404. All have head `tip`.
+    githubPulls: {} as Record<number, { state: string; merged: boolean; draft: boolean; reviews: unknown[]; checkRuns: unknown[]; statuses: unknown[] }> };
   const routes: Route[] = [
     (url, init) => {
       if (url.origin !== 'https://api.github.com') return undefined;
@@ -114,6 +117,18 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
         return state.resetStatus === 200 ? Response.json({ token: state.resetToken }) : Response.json({ message: 'unavailable' }, { status: state.resetStatus });
       }
       if (method === 'DELETE' && url.pathname === '/applications/oauth-client/token') return new Response(null, { status: 204 });
+      const pullRead = /^\/repos\/owner\/repo\/pulls\/(\d+)(\/reviews)?$/.exec(url.pathname);
+      if (method === 'GET' && pullRead) {
+        const pull = state.githubPulls[Number(pullRead[1])];
+        if (!pull) return Response.json({ message: 'Not Found' }, { status: 404 });
+        return pullRead[2] ? Response.json(pull.reviews)
+          : Response.json({ number: Number(pullRead[1]), state: pull.state, merged: pull.merged, draft: pull.draft, head: { sha: tip } });
+      }
+      const headPull = Object.values(state.githubPulls)[0];
+      if (method === 'GET' && url.pathname === `/repos/owner/repo/commits/${tip}/check-runs` && headPull) {
+        return Response.json({ total_count: headPull.checkRuns.length, check_runs: headPull.checkRuns });
+      }
+      if (method === 'GET' && url.pathname === `/repos/owner/repo/commits/${tip}/status` && headPull) return Response.json({ state: 'pending', statuses: headPull.statuses });
       if (method === 'GET' && url.pathname.startsWith('/repos/owner/repo/commits/')) return Response.json({ sha: state.githubTip });
       if (method === 'POST' && url.pathname === '/repos/owner/repo/pulls') {
         return state.githubPullExists ? Response.json({ message: 'exists' }, { status: 422 })
@@ -429,11 +444,78 @@ test('session lists and reads show the newest pull request a push from the sessi
   assert.deepEqual(sessionRecord((await listed()).row).pullRequest, { url: 'https://github.com/owner/repo/pull/5', number: 5 });
   assert.equal('pullRequest' in runnerSessionRecord(access.row), false, 'not part of the immutable runner binding');
 
+  assert.deepEqual(sessionPullRequest('https://github.com/owner/repo/pull/5', 'merged'), { url: 'https://github.com/owner/repo/pull/5', number: 5, state: 'merged' });
+  assert.deepEqual(sessionPullRequest('https://github.com/owner/repo/pull/5', 'bogus'), { url: 'https://github.com/owner/repo/pull/5', number: 5 });
   assert.deepEqual(sessionPullRequest('https://gitlab.com/group/project/-/merge_requests/12'), { url: 'https://gitlab.com/group/project/-/merge_requests/12', number: 12 });
   assert.deepEqual(sessionPullRequest('https://dev.azure.com/contoso/Project/_git/repo/pullrequest/3'), { url: 'https://dev.azure.com/contoso/Project/_git/repo/pullrequest/3', number: 3 });
   assert.deepEqual(sessionPullRequest('https://example.test/review'), { url: 'https://example.test/review' });
   assert.equal(sessionPullRequest('javascript:alert(1)'), undefined);
   assert.equal(sessionPullRequest(null), undefined);
+});
+
+test('session lists show the state the control plane last read for their pull request, with the owner account, until it is merged', async t => {
+  const f = await fixture(t);
+  const state = async () => sessionRecord((await sessionAccess(f.env, 'session', owner))!.row).pullRequest?.state;
+  const pull = { state: 'open', merged: false, draft: true, reviews: [] as unknown[], checkRuns: [] as unknown[], statuses: [] as unknown[] };
+  f.state.githubPulls[5] = pull;
+  const push = async (approvalId: string) => {
+    const issued = await (await f.post(credential, { sessionId: 'session', approvalId, actorId: owner,
+      operation: f.operation({ pullRequest: { title: 'Add feature', body: 'Details' } }), admissionId: f.admit('auto') })).json() as { credentialId: string };
+    assert.equal((await f.post(complete, { sessionId: 'session', approvalId, credentialId: issued.credentialId, outcome: 'pushed', tip })).status, 200);
+  };
+  await push('tool-s-1');
+  assert.equal(await state(), undefined, 'none until it is read');
+  /** Makes the last read stale, so the next sweep reads it again. */
+  const stale = () => f.sqlite.prepare('UPDATE push_credentials SET pull_request_checked_at = ? WHERE pull_request_url IS NOT NULL').run('2000-01-01T00:00:00.000Z');
+  const reads = () => f.calls.filter(call => call.url === 'https://api.github.com/repos/owner/repo/pulls/5').length;
+
+  await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'draft');
+  const read = f.calls.find(call => call.url === 'https://api.github.com/repos/owner/repo/pulls/5')!;
+  assert.equal(read.authorization, 'Bearer owner-oauth-token', 'read as the session owner');
+  assert.equal(read.redirect, 'manual');
+  await refreshPullRequestStates(f.env);
+  assert.equal(reads(), 1, 'a fresh state is not read again');
+
+  pull.draft = false;
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'open');
+
+  pull.checkRuns = [{ name: 'test', status: 'completed', conclusion: 'failure' }];
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'failing');
+
+  pull.reviews = [{ user: { login: 'reviewer' }, state: 'CHANGES_REQUESTED' }];
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'changes_requested', 'a requested change comes before failed CI');
+
+  // A new push to the same pull request keeps showing its state until the next sweep, which reads it first.
+  await push('tool-s-2');
+  assert.equal(await state(), 'changes_requested');
+  pull.reviews.push({ user: { login: 'reviewer' }, state: 'APPROVED' });
+  pull.checkRuns = [{ name: 'test', status: 'completed', conclusion: 'success' }];
+  pull.statuses = [{ context: 'ci/legacy', state: 'error' }];
+  await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'failing', 'a failed commit status is failed CI too');
+
+  // A read that fails keeps the last state.
+  delete f.state.githubPulls[5];
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'failing');
+
+  f.state.githubPulls[5] = { ...pull, state: 'closed', merged: true };
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(await state(), 'merged');
+  const before = reads();
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(reads(), before, 'merged pull requests are not read again');
+
+  // A github.com URL that names no pull request is never read, nor selected again.
+  f.sqlite.prepare("UPDATE push_credentials SET pull_request_url = 'https://github.com/owner/repo/pulls', pull_request_state = NULL, pull_request_checked_at = NULL WHERE pull_request_url IS NOT NULL").run();
+  const calls = f.calls.length;
+  await refreshPullRequestStates(f.env);
+  assert.equal(f.calls.length, calls);
+  assert.equal(f.ledger().filter(row => row.pull_request_url).at(-1)!.pull_request_checked_at, '9999-12-31T00:00:00.000Z', 'the newest is never stale');
 });
 
 test('token providers mint from the workspace identity and open pull requests with the owner account', async t => {

@@ -2,7 +2,8 @@ import Ionicons from "@expo/vector-icons/Ionicons";
 import { sessionStatus } from "@pistead/client";
 import { useEffect, useMemo, useState } from "react";
 import { Pressable, RefreshControl, SectionList, StyleSheet, Text, TextInput, View } from "react-native";
-import type { SessionRecord } from "../../../../packages/shared/src/types";
+import { pullRequestStateLabels, pullRequestStateTones } from "../../../../packages/shared/src/pull-requests";
+import type { SessionPullRequest, SessionRecord } from "../../../../packages/shared/src/types";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
 import { relativeTime } from "../lib/format";
@@ -72,13 +73,25 @@ export function SessionList({ selectedId, onOpen, onNew }: { selectedId?: string
           <Text style={[styles.title, { color: palette.text }]} numberOfLines={1}>{session.title}</Text>
           <Text style={[ui.small, { color: palette.muted }]} numberOfLines={1}>
             {status.label && <><Text testID={`session-status-${session.id}`} style={[styles.statusLabel, { color: palette.tones[status.tone].text }]}>{status.label}</Text> · </>}
-            {session.pullRequest && <><Text testID={`session-pull-${session.id}`} accessibilityLabel={`Pull request ${session.pullRequest.number ?? ""}`.trim()}>{session.pullRequest.number === undefined ? "PR" : `PR #${session.pullRequest.number}`}</Text> · </>}
+            {session.pullRequest && <><PullRequestLabel id={session.id} pull={session.pullRequest} /> · </>}
             {isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · {relativeTime(session.createdAt)}
           </Text>
         </View>
         <Ionicons name="chevron-forward" size={16} color={palette.muted} />
       </Pressable>;
     }} />;
+}
+
+/** "PR #12", then its state in the state's color: Draft, Open, CI failed, Changes requested, Merged, Closed. */
+function PullRequestLabel({ id, pull }: { id: string; pull: SessionPullRequest }) {
+  const palette = usePalette();
+  const tone = pull.state && pullRequestStateTones[pull.state];
+  // The mobile palette's purple is its running tone.
+  const color = tone && tone !== "neutral" ? palette.tones[tone === "merged" ? "running" : tone].text : undefined;
+  return <Text testID={`session-pull-${id}`} accessibilityLabel={[`Pull request ${pull.number ?? ""}`.trim(), pull.state && pullRequestStateLabels[pull.state]].filter(Boolean).join(", ")}>
+    {pull.number === undefined ? "PR" : `PR #${pull.number}`}
+    {pull.state && <Text style={color ? { color } : undefined}>{` ${pullRequestStateLabels[pull.state]}`}</Text>}
+  </Text>;
 }
 
 const styles = StyleSheet.create({
