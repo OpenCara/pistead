@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0029_disabled_host_models.sql.
+-- Postgres translation of sqlite/0030_disabled_host_models.sql.
 
 -- Models a host's owner or one of its admins disabled. The host still advertises them (Pi decides that), but no session
 -- starts from one and no message switches to one, in any workspace. Kept by provider and model id, apart from the
