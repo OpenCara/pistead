@@ -360,7 +360,8 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/git/push/complete', async c => pushComplete(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/restores/:restoreId/download', async c => connectorRestoreDownload(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/network', async c => egressGrant(c, (await authenticateConnector(c)).id));
-  // How the host runs its sessions, as its owner and admins set it; the connector asks when it connects and every minute.
+  // How the host runs its sessions, as its owner and admins set it; the connector asks when it connects, then at most
+  // every 30 seconds (HostConfigSource), so a change reaches running sessions within a minute.
   app.post('/api/connectors/self/config', async c => c.json({ config: await connectorHostConfig(c.env, (await authenticateConnector(c)).id) }));
   app.post('/api/connectors/self/git/relay/:bindingId/:service', async c => gitRelay(c, await authenticateConnector(c)));
 }
