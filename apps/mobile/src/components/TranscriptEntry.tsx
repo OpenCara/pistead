@@ -10,7 +10,7 @@ import { Markdown } from "./Markdown";
 import { Banner, type IconName } from "./ui";
 
 /** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
-function ToolDetails({ icon, label, text }: { icon: IconName; label: string; text: string }) {
+function ToolDetails({ icon, label, text, trimmed }: { icon: IconName; label: string; text: string; trimmed?: EntryView["trimmed"] }) {
   const palette = usePalette();
   const [open, setOpen] = useState(false);
   return <View style={[styles.tool, { borderColor: palette.border, backgroundColor: palette.surface }]}>
@@ -20,6 +20,9 @@ function ToolDetails({ icon, label, text }: { icon: IconName; label: string; tex
       <Ionicons name={open ? "chevron-down" : "chevron-forward"} size={14} color={palette.muted} />
     </Pressable>
     {open && <Text selectable style={[styles.toolText, { color: palette.text, borderColor: palette.border }]}>{text}</Text>}
+    {open && trimmed && <Text style={[styles.meta, { color: palette.muted }]}>
+      {`Brief tool output · ${trimmed.lines === 1 ? "1 line" : `${trimmed.lines.toLocaleString()} lines`}, ${trimmed.chars.toLocaleString()} characters in full. The session's owner can show full tool output in the web app's session details.`}
+    </Text>}
   </View>;
 }
 
@@ -52,7 +55,10 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
     const label = toolLabel || (entry.role === "toolResult" ? "Tool result" : "System");
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined ? ` · ${formatDuration(entry.durationMs)}` : "";
-    return <ToolDetails icon={toolLabel ? "construct-outline" : "terminal-outline"} label={`${label}${took}${actor ? ` · ${actor}` : ""}${autoApprovedSuffix(entry.autoApproved)}`} text={entry.text} />;
+    // A brief tool result's one line shows on its row.
+    const line = entry.trimmed && entry.role === "toolResult" && entry.text.trim() ? ` · ${entry.text}` : "";
+    return <ToolDetails icon={toolLabel ? "construct-outline" : "terminal-outline"} label={`${label}${took}${actor ? ` · ${actor}` : ""}${autoApprovedSuffix(entry.autoApproved)}${line}`}
+      text={entry.text} trimmed={entry.trimmed} />;
   }
   if (entry.error) {
     return <View style={styles.entry}>
@@ -73,7 +79,7 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
   const took = entry.durationMs !== undefined ? formatDuration(entry.durationMs) : "";
   return <View style={styles.entry}>
     {prose.trim() !== "" && <Markdown text={prose} />}
-    {toolLabel && <ToolDetails icon="construct-outline" label={`${toolLabel}${autoApprovedSuffix(entry.autoApproved)}`} text={calls.map(call => call.line).join("\n")} />}
+    {toolLabel && <ToolDetails icon="construct-outline" label={`${toolLabel}${autoApprovedSuffix(entry.autoApproved)}`} text={calls.map(call => call.line).join("\n")} trimmed={entry.trimmed} />}
     {(actor || took) && <Text style={meta}>{[actor && `by ${actor}`, took].filter(Boolean).join(" · ")}</Text>}
   </View>;
 });

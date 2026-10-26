@@ -14,7 +14,8 @@ export { decidesHostCommands, HOST_COMMAND_WAITING, isHostCommand } from "./host
 export { formatBytes, preparingRepositories, repositoryPhaseLabel, repositoryProgressText, repositoryProgressValue } from "./repository-progress";
 export { sessionStatus, type SessionStatus, type SessionStatusTone } from "./session-status";
 export { openFetchEventStream, SseParser, type FetchEventStreamOptions } from "./sse";
-export { splitToolCalls, type ToolCallLine } from "./transcript";
+export { splitToolCalls, transcriptLines, type ToolCallLine } from "./transcript";
+export { carryEarlier, firstHeld, withEarlier, type EarlierEntries } from "./transcript-pages";
 export {
   memberPerson, peopleDirectory, userIdFromInput, username, usernameWithId, withUsernames, type Person, type WorkspaceMember,
 } from "./usernames";

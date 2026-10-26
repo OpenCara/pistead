@@ -172,7 +172,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
     {!view ? (!live.error ? <Loading />
       : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
       : <View style={ui.flex} />)
-      : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
+      : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh} loadOlder={live.loadOlder}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
@@ -238,8 +238,9 @@ function ApprovalsSheet({ visible, approvals, olderApprovals, onClose, onOpenSes
   </Modal>;
 }
 
-function Conversation({ id, user, session, view, host, stale, refresh, pinned }: {
-  id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode;
+function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, pinned }: {
+  id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void;
+  loadOlder: (conversationId: string) => Promise<void>; pinned: ReactNode;
 }) {
   const { api } = useSession();
   const { rememberChat, autoApproveConfirmed } = useAppData();
@@ -285,6 +286,17 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (actualMode === "ask") return conversation?.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || entry.conversationId === conversationId);
     return conversation?.mode !== "ask";
   });
+  // In a workspace that loads transcripts latest first: the shown conversations with earlier entries still to read.
+  const olderConversations = conversations.filter(conversation => (conversation.olderEntries ?? 0) > 0 && (actualMode === "ask"
+    ? conversation.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || conversation.id === conversationId)
+    : conversation.mode !== "ask"));
+  const olderCount = olderConversations.reduce((total, conversation) => total + (conversation.olderEntries ?? 0), 0);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  function loadEarlier() {
+    if (loadingOlder || !olderConversations.length) return;
+    setLoadingOlder(true);
+    void Promise.all(olderConversations.map(conversation => loadOlder(conversation.id))).finally(() => setLoadingOlder(false));
+  }
 
   // FlatList's own scrollToEnd measures the footer from a layout event that can arrive after the content grew, which
   // leaves a new approval card (in the footer) below the fold; the native scroll view knows the real content end.
@@ -364,6 +376,10 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       ListEmptyComponent={<EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>
         {actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}
       </EmptyState>}
+      ListHeaderComponent={olderCount > 0 ? <Button small variant="ghost" icon="chevron-up" busy={loadingOlder} onPress={loadEarlier}
+        label={`Show earlier messages (${olderCount})`} testID="load-earlier" /> : undefined}
+      // Earlier entries arrive above what the reader is looking at, which stays where it is.
+      maintainVisibleContentPosition={olderCount > 0 || loadingOlder ? { minIndexForVisible: 0 } : undefined}
       ListFooterComponent={<View style={styles.pinned}>{pinned}</View>}
       onScrollEndDrag={onScrollEnd} onMomentumScrollEnd={onScrollEnd} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled"
       onContentSizeChange={() => { if (stick.current) toEnd(); }}

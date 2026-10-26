@@ -23,6 +23,8 @@ interface Backend {
   view: SessionView | ApiError;
   /** Snapshots each new /events stream sends before the Worker ends it (none: it ends empty), or "hold" to keep it open. */
   stream: SessionView[] | "hold";
+  /** Answers reads of earlier entries (`/entries?...`). */
+  entries?: (path: string) => unknown;
 }
 
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -43,6 +45,11 @@ async function liveSession(t: TestContext, backend: Backend) {
   }, {
     async api<T>(path: string) {
       requests.push({ at: now, path });
+      if (path.includes("/entries?")) {
+        const page = backend.entries?.(path);
+        if (page instanceof ApiError) throw page;
+        return page as T;
+      }
       const answer = path.endsWith("/view") ? backend.view : backend.session;
       if (answer instanceof ApiError) throw answer;
       return (path.endsWith("/view") ? { view: answer } : { session: answer }) as T;
@@ -200,4 +207,46 @@ test("streams ask for what changed since the held revision and apply patches to 
   next.emit("error");
   await live.advance(liveTiming.firstBackoffMs);
   assert.equal(live.requests.filter(request => request.path.includes("/events")).at(-1)!.path, "/api/sessions/s1/events?since=");
+});
+
+test("a paged view reads earlier entries a page at a time, once per conversation, and keeps them as the window moves", async t => {
+  const entry = (n: number) => ({ id: `0:${n}`, kind: "message", role: "assistant", text: `entry ${n}`, conversationId: "0" });
+  const paged = (from: number, to: number, older: number, conversations: unknown[] = []) => ({
+    ...idleView, approvals: [], entries: Array.from({ length: to - from + 1 }, (_, index) => entry(from + index)),
+    conversations: [{ id: "0", mode: "write", olderEntries: older, previousEntryId: `0:${from - 1}` }, ...conversations],
+  }) as unknown as SessionView;
+  const pages: Record<string, { entries: unknown[]; older: number }> = {
+    "0:5": { entries: [entry(3), entry(4)], older: 2 },
+    "0:3": { entries: [entry(1), entry(2)], older: 0 },
+  };
+  const backend: Backend = { session: record, view: paged(5, 7, 4), stream: "hold",
+    entries: path => pages[decodeURIComponent(/before=([^&]+)/.exec(path)![1]!)] ?? new ApiError(409, "entries_changed", "The transcript changed.") };
+  const live = await liveSession(t, backend);
+  const ids = () => live.state.view!.entries.map(item => item.id);
+  const reads = () => live.requests.filter(request => request.path.includes("/entries?")).map(request => request.path);
+  assert.deepEqual(ids(), ["0:5", "0:6", "0:7"]);
+
+  // Scrolling asks again and again while a page is on its way: one read.
+  await Promise.all([live.live.loadOlder("0"), live.live.loadOlder("0")]);
+  assert.deepEqual(reads(), ["/api/sessions/s1/entries?conversation=0&before=0%3A5&limit=50"]);
+  assert.deepEqual(ids(), ["0:3", "0:4", "0:5", "0:6", "0:7"]);
+  assert.equal(live.state.view!.conversations[0]!.olderEntries, 2);
+  await live.live.loadOlder("0");
+  assert.deepEqual(ids(), ["0:1", "0:2", "0:3", "0:4", "0:5", "0:6", "0:7"]);
+  assert.equal(live.state.view!.conversations[0]!.olderEntries, undefined, "Nothing left to read");
+  await live.live.loadOlder("0");
+  await live.live.loadOlder("unknown");
+  assert.equal(reads().length, 2, "Nothing more to read, so nothing is asked");
+
+  // New entries push the window on; what slid out of it stays shown.
+  const stream = live.streams.at(-1)!;
+  stream.emit("view", JSON.stringify({ view: paged(6, 8, 5) }));
+  assert.deepEqual(ids(), ["0:1", "0:2", "0:3", "0:4", "0:5", "0:6", "0:7", "0:8"]);
+  // A history that no longer joins up (after a compaction) starts again from the window, with earlier pages to read.
+  stream.emit("view", JSON.stringify({ view: paged(20, 21, 9) }));
+  assert.deepEqual(ids(), ["0:20", "0:21"]);
+  assert.equal(live.state.view!.conversations[0]!.olderEntries, 9);
+  await live.live.loadOlder("0");
+  assert.equal(live.state.error, "The transcript changed.");
+  assert.deepEqual(ids(), ["0:20", "0:21"]);
 });

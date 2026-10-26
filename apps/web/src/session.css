@@ -78,6 +78,9 @@
   .entry-tool > summary > .icon:last-child { transition: transform 120ms ease; }
   .entry-tool[open] > summary > .icon:last-child { transform: rotate(90deg); }
   .entry-tool > pre { max-height: 420px; margin-top: var(--space-2); }
+  .entry-tool > .entry-brief { margin-top: var(--space-1); }
+  /* A paged transcript's way back: scrolling near it loads the next page too. */
+  .transcript-earlier { display: flex; justify-content: center; }
   .approval-marks { display: inline-flex; flex: 0 0 auto; align-items: center; gap: var(--space-1); }
 
   /* Bottom stack: pinned approvals, queue line, composer. */

@@ -24,7 +24,8 @@ import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
 import { mayDecideHostCommands } from './host-access.js';
 import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
-import { invalidateSessionView, sessionView, viewChanges } from './view-feed.js';
+import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
+import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host offers: one it advertises that its
@@ -149,15 +150,19 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
     try {
       if (c.req.raw.signal.aborted) abort();
       for (let snapshot = 0; snapshot < snapshots && !stream.aborted; snapshot++) {
+        // Read with every snapshot: one session has one feed, so a stream left on settings someone just changed would
+        // keep replacing the feed of everyone reading with the new ones. The first view after a change is a whole one.
+        const display = await Promise.race([transcriptDisplay(c, row), stopped]);
+        if (!display || stream.aborted) break;
         // The view is checked against the session, presented and redacted by the feed.
-        const shown = await Promise.race([sessionView(c, row), stopped]);
+        const shown = await Promise.race([sessionView(c, row, { display }), stopped]);
         if (!shown || stream.aborted) break;
         // Never emit a snapshot fetched before a grant was revoked without a fresh policy check.
         const access = await Promise.race([requireSession(c, row.id, 'read'), stopped]);
         if (!access || stream.aborted) break;
         if (access.row.connector_id) await requireConnectorSession(c.env, access.row.connector_id, access.row);
         if (stream.aborted) break;
-        const patch = since === undefined ? null : viewChanges(c, row, held, shown);
+        const patch = since === undefined ? null : viewChanges(c, row, held, shown, display);
         held = shown.revision;
         await Promise.race([stream.writeSSE(patch ? { event: 'patch', data: JSON.stringify({ patch }) }
           : { event: 'view', data: JSON.stringify(since === undefined ? { view: shown.view } : { view: shown.view, revision: shown.revision }) }), stopped]);
@@ -345,7 +350,21 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const ownerId = c.get('auth').userId;
     const input = await jsonObject(c, 4096);
     const keys = Object.keys(input);
-    // A rename is cosmetic and a visibility change is policy; each is its own request, never mixed.
+    // A rename and tool output are cosmetic and a visibility change is policy; each is its own request, never mixed.
+    if (keys.length === 1 && keys[0] === 'toolOutput') {
+      if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change how it shows tool output.');
+      if (!toolOutputs.includes(input.toolOutput as ToolOutput)) fail(400, 'invalid_tool_output', 'Tool output is either full or brief.');
+      const toolOutput = input.toolOutput as ToolOutput;
+      // Display only: not part of the runner binding or policy, so the policy version stays.
+      const updated = await c.env.DB.query<SessionRow>(`UPDATE sessions SET tool_output = ?
+        WHERE id = ? AND owner_id = ?
+          AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = sessions.workspace_id AND user_id = ?)
+        RETURNING *`).bind(toolOutput, row.id, ownerId, ownerId).first();
+      if (!updated) fail(409, 'policy_changed', 'Session membership changed; reload and retry.');
+      await auditStatement(c.env, ownerId, 'session.tool_output.updated', row.workspace_id, row.id, { toolOutput }).run();
+      invalidateSessionView(c, row.id);
+      return c.json({ session: sessionRecord(updated, [...permissions]) });
+    }
     if (keys.length === 1 && keys[0] === 'title') {
       if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can rename it.');
       const title = text(input.title, 'title', 200).trim();
@@ -360,7 +379,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       return c.json({ session: sessionRecord(renamed, [...permissions]) });
     }
     if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change its visibility.');
-    if (keys.some(key => key !== 'visibility')) fail(400, 'invalid_input', 'Change either the session title or its visibility.');
+    if (keys.some(key => key !== 'visibility')) fail(400, 'invalid_input', 'Change the session title, its visibility or its tool output, one at a time.');
     const visibility = sessionVisibility(input.visibility);
     const updated = await c.env.DB.query<SessionRow>(`UPDATE sessions SET visibility = ?, policy_version = policy_version + 1
       WHERE id = ? AND owner_id = ? AND policy_version = ?
@@ -403,11 +422,30 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   });
   app.get('/api/sessions/:id/view', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
-    const shown = await sessionView(c, row, { latest: true });
+    const shown = await sessionView(c, row, { latest: true, display: await transcriptDisplay(c, row) });
     const fresh = await requireSession(c, row.id, 'read');
     if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
     // The revision lets the client's next /events stream send only what changed.
     return c.json({ view: shown.view, revision: shown.revision });
+  });
+  // Earlier entries of one conversation, for a view that holds only its latest ones (a workspace that pages transcripts),
+  // presented and redacted as views are. 409 when the conversation no longer has `before`, e.g. after a compaction.
+  app.get('/api/sessions/:id/entries', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
+    const conversation = c.req.query('conversation') ?? '';
+    const before = c.req.query('before') ?? '';
+    const limitText = c.req.query('limit') ?? String(transcriptPage.size);
+    const limit = Number(limitText);
+    // Only compared with the view's own ids, so any short text without control characters will do.
+    const name = /^[^\u0000-\u001f\u007f]{1,300}$/;
+    if (!name.test(conversation) || !name.test(before)) fail(400, 'invalid_input', 'Name a conversation and the entry to read before.');
+    if (!/^\d{1,4}$/.test(limitText) || limit < 1 || limit > transcriptPage.max) fail(400, 'invalid_input', `The limit must be 1 to ${transcriptPage.max}.`);
+    const page = await earlierEntries(c, row, await transcriptDisplay(c, row), conversation, before, limit);
+    // Never answer with entries read before access was revoked.
+    const fresh = await requireSession(c, row.id, 'read');
+    if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
+    if (!page) fail(409, 'entries_changed', 'The transcript changed. Scroll up again to load earlier messages.');
+    return c.json(page, 200, { 'Cache-Control': 'private, no-store' });
   });
   app.get('/api/sessions/:id/events', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
