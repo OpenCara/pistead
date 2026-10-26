@@ -3,6 +3,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { app } from '../apps/server/src/index.js';
+import { listSessionAccess, runnerSessionRecord, sessionAccess, sessionPullRequest, sessionRecord } from '../apps/server/src/db.js';
 import { settlePushCredentials } from '../apps/server/src/push/broker.js';
 import type { Env } from '../apps/server/src/types.js';
 import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
@@ -403,6 +404,36 @@ test('completion revokes the GitHub token, verifies the tip and opens the pull r
   const third = await (await f.post(credential, { sessionId: 'session', approvalId: 'tool-c-3', actorId: owner, operation: op2, admissionId: f.admit('auto') })).json() as { credentialId: string };
   const existing = await f.post(complete, { sessionId: 'session', approvalId: 'tool-c-3', credentialId: third.credentialId, outcome: 'up-to-date', tip });
   assert.deepEqual(await existing.json(), { pullRequest: { url: 'https://github.com/owner/repo/pull/4', number: 4, created: false } });
+});
+
+test('session lists and reads show the newest pull request a push from the session opened, outside the runner binding', async t => {
+  const f = await fixture(t);
+  const listed = async () => (await listSessionAccess(f.env, owner)).find(access => access.row.id === 'session')!;
+  assert.equal(sessionRecord((await listed()).row).pullRequest, undefined, 'none before a push opens one');
+
+  const push = async (approvalId: string, githubPullExists: boolean) => {
+    f.state.githubTip = tip;
+    f.state.githubPullExists = githubPullExists;
+    const issued = await (await f.post(credential, { sessionId: 'session', approvalId, actorId: owner,
+      operation: f.operation({ pullRequest: { title: 'Add feature', body: 'Details' } }), admissionId: f.admit('auto') })).json() as { credentialId: string };
+    assert.equal((await f.post(complete, { sessionId: 'session', approvalId, credentialId: issued.credentialId, outcome: 'pushed', tip })).status, 200);
+  };
+  await push('tool-l-1', true);
+  assert.deepEqual(sessionRecord((await listed()).row).pullRequest, { url: 'https://github.com/owner/repo/pull/4', number: 4 });
+  // A plain push afterwards opens none and keeps the one already shown.
+  const plain = await (await f.post(credential, { sessionId: 'session', approvalId: 'tool-l-2', actorId: owner, operation: f.operation(), admissionId: f.admit('auto') })).json() as { credentialId: string };
+  await f.post(complete, { sessionId: 'session', approvalId: 'tool-l-2', credentialId: plain.credentialId, outcome: 'pushed', tip });
+  await push('tool-l-3', false);
+  const access = (await sessionAccess(f.env, 'session', owner))!;
+  assert.deepEqual(sessionRecord(access.row).pullRequest, { url: 'https://github.com/owner/repo/pull/5', number: 5 }, 'the newest one');
+  assert.deepEqual(sessionRecord((await listed()).row).pullRequest, { url: 'https://github.com/owner/repo/pull/5', number: 5 });
+  assert.equal('pullRequest' in runnerSessionRecord(access.row), false, 'not part of the immutable runner binding');
+
+  assert.deepEqual(sessionPullRequest('https://gitlab.com/group/project/-/merge_requests/12'), { url: 'https://gitlab.com/group/project/-/merge_requests/12', number: 12 });
+  assert.deepEqual(sessionPullRequest('https://dev.azure.com/contoso/Project/_git/repo/pullrequest/3'), { url: 'https://dev.azure.com/contoso/Project/_git/repo/pullrequest/3', number: 3 });
+  assert.deepEqual(sessionPullRequest('https://example.test/review'), { url: 'https://example.test/review' });
+  assert.equal(sessionPullRequest('javascript:alert(1)'), undefined);
+  assert.equal(sessionPullRequest(null), undefined);
 });
 
 test('token providers mint from the workspace identity and open pull requests with the owner account', async t => {

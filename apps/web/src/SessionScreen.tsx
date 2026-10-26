@@ -12,6 +12,7 @@ import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
 import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
+import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
@@ -160,6 +161,8 @@ function SessionPane({ id }: { id: string }) {
   // Everyone a session names (owner, host owner, grantees, writers) is or was a member of its workspace.
   const people = useWorkspacePeople(known?.workspaceId ?? null);
   const workspaceName = known && workspaces.find(workspace => workspace.id === known.workspaceId)?.name;
+  // The list refreshes on its own, so a pull request opened while the session is on screen shows up without a reload.
+  const pullRequest = sessions.find(item => item.id === id)?.pullRequest ?? session?.pullRequest;
   const visibility = session?.visibility ?? "private";
   const streamBadge = live.status === "online" ? <StatusBadge tone="success" dot>Live</StatusBadge>
     : live.status === "reconnecting" ? <StatusBadge tone="warning" dot>Reconnecting</StatusBadge>
@@ -205,6 +208,7 @@ function SessionPane({ id }: { id: string }) {
         subtitle={workspaceName}
         actions={<>
           {session && <span className="session-badges">{archived ? <StatusBadge tone="neutral">Archived</StatusBadge> : badge}<StatusBadge>{visibility === "workspace" ? "Workspace-visible" : "Private"}</StatusBadge>{session.linkShared && <StatusBadge tone="info">Link shared</StatusBadge>}</span>}
+          {session && pullRequest && <PullRequestLink pull={pullRequest} />}
           {session && <Button variant="ghost" size="xs" icon="panel-right" aria-label="Toggle session panel" title="Session panel" aria-pressed={panelOpen} onClick={() => setPanelOpen(!panelOpen)} />}
           <DropdownMenu label="Session actions" items={menu} />
         </>}

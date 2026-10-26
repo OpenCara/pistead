@@ -1,4 +1,4 @@
-import type { AgentVersion, ModelDefinition, Permission, SessionRecord, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import type { AgentVersion, ModelDefinition, Permission, SessionPullRequest, SessionRecord, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import { hasPermission, normalizePermissions, roleSessionCeiling, sessionCreatorRoles, workspaceSessionPermissions } from '../../../packages/shared/src/policy.js';
 import type { AgentRow, AppContext, Env, MemberRow, ModelRow, SessionAccess, SessionRow, UserRow } from './types.js';
@@ -38,7 +38,18 @@ export function requireUnfrozen(row: Pick<SessionRow, 'repository_mode' | 'repos
   }
 }
 
+/** A recorded pull request URL as lists show it: its number from the last path segment (GitHub, GitLab, Bitbucket, Gitea, Azure). */
+export function sessionPullRequest(url: string | null | undefined): SessionPullRequest | undefined {
+  if (!url) return undefined;
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return undefined; }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return undefined;
+  const number = /\/(\d+)\/?$/.exec(parsed.pathname)?.[1];
+  return { url: parsed.href, ...(number ? { number: Number(number) } : {}) };
+}
+
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
+  const pullRequest = sessionPullRequest(row.pull_request_url);
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
@@ -46,12 +57,13 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     ...(frozenSession(row) ? { frozen: true as const } : {}),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}),
-    ...(row.activity ? { activity: row.activity } : {}) };
+    ...(row.activity ? { activity: row.activity } : {}),
+    ...(pullRequest ? { pullRequest } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity'> {
-  // Visibility is live control-plane policy and activity is what the host reports, so neither is part of the
-  // immutable runner binding.
-  const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, ...record } = sessionRecord(row);
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest'> {
+  // Visibility is live control-plane policy, and activity and the pull request are what the host and pushes report, so
+  // none of them is part of the immutable runner binding.
+  const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, pullRequest: _pullRequest, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {
@@ -75,7 +87,10 @@ type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: W
 
 // Membership, visibility and explicit grants must come from the same policy snapshot. A suspended account opens no
 // session, and nobody opens the sessions it owns, as if it had left the workspace.
-const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role FROM sessions s
+// The newest pull request a push opened or found comes along for session lists and headers.
+const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role,
+  (SELECT pr.pull_request_url FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
+    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_url FROM sessions s
   INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
   INNER JOIN workspace_members owner ON owner.workspace_id = s.workspace_id AND owner.user_id = s.owner_id
   INNER JOIN users actor_user ON actor_user.id = actor.user_id

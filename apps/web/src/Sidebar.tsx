@@ -3,6 +3,7 @@ import type { SessionRecord, Workspace } from "../../../packages/shared/src/type
 import { useApp } from "./app-context";
 import { Icon, Logo } from "./icons";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
+import { PullRequestTag } from "./pull-request";
 import { href, type Route } from "./router";
 import { sessionStatus } from "../../../packages/client/src/session-status";
 import { canCreateSessions } from "../../../packages/shared/src/policy";
@@ -45,9 +46,10 @@ function WorkspaceGroup({ workspace, sessions, route, collapsed, toggle, onNavig
             <StatusDot tone={status.tone} label={status.label ? undefined : session.status} />
             <span className="label">
               <span className="title">{session.title}</span>
-              {(status.label || relation) && <span className="sub">
-                {status.label && <span className={`session-status ${status.tone}`}>{status.label}</span>}
-                {status.label && relation && " · "}{relation}
+              {(status.label || session.pullRequest || relation) && <span className="sub">
+                {[status.label && <span key="status" className={`session-status ${status.tone}`}>{status.label}</span>,
+                  session.pullRequest && <PullRequestTag key="pull" pull={session.pullRequest} />,
+                  relation].filter(Boolean).flatMap((item, index) => index ? [" · ", item] : [item])}
               </span>}
             </span>
             <span className="meta"><RelativeTime value={session.createdAt} /></span>
