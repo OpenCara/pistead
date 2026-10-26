@@ -252,6 +252,43 @@ That makes MXC Seatbelt a candidate for a "sandboxed macOS host" mode that is cl
 better than none. It's a separate decision from the Windows backend, but the same runner-process design would serve
 both.
 
+## Choosing: a package, or our own, across Windows, Linux and macOS
+
+Pistead's requirements, which generic agent sandboxes don't share:
+
+- **reads denied by default**, because members share hosts;
+- **one boundary per session**;
+- **Pistead's own egress proxy as the only way out**, since it carries the Git relay and the owner's access;
+- **resource limits**;
+- **race-free file tools** that run inside the boundary.
+
+| Option | Windows | Linux | macOS | Fit |
+|---|---|---|---|---|
+| `@microsoft/mxc-sdk` | **PSEC (best available)**; AppContainer fallbacks must be refused | bubblewrap, weaker than ours (all of `/etc`, path binds, slirp4netns/iptables, no limits) | Seatbelt, deny-by-default, proxy-port-only egress | Good on Windows, fair on macOS, a step back on Linux. 108 MB package, in-process FFI, 1.0 released 2026-10, no resource limits on any platform |
+| `@anthropic-ai/sandbox-runtime` | alpha: one machine-wide `srt-sandbox` user, admin install, WFP for a port range; **no per-session separation** | bwrap + seccomp, **reads allowed everywhere by default** | `sandbox-exec`, same read-allow default | Built for one developer's CLI. Its own filtering proxy would sit in front of ours (`parentProxy`). Wrong trust model for shared hosts |
+| Codex crates | restricted token / dedicated users / MXC | own bwrap | Seatbelt | Not published as a library, and tied to Codex's protocol types. Reference only |
+| All our own | reimplement PSEC (`processmodel.dll` `CreateProcessSecurityEnvironment` + MXC's FlatBuffer spec, with per-build feature probing) or the dedicated-user design (about 38k lines in Codex) | **already done** (`sandbox.ts`) | a Seatbelt profile is a few hundred lines | Too costly on Windows, cheap elsewhere |
+
+**Decision: own the abstraction, Linux and macOS; borrow only Windows.**
+
+1. **The abstraction is ours: the runner's `Request` protocol.** That's one JSON line in for each of initialize,
+   read, write, list, browse, bash, snapshot and clone-*, run by a per-command helper process the runner launches
+   under that platform's limits. `Sandbox` becomes an interface with one implementation per platform, and
+   `session.ts`, the egress proxy and policy don't change.
+2. **Linux: keep `sandbox.ts`.** It's stronger than every alternative and already in production.
+3. **macOS: write our own Seatbelt profile.** That means `sandbox-exec -p` or a tiny `sandbox_init` launcher, using
+   MXC's documented profile rules as the reference: `(deny default)`, the session root read-write, system paths
+   read-only, `/private/etc` cut down to what tools need, outbound limited to the session's proxy port. It's small,
+   keeps the 108 MB package off Macs, and keeps the profile under our review. MXC's Seatbelt backend is the
+   shortcut if speed matters more.
+4. **Windows: `@microsoft/mxc-sdk`, pinned, PSEC tier only.** It's the only practical way to reach the OS container,
+   used through the per-command runner that sets job limits and refuses other tiers. Don't build the
+   dedicated-account design. Reconsider calling `processmodel.dll` ourselves only if Microsoft documents the PSEC
+   specification and MXC becomes a burden.
+5. **Shared pieces we write once:** per-session proxy ports and peer checks (needed on Windows and macOS, which have no
+   network namespace), platform path rules, and a capability report that says which guarantees each host actually
+   has. A macOS host would report "sandboxed" but without resource limits, and the UI should show that.
+
 ### Phases
 
 1. Run the unsandboxed host on win32: lease, path rules, `HostWorkspace`, `connect-setup` checks.
