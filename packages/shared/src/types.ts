@@ -114,6 +114,11 @@ export interface SessionRecord {
    */
   repositoryMode?: "clone";
   /**
+   * A clone session's own branch, named for its work when it was created (`pistead/<title-slug>-<short id>`; see
+   * sessionBranchName). Absent: `pistead/<session-id>`, for sessions from before named branches or on older connectors.
+   */
+  branch?: string;
+  /**
    * The session pinned its repositories when it started, as sessions did before they cloned them: it stays readable,
    * but runs nothing (no messages, approvals, backups, restores or moves).
    */

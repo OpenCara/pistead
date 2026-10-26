@@ -238,7 +238,7 @@ export class RunnerSession {
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
       this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { egressSocket: this.#egress.socketPath,
-        ...(this.#clone ? { sessionBranch: sessionBranch(binding.session.id) } : {}),
+        ...(this.#clone ? { sessionBranch: sessionBranch(binding.session) } : {}),
         ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
     const report = config.reportActivity;
@@ -252,13 +252,12 @@ export class RunnerSession {
   }
 
   private egressProxy(socketPath: string): EgressProxy {
-    const sessionId = this.binding.session.id;
     return new EgressProxy({
       socketPath,
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
       ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
-      ...(this.#clone ? { sessionBranch: sessionBranch(sessionId) } : {}),
+      ...(this.#clone ? { sessionBranch: sessionBranch(this.binding.session) } : {}),
     });
   }
 
@@ -529,7 +528,7 @@ export class RunnerSession {
         + "and fetch, switch, commit and push as usual. Git uses this host's own network and credentials, and each command waits for approval."
         + (this.#cloneRepositories.length ? `\nThis workspace's repositories: ${this.#cloneRepositories.join(", ")}.` : "");
     } else if (this.#clone) {
-      const branch = sessionBranch(this.binding.session.id);
+      const branch = sessionBranch(this.binding.session);
       instructions += "\n\nTrusted runtime repository context:\n"
         + "The execution root is the isolated session worktree, which starts empty; file-tool paths are relative to it. "
         + "Clone the repositories you need into it with plain Git in bash (for example git clone https://github.com/<owner>/<name>), "

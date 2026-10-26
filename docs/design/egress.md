@@ -29,7 +29,7 @@ The rules this keeps from today:
    authorized for it; sessions borrow its objects through `objects/info/alternates` (a `git` shim adds
    `--reference-if-able` to clones of bound repositories). Keep refs per live session, prune with a grace period,
    `pistead cache add` / `pistead cache prune`. Sparse checkout and partial clone served from the mirror.
-4. **Pushes and durability.** Pushes to the session branch `pistead/<session-id>` go through the proxy without
+4. **Pushes and durability.** Pushes to the session branch (`pistead/<title-slug>-<short id>`) go through the proxy without
    approval; pushes elsewhere need approval. Pull requests, comments and merges keep the broker. Backups and moves
    keep each clone's local work (branches, unpushed commits, uncommitted changes) as a Git bundle and clone the rest
    again. (The first plan pushed a WIP commit to the session branch instead; see below for why it doesn't.)
@@ -183,15 +183,21 @@ which pinned sessions were checked out of until phase 5. Clone sessions borrow f
 
 ## Phase 4: pushing the session branch
 
-A clone session's own branch is `pistead/<session-id>` (`sessionBranch`), given to shell commands as
-`PISTEAD_SESSION_BRANCH`. The agent pushes it with plain Git, without approval; every other branch still goes through
+A clone session's own branch is named for its work when the session is created: `pistead/<title-slug>-<short id>`
+(`sessionBranchName`), for example `pistead/add-dark-mode-toggle-1a2b3c4d5e6f` for a session titled "Add dark mode toggle".
+The slug comes from the title, which the apps take from the first prompt; the first 12 hex digits of the session id (48 random bits) keep
+sessions with the same title apart (the column is unique too). It is stored in `sessions.branch`, is immutable (renaming
+the session doesn't move it) and reaches the host in the runner binding (`session.branch`). A restored or moved
+session gets a branch of its own, never its source's. Sessions from before named branches, and those started on a
+connector that doesn't advertise `sessionBranches`, keep `pistead/<session-id>` (`sessionBranch`). The branch is given
+to shell commands as `PISTEAD_SESSION_BRANCH`. The agent pushes it with plain Git, without approval; every other branch still goes through
 `git_push` and its approval, and so do pull requests (the agent calls `git_push` with the session branch once it has
 pushed it). Pinned sessions push only with `git_push`.
 
 - **In the proxy.** `info/refs?service=git-receive-pack` (`receive-refs`) and `git-receive-pack` (`receive-pack`) of a
   workspace repository are relayed only when the session has a branch. The proxy reads a push's command section
   (`readPushCommands`: pkt-lines up to the first flush, at most 64 KiB) and lets through exactly one command that creates
-  or moves `refs/heads/pistead/<session-id>` (`sessionBranchRefusal`); anything else is answered as a forge answers it
+  or moves `refs/heads/<session branch>` (`sessionBranchRefusal`); anything else is answered as a forge answers it
   (`pushRejection`: `ng <ref> <reason>`, on side-band 1 when negotiated), so Git shows `! [remote rejected] … (reason)`.
   Git's probe before a chunked upload (a lone flush) is answered here. The pack then streams to the control plane as Git
   sends it, up to 2 GiB. Closing the proxy (a session closing, as on a connector reconnect) waits for pushes under way,

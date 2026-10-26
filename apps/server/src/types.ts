@@ -73,6 +73,8 @@ export interface SessionRow {
   repositories_json?: string;
   /** 'clone': no pins; the agent clones the workspace's repositories through the host's egress proxy. */
   repository_mode?: 'clone' | null;
+  /** A clone session's own branch, named when it was created; NULL: pistead/<id>. Immutable. */
+  branch?: string | null;
   visibility?: 'private' | 'workspace';
   /** The status before archiving, restored on unarchive. */
   archived_status?: 'provisioning' | 'ready' | 'error' | null;

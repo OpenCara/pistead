@@ -194,6 +194,22 @@ test("a session that pinned its repositories opens read-only: its history shows,
 
 const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0, timeout: 60_000 };
 
+test("a clone session's binding carries the branch named for its work, and only a well-formed one", () => {
+  const id = "1a2b3c4d-0000-4000-8000-000000000000";
+  const clone = binding(id, []);
+  clone.session.repositoryMode = "clone";
+  clone.session.branch = "pistead/add-dark-mode-1a2b3c4d0000";
+  assert.equal(validateBinding(clone, id).session.branch, "pistead/add-dark-mode-1a2b3c4d0000");
+  for (const branch of ["main", "pistead/add-dark-mode-ffffffffffff", "pistead/Add-dark-mode-1a2b3c4d0000", "pistead/a..b-1a2b3c4d0000", "pistead/x/y-1a2b3c4d0000"]) {
+    clone.session.branch = branch;
+    assert.throws(() => validateBinding(clone, id), runnerError(400, /Invalid session branch/), branch);
+  }
+  // Only a clone session has a branch of its own.
+  const pinned = binding(id);
+  pinned.session.branch = "pistead/add-dark-mode-1a2b3c4d0000";
+  assert.throws(() => validateBinding(pinned, id), runnerError(400, /Invalid session branch/));
+});
+
 test("unsandboxed clone sessions clone and push with the host's own Git, so they offer no git_push", hostMode, async t => {
   const root = await directory(t);
   const clone = binding("host-clone", []);

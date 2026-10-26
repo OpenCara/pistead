@@ -1,6 +1,48 @@
-/** The branch a clone session pushes to without approval, through its host's egress proxy. */
-export function sessionBranch(sessionId: string): string {
-  return `pistead/${sessionId}`;
+/**
+ * The branch a clone session pushes to without approval, through its host's egress proxy: the one named when it was
+ * created (see sessionBranchName), or `pistead/<session-id>` for a session from before that or on an older connector.
+ */
+export function sessionBranch(session: { id: string; branch?: string | null }): string {
+  return session.branch || `pistead/${session.id}`;
+}
+
+/** How many characters of the title a session branch keeps, before its short id. */
+export const SESSION_BRANCH_SLUG_LIMIT = 48;
+/**
+ * How many hex digits of the session id a session branch ends with: 48 random bits of a UUIDv4, so that even the many
+ * sessions sharing a slug (untitled ones are all `session`) practically never collide on the unique sessions.branch.
+ */
+export const SESSION_BRANCH_ID_DIGITS = 12;
+const SESSION_BRANCH = new RegExp(`^pistead/[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{${SESSION_BRANCH_ID_DIGITS}}$`);
+
+/** The session id's part of its branch: its first SESSION_BRANCH_ID_DIGITS hex digits. */
+function sessionBranchId(sessionId: string): string {
+  return sessionId.replace(/[^0-9a-f]/gi, "").slice(0, SESSION_BRANCH_ID_DIGITS).toLowerCase().padEnd(SESSION_BRANCH_ID_DIGITS, "0");
+}
+
+/**
+ * A new session's branch, named for what it works on: `pistead/<title-slug>-<first 12 hex of its id>`, for example
+ * `pistead/add-dark-mode-toggle-1a2b3c4d5e6f`. The short id keeps branches of sessions with the same title apart. A
+ * title with nothing to slug (or the default "Untitled session") gives `pistead/session-<short id>`. Fixed at creation:
+ * renaming the session doesn't move its branch.
+ */
+export function sessionBranchName(title: string, sessionId: string): string {
+  let slug = title.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (slug.length > SESSION_BRANCH_SLUG_LIMIT) {
+    const cut = slug.slice(0, SESSION_BRANCH_SLUG_LIMIT + 1);
+    // Cut at a word boundary when one is near enough, so the name doesn't end mid-word.
+    const boundary = cut.lastIndexOf("-");
+    slug = (boundary >= SESSION_BRANCH_SLUG_LIMIT / 2 ? cut.slice(0, boundary) : cut.slice(0, SESSION_BRANCH_SLUG_LIMIT)).replace(/-+$/, "");
+  }
+  if (!slug || slug === "untitled-session") slug = "session";
+  return `pistead/${slug}-${sessionBranchId(sessionId)}`;
+}
+
+/** Whether `branch` is a branch sessionBranchName could have named, for the session with this id. */
+export function validSessionBranch(branch: unknown, sessionId: string): branch is string {
+  return typeof branch === "string" && branch.length <= "pistead/".length + SESSION_BRANCH_SLUG_LIMIT + 1 + SESSION_BRANCH_ID_DIGITS
+    && SESSION_BRANCH.test(branch) && branch.endsWith(`-${sessionBranchId(sessionId)}`);
 }
 
 /** One ref update of a Git push. A zero `new` deletes the ref; a zero `old` creates it. */

@@ -1,5 +1,7 @@
 import type { AgentVersion, ModelDefinition, Permission, SessionPullRequest, SessionRecord, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
+import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
+import { sessionBranchName } from '../../../packages/shared/src/git-push.js';
 import { hasPermission, normalizePermissions, roleSessionCeiling, sessionCreatorRoles, workspaceSessionPermissions } from '../../../packages/shared/src/policy.js';
 import type { AgentRow, AppContext, Env, MemberRow, ModelRow, SessionAccess, SessionRow, UserRow } from './types.js';
 import { fail, id, now, testMode } from './http.js';
@@ -48,12 +50,22 @@ export function sessionPullRequest(url: string | null | undefined): SessionPullR
   return { url: parsed.href, ...(number ? { number: Number(number) } : {}) };
 }
 
+/**
+ * The own branch of a session restored or moved to a host with these capabilities: named for its work (sessionBranchName)
+ * where the host pushes named branches, otherwise none (pistead/<id>). A successor never takes its source's branch, so
+ * two sessions never push the same one.
+ */
+export function successorBranch(row: Pick<SessionRow, 'id' | 'title' | 'repository_mode'>, capabilities: ConnectorCapabilities): string | null {
+  return row.repository_mode === 'clone' && capabilities.sessionBranches === true ? sessionBranchName(row.title, row.id) : null;
+}
+
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
   const pullRequest = sessionPullRequest(row.pull_request_url);
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
     ...(row.repository_mode === 'clone' ? { repositoryMode: 'clone' as const } : {}),
+    ...(row.repository_mode === 'clone' && row.branch ? { branch: row.branch } : {}),
     ...(frozenSession(row) ? { frozen: true as const } : {}),
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}),
