@@ -56,6 +56,11 @@ export interface ConnectorCapabilities {
    * would restore its other files and drop the clones.
    */
   cloneBackups?: boolean;
+  /**
+   * The connector pushes a clone session's own branch under the name its binding carries (session.branch, named for the
+   * session's work), not only `pistead/<session-id>`. Absent on older connectors, whose sessions keep the old name.
+   */
+  sessionBranches?: boolean;
 }
 
 export interface ConnectorInfo {

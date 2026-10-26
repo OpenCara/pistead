@@ -10,7 +10,7 @@ import { EgressProxy, egressEnvironment, parseEgressGrant, publicAddress, reposi
 import { performClonePush, PushError, pushSummary } from "../apps/runner/src/push.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
 import type { EgressGrant } from "../packages/shared/src/network.js";
-import { parsePushCommands, pushRejection, readPushCommands, sessionBranchRefusal } from "../packages/shared/src/git-push.js";
+import { parsePushCommands, pushRejection, readPushCommands, sessionBranch, sessionBranchName, sessionBranchRefusal, validSessionBranch } from "../packages/shared/src/git-push.js";
 import { hostAllowed, parseNetworkPolicy } from "../packages/shared/src/network.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 import { startGitHttpServer } from "./helpers/git-http.js";
@@ -68,6 +68,25 @@ function tunnel(socketPath: string, target: string): Promise<{ status: number; s
     request.end();
   });
 }
+
+test("session branches are named for the session's work, with a short id", () => {
+  const id = "1A2B3C4D-5e6f-4000-8000-000000000000";
+  assert.equal(sessionBranchName("Add dark mode toggle to settings", id), "pistead/add-dark-mode-toggle-to-settings-1a2b3c4d");
+  assert.equal(sessionBranchName("  Fix: crash on `pistead connect` (#42)!  ", id), "pistead/fix-crash-on-pistead-connect-42-1a2b3c4d");
+  assert.equal(sessionBranchName("Résumé café naïve", id), "pistead/resume-cafe-naive-1a2b3c4d");
+  // Nothing to slug, or the default title: a generic name, still unique.
+  for (const title of ["", "修复登录", "!!!", "Untitled session"]) assert.equal(sessionBranchName(title, id), "pistead/session-1a2b3c4d");
+  // Long titles are cut at a word boundary.
+  const long = sessionBranchName("Refactor the egress proxy so that pushes of the session branch stream without buffering", id);
+  assert.equal(long, "pistead/refactor-the-egress-proxy-so-that-pushes-of-the-1a2b3c4d");
+  assert.equal(sessionBranchName("x".repeat(100), id), `pistead/${"x".repeat(48)}-1a2b3c4d`);
+  for (const title of ["Add dark mode", "", "x".repeat(100), long, "a -- b"]) assert.ok(validSessionBranch(sessionBranchName(title, id), id), title);
+  assert.ok(!validSessionBranch("pistead/add-dark-mode-1a2b3c4d", "ffffffff-0000-4000-8000-000000000000"));
+  // Sessions without a named branch keep pistead/<session-id>.
+  assert.equal(sessionBranch({ id: "s1" }), "pistead/s1");
+  assert.equal(sessionBranch({ id: "s1", branch: null }), "pistead/s1");
+  assert.equal(sessionBranch({ id: "s1", branch: "pistead/add-dark-mode-1a2b3c4d" }), "pistead/add-dark-mode-1a2b3c4d");
+});
 
 test("public addresses exclude the host, its networks and metadata services", () => {
   for (const address of ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946", "8.8.8.8"]) assert.equal(publicAddress(address), true, address);

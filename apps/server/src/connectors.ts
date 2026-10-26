@@ -62,11 +62,13 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
     || (cap.repositoryCache !== undefined && typeof cap.repositoryCache !== 'boolean')
     || (cap.hostMigration !== undefined && typeof cap.hostMigration !== 'boolean')
     || (cap.plainGit !== undefined && typeof cap.plainGit !== 'boolean')
-    || (cap.cloneBackups !== undefined && typeof cap.cloneBackups !== 'boolean') || (cap.cloneBackups && (!cap.plainGit || cap.unsandboxed))) fail(400, 'invalid_manifest', 'Invalid capabilities.');
+    || (cap.cloneBackups !== undefined && typeof cap.cloneBackups !== 'boolean') || (cap.cloneBackups && (!cap.plainGit || cap.unsandboxed))
+    || (cap.sessionBranches !== undefined && typeof cap.sessionBranches !== 'boolean') || (cap.sessionBranches && !cap.plainGit)) fail(400, 'invalid_manifest', 'Invalid capabilities.');
   return { models, capabilities: { platform, sandbox: cap.sandbox, productionShell: cap.productionShell, ...(cap.unsandboxed ? { unsandboxed: true } : {}), ...(cap.chatOptions ? { chatOptions: true } : {}),
     ...(cap.chatImages ? { chatImages: true } : {}), ...(cap.gitProviders ? { gitProviders: true } : {}), ...(cap.gitPush ? { gitPush: true } : {}), ...(cap.gitCredentials ? { gitCredentials: true } : {}),
     ...(cap.github ? { github: true } : {}), ...(cap.githubIssues ? { githubIssues: true } : {}), ...(cap.repositoryCache ? { repositoryCache: true } : {}),
-    ...(cap.hostMigration ? { hostMigration: true } : {}), ...(cap.plainGit ? { plainGit: true } : {}), ...(cap.cloneBackups ? { cloneBackups: true } : {}) } };
+    ...(cap.hostMigration ? { hostMigration: true } : {}), ...(cap.plainGit ? { plainGit: true } : {}), ...(cap.cloneBackups ? { cloneBackups: true } : {}),
+    ...(cap.sessionBranches ? { sessionBranches: true } : {}) } };
 }
 
 function requireConnectorTLS(env: Env, url: URL): void {

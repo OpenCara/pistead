@@ -38,7 +38,7 @@ function settled(body: ReadableStream<Uint8Array>, done: () => void): ReadableSt
 }
 
 /**
- * A clone session's push of its own branch (`pistead/<session-id>`) through its host's egress proxy, without approval:
+ * A clone session's push of its own branch (its `branch`, or `pistead/<session-id>`) through its host's egress proxy, without approval:
  * the ref advertisement (`receive-refs`) and the push itself (`receive-pack`), whose commands may only create or move
  * that branch. The workspace's push identity is minted here and used here; it never reaches the host. The caller has
  * checked the session's authority, its connector and the repository binding, and loaded the owner's account.
@@ -48,7 +48,7 @@ export async function sessionBranchPush(c: AppContext, input: {
   authorize: () => Promise<unknown>;
 }): Promise<Response> {
   const { session, binding, access, service, authorize } = input;
-  const branch = sessionBranch(session.id);
+  const branch = sessionBranch(session);
   const provider = gitProviderNames[binding.provider];
   await requireNoRestore(c, session.id);
   const pin = await cloneSessionRepository(c.env, session, row => row.id === binding.id);

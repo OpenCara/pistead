@@ -841,6 +841,35 @@ test('a clone session pushes its own branch through the egress relay with the pu
   assert.equal(await code(await relay('receive-refs')), 'session_branch_unavailable');
 });
 
+test('a clone session with a branch named for its work pushes that branch, not pistead/<session-id>', async t => {
+  const f = await fixture(t);
+  f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
+    + " DROP TRIGGER sessions_branch_immutable;"
+    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone', branch = 'pistead/fix-login-e0000000' WHERE id = 'session'; COMMIT;");
+  const report = pkt(`\x01${pkt('unpack ok\n')}${pkt('ok refs/heads/pistead/fix-login-e0000000\n')}0000`) + '0000';
+  const forge: string[] = [];
+  const mocked = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (!url.startsWith('https://github.com/owner/repo.git/')) return mocked(input, init);
+    forge.push(init.body ? Buffer.from(await new Response(init.body as BodyInit).arrayBuffer()).toString('latin1') : '');
+    return new Response(report, { headers: { 'Content-Type': 'application/x-git-receive-pack-result' } });
+  };
+  t.after(() => { globalThis.fetch = mocked; });
+  const relay = (body: string) => app.request('/api/internal/git/relay/binding-gh/receive-pack?sessionId=session', { method: 'POST',
+    headers: { Authorization: `Bearer ${internalSecret}`, 'Content-Type': 'application/x-git-receive-pack-request' }, body }, f.env);
+  const command = (ref: string) => pkt(`${'0'.repeat(40)} ${tip} ${ref}\0report-status side-band-64k agent=git/2.43.0\n`) + '0000';
+
+  const refused = await relay(command('refs/heads/pistead/session'));
+  assert.equal(refused.status, 403);
+  assert.equal(await code(refused), 'session_branch_only');
+  const pushed = await relay(command('refs/heads/pistead/fix-login-e0000000') + 'PACK-DATA');
+  assert.equal(pushed.status, 200);
+  assert.deepEqual(forge, [command('refs/heads/pistead/fix-login-e0000000') + 'PACK-DATA']);
+  const audit = f.audits('git.push.session_branch') as { detail_json: string }[];
+  assert.equal(JSON.parse(audit.at(-1)!.detail_json).branch, 'pistead/fix-login-e0000000');
+});
+
 test('a session that pinned its repositories is read-only: it gets no push credential', async t => {
   const f = await fixture(t);
   // Sessions no longer pin, so this one is turned back into one that did.

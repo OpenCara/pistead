@@ -55,7 +55,7 @@ export interface EgressOptions {
    */
   mirror?: (repository: EgressRepository) => Promise<string>;
   /**
-   * The branch this session may push without approval (a clone session's `pistead/<session-id>`); pushes of it are
+   * The branch this session may push without approval (a clone session's own branch, see sessionBranch); pushes of it are
    * relayed to the control plane, which pushes with the workspace's push identity. Without it, every push is refused.
    */
   sessionBranch?: string;
