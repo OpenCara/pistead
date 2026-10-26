@@ -104,6 +104,37 @@ async function chatImages(c: AppContext, row: SessionRow, value: unknown): Promi
   return parsed.images;
 }
 
+/**
+ * Sends a message (`submit`) or side ask to the session's agent as the request's user, who already holds the session
+ * permission for it: the chat box's route, and scheduled prompts (scheduled-prompts.ts) as the session's owner, whose
+ * audit entry names the schedule in `audit`.
+ */
+export async function submitMessage(c: AppContext, row: SessionRow, mode: 'submit' | 'ask', input: Record<string, unknown>,
+  audit: Record<string, unknown> = {}): Promise<SubmitResult> {
+  // Before an admission is issued: a read-only session runs nothing.
+  requireUnfrozen(row);
+  if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
+  const images = await chatImages(c, row, input.images);
+  // A message of images alone has no text.
+  const content = text(input.content, 'content', 60000, images ? 0 : 1);
+  const requestId = text(input.requestId, 'requestId', 128);
+  const options = await chatOptions(c, row, mode, input.options);
+  // A message that names no model must not run on one its host's owner or an admin disabled.
+  await requireEnabledModel(c, row, options);
+  // Said before an admission is issued, in words the sender can act on; the host request is checked again as it goes.
+  if (images && connectorUtf8Bytes(JSON.stringify({ content, requestId, admissionId: 'x'.repeat(43), options, images })) > connectorLimits.requestBytes) {
+    fail(413, 'message_too_large', 'This message and its images are too large to send together. Remove an image or shorten the message.');
+  }
+  const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access, images, options?.autoMerge === true) : undefined;
+  const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}),
+    ...(images ? { images } : {}) }));
+  invalidateSessionView(c, row.id);
+  if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
+  await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}),
+    ...(images ? { images: images.length } : {}), ...audit }).run();
+  return result;
+}
+
 export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
   const [owner, agent] = await Promise.all([
     getUser(c.env, row.owner_id),
@@ -456,31 +487,12 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   for (const mode of ['submit', 'ask'] as const) {
     app.post(`/api/sessions/:id/${mode}`, async c => {
       const { row } = await requireSession(c, identifier(c.req.param('id')), mode === 'ask' ? 'ask' : 'write');
-      // Before an admission is issued: a read-only session runs nothing.
+      // Before the body is read: a read-only session runs nothing.
       requireUnfrozen(row);
       // Pasted images make a message about as large as its host takes in one request; a little more is read, so a message
       // just over that is told why below rather than refused unread.
       const input = await jsonObject(c, connectorLimits.requestBytes + 256 * 1024);
-      if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
-      const images = await chatImages(c, row, input.images);
-      // A message of images alone has no text.
-      const content = text(input.content, 'content', 60000, images ? 0 : 1);
-      const requestId = text(input.requestId, 'requestId', 128);
-      const options = await chatOptions(c, row, mode, input.options);
-      // A message that names no model must not run on one its host's owner or an admin disabled.
-      await requireEnabledModel(c, row, options);
-      // Said before an admission is issued, in words the sender can act on; the host request is checked again as it goes.
-      if (images && connectorUtf8Bytes(JSON.stringify({ content, requestId, admissionId: 'x'.repeat(43), options, images })) > connectorLimits.requestBytes) {
-        fail(413, 'message_too_large', 'This message and its images are too large to send together. Remove an image or shorten the message.');
-      }
-      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access, images, options?.autoMerge === true) : undefined;
-      const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}),
-        ...(images ? { images } : {}) }));
-      invalidateSessionView(c, row.id);
-      if (typeof result?.submissionId !== 'string' || typeof result.conversationId !== 'string' || typeof result.status !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid submission.');
-      await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}),
-        ...(images ? { images: images.length } : {}) }).run();
-      return c.json(result, 202);
+      return c.json(await submitMessage(c, row, mode, input), 202);
     });
   }
 

@@ -82,6 +82,8 @@ export interface SessionRow {
   archived_status?: 'provisioning' | 'ready' | 'error' | null;
   /** What its agent is doing, as its host last reported it; display state only, never part of the runner binding. */
   activity?: SessionActivity | null;
+  /** When its next scheduled prompt runs (scheduled-prompts.ts); display state only, never part of the runner binding. */
+  next_scheduled_at?: string | null;
   /** How its transcript shows tool output to viewers (transcript-display.ts); display only. Absent on older rows: full. */
   tool_output?: 'full' | 'brief';
   /** Only on rows read through session access: the newest pull request a push from this session opened or found. */

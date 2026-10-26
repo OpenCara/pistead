@@ -64,7 +64,7 @@ export function SessionsScreen() {
             const viewerOnly = !isOwner && session.permissions?.includes("read") && session.permissions.every(permission => permission === "read");
             const status = sessionStatus(session);
             return <Row key={session.id} href={href({ name: "session", sessionId: session.id })} chevron
-              leading={<StatusDot tone={status.tone} label={status.label ? undefined : session.status} />}
+              leading={<StatusDot tone={status.tone} icon={status.icon} label={status.label ? undefined : session.status} />}
               title={<span className="truncate">{session.title}</span>}
               hint={<>{status.label && <><span className={`session-status ${status.tone}`}>{status.label}</span> · </>}{session.pullRequest && <><PullRequestTag pull={session.pullRequest} /> · </>}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
           })}
