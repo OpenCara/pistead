@@ -509,6 +509,13 @@ test('session lists show the state the control plane last read for their pull re
   const before = reads();
   stale(); await refreshPullRequestStates(f.env);
   assert.equal(reads(), before, 'merged pull requests are not read again');
+
+  // A github.com URL that names no pull request is never read, nor selected again.
+  f.sqlite.prepare("UPDATE push_credentials SET pull_request_url = 'https://github.com/owner/repo/pulls', pull_request_state = NULL, pull_request_checked_at = NULL WHERE pull_request_url IS NOT NULL").run();
+  const calls = f.calls.length;
+  await refreshPullRequestStates(f.env);
+  assert.equal(f.calls.length, calls);
+  assert.equal(f.ledger().filter(row => row.pull_request_url).at(-1)!.pull_request_checked_at, '9999-12-31T00:00:00.000Z', 'the newest is never stale');
 });
 
 test('token providers mint from the workspace identity and open pull requests with the owner account', async t => {

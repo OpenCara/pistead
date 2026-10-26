@@ -21,6 +21,8 @@ const freshMs = 2 * 60_000;
 const archivedFreshMs = 30 * 60_000;
 /** Pull requests read per sweep, the least recently read first. */
 const sweepLimit = 25;
+/** The read time of a URL that names no github.com pull request: never stale, so no sweep selects it again. */
+const neverStale = '9999-12-31T00:00:00.000Z';
 
 /** owner/name and the number of a github.com pull request URL; undefined for anything else. */
 export function githubPullRequest(url: string): { fullName: string; number: number } | undefined {
@@ -151,6 +153,6 @@ export async function refreshPullRequestStates(env: Env, limit = sweepLimit): Pr
       } catch { /* keep the last state; tried again once it goes stale */ }
     }
     await env.DB.query('UPDATE push_credentials SET pull_request_state = COALESCE(?, pull_request_state), pull_request_checked_at = ? WHERE id = ?')
-      .bind(state, now(), row.id).run();
+      .bind(state, pull ? now() : neverStale, row.id).run();
   }
 }
