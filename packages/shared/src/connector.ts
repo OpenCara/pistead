@@ -83,6 +83,11 @@ export interface ConnectorCapabilities {
    */
   hostGrants?: boolean;
   /**
+   * The connector lists the session worktree's directories and previews its files, read-only, for the session panel's
+   * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
+   */
+  fileBrowser?: boolean;
+  /**
    * The connector runs as its owner and admins configure it in Pistead (HostConfig: command time limit, GPU, Git
    * credentials, repository cache), read from the control plane, rather than by connect options. Absent on older
    * connectors, which keep their options.

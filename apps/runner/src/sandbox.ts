@@ -13,6 +13,7 @@ import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./r
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { CA_BUNDLE, trustedCertificates } from "./trust-store.js";
 import { runHostShell } from "./host-shell.js";
+import { checkedBrowse, type BrowseResult } from "./file-browser.js";
 import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 import { commandLimits, gpuMounts, type CommandLimits } from "./host-config.js";
 
@@ -185,7 +186,7 @@ interface Mounts {
 
 type Request =
   | { kind: "initialize" }
-  | { kind: "read" | "read-content" | "list"; path: string }
+  | { kind: "read" | "read-content" | "list" | "browse"; path: string }
   | { kind: "write"; path: string; content: string }
   | { kind: "snapshot"; clones?: string[] }
   | { kind: "bash"; command: string }
@@ -333,6 +334,89 @@ def read_at(parent, name, limit):
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError('file changed while being read; retry the operation')
         return b''.join(chunks), stat.S_IMODE(before.st_mode) & 0o777
+    finally:
+        os.close(fd)
+
+
+# Mirror fileBrowserLimits in packages/shared/src/types.ts.
+BROWSE_ENTRIES = 1000
+BROWSE_TEXT = 256 * 1024
+BROWSE_IMAGE = 2 * 1024 * 1024
+IMAGE_TYPES = ('image/png', 'image/jpeg', 'image/gif', 'image/gif', 'image/webp')
+
+
+def entry_type(mode):
+    if stat.S_ISDIR(mode):
+        return 'directory'
+    if stat.S_ISREG(mode):
+        return 'file'
+    if stat.S_ISLNK(mode):
+        return 'symlink'
+    return 'other'
+
+
+def browse_directory(directory):
+    # Entries are lstat-ed, never followed: a symlink is listed as one, and opening it resolves it again under parts_for.
+    names = os.listdir(directory)
+    if len(names) > MAX_ENTRIES * 10:
+        raise ValueError('directory has too many entries')
+    entries = []
+    for name in names:
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        kind = entry_type(info.st_mode)
+        entry = {'name': name, 'type': kind}
+        if kind == 'file':
+            entry['size'] = info.st_size
+        entries.append(entry)
+    entries.sort(key=lambda entry: (entry['type'] != 'directory', entry['name']))
+    return {'type': 'directory', 'entries': entries[:BROWSE_ENTRIES], 'total': len(entries), 'truncated': len(entries) > BROWSE_ENTRIES}
+
+
+def read_prefix(fd, limit):
+    chunks, size = [], 0
+    while size < limit:
+        chunk = os.read(fd, min(65536, limit - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b''.join(chunks)
+
+
+def browse_file(parent, name):
+    # O_NONBLOCK keeps a FIFO from blocking the open; only regular files are read.
+    fd = os.open(name, FILE_FLAGS, dir_fd=parent)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return {'type': 'file', 'size': 0, 'truncated': False, 'binary': True}
+        size = info.st_size
+        head = read_prefix(fd, 16)
+        image = next((IMAGE_TYPES[index] for index, signature in enumerate(IMAGE_SIGNATURES)
+                      if all(head[offset:offset + len(part)] == part for offset, part in signature)), None)
+        if image is not None:
+            if size > BROWSE_IMAGE:
+                return {'type': 'file', 'size': size, 'truncated': True, 'binary': True}
+            data = head + read_prefix(fd, BROWSE_IMAGE + 1 - len(head))
+            if len(data) > BROWSE_IMAGE:
+                return {'type': 'file', 'size': size, 'truncated': True, 'binary': True}
+            return {'type': 'file', 'size': size, 'truncated': False, 'image': {'mimeType': image, 'data': base64.b64encode(data).decode('ascii')}}
+        data = head + read_prefix(fd, BROWSE_TEXT + 1 - len(head))
+        truncated = len(data) > BROWSE_TEXT or size > BROWSE_TEXT
+        data = data[:BROWSE_TEXT]
+        if b'\0' in data:
+            return {'type': 'file', 'size': size, 'truncated': truncated, 'binary': True}
+        try:
+            content = data.decode('utf-8')
+        except UnicodeDecodeError as error:
+            # A preview cut inside a multi-byte character ends before it.
+            if not truncated or error.start < len(data) - 3 or error.reason != 'unexpected end of data':
+                return {'type': 'file', 'size': size, 'truncated': truncated, 'binary': True}
+            content = data[:error.start].decode('utf-8')
+        return {'type': 'file', 'size': size, 'truncated': truncated, 'text': content}
     finally:
         os.close(fd)
 
@@ -1016,6 +1100,23 @@ def main():
                         result = {'text': data.decode('utf-8')}
             finally:
                 os.close(parent)
+        elif kind == 'browse':
+            if not parts:
+                result = browse_directory(root)
+            else:
+                parent = walk(root, parts[:-1])
+                try:
+                    info = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        directory = os.open(parts[-1], DIR_FLAGS, dir_fd=parent)
+                        try:
+                            result = browse_directory(directory)
+                        finally:
+                            os.close(directory)
+                    else:
+                        result = browse_file(parent, parts[-1])
+                finally:
+                    os.close(parent)
         elif kind == 'list':
             directory = walk(root, parts)
             try:
@@ -1378,6 +1479,11 @@ export class Sandbox {
   async listFiles(path: string | undefined, authorize: SandboxAuthorize): Promise<string[]> {
     const output = await this.#operation({ kind: "list", path: text(path ?? ".", "path", 1024) }, true, authorize);
     return JSON.parse(output) as string[];
+  }
+
+  /** The file browser's read-only look at one worktree path: a directory's entries or a file's preview. */
+  async browse(path: string, authorize: SandboxAuthorize): Promise<BrowseResult> {
+    return checkedBrowse(JSON.parse(await this.#operation({ kind: "browse", path: text(path, "path", 1024) }, true, authorize)));
   }
 
   async execute(operation: Operation, readOnly: boolean, authorize: SandboxAuthorize, options: SandboxExecutionOptions = {}): Promise<string> {

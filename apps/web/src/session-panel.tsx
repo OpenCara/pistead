@@ -10,6 +10,7 @@ import { MoveHostSection } from "./host-migration";
 import { Icon } from "./icons";
 import { Username, usePeople } from "./people";
 import { RepositoryClonePolicy } from "./repositories";
+import { FilesPanel } from "./session-files";
 import { href } from "./router";
 import {
   Alert, Button, CardBody, Collapsible, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, RelativeTime,
@@ -18,7 +19,7 @@ import {
 import { userIdFromInput, usernameWithId, withUsernames, type Person } from "../../../packages/client/src/usernames";
 
 export type AuditEvent = { id: string; actorId: string; action: string; detail: unknown; createdAt: string };
-export type PanelTab = "details" | "approvals" | "activity";
+export type PanelTab = "details" | "approvals" | "files" | "activity";
 
 /** Session-level mutations reachable from both the header menu and the panel. */
 export interface SessionActions {
@@ -193,6 +194,7 @@ export function SessionPanel(props: PanelProps) {
       <SegmentedControl<PanelTab> size="xs" label="Panel" value={tab} onChange={setTab} options={[
         { value: "details", label: "Details" },
         { value: "approvals", label: pendingCount ? `Approvals ${pendingCount}` : "Approvals" },
+        { value: "files", label: "Files" },
         { value: "activity", label: "Activity" },
       ]} />
       <span className="spacer" />
@@ -206,6 +208,7 @@ export function SessionPanel(props: PanelProps) {
           {!!view?.olderApprovals && <p className="muted small">{olderApprovalsText(view.olderApprovals)}</p>}
         </div>
         : view ? <EmptyState title="No approvals">{AUTO_APPROVED_NOTE}</EmptyState> : <Loading />)}
+      {tab === "files" && <FilesPanel session={props.session} />}
       {tab === "activity" && <Section title="Audit log" action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh activity" title="Refresh" disabled={audit.loading} onClick={audit.refresh} />} bare>
         <ResourceState {...audit} retry={audit.refresh}>
           {!audit.data?.events.length ? <EmptyState title="No activity" /> : <div className="card">
