@@ -370,7 +370,12 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
       AND (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20
       AND EXISTS (SELECT 1 FROM users WHERE id = ? AND (? = 1 OR auth_kind <> 'test')) RETURNING id`)
       .bind(pairingId, ownerId, name, await sha256(code), expires, now(), ownerId, ownerId, ownerId, testMode(c.env) ? 1 : 0).first();
-    if (!created) fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
+    if (!created) {
+      // The write refuses a test user once test mode is off: a refusal, not a limit, so tell them apart.
+      const testUser = await c.env.DB.query('SELECT 1 FROM users WHERE id = ? AND auth_kind = \'test\'').bind(ownerId).first();
+      if (testUser && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Test users can pair hosts only while test mode is on.');
+      fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
+    }
     return c.json({ pairing: { id: pairingId, code, expiresAt: new Date(expires * 1000).toISOString() } }, 201);
   });
   app.get('/api/connectors', async c => {

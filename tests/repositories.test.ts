@@ -518,8 +518,9 @@ test('a claim connects the host privately to every workspace of its owner, and w
   }
   assert.deepEqual((await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${joined.id}/models`))).models, []);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares').get()!.n, 0);
-  // A host paired after its owner left a workspace isn't connected there.
+  // Leaving a workspace takes the owner's hosts with them, and a host paired afterwards isn't connected there.
   assert.equal((await admin.request('DELETE', `/api/workspaces/${team.id}/members/${host.user.id}`)).status, 204);
+  assert.deepEqual(associated(), [own.id, created.id, joined.id].sort());
   const later = await connect(f, host);
   assert.deepEqual(associated(later.connectorId), [own.id, created.id, joined.id].sort());
 });
@@ -544,14 +545,14 @@ test('anyone pairs without a workspace, and only enabled test mode lets a synthe
 });
 
 for (const scoped of [false, true]) {
-  test(`legacy ${scoped ? 'workspace-bound' : 'workspace-free'} pairing rechecks test-mode expiry at the write`, async t => {
+  test(`pairing ${scoped ? 'that names a workspace' : 'without a workspace'} rechecks test-mode expiry at the write, as a refusal rather than a limit`, async t => {
     const f = await fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
     beforeStatement(t, f, /^INSERT INTO connector_pairings\b/, () => {
       f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
     });
     await denied(await owner.request('POST', '/api/connectors/pairings', {
       name: 'Expiring fixture', ...(scoped ? { workspaceId: team.id } : {}),
-    }), 429, 'pairing_limit');
+    }), 403, 'test_mode_disabled');
     assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_pairings').get()!.n, 0);
   });
 }

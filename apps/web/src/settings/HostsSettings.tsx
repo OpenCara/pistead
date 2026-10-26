@@ -7,7 +7,7 @@ import { useApp } from "../app-context";
 import { ConnectionStatus, HostCapabilities, hostTone, useConnections, type ConnectionsResource } from "../hosts";
 import { Icon } from "../icons";
 import { href, navigate } from "../router";
-import { Alert, Button, CardBody, Collapsible, Combobox, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, ResourceState, Row, Section, Sheet, StatusDot, Timestamp, useAction, useResource, type ActionState } from "../ui";
+import { Alert, Button, CardBody, Collapsible, Combobox, confirmDialog, CopyField, EmptyState, Feedback, Field, Loading, ResourceState, Row, Section, Sheet, StatusDot, Timestamp, useAction, useResource, type ActionState } from "../ui";
 import { HostAdminsSection, HostCommandGrantsSection } from "./HostAccess";
 import "./settings.css";
 
