@@ -37,6 +37,7 @@
     --status-warning: #a8700e;
     --status-danger: #c8463b;
     --status-info: #3a74b8;
+    --status-merged: #8250df;
     --dot-success: #2fb36a;
     --dot-warning: #e0a01b;
     --dot-danger: #e5574a;
@@ -67,6 +68,7 @@
     --status-warning: #e2b25a;
     --status-danger: #f0877d;
     --status-info: #7fb0e6;
+    --status-merged: #b79cf5;
     --dot-success: #3fd17f;
     --dot-warning: #f2b438;
     --dot-danger: #ff6b5e;
@@ -329,6 +331,10 @@
   .session-pull > .icon { flex: 0 0 auto; }
   .session-pull-link { margin-right: var(--space-2); color: var(--foreground); text-decoration: none; }
   .session-pull-link:hover { background: var(--surface2); }
+  /* Its state (pull-requests.ts tones): the icon and the word take its color. */
+  .session-pull.success > .icon, .session-pull-link.success > .icon:first-child, .pull-state.success { color: var(--status-success); }
+  .session-pull.danger > .icon, .session-pull-link.danger > .icon:first-child, .pull-state.danger { color: var(--status-danger); }
+  .session-pull.merged > .icon, .session-pull-link.merged > .icon:first-child, .pull-state.merged { color: var(--status-merged); }
 
   /* Page-level alert: quiet tinted border, transparent fill. */
   .alert {

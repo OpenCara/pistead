@@ -22,11 +22,13 @@ import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
 import { mayDecideHostCommands } from './host-access.js';
+import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { invalidateSessionView, sessionView, viewChanges } from './view-feed.js';
 
 /**
- * Per-message model, reasoning and access. The model must be one the session's own host advertises; auto-approve is the
- * owner's alone. The runner re-checks all of it, but only the Worker can say whether the host understands options at all.
+ * Per-message model, reasoning and access. The model must be one the session's own host offers: one it advertises that its
+ * owner or an admin didn't disable. Auto-approve is the owner's alone. The runner re-checks all of it except the disabled
+ * models, which only the Worker knows, and only the Worker can say whether the host understands options at all.
  */
 async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask', value: unknown): Promise<ChatOptions | undefined> {
   if (value === undefined) return undefined;
@@ -49,6 +51,9 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
     const modelId = text(model.modelId, 'modelId', 200);
     const advertised = (JSON.parse(host.models_json) as LocalModelSummary[]).find(item => item.provider === provider && item.modelId === modelId);
     if (!advertised) fail(403, 'model_not_on_host', 'Only models offered by this session\'s host can be chosen.');
+    if (isModelDisabled(await disabledModelKeys(c.env, row.connector_id), advertised)) {
+      fail(403, 'model_disabled', `${advertised.name} is disabled on this session's host. Choose another model.`);
+    }
     if (input.thinkingLevel !== undefined && advertised.thinkingLevels && !advertised.thinkingLevels.includes(input.thinkingLevel as never)) {
       fail(400, 'invalid_options', 'The model does not support this reasoning level.');
     }
@@ -261,7 +266,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
         WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND host_user.suspended_at IS NULL AND association.workspace_id = ?
           AND (host.owner_id = ? OR EXISTS (SELECT 1 FROM connector_shares share
             WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
-          AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id
+          AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id AND ${modelEnabledSQL('host.id', 'm')}
           AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
           AND (? = 0 OR json_type(host.capabilities_json, '$.gitPush') = 'true')
           AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
@@ -398,6 +403,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       const content = text(input.content, 'content', 60000, images ? 0 : 1);
       const requestId = text(input.requestId, 'requestId', 128);
       const options = await chatOptions(c, row, mode, input.options);
+      // A message that names no model must not run on one its host's owner or an admin disabled.
+      await requireEnabledModel(c, row, options);
       // Said before an admission is issued, in words the sender can act on; the host request is checked again as it goes.
       if (images && connectorUtf8Bytes(JSON.stringify({ content, requestId, admissionId: 'x'.repeat(43), options, images })) > connectorLimits.requestBytes) {
         fail(413, 'message_too_large', 'This message and its images are too large to send together. Remove an image or shorten the message.');

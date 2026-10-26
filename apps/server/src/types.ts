@@ -82,6 +82,8 @@ export interface SessionRow {
   activity?: SessionActivity | null;
   /** Only on rows read through session access: the newest pull request a push from this session opened or found. */
   pull_request_url?: string | null;
+  /** Only on rows read through session access: that pull request's state as last read (pull-request-states.ts). */
+  pull_request_state?: string | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;
@@ -101,6 +103,7 @@ export interface PushCredentialRow {
   binding_id: string; operation_json: string; automatic: number; admission_id: string | null; revocation_ciphertext: string | null; expires_at: number;
   created_at: string; completed_at: string | null; outcome: 'pushed' | 'up-to-date' | 'failed' | 'unknown' | null; tip: string | null;
   pull_request_url: string | null;
+  pull_request_state?: string | null; pull_request_checked_at?: string | null;
 }
 export interface SessionAccess { row: SessionRow; permissions: Permission[] }
 export type PublicProfile = UserProfile;

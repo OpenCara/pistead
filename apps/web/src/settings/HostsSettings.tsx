@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import type { ConnectorInfo, ConnectorPairing } from "../../../../packages/shared/src/connector";
+import type { ConnectorInfo, ConnectorPairing, LocalModelSummary } from "../../../../packages/shared/src/connector";
 import type { Workspace } from "../../../../packages/shared/src/types";
 import type { WorkspaceRepositoryList } from "../../../../packages/shared/src/repositories";
+import { modelKey } from "../../../../packages/client/src/chat-options";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { ConnectionStatus, HostCapabilities, hostTone, useConnections, type ConnectionsResource } from "../hosts";
@@ -20,6 +21,17 @@ const workspacesHref = (workspaceId?: string) => href(workspaceId ? { name: "set
 
 function count(value: number, singular: string, plural: string) {
   return `${value} ${value === 1 ? singular : plural}`;
+}
+
+/** Orders strings by UTF-16 code unit: the same order in every browser and locale, unlike localeCompare. */
+function byCodeUnit(a: string, b: string) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** The models a host offers, and how many more its owner or an admin disabled. */
+function modelCount(connector: ConnectorInfo) {
+  const disabled = connector.disabledModels?.length ?? 0;
+  return `${count(connector.models.length, "model", "models")}${disabled ? `, ${disabled} disabled` : ""}`;
 }
 
 /** Repository gate for sharing: work needs a bound repository wherever the server requires one. */
@@ -43,7 +55,7 @@ export function HostsSettings({ id }: { id?: string }) {
         {empty ? <EmptyState title="No hosts yet" action={pair} /> : hosts.map(connector => <Row key={connector.id}
           leading={<StatusDot tone={hostTone(connector)} />}
           title={connector.name}
-          hint={`${connector.role === "admin" ? `${connector.ownerName}'s host, you are an admin · ` : ""}${count(connector.models.length, "model", "models")} · ${connector.workspaceIds.length ? `Shared with ${count(connector.workspaceIds.length, "workspace", "workspaces")}` : "Private"}`}
+          hint={`${connector.role === "admin" ? `${connector.ownerName}'s host, you are an admin · ` : ""}${modelCount(connector)} · ${connector.workspaceIds.length ? `Shared with ${count(connector.workspaceIds.length, "workspace", "workspaces")}` : "Private"}`}
           trailing={<ConnectionStatus connector={connector} />}
           href={href({ name: "settings", section: "hosts", id: connector.id })}
           chevron />)}
@@ -78,7 +90,7 @@ function WorkspaceSharedHosts({ workspace, userId, report }: { workspace: Worksp
     hint={`${connector.ownerName} · ${workspace.name}`}
     trailing={<ConnectionStatus connector={connector} />}>
     <HostCapabilities connector={connector} />
-    <span className="small muted">{connector.models.length ? connector.models.map(model => model.name).join(", ") : "No models advertised"}</span>
+    <span className="small muted">{connector.models.length ? connector.models.map(model => model.name).join(", ") : "No models offered"}</span>
   </Collapsible>)}</>;
 }
 
@@ -204,11 +216,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       </div>
       <HostCapabilities connector={connector} />
     </Section>
-    <Section title="Models" info="Models configured in Pi on this host. Configure providers and models in Pi on the host; credentials never leave it.">
-      {connector.models.length
-        ? connector.models.map(model => <Row key={`${model.provider}:${model.modelId}`} title={model.name} hint={`${model.provider} / ${model.modelId}`} />)
-        : <Row title="No models advertised" hint="Configure models in Pi on the host" />}
-    </Section>
+    <ModelsSection connector={connector} refresh={refresh} />
     <Section title="Sharing" bare info="Sharing with a workspace is optional and lets its members run their own sessions on this host; you will see their prompts and repository snapshots. Agents, session permissions and GitHub credentials are not shared, and personal Pi history is never imported.">
       <div className="card">
         {!associated.length && <Row title="Not in any workspace yet" hint="Create or join a workspace to use this host there" />}
@@ -249,6 +257,38 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       </div>
     </Sheet>}
   </>;
+}
+
+/** The models Pi on the host offers; its owner and admins choose which of them it offers to sessions. */
+function ModelsSection({ connector, refresh }: { connector: ConnectorInfo; refresh: () => void }) {
+  const action = useAction();
+  const disabled = new Set((connector.disabledModels ?? []).map(modelKey));
+  // One list, sorted by provider and then model id, so a model keeps its place as it moves between offered and disabled.
+  const models = [...connector.models, ...(connector.disabledModels ?? [])]
+    .sort((a, b) => byCodeUnit(a.provider, b.provider) || byCodeUnit(a.modelId, b.modelId));
+  const manage = Boolean(connector.role) && !connector.revokedAt;
+  function setEnabled(model: LocalModelSummary, enabled: boolean) {
+    if (action.busy || !manage) return;
+    void action.run(async () => {
+      await api(`/api/connectors/${segment(connector.id)}/models`, { method: "PATCH", body: { provider: model.provider, modelId: model.modelId, enabled } });
+      refresh();
+    }, enabled ? `${model.name} enabled.` : `${model.name} disabled. No new session or message can use it.`);
+  }
+  return <Section title="Models" bare info={<div className="stack">
+    <p>The models Pi on this host offers. Configure providers and models in Pi on the host; credentials never leave it.</p>
+    <p>The owner and admins can disable a model: no session starts from it and no message switches to it, for everyone who uses this host, the owner included, in every workspace. Sessions already on it keep their history and continue on another model.</p>
+  </div>}>
+    <div className="card">
+      {models.length
+        ? models.map(model => <Row key={modelKey(model)} title={model.name} hint={`${model.provider} / ${model.modelId}`}
+          trailing={<label className="inline small" title="Sessions can start from this model and messages can switch to it">
+            <input type="checkbox" className="checkbox" checked={!disabled.has(modelKey(model))} disabled={!manage || action.busy}
+              onChange={event => setEnabled(model, event.target.checked)} />Enabled
+          </label>} />)
+        : <Row title="No models advertised" hint="Configure models in Pi on the host" />}
+    </div>
+    <Feedback error={action.error} notice={action.notice} />
+  </Section>;
 }
 
 function ShareRow({ connector, available, busy, run, refresh }: { connector: ConnectorInfo; available: Workspace[]; busy: boolean; run: ActionState["run"]; refresh: () => void }) {

@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
-const hostConfigMigration = '0029_host_configuration.sql';
+const hostConfigMigration = '0031_host_configuration.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 
 function migrate(sqlite: DatabaseSync, files: string[]) {
@@ -21,7 +21,7 @@ test('hosts started with --git-credentials or --repo-cache keep them once config
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec('PRAGMA foreign_keys = ON');
   assert.ok(migrationFiles.includes(hostConfigMigration));
-  assert.ok(readdirSync(new URL('../apps/server/migrations/postgres/', import.meta.url)).includes('0022_host_configuration.sql'), 'Postgres has the same migration');
+  assert.ok(readdirSync(new URL('../apps/server/migrations/postgres/', import.meta.url)).includes('0024_host_configuration.sql'), 'Postgres has the same migration');
   migrate(sqlite, migrationFiles.filter(file => file < hostConfigMigration));
   const capabilities = (extra: object) => JSON.stringify({ platform: 'linux', sandbox: false, productionShell: false, gitPush: true, ...extra });
   sqlite.exec(`INSERT INTO users (id, display_name, git_name, git_email, auth_kind, created_at)

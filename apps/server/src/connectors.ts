@@ -17,6 +17,7 @@ import { connectorRestoreDownload } from './restore-routes.js';
 import { legacyRepositoryFixture, requireConfiguredWorkspace } from './repositories.js';
 import { connectorAdmins, connectorHostGrants, managedConnector, requireManagedWorkspace, viewerHostCommands } from './host-access.js';
 import { connectorHostConfig } from './host-config.js';
+import { disabledModelKeys, hostModelSettings } from './host-models.js';
 
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
@@ -189,8 +190,8 @@ async function ownedConnector(c: AppContext): Promise<ConnectorRow> {
 
 type ConnectorInfoRow = ConnectorRow & { owner_name?: string; workspace_ids?: string; connected_workspace_ids?: string };
 /**
- * Who reads the listing: `role` adds the host's admins and host command grants for its owner and admins; `workspaceId`
- * adds the viewer's own host command authority there.
+ * Who reads the listing: `role` adds the host's admins, host command grants and disabled models for its owner and
+ * admins; `workspaceId` adds the viewer's own host command authority there. Everyone is shown only the models it offers.
  */
 type InfoViewer = { userId: string; role?: 'owner' | 'admin'; workspaceId?: string };
 async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewer): Promise<ConnectorInfo> {
@@ -210,9 +211,10 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
       online = await env.CONNECTOR_HUB.status(row.id, 2000);
     } catch { /* Offline is safe metadata; do not expose transport errors. */ }
   }
-  const [admins, grants, config, hostCommandAccess, memberships] = await Promise.all([
+  const [admins, grants, disabled, config, hostCommandAccess, memberships] = await Promise.all([
     viewer?.role ? connectorAdmins(env, row.id) : undefined,
     viewer?.role ? connectorHostGrants(env, row.id) : undefined,
+    disabledModelKeys(env, row.id),
     viewer?.role ? connectorHostConfig(env, row.id) : undefined,
     viewer?.workspaceId ? viewerHostCommands(env, row, viewer.workspaceId, viewer.userId) : undefined,
     // An admin sees the owner's workspaces only where they are a member too.
@@ -221,10 +223,11 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
   ]);
   const visible = (workspaceId: string) => !memberships || memberships.has(workspaceId);
   const hostGrants = grants?.filter(grant => visible(grant.workspaceId));
+  const { models, disabledModels } = hostModelSettings(JSON.parse(row.models_json), disabled);
   return { id: row.id, ownerId: row.owner_id, ownerName, name: row.name,
-    createdAt: row.created_at, revokedAt: row.revoked_at, online, models: JSON.parse(row.models_json),
+    createdAt: row.created_at, revokedAt: row.revoked_at, online, models,
     workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities: JSON.parse(row.capabilities_json),
-    ...(viewer?.role ? { role: viewer.role, admins, hostGrants, config } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}) };
+    ...(viewer?.role ? { role: viewer.role, admins, hostGrants, disabledModels, config } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}) };
 }
 
 async function connectorInfos(env: Env, rows: ConnectorInfoRow[], viewer?: (row: ConnectorInfoRow) => InfoViewer): Promise<ConnectorInfo[]> {
@@ -484,6 +487,7 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
       c.env.DB.query('DELETE FROM connector_workspaces WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('DELETE FROM connector_host_grants WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('DELETE FROM connector_admins WHERE connector_id = ?').bind(row.id),
+      c.env.DB.query('DELETE FROM connector_disabled_models WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('UPDATE models SET available = 0 WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('UPDATE sessions SET policy_version = policy_version + 1 WHERE connector_id = ?').bind(row.id),
     ]);

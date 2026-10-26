@@ -198,6 +198,14 @@ An offline host's page in **Settings → Hosts** has **Reconnect**, which shows 
 
 A host offers the models matched by `enabledModels` in Pi's `settings.json` (the same patterns Pi uses for model cycling, such as `"anthropic/*"`), or every authenticated Pi model when that list is unset; `--model PROVIDER/MODEL` (repeatable) overrides both. A host offers at most 200 models. Each model starts at the reasoning level Pi gives it; see [Chat options](#chat-options).
 
+The host's owner and its [admins](#host-admins-and-host-command-grants) can also turn models off without touching the machine: under **Settings → Hosts →** the host **→ Models**, clear a model's **Enabled** box. Disabling a model applies to everyone who uses the host, the owner included, in every workspace, and takes effect at once:
+
+- It leaves every model picker, and no session starts from it or moves onto it. Only the host's **Models** section still lists it, to its owner and admins.
+- No message switches to it. Sessions already on it keep their history and continue on another model; while the host has a disabled model, each message names the model it runs on, as the apps always do, so a conversation still on a disabled model asks you to choose another.
+- A message already running on it when it is disabled runs to its end.
+
+The setting stays with the host until someone enables the model again, even if Pi on the host stops offering the model for a while. Disabling a model doesn't change Pi's own configuration on the host.
+
 Sessions on a host also follow two more of its Pi settings:
 
 - **Compaction**: `compaction` (`enabled`, `reserveTokens`, `keepRecentTokens`) decides when a long conversation is summarized, and `compaction.modelOverrides` sets the token values per exact `provider/modelId`, so a session that switches between a small-window and a large-window model compacts in time for each. Pi's defaults apply where these are unset.
@@ -215,16 +223,16 @@ This is how a team shares one model subscription or set of API keys. Sign Pi in 
 - As the host's operator, you can see the prompts and repository files of every session that runs on it. Members starting a session on someone else's host confirm they trust it (**I trust …'s host**).
 - **Settings → Hosts → Shared with you** lists the hosts others shared into your workspaces.
 
-The host's page shows its **Status** (online or offline, owner, capabilities), **Models**, **Sharing**, **[Configuration](#host-configuration)**, **Host command access**, **Admins**, **Details** (the connection ID) and **Danger zone**. **Revoke host** disconnects it and blocks work in every workspace, your own sessions included; session records are kept, and the machine needs a new pairing to come back.
+The host's page shows its **Status** (online or offline, owner, capabilities), **Models** (where its owner and admins [enable or disable](#models) each one), **Sharing**, **[Configuration](#host-configuration)**, **Host command access**, **Admins**, **Details** (the connection ID) and **Danger zone**. **Revoke host** disconnects it and blocks work in every workspace, your own sessions included; session records are kept, and the machine needs a new pairing to come back.
 
 #### Host admins and host command grants
 
-By default only a host's owner manages its sharing and decides its `host_bash` commands, which run outside the sandbox on their machine. The owner can hand some of that out on the host's page:
+By default only a host's owner manages its sharing and models and decides its `host_bash` commands, which run outside the sandbox on their machine. The owner can hand some of that out on the host's page:
 
-- **Admins**: **Add admin** makes another member of a workspace the host is connected to an admin. Admins share and unshare the host, in workspaces they and the owner both belong to, and give or remove host command grants, but hold no host command access themselves unless a grant gives it to them. Only the owner adds or removes admins, reconnects, revokes or removes the host; an admin can **Step down**.
+- **Admins**: **Add admin** makes another member of a workspace the host is connected to an admin. Admins share and unshare the host, in workspaces they and the owner both belong to, give or remove host command grants, and [enable or disable its models](#models) for everyone who uses it, but hold no host command access themselves unless a grant gives it to them. Only the owner adds or removes admins, reconnects, revokes or removes the host; an admin can **Step down**.
 - **Host command access**: in a workspace the host is shared with, grant one member or **All members** either **Approve host commands** (they decide each host command in sessions they can approve) or **Auto-approve host commands** (their own **Auto-approve** messages also run host commands without asking). A grant can expire after a day, a week or a month, or never. It ends when it expires, when an owner or admin removes it, or when the host stops being shared there. Viewers can't hold one.
 
-The host asks the control plane who holds which grant each time a host command is created, decided or run, so a grant that ends stops working at the next command. Grants need a connector advertising `hostGrants`; until it is updated, only the owner decides host commands. Every admin and grant change is recorded in the audit log.
+The host asks the control plane who holds which grant each time a host command is created, decided or run, so a grant that ends stops working at the next command. Grants need a connector advertising `hostGrants`; until it is updated, only the owner decides host commands. Every admin, grant and model change is recorded in the audit log.
 
 #### Host configuration
 
@@ -315,7 +323,7 @@ The Mac app's **This Mac** runs the same connector; see [iPhone, iPad and Mac ap
 
 ### Models and tools
 
-You can use the models of your own hosts and of hosts shared with the workspace. A session starts from a host and one of its models, and its agent gets every tool that host supports, with no extra instructions. The access you choose for each message (see [Chat options](#chat-options)) decides what runs without asking.
+You can use the models of your own hosts and of hosts shared with the workspace, except those the host's owner or an admin [disabled](#models). A session starts from a host and one of its models, and its agent gets every tool that host supports, with no extra instructions. The access you choose for each message (see [Chat options](#chat-options)) decides what runs without asking.
 
 The tools an agent can use:
 
@@ -374,7 +382,7 @@ The host can stop a message too. When the host crashes (rather than stopping its
 
 Beside the composer you can pick, for each message:
 
-- **Model**: any model the session's host offers.
+- **Model**: any model the session's host offers and hasn't [disabled](#models).
 - **Reasoning**: Off, Minimal, Low, Medium, High, Extra high or Max, as the model supports. A model starts at the level Pi on the host gives it: the level in its `enabledModels` pattern (such as `"anthropic/*:high"`), else its entry in `modelThinkingLevels`, else `defaultThinkingLevel`, else medium.
 - **Access** (shared messages only):
 
@@ -482,7 +490,7 @@ Agents commit with Git itself, as the session owner's Git identity, and push com
 - To tag a release, the agent checks out a commit that is already on a branch (main, say) and calls `git_push {directory, branch, tag}`. That creates the lightweight tag `refs/tags/<tag>` at the commit and moves no branch. Before pushing, Pistead confirms against the remote that the branch reaches the commit, and that the tag doesn't exist yet. Tags are never moved or replaced, a tag push opens no pull request, and the default-branch setting below doesn't apply because no branch moves. Plain `git push` of a tag is refused, like any ref other than the session branch.
 - The approval shows the repository, the clone's directory if any, the branch, the tag if any and the exact commit.
 - Pushes are fast-forward only and never forced; a branch that moved elsewhere is refused.
-- The agent can also ask for a pull request, which Pistead opens as the session owner with their connected account.
+- The agent can also ask for a pull request, which Pistead opens as the session owner with their connected account. Session lists and the session header then show the session's newest pull request with its state: **Draft**, **Open**, **CI failed** (a check run or commit status of its head failed), **Changes requested** (a reviewer's latest review asks for changes), **Merged** or **Closed**. Pistead reads the state in the background with the session owner's GitHub account, about every two minutes (every 30 minutes for archived sessions), and stops once the pull request is merged or closed. Only github.com pull requests show a state so far.
 - Before each push, Pistead checks with the session owner's own account that they may push to the repository and, where the Git host reports it, to that branch; GitHub protected branches are refused. For a tag, it checks that they may push to the repository (on Azure DevOps, that they may create that tag); tag rules on the Git host (GitHub rulesets, GitLab and Gitea protected tags) apply to the push identity's push, and its bypass list too. Owners and admins can forbid pushes to a repository's default branch by clearing **Allow agent pushes to the default branch**.
 - The connector holds the push credential in memory only and talks to the Git host directly; the sandbox never sees it.
 

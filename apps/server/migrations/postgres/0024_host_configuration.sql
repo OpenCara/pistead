@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0029_host_configuration.sql.
+-- Postgres translation of sqlite/0031_host_configuration.sql.
 
 -- How a host runs its sessions, set in Pistead by its owner and admins instead of connector options (HostConfig in
 -- packages/shared/src/host-config.ts). No row means the defaults. Connectors that take their configuration from Pistead
