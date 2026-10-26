@@ -61,9 +61,12 @@ export function OwnJoinRequests() {
       resource.refresh();
     }, "Request withdrawn.");
   }
-  if (!requests.length && !action.notice) return null;
+  // A failed load shows its error, so it never looks like there is nothing to withdraw.
+  if (!requests.length && !action.notice && !resource.error) return null;
   return <Section title="Your requests to join" info="Workspaces you asked to join through an invite link. An owner or admin of each accepts or declines you.">
-    {!requests.length
+    {resource.error && !requests.length
+      ? <CardBody><Alert variant="error" title="Could not load your requests" actions={<Button size="sm" onClick={resource.refresh}>Try again</Button>}>{resource.error}</Alert></CardBody>
+      : !requests.length
       ? <CardBody><span className="muted">You aren't waiting to join any workspace</span></CardBody>
       : requests.map(request => <Row key={request.workspaceId} title={request.workspaceName} hint={<>Waiting for approval · asked <RelativeTime value={request.createdAt} /></>}
         trailing={<Button variant="outline" size="sm" disabled={action.busy} aria-label={`Withdraw request to join ${request.workspaceName}`} onClick={() => void withdraw(request)}>Withdraw</Button>} />)}

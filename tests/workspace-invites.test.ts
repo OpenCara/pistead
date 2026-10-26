@@ -208,7 +208,7 @@ test('the pending queue is bounded', async t => {
     insertRequest.run(team.id, `test:filler-${index}`, at);
   }
   await denied(await ask(late, token), 409, 'too_many_pending');
-  // Waiting requests count until someone decides them, also after a link change; declining one makes room.
+  // Waiting requests count until someone decides them; declining one makes room.
   await json(await owner.request('DELETE', `/api/workspaces/${team.id}/join-requests/${encodeURIComponent('test:filler-0')}`));
   await json(await ask(late, token), 201);
 });
