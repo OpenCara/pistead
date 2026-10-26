@@ -267,6 +267,10 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         WHERE workspace_id = ? AND ? = 1 AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
         .bind(workspaceId, previous ? 1 : 0, auditId),
       membersStatement(c.env, workspaceId, actorId),
+      // Someone added directly no longer waits to join through the invite link.
+      c.env.DB.query<never>(`DELETE FROM workspace_join_requests WHERE workspace_id = ? AND user_id = ?
+        AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, targetId, auditId),
       // A member's own hosts follow them into the workspace, for their private use only: sharing stays the owner's choice.
       ...ownerHostStatements(c.env, targetId, workspaceId),
     ]);
