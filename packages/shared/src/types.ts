@@ -130,7 +130,7 @@ export interface SessionRecord {
 export interface SessionGrant {
   userId: string;
   permissions: Permission[];
-  /** The grantee's workspace role; absent from older servers. */
+  /** The grantee's workspace role (for the first entry, the session owner's); absent from older servers. */
   workspaceRole?: WorkspaceRole;
   /** The session tier the permissions are exactly (see sessionRoles in policy.ts); null for a custom grant. Absent from older servers. */
   sessionRole?: SessionRole | null;

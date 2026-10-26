@@ -729,7 +729,9 @@ test('session roles: an owner gives a member one of four tiers, capped by their 
   // The listing names each grantee's workspace role and tier; a grant matching no tier is custom (null).
   const listed = (await (await owner.request('GET', grants)).json() as { grants: { userId: string; sessionRole: string | null; workspaceRole?: string }[] }).grants;
   const tier = (client: { user: { id: string } }) => listed.find(grant => grant.userId === client.user.id);
-  assert.deepEqual(tier(owner), { userId: owner.user.id, permissions: ['read', 'ask', 'write', 'approve', 'manage'], sessionRole: 'admin' });
+  assert.deepEqual(tier(owner), { userId: owner.user.id, permissions: ['read', 'ask', 'write', 'approve', 'manage'], workspaceRole: 'owner', sessionRole: 'admin' });
+  assert.equal(listed[0]?.userId, owner.user.id, 'the owner comes first');
+  assert.equal(listed.length, 5, 'members without a grant are not listed');
   assert.equal(tier(member)?.sessionRole, 'admin');
   assert.equal(tier(viewer)?.sessionRole, 'viewer');
   assert.equal(tier(viewer)?.workspaceRole, 'viewer');

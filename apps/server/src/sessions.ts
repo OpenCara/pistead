@@ -478,10 +478,14 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
 
   app.get('/api/sessions/:id/grants', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
-    const result = await c.env.DB.query<{ user_id: string; permissions_json: string; role: WorkspaceRole }>(`SELECT g.user_id, g.permissions_json, m.role
-      FROM session_grants g
-      INNER JOIN workspace_members m ON m.workspace_id = ? AND m.user_id = g.user_id WHERE g.session_id = ?`)
-      .bind(row.workspace_id, row.id).all();
+    // The grantees and the owner, with each one's workspace role, read together.
+    const rows = await c.env.DB.query<{ user_id: string; permissions_json: string | null; role: WorkspaceRole }>(`SELECT m.user_id, g.permissions_json, m.role
+      FROM workspace_members m
+      LEFT JOIN session_grants g ON g.session_id = ? AND g.user_id = m.user_id
+      WHERE m.workspace_id = ? AND (g.user_id IS NOT NULL OR m.user_id = ?)`)
+      .bind(row.id, row.workspace_id, row.owner_id).all();
+    const ownerRole = rows.find(g => g.user_id === row.owner_id)?.role;
+    const result = rows.filter((g): g is typeof g & { permissions_json: string } => g.permissions_json !== null);
     // A grant shows what it allows: a viewer's (one demoted after it was granted) is capped at read, as sessionAccess caps it.
     const effective = (grant: { permissions_json: string; role: WorkspaceRole }) => {
       const ceiling = roleSessionCeiling(grant.role);
@@ -489,7 +493,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     };
     // Each grant also names the grantee's workspace role and the session tier it is, so a client offers only the tiers
     // that fit; a grant that matches no tier (one from before tiers) is custom (null).
-    return c.json({ grants: [{ userId: row.owner_id, permissions: [...permissions], sessionRole: sessionRoleOf(permissions) }, ...result.filter(g => g.user_id !== row.owner_id)
+    return c.json({ grants: [{ userId: row.owner_id, permissions: [...permissions], ...(ownerRole ? { workspaceRole: ownerRole } : {}), sessionRole: sessionRoleOf(permissions) }, ...result.filter(g => g.user_id !== row.owner_id)
       .map(g => { const held = effective(g); return { userId: g.user_id, permissions: held, workspaceRole: g.role, sessionRole: sessionRoleOf(held) }; })] });
   });
   app.post('/api/sessions/:id/grants', async c => {
