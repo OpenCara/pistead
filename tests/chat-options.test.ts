@@ -27,8 +27,10 @@ test("a message waits for a model its host offers, once the conversation's own o
   assert.match(modelUnavailable(offering, { model: { provider: "p", modelId: "deep" }, access: "approval" }) ?? "", /Bob's Pi no longer offers deep\. Choose another model/);
   // Without a model the message runs on the conversation's own one, which the server checks.
   assert.equal(modelUnavailable(offering, { access: "approval" }), undefined);
-  // A host that offers none runs nothing; one that can't switch models, or isn't known yet, is left to the server.
-  assert.match(modelUnavailable({ ...offering, models: [] }, { model: fast, access: "approval" }) ?? "", /offers no models right now/);
+  // A host that offers none runs nothing, whether Pi on it offers none or each one is disabled, so it says neither.
+  assert.equal(modelUnavailable({ ...offering, models: [] }, { model: fast, access: "approval" }), "Bob's Pi offers no models right now.");
+  assert.equal(modelUnavailable({ ...offering, models: [] }, { access: "approval" }), "Bob's Pi offers no models right now.");
+  // One that can't switch models, or isn't known yet, is left to the server.
   assert.equal(modelUnavailable({ ...offering, capabilities: {} } as unknown as ConnectorInfo, { model: { provider: "p", modelId: "deep" }, access: "approval" }), undefined);
   assert.equal(modelUnavailable(undefined, { model: fast, access: "approval" }), undefined);
 });

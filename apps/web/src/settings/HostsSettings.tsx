@@ -22,6 +22,11 @@ function count(value: number, singular: string, plural: string) {
   return `${value} ${value === 1 ? singular : plural}`;
 }
 
+/** Orders strings by UTF-16 code unit: the same order in every browser and locale, unlike localeCompare. */
+function byCodeUnit(a: string, b: string) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /** The models a host offers, and how many more its owner or an admin disabled. */
 function modelCount(connector: ConnectorInfo) {
   const disabled = connector.disabledModels?.length ?? 0;
@@ -256,9 +261,9 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
 function ModelsSection({ connector, refresh }: { connector: ConnectorInfo; refresh: () => void }) {
   const action = useAction();
   const disabled = new Set((connector.disabledModels ?? []).map(modelKey));
-  // One list in the connector's own order (by provider, then model), so a model keeps its place as it is switched.
+  // One list, sorted by provider and then model id, so a model keeps its place as it moves between offered and disabled.
   const models = [...connector.models, ...(connector.disabledModels ?? [])]
-    .sort((a, b) => a.provider.localeCompare(b.provider) || a.modelId.localeCompare(b.modelId));
+    .sort((a, b) => byCodeUnit(a.provider, b.provider) || byCodeUnit(a.modelId, b.modelId));
   const manage = Boolean(connector.role) && !connector.revokedAt;
   function setEnabled(model: LocalModelSummary, enabled: boolean) {
     if (action.busy || !manage) return;
