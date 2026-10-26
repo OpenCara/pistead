@@ -67,9 +67,9 @@ export interface ConnectorCapabilities {
    */
   conversationBackups?: boolean;
   /**
-   * The connector runs the session owner's GitHub comments and issues under Auto-approve, and merges when the message
-   * also chose auto-merge, through the control plane with the message's admission. Absent on older connectors, which
-   * still ask for each.
+   * The connector runs the session owner's GitHub comments, issues and merges under Auto-approve, through the control
+   * plane with the message's admission; merges only in a message the control plane marked `autoMerge`, as it marks each
+   * Auto-approve message to such a host (see ChatOptions). Absent on older connectors, which still ask for each.
    */
   automaticGitHub?: boolean;
   /**

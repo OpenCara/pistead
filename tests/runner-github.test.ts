@@ -386,7 +386,7 @@ test("on someone else's host, a member granted host commands decides their own, 
   });
 });
 
-test("the owner's Auto-approve posts comments and opens issues at once with its admission, and merges only with auto-merge", hostMode, async t => {
+test("the owner's Auto-approve posts comments, opens issues and merges at once with its admission, merging in a message marked autoMerge", hostMode, async t => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-auto-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const comments: unknown[] = []; const issues: GitHubIssueRequest[] = []; const merges: GitHubMergeRequest[] = [];
@@ -416,8 +416,10 @@ test("the owner's Auto-approve posts comments and opens issues at once with its 
   const session = await service.provision(target, await ticket(target.session.id, "create"));
 
   const admissionId = await sha256("github auto admission");
+  // Unmarked, as an older control plane sends Auto-approve unless its owner also chose Auto-merge (and would refuse an
+  // automatic merge): the comment and the issue ran at once, authorized by the message's admission, never a capability;
+  // the merge waits.
   await session.submit(await ticket(target.session.id, "submit"), { content: "Comment, file and merge.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
-  // The comment and the issue ran at once, authorized by the message's admission, never a capability; the merge waits.
   const card = await pendingApproval(session);
   assert.equal(card.operation.kind, "github.merge");
   assert.equal(comments.length, 1);
@@ -435,7 +437,7 @@ test("the owner's Auto-approve posts comments and opens issues at once with its 
   await idle(session);
   assert.equal(merges.length, 0);
 
-  // With auto-merge as well, the merge runs at once too.
+  // Marked, as the control plane now marks every Auto-approve message to a host like this one, the merge runs at once too.
   const mergeAdmission = await sha256("github auto-merge admission");
   await session.submit(await ticket(target.session.id, "submit"), { content: "Merge it.", requestId: "auto-merge", admissionId: mergeAdmission, options: { access: "auto", autoMerge: true } }, "write");
   await idle(session);
@@ -445,7 +447,7 @@ test("the owner's Auto-approve posts comments and opens issues at once with its 
   const merged = (await session.view()).approvals.find(approval => approval.operation.kind === "github.merge" && approval.automatic);
   assert.equal(merged?.status, "executed");
 
-  // Auto-merge only adds to Auto-approve.
+  // The mark never comes without Auto-approve.
   await assert.rejects(session.submit(await ticket(target.session.id, "submit"), { content: "Merge?", requestId: "asking-merge", admissionId: await sha256("asking"), options: { access: "approval", autoMerge: true } }, "write"),
     (error: unknown) => error instanceof RunnerError && error.status === 422);
 });

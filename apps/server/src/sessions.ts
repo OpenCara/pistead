@@ -38,7 +38,8 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
   const host = await c.env.DB.query<{ models_json: string; capabilities_json: string }>('SELECT models_json, capabilities_json FROM connectors WHERE id = ? AND revoked_at IS NULL')
     .bind(row.connector_id).first();
   if (!host) fail(409, 'connector_unavailable', 'The session\'s host is no longer available.');
-  if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).chatOptions !== true) {
+  const capabilities = JSON.parse(host.capabilities_json) as ConnectorCapabilities;
+  if (capabilities.chatOptions !== true) {
     fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to choose model, reasoning or access.');
   }
   const options: ChatOptions = {};
@@ -63,18 +64,12 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
     if (input.access === 'auto' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can auto-approve commands.');
     options.access = input.access as ChatOptions['access'];
   }
-  // Auto-merge is a separate opt-in on top of the owner's Auto-approve, which only connectors that run GitHub effects
-  // automatically understand. `false` is the same as leaving it out.
-  if (input.autoMerge !== undefined) {
-    if (typeof input.autoMerge !== 'boolean') fail(400, 'invalid_options', 'Invalid auto-merge choice.');
-    if (input.autoMerge) {
-      if (options.access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
-      if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).automaticGitHub !== true) {
-        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to auto-approve GitHub merges.');
-      }
-      options.autoMerge = true;
-    }
-  }
+  // Auto-approve covers merges too. Hosts that run GitHub effects automatically (`automaticGitHub`) merge without asking
+  // only in a message marked `autoMerge`, as when that was the owner's separate opt-in, and the broker only for an
+  // admission marked so (see issueRunAdmission): every Auto-approve message to such a host is. Older hosts would refuse
+  // the option. Apps from when it was an opt-in still send their choice, which changes nothing.
+  if (input.autoMerge !== undefined && typeof input.autoMerge !== 'boolean') fail(400, 'invalid_options', 'Invalid chat options.');
+  if (options.access === 'auto' && capabilities.automaticGitHub === true) options.autoMerge = true;
   return options;
 }
 

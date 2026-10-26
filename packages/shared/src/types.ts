@@ -260,7 +260,8 @@ export interface GitHubIssueOperation {
 }
 /**
  * How a GitHub effect is authorized: `capability`, minted when a human approved it, or `admissionId`, the session owner's
- * Auto-approve message whose tool call it is (merges also need that message's `autoMerge`). Exactly one is set.
+ * Auto-approve message whose tool call it is (merges also need its `autoMerge`, which the control plane sets on every
+ * Auto-approve message to a host with `automaticGitHub`). Exactly one is set.
  */
 export type GitHubEffectAuthority = { capability: string; admissionId?: undefined } | { admissionId: string; capability?: undefined };
 /** Runner -> control plane: open one issue, human-approved or under the owner's Auto-approve. */
@@ -323,7 +324,7 @@ export interface GitHubReadRequest {
   repository: string;
   issue: number;
 }
-/** Runner -> control plane: perform one merge, human-approved or under the owner's Auto-approve with auto-merge. */
+/** Runner -> control plane: perform one merge, human-approved or under the owner's Auto-approve. */
 export type GitHubMergeRequest = GitHubEffectAuthority & {
   sessionId: string;
   actorId: string;
@@ -619,7 +620,7 @@ export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh
 export type ThinkingLevel = (typeof thinkingLevels)[number];
 /**
  * read: inspect only, no edits or commands. approval: every command and commit needs a human decision. auto: the owner's
- * commands, commits, pushes, GitHub comments and issues run immediately (merges too with `autoMerge`).
+ * commands, commits, pushes, GitHub comments, issues and merges run immediately.
  */
 export const accessModes = ["read", "approval", "auto"] as const;
 export type AccessMode = (typeof accessModes)[number];
@@ -629,8 +630,10 @@ export interface ChatOptions {
   thinkingLevel?: ThinkingLevel;
   access?: AccessMode;
   /**
-   * With `access` auto only: the agent's GitHub merges run without asking too. A separate opt-in, since a merge changes
-   * a shared branch. Only hosts with `automaticGitHub` take it.
+   * With `access` auto only: the agent's GitHub merges run without asking too. Set by the control plane, not chosen: it
+   * marks every Auto-approve message to a host with `automaticGitHub`, whose connector merges without asking only in a
+   * message marked so (other hosts don't take it). Older control planes mark only the messages whose owner also chose
+   * Auto-merge, then a separate opt-in, and refuse other automatic merges.
    */
   autoMerge?: boolean;
 }
