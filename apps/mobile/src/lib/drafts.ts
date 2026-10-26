@@ -15,3 +15,11 @@ export function saveDraft(sessionId: string, text: string) {
 export function readDraft(sessionId: string): string {
   return drafts.get(sessionId) ?? "";
 }
+
+/**
+ * Forgets a draft that was just sent, unless it has been edited since. Done directly, not through the chat box's state:
+ * the box may have unmounted (another session opened) while the message was in flight.
+ */
+export function forgetSentDraft(sessionId: string, sent: string) {
+  if (drafts.get(sessionId) === sent) drafts.delete(sessionId);
+}

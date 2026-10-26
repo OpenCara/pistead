@@ -16,7 +16,7 @@ import type {} from "../../../../packages/shared/src/sharing";
 import type { ApprovalRecord, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
-import { readDraft, saveDraft } from "../lib/drafts";
+import { forgetSentDraft, readDraft, saveDraft } from "../lib/drafts";
 import { useKeyboardVisible, useOpenSession } from "../lib/layout";
 import { useLiveSession } from "../lib/live-session";
 import { PeopleProvider, useUsername, useWorkspacePeople } from "../lib/people";
@@ -332,6 +332,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
       if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
+      // Also cleared directly: the box may have unmounted, another session opened, while the message was in flight.
+      forgetSentDraft(id, sent);
       setContent(current => current === sent ? "" : current);
       request.current = null;
       refresh();
@@ -452,7 +454,8 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
         throw reason;
       }
       request.current = null;
-      setContent("");
+      forgetSentDraft(id, sent);
+      setContent(current => current === sent ? "" : current);
       recovered();
     });
   }

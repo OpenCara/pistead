@@ -9,10 +9,13 @@ export function readDraft(sessionId: string): string {
   try {
     const stored = localStorage.getItem(key(sessionId));
     if (stored !== null) return stored;
-    // A hand-over written by an earlier version of the app to sessionStorage.
+    // A hand-over written by an earlier version of the app to sessionStorage: moved, never dropped, so a render React
+    // discards cannot lose it.
     const legacy = sessionStorage.getItem(key(sessionId));
+    if (legacy === null) return "";
+    localStorage.setItem(key(sessionId), legacy);
     sessionStorage.removeItem(key(sessionId));
-    return legacy ?? "";
+    return legacy;
   } catch { return ""; }
 }
 
@@ -22,4 +25,14 @@ export function writeDraft(sessionId: string, text: string) {
     if (text) localStorage.setItem(key(sessionId), text);
     else localStorage.removeItem(key(sessionId));
   } catch { /* Storage unavailable: the draft lives only while the session is open. */ }
+}
+
+/**
+ * Forgets a draft that was just sent, unless it has been edited since. Done directly, not through the chat box's state:
+ * the box may have unmounted (another session opened) while the message was in flight.
+ */
+export function forgetSentDraft(sessionId: string, sent: string) {
+  try {
+    if (localStorage.getItem(key(sessionId)) === sent) localStorage.removeItem(key(sessionId));
+  } catch { /* Storage unavailable: nothing was remembered. */ }
 }

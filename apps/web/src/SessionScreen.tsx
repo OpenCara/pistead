@@ -10,7 +10,7 @@ import {
   accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, modelUnavailable, mustConfirmAutoApprove, rememberChat,
   type ChatSelection,
 } from "./chat-options";
-import { readDraft, writeDraft } from "./drafts";
+import { forgetSentDraft, readDraft, writeDraft } from "./drafts";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -393,6 +393,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
       if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
+      // Also cleared directly: the box may have unmounted, another session opened, while the message was in flight.
+      forgetSentDraft(id, sent);
       setContent(current => current === sent ? "" : current);
       attachments.sent(pasted);
       request.current = null;
@@ -547,7 +549,8 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
         throw reason;
       }
       request.current = null;
-      setContent("");
+      forgetSentDraft(id, sent);
+      setContent(current => current === sent ? "" : current);
       recovered();
     });
   }
