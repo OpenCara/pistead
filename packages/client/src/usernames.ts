@@ -4,6 +4,8 @@ import type { WorkspaceRole } from "../../shared/src/types";
 export interface Person {
   id: string;
   githubLogin?: string | null;
+  /** Their role in the workspace, when they are known as one of its members. */
+  role?: WorkspaceRole;
 }
 
 /** A workspace member as `GET /api/workspaces/:id/members` lists them. */
@@ -15,7 +17,7 @@ export interface WorkspaceMember {
 }
 
 export function memberPerson(member: WorkspaceMember): Person {
-  return { id: member.userId, githubLogin: member.githubLogin };
+  return { id: member.userId, githubLogin: member.githubLogin, role: member.role };
 }
 
 /** A person's username: their GitHub login, or their user ID when they have none. */
