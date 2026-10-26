@@ -152,7 +152,7 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
       <div className="card">
         <ResourceState loading={loading} error={error} retry={refresh}>
           {!repositories?.length
-            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
+            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
             : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<>{gitProviderLabel(repository.provider, repository.host)} · <code>{repository.ref}</code></>} trailing={<>
               <label className="inline small"><input type="checkbox" className="checkbox" checked={!repository.forbidDefaultBranchPush} disabled={!admin || action.busy} onChange={event => setPushPolicy(repository, event.target.checked)} />Allow agent pushes to the default branch</label>
               <label className="inline small" title="Sessions download this repository's Git LFS files instead of checking out pointer files"><input type="checkbox" className="checkbox" checked={repository.lfs} disabled={!admin || action.busy} onChange={event => setLfs(repository, event.target.checked)} />Git LFS</label>

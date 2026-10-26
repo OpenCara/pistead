@@ -119,11 +119,11 @@ async function member(owner: Client, workspaceId: string, client: Client, role =
 async function bindRepository(actor: Client, workspaceId: string, input = repositoryInput) {
   return (await json<{ repository: WorkspaceRepository }>(await actor.request('POST', `/api/workspaces/${workspaceId}/repositories`, input), 201)).repository;
 }
-async function pair(host: Client, workspaceId: string) {
-  return (await json<{ pairing: ConnectorPairing }>(await host.request('POST', '/api/connectors/pairings', { name: 'Repository host', workspaceId }), 201)).pairing;
+async function pair(host: Client) {
+  return (await json<{ pairing: ConnectorPairing }>(await host.request('POST', '/api/connectors/pairings', { name: 'Repository host' }), 201)).pairing;
 }
-async function connect(f: Fixture, host: Client, workspaceId: string, claim: object = manifest): Promise<Connected> {
-  const pending = await pair(host, workspaceId);
+async function connect(f: Fixture, host: Client, claim: object = manifest): Promise<Connected> {
+  const pending = await pair(host);
   const { credentials } = await json<{ credentials: ConnectorCredentials }>(await f.request('POST',
     `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...claim }), 201);
   const connectionToken = token();
@@ -195,7 +195,7 @@ async function connectedSetup(t: TestContext) {
   const team = await workspace(admin);
   await member(admin, team.id, host); await member(admin, team.id, owner);
   const repository = await bindRepository(admin, team.id);
-  const connector = await connect(f, host, team.id);
+  const connector = await connect(f, host);
   // This fixture intentionally runs another member's session on the host.
   await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
@@ -450,17 +450,21 @@ for (const change of ['identity', 'test-mode'] as const) {
   });
 }
 
-test('real users still require configured workspaces for pairing, claim, share and session creation in testMode', async t => {
+test('real users pair a host without any workspace, but still need configured workspaces to share and start sessions in testMode', async t => {
   const s = await connectedSetup(t); const empty = await workspace(s.owner);
   const health = await json<{ testMode: boolean }>(await s.f.request('GET', '/api/health'));
   assert.equal(health.testMode, true);
-  await denied(await s.owner.request('POST', '/api/connectors/pairings', { name: 'Empty workspace', workspaceId: empty.id }), 409, 'workspace_repositories_required');
+  // A workspace named by an older page is ignored: the pairing binds none, even an unconfigured one.
+  const ignored = (await json<{ pairing: ConnectorPairing }>(await s.owner.request('POST', '/api/connectors/pairings', { name: 'Empty workspace', workspaceId: empty.id }), 201)).pairing;
+  assert.equal(s.f.sqlite.prepare('SELECT workspace_id FROM connector_pairings WHERE id = ?').get(ignored.id)!.workspace_id, null);
   const hostEmpty = await workspace(s.host);
   await denied(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/shares/${hostEmpty.id}`), 409, 'workspace_repositories_required');
-  const pending = await pair(s.host, s.team.id);
+  const pending = await pair(s.host);
   assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/repositories/${s.repository.id}`)).status, 204);
-  await denied(await s.f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 409, 'workspace_repositories_required');
-  assert.equal(s.f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
+  const { credentials } = await json<{ credentials: ConnectorCredentials }>(await s.f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 201);
+  const associations = s.f.sqlite.prepare('SELECT workspace_id FROM connector_workspaces WHERE connector_id = ? ORDER BY workspace_id').all(credentials.connectorId);
+  assert.deepEqual(associations.map(row => row.workspace_id), [s.team.id, hostEmpty.id].sort());
+  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE connector_id = ?').get(credentials.connectorId)!.n, 0);
   await denied(await s.owner.request('POST', '/api/sessions', s.input), 409, 'workspace_repositories_required');
   assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
   assert.equal(s.provisions.length, 0);
@@ -483,37 +487,49 @@ test('testMode does not let a real user start an unconnected faux-model session'
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n, 0);
 });
 
-test('configured pairing claims privately associate and import models, but lost membership leaves a pairing unused', async t => {
+test('a claim connects the host privately to every workspace of its owner, and workspaces they create or join later get it too', async t => {
   const f = await fixture(t); github(t);
   const admin = await f.client('admin'); const host = await f.client('host');
   const team = await workspace(admin);
   await member(admin, team.id, host);
   await bindRepository(admin, team.id);
-  const connector = await connect(f, host, team.id);
-  const s = { f, admin, host, team, connector };
-  const shares = f.sqlite.prepare('SELECT workspace_id FROM connector_shares WHERE connector_id = ?').all(connector.connectorId);
-  assert.deepEqual(shares, []);
-  const associations = f.sqlite.prepare('SELECT workspace_id FROM connector_workspaces WHERE connector_id = ?').all(connector.connectorId);
-  assert.deepEqual(associations.map(row => row.workspace_id), [team.id]);
-  const models = f.sqlite.prepare('SELECT connector_owner_id, provider, model_id FROM models WHERE connector_id = ?').all(connector.connectorId);
-  assert.equal(models.length, 1);
-  assert.equal(models[0].connector_owner_id, host.user.id);
-  assert.equal(models[0].provider, manifest.models[0].provider);
-  assert.equal(models[0].model_id, manifest.models[0].modelId);
+  const own = await workspace(host);
+  const connector = await connect(f, host);
+  const associated = (connectorId = connector.connectorId) => f.sqlite.prepare('SELECT workspace_id FROM connector_workspaces WHERE connector_id = ? ORDER BY workspace_id')
+    .all(connectorId).map(row => row.workspace_id);
+  assert.deepEqual(f.sqlite.prepare('SELECT workspace_id FROM connector_shares WHERE connector_id = ?').all(connector.connectorId), []);
+  assert.deepEqual(associated(), [team.id, own.id].sort());
+  const models = f.sqlite.prepare('SELECT workspace_id, connector_owner_id, provider, model_id FROM models WHERE connector_id = ? ORDER BY workspace_id').all(connector.connectorId);
+  assert.deepEqual(models.map(row => row.workspace_id), [team.id, own.id].sort());
+  for (const model of models) {
+    assert.equal(model.connector_owner_id, host.user.id);
+    assert.equal(model.provider, manifest.models[0].provider);
+    assert.equal(model.model_id, manifest.models[0].modelId);
+  }
   assert.equal((await json<{ models: ModelDefinition[] }>(await host.request('GET', `/api/workspaces/${team.id}/models`))).models.length, 1);
   assert.deepEqual((await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${team.id}/models`))).models, []);
-  const pending = await pair(s.host, s.team.id);
-  assert.equal((await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/members/${s.host.user.id}`)).status, 204);
-  await denied(await s.f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 404, 'not_found');
-  assert.equal(s.f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(pending.id)!.claimed_at, null);
-  assert.equal(s.f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+  // A workspace the owner creates, or joins, afterwards gets their host too: privately, with its models.
+  const created = await workspace(host);
+  const joined = await workspace(admin);
+  await member(admin, joined.id, host);
+  assert.deepEqual(associated(), [team.id, own.id, created.id, joined.id].sort());
+  for (const workspaceId of [created.id, joined.id]) {
+    assert.equal((await json<{ models: ModelDefinition[] }>(await host.request('GET', `/api/workspaces/${workspaceId}/models`))).models.length, 1);
+  }
+  assert.deepEqual((await json<{ models: ModelDefinition[] }>(await admin.request('GET', `/api/workspaces/${joined.id}/models`))).models, []);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares').get()!.n, 0);
+  // A host paired after its owner left a workspace isn't connected there.
+  assert.equal((await admin.request('DELETE', `/api/workspaces/${team.id}/members/${host.user.id}`)).status, 204);
+  const later = await connect(f, host);
+  assert.deepEqual(associated(later.connectorId), [own.id, created.id, joined.id].sort());
 });
 
-test('only explicitly enabled synthetic fixtures can claim a legacy workspace-free pairing', async t => {
+test('anyone pairs without a workspace, and only enabled test mode lets a synthetic user claim', async t => {
   const f = await fixture(t); const synthetic = await f.client('synthetic', false); const real = await f.client('real');
-  assert.equal((await real.request('POST', '/api/connectors/pairings', { name: 'No workspace' })).status, 400);
-  const pending = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Legacy fixture' }), 201)).pairing;
-  const other = (await json<{ pairing: ConnectorPairing }>(await synthetic.request('POST', '/api/connectors/pairings', { name: 'Disabled fixture' }), 201)).pairing;
+  const unbound = await pair(real);
+  await json(await f.request('POST', `/api/connectors/pairings/${unbound.id}/claim`, { code: unbound.code, ...manifest }), 201);
+  const pending = await pair(synthetic);
+  const other = await pair(synthetic);
   await json(await f.request('POST', `/api/connectors/pairings/${pending.id}/claim`, { code: pending.code, ...manifest }), 201);
   f.env.TEST_AUTH_ENABLED = 'false';
   f.env.APP_ORIGIN = 'https://workspace.example.test';
@@ -523,7 +539,8 @@ test('only explicitly enabled synthetic fixtures can claim a legacy workspace-fr
   }, f.env);
   await denied(response, 403, 'invalid_pairing');
   assert.equal(f.sqlite.prepare('SELECT claimed_at FROM connector_pairings WHERE id = ?').get(other.id)!.claimed_at, null);
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 1);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connectors').get()!.n, 2);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_workspaces').get()!.n, 0);
 });
 
 for (const scoped of [false, true]) {
@@ -541,7 +558,7 @@ for (const scoped of [false, true]) {
 
 test('legacy pairing claim rechecks test-mode expiry without consuming its code', async t => {
   const f = await fixture(t); const owner = await f.client('synthetic', false); const team = await workspace(owner);
-  const pending = await pair(owner, team.id);
+  const pending = await pair(owner);
   beforeStatement(t, f, /^INSERT INTO connectors\b/, () => {
     f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
   });
@@ -556,14 +573,14 @@ test('legacy pairing claim rechecks test-mode expiry without consuming its code'
 test('legacy sharing rechecks test-mode expiry before sharing an unconfigured workspace', async t => {
   const f = await fixture(t); const owner = await f.client('synthetic', false);
   const existing = await workspace(owner); const target = await workspace(owner);
-  const connector = await connect(f, owner, existing.id);
+  const connector = await connect(f, owner);
   beforeStatement(t, f, /^INSERT INTO connector_shares\b/, () => {
     f.env.TEST_AUTH_EXPIRES_AT = new Date(Date.now() - 1000).toISOString();
   });
   await denied(await owner.request('PUT', `/api/connectors/${connector.connectorId}/shares/${target.id}`), 409, 'share_unavailable');
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE workspace_id = ?').get(target.id)!.n, 0);
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_workspaces WHERE workspace_id = ?').get(target.id)!.n, 0);
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM models WHERE workspace_id = ?').get(target.id)!.n, 0);
+  // The owner's own workspace has their host privately, as it has since the claim; only the share is refused.
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_workspaces WHERE workspace_id = ?').get(target.id)!.n, 1);
 });
 
 function pausedArchive() {
@@ -725,7 +742,7 @@ async function providerSetup(t: TestContext, claim: object = providerManifest) {
   await connectGitea(admin); await connectGitea(owner);
   const repository = await bindRepository(admin, team.id, giteaInput);
   assert.deepEqual(remote.calls.at(-1), { url: giteaRepository, authorization: `token ${giteaToken(admin)}`, redirect: 'manual' });
-  const connector = await connect(f, host, team.id, claim);
+  const connector = await connect(f, host, claim);
   await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
   const { models } = await json<{ models: ModelDefinition[] }>(await owner.request('GET', `/api/workspaces/${team.id}/models`));
   const provisions = provisionHub(f);
@@ -1079,7 +1096,7 @@ test('every session clones: older connectors are refused, and a session whose ag
   await bindRepository(admin, team.id);
   provisionHub(f);
   const host = async (capabilities: Record<string, unknown>, shared: boolean) => {
-    const connector = await connect(f, admin, team.id, { models: manifest.models, capabilities: { ...manifest.capabilities, ...capabilities } });
+    const connector = await connect(f, admin, { models: manifest.models, capabilities: { ...manifest.capabilities, ...capabilities } });
     if (shared) await json(await admin.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
     return connector;
   };

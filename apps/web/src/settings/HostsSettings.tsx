@@ -12,7 +12,7 @@ import { HostAdminsSection, HostCommandGrantsSection } from "./HostAccess";
 import "./settings.css";
 
 const hostsInfo = <>
-  Hosts are the Pis you pair. A paired host runs a dedicated app runtime for your own use and stays private to you until you share it with a workspace. Whoever operates a host sees the prompts and repository files processed on it, including private source, but never receives a GitHub token. Model credentials stay in Pi on the host. Status refreshes every 10 seconds.
+  Hosts are the Pis you pair. A paired host is yours, not a workspace's: it runs a dedicated app runtime you can use in every workspace you belong to, and stays private to you until you share it with one. Whoever operates a host sees the prompts and repository files processed on it, including private source, but never receives a GitHub token. Model credentials stay in Pi on the host. Status refreshes every 10 seconds.
 </>;
 
 const workspacesHref = (workspaceId?: string) => href(workspaceId ? { name: "settings", section: "workspaces", id: workspaceId } : { name: "settings", section: "workspaces" });
@@ -21,7 +21,7 @@ function count(value: number, singular: string, plural: string) {
   return `${value} ${value === 1 ? singular : plural}`;
 }
 
-/** Repository gate shared by pairing and sharing: work needs a bound repository wherever the server requires one. */
+/** Repository gate for sharing: work needs a bound repository wherever the server requires one. */
 function useRepositoryGate(workspace: Workspace | null) {
   const repositories = useResource<WorkspaceRepositoryList>(workspace ? `/api/workspaces/${segment(workspace.id)}/repositories` : null);
   const listed = !repositories.loading && !repositories.error ? repositories.data : null;
@@ -83,9 +83,6 @@ function WorkspaceSharedHosts({ workspace, userId, report }: { workspace: Worksp
 
 function PairHostSheet({ onClose, refresh }: { onClose: () => void; refresh: () => void }) {
   const { workspaces, currentWorkspace } = useApp();
-  const [workspaceId, setWorkspaceId] = useState(currentWorkspace?.id ?? "");
-  const workspace = workspaces.find(item => item.id === workspaceId) ?? null;
-  const repositories = useRepositoryGate(workspace);
   const [name, setName] = useState("");
   const [pairing, setPairing] = useState<ConnectorPairing | null>(null);
   const [expired, setExpired] = useState(false);
@@ -98,18 +95,13 @@ function PairHostSheet({ onClose, refresh }: { onClose: () => void; refresh: () 
     const timer = window.setTimeout(() => { setPairing(null); setExpired(true); }, delay);
     return () => window.clearTimeout(timer);
   }, [pairing]);
-  function chooseWorkspace(value: string) {
-    setWorkspaceId(value);
-    setPairing(null);
-    setExpired(false);
-  }
   function create(event?: FormEvent) {
     event?.preventDefault();
-    if (!workspace || !repositories.configured || action.busy || !name.trim()) return;
+    if (action.busy || !name.trim()) return;
     setPairing(null);
     setExpired(false);
     void action.run(async () => {
-      const result = await api<{ pairing: ConnectorPairing }>("/api/connectors/pairings", { method: "POST", body: { name: name.trim(), workspaceId: workspace.id } });
+      const result = await api<{ pairing: ConnectorPairing }>("/api/connectors/pairings", { method: "POST", body: { name: name.trim() } });
       if (mounted.current) setPairing(result.pairing);
     });
   }
@@ -118,32 +110,25 @@ function PairHostSheet({ onClose, refresh }: { onClose: () => void; refresh: () 
     refresh();
     onClose();
   }
+  const sessionWorkspace = currentWorkspace ?? workspaces[0] ?? null;
   const createLabel = action.busy ? "Creating code..." : pairing ? "Create another code" : "Create pairing code";
   const footer = pairing
-    ? <><Button variant="outline" disabled={action.busy || !name.trim() || !repositories.configured} onClick={() => create()}>{createLabel}</Button><Button variant="default" onClick={done}>Done</Button></>
-    : <Button variant="default" disabled={action.busy || !name.trim() || !repositories.configured} onClick={() => create()}>{createLabel}</Button>;
+    ? <><Button variant="outline" disabled={action.busy || !name.trim()} onClick={() => create()}>{createLabel}</Button><Button variant="default" onClick={done}>Done</Button></>
+    : <Button variant="default" disabled={action.busy || !name.trim()} onClick={() => create()}>{createLabel}</Button>;
   return <Sheet open wide title="Pair a host" onClose={onClose} footer={footer}>
     <div className="stack">
-      {!workspaces.length ? <Alert variant="warning" title="No workspaces yet" actions={<LinkButton variant="outline" size="sm" href={workspacesHref()}>Set up a workspace</LinkButton>}>Create or join a workspace with at least one bound repository before pairing.</Alert> : <>
-        <div className="field"><span className="field-label">Workspace</span><Combobox label="Workspace" placeholder="Choose a workspace" value={workspace?.id ?? ""} options={workspaces.map(item => ({ value: item.id, label: item.name }))} onChange={chooseWorkspace} disabled={action.busy} /></div>
-        {workspace && <ResourceState {...repositories} retry={repositories.refresh}>
-          {!repositories.configured
-            ? <Alert variant="warning" title={`No repositories in ${workspace.name}`} actions={<><LinkButton variant="outline" size="sm" href={workspacesHref(workspace.id)}>Set up repositories</LinkButton><Button variant="ghost" size="sm" icon="refresh" disabled={repositories.loading || action.busy} onClick={repositories.refresh}>Refresh</Button></>}>An owner or admin must bind a repository before you can pair.</Alert>
-            : <span className="small muted" role="status">{count(repositories.data?.repositories.length ?? 0, "repository", "repositories")} configured in {workspace.name}</span>}
-        </ResourceState>}
-      </>}
       <form onSubmit={create}>
-        <Field label="Host name" hint={`The host stays private to you in ${workspace?.name ?? "the chosen workspace"} until you share it`}>
+        <Field label="Host name" hint="The host is yours: you can use it in every workspace you belong to, and it stays private to you until you share it with one">
           <input className="input" required maxLength={120} autoComplete="off" value={name} onChange={event => setName(event.target.value)} placeholder="My Linux workstation" />
         </Field>
       </form>
       <Feedback {...action} />
       {expired && <Alert variant="warning" role="status" title="Pairing code expired">The code was cleared. Create a new code to try again.</Alert>}
       {pairing && <section className="stack" aria-label="One-time pairing instructions">
-        <span role="status">Code ready for {workspace?.name}. Expires <Timestamp value={pairing.expiresAt} /></span>
+        <span role="status">Code ready. Expires <Timestamp value={pairing.expiresAt} /></span>
         <Field label="Run this on your host"><CopyField value={`npx pistead@latest connect --server ${window.location.origin} --pairing-id ${pairing.id}`} label="Copy command" /></Field>
         <Field label="Paste at the hidden prompt, not on the command line"><CopyField value={pairing.code} label="Copy code" /></Field>
-        <span className="small muted">Single-use secret: don't share it. It is held only in this page's memory. Hiding it doesn't revoke it; an unused code stays tied to {workspace?.name} until it expires.{workspace && <> Once the host is online, <a href={href({ name: "new", workspaceId: workspace.id })}>start a session</a> with one of its models.</>}</span>
+        <span className="small muted">Single-use secret: don't share it. It is held only in this page's memory. Hiding it doesn't revoke it; an unused code stays valid until it expires.{sessionWorkspace && <> Once the host is online, <a href={href({ name: "new", workspaceId: sessionWorkspace.id })}>start a session</a> with one of its models.</>}</span>
       </section>}
       <Collapsible plain title="Host requirements">
         <span className="small">Linux or WSL2 (native Windows is unsupported) with Node.js 24, Pi configured there with its providers and models, and bubblewrap, Python 3, Git and flock installed.</span>
@@ -225,7 +210,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
     </Section>
     <Section title="Sharing" bare info="Sharing with a workspace is optional and lets its members run their own sessions on this host; you will see their prompts and repository snapshots. Agents, session permissions and GitHub credentials are not shared, and personal Pi history is never imported.">
       <div className="card">
-        {!associated.length && <Row title="No connected workspaces reported" />}
+        {!associated.length && <Row title="Not in any workspace yet" hint="Create or join a workspace to use this host there" />}
         {associated.map(workspaceId => {
           const shared = connector.workspaceIds.includes(workspaceId);
           return <Row key={workspaceId} title={workspaceNames.get(workspaceId) ?? workspaceId} hint={shared ? "Shared with members" : owner ? "Private: your use only" : "Private: the owner's use only"}

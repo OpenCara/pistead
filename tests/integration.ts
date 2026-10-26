@@ -91,7 +91,7 @@ let bobLocalSession: SessionRecord | undefined;
 let workspaceVisibleSession: SessionRecord | undefined;
 
 async function connectFixture(client: Client): Promise<ConnectorFixture> {
-  const pairing: ConnectorPairing = (await client.request("POST", "/api/connectors/pairings", { name: `${client.name} Pi ${run}`, workspaceId: workspace.id })).pairing;
+  const pairing: ConnectorPairing = (await client.request("POST", "/api/connectors/pairings", { name: `${client.name} Pi ${run}` })).pairing;
   const dataDir = await mkdtemp(join(tmpdir(), "opencara-connector-e2e-"));
   const fixture: ConnectorFixture = { id: "", token: "", connectionToken: "", stop: async () => {} };
   const observeFetch: typeof fetch = async (input, init) => {

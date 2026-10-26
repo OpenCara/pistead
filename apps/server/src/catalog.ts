@@ -7,6 +7,7 @@ import { auditAfterChange, auditStatement, modelDefinition, requireMember } from
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
 import { ConstraintError, type Query } from './db/types.js';
+import { ownerHostStatements } from './connectors.js';
 
 interface SafeMember {
   userId: string;
@@ -214,6 +215,8 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
       c.env.DB.query<never>("INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)")
         .bind(workspace.id, workspace.ownerId, createdAt),
       auditStatement(c.env, workspace.ownerId, 'workspace.create', workspace.id),
+      // The creator's hosts are theirs wherever they work: connect them here, privately.
+      ...ownerHostStatements(c.env, workspace.ownerId, workspace.id),
     ]);
     return c.json({ workspace }, 201);
   });
@@ -261,6 +264,8 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         WHERE workspace_id = ? AND ? = 1 AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
         .bind(workspaceId, previous ? 1 : 0, auditId),
       membersStatement(c.env, workspaceId, actorId),
+      // A member's own hosts follow them into the workspace, for their private use only: sharing stays the owner's choice.
+      ...ownerHostStatements(c.env, targetId, workspaceId),
     ]);
     if (result[0].changes !== 1) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');
     return c.json({ members: result[3].results });

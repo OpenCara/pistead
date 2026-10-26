@@ -79,7 +79,7 @@ try {
   const { workspace } = await request<{ workspace: Workspace }>("POST", "/api/workspaces", { name: "Dev workspace" });
   let session: SessionRecord | undefined;
   if (!values["no-host"]) {
-    const { pairing } = await request<{ pairing: ConnectorPairing }>("POST", "/api/connectors/pairings", { name: "Fixture host", workspaceId: workspace.id });
+    const { pairing } = await request<{ pairing: ConnectorPairing }>("POST", "/api/connectors/pairings", { name: "Fixture host" });
     const host = createConnector({
       server: origin, dataDir: join(temporary, "connector"), pairing: { id: pairing.id, code: pairing.code },
       localModels: createFauxLocalModels("faux-1"), allowFaux: true, allowTestShell: true, allowInsecureLoopback: true,
@@ -92,7 +92,7 @@ try {
     ({ session } = await request<{ session: SessionRecord }>("POST", "/api/sessions", { workspaceId: workspace.id, modelId: models[0]!.id, title: "Fixture session" }));
   }
   const desktopPairing = values.pairing
-    ? (await request<{ pairing: ConnectorPairing }>("POST", "/api/connectors/pairings", { name: "Desktop app", workspaceId: workspace.id })).pairing
+    ? (await request<{ pairing: ConnectorPairing }>("POST", "/api/connectors/pairings", { name: "Desktop app" })).pairing
     : undefined;
   const details = { server: origin, token: native.token, testSecret, workspaceId: workspace.id, sessionId: session?.id ?? null,
     pairing: desktopPairing ? { id: desktopPairing.id, code: desktopPairing.code } : null };
