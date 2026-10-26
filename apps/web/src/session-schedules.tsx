@@ -49,9 +49,9 @@ function untilText(value: string): string {
   return `in ${Math.round(seconds / 86400)}d`;
 }
 
-/** The next few runs of an expression being edited, or what is wrong with it. */
-function preview(cron: string, timeZone: string): { runs: string[] } | { error: string } {
-  if (!isTimeZone(timeZone)) return { error: "Unknown time zone." };
+/** The next few runs of an expression being edited, or what is wrong with it, and in which field. */
+function preview(cron: string, timeZone: string): { runs: string[] } | { error: string; field: "cron" | "timeZone" } {
+  if (!isTimeZone(timeZone)) return { error: "Unknown time zone.", field: "timeZone" };
   try {
     const schedule = parseCron(cron);
     const runs: string[] = [];
@@ -62,9 +62,9 @@ function preview(cron: string, timeZone: string): { runs: string[] } | { error: 
       runs.push(new Date(next).toISOString());
       after = next;
     }
-    return runs.length ? { runs } : { error: "This schedule never comes round." };
+    return runs.length ? { runs } : { error: "This schedule never comes round.", field: "cron" };
   } catch (error) {
-    return { error: error instanceof CronError ? error.message : "Invalid schedule." };
+    return { error: error instanceof CronError ? error.message : "Invalid schedule.", field: "cron" };
   }
 }
 
@@ -189,10 +189,10 @@ function ScheduleForm({ base, schedule, isOwner, onDone }: { base: string; sched
             </select>
           </Field>
           <Field label="Cron expression" hint={<>Minute, hour, day of month, month, day of week, as in crontab: <code>*/30 8-18 * * mon-fri</code>. Runs at least {MIN_CRON_INTERVAL_MINUTES} minutes apart.</>}
-            error={"error" in next ? next.error : undefined}>
+            error={"error" in next && next.field === "cron" ? next.error : undefined}>
             <input className="input mono" required spellCheck={false} autoComplete="off" value={cron} onChange={event => setCron(event.target.value)} />
           </Field>
-          <Field label="Time zone" hint="IANA name, such as UTC or Europe/Berlin">
+          <Field label="Time zone" hint="IANA name, such as UTC or Europe/Berlin" error={"error" in next && next.field === "timeZone" ? next.error : undefined}>
             <input className="input" required spellCheck={false} autoComplete="off" value={timeZone} onChange={event => setTimeZone(event.target.value)} />
           </Field>
           {"runs" in next && <p className="muted small">Next runs: {next.runs.map((run, index) => <span key={run}>{index ? ", " : ""}<Timestamp value={run} /></span>)}</p>}

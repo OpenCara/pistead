@@ -65,7 +65,7 @@ const origin = 'http://localhost:8787';
 const testSecret = 'scheduled-prompts-test-secret-not-for-deployment';
 
 async function fixture(t: TestContext) {
-  const { db, sqlite } = await testDatabase();
+  const { db, sqlite, setBeforeQuery } = await testDatabase();
   t.after(() => db.close());
   const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: testSecret,
     TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(), RUNNER_SHARED_SECRET: 'scheduled-prompts-internal-secret',
@@ -106,7 +106,7 @@ async function fixture(t: TestContext) {
   };
   const session = async (client: typeof owner) =>
     (await (await client.request('GET', '/api/sessions')).json() as { sessions: SessionRecord[] }).sessions.find(item => item.id === 'scheduled-session')!;
-  return { env, sqlite, owner, collaborator, submitted, session };
+  return { env, sqlite, setBeforeQuery, owner, collaborator, submitted, session };
 }
 
 const base = '/api/sessions/scheduled-session/schedules';
@@ -216,4 +216,42 @@ test('a refused run is recorded on its schedule, and Run now sends at once witho
   const listed = (await (await f.owner.request('GET', base)).json() as { schedules: SessionSchedule[] }).schedules[0]!;
   assert.equal(listed.lastError, outcome.error);
   assert.equal(listed.lastSubmissionId, null);
+});
+
+test('schedules due together for one session send one message; the rest find it busy', async t => {
+  const f = await fixture(t);
+  const first = (await (await f.owner.request('POST', base, { cron: '0 9 * * *', content: 'One' })).json() as { schedule: SessionSchedule }).schedule;
+  const second = (await (await f.owner.request('POST', base, { cron: '0 9 * * *', content: 'Two' })).json() as { schedule: SessionSchedule }).schedule;
+  assert.equal(first.nextRunAt, second.nextRunAt);
+  const outcomes = await runScheduledPrompts(f.env, Date.parse(first.nextRunAt!) + 1000);
+  assert.equal(outcomes.length, 2);
+  assert.equal(outcomes.filter(outcome => 'submissionId' in outcome).length, 1);
+  assert.equal(outcomes.filter(outcome => 'error' in outcome && outcome.error === 'session_busy').length, 1);
+  assert.equal(f.submitted.length, 1, 'not queued behind the first');
+});
+
+test('an edit never brings back a run a sweep claimed while it was being saved', async t => {
+  const f = await fixture(t);
+  const { schedule } = await (await f.owner.request('POST', base, { cron: '0 9 * * *', content: 'Report' })).json() as { schedule: SessionSchedule };
+  const claimed = new Date(Date.parse(schedule.nextRunAt!) + 86400_000).toISOString();
+  // A sweep claims the run between the edit's read and its write.
+  const claim = (sql: string) => {
+    if (!sql.startsWith('UPDATE session_schedules SET name')) return;
+    f.setBeforeQuery(undefined);
+    f.sqlite.prepare('UPDATE session_schedules SET next_run_at = ? WHERE id = ?').run(claimed, schedule.id);
+  };
+  f.setBeforeQuery(claim);
+  const renamed = await f.owner.request('PATCH', `${base}/${schedule.id}`, { name: 'Daily report', content: 'Report, briefly' });
+  assert.equal(renamed.status, 200, await renamed.clone().text());
+  assert.equal((await renamed.json() as { schedule: SessionSchedule }).schedule.nextRunAt, claimed, 'a rename leaves the next run alone');
+  assert.equal(f.sqlite.prepare('SELECT next_run_at FROM session_schedules WHERE id = ?').get(schedule.id)!.next_run_at, claimed);
+
+  // A change of when it runs replaces only the next run it read: here it read one the sweep has claimed since.
+  f.setBeforeQuery(sql => { if (sql.startsWith('UPDATE session_schedules SET name')) { f.setBeforeQuery(undefined);
+    f.sqlite.prepare('UPDATE session_schedules SET next_run_at = ? WHERE id = ?').run(new Date(Date.parse(claimed) + 86400_000).toISOString(), schedule.id); } });
+  const moved = await f.owner.request('PATCH', `${base}/${schedule.id}`, { cron: '0 10 * * *' });
+  assert.equal(moved.status, 409);
+  assert.equal((await moved.json() as { code: string }).code, 'schedule_changed');
+  assert.equal(f.sqlite.prepare('SELECT cron FROM session_schedules WHERE id = ?').get(schedule.id)!.cron, '0 9 * * *', 'nothing changed');
+  assert.equal((await f.owner.request('PATCH', `${base}/${schedule.id}`, { cron: '0 10 * * *' })).status, 200, 'read again, it saves');
 });

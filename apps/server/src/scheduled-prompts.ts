@@ -122,16 +122,18 @@ async function send(env: Env, schedule: ScheduleRow, ownerId: string, at: number
 /** What one due schedule did, for tests and logs. */
 export type ScheduledPromptOutcome = { scheduleId: string; sessionId: string; submissionId: string } | { scheduleId: string; sessionId: string; error: string };
 
-type DueSchedule = ScheduleRow & { owner_id: string; activity: string | null };
+type DueSchedule = ScheduleRow & { owner_id: string };
 
 /** Sends the scheduled prompts that are due now; see the top of this file. Safe to call at any time. */
 export async function runScheduledPrompts(env: Env, at = Date.now()): Promise<ScheduledPromptOutcome[]> {
   const timestamp = new Date(at).toISOString();
-  const due = await env.DB.query<DueSchedule>(`SELECT p.*, s.owner_id, s.activity
+  const due = await env.DB.query<DueSchedule>(`SELECT p.*, s.owner_id
     FROM session_schedules p JOIN sessions s ON s.id = p.session_id
     WHERE p.enabled = 1 AND p.next_run_at IS NOT NULL AND p.next_run_at <= ? AND s.status = 'ready'
     ORDER BY p.next_run_at, p.id LIMIT ?`).bind(timestamp, sweepLimit).all();
   const outcomes: ScheduledPromptOutcome[] = [];
+  // Sessions this sweep sent a message: busy from then on, though the list above read them before it did.
+  const sent = new Set<string>();
   for (const schedule of due) {
     // Claim the run before sending it, moving the schedule on, so that a sweep running beside this one doesn't send it too.
     const claimed = await env.DB.query(`UPDATE session_schedules SET next_run_at = ?, last_run_at = ?
@@ -139,11 +141,15 @@ export async function runScheduledPrompts(env: Env, at = Date.now()): Promise<Sc
       .bind(nextRun(schedule.cron, schedule.time_zone, at), timestamp, schedule.id, schedule.next_run_at).run();
     if (claimed.changes !== 1) continue;
     let outcome: ScheduledPromptOutcome;
-    if (schedule.activity === 'working' || schedule.activity === 'waiting') {
+    // What the host reports now, not when the list was read: an earlier run, or someone in the chat box, woke it since.
+    const activity = sent.has(schedule.session_id) ? 'working'
+      : await env.DB.query<{ activity: string | null }>('SELECT activity FROM sessions WHERE id = ?').bind(schedule.session_id).first('activity');
+    if (activity === 'working' || activity === 'waiting') {
       outcome = { scheduleId: schedule.id, sessionId: schedule.session_id, error: 'session_busy' };
     } else {
       try {
         const result = await send(env, schedule, schedule.owner_id, at, 'schedule');
+        sent.add(schedule.session_id);
         outcome = { scheduleId: schedule.id, sessionId: schedule.session_id, submissionId: result.submissionId };
       } catch (error) {
         outcome = { scheduleId: schedule.id, sessionId: schedule.session_id, error: await errorCode(error) };
@@ -210,14 +216,25 @@ export function registerScheduledPrompts(app: Hono<WorkerEnv>) {
     const timing = next.cron !== current.cron || next.time_zone !== current.time_zone || next.enabled !== current.enabled;
     if (timing) next.next_run_at = next.enabled ? nextRun(next.cron, next.time_zone, Date.now()) : null;
     if (next.enabled && next.next_run_at === null) fail(400, 'invalid_cron', 'This schedule never comes round.');
-    await c.env.DB.batch([
-      c.env.DB.query(`UPDATE session_schedules SET name = ?, cron = ?, time_zone = ?, content = ?, access = ?, enabled = ?, next_run_at = ?, updated_at = ?
-        WHERE id = ?`).bind(next.name, next.cron, next.time_zone, next.content, next.access, next.enabled, next.next_run_at, next.updated_at, next.id),
+    // A sweep may claim a run, moving next_run_at on, while this request runs: an edit that doesn't change when it runs
+    // leaves next_run_at alone, and one that does replaces only the next run it read, so a claimed run never comes back.
+    const update = timing
+      ? c.env.DB.query(`UPDATE session_schedules SET name = ?, cron = ?, time_zone = ?, content = ?, access = ?, enabled = ?, next_run_at = ?, updated_at = ?
+          WHERE id = ? AND ${current.next_run_at === null ? 'next_run_at IS NULL' : 'next_run_at = ?'}`)
+        .bind(next.name, next.cron, next.time_zone, next.content, next.access, next.enabled, next.next_run_at, next.updated_at, next.id,
+          ...(current.next_run_at === null ? [] : [current.next_run_at]))
+      : c.env.DB.query('UPDATE session_schedules SET name = ?, content = ?, access = ?, updated_at = ? WHERE id = ?')
+        .bind(next.name, next.content, next.access, next.updated_at, next.id);
+    const [updated] = await c.env.DB.batch([
+      update,
       auditStatement(c.env, c.get('auth').userId, 'session.schedule.updated', row.workspace_id, row.id,
         { scheduleId: next.id, cron: next.cron, timeZone: next.time_zone, access: next.access, enabled: next.enabled === 1 }),
     ]);
+    // Its next run moved on, or the schedule went, since it was read: nothing changed, and the editor reads it again.
+    if (updated!.changes !== 1) fail(409, 'schedule_changed', 'This schedule ran or changed meanwhile. Reload it and try again.');
     await refreshNextScheduled(c.env, row.id);
-    return c.json({ schedule: scheduleRecord(next) });
+    const saved = await c.env.DB.query<ScheduleRow>('SELECT * FROM session_schedules WHERE id = ?').bind(next.id).first();
+    return c.json({ schedule: scheduleRecord(saved ?? next) });
   });
 
   app.delete('/api/sessions/:id/schedules/:scheduleId', async c => {
