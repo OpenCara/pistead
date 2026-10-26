@@ -514,7 +514,7 @@ export class RunnerSession {
     if (!this.#lfsRepositories.length) return "";
     const lfs = hostGitLfs();
     if (!lfs) return `\nGit LFS is on for ${this.#lfsRepositories.join(", ")}, but git-lfs is not installed on this host, so clones check out LFS pointer files.`;
-    return `\nGit LFS is on for ${this.#lfsRepositories.join(", ")}: clones of them check out LFS files' content. In a clone made otherwise, `
+    return `\nGit LFS is on for ${this.#lfsRepositories.join(", ")}: clones of them check out LFS files' content. In a clone made otherwise, or restored from a backup, `
       + `run ${lfs} install --local, then ${lfs} pull. Other repositories check out LFS pointer files. `
       + "LFS objects are never uploaded from this session, so don't add or change LFS-tracked files in commits you push.";
   }

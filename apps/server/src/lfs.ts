@@ -192,8 +192,7 @@ export async function lfsRelay(c: AppContext, options: {
   }
   if (service === 'lfs-batch') {
     const request = lfsInput(body, parseLfsBatchRequest);
-    // Renames and transfers fail closed, as for every Git read. Objects are content-addressed and the owner's own access
-    // is checked by the provider on each download, so the downloads below don't verify again.
+    // Renames and transfers fail closed, as for every Git read.
     await verifyRepository(access, { repositoryId: binding.repository_id, fullName: binding.full_name });
     await recheckAccess(c.env, access);
     await authorize();
@@ -210,6 +209,9 @@ export async function lfsRelay(c: AppContext, options: {
     return c.json(result, 200, { 'Cache-Control': 'private, no-store' });
   }
   const object = lfsInput(body, parseLfsObject);
+  // A download verifies the repository's identity too: nothing makes the host ask for a batch first, and a repository
+  // that took a renamed binding's old name must not serve its objects, even by oid.
+  await verifyRepository(access, { repositoryId: binding.repository_id, fullName: binding.full_name });
   await recheckAccess(c.env, access);
   await authorize();
   const entry = (await providerBatch(binding, access, [object])).get(object.oid);

@@ -686,7 +686,11 @@ def clone_backup_one(path, nested, budget):
             shutil.copyfile(os.path.join(directory, '.git', 'index'), index, follow_symlinks=False)
         except FileNotFoundError:
             clone_git_checked(directory, ['read-tree', head] if head else ['read-tree', '--empty'], extra=extra, reason=reason)
-        clone_git_checked(directory, ['add', '-A'], extra=extra, reason=reason)
+        # Without the clone's LFS filters: git-lfs's clean filter would store a changed LFS file as a pointer to an object
+        # in .git/lfs, which the bundle doesn't carry and sessions can't upload, so the change would be lost. Its content
+        # goes into the bundle instead (within the budget below); unchanged files keep their pointers from the index.
+        clone_git_checked(directory, ['-c', 'filter.lfs.process=', '-c', 'filter.lfs.clean=', '-c', 'filter.lfs.required=false',
+                                      'add', '-A'], extra=extra, reason=reason)
         if nested:
             clone_git_checked(directory, ['update-index', '--force-remove', '--'] + nested, extra=extra, reason=reason)
         tree = clone_git_checked(directory, ['write-tree'], extra=extra, reason=reason)

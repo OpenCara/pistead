@@ -1025,6 +1025,7 @@ test('Git LFS downloads are relayed with the owner credential only while LFS is 
   assert.equal(object.status, 200);
   assert.equal(object.headers.get('content-type'), 'application/octet-stream');
   assert.equal(await object.text(), content);
+  assert.equal(verified() - before, 2, 'a download verifies the bound repository too');
   // The action's own headers go to its storage; the owner's credential never leaves the provider's origin.
   assert.deepEqual(media, [{ url: `https://lfs-media.githubusercontent.com/${oid}?sig=1`, signature: 'signed', authorization: null }]);
   // On the provider's own origin, an action without headers is downloaded with the owner's credential (the mock checks it).
@@ -1053,6 +1054,16 @@ test('Git LFS downloads are relayed with the owner credential only while LFS is 
   const long = await relay('lfs-object', { oid, size });
   if (long.status === 200) await assert.rejects(long.text());
   else assert.equal(long.status, 502);
+
+  // A repository that took the binding's name after a rename or transfer serves nothing, even to a download asked for
+  // directly, without a batch first.
+  batches.length = 0;
+  media.length = 0;
+  remote.state.metadata = async () => Response.json({ ...metadata, id: metadata.id + 1 });
+  await denied(await relay('lfs-object', { oid, size }), 409, 'repository_identity_changed');
+  await denied(await relay('lfs-batch', { objects: [{ oid, size }] }), 409, 'repository_identity_changed');
+  assert.deepEqual([batches.length, media.length], [0, 0]);
+  remote.state.metadata = async () => Response.json(metadata);
 
   // Turned off, the next request is refused, whatever the host's grant still says.
   await setLfs(false);

@@ -633,6 +633,62 @@ test("a backup keeps a clone's local work as a bundle, and a restore clones it a
   await assert.rejects(lstat(join(directory, "target", "worktree", "libs", "app", ".git", "pistead-restored")), { code: "ENOENT" });
 });
 
+test("a backup keeps local changes to LFS-tracked files as their content, not as pointers to objects it doesn't carry", { skip: !sandboxed }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), "egress-lfs-backup-"));
+  await chmod(directory, 0o700);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const projects = join(directory, "projects");
+  await mkdir(join(projects, "acme"), { recursive: true });
+  const work = join(directory, "upstream");
+  const environment = { ...process.env, GIT_AUTHOR_NAME: "U", GIT_AUTHOR_EMAIL: "u@example.test", GIT_COMMITTER_NAME: "U", GIT_COMMITTER_EMAIL: "u@example.test" };
+  const git = (args: string[], cwd: string) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: environment });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  await mkdir(work);
+  git(["init", "-q", "-b", "main"], work);
+  await writeFile(join(work, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+  await writeFile(join(work, "model.bin"), "upstream\n");
+  git(["add", ".gitattributes", "model.bin"], work);
+  git(["commit", "-q", "-m", "initial"], work);
+  git(["clone", "-q", "--bare", work, join(projects, "acme", "app.git")], directory);
+  const server = await startGitHttpServer(projects);
+  t.after(() => server.close());
+  const { instance } = await proxy(t, {
+    relay: async request => fetch(request.service === "info-refs"
+      ? `${server.url("acme/app.git")}/info/refs?service=git-upload-pack` : `${server.url("acme/app.git")}/git-upload-pack`, {
+      method: request.body ? "POST" : "GET", body: request.body as BodyInit | undefined,
+      headers: { ...(request.contentType ? { "content-type": request.contentType } : {}), ...(request.gitProtocol ? { "git-protocol": request.gitProtocol } : {}) },
+    }),
+  });
+  const authorize = async () => {};
+  const shell = (sandbox: Sandbox, command: string) => sandbox.execute({ kind: "bash", command }, false, authorize, { allowTestShell: true });
+  const source = new Sandbox(binding("lfs-backup-source"), join(directory, "source"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => source.close());
+  await source.initialize();
+  // A clean filter standing in for git-lfs's: it turns content into a pointer, keeping the content elsewhere in .git, as
+  // git-lfs keeps it in .git/lfs/objects, which backups don't carry.
+  await shell(source, "git clone -q https://github.com/acme/app.git app && cd app"
+    + " && git config filter.lfs.clean \"sh -c 'cat >/dev/null; echo pointer'\" && git config filter.lfs.required true"
+    + " && echo local > model.bin");
+  const { clones } = await source.cloneBackup(authorize);
+  assert.equal(clones.length, 1);
+  assert.notEqual(clones[0]!.bundle, null);
+
+  const target = new Sandbox(binding("lfs-backup-target"), join(directory, "target"), undefined, { egressSocket: instance.socketPath });
+  t.after(() => target.close());
+  await target.initialize();
+  const state = join(directory, "target", "git", "pistead-clones");
+  await mkdir(state, { recursive: true, mode: 0o700 });
+  await writeFile(join(state, "0.bundle"), Buffer.from(clones[0]!.bundle!, "base64"));
+  await writeFile(join(state, "manifest.json"), JSON.stringify({ version: 1, clones: [{ ...clones[0]!, bundle: "0.bundle" }] }));
+  await target.cloneRestore("app", "https://github.com/acme/app.git", null, authorize);
+  // The local change comes back as it was, not as a pointer whose object nothing holds.
+  assert.equal(await target.readFile("app/model.bin", authorize), "local\n");
+  assert.match(await shell(target, "cd app && git status --porcelain"), /^ M model\.bin\n$/);
+});
+
 test("https://user@host remotes are the same repository, and a refused grant ends access at once", async t => {
   const { RunnerError } = await import("../apps/runner/src/protocol.js");
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });

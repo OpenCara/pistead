@@ -285,25 +285,34 @@ audited as `repository.lfs.updated`; the setting is in `WorkspaceRepository.lfs`
   under `info/lfs` are refused in git-lfs's JSON error format, so git-lfs shows the reason. Smart-HTTP paths are matched
   first, so a repository whose path contains `info/lfs` is still fetched with Git.
 - **In the control plane** (`lfs.ts`, behind the relay route; `lfs-batch` and `lfs-object` are relay services). Each
-  request re-checks the switch, so turning it off stops downloads at once. `lfs-batch` verifies the repository's
-  identity, as every Git read does, then makes the provider's batch request with the session owner's own credential
-  (`ownerGitAuthorization`) and answers only, per object, whether it can be downloaded or the provider's error.
+  request re-checks the switch, so turning it off stops downloads at once, and verifies the repository's identity, as
+  every Git read does: nothing makes the host ask for a batch before a download, so a repository that took a renamed
+  binding's name serves nothing, not even by oid. `lfs-batch` makes the provider's batch request with the session
+  owner's own credential (`ownerGitAuthorization`) and answers only, per object, whether it can be downloaded or the
+  provider's error.
   `lfs-object` makes a one-object batch and downloads the object itself: the action's headers are sent only to its
   `href`, the owner's credential only to the provider's own origin and only when the action brings no authorization,
   `href`s and redirects (three at most) must be `https` on a public DNS name (`validGitHost`), and a redirect to another
   origin drops the action's headers. The answer streams back, cut off with an error if it isn't exactly the pointer's
-  size; git-lfs checks the content's sha256 itself. Objects are content-addressed and the provider checks the owner's
-  access on each download, so `lfs-object` doesn't verify the repository's identity again.
+  size; git-lfs checks the content's sha256 itself.
 - **What reaches the host:** object ids, sizes, provider error messages (printable ASCII, bounded) and content. The
   provider's download URLs and the short-lived tokens in their headers never do.
 - **A refused LFS request** doesn't unmount the session's mirror: only refused Git reads (`info-refs`, `upload-pack`)
   mean the owner lost the repository.
+- **Backups and restores.** A clone's backup stages its working tree with the LFS filters turned off, so an LFS-tracked
+  file changed in the session goes into the bundle as its content (within the bundle budget; a larger change fails the
+  backup rather than being dropped). With git-lfs's clean filter it would be a pointer to an object in `.git/lfs`, which
+  the bundle doesn't carry and the session can't upload. Restores check out without filters, as before: changed files
+  come back as their content, unchanged ones as pointers, which `git lfs install --local` and `git lfs pull` fetch
+  again.
 
 ### Not yet
 
 - Uploads. Sessions run Git without hooks, so git-lfs's pre-push upload never runs, and a pushed commit that adds or
   changes LFS-tracked files would point at objects the forge doesn't have. The agent is told not to push such commits.
-- The host cache keeps Git objects only; LFS objects are downloaded through the control plane for each clone.
+- The host cache keeps Git objects only; LFS objects are downloaded through the control plane for each clone, and each
+  download costs a repository identity check with the provider (an API request).
+- Restored clones don't get the LFS filters back by themselves.
 - Like other control-plane fetches of self-hosted providers, the relay checks download hosts by name, not by the
   addresses they resolve to.
 
