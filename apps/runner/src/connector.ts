@@ -284,7 +284,8 @@ export interface ConnectorOptions {
   runtimeFactory?: (config: RunnerConfig) => Promise<ConnectorRuntime>;
   acquireLease?: typeof acquireRunnerLease;
   reconnectDelayMs?: number;
-  onStatus?: (status: "connecting" | "connected" | "disconnected" | "stopped") => void;
+  /** With "disconnected", why the last connection ended, in fixed connector text, when it is known. */
+  onStatus?: (status: "connecting" | "connected" | "disconnected" | "stopped", reason?: string) => void;
   onWarning?: (warning: "resources-unavailable") => void;
 }
 
@@ -299,7 +300,8 @@ type Generation = {
   tail: Promise<void>;
   waiting: Set<PromiseWithResolvers<never>>;
   incomingBytes: number;
-  responsesReserved: number;
+  /** The first reason this connection was ended for. */
+  reason?: string;
   runtimeReady: PromiseWithResolvers<void>;
 };
 
@@ -315,6 +317,7 @@ export class LocalConnector {
   private readonly secret = Buffer.from(randomBytes(48)).toString("base64url");
   private readonly seen = new Map<string, number>();
   private generation?: Generation;
+  private lastReason?: string;
   private loop?: Promise<void>;
   private starting?: Promise<void>;
   private stopping?: Promise<void>;
@@ -355,7 +358,7 @@ export class LocalConnector {
     this.directory = await privateDirectory(this.options.dataDir);
     this.releaseLease = await (this.options.acquireLease ?? acquireRunnerLease)(this.directory, () => {
       this.lifetime.abort();
-      this.disconnect(this.generation);
+      this.disconnect(this.generation, "Runner lease lost");
       void this.stop().catch(() => {});
     });
     this.lifetime.signal.throwIfAborted();
@@ -379,8 +382,9 @@ export class LocalConnector {
     void this.loop.catch(() => { this.readiness.reject(new Error("Connector stopped before becoming ready")); });
   }
 
-  private disconnect(generation?: Generation): void {
+  private disconnect(generation?: Generation, reason = "Connection ended"): void {
     if (!generation || generation.abort.signal.aborted) return;
+    generation.reason ??= reason;
     generation.abort.abort();
     for (const waiting of generation.waiting) waiting.reject(new Error("Connector connection lost"));
     generation.waiting.clear();
@@ -393,10 +397,11 @@ export class LocalConnector {
   private async connectLoop(): Promise<void> {
     let failures = 0;
     while (!this.lifetime.signal.aborted) {
+      this.lastReason = undefined;
       try { await this.connectOnce(); failures = 0; }
       catch { failures++; }
       if (this.lifetime.signal.aborted) break;
-      this.options.onStatus?.("disconnected");
+      this.options.onStatus?.("disconnected", this.lastReason);
       const wait = this.options.reconnectDelayMs ?? Math.min(30_000, 500 * 2 ** Math.min(failures, 6)) + Math.floor(Math.random() * 250);
       try { await delay(wait, undefined, { signal: this.lifetime.signal }); } catch { break; }
     }
@@ -408,30 +413,36 @@ export class LocalConnector {
     const url = new URL("/api/connectors/socket", state.controlPlaneUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = (this.options.createSocket ?? defaultSocket)(url.href, ["opencara-pi-v1", `bearer.${state.token}`]);
-    const generation: Generation = { socket, abort: new AbortController(), done: Promise.withResolvers<void>(), welcome: Promise.withResolvers<string>(), active: new Set(), tail: Promise.resolve(), waiting: new Set(), incomingBytes: 0, responsesReserved: 0, runtimeReady: Promise.withResolvers<void>() };
+    const generation: Generation = { socket, abort: new AbortController(), done: Promise.withResolvers<void>(), welcome: Promise.withResolvers<string>(), active: new Set(), tail: Promise.resolve(), waiting: new Set(), incomingBytes: 0, runtimeReady: Promise.withResolvers<void>() };
     void generation.runtimeReady.promise.catch(() => {});
     this.generation = generation;
-    const timeout = setTimeout(() => this.disconnect(generation), 15_000);
+    const timeout = setTimeout(() => this.disconnect(generation, "Relay did not welcome the connection within 15s"), 15_000);
     let lastPong = Date.now();
     const heartbeat = setInterval(() => {
-      if (Date.now() - lastPong > 65_000) return this.disconnect(generation);
-      if (socket.readyState === 1 && generation.incomingBytes + generation.responsesReserved + socket.bufferedAmount + 4 <= connectorLimits.bufferedBytes) {
-        try { socket.send("ping"); } catch { this.disconnect(generation); }
+      if (Date.now() - lastPong > 65_000) return this.disconnect(generation, "No pong from the relay for 65s");
+      // Skipped while output is backed up: a ping would only queue behind it.
+      if (socket.readyState === 1 && socket.bufferedAmount + 4 <= connectorLimits.bufferedBytes) {
+        try { socket.send("ping"); } catch { this.disconnect(generation, "Ping could not be sent"); }
       }
     }, 20_000);
-    socket.addEventListener("error", () => this.disconnect(generation));
-    socket.addEventListener("close", () => this.disconnect(generation));
+    socket.addEventListener("error", () => this.disconnect(generation, "Socket error"));
+    socket.addEventListener("close", event => {
+      const { code, reason } = event as Partial<CloseEvent>;
+      // The relay's close reason is short fixed text (connector-hub.ts); keep it to one bounded line.
+      const detail = typeof reason === "string" ? reason.replace(/[^\x20-\x7e]/g, "").slice(0, 120) : "";
+      this.disconnect(generation, `Relay closed the connection${typeof code === "number" ? ` (${code}${detail ? ` ${detail}` : ""})` : ""}`);
+    });
     socket.addEventListener("message", event => {
       if (generation.abort.signal.aborted) return;
       const data: unknown = "data" in event ? event.data : undefined;
       if (data === "pong") { lastPong = Date.now(); return; }
-      if (typeof data !== "string" || encoder.encode(data).length > connectorLimits.frameBytes) return this.disconnect(generation);
+      if (typeof data !== "string" || encoder.encode(data).length > connectorLimits.frameBytes) return this.disconnect(generation, "Invalid relay frame");
       let value: unknown;
-      try { value = JSON.parse(data); } catch { return this.disconnect(generation); }
+      try { value = JSON.parse(data); } catch { return this.disconnect(generation, "Invalid relay frame"); }
       if (!generation.connectionToken) {
         const welcome = welcomeSchema.safeParse(value);
         if (!welcome.success || welcome.data.connectorId !== state.connectorId
-          || socket.protocol !== "opencara-pi-v1") return this.disconnect(generation);
+          || socket.protocol !== "opencara-pi-v1") return this.disconnect(generation, "Invalid relay welcome");
         generation.connectionToken = welcome.data.connectionToken;
         generation.welcome.resolve(welcome.data.connectionToken);
         return;
@@ -553,10 +564,15 @@ export class LocalConnector {
       this.options.onStatus?.("connected");
       this.readiness.resolve();
       await generation.done.promise;
+    } catch (error) {
+      // A callback, the runtime or the manifest failed before or while connecting.
+      this.disconnect(generation, "Connection setup failed");
+      throw error;
     } finally {
       clearTimeout(timeout);
       clearInterval(heartbeat);
       this.disconnect(generation);
+      this.lastReason = generation.reason;
       // Retire the old harness before a new generation can open the same SQLite files.
       await Promise.allSettled([...generation.active]);
       try { await generation.runtime?.close(); }
@@ -674,22 +690,29 @@ export class LocalConnector {
   }
 
   private dispatch(generation: Generation, value: unknown, frameSize: number): void {
-    if (generation.active.size >= connectorLimits.pendingRequests
-      || generation.incomingBytes + generation.responsesReserved + frameSize + generation.socket.bufferedAmount > connectorLimits.bufferedBytes) return this.disconnect(generation);
+    // Only what the relay itself bounds ends the connection here: its pending count and the request bytes it has charged
+    // (connector-hub.ts). This host's own response output is not the relay's to know; requests wait for it in execute().
+    if (generation.active.size >= connectorLimits.pendingRequests) return this.disconnect(generation, "Relay exceeded the pending request limit");
+    if (generation.incomingBytes + frameSize > connectorLimits.bufferedBytes) return this.disconnect(generation, "Relay exceeded the queued request byte limit");
     const parsed = requestSchema.safeParse(value);
-    if (!parsed.success) return this.disconnect(generation);
+    if (!parsed.success) return this.disconnect(generation, "Invalid relay request");
     const rpc = parsed.data;
     const now = Date.now();
     for (const [key, expiry] of this.seen) if (expiry <= now) this.seen.delete(key);
     const keys = [`request:${rpc.id}`, `ticket:${rpc.ticket.jti}`];
-    if (keys.some(key => this.seen.has(key)) || this.seen.size > 8192) return this.disconnect(generation);
+    if (keys.some(key => this.seen.has(key)) || this.seen.size > 8192) return this.disconnect(generation, "Replayed relay request");
     // Claim queued IDs too: reconnect must not turn an admitted ticket into a retry.
     // Bound provisional claims to the 60s ticket lifetime, 5s clock skew and 5s replay grace.
     const replayExpiry = Math.min((rpc.ticket.exp + 5) * 1000, now + 70_000);
     for (const key of keys) this.seen.set(key, replayExpiry);
     generation.incomingBytes += frameSize;
     const previous = generation.tail;
-    const task = this.execute(generation, rpc, previous).catch(() => this.disconnect(generation)).finally(() => {
+    const task = this.execute(generation, rpc, previous).catch((error: unknown) => {
+      // Validation, ordering or a lost generation; runtime failures became error replies instead. Only plain fixed
+      // connector text is shown: a parser's message could quote the request.
+      const message = error instanceof Error && /^[A-Za-z][A-Za-z ]{0,119}$/.test(error.message) ? error.message : "";
+      this.disconnect(generation, message ? `Relay request failed: ${message}` : "Relay request failed");
+    }).finally(() => {
       generation.active.delete(task);
       generation.incomingBytes -= frameSize;
     });
@@ -698,49 +721,68 @@ export class LocalConnector {
   }
 
   private async execute(generation: Generation, value: ConnectorRpcRequest, previous: Promise<void>): Promise<void> {
-    const timeout = setTimeout(() => this.disconnect(generation), RPC_TIMEOUT);
-    let reservation = 0;
+    const timeout = setTimeout(() => this.disconnect(generation, "Relay request timed out"), RPC_TIMEOUT);
     try {
       const { rpc, authorization } = await validateRelayRequest(value, this.state!.connectorId, this.secret);
       this.requireGeneration(generation);
       const canceled = Promise.withResolvers<never>();
       generation.waiting.add(canceled);
       try {
-        // Validate promptly, but effects and response reservations follow arrival order.
+        // Validate promptly, but effects and replies follow arrival order.
         await Promise.race([Promise.all([previous, generation.runtimeReady.promise]), canceled.promise]);
       } finally {
         generation.waiting.delete(canceled);
       }
       this.requireGeneration(generation);
-      while (generation.incomingBytes + connectorLimits.responseBytes + generation.socket.bufferedAmount > connectorLimits.bufferedBytes) {
-        // Incoming frames cannot drain while the FIFO head is blocked.
-        if (generation.incomingBytes + connectorLimits.responseBytes > connectorLimits.bufferedBytes) throw new Error("Relay request backpressure limit");
+      // A ticket validated on arrival may have expired while queued.
+      if (rpc.ticket.exp * 1000 <= Date.now()) throw new Error("Relay ticket expired while queued");
+      const payload = await this.reply(generation, rpc, authorization);
+      // The reply waits for socket output to drain to its own size, not to a worst-case reservation. It always fits
+      // eventually (frameBytes < bufferedBytes), and later requests stay queued behind it, so output stays bounded by
+      // bufferedBytes and queued requests by the relay's own budget.
+      const payloadSize = encoder.encode(payload).length;
+      while (generation.socket.bufferedAmount + payloadSize > connectorLimits.bufferedBytes) {
         await delay(10, undefined, { signal: generation.abort.signal });
         this.requireGeneration(generation);
       }
-      // A ticket validated on arrival may have expired while queued or draining output.
-      if (rpc.ticket.exp * 1000 <= Date.now()) throw new Error("Relay ticket expired while queued");
-      reservation = connectorLimits.responseBytes;
-      generation.responsesReserved += reservation;
+      generation.socket.send(payload);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * The reply frame for an admitted request. What goes wrong with this one request (the runtime failing, a body over
+   * the limit or not UTF-8, a frame too large once escaped) is answered as an error for it, not by ending the connection
+   * and every other request with it. Only a lost connection still throws.
+   */
+  private async reply(generation: Generation, rpc: ConnectorRpcRequest, authorization: string): Promise<string> {
+    const failed = (status: number, error: string) => JSON.stringify({
+      type: "response", id: rpc.id, status, body: JSON.stringify({ error, code: "connector_reply_error" }),
+    } satisfies ConnectorRpcResponse);
+    let result: ConnectorRpcResponse;
+    try {
       const response = await generation.runtime!.fetch(new Request(`http://local.invalid${rpc.path}`, {
         method: rpc.method, headers: { authorization: `Bearer ${authorization}`, "content-type": "application/json" },
         ...(rpc.method === "POST" ? { body: rpc.body } : {}), signal: generation.abort.signal,
       }));
-      const bytes = await boundedBody(response, connectorLimits.responseBytes, generation.abort.signal);
+      let bytes: Uint8Array;
+      try { bytes = await boundedBody(response, connectorLimits.responseBytes, generation.abort.signal); }
+      catch (error) {
+        this.requireGeneration(generation);
+        if (error instanceof Error && error.message === "Response exceeds connector limit") return failed(502, "The host's reply is too large to relay.");
+        throw error;
+      }
+      result = { type: "response", id: rpc.id, status: response.status, body: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    } catch {
       this.requireGeneration(generation);
-      const result: ConnectorRpcResponse = { type: "response", id: rpc.id, status: response.status, body: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
-      const payload = JSON.stringify(result);
-      const payloadSize = encoder.encode(payload).length;
-      if (payloadSize > connectorLimits.frameBytes
-        || generation.incomingBytes + generation.socket.bufferedAmount + payloadSize > connectorLimits.bufferedBytes) throw new Error("Relay response backpressure limit");
-      // Transfer the executing reservation to the socket's actual output charge.
-      generation.responsesReserved -= reservation;
-      reservation = 0;
-      generation.socket.send(payload);
-    } finally {
-      generation.responsesReserved -= reservation;
-      clearTimeout(timeout);
+      return failed(502, "The host could not complete the request.");
     }
+    this.requireGeneration(generation);
+    const payload = JSON.stringify(result);
+    // Escaping can make a body under responseBytes a frame over frameBytes.
+    if (encoder.encode(payload).length > connectorLimits.frameBytes) return failed(502, "The host's reply is too large to relay.");
+    return payload;
   }
 
   stop(): Promise<void> {

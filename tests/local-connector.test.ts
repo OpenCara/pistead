@@ -376,6 +376,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
   const allSockets: FakeSocket[] = [];
   const allCalls: WorkerCall[] = [];
   const statuses: string[] = [];
+  const reasons: (string | undefined)[] = [];
   const leases = { acquired: 0, released: 0 };
   let manifests = 0;
   const connector = createConnector({
@@ -424,14 +425,18 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
       if (request.url.startsWith(`${origin}/api/connectors/self/github/`) && options.github) return options.github(request);
       assert.fail(`Unexpected fixture Worker request: ${request.url}`);
     },
-    onStatus: status => { statuses.push(status); if (status === 'connected') connected.push(); },
+    onStatus: (status, reason) => {
+      statuses.push(status);
+      if (status === 'disconnected') reasons.push(reason);
+      if (status === 'connected') connected.push();
+    },
   });
   t.after(async () => {
     options.unblock?.();
     try { await connector.stop(); } finally { await rm(dataDir, { recursive: true, force: true }); }
   });
   await writeConnectorState(dataDir, credentials);
-  return { connector, dataDir, sockets, workerCalls, connected, runtimes, allSockets, allCalls, statuses, leases };
+  return { connector, dataDir, sockets, workerCalls, connected, runtimes, allSockets, allCalls, statuses, reasons, leases };
 }
 
 type FixtureStartup = {
@@ -748,68 +753,86 @@ test('one request beyond the active plus queued count limit disconnects without 
   assert.deepEqual(socket.sent, []);
 });
 
-test('aggregate queued frames, one response reservation and socket output overload below the count limit', { timeout: 10000 }, async t => {
+// #100: a large reply still draining to the relay and more requests behind it used to end the connection.
+test('requests arriving while socket output is backed up queue behind it instead of ending the connection', { timeout: 10000 }, async t => {
   const runtime = deferredRuntime();
   const fixture = await connectorFixture(t, runtime);
   const socket = await startFixture(fixture);
-  const first = await rpc('view', '', 'budget-first');
-  const second = await rpc('view', '', 'budget-second');
-  const firstBytes = Buffer.byteLength(JSON.stringify(first));
-  const secondBytes = Buffer.byteLength(JSON.stringify(second));
-  socket.bufferedAmount = connectorLimits.bufferedBytes - connectorLimits.responseBytes - firstBytes - secondBytes + 1;
-  assert.ok(socket.bufferedAmount > 0);
-  assert.ok(2 < connectorLimits.pendingRequests);
-  assert.ok(socket.bufferedAmount + connectorLimits.responseBytes + firstBytes <= connectorLimits.bufferedBytes);
-  assert.equal(socket.bufferedAmount + connectorLimits.responseBytes + firstBytes + secondBytes, connectorLimits.bufferedBytes + 1);
+  const requests = await Promise.all(['backed-first', 'backed-second', 'backed-third'].map(id => rpc('view', '', id)));
+  socket.bufferedAmount = connectorLimits.bufferedBytes - 16;
+  socket.receive(requests[0]!);
+  const first = await runtime.started.next();
+  socket.receive(requests[1]!);
+  socket.receive(requests[2]!);
+  assert.equal(socket.readyState, 1, 'queued requests are not the relay overrunning its budget');
 
-  socket.receive(first);
-  const execution = await runtime.started.next();
-  assert.equal(socket.readyState, 1, 'the first frame fits the aggregate budget');
-  socket.receive(second);
-  await socket.closed.promise;
-  execution.response.resolve(new Response('late'));
-  await fixture.connector.stop();
-  assert.equal(fixture.runtimes[0]!.requests.length, 1);
+  first.response.resolve(new Response('first response'));
+  // The reply waits for output to drain to its own size.
+  await new Promise(resolve => setTimeout(resolve, 50));
   assert.deepEqual(socket.sent, []);
+  assert.equal(fixture.runtimes[0]!.requests.length, 1, 'later requests stay behind the waiting reply');
+  socket.bufferedAmount = 0;
+  assert.equal(JSON.parse(await socket.messages.next()).id, requests[0]!.id);
+  for (const request of requests.slice(1)) {
+    const next = await runtime.started.next();
+    next.response.resolve(new Response(`${request.id} response`));
+    assert.deepEqual(JSON.parse(await socket.messages.next()), { type: 'response', id: request.id, status: 200, body: `${request.id} response` });
+  }
+  assert.equal(socket.readyState, 1);
+  assert.equal(fixture.statuses.includes('disconnected'), false);
+  assert.equal(fixture.allSockets.length, 1);
 });
 
-test('socket output waits for drain and resumes FIFO without falsely overloading a second small request', { timeout: 10000 }, async t => {
+test('a small reply is sent as soon as it fits, not once a worst-case reply would', { timeout: 10000 }, async t => {
   const runtime = deferredRuntime();
   const fixture = await connectorFixture(t, runtime);
   const socket = await startFixture(fixture);
-  const first = await rpc('view', '', 'drain-first');
-  const second = await rpc('view', '', 'drain-second');
-  socket.receive(first);
+  // Room for this reply, not for a full responseBytes one: the old reservation waited here for a drain.
+  socket.bufferedAmount = connectorLimits.bufferedBytes - connectorLimits.responseBytes + 1;
+  const request = await rpc('view', '', 'small-reply');
+  socket.receive(request);
   const execution = await runtime.started.next();
-  socket.receive(second);
+  execution.response.resolve(new Response('small'));
+  assert.deepEqual(JSON.parse(await socket.messages.next()), { type: 'response', id: request.id, status: 200, body: 'small' });
   assert.equal(socket.readyState, 1);
+});
 
-  // Sending the first response leaves socket output that must drain before the next reservation.
-  const observed = Promise.withResolvers<void>();
-  const send = socket.send.bind(socket);
-  const sending = t.mock.method(socket, 'send', (data: string) => {
-    socket.bufferedAmount = connectorLimits.bufferedBytes - connectorLimits.responseBytes + 1;
-    void socket.observeBufferRead().then(observed.resolve);
-    send(data);
+test('a reply that cannot be relayed is answered as an error for that request and the connection stays', { timeout: 30000 }, async t => {
+  let calls = 0;
+  const fixture = await connectorFixture(t, {
+    execute: () => {
+      switch (calls++) {
+        case 0: return new Response('x'.repeat(connectorLimits.responseBytes + 1));
+        // Within responseBytes, but over frameBytes once escaped into the reply frame.
+        case 1: return new Response('"'.repeat(16 * 1024 * 1024));
+        case 2: return new Response(new Uint8Array([0xff, 0xfe]));
+        case 3: return Promise.reject(new Error('runtime detail that must not reach the relay'));
+        default: return new Response('fine');
+      }
+    },
   });
-  execution.response.resolve(new Response('first response'));
-  assert.deepEqual(JSON.parse(await socket.messages.next()), {
-    type: 'response', id: first.id, status: 200, body: 'first response',
-  });
-  await observed.promise;
+  const socket = await startFixture(fixture);
+  const requests = await Promise.all(['too-large', 'escaped', 'not-utf8', 'runtime-error', 'after'].map(id => rpc('view', '', id)));
+  for (const request of requests) socket.receive(request);
+  for (const request of requests.slice(0, 4)) {
+    const reply = JSON.parse(await socket.messages.next());
+    assert.equal(reply.id, request.id);
+    assert.equal(reply.status, 502);
+    assert.equal(JSON.parse(reply.body).code, 'connector_reply_error');
+    assert.doesNotMatch(reply.body, /runtime detail/);
+  }
+  assert.deepEqual(JSON.parse(await socket.messages.next()), { type: 'response', id: requests[4]!.id, status: 200, body: 'fine' });
   assert.equal(socket.readyState, 1);
-  assert.equal(socket.sent.length, 1);
-  assert.equal(fixture.runtimes[0]!.requests.length, 1, 'the next response reservation waits for socket output');
-  sending.mock.restore();
-  socket.bufferedAmount = 0;
-  const next = await runtime.started.next();
-  next.response.resolve(new Response('second response'));
-  assert.deepEqual(JSON.parse(await socket.messages.next()), {
-    type: 'response', id: second.id, status: 200, body: 'second response',
-  });
-  assert.equal(socket.readyState, 1);
-  assert.equal(fixture.allSockets.length, 1);
-  await fixture.connector.stop();
+  assert.equal(fixture.statuses.includes('disconnected'), false);
+});
+
+test('a disconnect reports why the connection ended', { timeout: 10000 }, async t => {
+  const fixture = await connectorFixture(t);
+  const socket = await startFixture(fixture);
+  socket.dispatchEvent(new MessageEvent('message', { data: 'not json' }));
+  await socket.closed.promise;
+  (await fixture.sockets.next()).open();
+  assert.deepEqual(fixture.reasons, ['Invalid relay frame']);
 });
 
 test('stop drains the active request but never executes or publishes queued work', { timeout: 10000 }, async t => {
