@@ -40,7 +40,8 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
   const host = await c.env.DB.query<{ models_json: string; capabilities_json: string }>('SELECT models_json, capabilities_json FROM connectors WHERE id = ? AND revoked_at IS NULL')
     .bind(row.connector_id).first();
   if (!host) fail(409, 'connector_unavailable', 'The session\'s host is no longer available.');
-  if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).chatOptions !== true) {
+  const capabilities = JSON.parse(host.capabilities_json) as ConnectorCapabilities;
+  if (capabilities.chatOptions !== true) {
     fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to choose model, reasoning or access.');
   }
   const options: ChatOptions = {};
@@ -68,17 +69,16 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
     if (input.access === 'auto' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can auto-approve commands.');
     options.access = input.access as ChatOptions['access'];
   }
-  // Auto-merge is a separate opt-in on top of the owner's Auto-approve, which only connectors that run GitHub effects
-  // automatically understand. `false` is the same as leaving it out.
+  // Auto-approve covers merges on hosts that run GitHub effects automatically (`automaticGitHub`), which merge without
+  // asking only in a message marked `autoMerge`, as the broker does only for an admission marked so (see
+  // issueRunAdmission). The apps mark each Auto-approve message to such a host, once its owner confirmed there that it
+  // merges; apps from when that was a separate Auto-merge option mark only the messages that chose it. Other hosts would
+  // refuse the mark and ask before every GitHub effect anyway, so it is left off, as when an app's picture of the host is
+  // out of date. `false` is the same as leaving it out.
   if (input.autoMerge !== undefined) {
     if (typeof input.autoMerge !== 'boolean') fail(400, 'invalid_options', 'Invalid auto-merge choice.');
-    if (input.autoMerge) {
-      if (options.access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
-      if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).automaticGitHub !== true) {
-        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to auto-approve GitHub merges.');
-      }
-      options.autoMerge = true;
-    }
+    if (input.autoMerge && options.access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
+    if (input.autoMerge && capabilities.automaticGitHub === true) options.autoMerge = true;
   }
   return options;
 }

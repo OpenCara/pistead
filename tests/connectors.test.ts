@@ -2408,7 +2408,10 @@ test('a collaborator sends a message to a workspace-visible session it does not 
   assert.equal(requests.length, 2);
 });
 
-/** A run admission of `actorId`, as a message sent with `access` (and auto-merge) mints it. */
+/**
+ * A run admission of `actorId`, as a message sent with `access` mints it; `autoMerge` marks it as merging without asking
+ * too, as the apps ask for every Auto-approve message to a host that runs GitHub effects automatically.
+ */
 function autoAdmission(f: Fixture, sessionId: string, actorId: string, access: string | null = 'auto', autoMerge = false, expiresAt = Math.floor(Date.now() / 1000) + 600) {
   const id = token();
   f.sqlite.prepare(`INSERT INTO run_admissions (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at,access,auto_merge) VALUES (?,?,?,?,?,?,?,?,?,?)`)
@@ -2416,25 +2419,42 @@ function autoAdmission(f: Fixture, sessionId: string, actorId: string, access: s
   return id;
 }
 
-test('auto-merge is a separate opt-in on the owner\'s Auto-approve, only for hosts that run GitHub effects automatically', async t => {
-  const f = await fixture(t); const s = await sharedSession(f);
+test('an Auto-approve message whose app asks merges without asking, on hosts that run GitHub effects automatically', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_merge']);
   const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
   const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
   const path = `/api/sessions/${s.session.id}`;
+  // The options a message sent with `options` takes to the host, and whether its admission lets merges run without asking.
+  const send = async (requestId: string, options: Record<string, unknown>) => {
+    await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId, options }), 202);
+    const admission = f.sqlite.prepare('SELECT id, auto_merge FROM run_admissions WHERE request_id = ?').get(requestId)!;
+    return { admissionId: String(admission.id), sent: [JSON.parse(requests.at(-1)!.request.body).options, admission.auto_merge] };
+  };
+  // A host that asks before every GitHub effect isn't told, even by an app whose picture of it is out of date: its
+  // connector would refuse the option.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: true } }));
-  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'old-host', options: { access: 'auto', autoMerge: true } }), 409, 'connector_update_required');
+  const olderHost = await send('older-host', { access: 'auto', autoMerge: true });
+  assert.deepEqual(olderHost.sent, [{ access: 'auto' }, 0]);
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: true, automaticGitHub: true } }));
+  const auto = await send('auto', { access: 'auto', autoMerge: true });
+  assert.deepEqual(auto.sent, [{ access: 'auto', autoMerge: true }, 1]);
+  // A message that doesn't ask keeps merges asking, as from an app of when Auto-merge was a separate option, left off.
+  const unasked = await send('unasked', { access: 'auto' });
+  assert.deepEqual(unasked.sent, [{ access: 'auto' }, 0]);
+  assert.deepEqual((await send('declined', { access: 'auto', autoMerge: false })).sent, [{ access: 'auto' }, 0]);
   await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'asking', options: { access: 'approval', autoMerge: true } }), 400, 'invalid_options');
   await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'not-boolean', options: { access: 'auto', autoMerge: 'yes' } }), 400, 'invalid_options');
-  const before = requests.length;
-  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'auto-merge', options: { access: 'auto', autoMerge: true } }), 202);
-  assert.equal(requests.length, before + 1);
-  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { access: 'auto', autoMerge: true });
-  assert.equal(f.sqlite.prepare(`SELECT auto_merge FROM run_admissions WHERE request_id = 'auto-merge'`).get()!.auto_merge, 1);
-  // Leaving it off is the same as never choosing it.
-  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'auto-only', options: { access: 'auto', autoMerge: false } }), 202);
-  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { access: 'auto' });
-  assert.equal(f.sqlite.prepare(`SELECT auto_merge FROM run_admissions WHERE request_id = 'auto-only'`).get()!.auto_merge, 0);
+
+  // The asking message's merge then runs without a person, as its comments and issues do; the others' wait.
+  const calls = mergeFetch(t, () => Response.json({ merged: true, sha: mergedSha }));
+  const merge = (approvalId: string, admissionId: string) => ({ sessionId: s.session.id, actorId: s.creator.user.id, approvalId, admissionId,
+    repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' });
+  for (const [approvalId, admissionId] of [['tool-older-host', olderHost.admissionId], ['tool-unasked', unasked.admissionId]]) {
+    await denied(await self(f, s.connector, 'github/merge', merge(approvalId!, admissionId!)), 403, 'automatic_merge_not_admitted');
+  }
+  assert.deepEqual(calls, []);
+  assert.deepEqual(await json(await self(f, s.connector, 'github/merge', merge('tool-merge', auto.admissionId))), { sha: mergedSha, url: 'https://github.com/owner/repo/pull/5' });
+  assert.deepEqual(calls, ['GET https://api.github.com/repos/owner/repo', 'PUT https://api.github.com/repos/owner/repo/pulls/5/merge']);
 });
 
 test('the owner\'s Auto-approve message posts GitHub comments without a capability, once per tool call and only for its own message', async t => {
@@ -2469,12 +2489,13 @@ test('the owner\'s Auto-approve message posts GitHub comments without a capabili
   assert.equal(fetch.mock.callCount(), 20);
 });
 
-test('automatic GitHub merges need the message\'s auto-merge as well as Auto-approve, and runtimes cannot claim otherwise', async t => {
+test('automatic GitHub merges need an Auto-approve admission marked to merge, and runtimes cannot claim otherwise', async t => {
   const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_merge']);
   const calls = mergeFetch(t, () => Response.json({ merged: true, sha: mergedSha }));
   const owner = s.creator.user.id;
   const merge = (approvalId: string, admissionId: string) => ({ sessionId: s.session.id, actorId: owner, approvalId, admissionId,
     repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' });
+  // An Auto-approve message that didn't ask, or went to a host that asks before every GitHub effect.
   const autoOnly = autoAdmission(f, s.session.id, owner);
   await denied(await self(f, s.connector, 'github/merge', merge('tool-merge', autoOnly)), 403, 'automatic_merge_not_admitted');
   assert.deepEqual(calls, []);
@@ -2482,7 +2503,7 @@ test('automatic GitHub merges need the message\'s auto-merge as well as Auto-app
   assert.deepEqual(await json(await self(f, s.connector, 'github/merge', merge('tool-merge', autoMerge))), { sha: mergedSha, url: 'https://github.com/owner/repo/pull/5' });
   assert.deepEqual(calls, ['GET https://api.github.com/repos/owner/repo', 'PUT https://api.github.com/repos/owner/repo/pulls/5/merge']);
 
-  // A view shows a merge as automatic only for an admission that chose auto-merge; a comment for any owner Auto-approve.
+  // A view shows a merge as automatic only for an admission marked to merge; a comment for any owner Auto-approve.
   const operation = { kind: 'github.merge' as const, repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' as const };
   const record = (id: string, admissionId: string, kind: 'merge' | 'comment' = 'merge'): ApprovalRecord => ({ id, sessionId: s.session.id, requestedBy: owner, decidedBy: owner,
     automatic: true, admissionId, status: 'executed', result: '{}', createdAt: new Date().toISOString(),

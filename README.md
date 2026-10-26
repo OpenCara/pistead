@@ -15,7 +15,7 @@ And around them:
 
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
 - **Isolated work.** Each session clones the workspace's repositories into its own sandbox, whose only way out is a proxy that reads them with the session owner's account and follows the workspace's network policy.
-- **People decide.** Shell commands, commits, pushes, GitHub comments and new issues wait for an approval unless the session owner auto-approves a message; merges wait unless that message also turns on **Auto-merge**.
+- **People decide.** Shell commands, commits, pushes, GitHub comments, merges and new issues wait for an approval unless the session owner auto-approves a message.
 - **Built for teams.** Workspace roles (viewer, member, collaborator, admin) set what each person can do by default, and session grants add more for one session at a time.
 
 ## Contents
@@ -335,12 +335,12 @@ The tools an agent can use:
 | `bash` | Run a shell command in the sandbox | Approval |
 | `git_push` | Push a clone's checked-out commit to a branch, optionally opening a pull request, or tag a commit already on a branch | Approval |
 | `github_read` | Read a GitHub issue or pull request | Nothing, during a shared message |
-| `github_comment` | Comment on a GitHub issue or pull request | Approval, always |
-| `github_merge` | Merge a GitHub pull request | Approval, always |
-| `github_issue` | Open a GitHub issue | Approval, always |
+| `github_comment` | Comment on a GitHub issue or pull request | Approval |
+| `github_merge` | Merge a GitHub pull request | Approval |
+| `github_issue` | Open a GitHub issue | Approval |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
 
-"Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments and issues, for merges only when the message also turns on **Auto-merge**, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.
+"Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments, merges and issues, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.
 
 Sessions started from a saved agent, before agents were removed, keep that agent's instructions and tools; any other tool they call first asks the session owner with a [permission request](#permission-requests).
 
@@ -390,9 +390,9 @@ Beside the composer you can pick, for each message:
 |---|---|
 | **Read only** | Inspect files; edits, commands and commits ask the session owner first |
 | **Ask before acting** (default for everyone but the session owner) | Edits are automatic; commands, commits, pushes, GitHub comments, merges and issues need approval |
-| **Auto-approve** (session owner only; their default) | Commands, commits, pushes, GitHub comments and new issues run at once as the owner, as do tools outside the agent and commands without resource limits. Merges still need approval unless you also turn on **Auto-merge**. `host_bash` runs without asking only on the owner's own host, or one whose owner granted them automatic host commands. |
+| **Auto-approve** (session owner only; their default) | Commands, commits, pushes, GitHub comments, merges and new issues run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host, or one whose owner granted them automatic host commands. |
 
-Before a session's first shared message, the owner's chat box starts on **Auto-approve** and everyone else's on **Ask before acting**; after it, each starts on the last shared message's access (Auto-approve only for the owner). Switching to **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. With **Auto-approve** chosen, the owner can also turn on **Auto-merge** (its own confirmation, off by default), so the agent's merges run without asking too; GitHub's branch protection and required checks still apply. Leaving **Auto-approve** turns **Auto-merge** off. Automatic comments, issues and merges need a connector advertising `automaticGitHub`; older ones still ask for each. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
+Before a session's first shared message, the owner's chat box starts on **Auto-approve** and everyone else's on **Ask before acting**; after it, each starts on the last shared message's access (Auto-approve only for the owner). Switching to **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Under it the agent can merge any pull request of the workspace's github.com repositories that GitHub lets the owner merge, without asking; GitHub's branch protection and required checks still apply. The owner's chat box starts on **Auto-approve** without that confirmation, so their first message that would merge without asking asks for it instead, once in each browser or app (confirming it when switching counts too). Apps from before Auto-approve covered merges keep their **Auto-merge** option, and merge without asking only with it on. Automatic comments, issues and merges need a connector advertising `automaticGitHub`; older ones still ask for each. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
 The **Approvals** list keeps to what people decide. Shell and host commands that ran under **Auto-approve** get no card there: the conversation marks their tool calls **Auto-approved** (with their outcome when it isn't the usual "executed"), and each call's result holds the command's output. Automatic commits, pushes, repins and GitHub comments, issues and merges keep their cards. The list shows every approval still in play and the newest 50 settled ones, each with the start and end of its result; the host keeps them all. Hosts running an older connector list every approval.
 
@@ -526,7 +526,7 @@ The sandbox has no network, so agents read and act on GitHub through Pistead ins
 - `github_issue` opens an issue with exactly the approved title and body in one of the workspace's github.com repositories, once it's approved, and gives the agent its number and URL (connector newer than 0.9.0). Use it rather than `gh issue create`: the sandbox holds no GitHub credentials. If GitHub refuses (issues turned off, no access), no issue is opened and the agent gets GitHub's reason.
 - `github_merge` merges a pull request at the exact head commit the agent read, with a merge commit, squash or rebase, once it's approved. If the head moved or GitHub refuses, nothing is merged and the agent gets GitHub's reason.
 
-Comments, issues and merges wait for a human decision, unless the session owner sent the message with **Auto-approve**: then comments and issues run at once, and merges too when the message also turned on **Auto-merge**. Each automatic one is attempted once (never retried), keeps its card with its outcome and is recorded in the session's activity; a message runs at most 20 of them.
+Comments, issues and merges wait for a human decision, unless the session owner sent the message with **Auto-approve**: then they run at once. Each automatic one is attempted once (never retried), keeps its card with its outcome and is recorded in the session's activity; a message runs at most 20 of them.
 
 ### Host commands
 

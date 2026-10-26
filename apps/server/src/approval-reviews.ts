@@ -28,7 +28,7 @@ export function permissionCall(approvalId: string): string | undefined {
 /**
  * Whether `admission` is a message the session owner sent with Auto-approve access. Its tool calls use any tool without
  * a permission card, as the runner lets them; what those calls do still follows its own rules (a merge waits for a
- * human unless the message also chose auto-merge, a command without limits runs only on the owner's host).
+ * human unless the admission is marked `auto_merge`, a command without limits runs only on the owner's host).
  */
 function ownerAuto(row: SessionRow, admission: AdmissionAccess | undefined): boolean {
   return admission?.access === 'auto' && admission.mode === 'write' && admission.actor_id === row.owner_id && admission.session_id === row.id;
@@ -115,9 +115,9 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
       ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
     // Only the owner's own operations may auto-approve. GitHub comments, issues and merges only from their Auto-approve
-    // message (merges only when it chose auto-merge), checked below with the message's admission. A host command runs
-    // automatically only where the control plane told the host its owner may (see hostCommandAuthority); a grant can
-    // lapse later, so the records it left are not judged by today's grants.
+    // message (merges only when its admission is marked `auto_merge`), checked below with the message's admission. A
+    // host command runs automatically only where the control plane told the host its owner may (see
+    // hostCommandAuthority); a grant can lapse later, so the records it left are not judged by today's grants.
     if (raw.automatic !== undefined) {
       if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id || approval.status === 'pending'
         || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
