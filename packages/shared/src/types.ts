@@ -139,6 +139,11 @@ export interface SessionRecord {
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
   activity?: SessionActivity;
   /**
+   * When the next of its scheduled prompts sends its agent a message (SessionSchedule); absent when none is enabled.
+   * Display state, like activity.
+   */
+  nextScheduledAt?: string;
+  /**
    * The pull request its newest git_push with a pull request opened, or found already open; absent until one does.
    * Display state, like activity: what the push recorded, and the state the control plane last read for it.
    */
@@ -155,6 +160,31 @@ export interface SessionPullRequest {
   number?: number;
   /** Absent until it has been read (github.com pull requests only, so far). */
   state?: PullRequestState;
+}
+/**
+ * A scheduled prompt: a message the server sends the session's agent on a cron schedule (packages/shared/src/cron.ts),
+ * as the session's owner, who alone manages them. A run that comes while the agent is busy or waits for an approval is
+ * skipped, not queued.
+ */
+export interface SessionSchedule {
+  id: string;
+  sessionId: string;
+  name: string;
+  cron: string;
+  /** IANA time zone the cron expression is read in. */
+  timeZone: string;
+  content: string;
+  access: AccessMode;
+  enabled: boolean;
+  /** Null while paused, or when the expression never comes round. */
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastSubmissionId: string | null;
+  /** Why its last run sent nothing: an API error code, or `session_busy`. */
+  lastError: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
 }
 export interface SessionGrant {
   userId: string;

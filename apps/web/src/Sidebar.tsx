@@ -43,7 +43,7 @@ function WorkspaceGroup({ workspace, sessions, route, collapsed, toggle, onNavig
         const status = sessionStatus(session, liveActivity?.sessionId === session.id ? liveActivity.activity : undefined);
         return <li key={session.id}>
           <a className="nav-item session-item" href={href({ name: "session", sessionId: session.id })} aria-current={current ? "page" : undefined} onClick={() => { selectWorkspace(workspace.id); onNavigate(); }}>
-            <StatusDot tone={status.tone} label={status.label ? undefined : session.status} />
+            <StatusDot tone={status.tone} icon={status.icon} label={status.label ? undefined : session.status} />
             <span className="label">
               <span className="title">{session.title}</span>
               {(status.label || session.pullRequest || relation) && <span className="sub">

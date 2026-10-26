@@ -39,14 +39,15 @@ function minutesLater(from: number, minutes: number): string {
 /**
  * Runs `work` as the session's owner, with a request context of its own: every check a backup makes (membership, session
  * access, suspension, the host's ticket) applies as if the owner had asked. The owner gave that permission by owning the
- * workspace or by confirming its database for automatic backups.
+ * workspace or by confirming its database for automatic backups. Scheduled prompts (scheduled-prompts.ts) run their
+ * messages this way too, as `as`: the owner made those schedules.
  */
-async function asSessionOwner<T>(env: Env, row: SessionRow, work: (c: AppContext) => Promise<T>): Promise<T> {
+export async function asSessionOwner<T>(env: Env, row: Pick<SessionRow, 'owner_id'>, work: (c: AppContext) => Promise<T>, as = 'automatic-backup'): Promise<T> {
   const app = new Hono<WorkerEnv>();
   // A holder rather than a `let`: TypeScript doesn't see assignments made inside the handler.
   const result: { outcome?: { value: T } | { error: unknown } } = {};
   app.post('/', async c => {
-    c.set('auth', { userId: row.owner_id, tokenHash: 'automatic-backup', csrfToken: '', client: 'native' });
+    c.set('auth', { userId: row.owner_id, tokenHash: as, csrfToken: '', client: 'native' });
     try {
       result.outcome = { value: await work(c) };
     } catch (error) {
@@ -56,13 +57,13 @@ async function asSessionOwner<T>(env: Env, row: SessionRow, work: (c: AppContext
   });
   await app.request('/', { method: 'POST' }, env);
   const { outcome } = result;
-  if (!outcome) throw new Error('The automatic backup did not run.');
+  if (!outcome) throw new Error(`The ${as} work did not run.`);
   if ('error' in outcome) throw outcome.error;
   return outcome.value;
 }
 
 /** The error code an attempt stopped at: the API's own code for refusals, else 'internal_error'. */
-async function errorCode(error: unknown): Promise<string> {
+export async function errorCode(error: unknown): Promise<string> {
   if (error instanceof HTTPException) {
     try {
       const body = await error.getResponse().json() as { code?: unknown };

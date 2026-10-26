@@ -86,7 +86,9 @@ export function StatusBadge({ tone = "neutral", dot, children }: { tone?: Tone; 
   return <span className={`badge ${tone === "running" ? "info" : tone}`}>{dot && <StatusDot tone={tone} />}{children}</span>;
 }
 
-export function StatusDot({ tone = "neutral", label }: { tone?: Tone; label?: string }) {
+export function StatusDot({ tone = "neutral", label, icon }: { tone?: Tone; label?: string; icon?: "clock" }) {
+  // A session waiting for its next scheduled prompt shows a clock where others show a dot.
+  if (icon) return <span className={`status-icon ${tone}`} role={label ? "img" : undefined} aria-label={label} aria-hidden={label ? undefined : true}><Icon name={icon} size={11} /></span>;
   return <span className={`dot ${tone === "info" ? "running" : tone}`} role={label ? "img" : undefined} aria-label={label} aria-hidden={label ? undefined : true} />;
 }
 
