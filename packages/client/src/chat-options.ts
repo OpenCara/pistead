@@ -176,6 +176,18 @@ export function accessUnavailable(host: ConnectorInfo | undefined, selection: Ch
 }
 
 /**
+ * Why a message can't be sent with `selection`'s model, if it can't. On a host that switches models, a message runs on
+ * the model it names, and only on one the host offers: one its owner or an admin disabled is no longer listed, so a
+ * conversation still on it, or a pick made before, must choose another. A host that offers none runs nothing.
+ */
+export function modelUnavailable(host: ConnectorInfo | undefined, selection: ChatSelection): string | undefined {
+  if (!host?.capabilities.chatOptions) return undefined;
+  if (!host.models.length) return `${host.name} offers no models right now. Its owner or an admin can enable one.`;
+  if (selection.model && !findModel(host, selection.model)) return `${host.name} no longer offers ${selection.model.modelId}. Choose another model.`;
+  return undefined;
+}
+
+/**
  * Request options for a selection, or undefined when the host's connector cannot apply them.
  * Only choices the host advertises are sent; access only applies to the shared conversation.
  */

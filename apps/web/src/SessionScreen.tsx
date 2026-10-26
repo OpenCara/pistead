@@ -6,7 +6,7 @@ import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction"
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
-import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, rememberChat, type ChatSelection } from "./chat-options";
+import { accessUnavailable, ChatOptionsBar, chatOptionsBody, initialSelection, modelUnavailable, rememberChat, type ChatSelection } from "./chat-options";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -364,7 +364,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (request.current?.key !== key) request.current = { key, id: crypto.randomUUID() };
     const pending = request.current;
     stick.current = true;
-    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit");
+    const unavailable = accessUnavailable(host, selection, actualMode === "ask" ? "ask" : "submit") ?? modelUnavailable(host, selection);
     void submission.run(async () => {
       if (unavailable) throw new Error(unavailable);
       // Encoded once per request, so a retry sends the same bytes under the same key.

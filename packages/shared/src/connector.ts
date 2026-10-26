@@ -110,6 +110,7 @@ export interface ConnectorInfo {
   createdAt: string;
   revokedAt: string | null;
   online: boolean;
+  /** The models it offers: those it advertises, less any its owner or an admin disabled. */
   models: LocalModelSummary[];
   // Explicit runtime shares, not the owner's private workspace associations.
   workspaceIds: string[];
@@ -123,10 +124,24 @@ export interface ConnectorInfo {
   /** Listed to its owner and admins. */
   hostGrants?: HostCommandGrant[];
   /**
+   * Models it advertises that its owner or an admin disabled (see HostModelSettings): no session starts from one and no
+   * message switches to one. Listed to its owner and admins, who can enable them again.
+   */
+  disabledModels?: LocalModelSummary[];
+  /**
    * The viewer's own authority over host commands on it in the listed workspace: owner, or a grant's level. Absent when
    * they hold none.
    */
   hostCommandAccess?: "owner" | HostCommandLevel;
+}
+
+/**
+ * A host's models as its owner and admins manage them (PATCH /api/connectors/:id/models): what it offers, and what it
+ * advertises but they disabled.
+ */
+export interface HostModelSettings {
+  models: LocalModelSummary[];
+  disabledModels: LocalModelSummary[];
 }
 
 export interface ConnectorPairing {

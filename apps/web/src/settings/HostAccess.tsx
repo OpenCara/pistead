@@ -30,7 +30,10 @@ function useMembers(workspaceId: string | undefined) {
   return useResource<{ members: WorkspaceMember[] }>(workspaceId ? `/api/workspaces/${segment(workspaceId)}/members` : null);
 }
 
-/** Who manages this host's sharing besides its owner. Only the owner adds or removes them; an admin may step down. */
+/**
+ * Who manages this host's sharing, and which of its models it offers, besides its owner. Only the owner adds or removes
+ * them; an admin may step down.
+ */
 export function HostAdminsSection({ connector, refresh }: { connector: ConnectorInfo; refresh: () => void }) {
   const { user, workspaces } = useApp();
   const action = useAction();
@@ -48,7 +51,7 @@ export function HostAdminsSection({ connector, refresh }: { connector: Connector
   function add() {
     if (!chosen) return;
     void (async () => {
-      if (!await confirmDialog({ title: `Make ${usernameWithId(memberPerson(chosen))} an admin?`, message: `They will manage ${connector.name}'s sharing: share it with workspaces you both belong to, and grant members host commands there, including themselves. Host commands run on your machine with your files, credentials and network. Only you can add admins, revoke or remove the host.`, confirmLabel: "Add admin", destructive: true })) return;
+      if (!await confirmDialog({ title: `Make ${usernameWithId(memberPerson(chosen))} an admin?`, message: `They will manage ${connector.name}'s sharing: share it with workspaces you both belong to, and grant members host commands there, including themselves. Host commands run on your machine with your files, credentials and network. They will also choose which of its models it offers, to everyone including you. Only you can add admins, revoke or remove the host.`, confirmLabel: "Add admin", destructive: true })) return;
       await action.run(async () => {
         await api(`/api/connectors/${segment(connector.id)}/admins/${segment(chosen.userId)}`, { method: "PUT", body: {} });
         refresh();
@@ -66,7 +69,7 @@ export function HostAdminsSection({ connector, refresh }: { connector: Connector
     })();
   }
 
-  return <Section title="Admins" bare info="Admins manage this host's sharing for you: its workspace shares and host command grants. They hold no host command access of their own unless a grant gives it to them, and only the owner can add admins, revoke or remove the host.">
+  return <Section title="Admins" bare info="Admins manage this host's sharing for you: its workspace shares and host command grants, and which of its models it offers. They hold no host command access of their own unless a grant gives it to them, and only the owner can add admins, revoke or remove the host.">
     <div className="card">
       {!admins.length && <Row title="No admins" hint={owner ? "Only you manage this host" : undefined} />}
       {admins.map(admin => <Row key={admin.userId} title={admin.name || admin.userId} hint={<>Admin since <Timestamp value={admin.createdAt} /></>}

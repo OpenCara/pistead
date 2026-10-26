@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ConnectorInfo } from "../packages/shared/src/connector.js";
 import type { SessionView } from "../packages/shared/src/types.js";
-import { accessUnavailable, autoApproveWarning, autoMergeAvailable, chatOptionsBody, chatPreference, initialSelection, parseChatPreference, preferredSelection, type ChatSelection } from "../packages/client/src/chat-options.js";
+import { accessUnavailable, autoApproveWarning, autoMergeAvailable, chatOptionsBody, chatPreference, initialSelection, modelUnavailable, parseChatPreference, preferredSelection, type ChatSelection } from "../packages/client/src/chat-options.js";
 
 const host = { capabilities: { chatOptions: true }, models: [] } as unknown as ConnectorInfo;
 const auto: ChatSelection = { access: "auto" };
@@ -17,6 +17,20 @@ test("a chosen access goes with every shared message, or the message waits until
   // The default access needs no options, and side asks are read-only whatever is picked.
   assert.equal(accessUnavailable(undefined, { access: "approval" }, "submit"), undefined);
   assert.equal(accessUnavailable(undefined, auto, "ask"), undefined);
+});
+
+test("a message waits for a model its host offers, once the conversation's own one is disabled there", () => {
+  const offering = { name: "Bob's Pi", capabilities: { chatOptions: true }, models: [{ provider: "p", modelId: "fast", name: "Fast" }] } as unknown as ConnectorInfo;
+  const fast = { provider: "p", modelId: "fast" };
+  assert.equal(modelUnavailable(offering, { model: fast, access: "approval" }), undefined);
+  // The conversation's current model, or an earlier pick, that the host no longer offers, as when an admin disabled it.
+  assert.match(modelUnavailable(offering, { model: { provider: "p", modelId: "deep" }, access: "approval" }) ?? "", /Bob's Pi no longer offers deep\. Choose another model/);
+  // Without a model the message runs on the conversation's own one, which the server checks.
+  assert.equal(modelUnavailable(offering, { access: "approval" }), undefined);
+  // A host that offers none runs nothing; one that can't switch models, or isn't known yet, is left to the server.
+  assert.match(modelUnavailable({ ...offering, models: [] }, { model: fast, access: "approval" }) ?? "", /offers no models right now/);
+  assert.equal(modelUnavailable({ ...offering, capabilities: {} } as unknown as ConnectorInfo, { model: { provider: "p", modelId: "deep" }, access: "approval" }), undefined);
+  assert.equal(modelUnavailable(undefined, { model: fast, access: "approval" }), undefined);
 });
 
 test("the last chatted model and reasoning start the next new chat where the host offers them", () => {
