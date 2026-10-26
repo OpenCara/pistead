@@ -1,3 +1,4 @@
+import { isPullRequestState } from '../../../packages/shared/src/pull-requests.js';
 import type { AgentVersion, ModelDefinition, Permission, SessionPullRequest, SessionRecord, UserProfile, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
@@ -41,13 +42,13 @@ export function requireUnfrozen(row: Pick<SessionRow, 'repository_mode' | 'repos
 }
 
 /** A recorded pull request URL as lists show it: its number from the last path segment (GitHub, GitLab, Bitbucket, Gitea, Azure). */
-export function sessionPullRequest(url: string | null | undefined): SessionPullRequest | undefined {
+export function sessionPullRequest(url: string | null | undefined, state?: string | null): SessionPullRequest | undefined {
   if (!url) return undefined;
   let parsed: URL;
   try { parsed = new URL(url); } catch { return undefined; }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return undefined;
   const number = /\/(\d+)\/?$/.exec(parsed.pathname)?.[1];
-  return { url: parsed.href, ...(number ? { number: Number(number) } : {}) };
+  return { url: parsed.href, ...(number ? { number: Number(number) } : {}), ...(isPullRequestState(state) ? { state } : {}) };
 }
 
 /**
@@ -60,7 +61,7 @@ export function successorBranch(row: Pick<SessionRow, 'id' | 'title' | 'reposito
 }
 
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
-  const pullRequest = sessionPullRequest(row.pull_request_url);
+  const pullRequest = sessionPullRequest(row.pull_request_url, row.pull_request_state);
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
@@ -99,10 +100,12 @@ type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: W
 
 // Membership, visibility and explicit grants must come from the same policy snapshot. A suspended account opens no
 // session, and nobody opens the sessions it owns, as if it had left the workspace.
-// The newest pull request a push opened or found comes along for session lists and headers.
+// The newest pull request a push opened or found comes along for session lists and headers, with its last read state.
 const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role,
   (SELECT pr.pull_request_url FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
-    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_url FROM sessions s
+    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_url,
+  (SELECT pr.pull_request_state FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
+    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_state FROM sessions s
   INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
   INNER JOIN workspace_members owner ON owner.workspace_id = s.workspace_id AND owner.user_id = s.owner_id
   INNER JOIN users actor_user ON actor_user.id = actor.user_id

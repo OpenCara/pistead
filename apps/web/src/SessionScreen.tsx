@@ -209,7 +209,7 @@ function SessionPane({ id }: { id: string }) {
   const badge = startFailed ? <StatusBadge tone={session?.status === "error" ? "danger" : "running"} dot>{session?.status === "error" ? "Not started" : "Starting"}</StatusBadge>
     : !view && live.error ? <StatusBadge tone="warning" dot>Unavailable</StatusBadge>
     : streamBadge;
-  return <PeopleProvider people={people}><div className={panelOpen && session ? "session-screen panel-open" : "session-screen"}>
+  return <PeopleProvider people={people}><div className={panelOpen && session ? `session-screen panel-open${tab === "files" ? " panel-wide" : ""}` : "session-screen"}>
     <div className="session-pane">
       <ScreenHeader
         title={known?.title ?? "Session"}

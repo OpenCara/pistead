@@ -133,14 +133,21 @@ export interface SessionRecord {
   activity?: SessionActivity;
   /**
    * The pull request its newest git_push with a pull request opened, or found already open; absent until one does.
-   * Display state, like activity: what the push recorded, not the pull request's live state.
+   * Display state, like activity: what the push recorded, and the state the control plane last read for it.
    */
   pullRequest?: SessionPullRequest;
 }
+/**
+ * A pull request's state as the control plane last read it with the session owner's account: merged and closed win,
+ * then draft, then work to do (changes requested by a reviewer, then failed CI), otherwise open.
+ */
+export type PullRequestState = "draft" | "open" | "failing" | "changes_requested" | "merged" | "closed";
 export interface SessionPullRequest {
   url: string;
   /** Parsed from the URL's last path segment; absent when it has none. */
   number?: number;
+  /** Absent until it has been read (github.com pull requests only, so far). */
+  state?: PullRequestState;
 }
 export interface SessionGrant {
   userId: string;
@@ -156,7 +163,29 @@ export interface RunnerBinding {
   agent: AgentVersion;
   model: ModelDefinition;
 }
-export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop";
+export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop" | "files";
+
+/** How far the session file browser reads: entries listed per directory, and bytes of a file previewed. */
+export const fileBrowserLimits = { entries: 1000, textBytes: 256 * 1024, imageBytes: 2 * 1024 * 1024 } as const;
+
+/** One entry of a worktree directory, as the file browser lists it; symlinks are listed, not followed. */
+export interface FileEntry {
+  name: string;
+  type: "directory" | "file" | "symlink" | "other";
+  /** Bytes, for regular files only. */
+  size?: number;
+}
+
+/**
+ * What the file browser shows of one worktree path (`path` is relative to the worktree, "." for its root): a directory's
+ * entries, directories first and then by name, at most `fileBrowserLimits.entries` of them; or a file's preview, text
+ * up to `fileBrowserLimits.textBytes`, an image up to `fileBrowserLimits.imageBytes`, or neither for anything else.
+ */
+export type SessionFiles =
+  | { path: string; type: "directory"; entries: FileEntry[]; total: number; truncated: boolean }
+  | { path: string; type: "file"; size: number; truncated: boolean; text?: string; image?: { mimeType: string; data: string }; binary?: true;
+    /** The control plane hid something that looks like a secret in `text`. */
+    redacted?: true };
 export interface RunnerTicket {
   aud: "runner";
   sessionId: string;
