@@ -112,7 +112,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | View workspace-visible sessions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Start sessions | ✓ | ✓ | ✓ | ✓ | |
 | Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
-| Bind and remove repositories, set their push policy | ✓ | ✓ | | | |
+| Bind and remove repositories, set their push policy and Git LFS | ✓ | ✓ | | | |
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
 | Add, change or remove collaborators, members and viewers | ✓ | ✓ | | | |
@@ -139,7 +139,7 @@ Connect the accounts that can read your repositories under **Settings → Profil
 | Azure DevOps | Personal access token and organization | Code (Read); opening pull requests or pushing with your account needs Code (Read & write) |
 | Gitea / Forgejo | Personal access token and host | `read:repository` and `read:user`; opening pull requests or pushing with your account needs `write:repository` |
 
-Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
+Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's own account, on hosts that have `git-lfs` installed (Pistead uses the host's own). The provider's download links and the tokens that come with them stay on the control plane. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
 
 Sessions **clone on demand**: every new session starts with an empty worktree and pins nothing.
 

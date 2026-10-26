@@ -262,6 +262,60 @@ on the forge. Bundles in the backup keep all of that where backups already go.
   is kept for the agent to recover from.
 - Clones of repositories outside the workspace, worktrees and submodules (`.git` files) are not restored automatically.
 
+## Git LFS downloads
+
+Each workspace repository has a Git LFS switch (`repository_lfs_settings`, beside the immutable binding like its push
+policy; no row means off). `PUT /api/workspaces/:id/repositories/:bindingId/lfs {enabled}` is for owners and admins,
+audited as `repository.lfs.updated`; the setting is in `WorkspaceRepository.lfs`, in exports, and in the grant
+(`EgressRepository.lfs`).
+
+- **Off** (the default): nothing changes. Clones check out LFS pointer files, and the proxy refuses git-lfs's requests
+  with a message saying LFS is off for the repository.
+- **In the sandbox.** Where the host has `git-lfs` (`/usr/bin` or `/usr/local/bin`, seen through the read-only `/usr`
+  mount), clone sessions get the `git` shim even without a repository cache. Before `git clone` of a URL it asks the
+  proxy's `/__pistead/lfs?remote=…`, and for a repository with LFS on adds `-c filter.lfs.{process,smudge,clean}` and
+  `filter.lfs.required` to the clone, so the setting lands in that clone's own `.git/config` (the session's global
+  config is read-only). The agent is told which repositories have LFS on, and how to turn the filters on in a clone
+  made otherwise.
+- **In the proxy.** git-lfs finds its endpoint by applying the session's `url.<base>.insteadOf` rewrites to the remote,
+  so it asks `http://127.0.0.1:41080/git/<host>/<path>/info/lfs/objects/batch`. For a workspace repository with LFS
+  on, the proxy accepts only `download` batches of the `basic` transfer and sha256 objects, and sends each object's id
+  and size to the relay as `lfs-batch`. It answers git-lfs with `authenticated: true` and download links pointing back
+  at itself (`…/info/lfs/objects/<oid>?size=<n>`), which it relays as `lfs-object`. Uploads, locks and anything else
+  under `info/lfs` are refused in git-lfs's JSON error format, so git-lfs shows the reason. Smart-HTTP paths are matched
+  first, so a repository whose path contains `info/lfs` is still fetched with Git.
+- **In the control plane** (`lfs.ts`, behind the relay route; `lfs-batch` and `lfs-object` are relay services). Each
+  request re-checks the switch, so turning it off stops downloads at once, and verifies the repository's identity, as
+  every Git read does: nothing makes the host ask for a batch before a download, so a repository that took a renamed
+  binding's name serves nothing, not even by oid. `lfs-batch` makes the provider's batch request with the session
+  owner's own credential (`ownerGitAuthorization`) and answers only, per object, whether it can be downloaded or the
+  provider's error.
+  `lfs-object` makes a one-object batch and downloads the object itself: the action's headers are sent only to its
+  `href`, the owner's credential only to the provider's own origin and only when the action brings no authorization,
+  `href`s and redirects (three at most) must be `https` on a public DNS name (`validGitHost`), and a redirect to another
+  origin drops the action's headers. The answer streams back, cut off with an error if it isn't exactly the pointer's
+  size; git-lfs checks the content's sha256 itself.
+- **What reaches the host:** object ids, sizes, provider error messages (printable ASCII, bounded) and content. The
+  provider's download URLs and the short-lived tokens in their headers never do.
+- **A refused LFS request** doesn't unmount the session's mirror: only refused Git reads (`info-refs`, `upload-pack`)
+  mean the owner lost the repository.
+- **Backups and restores.** A clone's backup stages its working tree with the LFS filters turned off, so an LFS-tracked
+  file changed in the session goes into the bundle as its content (within the bundle budget; a larger change fails the
+  backup rather than being dropped). With git-lfs's clean filter it would be a pointer to an object in `.git/lfs`, which
+  the bundle doesn't carry and the session can't upload. Restores check out without filters, as before: changed files
+  come back as their content, unchanged ones as pointers, which `git lfs install --local` and `git lfs pull` fetch
+  again.
+
+### Not yet
+
+- Uploads. Sessions run Git without hooks, so git-lfs's pre-push upload never runs, and a pushed commit that adds or
+  changes LFS-tracked files would point at objects the forge doesn't have. The agent is told not to push such commits.
+- The host cache keeps Git objects only; LFS objects are downloaded through the control plane for each clone, and each
+  download costs a repository identity check with the provider (an API request).
+- Restored clones don't get the LFS filters back by themselves.
+- Like other control-plane fetches of self-hosted providers, the relay checks download hosts by name, not by the
+  addresses they resolve to.
+
 ## Phase 5: every session clones, pinned sessions are read-only
 
 - **New sessions** are all clone sessions (`repository_mode = 'clone'`), and pin nothing. The host must advertise

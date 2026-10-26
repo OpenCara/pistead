@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { accessSync, constants } from "node:fs";
 import { chmod, mkdir, open, realpath, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { validateUserEnv } from "../../../packages/shared/src/policy.js";
@@ -67,26 +67,46 @@ const CA_BUNDLE_FILE = "ca-certificates.crt";
 const MIRROR_KINDS: ReadonlySet<Request["kind"]> = new Set(["bash", "clone-head", "clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"]);
 
 /**
- * `git` for clone sessions on a cache host: a clone of a workspace repository first asks the egress proxy to bring the
- * host's mirror up to date, then borrows its objects (--reference-if-able) instead of downloading them again. If the
- * mirror is not ready within 20 seconds, the clone goes ahead on its own. Everything else runs Git unchanged.
+ * Where sandboxes find git-lfs: the host's own, as /usr is mounted read-only in every sandbox. Package managers install
+ * it in /usr/bin; /usr/local/bin is not on sandboxed commands' PATH, so it is always named by its full path.
+ */
+const GIT_LFS_PATHS = ["/usr/bin/git-lfs", "/usr/local/bin/git-lfs"] as const;
+/** The host's git-lfs, which sandboxed sessions can run, if it has one. */
+export function hostGitLfs(): string | undefined {
+  return GIT_LFS_PATHS.find(path => { try { accessSync(path, constants.X_OK); return true; } catch { return false; } });
+}
+
+/**
+ * `git` for clone sessions on a host with a repository cache or git-lfs. A clone of a workspace repository:
+ * - on a cache host, first asks the egress proxy to bring the host's mirror up to date, then borrows its objects
+ *   (--reference-if-able) instead of downloading them again; if the mirror is not ready within 20 seconds, the clone goes
+ *   ahead on its own;
+ * - where the workspace turned Git LFS on for the repository and git-lfs is installed, configures the clone's LFS
+ *   filters (in its own .git/config), so its checkout downloads LFS files' content through the proxy. Elsewhere clones
+ *   keep LFS pointer files, as plain Git does.
+ * Everything else runs Git unchanged.
  */
 const GIT_SHIM = String.raw`#!/usr/bin/python3 -I
 import json, os, sys, urllib.parse, urllib.request
 
 args = sys.argv[1:]
 VALUED = {'-o', '--origin', '-b', '--branch', '-u', '--upload-pack', '--template', '-c', '--config', '--depth', '--shallow-since',
-          '--shallow-exclude', '--separate-git-dir', '-j', '--jobs', '--filter', '--bundle-uri', '--server-option', '--ref-format'}
+          '--shallow-exclude', '--separate-git-dir', '-j', '--jobs', '--filter', '--bundle-uri', '--server-option', '--ref-format',
+          '--reference', '--reference-if-able', '--revision'}
 
 
-def mirror(url):
+LFS = next((path for path in ${JSON.stringify(GIT_LFS_PATHS)} if os.access(path, os.X_OK)), None)
+
+
+def ask(endpoint, url, timeout):
     query = urllib.parse.urlencode({'remote': url})
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/mirror?' + query, timeout=20) as response:
-            return json.load(response).get('path')
+        with opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/' + endpoint + '?' + query, timeout=timeout) as response:
+            answer = json.load(response)
+            return answer if isinstance(answer, dict) else {}
     except Exception:
-        return None
+        return {}
 
 
 index = 0
@@ -106,10 +126,15 @@ if index < len(args) and args[index] == 'clone':
         url = argument
         break
     borrowing = any(argument.startswith('--reference') or argument in ('-s', '--shared', '--dissociate') for argument in rest)
+    extra = []
     if url and not borrowing:
-        path = mirror(url)
-        if path:
-            args = args[:index + 1] + ['--reference-if-able', path] + rest
+        path = ask('mirror', url, 20).get('path')
+        if isinstance(path, str) and path:
+            extra += ['--reference-if-able', path]
+    if url and LFS and ask('lfs', url, 10).get('lfs') is True:
+        extra += ['-c', 'filter.lfs.process=' + LFS + ' filter-process', '-c', 'filter.lfs.smudge=' + LFS + ' smudge -- %f',
+                  '-c', 'filter.lfs.clean=' + LFS + ' clean -- %f', '-c', 'filter.lfs.required=true']
+    args = args[:index + 1] + extra + rest
 os.execv('/usr/bin/git', ['git'] + args)
 `;
 
@@ -661,7 +686,11 @@ def clone_backup_one(path, nested, budget):
             shutil.copyfile(os.path.join(directory, '.git', 'index'), index, follow_symlinks=False)
         except FileNotFoundError:
             clone_git_checked(directory, ['read-tree', head] if head else ['read-tree', '--empty'], extra=extra, reason=reason)
-        clone_git_checked(directory, ['add', '-A'], extra=extra, reason=reason)
+        # Without the clone's LFS filters: git-lfs's clean filter would store a changed LFS file as a pointer to an object
+        # in .git/lfs, which the bundle doesn't carry and sessions can't upload, so the change would be lost. Its content
+        # goes into the bundle instead (within the budget below); unchanged files keep their pointers from the index.
+        clone_git_checked(directory, ['-c', 'filter.lfs.process=', '-c', 'filter.lfs.clean=', '-c', 'filter.lfs.required=false',
+                                      'add', '-A'], extra=extra, reason=reason)
         if nested:
             clone_git_checked(directory, ['update-index', '--force-remove', '--'] + nested, extra=extra, reason=reason)
         tree = clone_git_checked(directory, ['write-tree'], extra=extra, reason=reason)
@@ -1165,6 +1194,8 @@ export class Sandbox {
   readonly #egressSocket: string | undefined;
   readonly #sessionBranch: string | undefined;
   readonly #mirrors: (() => Promise<readonly MirrorMount[]>) | undefined;
+  /** Whether shell commands get the `git` shim: on a cache host, or where git-lfs is installed, in sessions with a proxy. */
+  readonly #shim: boolean;
   #initialization: Promise<void> | undefined;
   #mounts: Mounts | undefined;
   #closed = false;
@@ -1193,6 +1224,7 @@ export class Sandbox {
     this.#egressSocket = options.egressSocket;
     this.#sessionBranch = options.sessionBranch;
     this.#mirrors = options.mirrors;
+    this.#shim = options.egressSocket !== undefined && (options.mirrors !== undefined || hostGitLfs() !== undefined);
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
     this.#identity = Object.freeze({ ownerId, githubLogin, gitName, gitEmail, home: `${base}/home`, worktree: `${base}/worktree`, env });
@@ -1249,7 +1281,7 @@ export class Sandbox {
         await placeholder(home, ".gitconfig");
         const config = await pinOwnerConfig(fdPath(root, "owner.gitconfig"), ownerGitConfig(this.#identity));
         // The shim lives beside the session's mounts, where nothing in the sandbox can change it.
-        if (this.#mirrors) {
+        if (this.#shim) {
           const shim = join(this.#root, "bin", "git");
           await mkdir(join(this.#root, "bin"), { recursive: true, mode: 0o700 });
           // Written afresh at every open: the previous one is read-only, and may be an older version.
@@ -1476,14 +1508,14 @@ export class Sandbox {
       // not open) is skipped; requests then fail to connect.
       // The certificates are written whenever there is a proxy, so a missing file is an error, not a skipped mount.
       ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET, "--ro-bind", join(this.#root, CA_BUNDLE_FILE), CA_BUNDLE] : []),
-      ...(egress && this.#mirrors ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY] : []),
+      ...(egress && this.#shim ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY] : []),
       ...mirrors.flatMap(({ source, target }) => ["--ro-bind-try", source, target]),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
     if (egress) for (const [name, value] of Object.entries(egressEnvironment(this.#sessionBranch))) args.push("--setenv", name, value);
-    if (egress && this.#mirrors) args.push("--setenv", "PATH", `${SHIM_DIRECTORY}:${this.#environment.PATH}`);
+    if (egress && this.#shim) args.push("--setenv", "PATH", `${SHIM_DIRECTORY}:${this.#environment.PATH}`);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" || request.kind === "clone-backup" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
     const launch = requireResources

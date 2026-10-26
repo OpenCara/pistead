@@ -5,10 +5,10 @@ import type {
 import type { NetworkPolicy } from '../../../packages/shared/src/network.js';
 import type { WorkspaceRepository } from '../../../packages/shared/src/repositories.js';
 import type { Database, SqlValue } from './db/types.js';
-import type { AgentRow, ModelRow, PushIdentityRow, RepositoryRow, SessionRow, WorkerEnv, WorkspaceRow } from './types.js';
+import type { AgentRow, ModelRow, PushIdentityRow, SessionRow, WorkerEnv, WorkspaceRow } from './types.js';
 import { agentVersion, auditStatement, modelDefinition, requireMember, requireSession, sessionRecord, workspaceSessionAccess } from './db.js';
 import { fail, identifier, now } from './http.js';
-import { publicRepository } from './repositories.js';
+import { publicRepository, repositorySettingsSelect, type RepositorySettingsRow } from './repositories.js';
 import { workspaceNetworkPolicy } from './network.js';
 import { publicIdentity } from './push/identities.js';
 import { publicWorkspaceDatabase, type WorkspaceDatabaseRow } from './workspace-databases/store.js';
@@ -152,8 +152,7 @@ export async function exportWorkspace(db: Database, workspaceId: string,
   const models = await db.query<ModelRow>('SELECT * FROM models WHERE workspace_id = ? ORDER BY created_at, id').bind(workspaceId).all();
   const agents = await db.query<AgentRow>('SELECT * FROM agent_versions WHERE workspace_id = ? ORDER BY created_at, agent_id, version')
     .bind(workspaceId).all();
-  const repositories = await db.query<RepositoryRow & { forbid_default_branch: number | null }>(`SELECT r.*, p.forbid_default_branch
-    FROM workspace_repositories r LEFT JOIN repository_push_policies p ON p.binding_id = r.id
+  const repositories = await db.query<RepositorySettingsRow>(`${repositorySettingsSelect}
     WHERE r.workspace_id = ? ORDER BY r.created_at, r.id`).bind(workspaceId).all();
   const identities = await db.query<PushIdentityRow>('SELECT * FROM push_identities WHERE workspace_id = ? ORDER BY provider, host, scope, id')
     .bind(workspaceId).all();

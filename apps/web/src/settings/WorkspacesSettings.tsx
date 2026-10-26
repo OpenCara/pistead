@@ -134,10 +134,18 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
       refresh();
     }, "Push policy saved.");
   }
+  function setLfs(repository: WorkspaceRepository, enabled: boolean) {
+    if (action.busy || !admin) return;
+    void action.run(async () => {
+      await api(`/api/workspaces/${segment(workspace.id)}/repositories/${segment(repository.id)}/lfs`, { method: "PUT", body: { enabled } });
+      refresh();
+    }, enabled ? "Git LFS turned on. New clones download LFS files." : "Git LFS turned off. Clones check out LFS pointer files.");
+  }
   const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
   return <Section bare title="Repositories" info={<div className="stack">
     {!admin && <p>Only workspace owners and admins can add or remove repositories.</p>}
     <p>Changes apply at once, in running sessions too: a removed repository can no longer be read or pushed. To change a ref, remove and re-add the repository.</p>
+    <p>Git LFS is off by default, and clones check out LFS pointer files. Turned on, sessions download the repository's LFS files with their owner's own account, where the host has git-lfs installed. Sessions never upload LFS files.</p>
     <RepositoryClonePolicy />
   </div>} action={canAdd && <Button variant="outline" size="sm" icon="plus" disabled={loading || Boolean(error) || action.busy} onClick={() => setPicking(true)}>Add repository</Button>}>
     <div className="stack" id="workspace-repositories">
@@ -147,6 +155,7 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
             ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
             : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<>{gitProviderLabel(repository.provider, repository.host)} · <code>{repository.ref}</code></>} trailing={<>
               <label className="inline small"><input type="checkbox" className="checkbox" checked={!repository.forbidDefaultBranchPush} disabled={!admin || action.busy} onChange={event => setPushPolicy(repository, event.target.checked)} />Allow agent pushes to the default branch</label>
+              <label className="inline small" title="Sessions download this repository's Git LFS files instead of checking out pointer files"><input type="checkbox" className="checkbox" checked={repository.lfs} disabled={!admin || action.busy} onChange={event => setLfs(repository, event.target.checked)} />Git LFS</label>
               <StatusBadge>{repository.private ? "Private" : "Public"}</StatusBadge>
               {admin && <Button variant="outline" size="sm" disabled={action.busy} aria-label={`Remove ${repository.fullName}`} onClick={() => void remove(repository)}>Remove</Button>}
             </>} />)}
