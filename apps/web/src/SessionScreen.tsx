@@ -34,15 +34,18 @@ function useLiveSession(id: string) {
   const [status, setStatus] = useState<StreamStatus>("connecting");
   const [revision, setRevision] = useState(0);
   const refreshRef = useRef<() => void>(() => {});
+  const loadOlderRef = useRef<(conversationId: string) => Promise<void>>(async () => {});
   const refresh = useCallback(() => refreshRef.current(), []);
+  const loadOlder = useCallback((conversationId: string) => loadOlderRef.current(conversationId), []);
   const reconnect = useCallback(() => setRevision(current => current + 1), []);
   useEffect(() => {
     setStatus("connecting");
     const live = startLiveSession(id, { session: setSession, view: setView, error: setError, status: setStatus });
     refreshRef.current = live.refresh;
-    return () => { live.stop(); refreshRef.current = () => {}; };
+    loadOlderRef.current = live.loadOlder;
+    return () => { live.stop(); refreshRef.current = () => {}; loadOlderRef.current = async () => {}; };
   }, [id, revision]);
-  return { session, view, error, status, refresh, reconnect };
+  return { session, view, error, status, refresh, loadOlder, reconnect };
 }
 
 const PANEL_KEY = "pistead.sessionPanel";
@@ -72,11 +75,22 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
 }
 
 /** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
-function ToolDetails({ role, icon, label, text, badges }: { role?: string; icon: IconName; label: ReactNode; text: string; badges?: ReactNode }) {
+function ToolDetails({ role, icon, label, text, badges, trimmed }: { role?: string; icon: IconName; label: ReactNode; text: string; badges?: ReactNode; trimmed?: EntryView["trimmed"] }) {
   return <details className="entry-tool" data-role={role}>
     <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span>{badges}<Icon name="chevron-right" size={14} /></summary>
     <pre>{text}</pre>
+    {trimmed && <BriefNote trimmed={trimmed} />}
   </details>;
+}
+
+/** Under a tool row the session shows briefly: how much the host keeps. */
+export function BriefNote({ trimmed }: { trimmed: NonNullable<EntryView["trimmed"]> }) {
+  return <p className="muted small entry-brief">Brief tool output · {trimmed.lines === 1 ? "1 line" : `${trimmed.lines.toLocaleString()} lines`}, {trimmed.chars.toLocaleString()} characters in full. The session's owner can show full tool output under Details.</p>;
+}
+
+/** The first line of a brief tool result, shown on its collapsed row. */
+function briefLine(entry: EntryView): ReactNode {
+  return entry.trimmed && entry.role === "toolResult" && entry.text.trim() ? <span className="muted"> · {entry.text}</span> : null;
 }
 
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
@@ -91,8 +105,8 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined
       && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
-    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text}
-      badges={<AutoApprovedMarks calls={entry.autoApproved} />} />;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}{briefLine(entry)}</>} text={entry.text}
+      badges={<AutoApprovedMarks calls={entry.autoApproved} />} trimmed={entry.trimmed} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
@@ -109,7 +123,7 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
-    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} />}
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} trimmed={entry.trimmed} />}
     {(actor || took) && <div className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</div>}
   </div>;
 }
@@ -236,7 +250,7 @@ function SessionPane({ id }: { id: string }) {
       {!view ? (!live.error ? <PageLoading />
         : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
         : <div className="session-transcript" />) : session && <Conversation
-        id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
+        id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh} loadOlder={live.loadOlder}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={refreshAll} />}
@@ -298,7 +312,10 @@ function RenameSheet({ open, title, busy, onClose, onSave }: { open: boolean; ti
   </Sheet>;
 }
 
-function Conversation({ id, user, session, view, host, stale, refresh, pinned }: { id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode }) {
+function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, pinned }: {
+  id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void;
+  loadOlder: (conversationId: string) => Promise<void>; pinned: ReactNode;
+}) {
   const owner = session.ownerId === user.id;
   // Initialised once per session (SessionPane remounts per id); view refreshes never reset the user's picks.
   const [selection, setSelection] = useState<ChatSelection>(() => initialSelection(view, owner));
@@ -345,6 +362,22 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     return conversation?.mode !== "ask";
   });
   const lastEntryId = entries.at(-1)?.id;
+  const firstEntryId = entries[0]?.id;
+  // In a workspace that loads transcripts latest first: the shown conversations with earlier entries still to read.
+  const olderConversations = conversations.filter(conversation => (conversation.olderEntries ?? 0) > 0 && (actualMode === "ask"
+    ? conversation.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || conversation.id === conversationId)
+    : conversation.mode !== "ask"));
+  const olderCount = olderConversations.reduce((total, conversation) => total + (conversation.olderEntries ?? 0), 0);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  /** Where the reader was when earlier entries were asked for, to keep them there once those arrive above. */
+  const anchor = useRef<{ first?: string; height: number; top: number } | null>(null);
+  function loadEarlier() {
+    if (loadingOlder || !olderConversations.length) return;
+    const element = transcript.current;
+    anchor.current = element ? { first: firstEntryId, height: element.scrollHeight, top: element.scrollTop } : null;
+    setLoadingOlder(true);
+    void Promise.all(olderConversations.map(conversation => loadOlder(conversation.id))).finally(() => setLoadingOlder(false));
+  }
 
   // Follow new entries unless the reader has scrolled up.
   useLayoutEffect(() => {
@@ -353,9 +386,18 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   }, [lastEntryId, entries.length]);
   useLayoutEffect(() => {
     stick.current = true;
+    anchor.current = null;
     const element = transcript.current;
     if (element) element.scrollTop = element.scrollHeight;
   }, [actualMode, conversationId]);
+  // Earlier entries arrived above: keep what the reader was looking at in place.
+  useLayoutEffect(() => {
+    const element = transcript.current;
+    const kept = anchor.current;
+    if (!element || !kept || kept.first === firstEntryId) return;
+    anchor.current = null;
+    element.scrollTop = kept.top + element.scrollHeight - kept.height;
+  }, [firstEntryId]);
 
   async function submit(event?: FormEvent) {
     event?.preventDefault();
@@ -420,8 +462,15 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     <div className="session-transcript" ref={transcript} onScroll={event => {
       const element = event.currentTarget;
       stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+      // Near the top of a transcript that has earlier entries: read the next page before the reader gets there.
+      if (element.scrollTop < 240 && olderCount > 0) loadEarlier();
     }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
       <div className="chat-column">
+        {olderCount > 0 && <div className="transcript-earlier">
+          <Button variant="ghost" size="sm" icon="chevron-up" disabled={loadingOlder} onClick={loadEarlier}>
+            {loadingOlder ? "Loading earlier messages..." : `Show earlier messages (${olderCount})`}
+          </Button>
+        </div>}
         {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
           : <EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}</EmptyState>}
       </div>
