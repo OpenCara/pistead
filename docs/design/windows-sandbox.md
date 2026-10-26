@@ -152,12 +152,11 @@ lines of Rust across its Windows crates, tests included), and is now moving to t
    OS. Grants: worktree and home read-write; `C:\Windows`, `Program Files`, Git for Windows, the CA bundle and
    mirrors read-only; `.git` read-only except for Git steps. Network: Model 2 with the session's own loopback proxy
    port.
-2. **Ship a small native launcher, `pistead-sandbox.exe` (Rust, using the `mxc-sdk` crate and `windows-sys`).**
-   It takes the same one-line JSON request on stdin as `HELPER`. It creates a job with the host's limits, starts the
-   MXC container inside it, runs the file operations or the command, and streams output. That mirrors today's
-   bwrap+Python pair. It keeps Node's `child_process` (which can't create suspended processes or job objects) out of
-   the trust boundary, and it means one signed binary per architecture (x64 and arm64) instead of a Python dependency.
-   The Node SDK would work for a prototype, but it ships about 108 MB of native assets and adds no job limits.
+2. **Use `@microsoft/mxc-sdk` directly, inside a small per-command Node runner process** (see
+   [Using the Node SDK directly](#using-microsoftmxc-sdk-directly)). The connector starts the runner, puts it in a
+   fresh job with the host's limits (through `koffi`, which the SDK already depends on), and only then lets it call
+   the SDK. That mirrors today's bwrap+Python pair and the cgroup supervisor's gated start, with no Rust and no
+   Python. A Rust launcher on the `mxc-sdk` crate is the fallback if the in-process FFI proves fragile.
 3. **Minimum OS: Windows 11 24H2/25H2 at .9550 or later, or 26H2/26H1 per MXC's table.** Before .9550 a session
    can't host a loopback server inside its container, and agents routinely start dev servers and test servers. The
    identity-less loopback proxy probe also needs that build. Older Windows keeps today's answer, WSL2, and
@@ -170,11 +169,49 @@ lines of Rust across its Windows crates, tests included), and is now moving to t
    run on win32 (`HostWorkspace`, the lease, path handling). It's useful on its own for Windows-native app work
    (games, GPU, SDKs), and it ports the platform-specific helpers the sandbox also needs.
 
+## Using `@microsoft/mxc-sdk` directly
+
+Checked against the published package, 1.0.1 (MIT; `engines.node >= 24`; dependencies `koffi`, `semver` and
+`node-pty`). The tarball is about 38 MB, about 108 MB unpacked, with Microsoft-signed binaries for x64 and arm64.
+
+**How it runs.** `spawn()` / `run()` don't start a helper process. They call `mxc_spawn_json` in the bundled
+`mxc_ffi.dll` **inside the calling Node process** through koffi (`dist/bindings/streaming.js`), and get back native
+stdio pipes and `wait`, `kill` and `killForTimeout` on a sandbox handle. The package also ships the standalone JSON
+executor `wxc-exec.exe`, the admin-only `wxc-host-prep.exe`, and Linux and macOS binaries.
+
+**What fits.**
+
+- `ContainerRequest` covers the session sandbox: read-write and read-only paths, denied paths, `workingDirectory`,
+  an explicit `environment` (`inheritDefaultEnvironment: false`), `timeoutMs`, and `network.egress` / `ingress` /
+  `hostLoopback` with `runtimeConfig.networkProxy` (MXC's Model 2).
+- Stdin, stdout and stderr are Node streams, so the one-line JSON request and the push-pack streaming work the same
+  way.
+- `probe(request)` reports the `isolationTier` the request would get, along with tier-degradation warnings.
+- Telemetry is off unless a request opts in.
+
+**Gaps, and how to cover them.**
+
+| Gap | Consequence | Cover |
+|---|---|---|
+| The typed API drops `fallback`: `prepareOneShotRequest` builds the native request without it, so `allowDaclMutation` stays at its default `true` | On a host without usable PSEC, MXC may fall back to AppContainer and **rewrite host folder ACLs** instead of failing | Call `probe(request)` before each spawn and refuse unless `isolationTier === "base-container"` with no warnings. This leaves a small window if the host changes between probe and spawn. To close it, use `wxc-exec.exe` with a JSON file that sets `fallback.allowDaclMutation: false`, or ask upstream to expose `fallback` in V1 |
+| `MxcProcess` has no PID and no job handle | Pistead can't set per-session memory, CPU or process limits on the container, and its egress proxy can't recognize the session's processes | Run each sandbox step in a **per-command Node runner** (`node runner.js`, mxc-sdk loaded there, not in the connector). The connector creates a job with `JOB_MEMORY`, `ACTIVE_PROCESS`, a CPU hard cap and kill-on-close, assigns the runner to it through koffi (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`), and only then sends the request on stdin, as the cgroup supervisor gates its child today. MXC's own kill-on-close job nests inside ours. The proxy checks a connecting peer with `GetExtendedTcpTable` and `IsProcessInJob(peer, sessionJob)` |
+| FFI runs in the calling process | A native crash or hang would take the whole connector down with it | The per-command runner above isolates that too |
+| The package carries Linux, macOS, WSLC, Windows Sandbox and test binaries | A 108 MB install on every platform | Install it only on win32: as an optional dependency fetched on first native-Windows connect, or bundled into a Windows-only connector build |
+| No disk quota | Same as before | Same as before |
+
+**Verdict:** yes. The SDK can be the Windows backend directly, as long as it's wrapped in a per-command runner
+process that the connector puts in a job first and that refuses any tier other than `base-container` (by probing,
+or by `wxc-exec` with `allowDaclMutation: false`). No Rust is needed for the first version.
+
+Also worth a spike: the `isolation_session` backend ("a freshly provisioned isolated user account in its own
+OS-managed session", available from build .9550) gives each session its own user SID. That would make NTFS per-user
+disk quotas possible, but it's heavier than a ProcessContainer.
+
 ### Phases
 
 1. Run the unsandboxed host on win32: lease, path rules, `HostWorkspace`, `connect-setup` checks.
-2. Prototype `pistead-sandbox.exe`: PSEC container, job limits, bash from Git for Windows, file operations. Use it
-   behind a hidden `--experimental-windows-sandbox` flag.
+2. Prototype the per-command runner on `@microsoft/mxc-sdk`: the koffi job gate, the base-container tier check, bash
+   from Git for Windows, and file operations. Use it behind a hidden `--experimental-windows-sandbox` flag.
 3. Egress on Windows: a per-session port, peer verification against the session job, Model 2 policy, and
    `identity`/env/`GIT_SHIM` taking the port.
 4. Cache mirrors, Git LFS, backups and restores, the file browser, and the GPU (if PSEC allows it).
