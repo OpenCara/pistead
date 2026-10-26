@@ -21,6 +21,7 @@ import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
 import { registerDataExports } from './data-export.js';
 import { registerNetworkPolicies } from './network.js';
 import { registerAdmin } from './admin.js';
+import { registerWorkspaceInvites } from './workspace-invites.js';
 import { compression } from './compression.js';
 
 export const app = new Hono<WorkerEnv>();
@@ -64,6 +65,7 @@ registerOidc(app);
 registerSharedSessions(app);
 app.use('/api/*', authenticate, csrfGuard);
 registerCatalog(app);
+registerWorkspaceInvites(app);
 registerRepositories(app);
 registerPushIdentities(app);
 registerGitAccounts(app);

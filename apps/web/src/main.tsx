@@ -6,6 +6,7 @@ import type { UserProfile } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage } from "./api";
 import { AppProvider, useApp } from "./app-context";
 import { GitHubMark, Icon, Logo } from "./icons";
+import { JoinWorkspaceScreen, rememberInvite, takeRememberedInvite } from "./JoinWorkspaceScreen";
 import { NewSession } from "./NewSession";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { navigate, useRoute, type Route } from "./router";
@@ -29,10 +30,11 @@ function title(route: Route): string {
     case "session": return "Session · Pistead";
     case "settings": return "Settings · Pistead";
     case "shared": return "Shared session · Pistead";
+    case "join": return "Join workspace · Pistead";
   }
 }
 
-function SignIn({ error, retry }: { error: string; retry: () => void }) {
+function SignIn({ error, retry, invited }: { error: string; retry: () => void; invited?: boolean }) {
   const health = useResource<{ githubConfigured?: boolean }>("/api/health");
   const callbackError = new URLSearchParams(window.location.search).get("error");
   const problem = error || health.error || (callbackError ? `GitHub sign-in did not complete: ${callbackError.slice(0, 300)}` : "");
@@ -42,6 +44,7 @@ function SignIn({ error, retry }: { error: string; retry: () => void }) {
       <Logo size={40} />
       <h1>Pistead</h1>
       <p>Run Pi agents on your own machine, and work on them together with your team.</p>
+      {invited && <Alert variant="info" title="You're invited to a workspace" role="status">Sign in to ask to join it. An owner or admin accepts you before you can see anything in it.</Alert>}
       {problem && <Alert variant="error" title="Sign-in problem">{problem}</Alert>}
       {unconfigured && <Alert variant="warning" title="GitHub sign-in is not configured">The operator needs to configure the GitHub OAuth app, its callback URL and the server's GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and VAULT_KEY settings.</Alert>}
       <div className="actions">
@@ -65,7 +68,7 @@ function Home() {
       <h1>Welcome to Pistead</h1>
       <p>Create a workspace for your team, add a repository and pair a host to start your first session.</p>
       <div className="actions"><Button variant="default" size="lg" onClick={() => setCreating(true)}>New workspace</Button></div>
-      <p className="welcome-footnote">Joining a team? Ask an owner to add you with your User ID from Settings.</p>
+      <p className="welcome-footnote">Joining a team? Open the invite link an owner or admin shared, or ask them to add you with your User ID from Settings.</p>
     </div>
     <NewWorkspaceSheet open={creating} onClose={() => setCreating(false)} />
   </div>;
@@ -76,7 +79,13 @@ function Shell() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   useEffect(() => { document.title = title(route); }, [route]);
   useEffect(() => { document.getElementById("main-content")?.scrollTo({ top: 0 }); }, [route]);
+  // A sign-in started from an invite link returns to the app's root; pick the invite up where it left off.
+  useEffect(() => {
+    const token = takeRememberedInvite();
+    if (token && route.name !== "join") navigate({ name: "join", token });
+  }, []); // Only once, on the first render after signing in.
   const screen = route.name === "session" ? <SessionScreen key={route.sessionId} sessionId={route.sessionId} />
+    : route.name === "join" ? <JoinWorkspaceScreen key={route.token} token={route.token} />
     : route.name === "new" ? <NewSession key={route.workspaceId} workspaceId={route.workspaceId} />
     : route.name === "sessions" ? <SessionsScreen />
     : route.name === "settings" ? <SettingsScreen key={`${route.section}/${route.id ?? ""}`} section={route.section} id={route.id} />
@@ -115,8 +124,11 @@ function App() {
     setUser(null);
     navigate({ name: "home" });
   }
+  const route = useRoute();
+  // GitHub's callback drops the fragment, so an invite link opened while signed out is remembered for after sign-in.
+  useEffect(() => { if (!loading && !user && route.name === "join") rememberInvite(route.token); }, [loading, user, route]);
   if (loading) return <PageLoading />;
-  if (!user) return <SignIn error={error} retry={() => setRevision(value => value + 1)} />;
+  if (!user) return <SignIn error={error} retry={() => setRevision(value => value + 1)} invited={route.name === "join"} />;
   return <AppProvider key={user.id} user={user} setUser={setUser} signOut={() => void signOut()}><Shell /></AppProvider>;
 }
 
