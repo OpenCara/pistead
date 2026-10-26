@@ -23,5 +23,15 @@ export interface WorkspaceJoinRequest {
   createdAt: string;
 }
 
+/**
+ * One of the caller's own pending requests. It names the workspace's id, which its requester needs to withdraw it even
+ * after the link it came through stops working.
+ */
+export interface OwnJoinRequest {
+  workspaceId: string;
+  workspaceName: string;
+  createdAt: string;
+}
+
 /** At most this many people wait to join one workspace at a time. */
 export const maxPendingMembers = 200;

@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { assignableWorkspaceRoles, type AssignableWorkspaceRole } from '../../../packages/shared/src/types.js';
 import { adminManagedRoles, workspaceManagerRoles } from '../../../packages/shared/src/policy.js';
-import { maxPendingMembers, type WorkspaceInvite, type WorkspaceInviteLink, type WorkspaceJoinRequest } from '../../../packages/shared/src/invites.js';
+import { maxPendingMembers, type OwnJoinRequest, type WorkspaceInvite, type WorkspaceInviteLink, type WorkspaceJoinRequest } from '../../../packages/shared/src/invites.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { auditAfterChange, auditStatement, requireMember } from './db.js';
 import { appOrigin, fail, identifier, id, jsonObject, now, randomToken, userIdentifier } from './http.js';
@@ -13,7 +13,8 @@ import { decryptToken, encryptToken } from './vault.js';
  * Invite links: a workspace's owner and admins can share one link with anyone. A registered user who opens it while
  * signed in can ask to join, which makes them a pending member: they are not in workspace_members, so they see and do
  * nothing in the workspace until an owner or admin accepts them with a role (or declines them). A link names no user
- * and admits nobody on its own; turning it off stops new requests but leaves the pending ones for a decision.
+ * and admits nobody on its own; turning it off stops new requests but leaves the pending ones for a decision, and their
+ * requesters can still withdraw them through /api/join-requests.
  */
 
 const INVITE_TOKEN = /^[A-Za-z0-9_-]{43}$/;
@@ -120,6 +121,28 @@ export function registerWorkspaceInvites(app: Hono<WorkerEnv>): void {
       auditAfterChange(c.env, userId, 'workspace.join.withdraw', workspace.id, { userId }),
     ]);
     return c.json({ invite: await inviteFor(c.env, workspace, userId) });
+  });
+
+  // One's own pending requests, without a link: a request outlives the link it came through (turned off or replaced),
+  // and its requester can still see and withdraw it.
+  app.get('/api/join-requests', async c => {
+    const requests = await c.env.DB.query<OwnJoinRequest>(`SELECT r.workspace_id AS workspaceId, w.name AS workspaceName,
+        r.created_at AS createdAt
+      FROM workspace_join_requests r JOIN workspaces w ON w.id = r.workspace_id
+      WHERE r.user_id = ? ORDER BY r.created_at, r.workspace_id`).bind(c.get('auth').userId).all();
+    return c.json({ requests });
+  });
+
+  app.delete('/api/join-requests/:workspaceId', async c => {
+    const workspaceId = identifier(c.req.param('workspaceId'), 'workspaceId');
+    const userId = c.get('auth').userId;
+    const result = await c.env.DB.batch([
+      c.env.DB.query('DELETE FROM workspace_join_requests WHERE workspace_id = ? AND user_id = ?').bind(workspaceId, userId),
+      auditAfterChange(c.env, userId, 'workspace.join.withdraw', workspaceId, { userId }),
+    ]);
+    // One answer for a workspace that doesn't exist and one the caller isn't waiting to join.
+    if (result[0].changes !== 1) fail(404, 'not_found', 'You are not waiting to join this workspace.');
+    return c.body(null, 204);
   });
 
   app.get('/api/workspaces/:id/invite-link', async c => {

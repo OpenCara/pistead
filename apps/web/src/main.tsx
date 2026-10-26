@@ -6,7 +6,7 @@ import type { UserProfile } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage } from "./api";
 import { AppProvider, useApp } from "./app-context";
 import { GitHubMark, Icon, Logo } from "./icons";
-import { JoinWorkspaceScreen, rememberInvite, takeRememberedInvite } from "./JoinWorkspaceScreen";
+import { JoinWorkspaceScreen, OwnJoinRequests, rememberInvite, takeRememberedInvite } from "./JoinWorkspaceScreen";
 import { NewSession } from "./NewSession";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { navigate, useRoute, type Route } from "./router";
@@ -69,6 +69,7 @@ function Home() {
       <p>Create a workspace for your team, add a repository and pair a host to start your first session.</p>
       <div className="actions"><Button variant="default" size="lg" onClick={() => setCreating(true)}>New workspace</Button></div>
       <p className="welcome-footnote">Joining a team? Open the invite link an owner or admin shared, or ask them to add you with your User ID from Settings.</p>
+      <OwnJoinRequests />
     </div>
     <NewWorkspaceSheet open={creating} onClose={() => setCreating(false)} />
   </div>;

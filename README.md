@@ -130,7 +130,8 @@ Owners and admins can share one link to the workspace with anyone: **Members →
 - The link opens only for people signed in to this Pistead server, and shows them the workspace's name and nothing else. It never admits anyone by itself, so accept only people you recognize.
 - The link's token is in the URL's fragment, so opening it sends the token to neither the server's access logs nor a proxy's; the server keeps it only hashed and encrypted.
 - **Replace link** issues a new link and stops the old one at once; **Turn off link** stops it. People already waiting stay pending until someone decides.
-- A pending member can withdraw their request from the link's page. Adding someone with **Add member** also settles their pending request. At most 200 people wait to join one workspace at a time.
+- A pending member can withdraw their request from the link's page, or under **Settings → Profile → Your requests to join**, which keeps working after the link is turned off or replaced. Adding someone with **Add member** also settles their pending request.
+- At most 200 people wait to join one workspace at a time. Requests count until someone accepts, declines or withdraws them, also after the link changes, so decline the ones you won't accept to make room.
 
 Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
 

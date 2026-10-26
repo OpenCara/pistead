@@ -175,6 +175,18 @@ test('declining, withdrawing, adding directly and turning the link off', async t
   await denied(await alice.request('GET', '/api/invite'), 404, 'not_found');
   assert.deepEqual((await requests(owner, team.id)).map(item => item.userId), [bob.user.id]);
 
+  // A request outlives its link: its requester still sees and withdraws it, without the link.
+  const own = async (client: Client) => (await json<{ requests: { workspaceId: string; workspaceName: string }[] }>(await client.request('GET', '/api/join-requests'))).requests;
+  assert.deepEqual((await own(bob)).map(item => [item.workspaceId, item.workspaceName]), [[team.id, 'Team']]);
+  assert.deepEqual(await own(alice), []);
+  // Nobody withdraws someone else's request, and a workspace they aren't waiting on answers like a missing one.
+  await denied(await alice.request('DELETE', `/api/join-requests/${team.id}`), 404, 'not_found');
+  await denied(await alice.request('DELETE', '/api/join-requests/missing'), 404, 'not_found');
+  assert.deepEqual((await requests(owner, team.id)).map(item => item.userId), [bob.user.id]);
+  assert.equal((await bob.request('DELETE', `/api/join-requests/${team.id}`)).status, 204);
+  assert.deepEqual(await own(bob), []);
+  assert.deepEqual(await requests(owner, team.id), []);
+
   // Turning it on again issues a new link; the old one keeps failing.
   const fresh = tokenOf((await json<{ link: WorkspaceInviteLink }>(await owner.request('PUT', path), 201)).link);
   assert.notEqual(fresh, token);
@@ -196,4 +208,7 @@ test('the pending queue is bounded', async t => {
     insertRequest.run(team.id, `test:filler-${index}`, at);
   }
   await denied(await ask(late, token), 409, 'too_many_pending');
+  // Waiting requests count until someone decides them, also after a link change; declining one makes room.
+  await json(await owner.request('DELETE', `/api/workspaces/${team.id}/join-requests/${encodeURIComponent('test:filler-0')}`));
+  await json(await ask(late, token), 201);
 });

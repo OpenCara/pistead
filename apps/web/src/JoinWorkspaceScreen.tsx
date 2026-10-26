@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import type { WorkspaceInvite } from "../../../packages/shared/src/invites";
-import { api, errorMessage } from "./api";
+import type { OwnJoinRequest, WorkspaceInvite } from "../../../packages/shared/src/invites";
+import { api, errorMessage, segment } from "./api";
 import { useApp } from "./app-context";
 import { Logo } from "./icons";
 import { href } from "./router";
-import { Alert, Button, Feedback, LinkButton, PageLoading, useAction } from "./ui";
+import { Alert, Button, CardBody, Feedback, LinkButton, PageLoading, RelativeTime, Row, Section, confirmDialog, useAction, useResource } from "./ui";
 
 /** Where a sign-in started from an invite link keeps its token: GitHub's callback returns to the app's root without the fragment. */
 const pendingInviteKey = "pistead.pendingInvite";
@@ -45,6 +45,33 @@ function useInvite(token: string) {
 }
 
 /**
+ * The signed-in person's own requests to join, each with Withdraw. They don't need the link they came through, which may
+ * have been turned off or replaced since. Shows nothing while there are none.
+ */
+export function OwnJoinRequests() {
+  const resource = useResource<{ requests: OwnJoinRequest[] }>("/api/join-requests");
+  const action = useAction();
+  const requests = resource.data?.requests ?? [];
+  async function withdraw(request: OwnJoinRequest) {
+    if (action.busy) return;
+    const confirmed = await confirmDialog({ title: "Withdraw request", message: `Stop waiting to join ${request.workspaceName}? You can ask again while you have a working invite link.`, confirmLabel: "Withdraw", destructive: true });
+    if (!confirmed) return;
+    void action.run(async () => {
+      await api(`/api/join-requests/${segment(request.workspaceId)}`, { method: "DELETE" });
+      resource.refresh();
+    }, "Request withdrawn.");
+  }
+  if (!requests.length && !action.notice) return null;
+  return <Section title="Your requests to join" info="Workspaces you asked to join through an invite link. An owner or admin of each accepts or declines you.">
+    {!requests.length
+      ? <CardBody><span className="muted">You aren't waiting to join any workspace</span></CardBody>
+      : requests.map(request => <Row key={request.workspaceId} title={request.workspaceName} hint={<>Waiting for approval · asked <RelativeTime value={request.createdAt} /></>}
+        trailing={<Button variant="outline" size="sm" disabled={action.busy} aria-label={`Withdraw request to join ${request.workspaceName}`} onClick={() => void withdraw(request)}>Withdraw</Button>} />)}
+    {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+  </Section>;
+}
+
+/**
  * An invite link, opened while signed in: shows the workspace's name and lets the visitor ask to join. Asking makes them a
  * pending member, who can see and do nothing in the workspace until an owner or admin accepts them with a role.
  */
@@ -76,6 +103,8 @@ export function JoinWorkspaceScreen({ token }: { token: string }) {
           <h1>Join a workspace</h1>
           <Alert variant="error" title="Invite link not available" actions={<Button size="sm" onClick={refresh}>Try again</Button>}>{error}</Alert>
           <div className="actions"><LinkButton href={href({ name: "home" })}>Go to Pistead</LinkButton></div>
+          {/* A request outlives a link that was turned off or replaced, so its requester can still withdraw it here. */}
+          <OwnJoinRequests />
         </>
         : <>
           <h1>{invite.workspaceName}</h1>
