@@ -8,6 +8,8 @@ export interface ChatSelection {
   model?: { provider: string; modelId: string };
   thinkingLevel?: ThinkingLevel;
   access: AccessMode;
+  /** With Auto-approve: the agent's merges run without asking too. Off unless picked. */
+  autoMerge?: boolean;
 }
 
 export const levelLabels: Record<ThinkingLevel, string> = {
@@ -17,16 +19,41 @@ export const levelLabels: Record<ThinkingLevel, string> = {
 export const accessLabels: Record<AccessMode, { label: string; hint: string }> = {
   read: { label: "Read only", hint: "Inspect files; edits, commands and commits ask the session owner first" },
   approval: { label: "Ask before acting", hint: "Edits are automatic; commands, commits, GitHub comments and merges need approval" },
-  auto: { label: "Auto-approve", hint: "Commands, commits and pushes run immediately as the owner, without asking" },
+  auto: { label: "Auto-approve", hint: "Commands, commits, pushes, GitHub comments and issues run immediately as the owner, without asking" },
 };
 
 /** What turning on Auto-approve means on `host`, confirmed before it applies. */
-export function autoApproveWarning(host: Pick<ConnectorInfo, "name" | "capabilities">, unsandboxed: boolean): string {
+export function autoApproveWarning(host: Pick<ConnectorInfo, "name" | "capabilities" | "hostCommandAccess">, unsandboxed: boolean): string {
+  // Older connectors still ask before every GitHub effect.
+  const github = host.capabilities.automaticGitHub
+    ? " GitHub comments and new issues are posted as you without asking too; merges still need approval unless you also turn on Auto-merge."
+    : " GitHub comments and merges still need approval.";
   return (unsandboxed
-    ? `Commands, commits and pushes the agent writes will run immediately on ${host.name}, an UNSANDBOXED host: commands run directly on the owner's machine with their full user permissions and network access, and no resource limits. Tools outside the agent won't ask either. GitHub comments and merges still need approval.`
-    : "Commands, commits and pushes the agent writes will run immediately as you, without asking, as will tools outside the agent and commands on a host without resource limits. GitHub comments and merges still need approval.")
-    + (host.capabilities.hostCommands ? " On your own host, host_bash also runs OUTSIDE the sandbox without asking, with access to your host files, credentials and network. On someone else's host it still needs their approval." : "");
+    ? `Commands, commits and pushes the agent writes will run immediately on ${host.name}, an UNSANDBOXED host: commands run directly on the owner's machine with their full user permissions and network access, and no resource limits. Tools outside the agent won't ask either.`
+    : "Commands, commits and pushes the agent writes will run immediately as you, without asking, as will tools outside the agent and commands on a host without resource limits.")
+    + github + hostCommandsWarning(host);
 }
+
+/** What Auto-approve means for host_bash on `host`, by the viewer's authority there when the listing says it. */
+function hostCommandsWarning(host: Pick<ConnectorInfo, "name" | "capabilities" | "hostCommandAccess">): string {
+  if (!host.capabilities.hostCommands) return "";
+  if (host.hostCommandAccess === "auto") {
+    return ` Its owner granted you automatic host commands, so host_bash also runs OUTSIDE the sandbox on ${host.name} without asking, with access to the owner's host files, credentials and network.`;
+  }
+  // Older connectors honor no grants: only the owner's own sessions run host commands without asking.
+  if (host.hostCommandAccess === "owner" || !host.capabilities.hostGrants) {
+    return " On your own host, host_bash also runs OUTSIDE the sandbox without asking, with access to your host files, credentials and network. On someone else's host it still needs their approval.";
+  }
+  return " On your own host, or one whose owner granted you automatic host commands, host_bash also runs OUTSIDE the sandbox without asking, with access to that host's files, credentials and network. Elsewhere it still needs approval.";
+}
+
+/** Whether the owner may add Auto-merge to `selection` on `host`. */
+export function autoMergeAvailable(host: Pick<ConnectorInfo, "capabilities"> | undefined, selection: ChatSelection, owner: boolean): boolean {
+  return owner && selection.access === "auto" && host?.capabilities.automaticGitHub === true;
+}
+
+/** What turning on Auto-merge means, confirmed before it applies. */
+export const AUTO_MERGE_WARNING = "The agent's GitHub merges will also run immediately as you, without asking: it can merge any pull request of this workspace's github.com repositories that GitHub lets you merge, into its base branch. Branch protection and required checks on GitHub still apply.";
 
 export const CONNECTOR_UPDATE_HINT = "Update the host's connector (npx pistead@latest connect) to choose model, reasoning and access";
 
@@ -160,5 +187,6 @@ export function chatOptionsBody(host: ConnectorInfo | undefined, selection: Chat
   const thinkingLevel = effectiveLevel(model, selection.thinkingLevel);
   if (thinkingLevel) options.thinkingLevel = thinkingLevel;
   if (mode === "submit") options.access = selection.access;
+  if (mode === "submit" && selection.access === "auto" && selection.autoMerge && host.capabilities.automaticGitHub) options.autoMerge = true;
   return options;
 }

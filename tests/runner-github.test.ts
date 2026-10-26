@@ -329,3 +329,120 @@ test("host commands outside the agent are allowed one call at a time, never for 
     ["host.bash", "denied", { decidedBy: "test:alice", scope: "call" }, undefined],
   ]);
 });
+
+test("on someone else's host, a member granted host commands decides their own, or auto-approves them, as the control plane reports", hostMode, async t => {
+  for (const level of ["approve", "auto"] as const) await t.test(level, async t => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-grant-")));
+    const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("host_bash", { command: "printf granted-marker", timeout_seconds: 10 })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("Requested."),
+    ]);
+    const models = createModels(); models.setProvider(faux.provider);
+    const target = binding(`host-grant-${level}`);
+    target.agent.tools = ["host_bash"];
+    target.session.connectorId = target.model.connectorId = "host-connector";
+    target.session.connectorOwnerId = target.model.connectorOwnerId = "test:bob";
+    const asked: AuthorizationRequest[] = [];
+    let granted: "approve" | "auto" | undefined = level;
+    const service = new RunnerService({
+      dataDir: directory, sharedSecret: "host-grant-test-secret-not-for-deployment", controlPlaneUrl: "http://127.0.0.1:8787",
+      connectorId: "host-connector", allowFaux: true, unsandboxed: true,
+      authorize: async input => {
+        if (input.host) asked.push(input);
+        return { allowed: true, ownerId: input.ownerId, policyVersion: 1, ...(input.host && input.actorId === "test:alice" && granted ? { hostCommands: granted } : {}) };
+      },
+      resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    });
+    await service.initialize();
+    t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
+    const claims = async (action: RunnerAction, actorId = "test:alice") => ({ ...await ticket(target.session.id, action), actorId, connectorId: "host-connector" });
+    const session = await service.provision(target, await claims("create"));
+    await session.submit(await claims("submit"), { content: "Run on host", requestId: "host", admissionId: await sha256(`host-grant-${level}`), options: { access: "auto" } }, "write");
+    if (level === "auto") {
+      await idle(session);
+      // Granted automatic host commands, the session owner's Auto-approve runs it on bob's host without asking.
+      const view = await session.view();
+      assert.deepEqual(view.approvals, []);
+      assert.deepEqual(view.entries.flatMap(entry => entry.autoApproved ?? []), [{ tool: "host_bash", status: "executed" }]);
+      assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("granted-marker")));
+      assert.ok(asked.some(input => input.actorId === "test:alice" && input.permission === "write"), "the grant is checked with the control plane");
+      return;
+    }
+    // Granted approval only, it still waits, and its owner may decide it; once the grant is gone, nobody but bob can.
+    const approval = await pendingApproval(session);
+    assert.equal(approval.automatic, undefined);
+    granted = undefined;
+    await assert.rejects(session.decide(await claims("approve"), approval.id, { decision: "approve", operation: approval.operation }), /host owner/);
+    granted = "approve";
+    await session.decide(await claims("approve"), approval.id, { decision: "approve", operation: approval.operation });
+    await idle(session);
+    const settled = (await session.view()).approvals[0]!;
+    assert.deepEqual([settled.status, settled.decidedBy], ["executed", "test:alice"]);
+    assert.match(settled.result!, /granted-marker/);
+  });
+});
+
+test("the owner's Auto-approve posts comments and opens issues at once with its admission, and merges only with auto-merge", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-github-auto-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const comments: unknown[] = []; const issues: GitHubIssueRequest[] = []; const merges: GitHubMergeRequest[] = [];
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  const merge = fauxToolCall("github_merge", { repository: "acme/alpha", pull: 7, sha: head, method: "squash" });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("github_comment", { repository: "acme/alpha", issue: 7, body: "Looks good." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("github_issue", { repository: "acme/alpha", title: "Follow up", body: "Later." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([merge], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Merge requested."),
+    fauxAssistantMessage([fauxToolCall("github_merge", { repository: "acme/alpha", pull: 7, sha: head, method: "squash" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Merged."),
+  ]);
+  const models = createModels(); models.setProvider(faux.provider);
+  const target = binding("github-auto");
+  target.agent.tools = ["github_comment", "github_issue", "github_merge"];
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: "runner-github-auto-secret-not-a-production-secret", controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
+    authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+    githubComment: async request => { comments.push(request); return { id: 5, url: "https://github.com/acme/alpha/issues/7#issuecomment-5" }; },
+    githubIssue: async request => { issues.push(request); return { number: 8, url: "https://github.com/acme/alpha/issues/8" }; },
+    githubMerge: async request => { merges.push(request); return { sha: "d".repeat(40), url: "https://github.com/acme/alpha/pull/7" }; },
+  });
+  await service.initialize();
+  t.after(() => service.close());
+  const session = await service.provision(target, await ticket(target.session.id, "create"));
+
+  const admissionId = await sha256("github auto admission");
+  await session.submit(await ticket(target.session.id, "submit"), { content: "Comment, file and merge.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
+  // The comment and the issue ran at once, authorized by the message's admission, never a capability; the merge waits.
+  const card = await pendingApproval(session);
+  assert.equal(card.operation.kind, "github.merge");
+  assert.equal(comments.length, 1);
+  assert.equal(issues.length, 1);
+  for (const request of [comments[0], issues[0]] as Record<string, unknown>[]) {
+    assert.equal(request.admissionId, admissionId);
+    assert.equal(request.capability, undefined);
+    assert.equal(request.actorId, "test:alice");
+    assert.match(String(request.approvalId), /^tool-/);
+  }
+  const automatic = (await session.view()).approvals.filter(approval => approval.automatic);
+  assert.deepEqual(automatic.map(approval => [approval.operation.kind, approval.status]), [["github.comment", "executed"], ["github.issue", "executed"]],
+    "automatic GitHub effects keep their cards, with their outcome");
+  await session.decide(await ticket(target.session.id, "approve"), card.id, { decision: "deny", operation: card.operation });
+  await idle(session);
+  assert.deepEqual(merges, []);
+
+  // With auto-merge as well, the merge runs at once too.
+  const mergeAdmission = await sha256("github auto-merge admission");
+  await session.submit(await ticket(target.session.id, "submit"), { content: "Merge it.", requestId: "auto-merge", admissionId: mergeAdmission, options: { access: "auto", autoMerge: true } }, "write");
+  await idle(session);
+  assert.equal(merges.length, 1);
+  assert.equal(merges[0]!.admissionId, mergeAdmission);
+  assert.equal(merges[0]!.capability, undefined);
+  const merged = (await session.view()).approvals.find(approval => approval.operation.kind === "github.merge" && approval.automatic);
+  assert.equal(merged?.status, "executed");
+
+  // Auto-merge only adds to Auto-approve.
+  await assert.rejects(session.submit(await ticket(target.session.id, "submit"), { content: "Merge?", requestId: "asking-merge", admissionId: await sha256("asking"), options: { access: "approval", autoMerge: true } }, "write"),
+    (error: unknown) => error instanceof RunnerError && error.status === 422);
+});

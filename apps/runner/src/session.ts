@@ -6,7 +6,7 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
@@ -91,12 +91,13 @@ export type RunnerConfig = {
   dataDir: string; controlPlaneUrl: string; sharedSecret: string; allowFaux: boolean; allowTestShell?: boolean; fetch?: typeof fetch;
   connectorId?: string;
   authorize?: (request: AuthorizationRequest) => Promise<AuthorizationResult>;
-  githubComment?: (request: { sessionId: string; actorId: string; approvalId: string; capability: string; repository: string; issue: number; body: string }) => Promise<{ id: number; url: string }>;
+  /** Posts one comment, human-approved (`capability`) or of the owner's Auto-approve message (`admissionId`). */
+  githubComment?: (request: GitHubCommentRequest) => Promise<{ id: number; url: string }>;
   /** Reads an issue or pull request as the session owner, through the control plane. */
   githubRead?: (request: GitHubReadRequest) => Promise<GitHubIssueView>;
-  /** Performs one human-approved merge; a refusal GitHub stated throws a RunnerError with status 422 and its reason. */
+  /** Performs one merge, as githubComment; a refusal GitHub stated throws a RunnerError with status 422 and its reason. */
   githubMerge?: (request: GitHubMergeRequest) => Promise<GitHubMergeResult>;
-  /** Opens one human-approved issue; a refusal GitHub stated throws a RunnerError with status 422 and its reason. */
+  /** Opens one issue, as githubComment; a refusal GitHub stated throws a RunnerError with status 422 and its reason. */
   githubIssue?: (request: GitHubIssueRequest) => Promise<GitHubIssueResult>;
   /** Issues the credential for one approved push; a token is held only in this process's memory. */
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
@@ -346,8 +347,9 @@ export class RunnerSession {
       throw new RunnerError(403, "Ticket session, owner, or connector mismatch");
   }
 
-  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number): Promise<AuthorizationResult> {
-    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission };
+  /** `host`: also ask for the actor's authority over host commands on this host (`hostCommands`). */
+  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false): Promise<AuthorizationResult> {
+    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission, ...(host ? { host: true } : {}) };
     let result: AuthorizationResult;
     try {
       if (this.config.authorize) result = await this.config.authorize(body);
@@ -365,6 +367,17 @@ export class RunnerSession {
     if (!result.allowed || result.ownerId !== this.binding.owner.id || !Number.isSafeInteger(result.policyVersion)
       || (expectedPolicyVersion !== undefined && result.policyVersion !== expectedPolicyVersion)) throw new RunnerError(403, "Authorization revoked or stale policy");
     return result;
+  }
+
+  /**
+   * What `actorId` may do with host commands here: the host's owner holds `auto`; anyone else what the control plane
+   * reports of the grants the host's owner or its admins gave them, checked with `permission` on this session. A control
+   * plane that predates grants reports none, so only the owner decides host commands there.
+   */
+  private async hostCommandLevel(actorId: string, permission: Permission): Promise<HostCommandLevel | undefined> {
+    if (this.binding.session.connectorOwnerId && actorId === this.binding.session.connectorOwnerId) return "auto";
+    const result = await this.authorize(actorId, permission, undefined, true);
+    return result.hostCommands === "approve" || result.hostCommands === "auto" ? result.hostCommands : undefined;
   }
 
   async prepareRestore(manifest: RestoreManifest): Promise<void> {
@@ -939,7 +952,7 @@ export class RunnerSession {
     const invalid = (message = "Invalid chat options") => new RunnerError(422, message);
     if (!input || typeof input !== "object" || Array.isArray(input)) throw invalid();
     const value = input as Record<string, unknown>;
-    if (Object.keys(value).some(key => !["model", "thinkingLevel", "access"].includes(key))) throw invalid();
+    if (Object.keys(value).some(key => !["model", "thinkingLevel", "access", "autoMerge"].includes(key))) throw invalid();
     const options: ChatOptions = {};
     if (value.model !== undefined) {
       const model = value.model as Record<string, unknown>;
@@ -969,6 +982,11 @@ export class RunnerSession {
       if (!accessModes.includes(value.access as never) || mode !== "write") throw invalid();
       if (value.access === "auto" && actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can auto-approve");
       options.access = value.access as ChatOptions["access"];
+    }
+    // Auto-merge only adds to the owner's Auto-approve.
+    if (value.autoMerge !== undefined) {
+      if (typeof value.autoMerge !== "boolean" || (value.autoMerge && options.access !== "auto")) throw invalid("Auto-merge needs Auto-approve");
+      if (value.autoMerge) options.autoMerge = true;
     }
     return Object.keys(options).length ? options : undefined;
   }
@@ -1372,19 +1390,19 @@ export class RunnerSession {
         const view = this.config.githubRead ? await this.config.githubRead(request) : await this.internalGitHub("read", request) as GitHubIssueView;
         return text({ ...attribution, ...view });
       } }),
-      defineTool({ name: "github_comment", description: "Post an exact GitHub comment through the owner's broker once a human approves it. Waits for the decision, even under auto-approve, and the result carries the outcome; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api, call) => {
+      defineTool({ name: "github_comment", description: "Post an exact GitHub comment as the session owner through the owner's broker, once a human approves it, or at once under the owner's auto-approve. The result carries the outcome; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }), body: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         await this.permit(api, call, "github_comment", `${args.repository}#${args.issue}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.comment", ...args }, String(api.taskId), { permitted: true }), call));
       } }),
-      defineTool({ name: "github_merge", description: "Request human approval to merge a pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase. Always waits for a human decision, even under auto-approve; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
+      defineTool({ name: "github_merge", description: "Merge a pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through the owner's broker: only while its head is still commit sha, as github_read reports it, with method merge, squash or rebase. Waits for a human decision unless the owner chose auto-approve with auto-merge for this message; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), pull: Type.Integer({ minimum: 1 }), sha: Type.String(), method: StringEnum(githubMergeMethods) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const repository = this.githubRepository(args.repository);
         if (!/^[0-9a-f]{40}$/.test(args.sha)) throw new RunnerError(400, "sha must be the pull request's full 40-character head commit, as github_read reports it");
         await this.permit(api, call, "github_merge", `${repository}#${args.pull}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.merge", repository, pull: args.pull, sha: args.sha, method: args.method }, String(api.taskId), { permitted: true }), call));
       } }),
-      defineTool({ name: "github_issue", description: "Open a GitHub issue with exactly this title (one line) and body (Markdown) in one of the workspace's github.com repositories (owner/name), as the session owner, through the owner's broker once a human approves it. Use this instead of gh issue create: the sandbox holds no GitHub credentials. Always waits for a human decision, even under auto-approve, and the result carries the new issue's number and URL; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), title: Type.String(), body: Type.String() }), execute: async (args, api, call) => {
+      defineTool({ name: "github_issue", description: "Open a GitHub issue with exactly this title (one line) and body (Markdown) in one of the workspace's github.com repositories (owner/name), as the session owner, through the owner's broker once a human approves it, or at once under the owner's auto-approve. Use this instead of gh issue create: the sandbox holds no GitHub credentials. The result carries the new issue's number and URL; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), title: Type.String(), body: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
         const repository = this.githubRepository(args.repository);
         if (!args.title.trim() || /[\r\n]/.test(args.title) || args.title.length > GITHUB_ISSUE_TITLE_LIMIT) throw new RunnerError(400, `title must be one non-empty line of at most ${GITHUB_ISSUE_TITLE_LIMIT} characters`);
@@ -1394,7 +1412,7 @@ export class RunnerSession {
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.issue", repository, title: args.title, body: args.body }, String(api.taskId), { permitted: true }), call));
       } }),
       defineTool({ name: "host_bash", executionMode: "sequential",
-        description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact host-owner approval; auto-approve skips it only in that host owner's own session. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
+        description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact approval by the host owner or a member they granted host commands; auto-approve skips it only in the session of the host owner or of a member granted automatic host commands. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
         parameters: Type.Object({ command: Type.String(), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600 })) }),
         execute: async (args, api, call) => {
           const attribution = await this.toolActor(api, true);
@@ -1416,7 +1434,11 @@ export class RunnerSession {
       try {
         await recheck();
         entry.controller.signal.throwIfAborted();
-        if (auth.actorId !== this.binding.session.connectorOwnerId) throw new RunnerError(403, "Only the host owner can execute host commands");
+        // Run under the owner's Auto-approve (an admission), it needs their automatic host commands; otherwise the
+        // approver's authority to decide host commands, either one still held now.
+        const automatic = auth.capability === undefined && auth.admissionId !== undefined;
+        const level = await this.hostCommandLevel(auth.actorId, automatic ? "write" : "approve");
+        if (!level || (automatic && level !== "auto")) throw new RunnerError(403, "Only the host owner, or a member granted host commands on this host, can execute host commands");
         result = await this.sandbox.executeHost(operation, recheck, entry.controller.signal);
       } catch (error) {
         const refused = error instanceof RunnerError && error.status < 500;
@@ -1437,6 +1459,30 @@ export class RunnerSession {
   private githubRepository(name: string): string {
     if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(name)) throw new RunnerError(400, "repository must be a github.com owner/name");
     return name;
+  }
+
+  /**
+   * Posts the comment, merges or opens the issue through the control plane's broker, authorized by a human approval's
+   * capability or the owner's Auto-approve admission, and says what happened.
+   */
+  private async githubEffect(operation: Extract<Operation, { kind: "github.comment" | "github.merge" | "github.issue" }>,
+    authority: { sessionId: string; actorId: string; approvalId: string } & ({ capability: string } | { admissionId: string })): Promise<string> {
+    if (operation.kind === "github.comment") {
+      const { repository, issue, body } = operation;
+      const request: GitHubCommentRequest = { ...authority, repository, issue, body };
+      const comment = this.config.githubComment ? await this.config.githubComment(request) : await this.internalGitHub("comment", request) as { id: number; url: string };
+      return JSON.stringify({ id: comment.id, url: comment.url });
+    }
+    if (operation.kind === "github.merge") {
+      const { repository, pull, sha, method } = operation;
+      const request: GitHubMergeRequest = { ...authority, repository, pull, sha, method };
+      const merged = this.config.githubMerge ? await this.config.githubMerge(request) : await this.internalGitHub("merge", request) as GitHubMergeResult;
+      return JSON.stringify({ merged: true, sha: merged.sha, url: merged.url });
+    }
+    const { repository, title, body } = operation;
+    const request: GitHubIssueRequest = { ...authority, repository, title, body };
+    const opened = this.config.githubIssue ? await this.config.githubIssue(request) : await this.internalGitHub("issue", request) as GitHubIssueResult;
+    return JSON.stringify({ number: opened.number, url: opened.url });
   }
 
   /** The control plane's GitHub broker for runners without a connector, with the shared secret; refusals keep their status and reason. */
@@ -1491,14 +1537,17 @@ export class RunnerSession {
         || !["admitting", "running"].includes(run.status)) throw new RunnerError(403, "Approval has no active originating write");
       admissionId = run.admissionId;
       if (this.config.connectorId && !admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
-      // GitHub comments, merges and issues need a Worker-minted broker capability, so they always wait for a human
-      // decision; automatic pushes mint their credential from the run's owner admission instead.
+      // Automatic pushes and GitHub effects are authorized by the control plane from the run's owner admission, so they
+      // need one. GitHub comments, issues and merges run automatically only under the owner's Auto-approve itself, never
+      // a session grant, and merges only when the message also chose auto-merge.
       // A tool the owner allowed for the rest of the session runs their calls of it as Auto-approve would; host commands
-      // never take a session grant, so each one still asks.
-      const sessionGranted = operation.kind !== "host.bash" && state.grants?.tools.includes(toolName) === true;
-      automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id && operation.kind !== "github.comment"
-        && operation.kind !== "github.merge" && operation.kind !== "github.issue" && (operation.kind !== "git.push" || admissionId !== undefined)
-        && (operation.kind !== "host.bash" || this.binding.session.connectorOwnerId === this.binding.owner.id);
+      // never take a session grant, so each one still asks unless the owner holds automatic host commands on this host.
+      const github = operation.kind === "github.comment" || operation.kind === "github.merge" || operation.kind === "github.issue";
+      const sessionGranted = operation.kind !== "host.bash" && !github && state.grants?.tools.includes(toolName) === true;
+      automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id
+        && (!github || (admissionId !== undefined && (operation.kind !== "github.merge" || run.options?.autoMerge === true)))
+        && (operation.kind !== "git.push" || admissionId !== undefined)
+        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -1525,6 +1574,21 @@ export class RunnerSession {
     let result: string;
     if (operation.kind === "host.bash") {
       await this.startHostOperation(id, operation, { actorId, admissionId: approval.admissionId }, async () => { await this.authorize(actorId, "write"); });
+      return (await this.metadata()).approvals[id]!;
+    }
+    if (operation.kind === "github.comment" || operation.kind === "github.merge" || operation.kind === "github.issue") {
+      // Under the owner's Auto-approve the control plane authorizes the effect from the run's admission and consumes the
+      // call's one attempt, so a replay never repeats it.
+      try {
+        await this.authorize(actorId, "write");
+        result = await this.githubEffect(operation, { sessionId: this.binding.session.id, actorId, approvalId: id, admissionId: approval.admissionId! });
+        status = "executed";
+      } catch (error) {
+        // GitHub said why it didn't merge or open the issue: nothing changed, so the agent can act on the reason.
+        if (error instanceof RunnerError && error.status === 422 && operation.kind !== "github.comment") { status = "failed"; result = error.message; }
+        else { status = "interrupted"; result = "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited."; }
+      }
+      await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: this.kept(id, result) }); });
       return (await this.metadata()).approvals[id]!;
     }
     if (operation.kind === "git.push") {
@@ -1575,8 +1639,8 @@ export class RunnerSession {
         if (card.status !== "pending") throw decided();
         Object.assign(card, decision);
       };
-      if (approval.operation.kind === "host.bash" && ticket.actorId !== this.binding.session.connectorOwnerId) {
-        throw new RunnerError(403, "Only the host owner can decide a host command");
+      if (approval.operation.kind === "host.bash" && !await this.hostCommandLevel(ticket.actorId, "approve")) {
+        throw new RunnerError(403, "Only the host owner, or a member granted host commands on this host, can decide a host command");
       }
       if (approval.operation.kind === "git.repin" && ticket.actorId !== this.binding.owner.id) {
         throw new RunnerError(403, "Only the session owner can decide a repin");
@@ -1651,27 +1715,10 @@ export class RunnerSession {
       }
       try {
         let result: string;
-        if (approval.operation.kind === "github.comment") {
-          const { repository, issue, body } = approval.operation;
-          const request = { sessionId: this.binding.session.id, actorId: ticket.actorId, approvalId: id, capability: input.brokerCapability!, repository, issue, body };
+        if (approval.operation.kind === "github.comment" || approval.operation.kind === "github.merge" || approval.operation.kind === "github.issue") {
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
-          const comment = this.config.githubComment ? await this.config.githubComment(request) : await this.internalGitHub("comment", request) as { id: number; url: string };
-          result = JSON.stringify({ id: comment.id, url: comment.url });
-        } else if (approval.operation.kind === "github.merge") {
-          const { repository, pull, sha, method } = approval.operation;
-          const request: GitHubMergeRequest = { sessionId: this.binding.session.id, actorId: ticket.actorId, approvalId: id, capability: input.brokerCapability!, repository, pull, sha, method };
-          await this.authorize(approval.requestedBy, "write");
-          await this.authorize(ticket.actorId, "approve");
-          const merged = this.config.githubMerge ? await this.config.githubMerge(request) : await this.internalGitHub("merge", request) as GitHubMergeResult;
-          result = JSON.stringify({ merged: true, sha: merged.sha, url: merged.url });
-        } else if (approval.operation.kind === "github.issue") {
-          const { repository, title, body } = approval.operation;
-          const request: GitHubIssueRequest = { sessionId: this.binding.session.id, actorId: ticket.actorId, approvalId: id, capability: input.brokerCapability!, repository, title, body };
-          await this.authorize(approval.requestedBy, "write");
-          await this.authorize(ticket.actorId, "approve");
-          const opened = this.config.githubIssue ? await this.config.githubIssue(request) : await this.internalGitHub("issue", request) as GitHubIssueResult;
-          result = JSON.stringify({ number: opened.number, url: opened.url });
+          result = await this.githubEffect(approval.operation, { sessionId: this.binding.session.id, actorId: ticket.actorId, approvalId: id, capability: input.brokerCapability! });
         } else result = await this.sandbox.execute(approval.operation, false, async () => {
           this.requireShellCapability(approval.operation, approval.unbounded === true);
           await this.authorize(approval.requestedBy, "write");

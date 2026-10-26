@@ -65,8 +65,10 @@ async function admissionStorage<T>(operation: Promise<T>): Promise<T> {
   catch { fail(503, 'admission_unavailable', 'Run admission storage is temporarily unavailable.'); }
 }
 
+/** `autoMerge`: the message also lets Auto-approve merge (only with `access` auto). */
 export async function issueRunAdmission(c: AppContext, row: SessionRow, content: string, requestId: string, access?: AccessMode,
-  images?: readonly ChatImage[]): Promise<string> {
+  images?: readonly ChatImage[], autoMerge = false): Promise<string> {
+  if (autoMerge && access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
   // Authentication middleware derives this identity from the cookie, never the submit body.
   const actorId = c.get('auth')?.userId;
   if (!actorId) fail(401, 'unauthorized', 'Authentication is required.');
@@ -98,8 +100,8 @@ export async function issueRunAdmission(c: AppContext, row: SessionRow, content:
   // Tenant-local quotas share the insertion statement; one account cannot consume a global gate.
   // Never delete proof rows or renew their expiry, including after ambiguous dispatches.
   await admissionStorage(c.env.DB.query(`WITH eligible AS (${ELIGIBLE_SESSION})
-    INSERT INTO run_admissions (id, session_id, actor_id, mode, request_id, content_hash, expires_at, created_at, access)
-    SELECT ?, eligible.id, ?, 'write', ?, ?, ?, ?, ? FROM eligible
+    INSERT INTO run_admissions (id, session_id, actor_id, mode, request_id, content_hash, expires_at, created_at, access, auto_merge)
+    SELECT ?, eligible.id, ?, 'write', ?, ?, ?, ?, ?, ? FROM eligible
     WHERE (SELECT COUNT(*) FROM (
       SELECT 1 FROM run_admissions WHERE session_id = ? AND actor_id = ? AND expires_at > ? LIMIT ?
     )) < ?
@@ -111,7 +113,7 @@ export async function issueRunAdmission(c: AppContext, row: SessionRow, content:
         WHERE owned.owner_id = ? AND admission.expires_at > ? LIMIT ?
       )) < ?
     ON CONFLICT(session_id, actor_id, request_id) DO NOTHING`)
-    .bind(...guardBindings, randomToken(), actorId, requestId, contentHash, issuedAt + ADMISSION_TTL_SECONDS, createdAt, access ?? null,
+    .bind(...guardBindings, randomToken(), actorId, requestId, contentHash, issuedAt + ADMISSION_TTL_SECONDS, createdAt, access ?? null, autoMerge ? 1 : 0,
       current.id, actorId, issuedAt, MAX_SESSION_ACTOR_PENDING, MAX_SESSION_ACTOR_PENDING,
       actorId, issuedAt, MAX_ACTOR_PENDING, MAX_ACTOR_PENDING,
       current.owner_id, issuedAt, MAX_OWNER_PENDING, MAX_OWNER_PENDING).run());

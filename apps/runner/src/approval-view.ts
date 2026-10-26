@@ -16,9 +16,9 @@ export const VIEW_SETTLED_RESULT = 1000;
 /**
  * Whether a view leaves `approval` to the transcript: a shell command that ran under the owner's auto-approve access.
  * Nobody decided it, and its call and result are already in the transcript, so a card would only repeat them; long
- * auto-approve sessions ran one per tool call and buried the decisions people made (#54). Automatic commits, pushes
- * and repins stay listed: they change repositories and sessions, and their results (a pull request, the repinned
- * session) are what people look for.
+ * auto-approve sessions ran one per tool call and buried the decisions people made (#54). Automatic commits, pushes,
+ * repins and GitHub comments, issues and merges stay listed: they change repositories, sessions and what others see,
+ * and their results (a pull request, the repinned session, the comment, issue or merge) are what people look for.
  */
 function inTranscript(approval: ApprovalRecord): boolean {
   return approval.automatic === true && (approval.operation.kind === "bash" || approval.operation.kind === "host.bash");

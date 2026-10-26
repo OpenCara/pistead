@@ -9,7 +9,7 @@ import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
-import type { AuthorizationRequest, AuthorizationResult, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
+import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
@@ -300,6 +300,11 @@ type Generation = {
   runtimeReady: PromiseWithResolvers<void>;
 };
 
+/** A GitHub effect's authority as the control plane takes it: the approval's capability or the owner's Auto-approve admission. */
+function effectAuthority(request: GitHubEffectAuthority): { capability: string } | { admissionId: string } {
+  return request.capability !== undefined ? { capability: request.capability } : { admissionId: request.admissionId! };
+}
+
 export class LocalConnector {
   readonly ready: Promise<void>;
   private readonly readiness = Promise.withResolvers<void>();
@@ -443,8 +448,8 @@ export class LocalConnector {
         reportActivity: (sessionId, activity) => this.reportActivity(generation, sessionId, activity),
         githubComment: async request => {
           const payload = {
-            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId,
-            capability: request.capability, repository: request.repository, issue: request.issue, body: request.body,
+            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
+            repository: request.repository, issue: request.issue, body: request.body,
           };
           return z.object({
             id: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
@@ -459,7 +464,7 @@ export class LocalConnector {
         },
         githubMerge: async request => {
           const payload = {
-            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, capability: request.capability,
+            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
             repository: request.repository, pull: request.pull, sha: request.sha, method: request.method,
           };
           return z.object({
@@ -469,7 +474,7 @@ export class LocalConnector {
         // Like merges, an issue GitHub refused comes back with its reason.
         githubIssue: async request => {
           const payload = {
-            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, capability: request.capability,
+            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
             repository: request.repository, title: request.title, body: request.body,
           };
           return z.object({
@@ -601,9 +606,9 @@ export class LocalConnector {
   }
 
   private async authorize(generation: Generation, request: AuthorizationRequest): Promise<AuthorizationResult> {
-    const payload = { sessionId: request.sessionId, actorId: request.actorId, ownerId: request.ownerId, permission: request.permission };
+    const payload = { sessionId: request.sessionId, actorId: request.actorId, ownerId: request.ownerId, permission: request.permission, ...(request.host ? { host: true } : {}) };
     const result = z.object({
-      allowed: z.boolean(), ownerId: actorSchema, policyVersion: z.number().int().positive(),
+      allowed: z.boolean(), ownerId: actorSchema, policyVersion: z.number().int().positive(), hostCommands: z.enum(["approve", "auto"]).optional(),
     }).strict().parse(await this.callback(generation, "/api/connectors/self/authorize", payload));
     if (result.ownerId !== request.ownerId) throw new Error("Invalid authorization response");
     return result;

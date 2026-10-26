@@ -1,11 +1,11 @@
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { AccessMode, ThinkingLevel } from "../../../packages/shared/src/types";
 import {
-  accessLabels, autoApproveWarning, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels,
+  accessLabels, AUTO_MERGE_WARNING, autoApproveWarning, autoMergeAvailable, chatPreference, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels,
   parseChatPreference, selectModel as pickModel, type ChatPreference, type ChatSelection,
 } from "../../../packages/client/src/chat-options";
 import { Icon, type IconName } from "./icons";
-import { Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
+import { Button, Combobox, confirmDialog, DropdownMenu, type MenuItem } from "./ui";
 import "./chat-options.css";
 
 export { accessUnavailable, chatOptionsBody, initialSelection, preferredSelection, type ChatPreference, type ChatSelection } from "../../../packages/client/src/chat-options";
@@ -55,7 +55,15 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
       confirmLabel: "Enable auto-approve",
       destructive: true,
     })) return;
-    onChange({ ...value, access });
+    // Leaving Auto-approve also turns Auto-merge off, so it is chosen afresh with it.
+    onChange({ ...value, access, ...(access === "auto" ? {} : { autoMerge: false }) });
+  }
+
+  async function toggleAutoMerge() {
+    if (!value.autoMerge && !await confirmDialog({
+      title: "Auto-merge pull requests?", message: AUTO_MERGE_WARNING, confirmLabel: "Enable auto-merge", destructive: true,
+    })) return;
+    onChange({ ...value, autoMerge: !value.autoMerge });
   }
 
   const modes: AccessMode[] = owner ? ["read", "approval", "auto"] : ["read", "approval"];
@@ -72,6 +80,10 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
       options={levels.map(item => ({ value: item, label: levelLabels[item] }))} onChange={thinkingLevel => onChange({ ...value, thinkingLevel })} />}
     {showAccess && <span className={value.access === "auto" ? "chat-access auto" : "chat-access"} title={`Access: ${current.label}`}>
       <DropdownMenu label="Access" align="end" side="above" items={accessItems} trigger={<><Icon name={accessIcons[value.access]} size={14} /><span className="truncate">{current.label}</span></>} />
+    </span>}
+    {showAccess && autoMergeAvailable(host, value, owner) && <span className={value.autoMerge ? "chat-access auto" : "chat-access"}>
+      <Button size="sm" variant="ghost" icon="git-branch" aria-pressed={Boolean(value.autoMerge)} title={value.autoMerge ? "Auto-merge is on: merges run without asking" : "Merges still ask; turn on to auto-merge too"}
+        onClick={() => void toggleAutoMerge()}><span className="truncate">{value.autoMerge ? "Auto-merge on" : "Auto-merge off"}</span></Button>
     </span>}
   </>;
 }

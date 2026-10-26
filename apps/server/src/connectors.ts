@@ -6,7 +6,7 @@ import { sessionActivities, thinkingLevels, type SessionActivity, type ThinkingL
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import type { Query } from './db/types.js';
-import { requireMember } from './db.js';
+import { auditStatement, requireMember } from './db.js';
 import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
 import { authorizeSession } from './internal.js';
 import { markSessionChanged } from './session-changes.js';
@@ -14,6 +14,7 @@ import { githubComment, githubIssue, githubMerge, githubRead } from './github-br
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
 import { legacyRepositoryFixture, requireConfiguredWorkspace } from './repositories.js';
+import { connectorAdmins, connectorHostGrants, managedConnector, viewerHostCommands } from './host-access.js';
 
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
@@ -178,7 +179,12 @@ async function ownedConnector(c: AppContext): Promise<ConnectorRow> {
 }
 
 type ConnectorInfoRow = ConnectorRow & { owner_name?: string; workspace_ids?: string; connected_workspace_ids?: string };
-async function connectorInfo(env: Env, row: ConnectorInfoRow): Promise<ConnectorInfo> {
+/**
+ * Who reads the listing: `role` adds the host's admins and host command grants for its owner and admins; `workspaceId`
+ * adds the viewer's own host command authority there.
+ */
+type InfoViewer = { userId: string; role?: 'owner' | 'admin'; workspaceId?: string };
+async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewer): Promise<ConnectorInfo> {
   const ownerName = row.owner_name ?? (await env.DB.query<{ display_name: string }>('SELECT display_name FROM users WHERE id = ?')
     .bind(row.owner_id).first())?.display_name ?? '';
   const workspaceIds: string[] = row.workspace_ids !== undefined ? JSON.parse(row.workspace_ids) :
@@ -195,15 +201,26 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow): Promise<Connector
       online = await env.CONNECTOR_HUB.status(row.id, 2000);
     } catch { /* Offline is safe metadata; do not expose transport errors. */ }
   }
+  const [admins, grants, hostCommandAccess, memberships] = await Promise.all([
+    viewer?.role ? connectorAdmins(env, row.id) : undefined,
+    viewer?.role ? connectorHostGrants(env, row.id) : undefined,
+    viewer?.workspaceId ? viewerHostCommands(env, row, viewer.workspaceId, viewer.userId) : undefined,
+    // An admin sees the owner's workspaces only where they are a member too.
+    viewer?.role === 'admin' ? env.DB.query<{ workspace_id: string }>('SELECT workspace_id FROM workspace_members WHERE user_id = ?')
+      .bind(viewer.userId).all().then(items => new Set(items.map(item => item.workspace_id))) : undefined,
+  ]);
+  const visible = (workspaceId: string) => !memberships || memberships.has(workspaceId);
+  const hostGrants = grants?.filter(grant => visible(grant.workspaceId));
   return { id: row.id, ownerId: row.owner_id, ownerName, name: row.name,
     createdAt: row.created_at, revokedAt: row.revoked_at, online, models: JSON.parse(row.models_json),
-    workspaceIds, connectedWorkspaceIds, capabilities: JSON.parse(row.capabilities_json) };
+    workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities: JSON.parse(row.capabilities_json),
+    ...(viewer?.role ? { role: viewer.role, admins, hostGrants } : {}), ...(hostCommandAccess ? { hostCommandAccess } : {}) };
 }
 
-async function connectorInfos(env: Env, rows: ConnectorInfoRow[]): Promise<ConnectorInfo[]> {
+async function connectorInfos(env: Env, rows: ConnectorInfoRow[], viewer?: (row: ConnectorInfoRow) => InfoViewer): Promise<ConnectorInfo[]> {
   const result: ConnectorInfo[] = [];
   for (let offset = 0; offset < rows.length; offset += 4) {
-    result.push(...await Promise.all(rows.slice(offset, offset + 4).map(row => connectorInfo(env, row))));
+    result.push(...await Promise.all(rows.slice(offset, offset + 4).map(row => connectorInfo(env, row, viewer?.(row)))));
   }
   return result;
 }
@@ -350,9 +367,13 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
         ON m.workspace_id = s.workspace_id AND m.user_id = c.owner_id WHERE s.connector_id = c.id) AS workspace_ids,
       (SELECT json_group_array(cw.workspace_id) FROM connector_workspaces cw JOIN workspace_members m
         ON m.workspace_id = cw.workspace_id AND m.user_id = c.owner_id WHERE cw.connector_id = c.id) AS connected_workspace_ids
-      FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.owner_id = ? AND c.removed_at IS NULL ORDER BY c.created_at DESC LIMIT 100`)
-      .bind(c.get('auth').userId).all();
-    return c.json({ connectors: await connectorInfos(c.env, rows) });
+      FROM connectors c JOIN users u ON u.id = c.owner_id WHERE c.removed_at IS NULL
+        AND (c.owner_id = ? OR EXISTS (SELECT 1 FROM connector_admins a WHERE a.connector_id = c.id AND a.user_id = ?))
+      ORDER BY c.created_at DESC LIMIT 100`)
+      .bind(c.get('auth').userId, c.get('auth').userId).all();
+    const userId = c.get('auth').userId;
+    // Owners and admins see its admins and grants; an admin's listing names the owner's shares, which they manage.
+    return c.json({ connectors: await connectorInfos(c.env, rows, row => ({ userId, role: row.owner_id === userId ? 'owner' : 'admin' })) });
   });
   app.get('/api/workspaces/:id/connectors', async c => {
     const workspaceId = identifier(c.req.param('id'));
@@ -369,12 +390,15 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
         WHERE sh.connector_id = c.id AND sh.workspace_id = cw.workspace_id))
       AND (? = 1 OR u.auth_kind <> 'test') ORDER BY c.created_at DESC LIMIT 30`)
       .bind(c.get('auth').userId, workspaceId, testMode(c.env) ? 1 : 0).all();
-    return c.json({ connectors: await connectorInfos(c.env, rows) });
+    const userId = c.get('auth').userId;
+    return c.json({ connectors: await connectorInfos(c.env, rows, () => ({ userId, workspaceId })) });
   });
+  // Its owner or an admin shares a host, into a workspace both they and the owner belong to.
   app.put('/api/connectors/:id/shares/:workspaceId', async c => {
-    const row = await ownedConnector(c);
+    const row = await managedConnector(c);
     if (row.revoked_at) fail(409, 'connector_revoked', 'Connector is revoked.');
     const workspaceId = identifier(c.req.param('workspaceId'));
+    if (row.role === 'admin') await requireMember(c.env, workspaceId, c.get('auth').userId);
     await requireMember(c.env, workspaceId, row.owner_id);
     await requireConfiguredWorkspace(c.env, workspaceId, row.owner_id);
     const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, row.owner_id);
@@ -404,13 +428,17 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
       fail(409, 'share_unavailable', 'Connector or workspace authority changed.');
     }
     await syncModels(c.env, row, workspaceId);
+    await auditStatement(c.env, c.get('auth').userId, 'connector.share.added', workspaceId, null, { connectorId: row.id }).run();
     return c.json({ connector: await connectorInfo(c.env, row) });
   });
+  // Unsharing also ends the workspace's host command grants.
   app.delete('/api/connectors/:id/shares/:workspaceId', async c => {
-    const row = await ownedConnector(c);
+    const row = await managedConnector(c);
     const workspaceId = identifier(c.req.param('workspaceId'));
     await c.env.DB.batch([
       c.env.DB.query('DELETE FROM connector_shares WHERE connector_id = ? AND workspace_id = ?').bind(row.id, workspaceId),
+      c.env.DB.query('DELETE FROM connector_host_grants WHERE connector_id = ? AND workspace_id = ?').bind(row.id, workspaceId),
+      auditStatement(c.env, c.get('auth').userId, 'connector.share.removed', workspaceId, null, { connectorId: row.id }),
       c.env.DB.query(`UPDATE sessions SET policy_version = policy_version + 1
         WHERE connector_id = ? AND workspace_id = ? AND owner_id <> ?`).bind(row.id, workspaceId, row.owner_id),
     ]);
@@ -426,6 +454,8 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
         WHERE id = ?`).bind(timestamp, timestamp, await sha256(randomToken()), row.id),
       c.env.DB.query('DELETE FROM connector_shares WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('DELETE FROM connector_workspaces WHERE connector_id = ?').bind(row.id),
+      c.env.DB.query('DELETE FROM connector_host_grants WHERE connector_id = ?').bind(row.id),
+      c.env.DB.query('DELETE FROM connector_admins WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('UPDATE models SET available = 0 WHERE connector_id = ?').bind(row.id),
       c.env.DB.query('UPDATE sessions SET policy_version = policy_version + 1 WHERE connector_id = ?').bind(row.id),
     ]);
