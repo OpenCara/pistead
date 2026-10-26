@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 760" width="600" height="760" role="img" aria-label="Pia, Pistead's mascot: a girl with copper-orange hair, amber eyes, a roof-and-pi hairpin, a charcoal dress with a cream apron, and a ring of keys at her waist.">
+  <!-- Pia, Pistead's mascot. Palette follows apps/web/src/styles.css (accent #c4541f) and the mark in apps/web/public/favicon.svg. -->
+  <defs>
+    <linearGradient id="iris" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5a2410"/>
+      <stop offset="0.55" stop-color="#c4541f"/>
+      <stop offset="1" stop-color="#f6b25e"/>
+    </linearGradient>
+    <linearGradient id="hair" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9622b"/>
+      <stop offset="1" stop-color="#a8431a"/>
+    </linearGradient>
+    <clipPath id="sclera"><ellipse cx="258" cy="268" rx="24" ry="25"/></clipPath>
+    <g id="eye">
+      <ellipse cx="258" cy="268" rx="24" ry="25" fill="#ffffff"/>
+      <g clip-path="url(#sclera)">
+        <ellipse cx="260" cy="271" rx="18" ry="23" fill="url(#iris)"/>
+        <ellipse cx="260" cy="273" rx="8" ry="11" fill="#3a160a"/>
+        <ellipse cx="258" cy="252" rx="24" ry="6" fill="#3a160a" opacity="0.25"/>
+      </g>
+      <circle cx="253" cy="261" r="6" fill="#ffffff"/>
+      <circle cx="267" cy="283" r="3" fill="#ffffff"/>
+      <path d="M232 258 Q255 236 284 250" fill="none" stroke="#2a1a14" stroke-width="5" stroke-linecap="round"/>
+      <path d="M233 257 L223 250" fill="none" stroke="#2a1a14" stroke-width="4" stroke-linecap="round"/>
+      <path d="M241 292 Q258 298 276 292" fill="none" stroke="#8f3413" stroke-width="1.5" stroke-linecap="round"/>
+    </g>
+  </defs>
+
+  <!-- Background: the homestead roof she keeps. -->
+  <rect width="600" height="760" rx="32" fill="#f7f1ea"/>
+  <path d="M70 340 L300 150 L530 340" fill="none" stroke="#c0491d" stroke-opacity="0.12" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#e2733f" opacity="0.5">
+    <path d="M95 140 l5 12 12 5 -12 5 -5 12 -5 -12 -12 -5 12 -5z"/>
+    <path d="M500 110 l4 9 9 4 -9 4 -4 9 -4 -9 -9 -4 9 -4z"/>
+    <path d="M520 470 l3 7 7 3 -7 3 -3 7 -3 -7 -7 -3 7 -3z"/>
+  </g>
+
+  <!-- Back hair, long, falling behind the shoulders. -->
+  <path d="M185 240 C180 130 240 92 300 92 C360 92 420 130 415 240 C430 330 452 450 446 545 Q425 525 410 548 Q398 505 382 522 L380 330 L220 330 L218 522 Q202 505 190 548 Q175 525 154 545 C148 450 170 330 185 240 Z" fill="url(#hair)"/>
+
+  <!-- Neck. -->
+  <rect x="278" y="320" width="44" height="80" fill="#fde3cf"/>
+  <path d="M278 335 Q300 360 322 335 L322 352 Q300 372 278 352 Z" fill="#f2c4a8"/>
+
+  <!-- Dress. -->
+  <path d="M170 420 C200 390 250 378 300 378 C350 378 400 390 430 420 L470 760 L130 760 Z" fill="#2a2522"/>
+  <path d="M300 378 L300 760" stroke="#1c1817" stroke-width="2"/>
+
+  <!-- Apron: bib, straps, waistband, skirt. -->
+  <path d="M232 402 L252 478 M368 402 L348 478" stroke="#f3ead8" stroke-width="14" stroke-linecap="round"/>
+  <path d="M245 478 Q245 466 257 466 L343 466 Q355 466 355 478 L355 642 L245 642 Z" fill="#f3ead8"/>
+  <path d="M252 472 L348 472" stroke="#e2733f" stroke-width="2" stroke-dasharray="5 4"/>
+  <rect x="268" y="548" width="64" height="58" rx="8" fill="#ebdfc6"/>
+  <g fill="none" stroke="#c4541f" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M284 566 L316 566"/>
+    <path d="M293 566 L293 592"/>
+    <path d="M307 566 L307 588 Q307 593 312 593"/>
+  </g>
+  <path d="M145 640 L455 640 L458 662 L142 662 Z" fill="#c4541f"/>
+  <path d="M208 662 L392 662 L408 760 L192 760 Z" fill="#f3ead8"/>
+
+  <!-- Keyring: every command, push and merge waits for a key. -->
+  <g>
+    <circle cx="420" cy="676" r="12" fill="none" stroke="#b08a2e" stroke-width="3.5"/>
+    <g fill="#f2b438" stroke="#b08a2e" stroke-width="1.5">
+      <circle cx="412" cy="698" r="6"/>
+      <rect x="409" y="702" width="6" height="26" rx="2"/>
+      <rect x="415" y="718" width="7" height="4"/>
+      <circle cx="432" cy="696" r="6"/>
+      <rect x="429" y="700" width="6" height="22" rx="2"/>
+      <rect x="435" y="712" width="6" height="4"/>
+    </g>
+  </g>
+
+  <!-- Collar and bow. -->
+  <path d="M300 386 C280 382 255 388 246 403 C262 428 292 420 300 400 Z" fill="#ffffff"/>
+  <path d="M300 386 C320 382 345 388 354 403 C338 428 308 420 300 400 Z" fill="#ffffff"/>
+  <path d="M300 400 L274 388 L276 414 Z M300 400 L326 388 L324 414 Z" fill="#c4541f"/>
+  <path d="M296 402 L284 432 L292 430 L298 404 Z M304 402 L316 432 L308 430 L302 404 Z" fill="#a8431a"/>
+  <circle cx="300" cy="401" r="6" fill="#e2733f"/>
+
+  <!-- Face. -->
+  <path d="M205 230 C205 300 250 345 300 350 C350 345 395 300 395 230 C395 170 350 140 300 140 C250 140 205 170 205 230 Z" fill="#fde3cf"/>
+  <ellipse cx="240" cy="300" rx="16" ry="8" fill="#f59a8a" opacity="0.45"/>
+  <ellipse cx="360" cy="300" rx="16" ry="8" fill="#f59a8a" opacity="0.45"/>
+  <path d="M236 226 Q256 218 276 224 M324 224 Q344 218 364 226" fill="none" stroke="#a8431a" stroke-width="3" stroke-linecap="round"/>
+  <use xlink:href="#eye" href="#eye"/>
+  <use xlink:href="#eye" href="#eye" transform="translate(600 0) scale(-1 1)"/>
+  <path d="M300 288 L298 294" stroke="#e0a88a" stroke-width="2" stroke-linecap="round"/>
+  <path d="M289 316 Q300 326 311 316" fill="none" stroke="#8f3413" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Side locks framing the face. -->
+  <path d="M206 218 C196 300 204 380 186 472 Q202 460 214 478 Q222 400 236 318 Z" fill="url(#hair)"/>
+  <path d="M394 218 C404 300 396 380 414 472 Q398 460 386 478 Q378 400 364 318 Z" fill="url(#hair)"/>
+
+  <!-- Bangs. -->
+  <path d="M196 262 C188 170 240 116 300 114 C360 116 412 170 404 262 L388 222 L376 246 L362 190 L344 232 L326 180 L306 226 L292 178 L272 232 L254 190 L238 246 L224 222 Z" fill="#d9622b" stroke="#d9622b" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M232 168 Q300 138 368 168" fill="none" stroke="#f6a066" stroke-width="7" stroke-linecap="round" opacity="0.7"/>
+  <!-- Ahoge: the curled leg of the pi in the mark. -->
+  <path d="M300 116 C296 88 318 74 334 86" fill="none" stroke="#d9622b" stroke-width="7" stroke-linecap="round"/>
+
+  <!-- Hairpin: Pistead's mark, inverted. -->
+  <g transform="translate(352 150) rotate(14) scale(1.15)">
+    <rect width="32" height="32" rx="9" fill="#ffffff" stroke="#a8431a" stroke-width="1"/>
+    <g fill="none" stroke="#c0491d" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M7 15.5 16 8l9 7.5"/>
+      <path d="M10.5 17h11"/>
+      <path d="M13.75 17v7"/>
+      <path d="M18.5 17v5.5c0 1 .6 1.5 1.6 1.5"/>
+    </g>
+  </g>
+</svg>
