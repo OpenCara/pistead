@@ -208,7 +208,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
     capabilities: { platform: process.platform, sandbox: false, productionShell: false },
-    onStatus: status => { process.stderr.write(`Local connector: ${status}\n`); },
+    onStatus: (status, reason) => { process.stderr.write(`Local connector: ${status}${reason ? ` (${reason})` : ""}\n`); },
     onWarning: () => { process.stderr.write("Some resource domains are unavailable; production bash remains fail-closed.\n"); },
   });
   process.stderr.write(unsandboxed
