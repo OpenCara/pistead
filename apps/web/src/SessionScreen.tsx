@@ -17,6 +17,7 @@ import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
+import { decidesHostCommands, HOST_COMMAND_WAITING, isHostCommand } from "../../../packages/client/src/host-commands";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
@@ -245,11 +246,11 @@ function SessionPane({ id }: { id: string }) {
             : <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>)}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
-            // Only the session owner can let a call do more than the session allows.
-            // A session that runs on its host runs its commands there, as host commands: decided the same way.
-            const hostCommand = approval.operation.kind === "host.bash" || (approval.operation.kind === "bash" && session.hostEnvironment === true);
+            // Only the session owner can let a call do more than the session allows. A host command, as every command of a
+            // session that runs on its host is, is decided by its host's owner or a member granted host commands.
+            const hostCommand = isHostCommand(approval.operation, session);
             const ownerOnly = permission || approval.operation.kind === "git.repin";
-            const decides = canApprove && (hostCommand ? session.connectorOwnerId === user.id : !ownerOnly || isOwner);
+            const decides = canApprove && (hostCommand ? decidesHostCommands(session, host, user.id) : !ownerOnly || isOwner);
             const disabled = approvalAction.busy || !approval.reviewHash;
             return <ApprovalCard approval={approval} key={approval.id}>
               {decides ? <>
@@ -264,7 +265,7 @@ function SessionPane({ id }: { id: string }) {
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
                   <span className="muted small">Runs as {hostCommand ? "the host OS user (outside the sandbox)" : view.owner.displayName} · each approval covers one exact operation and its arguments</span>
                 </div>}
-              </> : <p className="muted small">{hostCommand ? "Waiting for the host owner, who needs approve access to this session" : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
+              </> : <p className="muted small">{hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
           })}
           <Feedback {...approvalAction} />
