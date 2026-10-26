@@ -56,11 +56,7 @@ export interface UserRow {
   suspended_at?: string | null;
   github_connected?: number;
 }
-export interface WorkspaceRow {
-  id: string; name: string; owner_id: string; created_at: string;
-  /** 1: session views hold each conversation's latest entries, read further back a page at a time. */
-  transcript_paging?: number;
-}
+export interface WorkspaceRow { id: string; name: string; owner_id: string; created_at: string }
 export interface MemberRow { workspace_id: string; user_id: string; role: WorkspaceRole; created_at: string }
 export interface ModelRow {
   id: string; workspace_id: string; name: string; provider: string; model_id: string; created_at: string;

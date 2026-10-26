@@ -377,7 +377,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
         {actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}
       </EmptyState>}
       ListHeaderComponent={olderCount > 0 ? <Button small variant="ghost" icon="chevron-up" busy={loadingOlder} onPress={loadEarlier}
-        label={`Show earlier messages (${olderCount})`} testID="load-earlier" /> : null}
+        label={`Show earlier messages (${olderCount})`} testID="load-earlier" /> : undefined}
       // Earlier entries arrive above what the reader is looking at, which stays where it is.
       maintainVisibleContentPosition={olderCount > 0 || loadingOlder ? { minIndexForVisible: 0 } : undefined}
       ListFooterComponent={<View style={styles.pinned}>{pinned}</View>}

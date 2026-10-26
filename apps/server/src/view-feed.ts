@@ -10,6 +10,7 @@ import { fail } from './http.js';
 import { requireRunnerAccess, runnerJSON, runnerRequest } from './runner.js';
 import { briefEntry, entriesBefore, fullTranscript, latestEntries, type TranscriptDisplay } from '../../../packages/shared/src/transcript-display.js';
 import type { AppContext, SessionRow } from './types.js';
+import { workspaceTranscriptSettings } from './transcript-settings.js';
 
 /**
  * One feed of each session's view, shared by everyone watching it: a host is asked at most about once a second however
@@ -72,9 +73,8 @@ function registry(env: object): Map<string, Feed> {
 
 /** How the session's transcript is shown now: its own tool output setting, and its workspace's paging. */
 export async function transcriptDisplay(c: AppContext, row: SessionRow): Promise<TranscriptDisplay> {
-  const workspace = await c.env.DB.query<{ transcript_paging: number }>('SELECT transcript_paging FROM workspaces WHERE id = ?')
-    .bind(row.workspace_id).first();
-  return { toolOutput: row.tool_output === 'brief' ? 'brief' : 'full', paging: workspace?.transcript_paging === 1 };
+  const { paging } = await workspaceTranscriptSettings(c.env.DB, row.workspace_id);
+  return { toolOutput: row.tool_output === 'brief' ? 'brief' : 'full', paging };
 }
 
 function feedFor(c: AppContext, row: SessionRow, display: TranscriptDisplay): Feed {

@@ -1,7 +1,8 @@
 import type { Hono } from 'hono';
+import type { Database } from './db/types.js';
 import type { WorkerEnv } from './types.js';
 import { auditStatement, requireMember } from './db.js';
-import { fail, identifier, jsonObject } from './http.js';
+import { fail, identifier, jsonObject, now } from './http.js';
 
 /** How a workspace's session transcripts load (transcript-display.ts). */
 export interface TranscriptSettings {
@@ -9,14 +10,21 @@ export interface TranscriptSettings {
   paging: boolean;
 }
 
+/** Owner/admin authority, re-checked inside the write (binds workspace id, user id). */
+const adminSql = `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))`;
+
+/** The workspace's transcript settings; the defaults until an owner or admin saves some. */
+export async function workspaceTranscriptSettings(db: Database, workspaceId: string): Promise<TranscriptSettings> {
+  const row = await db.query<{ paging: number }>('SELECT paging FROM workspace_transcript_settings WHERE workspace_id = ?').bind(workspaceId).first();
+  return { paging: row?.paging === 1 };
+}
+
 export function registerTranscriptSettings(app: Hono<WorkerEnv>): void {
   // Every member may see how transcripts load; owners and admins change it.
   app.get('/api/workspaces/:id/transcripts', async c => {
     const workspaceId = identifier(c.req.param('id'));
     await requireMember(c.env, workspaceId, c.get('auth').userId);
-    const row = await c.env.DB.query<{ transcript_paging: number }>('SELECT transcript_paging FROM workspaces WHERE id = ?').bind(workspaceId).first();
-    if (!row) fail(404, 'not_found', 'Workspace not found.');
-    return c.json({ settings: { paging: row.transcript_paging === 1 } satisfies TranscriptSettings });
+    return c.json({ settings: await workspaceTranscriptSettings(c.env.DB, workspaceId) });
   });
   app.put('/api/workspaces/:id/transcripts', async c => {
     const workspaceId = identifier(c.req.param('id'));
@@ -25,10 +33,10 @@ export function registerTranscriptSettings(app: Hono<WorkerEnv>): void {
     const input = await jsonObject(c, 1024);
     if (Object.keys(input).some(key => key !== 'paging') || typeof input.paging !== 'boolean') fail(400, 'invalid_input', 'Set paging to true or false.');
     const settings: TranscriptSettings = { paging: input.paging };
-    // Authority is checked again inside the write.
-    const saved = await c.env.DB.query(`UPDATE workspaces SET transcript_paging = ?
-      WHERE id = ? AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))
-      RETURNING id`).bind(settings.paging ? 1 : 0, workspaceId, workspaceId, actor).first();
+    const saved = await c.env.DB.query(`INSERT INTO workspace_transcript_settings (workspace_id, paging, updated_by, updated_at)
+      SELECT ?,?,?,? WHERE ${adminSql}
+      ON CONFLICT (workspace_id) DO UPDATE SET paging = excluded.paging, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+      RETURNING workspace_id`).bind(workspaceId, settings.paging ? 1 : 0, actor, now(), workspaceId, actor).first();
     if (!saved) fail(403, 'forbidden', 'Workspace administrator access is required.');
     await auditStatement(c.env, actor, 'workspace.transcripts.updated', workspaceId, null, { ...settings }).run();
     return c.json({ settings });
