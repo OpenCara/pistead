@@ -162,9 +162,10 @@ test("agents open GitHub issues through the broker, always after a human approve
   const base = binding(id);
   const session = await service.provision({ ...base, agent: { ...base.agent, tools: [...base.agent.tools, "github_issue"] } }, await ticket(id, "create"));
 
-  // Even an auto-approve message only asks to open the issue; a multi-line title or a URL never becomes a card.
+  // A message that asks before acting only asks to open the issue (Auto-approve opens it at once, tested below); a
+  // multi-line title or a URL never becomes a card.
   const admissionId = await sha256("github issue admission");
-  await session.submit(await ticket(id, "submit"), { content: "File the bug.", requestId: "auto", admissionId, options: { access: "auto" } }, "write");
+  await session.submit(await ticket(id, "submit"), { content: "File the bug.", requestId: "asking", admissionId, options: { access: "approval" } }, "write");
   const pending = await pendingApproval(session);
   const transcript = (await session.view()).entries.map(entry => entry.text).join("\n");
   assert.match(transcript, /title must be one non-empty line/);
@@ -226,7 +227,9 @@ test("allowing github_issue for the rest of the session still leaves every issue
   assert.equal(permission.operation.kind, "permission");
   await session.decide(await ticket(id, "approve"), permission.id, { decision: "approve", operation: permission.operation, scope: "session" });
   for (const title of ["First", "Second"]) {
-    if (title === "Second") await session.submit(await ticket(id, "submit"), { content: "File another.", requestId: "second", admissionId, options: { access: "auto" } }, "write");
+    // A session grant lets the tool run without its permission card, never the issue itself without a person: only the
+    // owner's Auto-approve message does that.
+    if (title === "Second") await session.submit(await ticket(id, "submit"), { content: "File another.", requestId: "second", admissionId }, "write");
     const card = await pendingApproval(session);
     assert.deepEqual([card.operation.kind, card.automatic], ["github.issue", undefined], `${title} waits for a human`);
     assert.equal((card.operation as { title: string }).title, title);
