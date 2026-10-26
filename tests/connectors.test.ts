@@ -2577,3 +2577,47 @@ test('host owners add admins who manage sharing and host command grants, and gra
   assert.equal((await creator.request('DELETE', `${admins}/${creator.user.id}`)).status, 204);
   await denied(await creator.request('PUT', `/api/connectors/${id}/shares/${s.team.id}`), 404, 'not_found');
 });
+
+test('the Files tab reads the session worktree through its host, for collaborators, with secrets hidden', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const files = (path: string, client = s.creator) => client.request('GET', `/api/sessions/${s.session.id}/files?path=${encodeURIComponent(path)}`);
+  const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ';
+  const requests = rpcHub(f, s.connector, envelope => {
+    const { path } = JSON.parse(envelope.request.body) as { path: string };
+    return Response.json({ files: path === '.'
+      ? { path, type: 'directory', entries: [{ name: 'src', type: 'directory' }, { name: '.env', type: 'file', size: 60 }], total: 2, truncated: false }
+      : { path, type: 'file', size: 60, truncated: false, text: `API_KEY=${secret}\n` } });
+  });
+  // A connector that doesn't advertise the file browser isn't asked.
+  await denied(await files('.'), 409, 'files_unsupported');
+  assert.equal(requests.length, 0);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, fileBrowser: true } }));
+
+  const listing = await json<{ files: { type: string; entries: unknown[] } }>(await files('.'));
+  assert.deepEqual(listing.files, { path: '.', type: 'directory', entries: [{ name: 'src', type: 'directory' }, { name: '.env', type: 'file', size: 60 }], total: 2, truncated: false });
+  const request = requests.at(-1)!.request;
+  assert.equal(request.method, 'POST');
+  assert.equal(request.path, `/v1/sessions/${s.session.id}/files`);
+  assert.equal(request.ticket.action, 'files');
+  assert.deepEqual(JSON.parse(request.body), { path: '.' });
+
+  // What looks like a secret is hidden, as in the transcript.
+  const preview = await json<{ files: { text: string; redacted?: boolean } }>(await files('./.env'));
+  assert.equal(JSON.parse(requests.at(-1)!.request.body).path, '.env');
+  assert.equal(preview.files.redacted, true);
+  assert.ok(!preview.files.text.includes(secret));
+
+  // Only relative worktree paths reach the host.
+  const before = requests.length;
+  for (const path of ['/etc/passwd', '../outside', 'src/../../outside', 'a//b']) await denied(await files(path), 400, 'invalid_path');
+  assert.equal(requests.length, before);
+
+  // Someone without a session role can't see the session at all; a viewer follows only the conversation; a collaborator browses.
+  await denied(await files('.', s.host), 404, 'not_found');
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.host.user.id, role: 'viewer' }));
+  await denied(await files('.', s.host), 403, 'forbidden');
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.host.user.id, role: 'collaborator' }));
+  await json(await files('.', s.host));
+  assert.equal(requests.at(-1)!.request.ticket.actorId, s.host.user.id);
+  assert.equal(requests.length, before + 1);
+});
