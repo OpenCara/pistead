@@ -697,7 +697,9 @@ test('workspace roles: viewers read and create nothing, members read, collaborat
   assert.equal(f.sqlite.prepare('SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?').get(workspace.id, other.user.id), undefined);
   // Admins can't make or unmake admins, change themselves or the owner; non-admins change nothing.
   assert.equal((await change(admin, collaborator.user.id, { role: 'admin' })).status, 403);
-  assert.equal((await change(admin, admin.user.id, { role: 'member' })).status, 403);
+  const self = await change(admin, admin.user.id, { role: 'member' });
+  assert.equal(self.status, 403);
+  assert.match((await self.json() as { error: string }).error, /their own membership/);
   assert.equal((await change(admin, owner.user.id, { role: 'member' })).status, 403);
   assert.equal((await change(collaborator, member.user.id, { role: 'viewer' })).status, 403);
   for (const body of [{ role: 'owner' }, { role: 1 }, {}, { role: 'member', userId: member.user.id }]) {

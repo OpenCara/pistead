@@ -63,6 +63,9 @@ async function requireMemberManagement(
   if (targetId === authority.ownerId || authority.targetRole === 'owner') {
     fail(403, 'forbidden', 'The workspace owner membership cannot be changed or removed.');
   }
+  if (!owner && targetId === actorId) {
+    fail(403, 'forbidden', 'Administrators cannot change or remove their own membership. Ask the workspace owner.');
+  }
   // Admins manage collaborators, members and viewers; only the owner assigns, changes or removes an admin.
   if (!owner && ((role && !adminManagedRoles.includes(role)) || (authority.targetRole && !adminManagedRoles.includes(authority.targetRole)))) {
     fail(403, 'forbidden', 'Only the workspace owner can manage administrators.');
