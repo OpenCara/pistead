@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
-import { lstat, open, readdir } from "node:fs/promises";
-import { join } from "node:path";
-import { fileBrowserLimits, type FileEntry, type SessionFiles } from "../../../packages/shared/src/types.js";
+import { lstat, open, readdir, type FileHandle } from "node:fs/promises";
+import { checkBrowseResult, type BrowseResult } from "../../../packages/shared/src/file-browser.js";
+import { fileBrowserLimits, type FileEntry } from "../../../packages/shared/src/types.js";
 import { imageType } from "./images.js";
 
 /**
@@ -9,16 +9,12 @@ import { imageType } from "./images.js";
  * and the unsandboxed host workspace (below) read the same thing, within fileBrowserLimits: a directory's entries,
  * lstat-ed and never followed, or a preview of a file. Whatever comes back is checked again here.
  */
-export type BrowseResult = { [K in SessionFiles["type"]]: Omit<Extract<SessionFiles, { type: K }>, "path"> }[SessionFiles["type"]];
+export type { BrowseResult };
 
-const entryTypes: readonly FileEntry["type"][] = ["directory", "file", "symlink", "other"];
 const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 /** More entries than this in one directory are refused rather than listed in part: listing them would take too long. */
 const MAX_LISTED = 100_000;
-
-function invalid(): never { throw new Error("Invalid file browser response"); }
-
-const nonNegative = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
 /** Sorts directories first, then by name in code-unit order, as the sandbox helper does. */
 export function sortEntries(entries: FileEntry[]): FileEntry[] {
@@ -27,54 +23,54 @@ export function sortEntries(entries: FileEntry[]): FileEntry[] {
 
 /** Checks a browse result from the sandbox helper or the host workspace before it leaves the runner. */
 export function checkedBrowse(value: unknown): BrowseResult {
-  if (!value || typeof value !== "object" || Array.isArray(value)) invalid();
-  const result = value as Record<string, unknown>;
-  if (result.type === "directory") {
-    const { entries, total, truncated } = result;
-    if (!Array.isArray(entries) || entries.length > fileBrowserLimits.entries || !nonNegative(total) || total < entries.length
-      || typeof truncated !== "boolean" || truncated !== total > entries.length) invalid();
-    return { type: "directory", total, truncated, entries: entries.map((item: unknown) => {
-      const entry = item as Record<string, unknown> | null;
-      if (!entry || typeof entry !== "object" || typeof entry.name !== "string" || !entry.name || entry.name.length > 1024
-        || entry.name.includes("/") || entry.name === "." || entry.name === ".." || !entryTypes.includes(entry.type as FileEntry["type"])
-        || (entry.size !== undefined && (entry.type !== "file" || !nonNegative(entry.size)))) invalid();
-      return { name: entry.name, type: entry.type as FileEntry["type"], ...(entry.size !== undefined ? { size: entry.size as number } : {}) };
-    }) };
-  }
-  if (result.type !== "file" || !nonNegative(result.size) || typeof result.truncated !== "boolean") invalid();
-  const base = { type: "file" as const, size: result.size, truncated: result.truncated };
-  const kinds = [result.text !== undefined, result.image !== undefined, result.binary !== undefined].filter(Boolean).length;
-  if (kinds !== 1) invalid();
-  if (result.binary !== undefined) {
-    if (result.binary !== true) invalid();
-    return { ...base, binary: true };
-  }
-  if (result.text !== undefined) {
-    if (typeof result.text !== "string" || Buffer.byteLength(result.text) > fileBrowserLimits.textBytes) invalid();
-    return { ...base, text: result.text };
-  }
-  const image = result.image as Record<string, unknown> | null;
-  if (!image || typeof image !== "object" || typeof image.data !== "string" || typeof image.mimeType !== "string") invalid();
-  const bytes = Buffer.from(image.data, "base64");
+  const result = checkBrowseResult(value);
   // The signature is checked again here, like every image read_file returns.
-  if (bytes.length > fileBrowserLimits.imageBytes || bytes.toString("base64") !== image.data || imageType(bytes) !== image.mimeType) invalid();
-  return { ...base, image: { mimeType: image.mimeType, data: image.data } };
+  if (result.type === "file" && result.image && imageType(Buffer.from(result.image.data, "base64")) !== result.image.mimeType) {
+    throw new Error("Invalid file browser response");
+  }
+  return result;
 }
 
-/** The entries of `directory`, a real directory the caller confined to the worktree. */
+/**
+ * Where to read an open directory from. On Linux, the descriptor's own /proc path: what is read is what was opened,
+ * whatever the path names by then. Elsewhere (macOS hosts), the path itself, once it is checked to still name the
+ * directory that was opened.
+ */
+async function readablePath(directory: string, handle: FileHandle): Promise<{ path: string; check(): Promise<void> }> {
+  if (process.platform === "linux") return { path: `/proc/self/fd/${handle.fd}`, check: async () => {} };
+  const opened = await handle.stat({ bigint: true });
+  const check = async () => {
+    const now = await lstat(directory, { bigint: true });
+    if (!now.isDirectory() || now.dev !== opened.dev || now.ino !== opened.ino) throw new Error("directory changed while being read; retry the operation");
+  };
+  await check();
+  return { path: directory, check };
+}
+
+/**
+ * The entries of `directory`, which the caller confined to the worktree. It is opened once without following a symlink,
+ * and listed through that descriptor: a symlink swapped in after the caller's checks can't redirect the listing.
+ */
 export async function browseDirectory(directory: string): Promise<BrowseResult> {
-  const names = await readdir(directory);
-  if (names.length > MAX_LISTED) throw new Error("directory has too many entries");
-  const entries: FileEntry[] = [];
-  for (const name of names) {
-    let info;
-    try { info = await lstat(join(directory, name)); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-    const type: FileEntry["type"] = info.isDirectory() ? "directory" : info.isFile() ? "file" : info.isSymbolicLink() ? "symlink" : "other";
-    entries.push({ name, type, ...(type === "file" ? { size: info.size } : {}) });
+  const handle = await open(directory, DIRECTORY_FLAGS);
+  try {
+    const { path: opened, check } = await readablePath(directory, handle);
+    const names = await readdir(opened);
+    if (names.length > MAX_LISTED) throw new Error("directory has too many entries");
+    const entries: FileEntry[] = [];
+    for (const name of names) {
+      let info;
+      try { info = await lstat(`${opened}/${name}`); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      const type: FileEntry["type"] = info.isDirectory() ? "directory" : info.isFile() ? "file" : info.isSymbolicLink() ? "symlink" : "other";
+      entries.push({ name, type, ...(type === "file" ? { size: info.size } : {}) });
+    }
+    await check();
+    sortEntries(entries);
+    return { type: "directory", entries: entries.slice(0, fileBrowserLimits.entries), total: entries.length, truncated: entries.length > fileBrowserLimits.entries };
+  } finally {
+    await handle.close();
   }
-  sortEntries(entries);
-  return { type: "directory", entries: entries.slice(0, fileBrowserLimits.entries), total: entries.length, truncated: entries.length > fileBrowserLimits.entries };
 }
 
 /** A preview of `file`, which the caller confined to the worktree; opened without following a symlink. */

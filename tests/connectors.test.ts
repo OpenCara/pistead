@@ -2584,6 +2584,8 @@ test('the Files tab reads the session worktree through its host, for collaborato
   const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ';
   const requests = rpcHub(f, s.connector, envelope => {
     const { path } = JSON.parse(envelope.request.body) as { path: string };
+    if (path === 'huge') return Response.json({ files: { path, type: 'file', size: 300000, truncated: true, text: 'x'.repeat(300000) } });
+    if (path === 'other') return Response.json({ files: { path: 'elsewhere', type: 'file', size: 1, truncated: false, text: 'x' } });
     return Response.json({ files: path === '.'
       ? { path, type: 'directory', entries: [{ name: 'src', type: 'directory' }, { name: '.env', type: 'file', size: 60 }], total: 2, truncated: false }
       : { path, type: 'file', size: 60, truncated: false, text: `API_KEY=${secret}\n` } });
@@ -2607,12 +2609,19 @@ test('the Files tab reads the session worktree through its host, for collaborato
   assert.equal(preview.files.redacted, true);
   assert.ok(!preview.files.text.includes(secret));
 
+  // A host's answer is held to the runner's own limits, and must be for the path asked for.
+  await denied(await files('huge'), 502, 'invalid_runner_response');
+  await denied(await files('other'), 502, 'invalid_runner_response');
+
   // Only relative worktree paths reach the host.
   const before = requests.length;
   for (const path of ['/etc/passwd', '../outside', 'src/../../outside', 'a//b']) await denied(await files(path), 400, 'invalid_path');
   assert.equal(requests.length, before);
 
-  // Someone without a session role can't see the session at all; a viewer follows only the conversation; a collaborator browses.
+  // New sessions are workspace-visible: a workspace member follows the conversation, but doesn't browse its files.
+  await denied(await files('.', s.host), 403, 'forbidden');
+  // Private, they can't see the session at all; as a session viewer they follow only the conversation; a collaborator browses.
+  await json(await s.creator.request('PATCH', `/api/sessions/${s.session.id}`, { visibility: 'private' }));
   await denied(await files('.', s.host), 404, 'not_found');
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.host.user.id, role: 'viewer' }));
   await denied(await files('.', s.host), 403, 'forbidden');

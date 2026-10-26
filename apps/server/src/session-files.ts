@@ -1,14 +1,12 @@
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import { redactSecrets } from '../../../packages/shared/src/redaction.js';
-import { fileBrowserLimits, type FileEntry, type SessionFiles } from '../../../packages/shared/src/types.js';
+import { checkBrowseResult, InvalidBrowseResult, type BrowseResult } from '../../../packages/shared/src/file-browser.js';
+import type { SessionFiles } from '../../../packages/shared/src/types.js';
 import { requireSession } from './db.js';
 import { fail, identifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import type { Env, SessionRow, WorkerEnv } from './types.js';
-
-const imageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
-const entryTypes: readonly FileEntry['type'][] = ['directory', 'file', 'symlink', 'other'];
 
 /**
  * A worktree path as the file browser asks for it: relative, with no empty, `.` or `..` segment; the worktree's root is
@@ -31,36 +29,26 @@ async function fileBrowserSupported(env: Env, row: SessionRow): Promise<boolean>
   catch { return false; }
 }
 
-/** The host's answer, checked for shape before it reaches a browser; anything else is an invalid runner response. */
+/**
+ * The host's answer, checked by the same rules as the runner that read it (checkBrowseResult) before it reaches a
+ * browser, as the host isn't trusted to have run them; anything else is an invalid runner response.
+ */
 function checkedFiles(value: unknown, path: string): SessionFiles {
-  const invalid = (): never => fail(502, 'invalid_runner_response', 'The runner returned an invalid file listing.');
   const files = value as Record<string, unknown> | null;
-  if (!files || typeof files !== 'object' || files.path !== path) invalid();
-  const count = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0;
-  if (files!.type === 'directory') {
-    const { entries, total, truncated } = files!;
-    if (!Array.isArray(entries) || entries.length > fileBrowserLimits.entries || !count(total) || typeof truncated !== 'boolean') invalid();
-    return { path, type: 'directory', total: total as number, truncated: truncated as boolean, entries: (entries as unknown[]).map(item => {
-      const entry = item as Record<string, unknown> | null;
-      if (!entry || typeof entry.name !== 'string' || !entry.name || entry.name.includes('/') || !entryTypes.includes(entry.type as FileEntry['type'])
-        || (entry.size !== undefined && !count(entry.size))) invalid();
-      return { name: entry!.name as string, type: entry!.type as FileEntry['type'], ...(count(entry!.size) ? { size: entry!.size } : {}) };
-    }) };
+  let result: BrowseResult;
+  try {
+    if (!files || typeof files !== 'object' || files.path !== path) throw new InvalidBrowseResult();
+    result = checkBrowseResult(files);
+  } catch (error) {
+    if (error instanceof InvalidBrowseResult) fail(502, 'invalid_runner_response', 'The runner returned an invalid file listing.');
+    throw error;
   }
-  if (files!.type !== 'file' || !count(files!.size) || typeof files!.truncated !== 'boolean') invalid();
-  const base = { path, type: 'file' as const, size: files!.size as number, truncated: files!.truncated as boolean };
-  if (typeof files!.text === 'string') {
+  if (result.type === 'file' && result.text !== undefined) {
     // Like the transcript: what looks like a secret is hidden from everyone who views it.
-    const text = redactSecrets(files!.text);
-    return { ...base, text, ...(text !== files!.text ? { redacted: true } : {}) };
+    const text = redactSecrets(result.text);
+    return { path, ...result, text, ...(text !== result.text ? { redacted: true } : {}) };
   }
-  const image = files!.image as Record<string, unknown> | undefined;
-  if (image) {
-    if (typeof image.mimeType !== 'string' || !imageTypes.includes(image.mimeType) || typeof image.data !== 'string'
-      || image.data.length > Math.ceil(fileBrowserLimits.imageBytes / 3) * 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)) invalid();
-    return { ...base, image: { mimeType: image.mimeType as string, data: image.data as string } };
-  }
-  return { ...base, binary: true };
+  return { path, ...result };
 }
 
 export function registerSessionFiles(app: Hono<WorkerEnv>): void {
