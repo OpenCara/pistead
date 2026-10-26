@@ -56,7 +56,7 @@ And around them:
 | Concept | What it is |
 |---|---|
 | Workspace | A team's shared home: members, repositories, push access and sessions. Each member is its owner, an admin, a collaborator, a member or a viewer. |
-| Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It is private to the member who paired it until they share it with a workspace. |
+| Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It belongs to the member who paired it, not to a workspace: they can use it in every workspace they belong to, and it stays private to them until they share it with one. |
 | Model | A Pi model a host offers. Its credentials never leave the host. |
 | Agent | The Pi agent that works in a session, on the model it started from, with every tool its host supports. Each session has its own. |
 | Session | One agent conversation on one host, in its own worktree where the agent clones the workspace's repositories. It always runs as its owner. |
@@ -69,7 +69,7 @@ And around them:
 1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
 3. **Bind a repository**: **Settings → Workspaces →** your workspace **→ Repositories → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**.
-4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, choose the workspace, name the host and **Create pairing code**. Run the command it shows on the host and type the code at the hidden prompt:
+4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
    ```sh
    npx pistead@latest connect --server https://pistead.example.com --pairing-id PAIRING_ID
@@ -100,7 +100,7 @@ Pistead signs people in with GitHub only, and asks GitHub for the `read:user use
 
 Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
-Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Below the owner there are four tiers:
+Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Or they share an invite link instead (see [Invite links and pending members](#invite-links-and-pending-members)). Below the owner there are four tiers:
 
 - **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session role can't give a viewer more than session viewer (read).
 - **Member**: starts sessions, and follows other people's workspace-visible sessions read-only unless their owner grants more.
@@ -116,17 +116,28 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
 | Add, change or remove collaborators, members and viewers | ✓ | ✓ | | | |
+| Share the invite link, accept or decline pending members | ✓ | ✓ | | | |
 | Add, change or remove admins | ✓ | | | | |
 | Connect the session database, import dumps | ✓ | | | | |
 | Export the workspace | ✓ | ✓ | | | |
 
 Approving tool calls, and managing or opening someone else's private session, still take an explicit grant from the session's owner, whatever the role.
 
+#### Invite links and pending members
+
+Owners and admins can share one link to the workspace with anyone: **Members → Invite link → Create link**, then copy it. Whoever opens it signs in (if they haven't yet) and chooses **Ask to join**, which makes them a **pending member**. A pending member is not a member: they can't see or do anything in the workspace, and it doesn't appear in their sidebar. They show under **Members → Pending members**, where an owner or admin picks a role and chooses **Accept**, or **Decline**. Admins accept people with the roles below their own; only the owner can accept someone as an admin.
+
+- The link opens only for people signed in to this Pistead server, and shows them the workspace's name and nothing else. It never admits anyone by itself, so accept only people you recognize.
+- The link's token is in the URL's fragment, so opening it sends the token to neither the server's access logs nor a proxy's; the server keeps it only hashed and encrypted.
+- **Replace link** issues a new link and stops the old one at once; **Turn off link** stops it. People already waiting stay pending until someone decides.
+- A pending member can withdraw their request from the link's page, or under **Settings → Profile → Your requests to join**, which keeps working after the link is turned off or replaced. Adding someone with **Add member** also settles their pending request.
+- At most 200 people wait to join one workspace at a time. Requests count until someone accepts, declines or withdraws them, also after the link changes, so decline the ones you won't accept to make room.
+
 Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
 
 ### Repositories and Git accounts
 
-Sessions work on the repositories bound to their workspace. Until a workspace has one, nobody can pair a host into it, share a host with it or start a session in it.
+Sessions work on the repositories bound to their workspace. Until a workspace has one, nobody can share a host with it or start a session in it.
 
 Connect the accounts that can read your repositories under **Settings → Profile → Git accounts** (**Add account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
@@ -160,7 +171,7 @@ A host is a machine where you run the `pistead` connector next to [Pi](https://g
 
 #### Pairing
 
-1. In **Settings → Hosts**, choose **Pair a host**, pick the **Workspace** (it needs a bound repository) and a **Host name**, then **Create pairing code**.
+1. In **Settings → Hosts**, choose **Pair a host**, enter a **Host name**, then **Create pairing code**. A pairing names no workspace: the host is yours, and you can use it in every workspace you belong to, including ones you create or join later.
 2. On the host, run the command shown under **Run this on your host**:
 
    ```sh
@@ -177,7 +188,7 @@ npx pistead@latest connect
 
 Keep it running, for example in `tmux` or under your service manager: it reconnects by itself after network failures, and sessions on the host work only while it runs. Restart it after changing Pi's configuration, and run it with `@latest` to update it; newer features need a newer connector, and the web app says when a host's is too old.
 
-To pair a machine again (after revoking its host, or to move it to another workspace or server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
+To pair a machine again (after revoking its host, or to move it to another server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
 
 An offline host's page in **Settings → Hosts** has **Reconnect**, which shows the command to restart its saved connection on that machine (Pistead can't start it remotely), or **Pair again** once it's revoked. **Remove permanently** (owner only) takes a host off the list for good: it revokes its credentials, stops sharing it, and marks its models unavailable. Its sessions and their history stay, but can't run again, and nothing on the machine is deleted; pair it as a new host to use it again.
 
@@ -196,7 +207,7 @@ The connector reads these when it starts; restart it after changing them.
 
 #### Sharing a host
 
-A paired host is private: only you can start sessions on it. Under **Settings → Hosts →** the host **→ Sharing**, **Share** it with a workspace you belong to (one with a bound repository) to let its members run their own sessions on it; **Unshare** stops that at once.
+A paired host is private: only you can start sessions on it, in any of your workspaces. Under **Settings → Hosts →** the host **→ Sharing**, **Share** it with a workspace you belong to (one with a bound repository) to let its members run their own sessions on it; **Unshare** stops that at once.
 
 This is how a team shares one model subscription or set of API keys. Sign Pi in once on one machine and share that machine, and everyone in the workspace can pick its models when they start a session. The provider's credentials stay on that machine, and teammates never see or copy them. Revoking the host or unsharing it cuts everyone off at once. Check that your provider's terms allow sharing your plan this way.
 

@@ -9,7 +9,9 @@ export type Route =
   | { name: "session"; sessionId: string }
   | { name: "settings"; section: SettingsSection; id?: string }
   /** A session's share link: the token lives in the fragment, so opening the link never sends it to the server. */
-  | { name: "shared"; token: string };
+  | { name: "shared"; token: string }
+  /** A workspace's invite link, also with its token in the fragment: a signed-in visitor can ask to join. */
+  | { name: "join"; token: string };
 
 const sections: readonly SettingsSection[] = ["profile", "appearance", "hosts", "workspaces", "admin"];
 
@@ -24,6 +26,7 @@ export function parseRoute(hash: string): Route {
   if (head === "s" && decode(first)) return { name: "session", sessionId: decode(first)! };
   if (head === "sessions") return { name: "sessions" };
   if (head === "shared" && decode(first)) return { name: "shared", token: decode(first)! };
+  if (head === "join" && decode(first)) return { name: "join", token: decode(first)! };
   if (head === "w" && decode(first) && second === "new") return { name: "new", workspaceId: decode(first)! };
   if (head === "settings") {
     const section = sections.find(item => item === first) ?? "profile";
@@ -41,6 +44,7 @@ export function href(route: Route): string {
     case "session": return `#/s/${encodeURIComponent(route.sessionId)}`;
     case "settings": return `#/settings/${route.section}${route.id ? `/${encodeURIComponent(route.id)}` : ""}`;
     case "shared": return `#/shared/${encodeURIComponent(route.token)}`;
+    case "join": return `#/join/${encodeURIComponent(route.token)}`;
   }
 }
 

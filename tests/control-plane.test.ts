@@ -677,6 +677,38 @@ test('workspace roles: viewers read and create nothing, members read, collaborat
   assert.deepEqual(await held(collaborator, 'roles-shared'), ['read']);
   assert.equal((f.sqlite.prepare("SELECT policy_version FROM sessions WHERE id = 'roles-shared'").get() as { policy_version: number }).policy_version, before + 1);
   assert.equal((await admin.request('DELETE', `${members}/${other.user.id}`)).status, 204);
+
+  // PATCH changes an existing member's role, under the same authority, and never adds anyone.
+  const change = (client: typeof admin, userId: string, body: unknown) => client.request('PATCH', `${members}/${userId}`, body);
+  const patchedBefore = version();
+  const patched = await change(admin, collaborator.user.id, { role: 'viewer' });
+  assert.equal(patched.status, 200);
+  assert.ok((await patched.json() as { members: { userId: string; role: string }[] }).members.some(item => item.userId === collaborator.user.id && item.role === 'viewer'));
+  assert.equal(version(), patchedBefore + 1);
+  assert.deepEqual(await held(collaborator, 'roles-shared'), ['read']);
+  const audited = f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'workspace.member.role' ORDER BY created_at DESC LIMIT 1").get() as { detail_json: string };
+  assert.deepEqual(JSON.parse(audited.detail_json), { userId: collaborator.user.id, from: 'member', role: 'viewer' });
+  // The same role again changes nothing.
+  assert.equal((await change(admin, collaborator.user.id, { role: 'viewer' })).status, 200);
+  assert.equal(version(), patchedBefore + 1);
+  assert.equal((await change(admin, collaborator.user.id, { role: 'collaborator' })).status, 200);
+  // A removed or never-added user isn't re-added.
+  assert.equal((await change(admin, other.user.id, { role: 'member' })).status, 404);
+  assert.equal(f.sqlite.prepare('SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?').get(workspace.id, other.user.id), undefined);
+  // Admins can't make or unmake admins, change themselves or the owner; non-admins change nothing.
+  assert.equal((await change(admin, collaborator.user.id, { role: 'admin' })).status, 403);
+  const self = await change(admin, admin.user.id, { role: 'member' });
+  assert.equal(self.status, 403);
+  assert.match((await self.json() as { error: string }).error, /their own membership/);
+  assert.equal((await change(admin, owner.user.id, { role: 'member' })).status, 403);
+  assert.equal((await change(collaborator, member.user.id, { role: 'viewer' })).status, 403);
+  for (const body of [{ role: 'owner' }, { role: 1 }, {}, { role: 'member', userId: member.user.id }]) {
+    assert.equal((await change(owner, member.user.id, body)).status, 400);
+  }
+  assert.equal((await change(owner, owner.user.id, { role: 'admin' })).status, 403);
+  // The owner promotes and demotes admins.
+  assert.equal((await change(owner, collaborator.user.id, { role: 'admin' })).status, 200);
+  assert.equal((await change(owner, collaborator.user.id, { role: 'collaborator' })).status, 200);
   assert.equal((await owner.request('POST', members, { userId: admin.user.id, role: 'collaborator' })).status, 200);
 });
 

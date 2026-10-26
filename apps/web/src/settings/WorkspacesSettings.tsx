@@ -9,7 +9,8 @@ import { Icon } from "../icons";
 import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
 import { gitAccountLabel, gitProviderLabel, RepositoryClonePolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
-import { Alert, Button, CardBody, Combobox, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
+import { Alert, Button, CardBody, Combobox, CopyField, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, RelativeTime, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
+import type { WorkspaceInviteLink, WorkspaceJoinRequest } from "../../../../packages/shared/src/invites";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
 import { NetworkAccess } from "./NetworkAccess";
 import { PushAccess } from "./PushAccess";
@@ -152,7 +153,7 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
       <div className="card">
         <ResourceState loading={loading} error={error} retry={refresh}>
           {!repositories?.length
-            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to pair a host and start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
+            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
             : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<>{gitProviderLabel(repository.provider, repository.host)} · <code>{repository.ref}</code></>} trailing={<>
               <label className="inline small"><input type="checkbox" className="checkbox" checked={!repository.forbidDefaultBranchPush} disabled={!admin || action.busy} onChange={event => setPushPolicy(repository, event.target.checked)} />Allow agent pushes to the default branch</label>
               <label className="inline small" title="Sessions download this repository's Git LFS files instead of checking out pointer files"><input type="checkbox" className="checkbox" checked={repository.lfs} disabled={!admin || action.busy} onChange={event => setLfs(repository, event.target.checked)} />Git LFS</label>
@@ -237,6 +238,7 @@ function Members({ workspace, admin, owner }: { workspace: Workspace; admin: boo
   const path = `/api/workspaces/${segment(workspace.id)}/members`;
   const resource = useResource<{ members: WorkspaceMember[] }>(path);
   const [adding, setAdding] = useState(false);
+  const [changing, setChanging] = useState<WorkspaceMember | null>(null);
   const action = useAction();
   async function remove(member: WorkspaceMember) {
     const confirmed = await confirmDialog({ title: "Remove member", message: `Remove ${usernameWithId(memberPerson(member))} from this workspace?`, confirmLabel: "Remove", destructive: true });
@@ -267,21 +269,150 @@ function Members({ workspace, admin, owner }: { workspace: Workspace; admin: boo
             const name = member.displayName || username(person);
             return <Row key={member.userId} leading={<IdentityBadge name={name} id={member.userId} />} title={name} hint={usernameWithId(person)} trailing={<>
               <StatusBadge tone={member.role === "owner" || member.role === "admin" ? "success" : "neutral"}>{roleLabel[member.role]}</StatusBadge>
-              {admin && member.userId !== workspace.ownerId && (owner || adminManagedRoles.includes(member.role)) && <DropdownMenu label={`Actions for ${name}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
+              {admin && member.userId !== workspace.ownerId && (owner || adminManagedRoles.includes(member.role)) && <DropdownMenu label={`Actions for ${name}`} items={[
+                { label: "Change role", icon: "shield", disabled: action.busy, onSelect: () => setChanging(member) },
+                { label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) },
+              ]} />}
             </>} />;
           })}
         {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
       </ResourceState>
     </Section>
+    {admin && <InviteLink workspace={workspace} />}
+    {admin && <PendingMembers workspace={workspace} owner={owner} accepted={resource.refresh} />}
     {admin && <AddMember open={adding} path={path} owner={owner} close={() => setAdding(false)} saved={resource.refresh} />}
+    {admin && changing && <ChangeRole key={changing.userId} member={changing} path={path} owner={owner} close={() => setChanging(null)} saved={resource.refresh} />}
   </>;
+}
+
+/** The workspace's invite link: anyone signed in who opens it can ask to join, and waits as a pending member. */
+function InviteLink({ workspace }: { workspace: Workspace }) {
+  const path = `/api/workspaces/${segment(workspace.id)}/invite-link`;
+  const resource = useResource<{ link: WorkspaceInviteLink | null }>(path);
+  const action = useAction();
+  const link = resource.data?.link;
+  function create() {
+    if (action.busy) return;
+    void action.run(async () => {
+      resource.setData(await api<{ link: WorkspaceInviteLink }>(path, { method: "PUT" }));
+    }, "Invite link created. Share it with the people you want to invite.");
+  }
+  async function turnOff(replace: boolean) {
+    if (action.busy) return;
+    const confirmed = await confirmDialog(replace
+      ? { title: "Replace the invite link?", message: "The current link stops working at once, and a new one replaces it. People already waiting to join stay pending.", confirmLabel: "Replace link", destructive: true }
+      : { title: "Turn off the invite link?", message: "The link stops working at once, for everyone who has it. People already waiting to join stay pending until you accept or decline them. Turning the link on again creates a new link.", confirmLabel: "Turn off link", destructive: true });
+    if (!confirmed) return;
+    void action.run(async () => {
+      await api(path, { method: "DELETE" });
+      resource.setData(replace ? await api<{ link: WorkspaceInviteLink }>(path, { method: "PUT" }) : { link: null });
+    }, replace ? "Invite link replaced. The old link no longer works." : "Invite link turned off.");
+  }
+  return <Section title="Invite link" info={<div className="stack">
+    <p>Share this link with anyone. When someone signed in to this Pistead server opens it, they can ask to join, and appear under <strong>Pending members</strong>.</p>
+    <p>A pending member can't see or do anything in the workspace until an owner or admin accepts them with a role. Anyone with the link can ask, so only accept people you recognize.</p>
+  </div>} action={link
+    ? <DropdownMenu label="Invite link actions" items={[
+      { label: "Replace link", icon: "refresh", disabled: action.busy, onSelect: () => void turnOff(true) },
+      { label: "Turn off link", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void turnOff(false) },
+    ]} />
+    : resource.data && <Button variant="outline" size="sm" icon="plus" disabled={action.busy} onClick={create}>Create link</Button>}>
+    <ResourceState {...resource} retry={resource.refresh}>
+      {link
+        ? <CardBody><Field label="Invite link" hint={<>Created <RelativeTime value={link.createdAt} />. Anyone who opens it can ask to join</>}><CopyField value={link.url} label="Copy invite link" /></Field></CardBody>
+        : <CardBody><span className="muted">No invite link. Create one to let people ask to join</span></CardBody>}
+      {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+    </ResourceState>
+  </Section>;
+}
+
+/** People who asked to join through the invite link, waiting for an owner or admin to accept them with a role. */
+function PendingMembers({ workspace, owner, accepted }: { workspace: Workspace; owner: boolean; accepted: () => void }) {
+  const path = `/api/workspaces/${segment(workspace.id)}/join-requests`;
+  const resource = useResource<{ requests: WorkspaceJoinRequest[] }>(path);
+  const action = useAction();
+  const [roles, setRoles] = useState<Record<string, AssignableWorkspaceRole>>({});
+  const assignable = assignableRoles(owner);
+  const requests = resource.data?.requests ?? [];
+  function accept(request: WorkspaceJoinRequest, name: string) {
+    if (action.busy) return;
+    const role = roles[request.userId] ?? "member";
+    void action.run(async () => {
+      resource.setData(await api<{ requests: WorkspaceJoinRequest[] }>(`${path}/${segment(request.userId)}/accept`, { method: "POST", body: { role } }));
+      accepted();
+    }, `${name} joined as ${roleLabel[role].toLowerCase()}.`);
+  }
+  async function decline(request: WorkspaceJoinRequest, name: string) {
+    if (action.busy) return;
+    const confirmed = await confirmDialog({ title: "Decline request", message: `Decline ${name}'s request to join? They can ask again while they have a working invite link.`, confirmLabel: "Decline", destructive: true });
+    if (!confirmed) return;
+    void action.run(async () => {
+      resource.setData(await api<{ requests: WorkspaceJoinRequest[] }>(`${path}/${segment(request.userId)}`, { method: "DELETE" }));
+    }, "Request declined.");
+  }
+  return <Section title="Pending members" info={<p>People who asked to join through the invite link. Choose a role and accept them, or decline. Until then they can't see or do anything in the workspace.</p>}
+    action={<Button variant="ghost" size="sm" icon="refresh" aria-label="Refresh pending members" disabled={resource.loading} onClick={resource.refresh} />}>
+    <ResourceState {...resource} retry={resource.refresh}>
+      {!requests.length
+        ? <CardBody><span className="muted">Nobody is waiting to join</span></CardBody>
+        : requests.map(request => {
+          const person = memberPerson({ ...request, role: "member" });
+          const name = request.displayName || username(person);
+          const role = roles[request.userId] ?? "member";
+          return <Row key={request.userId} leading={<IdentityBadge name={name} id={request.userId} />} title={name}
+            hint={<>{usernameWithId(person)} · asked <RelativeTime value={request.createdAt} /></>} trailing={<>
+              <select className="select" aria-label={`Role for ${name}`} value={role} disabled={action.busy} title={roleHint[role]}
+                onChange={event => setRoles(current => ({ ...current, [request.userId]: event.target.value as AssignableWorkspaceRole }))}>
+                {assignable.map(item => <option key={item} value={item}>{roleLabel[item]}</option>)}
+              </select>
+              <Button variant="outline" size="sm" disabled={action.busy} onClick={() => accept(request, name)}>Accept</Button>
+              <Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Decline ${name}`} onClick={() => void decline(request, name)}>Decline</Button>
+            </>} />;
+        })}
+      {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+    </ResourceState>
+  </Section>;
+}
+
+/** Roles the actor may assign: admins the roles below their own; only the owner makes someone an admin. */
+function assignableRoles(owner: boolean): AssignableWorkspaceRole[] {
+  return assignableWorkspaceRoles.filter(item => owner || adminManagedRoles.includes(item));
+}
+
+function ChangeRole({ member, path, owner, close, saved }: { member: WorkspaceMember; path: string; owner: boolean; close: () => void; saved: () => void }) {
+  const current = member.role === "owner" ? null : member.role;
+  const [role, setRole] = useState<AssignableWorkspaceRole>(current ?? "member");
+  const roles = assignableRoles(owner);
+  const action = useAction();
+  const name = member.displayName || username(memberPerson(member));
+  function save(event: FormEvent) {
+    event.preventDefault();
+    if (action.busy || role === current) return;
+    void action.run(async () => {
+      await api(`${path}/${segment(member.userId)}`, { method: "PATCH", body: { role } });
+      saved();
+      close();
+    });
+  }
+  return <Sheet open title={`Change role of ${name}`} onClose={() => { if (!action.busy) close(); }} footer={<>
+    <Button disabled={action.busy} onClick={close}>Cancel</Button>
+    <Button variant="default" type="submit" form="change-role-form" disabled={action.busy || role === current}>{action.busy ? "Saving..." : "Save"}</Button>
+  </>}>
+    <form id="change-role-form" className="stack" onSubmit={save}>
+      <Field label="Role" hint={`${roleHint[role]}. Takes effect at once, in their open sessions too`}>
+        <select className="select" autoFocus value={role} onChange={event => setRole(event.target.value as AssignableWorkspaceRole)}>
+          {roles.map(item => <option key={item} value={item}>{roleLabel[item]}{item === current ? " (current)" : ""}</option>)}
+        </select>
+      </Field>
+      <Feedback error={action.error} />
+    </form>
+  </Sheet>;
 }
 
 function AddMember({ open, path, owner, close, saved }: { open: boolean; path: string; owner: boolean; close: () => void; saved: () => void }) {
   const [userId, setUserId] = useState("");
   const [role, setRole] = useState<AssignableWorkspaceRole>("member");
-  // Admins assign the roles below their own; only the owner makes someone an admin.
-  const roles = assignableWorkspaceRoles.filter(item => owner || adminManagedRoles.includes(item));
+  const roles = assignableRoles(owner);
   const action = useAction();
   function save(event: FormEvent) {
     event.preventDefault();
@@ -299,7 +430,7 @@ function AddMember({ open, path, owner, close, saved }: { open: boolean; path: s
     <Button variant="default" type="submit" form="add-member-form" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save"}</Button>
   </>}>
     <form id="add-member-form" className="stack" onSubmit={save}>
-      <Field label="User ID" hint="Copy it from their profile. Saving an existing member updates their role">
+      <Field label="User ID" hint="Copy it from their profile. To change an existing member's role, use Change role in their menu">
         <input className="input" required autoFocus value={userId} onChange={event => setUserId(event.target.value)} placeholder="User ID" autoComplete="off" spellCheck={false} />
       </Field>
       <Field label="Role" hint={roleHint[role]}>

@@ -5,6 +5,7 @@ import { useApp } from "../app-context";
 import { Button, CardBody, CopyButton, Feedback, Field, Row, Section, useAction } from "../ui";
 import { usernameWithId } from "../../../../packages/client/src/usernames";
 import { GitAccountsSection } from "./GitAccounts";
+import { OwnJoinRequests } from "../JoinWorkspaceScreen";
 import { SignedInAppsSection } from "./SignedInApps";
 import "./settings.css";
 
@@ -59,6 +60,7 @@ export function ProfileSettings() {
     </form>
     <GitAccountsSection />
     <SignedInAppsSection />
+    <OwnJoinRequests />
     <Section title="Account">
       <Row title="User ID" hint={<code>{usernameWithId(user)}</code>} trailing={<CopyButton value={user.id} label="Copy user ID" />} />
       <Row title="Sign out" trailing={<Button variant="outline" size="sm" onClick={signOut}>Sign out</Button>} />

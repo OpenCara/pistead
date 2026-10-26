@@ -7,6 +7,7 @@ import { auditAfterChange, auditStatement, modelDefinition, requireMember } from
 import { fail, id, identifier, jsonObject, now, testMode, text, userIdentifier } from './http.js';
 import type { AgentRow, Env, ModelRow, WorkerEnv } from './types.js';
 import { ConstraintError, type Query } from './db/types.js';
+import { ownerHostStatements } from './connectors.js';
 
 interface SafeMember {
   userId: string;
@@ -62,6 +63,9 @@ async function requireMemberManagement(
   }
   if (targetId === authority.ownerId || authority.targetRole === 'owner') {
     fail(403, 'forbidden', 'The workspace owner membership cannot be changed or removed.');
+  }
+  if (!owner && targetId === actorId) {
+    fail(403, 'forbidden', 'Administrators cannot change or remove their own membership. Ask the workspace owner.');
   }
   // Admins manage collaborators, members and viewers; only the owner assigns, changes or removes an admin.
   if (!owner && ((role && !adminManagedRoles.includes(role)) || (authority.targetRole && !adminManagedRoles.includes(authority.targetRole)))) {
@@ -214,6 +218,8 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
       c.env.DB.query<never>("INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)")
         .bind(workspace.id, workspace.ownerId, createdAt),
       auditStatement(c.env, workspace.ownerId, 'workspace.create', workspace.id),
+      // The creator's hosts are theirs wherever they work: connect them here, privately.
+      ...ownerHostStatements(c.env, workspace.ownerId, workspace.id),
     ]);
     return c.json({ workspace }, 201);
   });
@@ -261,6 +267,47 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         WHERE workspace_id = ? AND ? = 1 AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
         .bind(workspaceId, previous ? 1 : 0, auditId),
       membersStatement(c.env, workspaceId, actorId),
+      // Someone added directly no longer waits to join through the invite link.
+      c.env.DB.query<never>(`DELETE FROM workspace_join_requests WHERE workspace_id = ? AND user_id = ?
+        AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, targetId, auditId),
+      // A member's own hosts follow them into the workspace, for their private use only: sharing stays the owner's choice.
+      ...ownerHostStatements(c.env, targetId, workspaceId),
+    ]);
+    if (result[0].changes !== 1) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');
+    return c.json({ members: result[3].results });
+  });
+
+  // Changes an existing member's role, never adds one: a change racing the member's removal fails rather than re-adding them.
+  app.patch('/api/workspaces/:id/members/:userId', async c => {
+    const workspaceId = identifier(c.req.param('id'), 'workspaceId');
+    const targetId = userIdentifier(c.req.param('userId'));
+    const actorId = c.get('auth').userId;
+    const body = await jsonObject(c);
+    onlyFields(body, ['role']);
+    const role = body.role;
+    if (typeof role !== 'string' || !(assignableWorkspaceRoles as readonly string[]).includes(role)) fail(400, 'invalid_input', 'Invalid role.');
+    const previous = await requireMemberManagement(c.env, workspaceId, actorId, targetId, role as AssignableWorkspaceRole);
+    if (!previous) fail(404, 'not_found', 'Membership not found.');
+    if (previous === role) return c.json({ members: await membersStatement(c.env, workspaceId, actorId).all() });
+    const managed = adminManagedRoles.map(item => `'${item}'`).join(', ');
+    const auditId = id();
+    const result = await c.env.DB.batch<SafeMember>([
+      c.env.DB.query<never>(`UPDATE workspace_members SET role = ?
+        WHERE workspace_id = ? AND user_id = ? AND role = ? AND role <> 'owner'
+          AND EXISTS (SELECT 1 FROM workspaces w
+            INNER JOIN workspace_members actor ON actor.workspace_id = w.id AND actor.user_id = ?
+            WHERE w.id = workspace_members.workspace_id AND w.owner_id <> workspace_members.user_id
+              AND ((actor.role = 'owner' AND actor.user_id = w.owner_id)
+                OR (actor.role = 'admin' AND ? IN (${managed}) AND workspace_members.role IN (${managed}))))`)
+        // Only from the role authorized above: a concurrent change or removal leaves no row changed.
+        .bind(role, workspaceId, targetId, previous, actorId, role),
+      auditAfterChange(c.env, actorId, 'workspace.member.role', workspaceId, { userId: targetId, from: previous, role }, auditId),
+      // Tickets and capabilities issued under the previous role no longer hold.
+      c.env.DB.query<never>(`UPDATE sessions SET policy_version = policy_version + 1
+        WHERE workspace_id = ? AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, auditId),
+      membersStatement(c.env, workspaceId, actorId),
     ]);
     if (result[0].changes !== 1) fail(409, 'membership_changed', 'Membership changed. Refresh and try again.');
     return c.json({ members: result[3].results });
@@ -290,6 +337,11 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
         .bind(targetId, workspaceId, auditId),
       // A former member's confirmation of the workspace database doesn't outlive the membership.
       c.env.DB.query(`DELETE FROM workspace_database_consents WHERE workspace_id = ? AND user_id = ?
+        AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
+        .bind(workspaceId, targetId, auditId),
+      // Their hosts leave with them: the private connection doesn't outlive the membership (joining again restores it).
+      c.env.DB.query(`DELETE FROM connector_workspaces WHERE workspace_id = ?
+        AND connector_id IN (SELECT id FROM connectors WHERE owner_id = ?)
         AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`)
         .bind(workspaceId, targetId, auditId),
       c.env.DB.query(`UPDATE sessions SET policy_version = policy_version + 1
