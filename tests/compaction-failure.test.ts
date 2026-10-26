@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compactionFailure } from "../apps/runner/src/compaction.js";
+import { compactionFailure, hostCompaction, reasoningReserveTokens } from "../apps/runner/src/compaction.js";
 import { sharedView } from "../apps/server/src/session-links.js";
 import { compactionFailureText } from "../packages/client/src/compaction.js";
 import type { SessionView } from "../packages/shared/src/types.js";
@@ -39,4 +39,31 @@ test("a share link keeps a known compaction failure and drops anything else in i
     { provider: "anthropic", modelId: "m", compaction: "token_limit" },
     { provider: "anthropic" },
   ]);
+});
+
+test("a reasoning model keeps a tenth of its window for compaction, between Pi's 16K and 64K", () => {
+  assert.equal(reasoningReserveTokens({ reasoning: true, contextWindow: 1_000_000 }), 65_536);
+  assert.equal(reasoningReserveTokens({ reasoning: true, contextWindow: 400_000 }), 40_000);
+  assert.equal(reasoningReserveTokens({ reasoning: true, contextWindow: 200_000 }), 20_000);
+  assert.equal(reasoningReserveTokens({ reasoning: true, contextWindow: 128_000 }), undefined, "Pi's own default is already more");
+  assert.equal(reasoningReserveTokens({ reasoning: false, contextWindow: 1_000_000 }), undefined);
+  assert.equal(reasoningReserveTokens({ reasoning: true, contextWindow: 0 }), undefined);
+});
+
+test("the host's own compaction settings win over the reasoning default", () => {
+  const models = [
+    { provider: "anthropic", id: "opus", reasoning: true, contextWindow: 1_000_000 },
+    { provider: "anthropic", id: "sonnet", reasoning: true, contextWindow: 200_000 },
+    { provider: "openai", id: "plain", reasoning: false, contextWindow: 1_000_000 },
+  ];
+  assert.deepEqual(hostCompaction(undefined, models), { modelOverrides: { "anthropic/opus": { reserveTokens: 65_536 }, "anthropic/sonnet": { reserveTokens: 20_000 } } });
+  assert.equal(hostCompaction(undefined, [models[2]!]), undefined, "nothing to change for a host without reasoning models");
+  // A harness-wide reserveTokens is the owner's choice for every model.
+  const overall = { reserveTokens: 16_384 };
+  assert.equal(hostCompaction(overall, models), overall);
+  // A model's own override keeps its reserveTokens; its other fields join the default.
+  assert.deepEqual(hostCompaction({ enabled: true, modelOverrides: { "anthropic/opus": { reserveTokens: 16_384 }, "anthropic/sonnet": { keepRecentTokens: 1000 } } }, models), {
+    enabled: true,
+    modelOverrides: { "anthropic/opus": { reserveTokens: 16_384 }, "anthropic/sonnet": { reserveTokens: 20_000, keepRecentTokens: 1000 } },
+  });
 });

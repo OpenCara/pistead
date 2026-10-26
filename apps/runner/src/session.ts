@@ -28,7 +28,7 @@ import type { RepositoryPreparationItem, RepositoryPreparationView } from "../..
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
-import { compactionFailure } from "./compaction.js";
+import { compactionFailure, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
@@ -133,7 +133,7 @@ export type RunnerConfig = {
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
-  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them. */
+  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them, but for reasoning models' room (see hostCompaction). */
   compaction?: CompactionSettings;
   /** How the host's Pi identifies its requests to providers; pi-durable's default (attributed to pi) without it. */
   identity?: ClientIdentity;
@@ -663,10 +663,12 @@ export class RunnerSession {
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
     this.models = resolved.models;
     const models = this.models;
+    // Reasoning models keep more room for their compaction summary than Pi's default, unless the host's Pi says otherwise.
+    const compaction = hostCompaction(this.config.compaction, models.getModels());
     const storage = await this.openStorage();
     try {
       this.harness = await Harness.open(storage, { models, registry,
-        ...(this.config.compaction ? { settings: { compaction: this.config.compaction } } : {}),
+        ...(compaction ? { settings: { compaction } } : {}),
         ...(this.config.identity ? { identity: this.config.identity } : {}) }, context);
     }
     catch (error) { await storage.close(context); throw error; }
