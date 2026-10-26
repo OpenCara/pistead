@@ -11,6 +11,7 @@ import { githubComment, githubIssue, githubMerge, githubRead } from './github-br
 import { legacyRestoreDownload } from './restore-routes.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { egressGrant, gitRelay } from './network.js';
+import { hostCommandAuthority } from './host-access.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   const configured = c.env.RUNNER_SHARED_SECRET;
@@ -44,7 +45,11 @@ export async function authorizeSession(c: AppContext, connectorId: string | null
     if (!permissions.includes(input.permission as Permission)) fail(400, 'invalid_permission', 'Invalid permission.');
     const access = await sessionAccess(c.env, sessionId, actorId);
     if (access) await requireCallbackScope(c, access.row, connectorId);
+    if (input.host !== undefined && input.host !== true) fail(400, 'invalid_authorization', 'Invalid authorization request.');
     const allowed = !!access && access.row.owner_id === ownerId && access.row.status !== 'archived' && hasPermission(access.permissions, input.permission as Permission);
     const result: AuthorizationResult = { allowed, policyVersion: access?.row.policy_version ?? 0, ownerId: access?.row.owner_id ?? '' };
+    // The host's owner holds every level; to the runner, that is `auto`.
+    const host = allowed && input.host === true ? await hostCommandAuthority(c.env, access!.row, actorId) : undefined;
+    if (host) result.hostCommands = host === 'owner' ? 'auto' : host;
     return c.json(result);
 }

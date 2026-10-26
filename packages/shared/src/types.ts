@@ -175,11 +175,22 @@ export interface AuthorizationRequest {
   actorId: string;
   permission: Permission;
   ownerId: string;
+  /** Also report the actor's authority over host commands on the session's host (`hostCommands`). */
+  host?: boolean;
 }
+/**
+ * What a member may do with host_bash on a host: `approve` decides each host command; `auto` also runs the host
+ * commands of their own Auto-approve messages without asking. The host's owner holds `auto`; anyone else holds what the
+ * host's owner or one of its admins granted them (see HostCommandGrant).
+ */
+export const hostCommandLevels = ["approve", "auto"] as const;
+export type HostCommandLevel = (typeof hostCommandLevels)[number];
 export interface AuthorizationResult {
   allowed: boolean;
   policyVersion: number;
   ownerId: string;
+  /** Present only when requested (`host`) and the actor holds some authority over the session's host commands. */
+  hostCommands?: HostCommandLevel;
 }
 /** A pull request the control plane opens as the session owner after a successful push. `base` defaults to the default branch. */
 export interface PullRequestRequest {
@@ -247,22 +258,26 @@ export interface GitHubIssueOperation {
   title: string;
   body: string;
 }
-/** Runner -> control plane: open one human-approved issue with the capability minted when it was approved. */
-export interface GitHubIssueRequest {
+/**
+ * How a GitHub effect is authorized: `capability`, minted when a human approved it, or `admissionId`, the session owner's
+ * Auto-approve message whose tool call it is (merges also need that message's `autoMerge`). Exactly one is set.
+ */
+export type GitHubEffectAuthority = { capability: string; admissionId?: undefined } | { admissionId: string; capability?: undefined };
+/** Runner -> control plane: open one issue, human-approved or under the owner's Auto-approve. */
+export type GitHubIssueRequest = GitHubEffectAuthority & {
   sessionId: string;
   actorId: string;
   approvalId: string;
-  capability: string;
   repository: string;
   title: string;
   body: string;
-}
+};
 /** The issue GitHub opened: its number and page. */
 export interface GitHubIssueResult {
   number: number;
   url: string;
 }
-/** Runs outside isolation as the connector user; only the host owner may approve. */
+/** Runs outside isolation as the connector user; only the host owner, or a member they granted host commands to, may approve. */
 export interface HostCommandOperation {
   kind: "host.bash";
   command: string;
@@ -308,17 +323,25 @@ export interface GitHubReadRequest {
   repository: string;
   issue: number;
 }
-/** Runner -> control plane: perform one human-approved merge with the capability minted when it was approved. */
-export interface GitHubMergeRequest {
+/** Runner -> control plane: perform one merge, human-approved or under the owner's Auto-approve with auto-merge. */
+export type GitHubMergeRequest = GitHubEffectAuthority & {
   sessionId: string;
   actorId: string;
   approvalId: string;
-  capability: string;
   repository: string;
   pull: number;
   sha: string;
   method: GitHubMergeMethod;
-}
+};
+/** Runner -> control plane: post one comment, human-approved or under the owner's Auto-approve. */
+export type GitHubCommentRequest = GitHubEffectAuthority & {
+  sessionId: string;
+  actorId: string;
+  approvalId: string;
+  repository: string;
+  issue: number;
+  body: string;
+};
 /** `sha` is the commit the merge created on the base branch; `url` the pull request. */
 export interface GitHubMergeResult {
   sha: string;
@@ -594,7 +617,10 @@ export interface SessionView {
 }
 export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof thinkingLevels)[number];
-/** read: inspect only, no edits or commands. approval: every command and commit needs a human decision. auto: the owner's commands and commits run immediately. */
+/**
+ * read: inspect only, no edits or commands. approval: every command and commit needs a human decision. auto: the owner's
+ * commands, commits, pushes, GitHub comments and issues run immediately (merges too with `autoMerge`).
+ */
 export const accessModes = ["read", "approval", "auto"] as const;
 export type AccessMode = (typeof accessModes)[number];
 /** Per-message choices. Omitted model/thinkingLevel keep the conversation's current ones; omitted access means "approval". */
@@ -602,6 +628,11 @@ export interface ChatOptions {
   model?: { provider: string; modelId: string };
   thinkingLevel?: ThinkingLevel;
   access?: AccessMode;
+  /**
+   * With `access` auto only: the agent's GitHub merges run without asking too. A separate opt-in, since a merge changes
+   * a shared branch. Only hosts with `automaticGitHub` take it.
+   */
+  autoMerge?: boolean;
 }
 export interface SubmitInput {
   /** May be empty only when the message carries images. */

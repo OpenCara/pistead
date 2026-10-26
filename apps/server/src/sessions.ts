@@ -21,6 +21,7 @@ import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
+import { mayDecideHostCommands } from './host-access.js';
 import { invalidateSessionView, sessionView, viewChanges } from './view-feed.js';
 
 /**
@@ -31,7 +32,7 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
   if (value === undefined) return undefined;
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400, 'invalid_options', 'Invalid chat options.');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !['model', 'thinkingLevel', 'access'].includes(key))) fail(400, 'invalid_options', 'Invalid chat options.');
+  if (Object.keys(input).some(key => !['model', 'thinkingLevel', 'access', 'autoMerge'].includes(key))) fail(400, 'invalid_options', 'Invalid chat options.');
   if (!Object.keys(input).length) return undefined;
   if (!row.connector_id) fail(400, 'options_unsupported', 'This session\'s runner cannot change model, reasoning or access.');
   const host = await c.env.DB.query<{ models_json: string; capabilities_json: string }>('SELECT models_json, capabilities_json FROM connectors WHERE id = ? AND revoked_at IS NULL')
@@ -61,6 +62,18 @@ async function chatOptions(c: AppContext, row: SessionRow, mode: 'submit' | 'ask
     if (mode !== 'submit' || !accessModes.includes(input.access as never)) fail(400, 'invalid_options', 'Side asks are always read-only.');
     if (input.access === 'auto' && c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can auto-approve commands.');
     options.access = input.access as ChatOptions['access'];
+  }
+  // Auto-merge is a separate opt-in on top of the owner's Auto-approve, which only connectors that run GitHub effects
+  // automatically understand. `false` is the same as leaving it out.
+  if (input.autoMerge !== undefined) {
+    if (typeof input.autoMerge !== 'boolean') fail(400, 'invalid_options', 'Invalid auto-merge choice.');
+    if (input.autoMerge) {
+      if (options.access !== 'auto') fail(400, 'invalid_options', 'Auto-merge needs Auto-approve.');
+      if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).automaticGitHub !== true) {
+        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to auto-approve GitHub merges.');
+      }
+      options.autoMerge = true;
+    }
   }
   return options;
 }
@@ -389,7 +402,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       if (images && connectorUtf8Bytes(JSON.stringify({ content, requestId, admissionId: 'x'.repeat(43), options, images })) > connectorLimits.requestBytes) {
         fail(413, 'message_too_large', 'This message and its images are too large to send together. Remove an image or shorten the message.');
       }
-      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access, images) : undefined;
+      const admissionId = mode === 'submit' ? await issueRunAdmission(c, row, content, requestId, options?.access, images, options?.autoMerge === true) : undefined;
       const result = await runnerJSON<SubmitResult>(await runnerRequest(c, row, mode, '', { content, requestId, ...(admissionId ? { admissionId } : {}), ...(options ? { options } : {}),
         ...(images ? { images } : {}) }));
       invalidateSessionView(c, row.id);
@@ -432,8 +445,9 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (!approval) fail(404, 'not_found', 'Approval request not found.');
     if (approval.status !== 'pending') fail(409, 'approval_already_decided', 'This approval request is no longer pending.');
     const operation = review.operation;
-    if (operation.kind === 'host.bash' && (!row.connector_id || c.get('auth').userId !== row.connector_owner_id)) {
-      fail(403, 'host_owner_required', 'Only the host owner can decide host commands. Grant the host owner approve access to this session first.');
+    // The host's owner decides host commands, as does a member they (or a host admin) granted host commands to.
+    if (operation.kind === 'host.bash' && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
+      fail(403, 'host_owner_required', 'Only the host owner, or a member granted host commands on this host, can decide host commands. Grant them approve access to this session first.');
     }
     // A permission request lets a tool call do more than the session allows, so only its owner decides it.
     if (operation.kind === 'permission') {

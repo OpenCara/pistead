@@ -1,4 +1,4 @@
-import type { RunnerBinding, RunnerTicket, ThinkingLevel } from "./types.js";
+import type { HostCommandLevel, RunnerBinding, RunnerTicket, ThinkingLevel } from "./types.js";
 
 export interface LocalModelSummary {
   provider: string;
@@ -61,6 +61,40 @@ export interface ConnectorCapabilities {
    * session's work), not only `pistead/<session-id>`. Absent on older connectors, whose sessions keep the old name.
    */
   sessionBranches?: boolean;
+  /**
+   * The connector runs the session owner's GitHub comments and issues under Auto-approve, and merges when the message
+   * also chose auto-merge, through the control plane with the message's admission. Absent on older connectors, which
+   * still ask for each.
+   */
+  automaticGitHub?: boolean;
+  /**
+   * The connector lets members its owner granted host commands to (HostCommandGrant) approve them, or auto-approve
+   * them in their own sessions, as the control plane reports. Absent on older connectors: only the owner decides them.
+   */
+  hostGrants?: boolean;
+}
+
+/** A member other than the owner who may manage the host's sharing: its workspace shares and host command grants. */
+export interface ConnectorAdmin {
+  userId: string;
+  name: string;
+  createdAt: string;
+}
+
+/**
+ * Host command authority the host's owner or an admin gave in one workspace the host is shared with: to one member
+ * (`userId`), or to every member of the workspace (`userId` null). Expired grants are not listed.
+ */
+export interface HostCommandGrant {
+  workspaceId: string;
+  userId: string | null;
+  /** The member's display name; absent for a workspace-wide grant. */
+  userName?: string;
+  level: HostCommandLevel;
+  /** When the grant lapses; null for no expiry. */
+  expiresAt: string | null;
+  createdBy: string;
+  createdAt: string;
 }
 
 export interface ConnectorInfo {
@@ -77,6 +111,17 @@ export interface ConnectorInfo {
   // Private associations are owner-scoped; shared listings expose only their workspace.
   connectedWorkspaceIds?: string[];
   capabilities: ConnectorCapabilities;
+  /** The viewer's part in managing it: its owner, or an admin of its sharing. Absent for everyone else. */
+  role?: "owner" | "admin";
+  /** Listed to its owner and admins. */
+  admins?: ConnectorAdmin[];
+  /** Listed to its owner and admins. */
+  hostGrants?: HostCommandGrant[];
+  /**
+   * The viewer's own authority over host commands on it in the listed workspace: owner, or a grant's level. Absent when
+   * they hold none.
+   */
+  hostCommandAccess?: "owner" | HostCommandLevel;
 }
 
 export interface ConnectorPairing {

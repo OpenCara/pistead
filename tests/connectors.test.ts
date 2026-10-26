@@ -2400,3 +2400,180 @@ test('a collaborator sends a message to a workspace-visible session it does not 
   await denied(await collaborator.request('POST', `${path}/submit`, { content: 'After demotion', requestId: 'demoted-write' }), 403, 'forbidden');
   assert.equal(requests.length, 2);
 });
+
+/** A run admission of `actorId`, as a message sent with `access` (and auto-merge) mints it. */
+function autoAdmission(f: Fixture, sessionId: string, actorId: string, access: string | null = 'auto', autoMerge = false, expiresAt = Math.floor(Date.now() / 1000) + 600) {
+  const id = token();
+  f.sqlite.prepare(`INSERT INTO run_admissions (id,session_id,actor_id,mode,request_id,content_hash,expires_at,created_at,access,auto_merge) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, sessionId, actorId, 'write', `request-${id}`, 'h'.repeat(43), expiresAt, new Date().toISOString(), access, autoMerge ? 1 : 0);
+  return id;
+}
+
+test('auto-merge is a separate opt-in on the owner\'s Auto-approve, only for hosts that run GitHub effects automatically', async t => {
+  const f = await fixture(t); const s = await sharedSession(f);
+  const receipt = { submissionId: 'submission', conversationId: 'conversation', status: 'queued' };
+  const requests = rpcHub(f, s.connector, () => Response.json(receipt, { status: 202 }));
+  const path = `/api/sessions/${s.session.id}`;
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'old-host', options: { access: 'auto', autoMerge: true } }), 409, 'connector_update_required');
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, chatOptions: true, automaticGitHub: true } }));
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'asking', options: { access: 'approval', autoMerge: true } }), 400, 'invalid_options');
+  await denied(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'not-boolean', options: { access: 'auto', autoMerge: 'yes' } }), 400, 'invalid_options');
+  const before = requests.length;
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'auto-merge', options: { access: 'auto', autoMerge: true } }), 202);
+  assert.equal(requests.length, before + 1);
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { access: 'auto', autoMerge: true });
+  assert.equal(f.sqlite.prepare(`SELECT auto_merge FROM run_admissions WHERE request_id = 'auto-merge'`).get()!.auto_merge, 1);
+  // Leaving it off is the same as never choosing it.
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Hi', requestId: 'auto-only', options: { access: 'auto', autoMerge: false } }), 202);
+  assert.deepEqual(JSON.parse(requests.at(-1)!.request.body).options, { access: 'auto' });
+  assert.equal(f.sqlite.prepare(`SELECT auto_merge FROM run_admissions WHERE request_id = 'auto-only'`).get()!.auto_merge, 0);
+});
+
+test('the owner\'s Auto-approve message posts GitHub comments without a capability, once per tool call and only for its own message', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_comment']); const fetch = githubFetch(t);
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['write', 'approve'] }));
+  const owner = s.creator.user.id;
+  const comment = (approvalId: string, admissionId: string, actorId = owner) => ({ sessionId: s.session.id, actorId, approvalId, admissionId,
+    repository: 'owner/repo', issue: 3, body: 'Exactly approved text' });
+  const auto = autoAdmission(f, s.session.id, owner);
+  // Only an owner's unexpired Auto-approve message, for a tool call of its own, runs it without a person.
+  await denied(await self(f, s.connector, 'github/comment', comment('manual-id', auto)), 400, 'invalid_input');
+  await denied(await self(f, s.connector, 'github/comment', { ...comment('tool-both', auto), capability: token() }), 400, 'invalid_input');
+  await denied(await self(f, s.connector, 'github/comment', comment('tool-asking', autoAdmission(f, s.session.id, owner, 'approval'))), 403, 'automatic_github_not_admitted');
+  await denied(await self(f, s.connector, 'github/comment', comment('tool-expired', autoAdmission(f, s.session.id, owner, 'auto', false, Math.floor(Date.now() / 1000) - 1))), 403, 'automatic_github_not_admitted');
+  await denied(await self(f, s.connector, 'github/comment', comment('tool-teammate', autoAdmission(f, s.session.id, s.admin.user.id), s.admin.user.id)), 403, 'permission_revoked');
+  await denied(await self(f, s.connector, 'github/comment', comment('tool-borrowed', auto, s.admin.user.id)), 403, 'permission_revoked');
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM automatic_github_effects').get()!.n, 0);
+
+  assert.deepEqual(await json(await self(f, s.connector, 'github/comment', comment('tool-comment', auto))), { id: 99, url: 'https://github.com/owner/repo/issues/3#issuecomment-99' });
+  assert.equal(fetch.mock.callCount(), 1);
+  // A replay never repeats the effect.
+  await denied(await self(f, s.connector, 'github/comment', comment('tool-comment', auto)), 409, 'capability_consumed');
+  assert.equal(fetch.mock.callCount(), 1);
+  const attempt = f.sqlite.prepare(`SELECT detail_json FROM audit WHERE action = 'github.comment.attempted'`).get()!;
+  assert.equal(JSON.parse(String(attempt.detail_json)).automatic, true);
+  assert.ok(!String(attempt.detail_json).includes(auto), 'the admission is never audited');
+
+  // One message runs at most twenty of them.
+  for (let index = 0; index < 19; index++) await json(await self(f, s.connector, 'github/comment', comment(`tool-more-${index}`, auto)));
+  await denied(await self(f, s.connector, 'github/comment', comment('tool-over', auto)), 429, 'automatic_github_limit');
+  assert.equal(fetch.mock.callCount(), 20);
+});
+
+test('automatic GitHub merges need the message\'s auto-merge as well as Auto-approve, and runtimes cannot claim otherwise', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'github_merge']);
+  const calls = mergeFetch(t, () => Response.json({ merged: true, sha: mergedSha }));
+  const owner = s.creator.user.id;
+  const merge = (approvalId: string, admissionId: string) => ({ sessionId: s.session.id, actorId: owner, approvalId, admissionId,
+    repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' });
+  const autoOnly = autoAdmission(f, s.session.id, owner);
+  await denied(await self(f, s.connector, 'github/merge', merge('tool-merge', autoOnly)), 403, 'automatic_merge_not_admitted');
+  assert.deepEqual(calls, []);
+  const autoMerge = autoAdmission(f, s.session.id, owner, 'auto', true);
+  assert.deepEqual(await json(await self(f, s.connector, 'github/merge', merge('tool-merge', autoMerge))), { sha: mergedSha, url: 'https://github.com/owner/repo/pull/5' });
+  assert.deepEqual(calls, ['GET https://api.github.com/repos/owner/repo', 'PUT https://api.github.com/repos/owner/repo/pulls/5/merge']);
+
+  // A view shows a merge as automatic only for an admission that chose auto-merge; a comment for any owner Auto-approve.
+  const operation = { kind: 'github.merge' as const, repository: 'owner/repo', pull: 5, sha: headSha, method: 'squash' as const };
+  const record = (id: string, admissionId: string, kind: 'merge' | 'comment' = 'merge'): ApprovalRecord => ({ id, sessionId: s.session.id, requestedBy: owner, decidedBy: owner,
+    automatic: true, admissionId, status: 'executed', result: '{}', createdAt: new Date().toISOString(),
+    operation: kind === 'merge' ? operation : { kind: 'github.comment', repository: 'owner/repo', issue: 3, body: 'text' } });
+  let advertised = [record('tool-merged', autoMerge), record('tool-commented', autoOnly, 'comment')];
+  rpcHub(f, s.connector, () => Response.json({ view: {
+    sessionId: s.session.id, owner: { id: owner, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+    entries: [], approvals: advertised, conversations: [], busy: false,
+  } }));
+  const path = `/api/sessions/${s.session.id}/view`;
+  const { view } = await json<{ view: SessionView }>(await s.creator.request('GET', path));
+  assert.deepEqual(view.approvals.map(item => item.automatic), [true, true]);
+  for (const forged of [record('tool-forged', autoOnly), record('tool-forged', autoAdmission(f, s.session.id, owner, 'approval', true), 'comment')]) {
+    advertised = [forged];
+    await denied(await s.creator.request('GET', path), 502, 'invalid_runner_response');
+  }
+});
+
+test('host owners add admins who manage sharing and host command grants, and grants decide host command authority', async t => {
+  const f = await fixture(t); const s = await sharedSession(f); const outsider = await f.client('outsider');
+  const host = s.host; const creator = s.creator; const id = s.connector.connectorId;
+  const admins = `/api/connectors/${id}/admins`; const grants = `/api/connectors/${id}/host-grants/${s.team.id}`;
+  // Host command authority is reported only to someone who can still use the session; here, read it.
+  for (const userId of [host.user.id, s.admin.user.id]) {
+    await json(await creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId, permissions: ['read', 'approve'] }));
+  }
+  const authority = async (actorId: string) => {
+    const result = await json<{ allowed: boolean; hostCommands?: string }>(await self(f, s.connector, 'authorize', { ...authorization(s.session, actorId), permission: 'read', host: true }));
+    assert.equal(result.allowed, true);
+    return result.hostCommands;
+  };
+  // Without a grant, only the host's owner holds host command authority; nobody learns of any unless asked.
+  assert.equal(await authority(creator.user.id), undefined);
+  assert.equal(await authority(host.user.id), 'auto');
+  assert.equal(Object.hasOwn(await json(await self(f, s.connector, 'authorize', authorization(s.session))), 'hostCommands'), false);
+
+  // Only the owner adds admins, from the workspaces the host is connected to.
+  await denied(await creator.request('PUT', `${admins}/${creator.user.id}`), 404, 'not_found');
+  await denied(await host.request('PUT', `${admins}/${outsider.user.id}`), 409, 'admin_unavailable');
+  await denied(await host.request('PUT', `${admins}/${host.user.id}`), 400, 'invalid_admin');
+  // A viewer of the workspace stays read-only: never an admin.
+  const viewer = await f.client('viewer');
+  await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: viewer.user.id, role: 'viewer' }));
+  await denied(await host.request('PUT', `${admins}/${viewer.user.id}`), 409, 'admin_unavailable');
+  const added = await json<{ admins: { userId: string }[] }>(await host.request('PUT', `${admins}/${creator.user.id}`));
+  assert.deepEqual(added.admins.map(admin => admin.userId), [creator.user.id]);
+  const listed = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', '/api/connectors'))).connectors;
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].role, 'admin');
+  assert.deepEqual(listed[0].admins?.map(admin => admin.userId), [creator.user.id]);
+  // An admin manages sharing, not the host itself or its admins.
+  await denied(await creator.request('PUT', `${admins}/${s.admin.user.id}`), 403, 'host_owner_required');
+  await denied(await creator.request('DELETE', `/api/connectors/${id}`), 404, 'not_found');
+  await denied(await creator.request('DELETE', `/api/connectors/${id}/permanent`), 404, 'not_found');
+
+  // Grants: to one member or the whole workspace, never past the share, never to the owner.
+  await denied(await creator.request('PUT', grants, { level: 'root' }), 400, 'invalid_grant');
+  await denied(await creator.request('PUT', grants, { level: 'auto', userId: host.user.id }), 400, 'invalid_grant');
+  await denied(await creator.request('PUT', grants, { level: 'auto', expiresAt: new Date(Date.now() - 1000).toISOString() }), 400, 'invalid_expiry');
+  await denied(await outsider.request('PUT', grants, { level: 'auto' }), 404, 'not_found');
+  await json(await creator.request('PUT', grants, { level: 'auto', userId: creator.user.id }));
+  await json(await host.request('PUT', grants, { level: 'approve' }));
+  assert.equal(await authority(creator.user.id), 'auto');
+  assert.equal(await authority(s.admin.user.id), 'approve');
+  const own = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
+  assert.equal(own[0].hostCommandAccess, 'auto');
+  const audits = f.sqlite.prepare(`SELECT action FROM audit WHERE action LIKE 'host.grant.%' OR action LIKE 'connector.admin.%' ORDER BY created_at, rowid`).all().map(row => row.action);
+  assert.deepEqual(audits, ['connector.admin.added', 'host.grant.set', 'host.grant.set']);
+
+  // In a workspace of the owner's the admin isn't in, they neither see nor change the host's sharing.
+  const other = await workspace(host);
+  f.sqlite.prepare(`INSERT INTO workspace_repositories (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
+    .run('other-repository', other.id, '8', 'owner/other', 'main', 1, new Date().toISOString());
+  await json(await host.request('PUT', `/api/connectors/${id}/shares/${other.id}`));
+  await json(await host.request('PUT', `/api/connectors/${id}/host-grants/${other.id}`, { level: 'approve' }));
+  await denied(await creator.request('DELETE', `/api/connectors/${id}/shares/${other.id}`), 404, 'not_found');
+  await denied(await creator.request('DELETE', `/api/connectors/${id}/host-grants/${other.id}`), 404, 'not_found');
+  await denied(await creator.request('PUT', `/api/connectors/${id}/host-grants/${other.id}`, { level: 'auto' }), 404, 'not_found');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE workspace_id = ?').get(other.id)!.n, 1);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_host_grants WHERE workspace_id = ?').get(other.id)!.n, 1);
+  const shown = await json<{ hostGrants: { workspaceId: string }[] }>(await creator.request('PUT', grants, { level: 'auto', userId: creator.user.id }));
+  assert.deepEqual([...new Set(shown.hostGrants.map(grant => grant.workspaceId))], [s.team.id], 'an admin sees only grants of their own workspaces');
+  const asAdmin = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', '/api/connectors'))).connectors[0];
+  assert.ok(!asAdmin.workspaceIds.includes(other.id) && !asAdmin.hostGrants?.some(grant => grant.workspaceId === other.id));
+  const asOwner = (await json<{ connectors: ConnectorInfo[] }>(await host.request('GET', '/api/connectors'))).connectors[0];
+  assert.ok(asOwner.workspaceIds.includes(other.id) && asOwner.hostGrants?.some(grant => grant.workspaceId === other.id));
+
+  // An expired grant no longer counts; the workspace-wide one still does. Removing a grant ends it.
+  f.sqlite.prepare('UPDATE connector_host_grants SET expires_at = ? WHERE user_id = ?').run(Math.floor(Date.now() / 1000) - 1, creator.user.id);
+  assert.equal(await authority(creator.user.id), 'approve');
+  assert.equal((await creator.request('DELETE', grants)).status, 204);
+  assert.equal(await authority(s.admin.user.id), undefined);
+
+  // Unsharing ends every grant in the workspace; an admin may step down, and then manages nothing.
+  await json(await creator.request('PUT', grants, { level: 'approve', userId: s.admin.user.id }));
+  assert.equal((await creator.request('DELETE', `/api/connectors/${id}/shares/${s.team.id}`)).status, 204);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_host_grants WHERE workspace_id = ?').get(s.team.id)!.n, 0);
+  await denied(await creator.request('PUT', grants, { level: 'approve' }), 409, 'grant_unavailable');
+  assert.equal((await creator.request('DELETE', `${admins}/${creator.user.id}`)).status, 204);
+  await denied(await creator.request('PUT', `/api/connectors/${id}/shares/${s.team.id}`), 404, 'not_found');
+});

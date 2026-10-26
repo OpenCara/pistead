@@ -1,5 +1,5 @@
 import {
-  accessLabels, autoApproveWarning, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels, selectModel,
+  accessLabels, AUTO_MERGE_WARNING, autoApproveWarning, autoMergeAvailable, CONNECTOR_UPDATE_HINT, effectiveLevel, findModel, levelLabels, modelKey, offeredLevels, selectModel,
   type ChatSelection,
 } from "@pistead/client";
 import { useState } from "react";
@@ -38,7 +38,15 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
       confirmLabel: "Enable auto-approve",
       destructive: true,
     })) return;
-    onChange({ ...value, access });
+    // Leaving Auto-approve also turns Auto-merge off, so it is chosen afresh with it.
+    onChange({ ...value, access, ...(access === "auto" ? {} : { autoMerge: false }) });
+  }
+
+  async function toggleAutoMerge() {
+    if (!value.autoMerge && !await confirm({
+      title: "Auto-merge pull requests?", message: AUTO_MERGE_WARNING, confirmLabel: "Enable auto-merge", destructive: true,
+    })) return;
+    onChange({ ...value, autoMerge: !value.autoMerge });
   }
 
   const modes: AccessMode[] = owner ? ["read", "approval", "auto"] : ["read", "approval"];
@@ -46,6 +54,8 @@ export function ChatOptionsBar({ host, value, onChange, owner, showAccess, unsan
     <Chip testID="chat-model" icon="hardware-chip-outline" label={model?.name ?? "Model"} disabled={!host.models.length} onPress={() => setOpen("model")} />
     {levels.length > 0 && <Chip testID="chat-reasoning" icon="bulb-outline" label={level && levels.includes(level) ? levelLabels[level] : "Default"} onPress={() => setOpen("level")} />}
     {showAccess && <Chip testID="chat-access" icon={accessIcons[value.access]} tone={value.access === "auto" ? "danger" : undefined} label={accessLabels[value.access].label} onPress={() => setOpen("access")} />}
+    {showAccess && autoMergeAvailable(host, value, owner) && <Chip testID="chat-auto-merge" icon="git-merge-outline" tone={value.autoMerge ? "danger" : undefined}
+      label={value.autoMerge ? "Auto-merge on" : "Auto-merge off"} onPress={() => void toggleAutoMerge()} />}
     <OptionSheet<string> visible={open === "model"} title="Model" onClose={close}
       value={value.model && model ? modelKey(value.model) : undefined}
       options={host.models.map(item => ({ value: modelKey(item), label: item.name, hint: item.provider }))}
