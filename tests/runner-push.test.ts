@@ -294,11 +294,11 @@ test("pushes with the host's Git credentials run only in its owner's sessions wh
   const shared = await run("host-shared", "test:bob");
   assert.equal(shared.status, "failed");
   assert.match(shared.result ?? "", /Only the host's owner can push with its Git credentials\. Nothing was pushed/);
-  // The owner restarted the connector without --git-credentials.
+  // A runner that can't read the host's credentials says where the owner turns them on.
   delete config.hostGitCredential;
   const off = await run("host-off", "test:alice");
   assert.equal(off.status, "failed");
-  assert.match(off.result ?? "", /restart the connector with --git-credentials/);
+  assert.match(off.result ?? "", /turn them on in Pistead \(Settings → Hosts → the host → Configuration\)/);
   assert.deepEqual(completions.map(item => [item.approvalId, item.outcome]), [[own.id, "pushed"], [shared.id, "failed"], [off.id, "failed"]]);
   for (const branch of ["shared", "off"]) assert.equal(spawnSync("git", ["--git-dir", bare, "rev-parse", "--verify", "-q", `refs/heads/${branch}`]).status, 1);
 });
