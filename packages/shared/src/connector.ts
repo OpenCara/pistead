@@ -77,6 +77,11 @@ export interface ConnectorCapabilities {
    * them in their own sessions, as the control plane reports. Absent on older connectors: only the owner decides them.
    */
   hostGrants?: boolean;
+  /**
+   * The connector lists the session worktree's directories and previews its files, read-only, for the session panel's
+   * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
+   */
+  fileBrowser?: boolean;
 }
 
 /** A member other than the owner who may manage the host's sharing: its workspace shares and host command grants. */
