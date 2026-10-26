@@ -251,6 +251,36 @@ async function syncModels(env: Env, row: ConnectorRow, workspaceId: string | nul
   await env.DB.batch(modelStatements(env, row, workspaceId));
 }
 
+/**
+ * A host belongs to its owner, not to one workspace: it is connected, for the owner's private use, to every workspace
+ * they belong to. These statements connect `userId`'s hosts to `workspaceId` and import their models there, once the
+ * user is a member of it (a workspace they create or join); without that membership they change nothing.
+ */
+export function ownerHostStatements(env: Env, userId: string, workspaceId: string): Query<never>[] {
+  const createdAt = now();
+  return [
+    env.DB.query<never>(`INSERT INTO connector_workspaces (connector_id, workspace_id, created_at)
+      SELECT c.id, m.workspace_id, ? FROM connectors c
+      JOIN workspace_members m ON m.user_id = c.owner_id AND m.workspace_id = ?
+      WHERE c.owner_id = ? AND c.revoked_at IS NULL
+      ON CONFLICT (connector_id, workspace_id) DO NOTHING`)
+      .bind(createdAt, workspaceId, userId),
+    env.DB.query<never>(`UPDATE models SET available = 0 WHERE workspace_id = ? AND connector_owner_id = ?
+      AND connector_id IN (SELECT id FROM connectors WHERE owner_id = ? AND revoked_at IS NULL)`)
+      .bind(workspaceId, userId, userId),
+    env.DB.query<never>(`INSERT INTO models
+      (id, workspace_id, name, provider, model_id, created_at, connector_id, connector_owner_id, available)
+      SELECT lower(hex(randomblob(16))), cw.workspace_id, json_extract(local.value, '$.name'),
+        json_extract(local.value, '$.provider'), json_extract(local.value, '$.modelId'), ?, c.id, c.owner_id, 1
+      FROM connectors c JOIN connector_workspaces cw ON cw.connector_id = c.id AND cw.workspace_id = ?
+      JOIN workspace_members m ON m.workspace_id = cw.workspace_id AND m.user_id = c.owner_id
+      JOIN json_each(c.models_json) local
+      WHERE c.owner_id = ? AND c.revoked_at IS NULL
+      ON CONFLICT (workspace_id, connector_id, provider, model_id) DO UPDATE SET name = excluded.name, available = 1`)
+      .bind(createdAt, workspaceId, userId),
+  ];
+}
+
 export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/pairings/:id/claim', async c => {
     requireConnectorTLS(c.env, new URL(c.req.url));
@@ -262,51 +292,40 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
     const code = text(input.code, 'code', 128);
     const controlPlaneUrl = appOrigin(c.env);
     const codeHash = await sha256(code);
-    const pairing = await c.env.DB.query<{ owner_id: string; name: string; workspace_id: string | null }>(`SELECT owner_id, name, workspace_id FROM connector_pairings
+    const pairing = await c.env.DB.query<{ owner_id: string }>(`SELECT owner_id FROM connector_pairings
       WHERE id = ? AND code_hash = ? AND claimed_at IS NULL AND expires_at > ?`)
       .bind(pairingId, codeHash, Math.floor(Date.now() / 1000))
       .first();
     if (!pairing) fail(403, 'invalid_pairing', 'Pairing is expired, used, or invalid.');
-    const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, pairing.owner_id);
-    if (pairing.workspace_id !== null) {
-      await requireMember(c.env, pairing.workspace_id, pairing.owner_id);
-      await requireConfiguredWorkspace(c.env, pairing.workspace_id, pairing.owner_id);
-    } else if (!legacy) {
-      fail(403, 'invalid_pairing', 'Pairing requires a configured workspace.');
-    }
     const connectorId = id();
     const token = randomToken();
     const credentialHash = await sha256(token);
     const createdAt = now();
-    // Consume the code, create the connector and its private association in one transaction.
+    // Consume the code, create the connector and connect it privately to its owner's workspaces in one transaction.
+    // A pairing names no workspace: the host is its owner's, wherever they work (ownerHostStatements).
     // INSERT rechecks authority after the asynchronous preflight and token hashing.
     const results = await c.env.DB.batch<ConnectorRow>([
       c.env.DB.query<ConnectorRow>(`INSERT INTO connectors (id,owner_id,name,credential_hash,created_at,models_json,capabilities_json)
         SELECT ?, p.owner_id, p.name, ?, ?, ?, ? FROM connector_pairings p
         JOIN users u ON u.id = p.owner_id
         WHERE p.id = ? AND p.code_hash = ? AND p.claimed_at IS NULL AND p.expires_at > ?
-        AND p.owner_id = ? AND p.workspace_id IS ?
+        AND p.owner_id = ?
         AND (? = 1 OR u.auth_kind <> 'test')
         AND (SELECT COUNT(*) FROM connectors WHERE owner_id = p.owner_id AND revoked_at IS NULL) < 20
-        AND ((p.workspace_id IS NULL AND ? = 1 AND u.auth_kind = 'test')
-          OR (p.workspace_id IS NOT NULL
-            AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = p.workspace_id AND user_id = p.owner_id)
-            AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = p.workspace_id)
-              OR (? = 1 AND u.auth_kind = 'test'))))
         RETURNING *`)
         .bind(connectorId, credentialHash, createdAt, JSON.stringify(manifest.models), JSON.stringify(manifest.capabilities),
-          pairingId, codeHash, Math.floor(Date.now() / 1000), pairing.owner_id, pairing.workspace_id,
-          testMode(c.env) ? 1 : 0, legacy && testMode(c.env) ? 1 : 0, legacy && testMode(c.env) ? 1 : 0),
+          pairingId, codeHash, Math.floor(Date.now() / 1000), pairing.owner_id, testMode(c.env) ? 1 : 0),
       c.env.DB.query<never>(`UPDATE connector_pairings SET claimed_at = ? WHERE id = ?
         AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND credential_hash = ?)`)
         .bind(createdAt, pairingId, connectorId, credentialHash),
       c.env.DB.query<never>(`INSERT INTO connector_workspaces (connector_id, workspace_id, created_at)
-        SELECT id, ?, ? FROM connectors WHERE id = ? AND ? IS NOT NULL`)
-        .bind(pairing.workspace_id, createdAt, connectorId, pairing.workspace_id),
-      ...modelStatements(c.env, { id: connectorId, models_json: JSON.stringify(manifest.models) }, pairing.workspace_id),
+        SELECT c.id, m.workspace_id, ? FROM connectors c JOIN workspace_members m ON m.user_id = c.owner_id
+        WHERE c.id = ? ON CONFLICT (connector_id, workspace_id) DO NOTHING`)
+        .bind(createdAt, connectorId),
+      ...modelStatements(c.env, { id: connectorId, models_json: JSON.stringify(manifest.models) }, null),
     ]);
     const created = results[0].results[0];
-    if (!created) fail(403, 'invalid_pairing', 'Pairing is expired, used, invalid, or its workspace is no longer available.');
+    if (!created) fail(403, 'invalid_pairing', 'Pairing is expired, used, or invalid.');
     return c.json({ credentials: { connectorId, token, controlPlaneUrl } }, 201);
   });
   // The upgrade itself is completed by the HTTP server (`main.ts`) with `authenticateConnectorSocket`;
@@ -340,28 +359,23 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
 export function registerConnectors(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/pairings', async c => {
     const input = await jsonObject(c, 4096);
+    // `workspaceId` is accepted, and ignored, from pages that predate it: a host is no longer paired into a workspace.
     onlyFields(input, ['name', 'workspaceId']);
     const name = text(input.name, 'name', 120);
     const ownerId = c.get('auth').userId;
-    const legacy = testMode(c.env) && await legacyRepositoryFixture(c.env, ownerId);
-    const workspaceId = input.workspaceId === undefined && legacy ? null : identifier(input.workspaceId, 'workspaceId');
-    if (workspaceId !== null) {
-      await requireMember(c.env, workspaceId, ownerId);
-      await requireConfiguredWorkspace(c.env, workspaceId, ownerId);
-    }
     const pairingId = id(); const code = randomToken(); const expires = Math.floor(Date.now() / 1000) + 600;
     await c.env.DB.query('DELETE FROM connector_pairings WHERE owner_id = ? AND expires_at <= ?').bind(ownerId, Math.floor(Date.now() / 1000)).run();
     const created = await c.env.DB.query(`INSERT INTO connector_pairings (id,owner_id,name,code_hash,expires_at,created_at,workspace_id)
-      SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM connector_pairings WHERE owner_id = ?) < 5
+      SELECT ?,?,?,?,?,?,NULL WHERE (SELECT COUNT(*) FROM connector_pairings WHERE owner_id = ?) < 5
       AND (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20
-      AND ((? IS NULL AND ? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test'))
-        OR (? IS NOT NULL AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
-          AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = ?)
-            OR (? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test'))))) RETURNING id`)
-      .bind(pairingId, ownerId, name, await sha256(code), expires, now(), workspaceId, ownerId, ownerId,
-        workspaceId, legacy && testMode(c.env) ? 1 : 0, ownerId, workspaceId, workspaceId, ownerId,
-        workspaceId, legacy && testMode(c.env) ? 1 : 0, ownerId).first();
-    if (!created) fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
+      AND EXISTS (SELECT 1 FROM users WHERE id = ? AND (? = 1 OR auth_kind <> 'test')) RETURNING id`)
+      .bind(pairingId, ownerId, name, await sha256(code), expires, now(), ownerId, ownerId, ownerId, testMode(c.env) ? 1 : 0).first();
+    if (!created) {
+      // The write refuses a test user once test mode is off: a refusal, not a limit, so tell them apart.
+      const testUser = await c.env.DB.query('SELECT 1 FROM users WHERE id = ? AND auth_kind = \'test\'').bind(ownerId).first();
+      if (testUser && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Test users can pair hosts only while test mode is on.');
+      fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
+    }
     return c.json({ pairing: { id: pairingId, code, expiresAt: new Date(expires * 1000).toISOString() } }, 201);
   });
   app.get('/api/connectors', async c => {

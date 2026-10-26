@@ -56,7 +56,7 @@ And around them:
 | Concept | What it is |
 |---|---|
 | Workspace | A team's shared home: members, repositories, push access and sessions. Each member is its owner, an admin, a collaborator, a member or a viewer. |
-| Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It is private to the member who paired it until they share it with a workspace. |
+| Host | A machine running the `pistead` connector (or the Mac app) next to Pi. It belongs to the member who paired it, not to a workspace: they can use it in every workspace they belong to, and it stays private to them until they share it with one. |
 | Model | A Pi model a host offers. Its credentials never leave the host. |
 | Agent | The Pi agent that works in a session, on the model it started from, with every tool its host supports. Each session has its own. |
 | Session | One agent conversation on one host, in its own worktree where the agent clones the workspace's repositories. It always runs as its owner. |
@@ -69,7 +69,7 @@ And around them:
 1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
 3. **Bind a repository**: **Settings → Workspaces →** your workspace **→ Repositories → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**.
-4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, choose the workspace, name the host and **Create pairing code**. Run the command it shows on the host and type the code at the hidden prompt:
+4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
    ```sh
    npx pistead@latest connect --server https://pistead.example.com --pairing-id PAIRING_ID
@@ -137,7 +137,7 @@ Workspace admins manage only their workspace; the server's administrators are co
 
 ### Repositories and Git accounts
 
-Sessions work on the repositories bound to their workspace. Until a workspace has one, nobody can pair a host into it, share a host with it or start a session in it.
+Sessions work on the repositories bound to their workspace. Until a workspace has one, nobody can share a host with it or start a session in it.
 
 Connect the accounts that can read your repositories under **Settings → Profile → Git accounts** (**Add account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
@@ -171,7 +171,7 @@ A host is a machine where you run the `pistead` connector next to [Pi](https://g
 
 #### Pairing
 
-1. In **Settings → Hosts**, choose **Pair a host**, pick the **Workspace** (it needs a bound repository) and a **Host name**, then **Create pairing code**.
+1. In **Settings → Hosts**, choose **Pair a host**, enter a **Host name**, then **Create pairing code**. A pairing names no workspace: the host is yours, and you can use it in every workspace you belong to, including ones you create or join later.
 2. On the host, run the command shown under **Run this on your host**:
 
    ```sh
@@ -188,7 +188,7 @@ npx pistead@latest connect
 
 Keep it running, for example in `tmux` or under your service manager: it reconnects by itself after network failures, and sessions on the host work only while it runs. Restart it after changing Pi's configuration, and run it with `@latest` to update it; newer features need a newer connector, and the web app says when a host's is too old.
 
-To pair a machine again (after revoking its host, or to move it to another workspace or server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
+To pair a machine again (after revoking its host, or to move it to another server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
 
 An offline host's page in **Settings → Hosts** has **Reconnect**, which shows the command to restart its saved connection on that machine (Pistead can't start it remotely), or **Pair again** once it's revoked. **Remove permanently** (owner only) takes a host off the list for good: it revokes its credentials, stops sharing it, and marks its models unavailable. Its sessions and their history stay, but can't run again, and nothing on the machine is deleted; pair it as a new host to use it again.
 
@@ -207,7 +207,7 @@ The connector reads these when it starts; restart it after changing them.
 
 #### Sharing a host
 
-A paired host is private: only you can start sessions on it. Under **Settings → Hosts →** the host **→ Sharing**, **Share** it with a workspace you belong to (one with a bound repository) to let its members run their own sessions on it; **Unshare** stops that at once.
+A paired host is private: only you can start sessions on it, in any of your workspaces. Under **Settings → Hosts →** the host **→ Sharing**, **Share** it with a workspace you belong to (one with a bound repository) to let its members run their own sessions on it; **Unshare** stops that at once.
 
 This is how a team shares one model subscription or set of API keys. Sign Pi in once on one machine and share that machine, and everyone in the workspace can pick its models when they start a session. The provider's credentials stay on that machine, and teammates never see or copy them. Revoking the host or unsharing it cuts everyone off at once. Check that your provider's terms allow sharing your plan this way.
 

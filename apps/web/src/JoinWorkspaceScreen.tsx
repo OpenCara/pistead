@@ -52,6 +52,12 @@ export function OwnJoinRequests() {
   const resource = useResource<{ requests: OwnJoinRequest[] }>("/api/join-requests");
   const action = useAction();
   const requests = resource.data?.requests ?? [];
+  // Once a load fails, the section stays until one succeeds, so Try again doesn't make it vanish while it retries.
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (resource.error) setFailed(true);
+    else if (resource.data) setFailed(false);
+  }, [resource.error, resource.data]);
   async function withdraw(request: OwnJoinRequest) {
     if (action.busy) return;
     const confirmed = await confirmDialog({ title: "Withdraw request", message: `Stop waiting to join ${request.workspaceName}? You can ask again while you have a working invite link.`, confirmLabel: "Withdraw", destructive: true });
@@ -62,10 +68,10 @@ export function OwnJoinRequests() {
     }, "Request withdrawn.");
   }
   // A failed load shows its error, so it never looks like there is nothing to withdraw.
-  if (!requests.length && !action.notice && !resource.error) return null;
+  if (!requests.length && !action.notice && !failed) return null;
   return <Section title="Your requests to join" info="Workspaces you asked to join through an invite link. An owner or admin of each accepts or declines you.">
-    {resource.error && !requests.length
-      ? <CardBody><Alert variant="error" title="Could not load your requests" actions={<Button size="sm" onClick={resource.refresh}>Try again</Button>}>{resource.error}</Alert></CardBody>
+    {failed && !requests.length
+      ? <CardBody><Alert variant="error" title="Could not load your requests" actions={<Button size="sm" disabled={resource.loading} onClick={resource.refresh}>{resource.loading ? "Trying..." : "Try again"}</Button>}>{resource.error || "Your requests could not be loaded."}</Alert></CardBody>
       : !requests.length
       ? <CardBody><span className="muted">You aren't waiting to join any workspace</span></CardBody>
       : requests.map(request => <Row key={request.workspaceId} title={request.workspaceName} hint={<>Waiting for approval · asked <RelativeTime value={request.createdAt} /></>}

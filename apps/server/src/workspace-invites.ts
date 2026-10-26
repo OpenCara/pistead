@@ -8,6 +8,7 @@ import { auditAfterChange, auditStatement, requireMember } from './db.js';
 import { appOrigin, fail, identifier, id, jsonObject, now, randomToken, userIdentifier } from './http.js';
 import type { Env, WorkerEnv } from './types.js';
 import { decryptToken, encryptToken } from './vault.js';
+import { ownerHostStatements } from './connectors.js';
 
 /**
  * Invite links: a workspace's owner and admins can share one link with anyone. A registered user who opens it while
@@ -223,6 +224,9 @@ export function registerWorkspaceInvites(app: Hono<WorkerEnv>): void {
       auditAfterChange(c.env, actorId, 'workspace.join.accept', workspaceId, { userId: targetId, role }, auditId),
       c.env.DB.query(`DELETE FROM workspace_join_requests WHERE workspace_id = ? AND user_id = ?
         AND EXISTS (SELECT 1 FROM audit WHERE id = ?)`).bind(workspaceId, targetId, auditId),
+      // As for a member added directly, their own hosts follow them in, for their private use only. These statements
+      // act only while the membership exists, so a refused accept attaches nothing.
+      ...ownerHostStatements(c.env, targetId, workspaceId),
     ]);
     if (result[0].changes !== 1) {
       const pending = await c.env.DB.query('SELECT 1 FROM workspace_join_requests WHERE workspace_id = ? AND user_id = ?').bind(workspaceId, targetId).first();

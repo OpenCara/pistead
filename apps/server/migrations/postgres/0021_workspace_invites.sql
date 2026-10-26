@@ -1,4 +1,4 @@
--- Postgres translation of the SQLite migration 0027_workspace_invites.sql.
+-- Postgres translation of the SQLite migration 0028_workspace_invites.sql.
 -- A workspace's invite link: anyone signed in who opens it can ask to join the workspace. Asking only makes them a
 -- pending member (workspace_join_requests), which grants nothing until an owner or admin accepts them with a role.
 -- The token is looked up by its hash and kept vault-encrypted with 'workspace-invite:<workspace id>' as AAD so owners

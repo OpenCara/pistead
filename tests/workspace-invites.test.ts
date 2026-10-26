@@ -194,6 +194,28 @@ test('declining, withdrawing, adding directly and turning the link off', async t
   await json(await ask(alice, fresh), 201);
 });
 
+test('accepting a pending member brings their own hosts into the workspace, as adding them directly does', async t => {
+  const f = await fixture(t);
+  const [owner, alice] = await Promise.all([f.client('owner'), f.client('alice')]);
+  const team = await workspace(owner);
+  const { pairing } = await json<{ pairing: { id: string; code: string } }>(await alice.request('POST', '/api/connectors/pairings', { name: 'Alice host' }), 201);
+  const { credentials } = await json<{ credentials: { connectorId: string } }>(await alice.request('POST', `/api/connectors/pairings/${pairing.id}/claim`, {
+    code: pairing.code,
+    models: [{ provider: 'local-native', modelId: 'local/model-v1', name: 'Local model' }],
+    capabilities: { platform: 'linux', sandbox: true, productionShell: false, plainGit: true },
+  }), 201);
+  const attached = () => f.sqlite.prepare('SELECT COUNT(*) AS count FROM connector_workspaces WHERE connector_id = ? AND workspace_id = ?')
+    .get(credentials.connectorId, team.id) as { count: number };
+  const token = tokenOf((await json<{ link: WorkspaceInviteLink }>(await owner.request('PUT', `/api/workspaces/${team.id}/invite-link`), 201)).link);
+  await json(await ask(alice, token), 201);
+  // Pending brings nothing in.
+  assert.equal(Number(attached().count), 0);
+  await json(await owner.request('POST', `/api/workspaces/${team.id}/join-requests/${encodeURIComponent(alice.user.id)}/accept`, { role: 'member' }));
+  assert.equal(Number(attached().count), 1);
+  const models = f.sqlite.prepare('SELECT available FROM models WHERE workspace_id = ? AND connector_id = ?').all(team.id, credentials.connectorId) as { available: number }[];
+  assert.deepEqual(models.map(model => Number(model.available)), [1]);
+});
+
 test('the pending queue is bounded', async t => {
   const f = await fixture(t);
   const [owner, late] = await Promise.all([f.client('owner'), f.client('late')]);
