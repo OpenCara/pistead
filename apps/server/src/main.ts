@@ -11,6 +11,7 @@ import type { Database } from './db/types.js';
 import { app } from './index.js';
 import { createStaticHandler } from './static.js';
 import { settlePushCredentials } from './push/broker.js';
+import { refreshPullRequestStates } from './pull-request-states.js';
 import { runAutomaticBackups } from './automatic-backups.js';
 import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
 import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
@@ -183,6 +184,17 @@ await migrateWhenReachable(env.DB);
 // Push credentials no completion settled: pushes their host never reported, and owner-token resets to retry.
 const settling = setInterval(() => { void settlePushCredentials(env).catch(() => {}); }, 5 * 60_000);
 settling.unref();
+
+// The state of each session's pull request (pull-request-states.ts); one sweep at a time.
+let readingPulls = false;
+const pullStates = setInterval(() => {
+  if (readingPulls) return;
+  readingPulls = true;
+  void refreshPullRequestStates(env)
+    .catch(error => { console.error('pistead: pull request states failed:', error instanceof Error ? error.message : error); })
+    .finally(() => { readingPulls = false; });
+}, 30_000);
+pullStates.unref();
 
 // Automatic backups into workspace databases (automatic-backups.ts); one sweep at a time.
 let sweeping = false;

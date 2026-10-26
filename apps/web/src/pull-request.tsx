@@ -1,4 +1,5 @@
 import type { SessionPullRequest } from "../../../packages/shared/src/types";
+import { pullRequestStateLabels, pullRequestStateTones } from "../../../packages/shared/src/pull-requests";
 import { Icon } from "./icons";
 
 /** "#12", or "PR" for a pull request URL with no number. */
@@ -23,20 +24,28 @@ export function pullRequestRepository(url: string): string | undefined {
   return before.filter(part => part !== "_git").join("/");
 }
 
-/** The tooltip: "Pull request #12 in owner/repo", or the URL when it names no repository this recognizes. */
+/** The tooltip: "Pull request #12 in owner/repo: CI failed", or the URL when it names no repository this recognizes. */
 function pullRequestTitle(pull: SessionPullRequest): string {
   const repository = pullRequestRepository(pull.url);
-  return repository ? `Pull request ${pullRequestLabel(pull)} in ${repository}` : pull.url;
+  const state = pull.state ? `: ${pullRequestStateLabels[pull.state]}` : "";
+  return repository ? `Pull request ${pullRequestLabel(pull)} in ${repository}${state}` : `${pull.url}${state}`;
+}
+
+/** Its state as a word in the state's color: Draft, Open, CI failed, Changes requested, Merged, Closed. */
+function PullRequestState({ pull }: { pull: SessionPullRequest }) {
+  return pull.state ? <span className={`pull-state ${pullRequestStateTones[pull.state]}`}>{pullRequestStateLabels[pull.state]}</span> : null;
 }
 
 /** Beside a session's status in lists, which are links themselves, so this is a label rather than a link. */
 export function PullRequestTag({ pull }: { pull: SessionPullRequest }) {
-  return <span className="session-pull" title={pullRequestTitle(pull)}><Icon name="git-pull-request" size={12} />{pullRequestLabel(pull)}</span>;
+  return <span className={`session-pull${pull.state ? ` ${pullRequestStateTones[pull.state]}` : ""}`} title={pullRequestTitle(pull)}>
+    <Icon name="git-pull-request" size={12} />{pullRequestLabel(pull)}{pull.state && <> <PullRequestState pull={pull} /></>}
+  </span>;
 }
 
 /** The open session's header: a link to its pull request. */
 export function PullRequestLink({ pull }: { pull: SessionPullRequest }) {
-  return <a className="badge session-pull-link" href={pull.url} target="_blank" rel="noreferrer" title={pullRequestTitle(pull)}>
-    <Icon name="git-pull-request" size={12} />{pull.number === undefined ? "Pull request" : `PR #${pull.number}`}<Icon name="external" size={12} />
+  return <a className={`badge session-pull-link${pull.state ? ` ${pullRequestStateTones[pull.state]}` : ""}`} href={pull.url} target="_blank" rel="noreferrer" title={pullRequestTitle(pull)}>
+    <Icon name="git-pull-request" size={12} />{pull.number === undefined ? "Pull request" : `PR #${pull.number}`}{pull.state && <> · <PullRequestState pull={pull} /></>}<Icon name="external" size={12} />
   </a>;
 }
