@@ -60,7 +60,7 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     ...(row.activity ? { activity: row.activity } : {}),
     ...(pullRequest ? { pullRequest } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity'> {
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest'> {
   // Visibility is live control-plane policy, and activity and the pull request are what the host and pushes report, so
   // none of them is part of the immutable runner binding.
   const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, pullRequest: _pullRequest, ...record } = sessionRecord(row);
@@ -90,7 +90,7 @@ type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: W
 // The newest pull request a push opened or found comes along for session lists and headers.
 const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role,
   (SELECT pr.pull_request_url FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
-    ORDER BY pr.completed_at DESC, pr.id DESC LIMIT 1) AS pull_request_url FROM sessions s
+    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_url FROM sessions s
   INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
   INNER JOIN workspace_members owner ON owner.workspace_id = s.workspace_id AND owner.user_id = s.owner_id
   INNER JOIN users actor_user ON actor_user.id = actor.user_id
