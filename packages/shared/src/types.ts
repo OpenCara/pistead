@@ -127,6 +127,11 @@ export interface SessionRecord {
   cloneUnavailable?: string;
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
+  /**
+   * "brief": everyone viewing the session (share links included) sees each tool result as its first line and long tool
+   * calls cut short, to keep transcripts small. Absent: full tool output. Only the owner changes it.
+   */
+  toolOutput?: "brief";
   // Present only on single-session reads: the pinned host explicitly runs without isolation, or this session runs on it
   // directly (hostEnvironment).
   hostUnsandboxed?: boolean;
@@ -631,6 +636,12 @@ export interface EntryView {
   durationMs?: number;
   /** This entry's tool calls whose commands ran under auto-approve, in call order; absent from older runners. */
   autoApproved?: AutoApprovedCall[];
+  /**
+   * The session shows brief tool output (`SessionRecord.toolOutput`) and `text` is shortened: a tool result's first
+   * line, or tool calls cut to their first characters. The whole text's lines and characters (code points); the host
+   * keeps it.
+   */
+  trimmed?: { lines: number; chars: number };
 }
 /**
  * Phases of preparing one pinned repository on a host with a repository cache (connect --repo-cache): its turn, the
@@ -658,6 +669,18 @@ export interface RepositoryPreparationView {
   /** Why it failed, in fixed and credential-free words. Restarting the session tries again. */
   error?: string;
 }
+export interface ConversationView {
+  id: string;
+  mode: "write" | "ask";
+  actorId?: string;
+  /**
+   * In a workspace that loads transcripts latest first, how many of this conversation's entries come before the ones
+   * `entries` holds; `GET /api/sessions/:id/entries` reads them. Absent when `entries` holds them all.
+   */
+  olderEntries?: number;
+  /** With `olderEntries`: the entry just before this conversation's first one in `entries`. */
+  previousEntryId?: string;
+}
 export interface SessionView {
   sessionId: string;
   owner: Pick<UserProfile, "id" | "displayName" | "gitName" | "gitEmail" | "githubLogin">;
@@ -669,7 +692,7 @@ export interface SessionView {
   approvals: ApprovalRecord[];
   /** How many older settled approvals `approvals` leaves out; the host keeps them. */
   olderApprovals?: number;
-  conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
+  conversations: ConversationView[];
   busy: boolean;
   /**
    * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host

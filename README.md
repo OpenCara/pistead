@@ -98,7 +98,7 @@ Pistead signs people in with GitHub only, and asks GitHub for the `read:user use
 
 ### Workspaces and members
 
-Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
+Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Transcripts**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Or they share an invite link instead (see [Invite links and pending members](#invite-links-and-pending-members)). Below the owner there are four tiers:
 
@@ -417,7 +417,7 @@ The session's menu offers **Copy session ID** and **Open in workspace settings**
 
 The session panel has five tabs:
 
-- **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
+- **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Transcript** (see [Transcript size](#transcript-size)), **Backups**, **Operation request**, **Export** and **Access**.
 - **Approvals**: every approval and permission request, pending ones first.
 - **Files**: the session's worktree on its host, read-only. Open directories and preview files: text up to 256 KB, with line numbers and syntax highlighting chosen by file name (up to 128 KB), and PNG, JPEG, GIF and WebP images up to 2 MB, over a checkerboard that shows transparency; click an image to switch between fitting the panel and its actual size. SVG files show as an image, drawn without running scripts or loading anything, with their source a click away. Each path is read from the host as you open it (**Refresh** reads it again), inside the session's sandbox and confined to its worktree like the agent's file tools; symlinks that lead out of it don't open, and values that look like secrets are hidden as in the transcript. It takes the session collaborator role (`write`), since collaborators can already have the agent read any file; viewers and share links don't get it. It isn't offered on archived sessions, and needs a host whose connector is new enough to advertise it.
 - **Schedules**: the session's [scheduled prompts](#scheduled-prompts).
@@ -500,6 +500,15 @@ Only the session's owner can rename, archive or restart it, change its visibilit
 #### Share links
 
 The owner can share a session by link (**Details → People → Create link**). Anyone who has the link can follow the shared conversation read-only, without signing in, with the session's title and the owner's display name. They see nothing else: no side asks, approvals, senders, host, workspace or repositories. **Turn off** stops the link at once, and turning sharing on again issues a new one; archived sessions can't get a new link. The token is carried only in the URL fragment (`#/shared/…`) and an `X-Share-Token` header, never in a request path, and the link pages read only `GET /api/shared` and `GET /api/shared/view`.
+
+#### Transcript size
+
+A session's transcript comes from its host, which always sends Pistead the whole conversation, compressed. Two settings make what reaches each viewer smaller. Both change only what Pistead shows, so they work with every connector version:
+
+- **Full tool output** (**Details → Transcript**, the session's owner only; `PATCH /api/sessions/:id` with `{"toolOutput": "brief"}` or `"full"`) is on by default. Turned off, each tool result shows only its first line (up to 200 characters), on its row in the transcript. Long tool calls, such as a file the agent writes, are cut to their first 200 characters. Tool output is most of a typical transcript, so long sessions then load roughly half as much. It applies to everyone viewing the session, its share link included. A shortened row says how many lines and characters the full output has; the host keeps all of it, and the agent still sees all of it. Secrets are hidden before anything is shortened.
+- **Latest messages first** (**Settings → Workspaces →** the workspace **→ Transcripts**, owners and admins; `PUT /api/workspaces/:id/transcripts` with `{"paging": true}`) is off by default. Turned on, a session opens with only the newest 50 entries of each conversation. Earlier ones load 50 at a time as you scroll up, or with **Show earlier messages** at the top (`GET /api/sessions/:id/entries?conversation=…&before=…&limit=…`, up to 200). Entries you've already seen stay in place while new ones arrive. Your browser's find on the page only searches what has loaded. Share links aren't paged: they show the whole shared conversation.
+
+Open sessions pick up either change within a few seconds.
 
 #### Hidden secrets
 

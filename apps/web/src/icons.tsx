@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 export type IconName =
-  | "plus" | "settings" | "more" | "chevron-right" | "chevron-down" | "chevron-left" | "x" | "check" | "copy"
+  | "plus" | "settings" | "more" | "chevron-right" | "chevron-down" | "chevron-up" | "chevron-left" | "x" | "check" | "copy"
   | "folder" | "file" | "message" | "terminal" | "tool" | "send" | "panel-right" | "menu" | "info" | "alert" | "shield"
   | "server" | "users" | "user" | "palette" | "sun" | "moon" | "monitor" | "logout" | "archive"
   | "git-branch" | "git-pull-request" | "github" | "lock" | "globe" | "refresh" | "search" | "eye" | "trash" | "external" | "history" | "pencil" | "link" | "stop" | "clock";
@@ -13,6 +13,7 @@ const paths: Record<Exclude<IconName, "github">, ReactNode> = {
   more: <><circle cx="12" cy="5" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="12" cy="19" r="1" /></>,
   "chevron-right": <path d="m9 18 6-6-6-6" />,
   "chevron-down": <path d="m6 9 6 6 6-6" />,
+  "chevron-up": <path d="m18 15-6-6-6 6" />,
   "chevron-left": <path d="m15 18-6-6 6-6" />,
   x: <><path d="M18 6 6 18" /><path d="m6 6 12 12" /></>,
   check: <path d="M20 6 9 17l-5-5" />,

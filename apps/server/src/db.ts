@@ -73,13 +73,15 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     ...(grants ? { permissions: grants } : {}),
     ...(row.activity ? { activity: row.activity } : {}),
     ...(row.next_scheduled_at ? { nextScheduledAt: row.next_scheduled_at } : {}),
+    ...(row.tool_output === 'brief' ? { toolOutput: 'brief' as const } : {}),
     ...(pullRequest ? { pullRequest } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest' | 'nextScheduledAt'> {
-  // Visibility is live control-plane policy, activity and the pull request are what the host and pushes report, and the
-  // next scheduled prompt is the owner's schedule, so none of them is part of the immutable runner binding.
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest' | 'toolOutput' | 'nextScheduledAt'> {
+  // Visibility is live control-plane policy, activity and the pull request are what the host and pushes report, tool
+  // output is how the control plane shows the transcript, and the next scheduled prompt is the owner's schedule, so none
+  // of them is part of the immutable runner binding.
   const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, pullRequest: _pullRequest,
-    nextScheduledAt: _nextScheduledAt, ...record } = sessionRecord(row);
+    toolOutput: _toolOutput, nextScheduledAt: _nextScheduledAt, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {

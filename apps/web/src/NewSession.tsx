@@ -7,6 +7,7 @@ import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAt
 import {
   autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, mustConfirmAutoApprove, preferredSelection, readChatPreference, rememberChat, type ChatSelection,
 } from "./chat-options";
+import { writeDraft } from "./drafts";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
@@ -161,7 +162,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
             ...(images.length ? { images } : {}) } });
         } catch {
           // The session exists; keep the unsent text and images for its composer instead of failing the start.
-          writeStorage(() => sessionStorage, `pistead.draft.${sessionId}`, message);
+          writeDraft(sessionId, message);
           handOverImages(sessionId, pasted);
         }
       }

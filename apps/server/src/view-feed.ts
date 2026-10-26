@@ -8,6 +8,7 @@ import { presentApprovals } from './approval-reviews.js';
 import type { ConnectionPin } from './connector-transport.js';
 import { fail } from './http.js';
 import { requireRunnerAccess, runnerJSON, runnerRequest } from './runner.js';
+import { briefEntry, entriesBefore, fullTranscript, latestEntries, type TranscriptDisplay } from '../../../packages/shared/src/transcript-display.js';
 import type { AppContext, SessionRow } from './types.js';
 
 /**
@@ -16,6 +17,10 @@ import type { AppContext, SessionRow } from './types.js';
  * checked on every read, and callers check it again before showing anything.
  *
  * The server is a single process, so feeds live in memory; a restart or a reconnected host starts again from a whole view.
+ *
+ * How the session's transcript is shown (transcript-display.ts) is part of a feed's identity: brief tool output is applied
+ * after redaction, and a paged feed's views hold each conversation's latest entries while it keeps the whole view to
+ * answer reads of earlier ones. Hosts always send whole views.
  */
 
 /** A view stays current this long after it arrives; snapshots reach each viewer about a second apart. */
@@ -36,11 +41,14 @@ interface Snapshot {
   /** The connector connection `hostRevision` belongs to: a reconnected host may run another connector version. */
   generation: string | null;
   raw: SessionView;
+  /** Presented and redacted, with every entry: what earlier pages of a paged view come from. */
+  full: SessionView;
   shown: ShownView;
 }
 
 interface Feed {
   key: string;
+  display: TranscriptDisplay;
   snapshot?: Snapshot;
   fresh: boolean;
   /** Bumped by every change made through the server, so no read after it is served a view fetched before it. */
@@ -54,6 +62,7 @@ interface Feed {
 
 const registries = new WeakMap<object, Map<string, Feed>>();
 const redacted = new WeakMap<object, EntryView>();
+const briefed = new WeakMap<object, EntryView>();
 
 function registry(env: object): Map<string, Feed> {
   let feeds = registries.get(env);
@@ -61,14 +70,26 @@ function registry(env: object): Map<string, Feed> {
   return feeds;
 }
 
-function feedFor(c: AppContext, row: SessionRow): Feed {
+/**
+ * How the session's transcript is shown now: its own tool output setting and its workspace's paging, both read again
+ * (a stream holds its session row for seconds, and either can change meanwhile).
+ */
+export async function transcriptDisplay(c: AppContext, row: SessionRow): Promise<TranscriptDisplay> {
+  const current = await c.env.DB.query<{ tool_output: string | null; paging: number | null }>(`SELECT s.tool_output, t.paging
+    FROM sessions s LEFT JOIN workspace_transcript_settings t ON t.workspace_id = s.workspace_id WHERE s.id = ?`).bind(row.id).first();
+  return { toolOutput: (current ? current.tool_output : row.tool_output) === 'brief' ? 'brief' : 'full', paging: current?.paging === 1 };
+}
+
+function feedFor(c: AppContext, row: SessionRow, display: TranscriptDisplay): Feed {
   const feeds = registry(c.env);
   const now = Date.now();
   for (const [id, feed] of feeds) if (now - feed.usedAt > idleMs && !feed.inflight) feeds.delete(id);
-  const key = JSON.stringify([row.owner_id, row.connector_id ?? null]);
+  const key = JSON.stringify([row.owner_id, row.connector_id ?? null, display.toolOutput, display.paging]);
   let feed = feeds.get(row.id);
-  // A session that changed hosts or owners starts over.
-  if (!feed || feed.key !== key) feed = { key, fresh: false, epoch: 0, started: 0, applied: 0, revisions: new ViewRevisions(8), usedAt: now };
+  // A session that changed hosts, owners or how it is shown starts over: viewers holding an older revision get a whole view.
+  if (!feed || feed.key !== key) {
+    feed = { key, display: { ...display }, fresh: false, epoch: 0, started: 0, applied: 0, revisions: new ViewRevisions(8), usedAt: now };
+  }
   feeds.delete(row.id);
   feeds.set(row.id, feed);
   feed.usedAt = now;
@@ -91,37 +112,54 @@ export function invalidateSessionView(c: AppContext, sessionId: string): void {
  * The session's current view for the signed-in viewer, after checking their access. Callers must recheck access before
  * showing it, as for any view read from a host. `latest` always asks the host, as a page loading the session does.
  */
-export async function sessionView(c: AppContext, row: SessionRow, { latest = false } = {}): Promise<ShownView> {
-  const feed = feedFor(c, row);
-  if (latest) return (await refresh(c, row, feed)).shown;
+export async function sessionView(c: AppContext, row: SessionRow, { latest = false, display = fullTranscript }: { latest?: boolean; display?: TranscriptDisplay } = {}): Promise<ShownView> {
+  return (await currentSnapshot(c, row, feedFor(c, row, display), latest)).shown;
+}
+
+async function currentSnapshot(c: AppContext, row: SessionRow, feed: Feed, latest: boolean): Promise<Snapshot> {
+  if (latest) return refresh(c, row, feed);
   if (feed.fresh && feed.snapshot) {
     await requireRunnerAccess(c, c.get('auth').userId, row, 'view');
-    return feed.snapshot.shown;
+    return feed.snapshot;
   }
   const inflight = feed.inflight;
   if (inflight && inflight.epoch === feed.epoch) {
     await requireRunnerAccess(c, c.get('auth').userId, row, 'view');
-    try { return (await inflight.promise).shown; } catch (error) {
+    try { return await inflight.promise; } catch (error) {
       // Access revoked from the viewer who started it says nothing about this one, who fetches as themselves.
       if (!(error instanceof HTTPException) || error.status !== 403) throw error;
     }
   }
-  return (await refresh(c, row, feed)).shown;
+  return refresh(c, row, feed);
+}
+
+/**
+ * Up to `limit` of a conversation's entries before `before`, presented and redacted as the session's views are, and how
+ * many come before those; null when the conversation has no such entry any more. Callers must recheck access.
+ */
+export async function earlierEntries(c: AppContext, row: SessionRow, display: TranscriptDisplay, conversationId: string, before: string,
+  limit: number): Promise<{ entries: EntryView[]; older: number } | null> {
+  const feed = feedFor(c, row, display);
+  const page = entriesBefore((await currentSnapshot(c, row, feed, false)).full, conversationId, before, limit);
+  // The viewer may hold a newer view than the feed: ask the host before saying the entry is gone.
+  return page ?? entriesBefore((await currentSnapshot(c, row, feed, true)).full, conversationId, before, limit);
 }
 
 /** What changed for a viewer holding `since`, or null when they need the whole view. */
-export function viewChanges(c: AppContext, row: SessionRow, since: string | undefined, current: ShownView): SessionViewPatch | null {
-  return feedFor(c, row).revisions.since(since, current);
+export function viewChanges(c: AppContext, row: SessionRow, since: string | undefined, current: ShownView,
+  display: TranscriptDisplay = fullTranscript): SessionViewPatch | null {
+  return feedFor(c, row, display).revisions.since(since, current);
 }
 
 function refresh(c: AppContext, row: SessionRow, feed: Feed): Promise<Snapshot> {
   const sequence = ++feed.started;
   const epoch = feed.epoch;
-  const promise = fetchSnapshot(c, row, feed.snapshot).then(({ view, ...fetched }) => {
+  const promise = fetchSnapshot(c, row, feed.snapshot, feed.display).then(({ view, ...fetched }) => {
     // A fetch that started earlier but finished later never replaces a newer view.
     if (sequence < feed.applied) return feed.snapshot!;
     feed.applied = sequence;
-    const snapshot: Snapshot = { ...fetched, shown: feed.revisions.record(view) };
+    const shown = feed.revisions.record(feed.display.paging ? latestEntries(view) : view);
+    const snapshot: Snapshot = { ...fetched, full: view, shown };
     feed.snapshot = snapshot;
     if (epoch === feed.epoch) {
       feed.fresh = true;
@@ -135,9 +173,10 @@ function refresh(c: AppContext, row: SessionRow, feed: Feed): Promise<Snapshot> 
 }
 
 /** The host's current view, presented and redacted, from what the server holds in `base`. */
-async function fetchSnapshot(c: AppContext, row: SessionRow, base: Snapshot | undefined): Promise<Omit<Snapshot, 'shown'> & { view: SessionView }> {
+async function fetchSnapshot(c: AppContext, row: SessionRow, base: Snapshot | undefined,
+  display: TranscriptDisplay): Promise<Omit<Snapshot, 'shown' | 'full'> & { view: SessionView }> {
   /** The host's view, as a patch from `since` when given; null when the host should be asked for the whole view instead. */
-  const read = async (since?: string): Promise<Omit<Snapshot, 'shown'> | null> => {
+  const read = async (since?: string): Promise<Omit<Snapshot, 'shown' | 'full'> | null> => {
     const pin: ConnectionPin = since && row.connector_id ? { hash: base!.generation } : {};
     let reply: { view?: SessionView; revision?: unknown; patch?: unknown };
     try {
@@ -171,9 +210,18 @@ async function fetchSnapshot(c: AppContext, row: SessionRow, base: Snapshot | un
   const approvals = await presentApprovals(c, row, raw.approvals);
   // Secrets are hidden from everyone; approvals keep the review hash committed to the real operation.
   const { olderApprovals, ...rest } = raw;
-  const view: SessionView = { ...rest, entries: raw.entries.map(redactedEntry), approvals: approvals.map(redactApproval),
+  const entries = raw.entries.map(redactedEntry);
+  const view: SessionView = { ...rest, entries: display.toolOutput === 'brief' ? entries.map(briefedEntry) : entries, approvals: approvals.map(redactApproval),
     ...(Number.isSafeInteger(olderApprovals) && olderApprovals! > 0 ? { olderApprovals } : {}) };
   return { ...result, view };
+}
+
+/** A redacted entry as brief tool output shows it, the same object each time so it is neither compared nor sent again. */
+function briefedEntry(entry: EntryView): EntryView {
+  if (!entry || typeof entry !== 'object') return entry;
+  let shown = briefed.get(entry);
+  if (!shown) briefed.set(entry, shown = briefEntry(entry));
+  return shown;
 }
 
 function redactedEntry(entry: EntryView): EntryView {

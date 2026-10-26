@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0032_scheduled_prompts.sql.
+-- Postgres translation of sqlite/0033_scheduled_prompts.sql.
 
 -- Scheduled prompts (scheduled-prompts.ts): messages the server sends a session's agent on a cron schedule, as the
 -- session's owner, who alone manages them. A sweep sends each one that is due while its session is idle.
