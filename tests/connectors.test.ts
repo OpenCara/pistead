@@ -467,6 +467,9 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'git credentials without pushes', value: { ...manifest, capabilities: { ...manifest.capabilities, gitCredentials: true } }, code: 'invalid_manifest' },
     { name: 'non-boolean session branches', value: { ...manifest, capabilities: { ...manifest.capabilities, sessionBranches: 'true' } }, code: 'invalid_manifest' },
     { name: 'session branches without plain Git', value: { ...manifest, capabilities: { ...manifest.capabilities, plainGit: false, sessionBranches: true } }, code: 'invalid_manifest' },
+    { name: 'non-boolean host configuration', value: { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: 'true' } }, code: 'invalid_manifest' },
+    { name: 'unknown GPU device', value: { ...manifest, capabilities: { ...manifest.capabilities, gpu: 'cuda' } }, code: 'invalid_manifest' },
+    { name: 'GPU lent by an unsandboxed host', value: { ...manifest, capabilities: { platform: 'darwin', sandbox: false, productionShell: false, unsandboxed: true, gpu: 'render' } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -488,6 +491,10 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
   const named = { ...manifest.capabilities, sessionBranches: true };
   await json(await self(f, connector, 'manifest', { ...manifest, capabilities: named }));
   assert.equal(JSON.parse(String(f.sqlite.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').get(connector.connectorId)!.capabilities_json)).sessionBranches, true);
+  // Connectors configured in Pistead say so, and which GPU device they can lend.
+  const configured = { ...manifest.capabilities, hostConfig: true, gpu: 'dxg' };
+  await json(await self(f, connector, 'manifest', { ...manifest, capabilities: configured }));
+  assert.deepEqual(JSON.parse(String(f.sqlite.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').get(connector.connectorId)!.capabilities_json)), configured);
   for (const table of ['connectors', 'connector_pairings', 'models', 'audit']) {
     assert.ok(!JSON.stringify(f.sqlite.prepare(`SELECT * FROM ${table}`).all()).includes(secret));
   }
@@ -2576,4 +2583,59 @@ test('host owners add admins who manage sharing and host command grants, and gra
   await denied(await creator.request('PUT', grants, { level: 'approve' }), 409, 'grant_unavailable');
   assert.equal((await creator.request('DELETE', `${admins}/${creator.user.id}`)).status, 204);
   await denied(await creator.request('PUT', `/api/connectors/${id}/shares/${s.team.id}`), 404, 'not_found');
+});
+
+test('host owners and admins configure how the host runs sessions, and only the owner decides whose credentials it uses', async t => {
+  const f = await fixture(t); const s = await sharedHost(f); const outsider = await f.client('outsider');
+  const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off' };
+  const listed = async (client: Client) => (await json<{ connectors: ConnectorInfo[] }>(await client.request('GET', '/api/connectors'))).connectors
+    .find(item => item.id === id)?.config;
+  // Its owner and the connector itself read it; members of a workspace it is shared with neither see nor change it.
+  assert.deepEqual(await listed(host), defaults);
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: defaults });
+  const shared = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
+  assert.equal(shared.find(item => item.id === id)?.config, undefined);
+  await denied(await creator.request('PUT', path, defaults), 404, 'not_found');
+  await denied(await outsider.request('PUT', path, defaults), 404, 'not_found');
+
+  // Only a whole, valid configuration.
+  for (const invalid of [{ ...defaults, commandTimeoutSeconds: 29 }, { ...defaults, commandTimeoutSeconds: 3601 }, { ...defaults, commandTimeoutSeconds: 60.5 },
+    { ...defaults, commandTimeoutSeconds: '60' }, { ...defaults, gpu: 'yes' }, { ...defaults, gitCredentials: 1 }, { ...defaults, repositoryCache: 'shared' },
+    { ...defaults, unknown: true }, { commandTimeoutSeconds: 60 }, []]) {
+    await denied(await host.request('PUT', path, invalid), 400, 'invalid_host_config');
+  }
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_configs').get()!.n, 0);
+  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner' };
+  assert.deepEqual(await json(await host.request('PUT', path, owned)), { config: owned });
+  assert.deepEqual(await listed(host), owned);
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: owned });
+  // Only over its current connection.
+  await denied(await self(f, s.connector, 'config', {}, null), 401, 'stale_connection');
+
+  // Its admins change the time limit and the GPU, never whose Git credentials the host uses.
+  await json(await host.request('PUT', `/api/connectors/${id}/admins/${creator.user.id}`));
+  assert.deepEqual(await listed(creator), owned);
+  await denied(await creator.request('PUT', path, { ...owned, gitCredentials: false }), 403, 'host_owner_required');
+  await denied(await creator.request('PUT', path, { ...owned, repositoryCache: 'host' }), 403, 'host_owner_required');
+  const tuned = { ...owned, commandTimeoutSeconds: 3600, gpu: false };
+  assert.deepEqual(await json(await creator.request('PUT', path, tuned)), { config: tuned });
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: tuned });
+  const audits = f.sqlite.prepare(`SELECT actor_id, detail_json FROM audit WHERE action = 'host.config.updated' ORDER BY created_at, rowid`).all()
+    .map(row => ({ actor: row.actor_id, detail: JSON.parse(String(row.detail_json)) }));
+  assert.deepEqual(audits, [{ actor: host.user.id, detail: { connectorId: id, ...owned } }, { actor: creator.user.id, detail: { connectorId: id, ...tuned } }]);
+
+  // A revoked host takes no configuration.
+  assert.equal((await host.request('DELETE', `/api/connectors/${id}`)).status, 204);
+  await denied(await host.request('PUT', path, defaults), 409, 'connector_revoked');
+});
+
+test('an admin\'s first configuration of a host leaves the owner\'s settings at their defaults', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
+  await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.creator.user.id}`));
+  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off' };
+  assert.deepEqual(await json(await s.creator.request('PUT', path, config)), { config });
+  assert.deepEqual({ ...f.sqlite.prepare('SELECT git_credentials, repository_cache, updated_by FROM connector_configs WHERE connector_id = ?').get(id) },
+    { git_credentials: 0, repository_cache: 'off', updated_by: s.creator.user.id });
 });

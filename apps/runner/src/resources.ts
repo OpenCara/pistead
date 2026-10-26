@@ -286,6 +286,9 @@ def recover(cg, control):
 def run(cg, control, entries):
     name = PREFIX + sys.argv[3]
     require(KEY.fullmatch(name), 'invalid resource session key')
+    # The command's time limit, from the host's configuration: the runner's own deadline is the same.
+    require(re.fullmatch(r'[1-9][0-9]{0,4}', sys.argv[4]) is not None and int(sys.argv[4]) <= 86400, 'invalid resource deadline')
+    seconds = int(sys.argv[4])
     verify_storage(8, entries)
     for fd in (3, 4, 5):
         require(os.fstat(fd).st_dev == os.fstat(8).st_dev and mount_for(fd, entries)['id'] == mount_for(8, entries)['id'], 'writable mount escapes bounded session volume')
@@ -313,7 +316,7 @@ def run(cg, control, entries):
         for file, value in values.items():
             write_at(group, file, value)
             require(read_at(group, file) == str(value), 'kernel did not apply ' + file)
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + seconds
         gate_read, gate = os.pipe2(os.O_CLOEXEC)
         child = os.fork()
         if child == 0:
@@ -328,7 +331,7 @@ def run(cg, control, entries):
                             os.close(fd)
                         except OSError:
                             pass
-                os.execve('/usr/bin/bwrap', ['/usr/bin/bwrap'] + sys.argv[4:], {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'})
+                os.execve('/usr/bin/bwrap', ['/usr/bin/bwrap'] + sys.argv[5:], {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'})
             except BaseException:
                 os._exit(125)
         os.close(gate_read)
@@ -394,9 +397,11 @@ except Exception as error:
     sys.exit(125)
 `;
 
-export function resourceLaunch(config: ResourceConfig, sessionKey: string, args: string[]): { command: string; args: string[] } {
+/** `deadlineSeconds`: the command's time limit; the supervisor kills the whole domain once it passes. */
+export function resourceLaunch(config: ResourceConfig, sessionKey: string, args: string[], deadlineSeconds = 30): { command: string; args: string[] } {
   if (!/^[0-9a-f]{64}$/.test(sessionKey)) throw new Error("Invalid resource session key");
-  return { command: "/usr/bin/python3", args: ["-I", "-c", SUPERVISOR, JSON.stringify(validateResourceConfig(config)), "run", sessionKey, ...args] };
+  if (!Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1 || deadlineSeconds > 86_400) throw new Error("Invalid resource deadline");
+  return { command: "/usr/bin/python3", args: ["-I", "-c", SUPERVISOR, JSON.stringify(validateResourceConfig(config)), "run", sessionKey, String(deadlineSeconds), ...args] };
 }
 
 async function controlCommand(config: ResourceConfig, mode: "probe" | "recover", storageRoot = ""): Promise<void> {

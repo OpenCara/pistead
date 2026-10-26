@@ -10,7 +10,6 @@ const bridge: PisteadBridge = {
     refresh: () => ipcRenderer.invoke(channels.hostRefresh),
     start: input => ipcRenderer.invoke(channels.hostStart, input),
     stop: () => ipcRenderer.invoke(channels.hostStop),
-    setGitCredentials: enabled => ipcRenderer.invoke(channels.hostGitCredentials, enabled),
     setOpenAtLogin: enabled => ipcRenderer.invoke(channels.hostOpenAtLogin, enabled),
     onUpdate: listener => {
       const forward = (_event: unknown, view: HostView) => listener(view);

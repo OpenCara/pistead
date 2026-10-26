@@ -762,6 +762,22 @@ test('push access with the host\'s Git credentials needs its owner\'s opt-in, th
   assert.equal(f.calls.find(call => call.method === 'POST' && call.url.endsWith('/pulls'))!.authorization, 'Bearer owner-oauth-token', 'pull requests are still opened as the owner');
 });
 
+test('a host configured in Pistead pushes with its Git credentials only while its owner has them on there, whatever it advertises', async t => {
+  const f = await fixture(t, { host: { owner } });
+  f.pushIdentity('github', 'github.com', '', 'host-credentials');
+  // Even claiming the old --git-credentials opt-in, a connector configured in Pistead follows its configuration.
+  f.sqlite.prepare("UPDATE connectors SET capabilities_json = json_set(capabilities_json, '$.hostConfig', json('true'), '$.gitCredentials', json('true')) WHERE id = 'connector'").run();
+  const op = f.operation({});
+  const attempt = (approvalId: string) => f.post(credential, { sessionId: 'session', approvalId, actorId: owner, operation: op, admissionId: f.admit('auto') });
+  assert.equal(await code(await attempt('tool-configured-1')), 'host_git_credentials_disabled');
+  f.sqlite.prepare("INSERT INTO connector_configs (connector_id, git_credentials, updated_by, updated_at) VALUES ('connector', 1, ?, ?)").run(owner, new Date().toISOString());
+  const response = await attempt('tool-configured-2');
+  assert.equal(response.status, 200);
+  assert.equal((await response.json() as { hostCredentials?: boolean }).hostCredentials, true);
+  f.sqlite.prepare("UPDATE connector_configs SET git_credentials = 0 WHERE connector_id = 'connector'").run();
+  assert.equal(await code(await attempt('tool-configured-3')), 'host_git_credentials_disabled');
+});
+
 test('a clone session pushes to the workspace repository at the operation path, with no pins', async t => {
   const f = await fixture(t);
   const op = f.operation({ directory: 'repo' });

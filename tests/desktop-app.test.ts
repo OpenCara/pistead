@@ -67,11 +67,12 @@ test("start requests from the page are checked field by field, and a pasted code
 });
 
 test("a damaged settings file falls back to defaults field by field, never to an unchecked server", () => {
-  assert.deepEqual(parseSettings(undefined), { server: "https://pistead.com", gitCredentials: false });
-  assert.deepEqual(parseSettings({ server: "http://evil.example", gitCredentials: "true", windowBounds: { x: 0, y: 0, width: 10, height: 10 }, resumeHost: {} }),
-    { server: "https://pistead.com", gitCredentials: false });
+  assert.deepEqual(parseSettings(undefined), { server: "https://pistead.com" });
+  assert.deepEqual(parseSettings({ server: "http://evil.example", windowBounds: { x: 0, y: 0, width: 10, height: 10 }, resumeHost: {} }),
+    { server: "https://pistead.com" });
+  // Git credentials an older version kept here are dropped: the host's owner turns them on in Pistead now.
   assert.deepEqual(parseSettings({ server: "http://127.0.0.1:8789/", gitCredentials: true, windowBounds: { x: 10, y: 20, width: 900, height: 700 }, resumeHost: { unsandboxedConsent: true } }),
-    { server: "http://127.0.0.1:8789", gitCredentials: true, windowBounds: { x: 10, y: 20, width: 900, height: 700 }, resumeHost: { unsandboxedConsent: true } });
+    { server: "http://127.0.0.1:8789", windowBounds: { x: 10, y: 20, width: 900, height: 700 }, resumeHost: { unsandboxedConsent: true } });
 });
 
 test("resuming at launch reuses only the consent given at the owner's last start; a failure or the owner's stop ends it", async t => {

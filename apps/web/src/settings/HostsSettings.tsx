@@ -9,6 +9,7 @@ import { Icon } from "../icons";
 import { href, navigate } from "../router";
 import { Alert, Button, CardBody, Collapsible, Combobox, confirmDialog, CopyField, EmptyState, Feedback, Field, Loading, ResourceState, Row, Section, Sheet, StatusDot, Timestamp, useAction, useResource, type ActionState } from "../ui";
 import { HostAdminsSection, HostCommandGrantsSection } from "./HostAccess";
+import { HostConfigSection } from "./HostConfig";
 import "./settings.css";
 
 const hostsInfo = <>
@@ -222,6 +223,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       </div>
       <Feedback error={shareAction.error} notice={shareAction.notice} />
     </Section>
+    <HostConfigSection connector={connector} refresh={refresh} />
     {connector.capabilities.hostCommands && <HostCommandGrantsSection connector={connector} refresh={refresh} />}
     <HostAdminsSection connector={connector} refresh={refresh} />
     <Section title="Details">
@@ -241,7 +243,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       <div className="stack">
         <Alert variant={connector.online ? "success" : "warning"} title={connector.online ? "Host is connected" : "Start the connection on your host"}>Pistead cannot remotely start an offline host. If you use the desktop app, open it on the host and start its connection. For a CLI host, run the command below on the original machine with its saved pairing.</Alert>
         <Field label="Run on your host"><CopyField value={`npx pistead@latest connect${connector.capabilities.unsandboxed ? " --unsafe-no-sandbox" : ""}`} label="Copy reconnect command" /></Field>
-        <span className="small muted">Use the same OS user and any original options, especially --state-dir, --resources, --pi-agent-dir, --model, --git-credentials and --repo-cache. Do not add --pairing-id or --force: the saved credentials preserve this host and its sessions. Stop any existing connector before starting another. Status refreshes every 10 seconds.</span>
+        <span className="small muted">Use the same OS user and any original options of the machine's own setup: --state-dir, --resources, --pi-agent-dir and --model. Everything else is this host's Configuration, here. Do not add --pairing-id or --force: the saved credentials preserve this host and its sessions. Stop any existing connector before starting another. Status refreshes every 10 seconds.</span>
         <span className="small muted">If the saved pairing is missing, pair a new host instead. A new pairing does not reconnect this host's existing sessions.</span>
         <Button variant="outline" onClick={refresh}>Refresh status</Button>
       </div>

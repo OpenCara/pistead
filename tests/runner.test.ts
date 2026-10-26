@@ -18,6 +18,7 @@ import type { RestoreDescriptor, RestoreInput } from "../packages/shared/src/con
 import { RunnerError, assertId, requestKey, stableJson, validateBinding, validateOperation, verifyRunnerTicket } from "../apps/runner/src/protocol.js";
 import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
 import { RunnerSession } from "../apps/runner/src/session.js";
+import { commandLimits, type CommandLimits } from "../apps/runner/src/host-config.js";
 import { acquireRunnerLease } from "../apps/runner/src/lease.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 
@@ -67,6 +68,19 @@ async function operationRequests(session: RunnerSession, count = 1): Promise<App
     await delay(20);
   }
   assert.fail("no operation request");
+}
+/**
+ * Waits for card `id` to settle and returns it as the session keeps it: an approved shell command runs in the background,
+ * as host commands do, so deciding reports it executing.
+ */
+async function settledCard(session: RunnerSession, id: string): Promise<ApprovalRecord> {
+  const metadata = () => (session as unknown as { metadata(): Promise<{ approvals: Record<string, ApprovalRecord> }> }).metadata();
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const card = (await metadata()).approvals[id];
+    if (card && !["pending", "approved", "executing"].includes(card.status)) return card;
+    await delay(20);
+  }
+  assert.fail("the card did not settle");
 }
 const rejectedWith = (code: number, message: RegExp) => (error: unknown) => error instanceof RunnerError && error.status === code && message.test(error.message);
 async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
@@ -198,7 +212,9 @@ test("writer cannot self-approve without approve permission; exact authorized op
   const approval = await session.createApproval("test:bob", operation);
   await assert.rejects(session.decide(await ticket("approval-session", "approve", "test:bob"), approval.id, { decision: "approve", operation }));
   await assert.rejects(session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation: { ...operation, command: "true" } }));
-  const result = await session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation });
+  const decided = await session.decide(await ticket("approval-session", "approve"), approval.id, { decision: "approve", operation });
+  assert.equal(decided.status, "executing", "an approved command runs in the background");
+  const result = await settledCard(session, approval.id);
   assert.equal(result.status, "executed", result.result);
   assert.equal(result.requestedBy, "test:bob");
   assert.equal(result.decidedBy, "test:alice");
@@ -521,7 +537,8 @@ test("only the host's owner lets a command run without the resource limits the h
   const [command] = await operationRequests(own);
   assert.equal(command!.operation.kind, "bash");
   assert.equal(command!.unbounded, true);
-  const ran = await own.decide({ ...await ticket("limitless-own", "approve"), connectorId }, command!.id, { decision: "approve", operation: command!.operation });
+  await own.decide({ ...await ticket("limitless-own", "approve"), connectorId }, command!.id, { decision: "approve", operation: command!.operation });
+  const ran = await settledCard(own, command!.id);
   assert.equal(ran.status, "executed");
   assert.match(ran.result ?? "", /unlimited-marker/);
   await idle(own);
@@ -544,6 +561,35 @@ test("shell commands may reserve address space they never touch, as gh and node 
   // Mapped PROT_NONE, 16 GiB commits no memory: only an address-space cap refuses it.
   const command = "python3 -I -c 'import mmap; mmap.mmap(-1, 16 << 30, flags=mmap.MAP_PRIVATE, prot=0); print(\"reserved\")'";
   assert.match(await session.sandbox.execute({ kind: "bash", command }, true, allowTestOperation, { allowTestShell: true }), /reserved/);
+});
+
+test("a longer command time limit gives builds room; the default keeps the limits of short commands", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const session = await service.provision(binding("limits-session"), await ticket("limits-session", "create"));
+  const limits = async (options: { limits?: CommandLimits } = {}) => (await session.sandbox.execute({ kind: "bash", command: "ulimit -t; ulimit -f; ulimit -n" }, true,
+    allowTestOperation, { allowTestShell: true, ...options })).trim().split("\n");
+  assert.deepEqual(await limits(), ["25", "65536", "256"]);
+  assert.deepEqual(await limits({ limits: commandLimits(30) }), ["25", "65536", "256"]);
+  const [cpu, size, files] = await limits({ limits: commandLimits(600, 2) });
+  assert.equal(cpu, "1200", "every CPU for the whole time limit");
+  assert.equal(size, String(16 * 1024 * 1024), "16 GiB, in ulimit's 1024-byte blocks");
+  // Never more open files than the runner's own hard limit.
+  assert.ok(Number(files) > 256 && Number(files) <= 8192, files);
+});
+
+test("a stopped shell command ends at once, and one stopped before it starts never runs", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const session = await service.provision(binding("stop-session"), await ticket("stop-session", "create"));
+  const controller = new AbortController();
+  const started = Date.now();
+  const running = session.sandbox.execute({ kind: "bash", command: "sleep 20" }, false, allowTestOperation,
+    { allowTestShell: true, limits: commandLimits(600), signal: controller.signal });
+  setTimeout(() => controller.abort(), 200);
+  await assert.rejects(running, /Command stopped/);
+  assert.ok(Date.now() - started < 10_000);
+  await assert.rejects(session.sandbox.execute({ kind: "bash", command: "touch never" }, false, allowTestOperation,
+    { allowTestShell: true, signal: controller.signal }), /stopped before it started/);
+  assert.doesNotMatch(await session.sandbox.execute({ kind: "bash", command: "ls -a" }, true, allowTestOperation, { allowTestShell: true }), /never/);
 });
 
 test("kernel runner lease admits one owner and releases without deleting stale files", { skip: process.platform !== "linux" }, async t => {
@@ -582,7 +628,8 @@ test("the agent gets a command's whole output; the approval record and the contr
 
   await session.submit(await ticket("long-output", "submit"), { content: `TEST_BASH ${command}`, requestId: "approved" }, "write");
   const [pending] = await operationRequests(session);
-  const ran = await session.decide(await ticket("long-output", "approve"), pending!.id, { decision: "approve", operation: pending!.operation });
+  await session.decide(await ticket("long-output", "approve"), pending!.id, { decision: "approve", operation: pending!.operation });
+  const ran = await settledCard(session, pending!.id);
   assert.equal(ran.status, "executed");
   assert.ok(ran.result!.length <= 8192, "the control plane gets an excerpt it accepts");
   assert.match(ran.result!, /^start-marker[\s\S]*characters omitted[\s\S]*end-marker$/);
@@ -627,7 +674,8 @@ test("read access asks the owner before a change, and auto access runs owner com
   assert.equal(view.activity, "waiting");
   assert.ok(!view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("pending-marker")), "no result before the decision");
   // Deciding doesn't wait for the message: the message waits for the decision.
-  const ran = await session.decide(await ticket("options-session", "approve"), pending!.id, { decision: "approve", operation: pending!.operation });
+  await session.decide(await ticket("options-session", "approve"), pending!.id, { decision: "approve", operation: pending!.operation });
+  const ran = await settledCard(session, pending!.id);
   assert.equal(ran.status, "executed");
   await idle(session);
   view = await session.view();

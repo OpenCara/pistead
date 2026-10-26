@@ -26,7 +26,6 @@ export interface StartRequest extends DevelopmentOptions {
   pairing?: { id: string; code: string };
   /** With `pairing`, replace this machine's saved pairing. */
   replacePairing?: boolean;
-  gitCredentials?: boolean;
   /** Set only after the owner accepted the unsandboxed warning in a native dialog. */
   unsandboxedConsent?: boolean;
   /** Explicit subset; without it Pi's enabledModels setting, else every authenticated model, is advertised. */

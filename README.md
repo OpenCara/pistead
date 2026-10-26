@@ -204,7 +204,7 @@ This is how a team shares one model subscription or set of API keys. Sign Pi in 
 - As the host's operator, you can see the prompts and repository files of every session that runs on it. Members starting a session on someone else's host confirm they trust it (**I trust …'s host**).
 - **Settings → Hosts → Shared with you** lists the hosts others shared into your workspaces.
 
-The host's page shows its **Status** (online or offline, owner, capabilities), **Models**, **Sharing**, **Host command access**, **Admins**, **Details** (the connection ID) and **Danger zone**. **Revoke host** disconnects it and blocks work in every workspace, your own sessions included; session records are kept, and the machine needs a new pairing to come back.
+The host's page shows its **Status** (online or offline, owner, capabilities), **Models**, **Sharing**, **[Configuration](#host-configuration)**, **Host command access**, **Admins**, **Details** (the connection ID) and **Danger zone**. **Revoke host** disconnects it and blocks work in every workspace, your own sessions included; session records are kept, and the machine needs a new pairing to come back.
 
 #### Host admins and host command grants
 
@@ -215,9 +215,26 @@ By default only a host's owner manages its sharing and decides its `host_bash` c
 
 The host asks the control plane who holds which grant each time a host command is created, decided or run, so a grant that ends stops working at the next command. Grants need a connector advertising `hostGrants`; until it is updated, only the owner decides host commands. Every admin and grant change is recorded in the audit log.
 
+#### Host configuration
+
+How a host runs its sessions is set on its page, under **Configuration**, rather than with connector options (connector newer than 0.9.0):
+
+| Setting | Effect | Changed by |
+|---|---|---|
+| **Command time limit** | How long a shell command may run before it is stopped, from 30 seconds (the default) to an hour. A longer limit also lifts the per-process limits of short commands (25 seconds of CPU, 64 MiB per file, 256 open files) so builds fit: each process may use every CPU for the whole limit, write files of up to 16 GiB and open 8192 files | Owner and admins |
+| **GPU** | Sandboxed commands get the host's GPU render device for rendering and compute: `/dev/dxg` on WSL2, or Linux DRM render nodes with their sysfs entries. Never the screen, windows, input or display (`card`) nodes, so the agent renders offscreen, for example to image files it reads back. Offered only where the connector found such a device. On WSL2, Mesa's `vulkan-dzn` on the host gives Vulkan over the Windows driver | Owner and admins |
+| **Git credentials** | Pushes in the owner's own sessions may use the credentials Git on the host would use (see [push access](#push-access)) | Owner |
+| **Repository cache** | Off, or a full mirror of each repository on the host for every session (**Shared**) or one per session owner (**Per owner**); see [Repository cache](#repository-cache-preview) | Owner |
+
+Running sessions pick up a change within a minute, and the agent finds the time limit and GPU in `identity` (`commands`); a repository cache change applies when the connector next connects. Turning on Git credentials, the cache or the GPU asks first, and every change is recorded in the audit log (`host.config.updated`).
+
+- A command approved by hand no longer holds the approval until it ends: its card shows it running and settles with its outcome, as host commands do. Stopping the message, or the session closing, stops a running command.
+- Without provisioned resource limits (`--resources`), a command can use the whole machine for its time limit.
+- A host started with `--git-credentials` or `--repo-cache` keeps those settings here; current connectors ignore the options. A connector that predates host configuration keeps its options until it is updated, and the page says so.
+
 #### The sandbox
 
-With bubblewrap, every session runs in its own sandbox: no direct network (see [Network access](#network-access)), read-only system directories, and only the session's own worktree writable. Commands in it stop after 30 seconds. Git there runs without hooks, stored credentials or SSH: an approved push gets a credential for that push alone (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)), and GitHub actions go through Pistead.
+With bubblewrap, every session runs in its own sandbox: no direct network (see [Network access](#network-access)), read-only system directories, and only the session's own worktree writable. Commands in it stop after the host's [command time limit](#host-configuration), 30 seconds unless its owner or an admin sets a longer one. Git there runs without hooks, stored credentials or SSH: an approved push gets a credential for that push alone (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)), and GitHub actions go through Pistead.
 
 Shell commands (`bash`) also need resource limits. A connector started with `--resources PATH` (an operator-provisioned cgroup v2 configuration: CPU, memory, process and disk limits, described in [`apps/runner/src/resources.ts`](apps/runner/src/resources.ts)) runs them in every session. Without it, only the host's owner can let commands run without limits, and only in their own sessions, through a [permission request](#permission-requests); in other members' sessions on that host, `bash` is refused.
 
@@ -260,12 +277,7 @@ Pistead labels such a host **Unsandboxed** to everyone who can see it.
 
 #### Repository cache (preview)
 
-By default each session downloads its clones itself. With `--repo-cache` (connector 0.9.0 or newer), the connector keeps a full clone of each repository on the host and lets sessions' clones borrow from it:
-
-```sh
-npx pistead@latest connect --repo-cache                            # one cache for every session on this host
-npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
-```
+By default each session downloads its clones itself. With **Repository cache** set to **Shared** (one cache for every session on the host) or **Per owner** (a separate cache for each session owner) in the host's [configuration](#host-configuration), the connector keeps a full clone of each repository on the host and lets sessions' clones borrow from it. Only the host's owner changes it, and it applies when the connector next connects. (Connectors 0.9.0 and older take `--repo-cache` and `--repo-cache-scope owner` instead.)
 
 - `git clone` of a workspace repository first brings the host's copy up to date through Pistead, with the session owner's own account like every other read, then borrows its objects (`--reference-if-able`) instead of downloading and storing them again. A clone that doesn't come within 20 seconds goes ahead on its own; clones with `--reference`, `--shared` or `--dissociate` are left alone. A session sees a copy, read-only, only once Pistead has let its owner read the repository, again each time the session is reopened. A copy the session's first command created is visible from its next command on.
 - Inside the sandbox the cache is read-only.
@@ -283,11 +295,10 @@ npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate 
 | `--model PROVIDER/MODEL` | Offer this model (repeatable) instead of `enabledModels` |
 | `--resources PATH` | Operator-provisioned resource limits that let `bash` run in every session |
 | `--unsafe-no-sandbox` | Run agent work directly on this machine, without isolation; asks for confirmation |
-| `--git-credentials` | Let pushes in your own sessions use this machine's Git credentials (see [push access](#push-access)) |
-| `--repo-cache` | Check repositories out of a full-history cache on this machine (preview) |
-| `--repo-cache-scope host\|owner` | One cache for the whole host (default) or one per session owner |
 | `--allow-insecure-loopback` | Allow an `http://` server on localhost (development) |
 | `--help` | Show all options |
+
+Everything else is the host's [configuration](#host-configuration), set in Pistead: its command time limit, GPU, Git credentials and repository cache. `--git-credentials`, `--repo-cache` and `--repo-cache-scope` are still accepted, so existing service units keep starting, but ignored.
 
 The Mac app's **This Mac** runs the same connector; see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps). [`packages/cli/README.md`](packages/cli/README.md) is the connector's own guide.
 
@@ -389,7 +400,7 @@ Commands, pushes, GitHub comments, merges and issues, and host commands each nee
 | Commands, commits, pushes, GitHub comments, merges | Anyone with approve permission on the session (the owner always has it) |
 | Host commands | Only the host's owner, who also needs approve permission on the session |
 
-The agent's tool call waits for the decision, and its message waits with it (connector 0.9.0 or newer). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
+The agent's tool call waits for the decision, and its message waits with it (connector 0.9.0 or newer). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. Commands, pushes and host commands run in the background (connector newer than 0.9.0 for commands), so the card shows them running until they end. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
 #### Permission requests
 
@@ -482,7 +493,7 @@ OAuth app identities show a **Redirect URI** to register and need **Authorize** 
 Instead of an app or bot, an identity can be one of these. Both push only from sessions on the session owner's own hosts, so nobody's credentials reach anyone else's machine; elsewhere the push is refused:
 
 - **Session owner's account**: the account the owner connected (their GitHub sign-in, or a token under **Git accounts** with write scopes). Their own host receives that token for each push; Pistead resets a GitHub token when the push ends, but tokens of other providers stay valid.
-- **Host's Git credentials** (connector 0.6.0 or newer): the connector reads the HTTPS credentials Git on the host would use, through its credential helpers (for example after `gh auth setup-git`, or from the macOS keychain or Git Credential Manager), without prompting. The host's owner opts in with `npx pistead@latest connect --git-credentials`.
+- **Host's Git credentials** (connector 0.6.0 or newer): the connector reads the HTTPS credentials Git on the host would use, through its credential helpers (for example after `gh auth setup-git`, or from the macOS keychain or Git Credential Manager), without prompting. The host's owner turns on **Git credentials** in its [configuration](#host-configuration) (connectors 0.9.0 and older: `npx pistead@latest connect --git-credentials`).
 
 Pull requests are opened as the session owner with their connected account either way. [`packages/cli/README.md`](packages/cli/README.md#pushing-commits) has the full details of each identity.
 

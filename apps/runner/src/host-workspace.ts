@@ -20,7 +20,7 @@ const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O
 const queues = new Map<string, Promise<void>>();
 
 type Captured = { code: number | null; stdout: string; stderr: string };
-type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number };
+type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal };
 
 /**
  * Owner-consented host mode for macOS or Linux without bubblewrap. It runs as the
@@ -146,7 +146,10 @@ export class HostWorkspace {
         if (readOnly) throw new Error("Unsandboxed hosts cannot run read-only shell commands");
         const command = text(operation.command, "shell command", 64 * 1024, true);
         return this.#operation(authorize, async () => {
-              return output(checked(await this.#spawn("/bin/bash", ["--noprofile", "--norc", "-c", command])));
+          // The host's command time limit applies here too; nothing else does (there is no sandbox to set limits in).
+          if (options.signal?.aborted) throw new SandboxProcessError("Command stopped before it started", null, null, "", "");
+          return output(checked(await this.#spawn("/bin/bash", ["--noprofile", "--norc", "-c", command], undefined,
+            { timeoutMs: (options.limits?.seconds ?? TIMEOUT_MS / 1000) * 1000, signal: options.signal })));
         });
       }
       case "github.comment":
@@ -310,6 +313,9 @@ export class HostWorkspace {
     };
     const cancel = () => { failure ??= "Sandbox closed"; kill(); };
     this.#cancelActive = cancel;
+    const stop = () => { failure ??= "Command stopped"; kill(); };
+    options.signal?.addEventListener("abort", stop, { once: true });
+    if (options.signal?.aborted) stop();
     const timer = setTimeout(() => { failure ??= `Command exceeded ${timeoutMs}ms time limit`; kill(); }, timeoutMs);
     const capture = (target: Buffer[], chunk: Buffer) => {
       const remaining = Math.max(0, MAX_OUTPUT_BYTES - bytes);
@@ -322,10 +328,12 @@ export class HostWorkspace {
     child.stdin.on("error", () => { /* Early exit closes stdin; the exit status is authoritative. */ });
     child.once("error", (error) => {
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", stop);
       reject(new SandboxProcessError(`Cannot start ${command}: ${errorCode(error) ?? "launch failed"}`, null, null, "", ""));
     });
     child.once("close", (code, signal) => {
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", stop);
       if (this.#cancelActive === cancel) this.#cancelActive = undefined;
       const out = Buffer.concat(stdout).toString("utf8");
       const err = Buffer.concat(stderr).toString("utf8");
