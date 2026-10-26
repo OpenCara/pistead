@@ -6,9 +6,11 @@
 # Node 24, as in .node-version, CI and the connector's engines, so CI tests the Node the image ships.
 ARG NODE_IMAGE=node:24-bookworm-slim
 FROM ${NODE_IMAGE} AS base
-# pnpm from npm, not corepack (gone from Node 25+ images), pinned by hand to match packageManager in package.json.
-RUN npm install -g pnpm@10.32.1 && npm cache clean --force
 WORKDIR /app
+# pnpm from npm, not corepack (gone from Node 25+ images), at the version packageManager in package.json names (without
+# any +sha suffix, which npm doesn't take), so the two can't drift apart.
+COPY package.json ./
+RUN npm install -g "$(node -p 'require("./package.json").packageManager.split("+")[0]')" && npm cache clean --force
 
 FROM base AS build
 # Only the server, web and connector manifests: the native apps' workspaces (apps/mobile, apps/desktop) stay out of
