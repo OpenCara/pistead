@@ -465,6 +465,8 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'non-boolean chat images', value: { ...manifest, capabilities: { ...manifest.capabilities, chatImages: 'true' } }, code: 'invalid_manifest' },
     { name: 'non-boolean git providers', value: { ...manifest, capabilities: { ...manifest.capabilities, gitProviders: 1 } }, code: 'invalid_manifest' },
     { name: 'git credentials without pushes', value: { ...manifest, capabilities: { ...manifest.capabilities, gitCredentials: true } }, code: 'invalid_manifest' },
+    { name: 'non-boolean session branches', value: { ...manifest, capabilities: { ...manifest.capabilities, sessionBranches: 'true' } }, code: 'invalid_manifest' },
+    { name: 'session branches without plain Git', value: { ...manifest, capabilities: { ...manifest.capabilities, plainGit: false, sessionBranches: true } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -482,6 +484,10 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
   await json(await self(f, connector, 'manifest', { ...manifest, capabilities: unsandboxed }));
   assert.deepEqual(JSON.parse(String(f.sqlite.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').get(connector.connectorId)!.capabilities_json)), unsandboxed,
     'an owner-disabled sandbox and owner-offered Git credentials must stay disclosed in stored host metadata');
+  // Connectors that push the branch named in the binding say so, and it is kept.
+  const named = { ...manifest.capabilities, sessionBranches: true };
+  await json(await self(f, connector, 'manifest', { ...manifest, capabilities: named }));
+  assert.equal(JSON.parse(String(f.sqlite.prepare('SELECT capabilities_json FROM connectors WHERE id = ?').get(connector.connectorId)!.capabilities_json)).sessionBranches, true);
   for (const table of ['connectors', 'connector_pairings', 'models', 'audit']) {
     assert.ok(!JSON.stringify(f.sqlite.prepare(`SELECT * FROM ${table}`).all()).includes(secret));
   }

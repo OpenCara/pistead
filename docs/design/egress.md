@@ -184,8 +184,8 @@ which pinned sessions were checked out of until phase 5. Clone sessions borrow f
 ## Phase 4: pushing the session branch
 
 A clone session's own branch is named for its work when the session is created: `pistead/<title-slug>-<short id>`
-(`sessionBranchName`), for example `pistead/add-dark-mode-toggle-1a2b3c4d` for a session titled "Add dark mode toggle".
-The slug comes from the title, which the apps take from the first prompt; the first 8 hex digits of the session id keep
+(`sessionBranchName`), for example `pistead/add-dark-mode-toggle-1a2b3c4d5e6f` for a session titled "Add dark mode toggle".
+The slug comes from the title, which the apps take from the first prompt; the first 12 hex digits of the session id (48 random bits) keep
 sessions with the same title apart (the column is unique too). It is stored in `sessions.branch`, is immutable (renaming
 the session doesn't move it) and reaches the host in the runner binding (`session.branch`). A restored or moved
 session gets a branch of its own, never its source's. Sessions from before named branches, and those started on a

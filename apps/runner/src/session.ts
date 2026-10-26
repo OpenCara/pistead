@@ -250,7 +250,6 @@ export class RunnerSession {
   }
 
   private egressProxy(socketPath: string): EgressProxy {
-    const sessionId = this.binding.session.id;
     return new EgressProxy({
       socketPath,
       grant: () => this.requestGrant(),

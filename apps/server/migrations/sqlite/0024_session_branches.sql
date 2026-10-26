@@ -1,5 +1,5 @@
 -- The branch a clone session pushes without approval, named for its work when it was created
--- (pistead/<title-slug>-<short id>). NULL: the session predates named branches, or started on a connector without them,
+-- (pistead/<title-slug>-<first 12 hex of the session id>). NULL: the session predates named branches, or started on a connector without them,
 -- and pushes pistead/<session-id>. Like its repository mode, it is part of the session's immutable binding.
 ALTER TABLE sessions ADD COLUMN branch TEXT;
 CREATE UNIQUE INDEX sessions_branch ON sessions(branch) WHERE branch IS NOT NULL;

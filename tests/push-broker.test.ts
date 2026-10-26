@@ -876,8 +876,8 @@ test('a clone session with a branch named for its work pushes that branch, not p
   const f = await fixture(t);
   f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repositories_immutable; DROP TRIGGER sessions_repository_mode_immutable;"
     + " DROP TRIGGER sessions_branch_immutable;"
-    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone', branch = 'pistead/fix-login-e0000000' WHERE id = 'session'; COMMIT;");
-  const report = pkt(`\x01${pkt('unpack ok\n')}${pkt('ok refs/heads/pistead/fix-login-e0000000\n')}0000`) + '0000';
+    + " UPDATE sessions SET repositories_json = '[]', repository_mode = 'clone', branch = 'pistead/fix-login-e00000000000' WHERE id = 'session'; COMMIT;");
+  const report = pkt(`\x01${pkt('unpack ok\n')}${pkt('ok refs/heads/pistead/fix-login-e00000000000\n')}0000`) + '0000';
   const forge: string[] = [];
   const mocked = globalThis.fetch;
   globalThis.fetch = async (input, init = {}) => {
@@ -894,11 +894,11 @@ test('a clone session with a branch named for its work pushes that branch, not p
   const refused = await relay(command('refs/heads/pistead/session'));
   assert.equal(refused.status, 403);
   assert.equal(await code(refused), 'session_branch_only');
-  const pushed = await relay(command('refs/heads/pistead/fix-login-e0000000') + 'PACK-DATA');
+  const pushed = await relay(command('refs/heads/pistead/fix-login-e00000000000') + 'PACK-DATA');
   assert.equal(pushed.status, 200);
-  assert.deepEqual(forge, [command('refs/heads/pistead/fix-login-e0000000') + 'PACK-DATA']);
+  assert.deepEqual(forge, [command('refs/heads/pistead/fix-login-e00000000000') + 'PACK-DATA']);
   const audit = f.audits('git.push.session_branch') as { detail_json: string }[];
-  assert.equal(JSON.parse(audit.at(-1)!.detail_json).branch, 'pistead/fix-login-e0000000');
+  assert.equal(JSON.parse(audit.at(-1)!.detail_json).branch, 'pistead/fix-login-e00000000000');
 });
 
 test('a session that pinned its repositories is read-only: it gets no push credential', async t => {

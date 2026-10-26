@@ -198,15 +198,15 @@ test("a clone session's binding carries the branch named for its work, and only 
   const id = "1a2b3c4d-0000-4000-8000-000000000000";
   const clone = binding(id, []);
   clone.session.repositoryMode = "clone";
-  clone.session.branch = "pistead/add-dark-mode-1a2b3c4d";
-  assert.equal(validateBinding(clone, id).session.branch, "pistead/add-dark-mode-1a2b3c4d");
-  for (const branch of ["main", "pistead/add-dark-mode-ffffffff", "pistead/Add-dark-mode-1a2b3c4d", "pistead/a..b-1a2b3c4d", "pistead/x/y-1a2b3c4d"]) {
+  clone.session.branch = "pistead/add-dark-mode-1a2b3c4d0000";
+  assert.equal(validateBinding(clone, id).session.branch, "pistead/add-dark-mode-1a2b3c4d0000");
+  for (const branch of ["main", "pistead/add-dark-mode-ffffffffffff", "pistead/Add-dark-mode-1a2b3c4d0000", "pistead/a..b-1a2b3c4d0000", "pistead/x/y-1a2b3c4d0000"]) {
     clone.session.branch = branch;
     assert.throws(() => validateBinding(clone, id), runnerError(400, /Invalid session branch/), branch);
   }
   // Only a clone session has a branch of its own.
   const pinned = binding(id);
-  pinned.session.branch = "pistead/add-dark-mode-1a2b3c4d";
+  pinned.session.branch = "pistead/add-dark-mode-1a2b3c4d0000";
   assert.throws(() => validateBinding(pinned, id), runnerError(400, /Invalid session branch/));
 });
 
