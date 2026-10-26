@@ -52,7 +52,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
   const backupsOff = backups.data?.enabled === false;
   // A listing that failed leaves the server to explain a refusal; one still loading offers nothing yet.
   const backupsPending = !backups.data && !backups.error;
-  const conversationOnlyOff = backups.data?.conversationOnly === false;
+  const conversationOnlyOff = backups.data?.conversationOnlySupported === false;
   async function changeVisibility() {
     if (!session || !isOwner || action.busy) return;
     const nextVisibility = (session.visibility ?? "private") === "workspace" ? "private" : "workspace";

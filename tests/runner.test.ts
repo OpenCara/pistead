@@ -346,9 +346,25 @@ test("a conversation-only backup keeps the conversation, not the files, and its 
   const instructions = (restored as unknown as { agentInstructions(mode: "write"): string }).agentInstructions("write");
   assert.match(instructions, /restored from a backup that kept only its conversation/);
   assert.doesNotMatch((source as unknown as { agentInstructions(mode: "write"): string }).agentInstructions("write"), /kept only its conversation/);
-  // A full backup of the restored session keeps the note: its history still mentions files it never had.
+  // The note follows the latest restore: a full backup of the restored session still carries it, and restoring that
+  // backup in full brings back its files, so the note goes.
+  await restored.submit(await ticket(target.session.id, "submit"), { requestId: "conversation-again", content: "TEST_WRITE again.txt\nmade again" }, "write");
+  await idle(restored);
   const again = await restored.backup(await ticket(target.session.id, "backup"));
   assert.equal(again.manifest.conversationOnlyRestore, true);
+  const againText = JSON.stringify(again);
+  const againBytes = new TextEncoder().encode(againText);
+  const fullTarget = binding("conversation-full-target");
+  const fullService = new RunnerService({ ...service.config,
+    authorize: async request => ({ allowed: request.actorId === fullTarget.owner.id, ownerId: fullTarget.owner.id, policyVersion: 1 }),
+    readBackup: async () => againBytes });
+  await fullService.initialize();
+  t.after(() => fullService.close());
+  await fullService.restore({ binding: fullTarget, restore: { id: "conversation-full-restore", sourceSessionId: target.session.id, backupId: "full-backup",
+    sha256: await sha256(againText), size: againBytes.byteLength, downloadToken: "opaque-scoped-test-capability" } }, await ticket(fullTarget.session.id, "restore"));
+  const fullRestored = await fullService.get(fullTarget.session.id);
+  assert.equal(await fullRestored.sandbox.readFile("again.txt", allowTestOperation), "made again");
+  assert.doesNotMatch((fullRestored as unknown as { agentInstructions(mode: "write"): string }).agentInstructions("write"), /kept only its conversation/);
 });
 
 test("restore checks actual paused pi tasks, not only a manifest claiming idle", { skip: process.platform !== "linux" }, async t => {

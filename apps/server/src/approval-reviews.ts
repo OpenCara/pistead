@@ -8,7 +8,7 @@ type ReviewRow = {
   session_id: string; approval_id: string; requested_by: string; operation_json: string;
   source: 'explicit' | 'model'; admission_id: string | null; review_hash: string; created_at: string;
 };
-type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: string; access: string | null; expires_at: number };
+type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: string; access: string | null; auto_merge?: number; expires_at: number };
 /** What decides whether an admission is the session owner's Auto-approve message. */
 type AdmissionAccess = Pick<AdmissionRow, 'session_id' | 'actor_id' | 'mode' | 'access'>;
 const operationTools: Record<Exclude<Operation['kind'], 'permission'>, ToolName> = {
@@ -27,8 +27,8 @@ export function permissionCall(approvalId: string): string | undefined {
 }
 /**
  * Whether `admission` is a message the session owner sent with Auto-approve access. Its tool calls use any tool without
- * a permission card, as the runner lets them; what those calls do still follows its own rules (comments, merges and
- * issues wait for a human, a command without limits runs only on the owner's host).
+ * a permission card, as the runner lets them; what those calls do still follows its own rules (a merge waits for a
+ * human unless the message also chose auto-merge, a command without limits runs only on the owner's host).
  */
 function ownerAuto(row: SessionRow, admission: AdmissionAccess | undefined): boolean {
   return admission?.access === 'auto' && admission.mode === 'write' && admission.actor_id === row.owner_id && admission.session_id === row.id;
@@ -114,11 +114,13 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
       createdAt: text(raw.createdAt, 'createdAt', 64),
       ...(raw.decidedBy === undefined ? {} : { decidedBy: userIdentifier(raw.decidedBy, 'decidedBy') }),
       ...(raw.result === undefined ? {} : { result: text(raw.result, 'result', 8192, 0) }) };
-    // Only the owner's own commands, commits, pushes and repins may auto-approve, never a GitHub comment, merge or issue.
+    // Only the owner's own operations may auto-approve. GitHub comments, issues and merges only from their Auto-approve
+    // message (merges only when it chose auto-merge), checked below with the message's admission. A host command runs
+    // automatically only where the control plane told the host its owner may (see hostCommandAuthority); a grant can
+    // lapse later, so the records it left are not judged by today's grants.
     if (raw.automatic !== undefined) {
       if (raw.automatic !== true || explicit || requestedBy !== row.owner_id || approval.decidedBy !== row.owner_id || approval.status === 'pending'
-        || operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'github.issue' || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
-      if (operation.kind === 'host.bash' && row.connector_owner_id !== row.owner_id) fail(502, 'invalid_runner_response', 'Only the host owner can auto-approve host commands.');
+        || operation.kind === 'permission') fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic approval.');
       approval.automatic = true;
     }
     // An allowed permission request says how far it reaches; only a command can run without resource limits.
@@ -152,9 +154,19 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
   const admissionIds = [...new Set(normalized.map(item => stored.get(item.approval.id)?.admission_id ?? item.admissionId).filter((value): value is string => value !== null))];
   const admissions = new Map<string, AdmissionRow>();
   if (admissionIds.length) {
-    const result = await c.env.DB.query<AdmissionRow>(`SELECT id, session_id, actor_id, mode, access, expires_at FROM run_admissions
+    const result = await c.env.DB.query<AdmissionRow>(`SELECT id, session_id, actor_id, mode, access, auto_merge, expires_at FROM run_admissions
       WHERE session_id = ? AND id IN (SELECT value FROM json_each(?))`).bind(row.id, JSON.stringify(admissionIds)).all();
     for (const admission of result) admissions.set(admission.id, admission);
+  }
+  for (const { approval, admissionId } of normalized) {
+    const kind = approval.operation.kind;
+    if (!approval.automatic || (kind !== 'github.comment' && kind !== 'github.issue' && kind !== 'github.merge')) continue;
+    // The admission its review recorded, as for every other check here; a changed one is refused below anyway.
+    const reviewed = stored.get(approval.id)?.admission_id ?? admissionId;
+    const admission = reviewed ? admissions.get(reviewed) : undefined;
+    if (!ownerAuto(row, admission) || (kind === 'github.merge' && admission!.auto_merge !== 1)) {
+      fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic GitHub approval.');
+    }
   }
   const allows = await sessionTools(c.env, row);
   const candidates: ReviewRow[] = [];

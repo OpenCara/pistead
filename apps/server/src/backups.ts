@@ -212,7 +212,7 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
       // False when no new backup can be saved, so the web app turns backups off instead of offering one that is refused.
       enabled: canSave(c.env, location),
       // False when the session's host would take a full backup instead (an older connector).
-      conversationOnly: await conversationBackupsSupported(c.env, row),
+      conversationOnlySupported: await conversationBackupsSupported(c.env, row),
       ...(database ? { workspaceDatabase: { id: database.id, host: database.host, port: database.port, database: database.database_name, confirm,
         ...(consented ? { consented: true } : {}) } } : {}),
       // The workspace's schedule; `included`: this session's owner confirmed the database (or connected it), so it takes part.

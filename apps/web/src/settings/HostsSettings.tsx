@@ -8,6 +8,7 @@ import { ConnectionStatus, HostCapabilities, hostTone, useConnections, type Conn
 import { Icon } from "../icons";
 import { href, navigate } from "../router";
 import { Alert, Button, CardBody, Collapsible, Combobox, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, ResourceState, Row, Section, Sheet, StatusDot, Timestamp, useAction, useResource, type ActionState } from "../ui";
+import { HostAdminsSection, HostCommandGrantsSection } from "./HostAccess";
 import "./settings.css";
 
 const hostsInfo = <>
@@ -41,7 +42,7 @@ export function HostsSettings({ id }: { id?: string }) {
         {empty ? <EmptyState title="No hosts yet" action={pair} /> : hosts.map(connector => <Row key={connector.id}
           leading={<StatusDot tone={hostTone(connector)} />}
           title={connector.name}
-          hint={`${count(connector.models.length, "model", "models")} · ${connector.workspaceIds.length ? `Shared with ${count(connector.workspaceIds.length, "workspace", "workspaces")}` : "Private"}`}
+          hint={`${connector.role === "admin" ? `${connector.ownerName}'s host, you are an admin · ` : ""}${count(connector.models.length, "model", "models")} · ${connector.workspaceIds.length ? `Shared with ${count(connector.workspaceIds.length, "workspace", "workspaces")}` : "Private"}`}
           trailing={<ConnectionStatus connector={connector} />}
           href={href({ name: "settings", section: "hosts", id: connector.id })}
           chevron />)}
@@ -170,6 +171,8 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
   const [reconnecting, setReconnecting] = useState(false);
   const [pairing, setPairing] = useState(false);
   const workspaceNames = new Map(workspaces.map(workspace => [workspace.id, workspace.name]));
+  // An admin manages sharing; running, revoking and removing the host stay its owner's.
+  const owner = connector.role !== "admin";
   const associated = [...new Set([...(connector.connectedWorkspaceIds ?? []), ...connector.workspaceIds])];
   const available = workspaces.filter(workspace => !connector.workspaceIds.includes(workspace.id));
   function unshare(workspaceId: string) {
@@ -207,7 +210,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
     <Section title="Status" bare>
       <div className="card">
         <Row title="Status" trailing={<ConnectionStatus connector={connector} />} />
-        {!connector.online && <Row title={connector.revokedAt ? "Pair again" : "Reconnect host"} hint={connector.revokedAt ? "Revoked credentials cannot be reused; create a new pairing" : "Restart the saved connection on your host machine"}
+        {owner && !connector.online && <Row title={connector.revokedAt ? "Pair again" : "Reconnect host"} hint={connector.revokedAt ? "Revoked credentials cannot be reused; create a new pairing" : "Restart the saved connection on your host machine"}
           trailing={<Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={() => connector.revokedAt ? setPairing(true) : setReconnecting(true)}>{connector.revokedAt ? "Pair again" : "Reconnect"}</Button>} />}
         <Row title="Owner" trailing={connector.ownerName} />
         <Row title="Paired" trailing={<Timestamp value={connector.createdAt} />} />
@@ -225,7 +228,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
         {!associated.length && <Row title="No connected workspaces reported" />}
         {associated.map(workspaceId => {
           const shared = connector.workspaceIds.includes(workspaceId);
-          return <Row key={workspaceId} title={workspaceNames.get(workspaceId) ?? workspaceId} hint={shared ? "Shared with members" : "Private: your use only"}
+          return <Row key={workspaceId} title={workspaceNames.get(workspaceId) ?? workspaceId} hint={shared ? "Shared with members" : owner ? "Private: your use only" : "Private: the owner's use only"}
             trailing={shared && !connector.revokedAt && <Button variant="outline" size="sm" disabled={shareAction.busy} onClick={() => unshare(workspaceId)}>Unshare</Button>} />;
         })}
         {!connector.revokedAt && (available.length
@@ -234,10 +237,12 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       </div>
       <Feedback error={shareAction.error} notice={shareAction.notice} />
     </Section>
+    {connector.capabilities.hostCommands && <HostCommandGrantsSection connector={connector} refresh={refresh} />}
+    <HostAdminsSection connector={connector} refresh={refresh} />
     <Section title="Details">
       <CardBody><Field label="Connection ID"><CopyField value={connector.id} label="Copy connection ID" /></Field></CardBody>
     </Section>
-    <Section title="Danger zone" bare>
+    {owner && <Section title="Danger zone" bare>
       <div className="card">
         <Row title="Revoke host" hint={connector.revokedAt ? <>Revoked <Timestamp value={connector.revokedAt} /></> : "Disconnects its runtime and blocks work in every connected workspace"}
           trailing={!connector.revokedAt && <Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={revoke}>{revokeAction.busy ? "Revoking..." : "Revoke"}</Button>} />
@@ -245,7 +250,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
           trailing={<Button variant="outline" size="sm" disabled={revokeAction.busy} onClick={remove}>Remove permanently</Button>} />
       </div>
       <Feedback error={revokeAction.error} notice={revokeAction.notice} />
-    </Section>
+    </Section>}
     {pairing && <PairHostSheet onClose={() => setPairing(false)} refresh={refresh} />}
     {reconnecting && <Sheet open title={`Reconnect ${connector.name}`} onClose={() => setReconnecting(false)} footer={<Button onClick={() => { refresh(); setReconnecting(false); }}>Done</Button>}>
       <div className="stack">

@@ -10,14 +10,14 @@ import { fail, identifier, jsonObject, now, text, userIdentifier } from './http.
 import { githubRepositoryName, issueNumber, parseOperation } from './operations.js';
 import { decryptToken } from './vault.js';
 import { requireCallbackScope } from './connectors.js';
-import { requireBrokerReview, requireToolCall } from './approval-reviews.js';
+import { requireBrokerReview, requireOperationTool, requireToolCall } from './approval-reviews.js';
 import { cloneSessionRepository, recheckAccess, verifyRepository, type GitHubAccess } from './repositories.js';
 import { requireBinding, requireNoRestore } from './push/broker.js';
 
 /*
  * Agents reach GitHub only through these brokers, as the session owner: the owner's token stays in the control plane's
- * vault, and the sandbox stays offline. Comments, merges and new issues need a human approval each; reads need a live
- * write message.
+ * vault, and the sandbox stays offline. Comments, merges and new issues need a human approval each, unless the session
+ * owner sent the message with Auto-approve (and, for merges, auto-merge); reads need a live write message.
  */
 
 const githubApi = 'https://api.github.com';
@@ -63,7 +63,71 @@ async function verifyPin(env: Env, github: GitHubAccess, pin: GitHubSessionRepos
   await recheckAccess(env, { provider: 'github', github });
 }
 
-type ApprovalInput = { sessionId: string; actorId: string; approvalId: string; capability: string };
+type ApprovalInput = { sessionId: string; actorId: string; approvalId: string } & ({ capability: string; admissionId?: undefined } | { admissionId: string; capability?: undefined });
+/** GitHub effects one Auto-approve message may run without asking, as for automatic pushes. */
+const automaticEffectsPerAdmission = 20;
+
+/** The approval fields of a GitHub effect request: a human approval's capability, or the owner's Auto-approve admission. */
+function approvalInput(input: Record<string, unknown>): ApprovalInput {
+  const base = { sessionId: identifier(input.sessionId, 'sessionId'), actorId: userIdentifier(input.actorId, 'actorId'), approvalId: identifier(input.approvalId, 'approvalId') };
+  if ((input.capability === undefined) === (input.admissionId === undefined)) fail(400, 'invalid_input', 'Provide exactly one of capability or admissionId.');
+  return input.capability !== undefined ? { ...base, capability: text(input.capability, 'capability', 128) } : { ...base, admissionId: text(input.admissionId, 'admissionId', 128) };
+}
+
+/**
+ * Authorizes one GitHub effect of the session owner's Auto-approve message and consumes its tool call's single attempt
+ * before the effect runs: the requester must be the session owner, still able to write, and the admission theirs, for
+ * this session, unexpired and sent with Auto-approve (merges: with auto-merge too). As with approved effects, every check
+ * is repeated after each await boundary that precedes the effect.
+ */
+async function automaticEffect<T>(c: AppContext, connectorId: string | null, approval: ApprovalInput & { admissionId: string }, operation: Operation,
+  action: 'github.comment' | 'github.merge' | 'github.issue', prepare: (row: SessionRow, github: GitHubAccess) => Promise<T>): Promise<{ row: SessionRow; github: GitHubAccess; prepared: T }> {
+  const { sessionId, actorId, approvalId, admissionId } = approval;
+  // Automatic effects come only from the runner's own tool-call approvals.
+  if (!approvalId.startsWith('tool-')) fail(400, 'invalid_input', 'Automatic GitHub effects must name a tool-call approval.');
+  const authorize = async (): Promise<SessionRow> => {
+    const owner = await sessionAccess(c.env, sessionId, actorId);
+    if (!owner || owner.row.owner_id !== actorId || owner.row.status === 'archived' || !hasPermission(owner.permissions, 'write')) {
+      fail(403, 'permission_revoked', 'Automatic GitHub effects require the session owner.');
+    }
+    requireUnfrozen(owner.row);
+    const admission = await c.env.DB.query<{ id: string; session_id: string; actor_id: string; mode: string; access: string | null; auto_merge: number; expires_at: number }>(
+      'SELECT id, session_id, actor_id, mode, access, auto_merge, expires_at FROM run_admissions WHERE id = ?').bind(admissionId).first();
+    if (!admission || admission.session_id !== sessionId || admission.actor_id !== actorId || admission.mode !== 'write' || admission.access !== 'auto'
+      || admission.expires_at <= Math.floor(Date.now() / 1000)) {
+      fail(403, 'automatic_github_not_admitted', 'GitHub effects run without asking only for an unexpired message the session owner sent with Auto-approve.');
+    }
+    if (action === 'github.merge' && admission.auto_merge !== 1) fail(403, 'automatic_merge_not_admitted', 'Merges run without asking only when the message also chose auto-merge.');
+    await requireCallbackScope(c, owner.row, connectorId);
+    await requireOperationTool(c.env, owner.row, operation, approvalId, admission);
+    return owner.row;
+  };
+  const row = await authorize();
+  await requireNoRestore(c, sessionId);
+  const github = await ownerGitHub(c.env, row.owner_id);
+  const prepared = await prepare(row, github);
+  const checked = await authorize();
+  if (checked.policy_version !== row.policy_version) fail(403, 'permission_revoked', 'Session authority changed.');
+  // Consume the call's one attempt before the network effect, within the message's limit. A timeout is ambiguous, not
+  // permission to replay the effect.
+  const consumed = await c.env.DB.query(`INSERT INTO automatic_github_effects (session_id, approval_id, admission_id, kind, operation_hash, created_at)
+    SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM automatic_github_effects WHERE admission_id = ?) < ?
+      AND EXISTS (SELECT 1 FROM sessions WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> ?)
+    ON CONFLICT (session_id, approval_id) DO NOTHING RETURNING approval_id`)
+    .bind(sessionId, approvalId, admissionId, action, await sha256(JSON.stringify(operation)), now(), admissionId, automaticEffectsPerAdmission,
+      sessionId, actorId, row.policy_version, 'archived').first();
+  if (!consumed) {
+    if (await c.env.DB.query('SELECT 1 FROM automatic_github_effects WHERE session_id = ? AND approval_id = ?').bind(sessionId, approvalId).first()) {
+      fail(409, 'capability_consumed', 'This operation has already been attempted; do not retry the external effect.');
+    }
+    fail(429, 'automatic_github_limit', 'This message already used its automatic GitHub effects, or session authority changed.');
+  }
+  await auditStatement(c.env, actorId, `${action}.attempted`, row.workspace_id, sessionId, { approvalId, requestedBy: actorId, actingAs: github.userId, automatic: true }).run();
+  // An audit write is an await boundary too.
+  const fresh = await authorize();
+  if (fresh.policy_version !== row.policy_version) fail(403, 'permission_revoked', 'Operation authority changed. The attempt remains consumed.');
+  return { row, github, prepared };
+}
 
 /**
  * Authorizes one human-approved GitHub effect and consumes its single-use capability before the effect runs: the
@@ -73,6 +137,7 @@ type ApprovalInput = { sessionId: string; actorId: string; approvalId: string; c
  */
 async function approvedEffect<T>(c: AppContext, connectorId: string | null, approval: ApprovalInput, operation: Operation,
   action: 'github.comment' | 'github.merge' | 'github.issue', prepare: (row: SessionRow, github: GitHubAccess) => Promise<T>): Promise<{ row: SessionRow; github: GitHubAccess; prepared: T }> {
+  if (approval.admissionId !== undefined) return automaticEffect(c, connectorId, approval, operation, action, prepare);
   const { sessionId, actorId, approvalId } = approval;
   const tokenHash = await sha256(approval.capability);
   const stored = await c.env.DB.query<{
@@ -146,8 +211,7 @@ async function boundedJson(response: Response, limit: number): Promise<unknown> 
 
 export async function githubComment(c: AppContext, connectorId: string | null): Promise<Response> {
   const input = await jsonObject(c);
-  const approval: ApprovalInput = { sessionId: identifier(input.sessionId, 'sessionId'), actorId: userIdentifier(input.actorId, 'actorId'),
-    approvalId: identifier(input.approvalId, 'approvalId'), capability: text(input.capability, 'capability', 128) };
+  const approval = approvalInput(input);
   const operation = parseOperation({ kind: 'github.comment', repository: input.repository, issue: input.issue, body: input.body });
   if (operation.kind !== 'github.comment') fail(400, 'invalid_operation', 'Only GitHub comments are supported.');
   const { sessionId, actorId, approvalId } = approval;
@@ -188,8 +252,7 @@ export async function githubComment(c: AppContext, connectorId: string | null): 
  */
 export async function githubMerge(c: AppContext, connectorId: string | null): Promise<Response> {
   const input = await jsonObject(c, 4096);
-  const approval: ApprovalInput = { sessionId: identifier(input.sessionId, 'sessionId'), actorId: userIdentifier(input.actorId, 'actorId'),
-    approvalId: identifier(input.approvalId, 'approvalId'), capability: text(input.capability, 'capability', 128) };
+  const approval = approvalInput(input);
   const operation = parseOperation({ kind: 'github.merge', repository: input.repository, pull: input.pull, sha: input.sha, method: input.method });
   if (operation.kind !== 'github.merge') fail(400, 'invalid_operation', 'Only GitHub merges are supported.');
   const { sessionId, actorId, approvalId } = approval;
@@ -235,11 +298,10 @@ export async function githubMerge(c: AppContext, connectorId: string | null): Pr
 export async function githubIssue(c: AppContext, connectorId: string | null): Promise<Response> {
   // Room for a body at its character limit in any script, and JSON's escapes.
   const input = await jsonObject(c, 512 * 1024);
-  if (Object.keys(input).some(key => !['sessionId', 'actorId', 'approvalId', 'capability', 'repository', 'title', 'body'].includes(key))) {
+  if (Object.keys(input).some(key => !['sessionId', 'actorId', 'approvalId', 'capability', 'admissionId', 'repository', 'title', 'body'].includes(key))) {
     fail(400, 'invalid_input', 'Unexpected GitHub issue field.');
   }
-  const approval: ApprovalInput = { sessionId: identifier(input.sessionId, 'sessionId'), actorId: userIdentifier(input.actorId, 'actorId'),
-    approvalId: identifier(input.approvalId, 'approvalId'), capability: text(input.capability, 'capability', 128) };
+  const approval = approvalInput(input);
   const operation = parseOperation({ kind: 'github.issue', repository: input.repository, title: input.title, body: input.body });
   if (operation.kind !== 'github.issue') fail(400, 'invalid_operation', 'Only GitHub issues are supported.');
   const { sessionId, actorId, approvalId } = approval;

@@ -37,7 +37,7 @@ export function backupDatabaseLabel(database: BackupDatabase): string {
 export type BackupListing = { backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase; enabled?: boolean;
   automaticBackups?: AutomaticBackups;
   /** The session's host can back up its conversation only; false on an older connector. */
-  conversationOnly?: boolean };
+  conversationOnlySupported?: boolean };
 
 function everyLabel(minutes: number): string {
   return minutes === 15 ? "every 15 minutes" : minutes === 60 ? "every hour" : minutes === 360 ? "every 6 hours" : minutes === 1440 ? "every day" : `every ${minutes} minutes`;

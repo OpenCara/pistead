@@ -333,7 +333,7 @@ test('without backup storage the server saves no backup, and its listings say so
   delete f.env.BUCKET;
   const runner = f.runner();
   assert.deepEqual(await (await f.request('GET', '/api/sessions/owner-session/backups', 'test:owner')).json(),
-    { backups: [], destination: 'server', enabled: false });
+    { backups: [], destination: 'server', enabled: false, conversationOnlySupported: true });
   const refused = await f.request('POST', '/api/sessions/owner-session/backup', 'test:owner', {});
   assert.equal(refused.status, 503);
   assert.equal(await code(refused), 'backup_unavailable');
@@ -389,7 +389,7 @@ test('backups of a workspace with its own database are saved and read back there
   const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
   f.runner();
   assert.deepEqual(await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json(), { backups: [], destination: 'workspace-database',
-    enabled: true, workspaceDatabase: { id: database.id, host: 'db.example.com', port: 5432, database: 'pistead', confirm: true } });
+    enabled: true, conversationOnlySupported: true, workspaceDatabase: { id: database.id, host: 'db.example.com', port: 5432, database: 'pistead', confirm: true } });
   const created = await f.request('POST', '/api/sessions/session/backup', 'test:member', { trustedDatabaseId: database.id });
   assert.equal(created.status, 201);
   const { backup } = await created.json() as { backup: { id: string; sha256: string; size: number; location: string } };
@@ -891,8 +891,8 @@ test('a conversation-only backup asks the host for the conversation only, and is
     return new Response(JSON.stringify(answer === 'conversation' ? { ...snapshot, conversationOnly: true } : { ...snapshot, files }),
       { headers: { 'Content-Type': 'application/json' } });
   });
-  const listing = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as { conversationOnly: boolean };
-  assert.equal(listing.conversationOnly, true);
+  const listing = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as { conversationOnlySupported: boolean };
+  assert.equal(listing.conversationOnlySupported, true);
   for (const body of [{ conversationOnly: 'yes' }, { conversationOnly: 1 }]) {
     const response = await f.request('POST', '/api/sessions/session/backup', 'test:member', body);
     assert.equal(response.status, 400);
@@ -930,8 +930,8 @@ test('a conversation-only backup asks the host for the conversation only, and is
       VALUES ('hosted','workspace','test:member','version','Hosted session',1,'ready','2026-01-03','old-host','test:member');
   `);
   const calls = bodies.length;
-  const hostListing = await (await f.request('GET', '/api/sessions/hosted/backups', 'test:member')).json() as { conversationOnly: boolean };
-  assert.equal(hostListing.conversationOnly, false);
+  const hostListing = await (await f.request('GET', '/api/sessions/hosted/backups', 'test:member')).json() as { conversationOnlySupported: boolean };
+  assert.equal(hostListing.conversationOnlySupported, false);
   const old = await f.request('POST', '/api/sessions/hosted/backup', 'test:member', { conversationOnly: true });
   assert.equal(old.status, 409);
   assert.equal(await code(old), 'connector_update_required');
