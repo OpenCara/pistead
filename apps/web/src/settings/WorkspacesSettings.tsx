@@ -237,6 +237,7 @@ function Members({ workspace, admin, owner }: { workspace: Workspace; admin: boo
   const path = `/api/workspaces/${segment(workspace.id)}/members`;
   const resource = useResource<{ members: WorkspaceMember[] }>(path);
   const [adding, setAdding] = useState(false);
+  const [changing, setChanging] = useState<WorkspaceMember | null>(null);
   const action = useAction();
   async function remove(member: WorkspaceMember) {
     const confirmed = await confirmDialog({ title: "Remove member", message: `Remove ${usernameWithId(memberPerson(member))} from this workspace?`, confirmLabel: "Remove", destructive: true });
@@ -267,21 +268,59 @@ function Members({ workspace, admin, owner }: { workspace: Workspace; admin: boo
             const name = member.displayName || username(person);
             return <Row key={member.userId} leading={<IdentityBadge name={name} id={member.userId} />} title={name} hint={usernameWithId(person)} trailing={<>
               <StatusBadge tone={member.role === "owner" || member.role === "admin" ? "success" : "neutral"}>{roleLabel[member.role]}</StatusBadge>
-              {admin && member.userId !== workspace.ownerId && (owner || adminManagedRoles.includes(member.role)) && <DropdownMenu label={`Actions for ${name}`} items={[{ label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) }]} />}
+              {admin && member.userId !== workspace.ownerId && (owner || adminManagedRoles.includes(member.role)) && <DropdownMenu label={`Actions for ${name}`} items={[
+                { label: "Change role", icon: "shield", disabled: action.busy, onSelect: () => setChanging(member) },
+                { label: "Remove", icon: "trash", destructive: true, disabled: action.busy, onSelect: () => void remove(member) },
+              ]} />}
             </>} />;
           })}
         {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
       </ResourceState>
     </Section>
     {admin && <AddMember open={adding} path={path} owner={owner} close={() => setAdding(false)} saved={resource.refresh} />}
+    {admin && changing && <ChangeRole key={changing.userId} member={changing} path={path} owner={owner} close={() => setChanging(null)} saved={resource.refresh} />}
   </>;
+}
+
+/** Roles the actor may assign: admins the roles below their own; only the owner makes someone an admin. */
+function assignableRoles(owner: boolean): AssignableWorkspaceRole[] {
+  return assignableWorkspaceRoles.filter(item => owner || adminManagedRoles.includes(item));
+}
+
+function ChangeRole({ member, path, owner, close, saved }: { member: WorkspaceMember; path: string; owner: boolean; close: () => void; saved: () => void }) {
+  const current = member.role === "owner" ? null : member.role;
+  const [role, setRole] = useState<AssignableWorkspaceRole>(current ?? "member");
+  const roles = assignableRoles(owner);
+  const action = useAction();
+  const name = member.displayName || username(memberPerson(member));
+  function save(event: FormEvent) {
+    event.preventDefault();
+    if (action.busy || role === current) return;
+    void action.run(async () => {
+      await api(`${path}/${segment(member.userId)}`, { method: "PATCH", body: { role } });
+      saved();
+      close();
+    });
+  }
+  return <Sheet open title={`Change role of ${name}`} onClose={() => { if (!action.busy) close(); }} footer={<>
+    <Button disabled={action.busy} onClick={close}>Cancel</Button>
+    <Button variant="default" type="submit" form="change-role-form" disabled={action.busy || role === current}>{action.busy ? "Saving..." : "Save"}</Button>
+  </>}>
+    <form id="change-role-form" className="stack" onSubmit={save}>
+      <Field label="Role" hint={`${roleHint[role]}. Takes effect at once, in their open sessions too`}>
+        <select className="select" autoFocus value={role} onChange={event => setRole(event.target.value as AssignableWorkspaceRole)}>
+          {roles.map(item => <option key={item} value={item}>{roleLabel[item]}{item === current ? " (current)" : ""}</option>)}
+        </select>
+      </Field>
+      <Feedback error={action.error} />
+    </form>
+  </Sheet>;
 }
 
 function AddMember({ open, path, owner, close, saved }: { open: boolean; path: string; owner: boolean; close: () => void; saved: () => void }) {
   const [userId, setUserId] = useState("");
   const [role, setRole] = useState<AssignableWorkspaceRole>("member");
-  // Admins assign the roles below their own; only the owner makes someone an admin.
-  const roles = assignableWorkspaceRoles.filter(item => owner || adminManagedRoles.includes(item));
+  const roles = assignableRoles(owner);
   const action = useAction();
   function save(event: FormEvent) {
     event.preventDefault();
@@ -299,7 +338,7 @@ function AddMember({ open, path, owner, close, saved }: { open: boolean; path: s
     <Button variant="default" type="submit" form="add-member-form" disabled={action.busy || !userId.trim()}>{action.busy ? "Saving..." : "Save"}</Button>
   </>}>
     <form id="add-member-form" className="stack" onSubmit={save}>
-      <Field label="User ID" hint="Copy it from their profile. Saving an existing member updates their role">
+      <Field label="User ID" hint="Copy it from their profile. To change an existing member's role, use Change role in their menu">
         <input className="input" required autoFocus value={userId} onChange={event => setUserId(event.target.value)} placeholder="User ID" autoComplete="off" spellCheck={false} />
       </Field>
       <Field label="Role" hint={roleHint[role]}>
