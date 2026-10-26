@@ -10,6 +10,8 @@ export interface BackupRow {
   sha256: string; size: number; created_at: string;
   /** 1 when the server took it on the workspace's schedule (automatic-backups.ts); absent in rows read before. */
   automatic?: number;
+  /** 1 when it keeps only the session's conversation, without its files or clones; absent in rows read before. */
+  conversation_only?: number;
 }
 
 export async function boundedSnapshotText(response: Response, expectedSize?: number): Promise<string> {
@@ -65,14 +67,26 @@ export function bindingIdentity(binding: RunnerBinding): string {
     repositoryIdentity(s.repositories)]);
 }
 
-export function validateSnapshot(raw: string, source: RunnerBinding): void {
+/**
+ * Checks a snapshot against its session's binding. With `conversationOnly` set, the snapshot must also be of that kind:
+ * a conversation-only one carries no files and no clones, and a host that ignored the request sends a full one instead.
+ */
+export function validateSnapshot(raw: string, source: RunnerBinding, expected: { conversationOnly?: boolean } = {}): void {
+  // Untrusted JSON, checked field by field below.
+  let snapshot: any;
   try {
-    const snapshot = JSON.parse(raw);
+    snapshot = JSON.parse(raw);
     if (JSON.stringify(snapshot) !== raw) throw new Error('Noncanonical snapshot');
     if (snapshot?.format !== 'pi-runner-backup-v1' || snapshot.binding?.session?.id !== source.session.id ||
         bindingIdentity(snapshot.binding) !== bindingIdentity(source) || typeof snapshot.sqlite !== 'string' ||
         !snapshot.sqlite || !Array.isArray(snapshot.files) || !snapshot.manifest) throw new Error('Invalid binding');
   } catch { fail(502, 'invalid_backup', 'The backup does not match the immutable session binding.'); }
+  if (expected.conversationOnly === undefined) return;
+  const conversationOnly = snapshot.conversationOnly === true && !snapshot.files.length && snapshot.clones === undefined;
+  if (expected.conversationOnly !== conversationOnly || (!expected.conversationOnly && snapshot.conversationOnly !== undefined)) {
+    fail(502, 'invalid_backup', expected.conversationOnly ? 'The host returned a full backup instead of the conversation only; update its connector.'
+      : 'The host returned a conversation-only backup instead of a full one.');
+  }
 }
 
 /**

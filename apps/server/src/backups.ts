@@ -1,5 +1,6 @@
 import type { Hono } from 'hono';
 import type { BackupLocation } from '../../../packages/shared/src/types.js';
+import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { bindingForSession } from './sessions.js';
 import type { AppContext, Env, SessionRow, WorkerEnv, WorkspaceRow } from './types.js';
@@ -15,7 +16,18 @@ const snapshotFormat = 'pi-runner-backup-v1';
 
 function backupInfo(row: BackupRow, location: BackupLocation) {
   return { id: row.id, sessionId: row.session_id, size: row.size, sha256: row.sha256, createdAt: row.created_at, location,
-    ...(row.automatic ? { automatic: true } : {}) };
+    ...(row.automatic ? { automatic: true } : {}), ...(row.conversation_only ? { conversationOnly: true } : {}) };
+}
+
+/**
+ * Whether the session's host can take a conversation-only backup. A connector says so in its capabilities; an older one
+ * would take a full backup instead. The configured external runner is trusted to, and its snapshot is checked either way.
+ */
+async function conversationBackupsSupported(env: Env, row: SessionRow): Promise<boolean> {
+  if (!row.connector_id) return true;
+  const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(row.connector_id).first();
+  try { return (JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).conversationBackups === true; }
+  catch { return false; }
 }
 
 /** Whether `userId` gave their standing confirmation of this workspace database (see workspace_database_consents). */
@@ -85,6 +97,8 @@ export interface CreateBackupOptions {
   trustedDatabaseId?: unknown;
   /** Taken on the workspace's schedule (automatic-backups.ts): saved only in the workspace's database, and marked so. */
   automatic?: boolean;
+  /** Keep only the session's conversation (Pi's SQLite and the runner's state), not its files or clones. */
+  conversationOnly?: boolean;
 }
 
 /**
@@ -104,20 +118,24 @@ export async function createBackup(c: AppContext, row: SessionRow, options: Crea
   if (chosen && confirm && options.trustedDatabaseId !== chosen.id) {
     fail(409, 'workspace_database_trust_required', `Backups of this session are saved in the database the workspace owner connected (${chosen.host}/${chosen.database_name}). Whoever can read it can read this session, including your personal environment values. Confirm that database to save a backup.`);
   }
-  const response = await runnerRequest(c, row, 'backup', '', {});
+  const conversationOnly = options.conversationOnly === true;
+  if (conversationOnly && !await conversationBackupsSupported(c.env, row)) {
+    fail(409, 'connector_update_required', 'Update this session\'s host connector (npx pistead@latest connect) to back up its conversation only.');
+  }
+  const response = await runnerRequest(c, row, 'backup', '', conversationOnly ? { conversationOnly: true } : {});
   if (!response.headers.get('content-type')?.includes('application/json')) {
     await response.body?.cancel();
     fail(502, 'invalid_backup', 'The runner returned an invalid backup format.');
   }
   // A bounded snapshot avoids exhausting the server heap. The execution authority checkpoints it first.
   const bytes = await boundedSnapshotText(response);
-  validateSnapshot(bytes, await bindingForSession(c, row));
+  validateSnapshot(bytes, await bindingForSession(c, row), { conversationOnly });
   const { row: current } = await requireSession(c, row.id, 'manage');
   const backupId = id();
   const encoded = new TextEncoder().encode(bytes);
   const record: BackupRow = { id: backupId, session_id: row.id, owner_id: row.owner_id,
     object_key: `sessions/${row.owner_id}/${row.id}/${backupId}.json`, sha256: await sha256(bytes),
-    size: encoded.byteLength, created_at: now(), automatic: options.automatic ? 1 : 0 };
+    size: encoded.byteLength, created_at: now(), automatic: options.automatic ? 1 : 0, conversation_only: conversationOnly ? 1 : 0 };
   // The owner may have connected, replaced or disconnected the workspace database while the host prepared the snapshot;
   // then it would not be stored where it was meant to go. The same database with rotated credentials keeps its id.
   const database = await workspaceDatabaseRow(c.env, row.workspace_id);
@@ -148,10 +166,13 @@ export async function createBackup(c: AppContext, row: SessionRow, options: Crea
     } catch { fail(503, 'backup_unavailable', 'Durable backup storage is unavailable.'); }
   }
   // An orphaned private object (or workspace database row) on DB failure is safer than a downloadable DB row with no object.
-  const insert = c.env.DB.query('INSERT INTO backups (id, session_id, owner_id, object_key, sha256, size, created_at, automatic) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(record.id, record.session_id, record.owner_id, record.object_key, record.sha256, record.size, record.created_at, record.automatic ?? 0);
+  const insert = c.env.DB.query(`INSERT INTO backups (id, session_id, owner_id, object_key, sha256, size, created_at, automatic, conversation_only)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(record.id, record.session_id, record.owner_id, record.object_key, record.sha256, record.size, record.created_at, record.automatic ?? 0,
+      record.conversation_only ?? 0);
   const audit = auditStatement(c.env, c.get('auth').userId, 'backup.created', row.workspace_id, row.id,
-    { backupId, sha256: record.sha256, size: record.size, location: destination, ...(options.automatic ? { automatic: true } : {}) });
+    { backupId, sha256: record.sha256, size: record.size, location: destination, ...(options.automatic ? { automatic: true } : {}),
+      ...(conversationOnly ? { conversationOnly: true } : {}) });
   await c.env.DB.batch(destination === 'workspace-database'
     ? [insert, c.env.DB.query('INSERT INTO workspace_database_backups (backup_id, workspace_id, created_at) VALUES (?, ?, ?)')
       .bind(record.id, row.workspace_id, record.created_at), audit]
@@ -163,10 +184,13 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/backup', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
     if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can create its backups.');
-    // The body is optional: only a backup to someone else's database needs one.
+    // The body is optional: only a backup to someone else's database, or of the conversation only, needs one.
     const input: Record<string, unknown> = c.req.header('content-type') ? await jsonObject(c, 1024) : {};
-    if (Object.keys(input).some(key => key !== 'trustedDatabaseId')) fail(400, 'invalid_input', 'Backups accept only trustedDatabaseId.');
-    return c.json(await createBackup(c, row, { trustedDatabaseId: input.trustedDatabaseId }), 201);
+    if (Object.keys(input).some(key => key !== 'trustedDatabaseId' && key !== 'conversationOnly')) {
+      fail(400, 'invalid_input', 'Backups accept only trustedDatabaseId and conversationOnly.');
+    }
+    if (input.conversationOnly !== undefined && typeof input.conversationOnly !== 'boolean') fail(400, 'invalid_input', 'conversationOnly must be a boolean.');
+    return c.json(await createBackup(c, row, { trustedDatabaseId: input.trustedDatabaseId, conversationOnly: input.conversationOnly === true }), 201);
   });
 
   app.get('/api/sessions/:id/backups', async c => {
@@ -187,6 +211,8 @@ export function registerBackups(app: Hono<WorkerEnv>): void {
       destination: location,
       // False when no new backup can be saved, so the web app turns backups off instead of offering one that is refused.
       enabled: canSave(c.env, location),
+      // False when the session's host would take a full backup instead (an older connector).
+      conversationOnly: await conversationBackupsSupported(c.env, row),
       ...(database ? { workspaceDatabase: { id: database.id, host: database.host, port: database.port, database: database.database_name, confirm,
         ...(consented ? { consented: true } : {}) } } : {}),
       // The workspace's schedule; `included`: this session's owner confirmed the database (or connected it), so it takes part.

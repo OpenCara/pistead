@@ -495,3 +495,43 @@ test("a clone session's backup stages its clones' bundles and what is pending; m
   await refused(pinned, binding("other"));
   assert.equal(prepare.mock.callCount(), 0);
 });
+
+test("a conversation-only backup restores into an empty worktree and tells preparation so", linux, async t => {
+  const f = await fixture(t);
+  const value: BackupArchive & { conversationOnly?: true } = { ...archive(), files: [], conversationOnly: true };
+  const saved = envelope(value);
+  let staged = "";
+  fakeInitializer(t, () => staged);
+  const seen: { conversationOnly: boolean }[] = [];
+  await restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, async (stage, manifest, options) => {
+    staged = stage;
+    seen.push(options);
+    assert.deepEqual(manifest, value.manifest);
+    for (const name of ["home", "worktree", "git"]) assert.deepEqual(await readdir(join(stage, "sandbox", name)), []);
+  });
+  assert.deepEqual(seen, [{ conversationOnly: true }]);
+  // A full backup says it isn't one.
+  const full = await fixture(t);
+  let fullStage = "";
+  t.mock.restoreAll();
+  fakeInitializer(t, () => fullStage);
+  const options: { conversationOnly: boolean }[] = [];
+  await restoreSession(full.config, full.target, full.descriptor, async (stage, _manifest, given) => { fullStage = stage; options.push(given); });
+  assert.deepEqual(options, [{ conversationOnly: false }]);
+});
+
+test("a conversation-only backup carrying files or clones, or a malformed marker, is refused", linux, async t => {
+  const f = await fixture(t);
+  const prepare = t.mock.fn(async () => {});
+  for (const value of [
+    { ...archive(), conversationOnly: true },
+    { ...archive(), files: [], conversationOnly: true, clones: [] },
+    { ...archive(), files: [], conversationOnly: false },
+    { ...archive(), files: [], conversationOnly: "yes" },
+  ]) {
+    const saved = envelope(value);
+    await assert.rejects(restoreSession({ ...f.config, readBackup: async () => saved.bytes }, f.target, saved.descriptor, prepare), /conversation-only/);
+  }
+  assert.equal(prepare.mock.callCount(), 0);
+  await absent(join(f.directory, "sessions", "target"));
+});

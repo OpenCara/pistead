@@ -308,6 +308,49 @@ test("owner restore publishes a new idle session, drops old authority and leaves
   await restoredService.close();
 });
 
+test("a conversation-only backup keeps the conversation, not the files, and its restore tells the agent so", { skip: process.platform !== "linux" }, async t => {
+  const { service } = await fixture(t);
+  const source = await service.provision(binding("conversation-source"), await ticket("conversation-source", "create"));
+  await source.submit(await ticket("conversation-source", "submit"), { requestId: "conversation-write", content: "TEST_WRITE evidence.txt\noriginal" }, "write");
+  await idle(source);
+  const full = await source.backup(await ticket("conversation-source", "backup"));
+  assert.ok(full.files.some(file => file.path === "worktree/evidence.txt"));
+  assert.equal("conversationOnly" in full, false);
+  const backup = await source.backup(await ticket("conversation-source", "backup"), { conversationOnly: true });
+  assert.equal(backup.format, "pi-runner-backup-v1");
+  assert.deepEqual(backup.files, []);
+  assert.equal("clones" in backup, false);
+  assert.equal((backup as { conversationOnly?: boolean }).conversationOnly, true);
+  assert.equal(Buffer.from(backup.sqlite, "base64").subarray(0, 15).toString(), "SQLite format 3");
+  // The runner's HTTP route takes the request from the backup's body, and nothing else.
+  const app = createRunnerApp(service);
+  for (const [body, status] of [[JSON.stringify({ conversationOnly: true }), 200], [JSON.stringify({ conversationOnly: "yes" }), 400], [JSON.stringify({ files: false }), 400]] as const) {
+    const response = await app.request("/v1/sessions/conversation-source/backup", { method: "POST",
+      headers: { authorization: `Bearer ${await signToken(await ticket("conversation-source", "backup", "test:alice", body), SECRET)}`, "content-type": "application/json" }, body });
+    assert.equal(response.status, status, await response.clone().text());
+    if (status === 200) assert.deepEqual((await response.json() as { files: unknown[] }).files, []);
+  }
+  const text = JSON.stringify(backup);
+  const bytes = new TextEncoder().encode(text);
+  const descriptor: RestoreDescriptor = { id: "conversation-restore", sourceSessionId: "conversation-source", backupId: "conversation-backup", sha256: await sha256(text), size: bytes.byteLength, downloadToken: "opaque-scoped-test-capability" };
+  const target = binding("conversation-target");
+  const restoredService = new RunnerService({ ...service.config,
+    authorize: async request => ({ allowed: request.actorId === target.owner.id, ownerId: target.owner.id, policyVersion: 1 }),
+    readBackup: async () => bytes });
+  await restoredService.initialize();
+  t.after(() => restoredService.close());
+  await restoredService.restore({ binding: target, restore: descriptor }, await ticket(target.session.id, "restore"));
+  const restored = await restoredService.get(target.session.id);
+  assert.ok((await restored.view()).entries.some(entry => entry.text.includes("TEST_WRITE evidence.txt")), "the conversation is restored");
+  await assert.rejects(restored.sandbox.readFile("evidence.txt", allowTestOperation));
+  const instructions = (restored as unknown as { agentInstructions(mode: "write"): string }).agentInstructions("write");
+  assert.match(instructions, /restored from a backup that kept only its conversation/);
+  assert.doesNotMatch((source as unknown as { agentInstructions(mode: "write"): string }).agentInstructions("write"), /kept only its conversation/);
+  // A full backup of the restored session keeps the note: its history still mentions files it never had.
+  const again = await restored.backup(await ticket(target.session.id, "backup"));
+  assert.equal(again.manifest.conversationOnlyRestore, true);
+});
+
 test("restore checks actual paused pi tasks, not only a manifest claiming idle", { skip: process.platform !== "linux" }, async t => {
   const { service, directory } = await fixture(t);
   const source = binding("hidden-task-source");

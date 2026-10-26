@@ -61,6 +61,11 @@ export interface ConnectorCapabilities {
    * session's work), not only `pistead/<session-id>`. Absent on older connectors, whose sessions keep the old name.
    */
   sessionBranches?: boolean;
+  /**
+   * The connector takes conversation-only backups: the session's Pi conversation and state, without its files or clones.
+   * Absent on older connectors, which would take a full backup instead.
+   */
+  conversationBackups?: boolean;
 }
 
 export interface ConnectorInfo {

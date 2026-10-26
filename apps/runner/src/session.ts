@@ -15,7 +15,9 @@ import { messageHash, parseChatImages, type ChatImage } from "../../../packages/
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
-import { hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type MirrorMount, type SandboxAuthorize } from "./sandbox.js";
+import {
+  hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
+} from "./sandbox.js";
 import { IMAGE_BUSY, IMAGE_ERROR, imageType, prepareImage } from "./images.js";
 import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
 import { HostCredentialError } from "./git-credentials.js";
@@ -59,7 +61,23 @@ type Run = {
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
 /** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
 type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
-type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, StoredApproval>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string; callId?: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants };
+/** A session's backup (format pi-runner-backup-v1), as restore.ts reads it back. */
+interface RunnerBackup {
+  format: "pi-runner-backup-v1";
+  binding: RunnerBinding;
+  manifest: Metadata;
+  /** Pi's SQLite, base64. */
+  sqlite: string;
+  files: SnapshotFile[];
+  /** A clone session's clones, as bundles of their local work (Sandbox.cloneBackup). */
+  clones?: CloneBackup[];
+  /** Only the conversation: no files and no clones. */
+  conversationOnly?: true;
+  createdAt: string;
+}
+type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, StoredApproval>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string; callId?: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants;
+  /** The session was restored from a conversation-only backup: the files and clones its history mentions weren't kept. */
+  conversationOnlyRestore?: true };
 /** One JSON string that every change replaces, so each change is stored whole: a delta would be as large and only lengthen replay. */
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
 /** A message's image as the model gets it: prepared by `prepareImage`, base64. */
@@ -221,6 +239,8 @@ export class RunnerSession {
   #lfsRepositories: string[] = [];
   /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
   #cloneFailures: { path: string; reason: string }[] = [];
+  /** Restored from a conversation-only backup (Metadata.conversationOnlyRestore), for the agent's instructions. */
+  #conversationOnlyRestore = false;
   /**
    * The host cache's mirrors this clone session may borrow from, by sandbox path, and when the relay last let its owner
    * read each (0: not yet in this open). Mounted only while confirmed in the last MIRROR_CONFIRM_MS (see mirrorMounts).
@@ -369,7 +389,7 @@ export class RunnerSession {
     return result;
   }
 
-  async prepareRestore(manifest: RestoreManifest): Promise<void> {
+  async prepareRestore(manifest: RestoreManifest, { conversationOnly = false }: { conversationOnly?: boolean } = {}): Promise<void> {
     await this.initializeRepositories();
     const resolved = this.config.resolveModels ? await this.config.resolveModels(this.binding.model)
       : { models: runnerModels(this.binding.model, this.config.allowFaux) };
@@ -404,6 +424,8 @@ export class RunnerSession {
         state.toolActors = {};
         // What the owner allowed for the rest of a session covers that session only; the restored one asks again.
         delete state.grants;
+        // Its agent is told its files weren't kept, from now on: the history still mentions them.
+        if (conversationOnly) state.conversationOnlyRestore = true;
         for (const run of Object.values(state.runs)) delete run.admissionId;
         for (const approval of Object.values(state.approvals)) {
           approval.sessionId = this.binding.session.id;
@@ -551,6 +573,9 @@ export class RunnerSession {
           + "git_push {directory, branch, tag}: it creates that tag at the commit and moves no branch. Tags are never moved; "
           + "plain git push of tags is refused.";
     }
+    if (this.#conversationOnlyRestore) instructions += "\n\nThis session was restored from a backup that kept only its conversation: "
+      + "the files, clones and uncommitted work its earlier messages mention were not restored, so the worktree held none of them when it was "
+      + "restored. Clone the repositories you need again, and check that a file exists before relying on it.";
     if (mode === "ask") instructions += "\n\nThis is a read-only ask. Inspect isolated session files only; do not modify files, execute commands, or perform external effects.";
     if (mode === "read") instructions += "\n\nThis request is read-only. Inspect isolated session files; any change to files, command or other effect waits for the session owner to allow it.";
     return instructions;
@@ -614,6 +639,7 @@ export class RunnerSession {
       if (!doc.json) doc.json = JSON.stringify({ binding: this.binding, branches: [{ id: this.root.id, mode: "write" }], runs: {}, approvals: {}, toolActors: {} } satisfies Metadata);
       const state: Metadata = JSON.parse(doc.json);
       if (stableJson(state.binding) !== stableJson(this.binding)) throw new RunnerError(409, "Persisted binding mismatch");
+      this.#conversationOnlyRestore = state.conversationOnlyRestore === true;
       for (const approval of Object.values(state.approvals)) {
         if (approval.status === "executing") {
           approval.status = "interrupted";
@@ -1811,7 +1837,11 @@ export class RunnerSession {
     await this.exclusive(async () => { await this.close(); await this.open(); });
   }
 
-  async backup(ticket: RunnerTicket) {
+  /**
+   * The session's idle, checkpointed snapshot. `conversationOnly` keeps just Pi's SQLite and the runner state: no files,
+   * no clones, so a restore starts with an empty worktree.
+   */
+  async backup(ticket: RunnerTicket, { conversationOnly = false }: { conversationOnly?: boolean } = {}): Promise<RunnerBackup> {
     this.assertTicket(ticket);
     return this.exclusive(async () => {
       await this.authorize(ticket.actorId, "manage");
@@ -1823,6 +1853,10 @@ export class RunnerSession {
       await this.close();
       try {
         const sqlite = await readFile(this.sqlitePath, "base64");
+        if (conversationOnly) {
+          return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files: [], conversationOnly: true,
+            createdAt: new Date().toISOString() };
+        }
         const authorize = async () => { await this.authorize(ticket.actorId, "manage"); };
         // A clone session's clones go into the backup as bundles of their local work, not as files: a restore clones them
         // again from their origin.

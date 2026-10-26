@@ -30,7 +30,7 @@ export interface SessionData {
   session: SessionRecord & { archivedStatus: string | null };
   grants: { userId: string; permissions: unknown; createdAt: string }[];
   toolGrants: { tool: string; callId: string; approvalId: string; grantedBy: string; createdAt: string }[];
-  backups: { id: string; size: number; sha256: string; createdAt: string; location: BackupLocation }[];
+  backups: { id: string; size: number; sha256: string; createdAt: string; location: BackupLocation; conversationOnly?: true }[];
   restores: {
     id: string; sourceSessionId: string; backupId: string; targetSessionId: string; title: string | null; status: string;
     createdAt: string; completedAt: string | null;
@@ -94,8 +94,8 @@ export async function sessionData(db: Database, row: SessionRow): Promise<Sessio
     'SELECT user_id, permissions_json, created_at FROM session_grants WHERE session_id = ? ORDER BY created_at, user_id', row.id);
   const toolGrants = await all<{ tool: string; call_id: string; approval_id: string; granted_by: string; created_at: string }>(
     'SELECT tool, call_id, approval_id, granted_by, created_at FROM session_tool_grants WHERE session_id = ? ORDER BY created_at, tool, call_id', row.id);
-  const backups = await all<{ id: string; size: number; sha256: string; created_at: string; stored_in: string | null }>(
-    `SELECT b.id, b.size, b.sha256, b.created_at, l.workspace_id AS stored_in FROM backups b
+  const backups = await all<{ id: string; size: number; sha256: string; created_at: string; conversation_only: number; stored_in: string | null }>(
+    `SELECT b.id, b.size, b.sha256, b.created_at, b.conversation_only, l.workspace_id AS stored_in FROM backups b
       LEFT JOIN workspace_database_backups l ON l.backup_id = b.id WHERE b.session_id = ? ORDER BY b.created_at, b.id`, row.id);
   const restores = await all<{
     id: string; source_session_id: string; backup_id: string; target_session_id: string; request_title: string | null; status: string;
@@ -115,7 +115,7 @@ export async function sessionData(db: Database, row: SessionRow): Promise<Sessio
     toolGrants: toolGrants.map(grant => ({ tool: grant.tool, callId: grant.call_id, approvalId: grant.approval_id, grantedBy: grant.granted_by,
       createdAt: grant.created_at })),
     backups: backups.map(backup => ({ id: backup.id, size: backup.size, sha256: backup.sha256, createdAt: backup.created_at,
-      location: backupLocation(backup.stored_in) })),
+      location: backupLocation(backup.stored_in), ...(backup.conversation_only ? { conversationOnly: true as const } : {}) })),
     restores: restores.map(restore => ({ id: restore.id, sourceSessionId: restore.source_session_id, backupId: restore.backup_id,
       targetSessionId: restore.target_session_id, title: restore.request_title, status: restore.status, createdAt: restore.created_at,
       completedAt: restore.completed_at })),
