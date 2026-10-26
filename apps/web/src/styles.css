@@ -322,6 +322,9 @@
   .dot.warning { background: var(--dot-warning); }
   .dot.danger { background: var(--dot-danger); }
   .dot.running { background: var(--dot-running); animation: pulse 1.6s ease-in-out infinite; }
+  /* Where a dot would be: a clock for a session that waits for its next scheduled prompt. */
+  .status-icon { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 11px; height: 11px; margin: 0 -2px; color: var(--foreground-extra-muted); }
+  .status-icon.info, .status-icon.running { color: var(--status-info); }
   /* A session's status label beside its dot: colored only while under way or needing attention. */
   .session-status.running, .session-status.info { color: var(--status-info); }
   .session-status.warning { color: var(--status-warning); }

@@ -13,6 +13,7 @@ import { createStaticHandler } from './static.js';
 import { settlePushCredentials } from './push/broker.js';
 import { refreshPullRequestStates } from './pull-request-states.js';
 import { runAutomaticBackups } from './automatic-backups.js';
+import { runScheduledPrompts } from './scheduled-prompts.js';
 import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
 import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
 import { WorkspaceDatabaseError } from './workspace-databases/types.js';
@@ -206,6 +207,17 @@ const backingUp = setInterval(() => {
     .finally(() => { sweeping = false; });
 }, 60_000);
 backingUp.unref();
+
+// Scheduled prompts (scheduled-prompts.ts); one sweep at a time.
+let scheduling = false;
+const scheduledPrompts = setInterval(() => {
+  if (scheduling) return;
+  scheduling = true;
+  void runScheduledPrompts(env)
+    .catch(error => { console.error('pistead: scheduled prompts failed:', error instanceof Error ? error.message : error); })
+    .finally(() => { scheduling = false; });
+}, 30_000);
+scheduledPrompts.unref();
 
 const serveStatic = createStaticHandler(staticDir);
 app.notFound(async c => {
