@@ -120,7 +120,7 @@ function SharedEntry({ entry }: { entry: EntryView }) {
     const took = entry.role === "toolResult" && entry.durationMs !== undefined
       && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
     // A brief tool result's one line shows on its row.
-    const line = entry.trimmed && entry.role === "toolResult" && entry.text.trim() && <span className="muted"> · {entry.text}</span>;
+    const line = entry.trimmed && entry.role === "toolResult" && entry.text.trim() ? <span className="muted"> · {entry.text}</span> : null;
     return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{line}</>} text={entry.text} trimmed={entry.trimmed} />;
   }
   if (entry.error) {

@@ -3,7 +3,7 @@ import test from "node:test";
 import { sharedView } from "../apps/server/src/session-links.js";
 import { carryEarlier, withEarlier } from "../packages/client/src/transcript-pages.js";
 import { splitToolCalls } from "../packages/client/src/transcript.js";
-import { briefChars, briefEntry, entriesBefore, latestEntries } from "../packages/shared/src/transcript-display.js";
+import { briefChars, briefEntry, characters, entriesBefore, latestEntries } from "../packages/shared/src/transcript-display.js";
 import type { EntryView, SessionView } from "../packages/shared/src/types.js";
 
 const entry = (id: string, conversationId = "0", extra: Partial<EntryView> = {}): EntryView =>
@@ -25,12 +25,20 @@ test("brief tool output keeps a tool result's first line and says how long the w
   // A long line is cut at whole code points, with an ellipsis.
   const long = briefEntry(entry("0:4", "0", { role: "toolResult", text: "😀".repeat(briefChars + 5) }));
   assert.equal(long.text, `${"😀".repeat(briefChars)}…`);
-  assert.deepEqual(long.trimmed, { lines: 1, chars: (briefChars + 5) * 2 });
+  assert.deepEqual(long.trimmed, { lines: 1, chars: briefChars + 5 }, "Characters as people count them, not UTF-16 units");
   // Prose, user messages and system entries are never shortened.
   for (const role of ["user", "system"]) {
     const other = entry("0:5", "0", { role, text: "a\n".repeat(500) });
     assert.equal(briefEntry(other), other);
   }
+});
+
+test("characters count code points, and a lone surrogate as one", () => {
+  assert.equal(characters(""), 0);
+  assert.equal(characters("abc"), 3);
+  assert.equal(characters("a😀b"), 3);
+  assert.equal(characters("\ud83d"), 1);
+  assert.equal(characters("\ude00\ud83d"), 2);
 });
 
 test("brief tool output cuts long tool calls but keeps them tool calls, and leaves prose and code alone", () => {

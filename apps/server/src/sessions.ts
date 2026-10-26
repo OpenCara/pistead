@@ -149,9 +149,11 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
     const snapshots = row.connector_id ? 2 : 4;
     try {
       if (c.req.raw.signal.aborted) abort();
-      // Read once per stream: a changed setting reaches viewers with their next stream, a second or so later.
-      const display = await Promise.race([transcriptDisplay(c, row), stopped]);
-      for (let snapshot = 0; display && snapshot < snapshots && !stream.aborted; snapshot++) {
+      for (let snapshot = 0; snapshot < snapshots && !stream.aborted; snapshot++) {
+        // Read with every snapshot: one session has one feed, so a stream left on settings someone just changed would
+        // keep replacing the feed of everyone reading with the new ones. The first view after a change is a whole one.
+        const display = await Promise.race([transcriptDisplay(c, row), stopped]);
+        if (!display || stream.aborted) break;
         // The view is checked against the session, presented and redacted by the feed.
         const shown = await Promise.race([sessionView(c, row, { display }), stopped]);
         if (!shown || stream.aborted) break;

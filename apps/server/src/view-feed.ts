@@ -10,7 +10,6 @@ import { fail } from './http.js';
 import { requireRunnerAccess, runnerJSON, runnerRequest } from './runner.js';
 import { briefEntry, entriesBefore, fullTranscript, latestEntries, type TranscriptDisplay } from '../../../packages/shared/src/transcript-display.js';
 import type { AppContext, SessionRow } from './types.js';
-import { workspaceTranscriptSettings } from './transcript-settings.js';
 
 /**
  * One feed of each session's view, shared by everyone watching it: a host is asked at most about once a second however
@@ -71,10 +70,14 @@ function registry(env: object): Map<string, Feed> {
   return feeds;
 }
 
-/** How the session's transcript is shown now: its own tool output setting, and its workspace's paging. */
+/**
+ * How the session's transcript is shown now: its own tool output setting and its workspace's paging, both read again
+ * (a stream holds its session row for seconds, and either can change meanwhile).
+ */
 export async function transcriptDisplay(c: AppContext, row: SessionRow): Promise<TranscriptDisplay> {
-  const { paging } = await workspaceTranscriptSettings(c.env.DB, row.workspace_id);
-  return { toolOutput: row.tool_output === 'brief' ? 'brief' : 'full', paging };
+  const current = await c.env.DB.query<{ tool_output: string | null; paging: number | null }>(`SELECT s.tool_output, t.paging
+    FROM sessions s LEFT JOIN workspace_transcript_settings t ON t.workspace_id = s.workspace_id WHERE s.id = ?`).bind(row.id).first();
+  return { toolOutput: (current ? current.tool_output : row.tool_output) === 'brief' ? 'brief' : 'full', paging: current?.paging === 1 };
 }
 
 function feedFor(c: AppContext, row: SessionRow, display: TranscriptDisplay): Feed {

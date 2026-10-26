@@ -397,12 +397,14 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     const element = transcript.current;
     if (element) element.scrollTop = element.scrollHeight;
   }, [actualMode, conversationId]);
-  // Earlier entries arrived above: keep what the reader was looking at in place.
+  // Earlier entries arrived above: keep what the reader was looking at in place. When the first entry they saw is gone
+  // instead (the transcript started again, after a compaction say), nothing was added above it, so the scroll stays.
   useLayoutEffect(() => {
     const element = transcript.current;
     const kept = anchor.current;
     if (!element || !kept || kept.first === firstEntryId) return;
     anchor.current = null;
+    if (kept.first === undefined || !entries.some(entry => entry.id === kept.first)) return;
     element.scrollTop = kept.top + element.scrollHeight - kept.height;
   }, [firstEntryId]);
 

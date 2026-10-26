@@ -24,6 +24,19 @@ export const briefChars = 200;
 /** Entries per conversation a paged view holds, entries one page reads, and the most one request may ask for. */
 export const transcriptPage = { size: 50, max: 200 } as const;
 
+/** How many characters (code points) `text` has, as people count them: an emoji is one, not two UTF-16 units. */
+export function characters(text: string): number {
+  let count = text.length;
+  for (let index = 0; index < text.length - 1; index++) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { count--; index++; }
+    }
+  }
+  return count;
+}
+
 /** At most `limit` characters (whole code points) of `text`, with an ellipsis when cut. */
 function cut(text: string, limit: number): string {
   // A code point is at most two UTF-16 units: only text longer than `limit` units can need cutting, and its first
@@ -44,7 +57,7 @@ export function briefEntry(entry: EntryView): EntryView {
     const lines = text.split("\n");
     const first = cut((lines.find(line => line.trim()) ?? "").trimEnd(), briefChars);
     if (first === text) return entry;
-    return { ...entry, text: first, trimmed: { lines: lines.length, chars: text.length } };
+    return { ...entry, text: first, trimmed: { lines: lines.length, chars: characters(text) } };
   }
   if (entry.role !== "assistant") return entry;
   let changed = false;
@@ -58,7 +71,7 @@ export function briefEntry(entry: EntryView): EntryView {
     // Still a call line (`name({…})`), so clients show it as a tool call, never as prose.
     return `${tool}(${short}})`;
   });
-  return changed ? { ...entry, text: shown.join("\n"), trimmed: { lines: shown.length, chars: text.length } } : entry;
+  return changed ? { ...entry, text: shown.join("\n"), trimmed: { lines: shown.length, chars: characters(text) } } : entry;
 }
 
 /** The conversations whose entries a paged view can hold back: only those the view lists. */

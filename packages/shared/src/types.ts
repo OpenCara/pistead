@@ -608,7 +608,8 @@ export interface EntryView {
   autoApproved?: AutoApprovedCall[];
   /**
    * The session shows brief tool output (`SessionRecord.toolOutput`) and `text` is shortened: a tool result's first
-   * line, or tool calls cut to their first characters. The whole text's size; the host keeps it.
+   * line, or tool calls cut to their first characters. The whole text's lines and characters (code points); the host
+   * keeps it.
    */
   trimmed?: { lines: number; chars: number };
 }
