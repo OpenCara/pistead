@@ -161,7 +161,9 @@ export async function presentApprovals(c: AppContext, row: SessionRow, input: Ap
   for (const { approval, admissionId } of normalized) {
     const kind = approval.operation.kind;
     if (!approval.automatic || (kind !== 'github.comment' && kind !== 'github.issue' && kind !== 'github.merge')) continue;
-    const admission = admissionId ? admissions.get(admissionId) : undefined;
+    // The admission its review recorded, as for every other check here; a changed one is refused below anyway.
+    const reviewed = stored.get(approval.id)?.admission_id ?? admissionId;
+    const admission = reviewed ? admissions.get(reviewed) : undefined;
     if (!ownerAuto(row, admission) || (kind === 'github.merge' && admission!.auto_merge !== 1)) {
       fail(502, 'invalid_runner_response', 'The runtime returned an invalid automatic GitHub approval.');
     }

@@ -69,6 +69,23 @@ export async function connectorAdmins(env: Env, connectorId: string): Promise<Co
     .bind(connectorId).all()).map(item => ({ userId: item.user_id, name: item.display_name, createdAt: item.created_at }));
 }
 
+/**
+ * The host's grants, as `viewer` may see them: all of them for its owner, an admin only those in workspaces they belong
+ * to too, as their listing shows.
+ */
+export async function visibleHostGrants(env: Env, row: ManagedConnector, viewer: string): Promise<HostCommandGrant[]> {
+  const grants = await connectorHostGrants(env, row.id);
+  if (row.role === 'owner') return grants;
+  const memberships = new Set((await env.DB.query<{ workspace_id: string }>('SELECT workspace_id FROM workspace_members WHERE user_id = ?')
+    .bind(viewer).all()).map(item => item.workspace_id));
+  return grants.filter(grant => memberships.has(grant.workspaceId));
+}
+
+/** An admin acts on a host's sharing only in workspaces they belong to; its owner, in any of theirs. */
+export async function requireManagedWorkspace(env: Env, row: ManagedConnector, workspaceId: string, actorId: string): Promise<void> {
+  if (row.role === 'admin') await requireMember(env, workspaceId, actorId);
+}
+
 export async function connectorHostGrants(env: Env, connectorId: string): Promise<HostCommandGrant[]> {
   const rows = await env.DB.query<{ workspace_id: string; user_id: string; display_name: string | null; level: HostCommandLevel;
     expires_at: number | null; created_by: string; created_at: string }>(`SELECT g.workspace_id, g.user_id, u.display_name, g.level, g.expires_at,
@@ -94,7 +111,7 @@ function expiry(value: unknown): number | null {
 }
 
 export function registerHostAccess(app: Hono<WorkerEnv>): void {
-  // Only the owner adds admins: a member who shares a workspace with the host.
+  // Only the owner adds admins: a member who shares a workspace with the host, other than as a viewer there.
   app.put('/api/connectors/:id/admins/:userId', async c => {
     const actorId = c.get('auth').userId;
     const row = await managedConnector(c);
@@ -108,10 +125,10 @@ export function registerHostAccess(app: Hono<WorkerEnv>): void {
         AND EXISTS (SELECT 1 FROM connector_workspaces cw
           JOIN workspace_members owner ON owner.workspace_id = cw.workspace_id AND owner.user_id = ?
           JOIN workspace_members admin ON admin.workspace_id = cw.workspace_id AND admin.user_id = ?
-          WHERE cw.connector_id = ?)
+          WHERE cw.connector_id = ? AND admin.role NOT IN (${sqlList(readOnlyRoles)}))
       ON CONFLICT (connector_id, user_id) DO UPDATE SET created_at = connector_admins.created_at RETURNING user_id`)
       .bind(row.id, userId, actorId, now(), row.id, maxAdmins, userId, row.owner_id, userId, row.id).first();
-    if (!inserted) fail(409, 'admin_unavailable', 'Admins must be members of a workspace this host is connected to, and a host has at most 20.');
+    if (!inserted) fail(409, 'admin_unavailable', 'Admins must be members (not viewers) of a workspace this host is connected to, and a host has at most 20.');
     await auditStatement(c.env, actorId, 'connector.admin.added', null, null, { connectorId: row.id, userId }).run();
     return c.json({ admins: await connectorAdmins(c.env, row.id) });
   });
@@ -141,7 +158,8 @@ export function registerHostAccess(app: Hono<WorkerEnv>): void {
     const userId = input.userId === undefined || input.userId === null ? '' : userIdentifier(input.userId, 'userId');
     if (userId === row.owner_id) fail(400, 'invalid_grant', 'The host\'s owner already decides its host commands.');
     const expiresAt = expiry(input.expiresAt);
-    await requireMember(c.env, workspaceId, actorId);
+    // An admin grants only where they are a member; the owner, where the host is shared (checked by the insert).
+    await requireManagedWorkspace(c.env, row, workspaceId, actorId);
     if (userId) {
       const member = await requireMember(c.env, workspaceId, userId);
       if (readOnlyRoles.includes(member.role)) fail(400, 'viewer_role', 'Viewers cannot be granted host commands.');
@@ -157,13 +175,14 @@ export function registerHostAccess(app: Hono<WorkerEnv>): void {
       .bind(row.id, workspaceId, userId, level, expiresAt, actorId, now(), row.id, maxGrants, row.id, workspaceId, userId, row.id, workspaceId, row.id).first();
     if (!inserted) fail(409, 'grant_unavailable', 'Share the host with this workspace first; a host has at most 200 grants.');
     await auditStatement(c.env, actorId, 'host.grant.set', workspaceId, null, { connectorId: row.id, userId: userId || null, level, expiresAt }).run();
-    return c.json({ hostGrants: await connectorHostGrants(c.env, row.id) });
+    return c.json({ hostGrants: await visibleHostGrants(c.env, row, actorId) });
   });
   // `?userId=` names the member's grant; without it, the workspace-wide one.
   app.delete('/api/connectors/:id/host-grants/:workspaceId', async c => {
     const actorId = c.get('auth').userId;
     const row = await managedConnector(c);
     const workspaceId = identifier(c.req.param('workspaceId'));
+    await requireManagedWorkspace(c.env, row, workspaceId, actorId);
     const named = c.req.query('userId');
     const userId = named === undefined || named === '' ? '' : userIdentifier(named, 'userId');
     await c.env.DB.batch([

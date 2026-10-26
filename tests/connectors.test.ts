@@ -2510,6 +2510,10 @@ test('host owners add admins who manage sharing and host command grants, and gra
   await denied(await creator.request('PUT', `${admins}/${creator.user.id}`), 404, 'not_found');
   await denied(await host.request('PUT', `${admins}/${outsider.user.id}`), 409, 'admin_unavailable');
   await denied(await host.request('PUT', `${admins}/${host.user.id}`), 400, 'invalid_admin');
+  // A viewer of the workspace stays read-only: never an admin.
+  const viewer = await f.client('viewer');
+  await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: viewer.user.id, role: 'viewer' }));
+  await denied(await host.request('PUT', `${admins}/${viewer.user.id}`), 409, 'admin_unavailable');
   const added = await json<{ admins: { userId: string }[] }>(await host.request('PUT', `${admins}/${creator.user.id}`));
   assert.deepEqual(added.admins.map(admin => admin.userId), [creator.user.id]);
   const listed = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', '/api/connectors'))).connectors;
@@ -2534,6 +2538,24 @@ test('host owners add admins who manage sharing and host command grants, and gra
   assert.equal(own[0].hostCommandAccess, 'auto');
   const audits = f.sqlite.prepare(`SELECT action FROM audit WHERE action LIKE 'host.grant.%' OR action LIKE 'connector.admin.%' ORDER BY created_at, rowid`).all().map(row => row.action);
   assert.deepEqual(audits, ['connector.admin.added', 'host.grant.set', 'host.grant.set']);
+
+  // In a workspace of the owner's the admin isn't in, they neither see nor change the host's sharing.
+  const other = await workspace(host);
+  f.sqlite.prepare(`INSERT INTO workspace_repositories (id, workspace_id, repository_id, full_name, ref, private, created_at) VALUES (?,?,?,?,?,?,?)`)
+    .run('other-repository', other.id, '8', 'owner/other', 'main', 1, new Date().toISOString());
+  await json(await host.request('PUT', `/api/connectors/${id}/shares/${other.id}`));
+  await json(await host.request('PUT', `/api/connectors/${id}/host-grants/${other.id}`, { level: 'approve' }));
+  await denied(await creator.request('DELETE', `/api/connectors/${id}/shares/${other.id}`), 404, 'not_found');
+  await denied(await creator.request('DELETE', `/api/connectors/${id}/host-grants/${other.id}`), 404, 'not_found');
+  await denied(await creator.request('PUT', `/api/connectors/${id}/host-grants/${other.id}`, { level: 'auto' }), 404, 'not_found');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_shares WHERE workspace_id = ?').get(other.id)!.n, 1);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_host_grants WHERE workspace_id = ?').get(other.id)!.n, 1);
+  const shown = await json<{ hostGrants: { workspaceId: string }[] }>(await creator.request('PUT', grants, { level: 'auto', userId: creator.user.id }));
+  assert.deepEqual([...new Set(shown.hostGrants.map(grant => grant.workspaceId))], [s.team.id], 'an admin sees only grants of their own workspaces');
+  const asAdmin = (await json<{ connectors: ConnectorInfo[] }>(await creator.request('GET', '/api/connectors'))).connectors[0];
+  assert.ok(!asAdmin.workspaceIds.includes(other.id) && !asAdmin.hostGrants?.some(grant => grant.workspaceId === other.id));
+  const asOwner = (await json<{ connectors: ConnectorInfo[] }>(await host.request('GET', '/api/connectors'))).connectors[0];
+  assert.ok(asOwner.workspaceIds.includes(other.id) && asOwner.hostGrants?.some(grant => grant.workspaceId === other.id));
 
   // An expired grant no longer counts; the workspace-wide one still does. Removing a grant ends it.
   f.sqlite.prepare('UPDATE connector_host_grants SET expires_at = ? WHERE user_id = ?').run(Math.floor(Date.now() / 1000) - 1, creator.user.id);
