@@ -12,6 +12,7 @@ import {
   type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SnapshotFile,
 } from "./sandbox.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
+import { browseDirectory, browseFile, checkedBrowse, type BrowseResult } from "./file-browser.js";
 
 const MAX_ENTRIES = 10_000;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
@@ -135,6 +136,18 @@ export class HostWorkspace {
       const names = await readdir(await directoryAt(this.worktree, await this.#parts(value, false)));
       if (names.length > MAX_ENTRIES) throw hostError("directory has too many entries");
       return names.sort();
+    });
+  }
+
+  /** The file browser's read-only look at one worktree path, under the same path rules as the file tools. */
+  async browse(path: string, authorize: SandboxAuthorize): Promise<BrowseResult> {
+    const value = text(path, "path", 1024);
+    return this.#operation(authorize, async () => {
+      const parts = await this.#parts(value, false);
+      if (!parts.length) return checkedBrowse(await browseDirectory(this.worktree));
+      const parent = await directoryAt(this.worktree, parts.slice(0, -1));
+      const target = join(parent, parts.at(-1)!);
+      return checkedBrowse((await lstat(target)).isDirectory() ? await browseDirectory(target) : await browseFile(target));
     });
   }
 

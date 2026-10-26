@@ -383,10 +383,11 @@ Session lists show what each session's agent is doing: **Starting**, **Not start
 
 The session's menu offers **Copy session ID** and **Open in workspace settings**, and to its owner **Rename**, **Make private** or **Make workspace-visible**, **Create backup** and **Archive** (or **Unarchive**). Archiving makes a session read-only for everyone and hides it from lists; unarchiving brings it back as it was.
 
-The session panel has three tabs:
+The session panel has four tabs:
 
 - **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
 - **Approvals**: every approval and permission request, pending ones first.
+- **Files**: the session's worktree on its host, read-only. Open directories and preview files: text up to 256 KB, with line numbers and syntax highlighting chosen by file name (up to 128 KB), and PNG, JPEG, GIF and WebP images up to 2 MB, over a checkerboard that shows transparency; click an image to switch between fitting the panel and its actual size. SVG files show as an image, drawn without running scripts or loading anything, with their source a click away. Each path is read from the host as you open it (**Refresh** reads it again), inside the session's sandbox and confined to its worktree like the agent's file tools; symlinks that lead out of it don't open, and values that look like secrets are hidden as in the transcript. It takes the session collaborator role (`write`), since collaborators can already have the agent read any file; viewers and share links don't get it. It isn't offered on archived sessions, and needs a host whose connector is new enough to advertise it.
 - **Activity**: the session's audit log, newest 200 entries.
 
 ### Approvals and permission requests

@@ -156,7 +156,29 @@ export interface RunnerBinding {
   agent: AgentVersion;
   model: ModelDefinition;
 }
-export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop";
+export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop" | "files";
+
+/** How far the session file browser reads: entries listed per directory, and bytes of a file previewed. */
+export const fileBrowserLimits = { entries: 1000, textBytes: 256 * 1024, imageBytes: 2 * 1024 * 1024 } as const;
+
+/** One entry of a worktree directory, as the file browser lists it; symlinks are listed, not followed. */
+export interface FileEntry {
+  name: string;
+  type: "directory" | "file" | "symlink" | "other";
+  /** Bytes, for regular files only. */
+  size?: number;
+}
+
+/**
+ * What the file browser shows of one worktree path (`path` is relative to the worktree, "." for its root): a directory's
+ * entries, directories first and then by name, at most `fileBrowserLimits.entries` of them; or a file's preview, text
+ * up to `fileBrowserLimits.textBytes`, an image up to `fileBrowserLimits.imageBytes`, or neither for anything else.
+ */
+export type SessionFiles =
+  | { path: string; type: "directory"; entries: FileEntry[]; total: number; truncated: boolean }
+  | { path: string; type: "file"; size: number; truncated: boolean; text?: string; image?: { mimeType: string; data: string }; binary?: true;
+    /** The control plane hid something that looks like a secret in `text`. */
+    redacted?: true };
 export interface RunnerTicket {
   aud: "runner";
   sessionId: string;
