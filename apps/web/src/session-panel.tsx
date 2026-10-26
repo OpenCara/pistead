@@ -33,7 +33,10 @@ export interface SessionActions {
   /** Backups need an idle session whose live state is confirmed. */
   backupBlocked: boolean;
   changeVisibility: () => void;
-  createBackup: () => void;
+  /** `conversationOnly`: keep the conversation without the session's files or clones. */
+  createBackup: (options?: { conversationOnly?: boolean }) => void;
+  /** The session's host can't back up its conversation only (an older connector). */
+  conversationOnlyOff: boolean;
   /** Resolves true once the new title is saved. */
   rename: (title: string) => Promise<boolean>;
   archive: () => void;
@@ -49,6 +52,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
   const backupsOff = backups.data?.enabled === false;
   // A listing that failed leaves the server to explain a refusal; one still loading offers nothing yet.
   const backupsPending = !backups.data && !backups.error;
+  const conversationOnlyOff = backups.data?.conversationOnlySupported === false;
   async function changeVisibility() {
     if (!session || !isOwner || action.busy) return;
     const nextVisibility = (session.visibility ?? "private") === "workspace" ? "private" : "workspace";
@@ -69,8 +73,8 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       ? "Session is workspace-visible. Workspace members can view prompts and output."
       : "Session is private. Existing explicit grants still apply.");
   }
-  async function createBackup() {
-    if (!session || !isOwner || backupBlocked || backupsOff || backupsPending || action.busy) return;
+  async function createBackup({ conversationOnly = false }: { conversationOnly?: boolean } = {}) {
+    if (!session || !isOwner || backupBlocked || backupsOff || backupsPending || action.busy || (conversationOnly && conversationOnlyOff)) return;
     setBackup(null);
     const base = `/api/sessions/${segment(session.id)}`;
     let trustedDatabaseId: string | undefined;
@@ -80,7 +84,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       if (workspaceDatabase?.confirm) {
         const confirmed = await confirmDialog({
           title: "Save to the workspace database?",
-          message: `This backup is saved in ${backupDatabaseLabel(workspaceDatabase)}, the database the workspace owner connected. Whoever can read it can read this session: its prompts, output and files, and your personal environment values.`,
+          message: `This backup is saved in ${backupDatabaseLabel(workspaceDatabase)}, the database the workspace owner connected. Whoever can read it can read this session: its prompts, output${conversationOnly ? "" : " and files"}, and your personal environment values.`,
           confirmLabel: "Save backup",
         });
         if (!confirmed) return;
@@ -88,10 +92,11 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       }
     } catch { /* The backup request repeats the check and explains a refusal. */ }
     await action.run(async () => {
-      const result = await api<{ backup: Backup }>(`${base}/backup`, { method: "POST", ...(trustedDatabaseId ? { body: { trustedDatabaseId } } : {}) });
+      const body = { ...(trustedDatabaseId ? { trustedDatabaseId } : {}), ...(conversationOnly ? { conversationOnly: true } : {}) };
+      const result = await api<{ backup: Backup }>(`${base}/backup`, { method: "POST", ...(Object.keys(body).length ? { body } : {}) });
       setBackup(result.backup);
       onChange();
-    }, "Backup created");
+    }, conversationOnly ? "Conversation backup created" : "Backup created");
   }
   async function rename(title: string): Promise<boolean> {
     const next = title.trim();
@@ -125,7 +130,8 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       onChange();
     }, "Session unarchived");
   }
-  return { action, backup, backups, backupsOff, backupsPending, backupBlocked, changeVisibility: () => void changeVisibility(), createBackup: () => void createBackup(), rename,
+  return { action, backup, backups, backupsOff, backupsPending, backupBlocked, changeVisibility: () => void changeVisibility(),
+    createBackup: options => void createBackup(options), conversationOnlyOff, rename,
     archive: () => void archive(), unarchive };
 }
 
@@ -548,10 +554,13 @@ function BackupsSection({ session, actions, openSession }: { session: SessionRec
   const { backup } = actions;
   return <Section
     title="Backups"
-    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p><p>Backups are saved in the database the workspace owner connected, if there is one, and otherwise in the server's backup storage. A server without backup storage keeps no backups.</p></>}
+    info={<><p>Only the session owner can create, download or restore backups. Backups need the session to be idle.</p><p>A backup keeps the conversation, the session's files and each clone's local work. <strong>Conversation only</strong> keeps just the conversation: it's much smaller, and a session restored from it starts with an empty worktree, so the agent clones its repositories again.</p><p>Restore creates a new private session and never overwrites this one. It doesn't replay approvals or run operations, and needs the original host to be available. Listing and downloading work while offline.</p><p>Backups are saved in the database the workspace owner connected, if there is one, and otherwise in the server's backup storage. A server without backup storage keeps no backups.</p></>}
     action={<div className="inline">
       <Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh backups" title="Refresh backups" onClick={() => setRefreshKey(value => value + 1)} />
-      <Button variant="outline" size="sm" disabled={actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy} title={actions.backupsOff ? "Backups are off" : undefined} onClick={actions.createBackup}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
+      <Button variant="ghost" size="sm" disabled={actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.conversationOnlyOff || actions.action.busy}
+        title={actions.backupsOff ? "Backups are off" : actions.conversationOnlyOff ? "Update this session's host connector to back up its conversation only" : "Back up the conversation without the session's files"}
+        onClick={() => actions.createBackup({ conversationOnly: true })}>Conversation only</Button>
+      <Button variant="outline" size="sm" disabled={actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy} title={actions.backupsOff ? "Backups are off" : undefined} onClick={() => actions.createBackup()}>{actions.action.busy ? "Working..." : "Create backup"}</Button>
     </div>}
   >
     {actions.backupBlocked && !actions.backupsOff && <Row title="Backup unavailable right now" hint="Unavailable while work is queued or running, or the live state can't be confirmed" />}

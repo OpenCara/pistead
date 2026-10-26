@@ -142,11 +142,11 @@ export class RunnerService {
     const authority = new RunnerSession(binding, join(this.dataDir, "sessions", id), this.config);
     await authority.authorize(ticket.actorId, "manage", ticket.policyVersion);
     await restoreSession({ dataDir: this.dataDir, readBackup: (descriptor, target) => this.pullBackup(descriptor, target) },
-      binding, input.restore, async (stage, manifest) => {
+      binding, input.restore, async (stage, manifest, options) => {
         if (this.closed) throw new RunnerError(503, "Runner service is closed");
         await authority.authorize(ticket.actorId, "manage", ticket.policyVersion);
         const staged = new RunnerSession(binding, stage, this.config);
-        try { await staged.prepareRestore(manifest); }
+        try { await staged.prepareRestore(manifest, options); }
         finally { await staged.sandbox.close(); }
       });
     return binding;
@@ -253,7 +253,10 @@ export function createRunnerApp(service: RunnerService): Hono {
       await session.restart();
       return c.json({ ok: true, sessionId: id });
     }
-    return c.json(await session.backup(ticket));
+    // A backup's body is empty, or asks for the conversation only.
+    if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => key !== "conversationOnly")
+      || (input.conversationOnly !== undefined && typeof input.conversationOnly !== "boolean")) throw new RunnerError(400, "Invalid backup request");
+    return c.json(await session.backup(ticket, { conversationOnly: input.conversationOnly === true }));
   });
   app.notFound(c => c.json({ error: "Not found" }, 404));
   return app;

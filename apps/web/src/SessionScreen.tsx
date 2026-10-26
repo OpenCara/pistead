@@ -173,8 +173,14 @@ function SessionPane({ id }: { id: string }) {
   if (session && isOwner && !archived) {
     menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
-    if (!frozen) menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy,
-      hint: actions.backupsOff ? "Backups are off" : actions.backupBlocked ? "Session busy" : undefined, onSelect: actions.createBackup });
+    if (!frozen) {
+      menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy,
+        hint: actions.backupsOff ? "Backups are off" : actions.backupBlocked ? "Session busy" : undefined, onSelect: () => actions.createBackup() });
+      menu.push({ label: "Back up conversation only", icon: "archive",
+        disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.conversationOnlyOff || actions.action.busy,
+        hint: actions.backupsOff ? "Backups are off" : actions.backupBlocked ? "Session busy" : actions.conversationOnlyOff ? "Update the host's connector" : undefined,
+        onSelect: () => actions.createBackup({ conversationOnly: true }) });
+    }
     menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
   }
   if (session && isOwner && archived) {

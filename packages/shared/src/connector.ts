@@ -62,6 +62,11 @@ export interface ConnectorCapabilities {
    */
   sessionBranches?: boolean;
   /**
+   * The connector takes conversation-only backups: the session's Pi conversation and state, without its files or clones.
+   * Absent on older connectors, which would take a full backup instead.
+   */
+  conversationBackups?: boolean;
+  /**
    * The connector runs the session owner's GitHub comments and issues under Auto-approve, and merges when the message
    * also chose auto-merge, through the control plane with the message's admission. Absent on older connectors, which
    * still ask for each.

@@ -7,11 +7,17 @@ import { Icon } from "./icons";
 /** `unavailable`: listed, but saved in a store this server can't read now, so it can't be downloaded or restored. */
 export type Backup = { id: string; sessionId: string; size: number; sha256: string; createdAt: string; location?: BackupLocation; unavailable?: boolean;
   /** Taken on the workspace's schedule rather than by its owner. */
-  automatic?: boolean };
+  automatic?: boolean;
+  /** Keeps only the conversation: a restore of it starts with an empty worktree. */
+  conversationOnly?: boolean };
 
-/** "Workspace database" for backups saved in the database the workspace owner connected; "Automatic" for scheduled ones. */
+/**
+ * "Workspace database" for backups saved in the database the workspace owner connected; "Automatic" for scheduled ones;
+ * "Conversation only" for backups without the session's files.
+ */
 export function backupLocationLabel(backup: Backup): string {
-  return `${backup.location === "workspace-database" ? " · Workspace database" : ""}${backup.automatic ? " · Automatic" : ""}`;
+  return `${backup.location === "workspace-database" ? " · Workspace database" : ""}${backup.automatic ? " · Automatic" : ""}`
+    + `${backup.conversationOnly ? " · Conversation only" : ""}`;
 }
 
 /**
@@ -29,7 +35,9 @@ export function backupDatabaseLabel(database: BackupDatabase): string {
 
 /** What `GET /api/sessions/:id/backups` returns: the session's backups, where a new one goes and whether it can be saved. */
 export type BackupListing = { backups: Backup[]; destination?: BackupLocation; workspaceDatabase?: BackupDatabase; enabled?: boolean;
-  automaticBackups?: AutomaticBackups };
+  automaticBackups?: AutomaticBackups;
+  /** The session's host can back up its conversation only; false on an older connector. */
+  conversationOnlySupported?: boolean };
 
 function everyLabel(minutes: number): string {
   return minutes === 15 ? "every 15 minutes" : minutes === 60 ? "every hour" : minutes === 360 ? "every 6 hours" : minutes === 1440 ? "every day" : `every ${minutes} minutes`;

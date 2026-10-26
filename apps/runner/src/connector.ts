@@ -181,9 +181,9 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
   const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, sessionBranches: true, ...credentials };
+    github: true, githubIssues: true, plainGit: true, sessionBranches: true, conversationBackups: true, ...credentials };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, ...credentials };
+    github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, ...credentials };
 }
 
 export async function claimConnectorPairing(options: {

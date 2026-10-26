@@ -333,7 +333,7 @@ test('without backup storage the server saves no backup, and its listings say so
   delete f.env.BUCKET;
   const runner = f.runner();
   assert.deepEqual(await (await f.request('GET', '/api/sessions/owner-session/backups', 'test:owner')).json(),
-    { backups: [], destination: 'server', enabled: false });
+    { backups: [], destination: 'server', enabled: false, conversationOnlySupported: true });
   const refused = await f.request('POST', '/api/sessions/owner-session/backup', 'test:owner', {});
   assert.equal(refused.status, 503);
   assert.equal(await code(refused), 'backup_unavailable');
@@ -389,7 +389,7 @@ test('backups of a workspace with its own database are saved and read back there
   const { database } = await (await f.request('PUT', databasePath, 'test:owner', settings)).json() as { database: WorkspaceDatabase };
   f.runner();
   assert.deepEqual(await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json(), { backups: [], destination: 'workspace-database',
-    enabled: true, workspaceDatabase: { id: database.id, host: 'db.example.com', port: 5432, database: 'pistead', confirm: true } });
+    enabled: true, conversationOnlySupported: true, workspaceDatabase: { id: database.id, host: 'db.example.com', port: 5432, database: 'pistead', confirm: true } });
   const created = await f.request('POST', '/api/sessions/session/backup', 'test:member', { trustedDatabaseId: database.id });
   assert.equal(created.status, 201);
   const { backup } = await created.json() as { backup: { id: string; sha256: string; size: number; location: string } };
@@ -878,4 +878,62 @@ test("a member's sessions are backed up automatically only once they confirm tha
   assert.equal(runner.calls, 3);
   const actions = f.sqlite.prepare("SELECT action FROM audit WHERE action LIKE 'workspace.database.consent%' ORDER BY rowid").all().map(row => String(row.action));
   assert.deepEqual(actions, ['workspace.database.consented', 'workspace.database.consented', 'workspace.database.consent_withdrawn']);
+});
+
+test('a conversation-only backup asks the host for the conversation only, and is refused when the host sends files or is too old', async t => {
+  const f = await fixture(t);
+  const bodies: unknown[] = [];
+  let answer: 'conversation' | 'full' = 'conversation';
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? '{}')));
+    const snapshot = JSON.parse(f.snapshot) as Record<string, unknown>;
+    const files = [{ path: 'worktree/a.txt', data: 'YQ==', mode: 420 }];
+    return new Response(JSON.stringify(answer === 'conversation' ? { ...snapshot, conversationOnly: true } : { ...snapshot, files }),
+      { headers: { 'Content-Type': 'application/json' } });
+  });
+  const listing = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as { conversationOnlySupported: boolean };
+  assert.equal(listing.conversationOnlySupported, true);
+  for (const body of [{ conversationOnly: 'yes' }, { conversationOnly: 1 }]) {
+    const response = await f.request('POST', '/api/sessions/session/backup', 'test:member', body);
+    assert.equal(response.status, 400);
+  }
+  assert.equal(bodies.length, 0);
+  const created = await f.request('POST', '/api/sessions/session/backup', 'test:member', { conversationOnly: true });
+  assert.equal(created.status, 201, await created.clone().text());
+  const { backup } = await created.json() as { backup: { id: string; conversationOnly?: boolean } };
+  assert.equal(backup.conversationOnly, true);
+  assert.deepEqual(bodies, [{ conversationOnly: true }]);
+  assert.equal(f.sqlite.prepare('SELECT conversation_only FROM backups WHERE id = ?').get(backup.id)!.conversation_only, 1);
+  const audit = f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'backup.created'").get();
+  assert.equal(JSON.parse(String(audit!.detail_json)).conversationOnly, true);
+  const listed = await (await f.request('GET', '/api/sessions/session/backups', 'test:member')).json() as { backups: { id: string; conversationOnly?: boolean }[] };
+  assert.equal(listed.backups.find(item => item.id === backup.id)?.conversationOnly, true);
+  const exported = await exportSession(f.env.DB, 'session', 'test:member');
+  assert.equal(exported?.backups.find(item => item.id === backup.id)?.conversationOnly, true);
+  // A full backup asks for nothing more and isn't marked; a host that answers a conversation-only request with files is refused.
+  answer = 'full';
+  const full = await f.request('POST', '/api/sessions/session/backup', 'test:member', {});
+  assert.equal(full.status, 201);
+  assert.equal((await full.json() as { backup: { conversationOnly?: boolean } }).backup.conversationOnly, undefined);
+  assert.deepEqual(bodies.at(-1), {});
+  const ignored = await f.request('POST', '/api/sessions/session/backup', 'test:member', { conversationOnly: true });
+  assert.equal(ignored.status, 502);
+  assert.equal(await code(ignored), 'invalid_backup');
+  answer = 'conversation';
+  const unasked = await f.request('POST', '/api/sessions/session/backup', 'test:member', {});
+  assert.equal(unasked.status, 502);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS count FROM backups').get()!.count, 2);
+  // A connector that doesn't advertise conversationBackups would take a full backup: it isn't asked.
+  f.sqlite.exec(`
+    INSERT INTO connectors (id,owner_id,name,credential_hash,created_at,capabilities_json) VALUES ('old-host','test:member','Old host','old-hash','2026-01-01','{}');
+    INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id)
+      VALUES ('hosted','workspace','test:member','version','Hosted session',1,'ready','2026-01-03','old-host','test:member');
+  `);
+  const calls = bodies.length;
+  const hostListing = await (await f.request('GET', '/api/sessions/hosted/backups', 'test:member')).json() as { conversationOnlySupported: boolean };
+  assert.equal(hostListing.conversationOnlySupported, false);
+  const old = await f.request('POST', '/api/sessions/hosted/backup', 'test:member', { conversationOnly: true });
+  assert.equal(old.status, 409);
+  assert.equal(await code(old), 'connector_update_required');
+  assert.equal(bodies.length, calls);
 });

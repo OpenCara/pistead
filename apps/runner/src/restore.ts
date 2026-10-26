@@ -36,10 +36,11 @@ export interface RestoreManifest {
 
 /** Open only the staged SQLite with the supported pi API, paused; verify idle tasks,
  * rebind app metadata, reset authority, and checkpoint/close before returning. */
-export type PrepareRestore = (stage: string, manifest: RestoreManifest) => Promise<void>;
+export type PrepareRestore = (stage: string, manifest: RestoreManifest, options: { conversationOnly: boolean }) => Promise<void>;
 
 type SnapshotFile = { path: string; bytes: Buffer; mode: number };
-type Snapshot = { manifest: RestoreManifest; sqlite: Buffer; files: SnapshotFile[] };
+/** `conversationOnly`: the backup kept only the conversation, so the restored session starts with an empty worktree. */
+type Snapshot = { manifest: RestoreManifest; sqlite: Buffer; files: SnapshotFile[]; conversationOnly: boolean };
 type PublicationFence = { publish(stage: string, dev: string, ino: string): Promise<void>; close(): Promise<void> };
 
 function invalid(message: string): never { throw new RunnerError(400, message); }
@@ -97,6 +98,10 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
   if (text !== JSON.stringify(value)) invalid("Backup JSON is not canonical");
   if (!record(value) || value.format !== "pi-runner-backup-v1" || !Array.isArray(value.files)
     || value.files.length > MAX_FILES || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) invalid("Invalid backup format");
+  // A conversation-only backup carries no files and no clones.
+  const conversationOnly = value.conversationOnly === true;
+  if ((value.conversationOnly !== undefined && !conversationOnly)
+    || (conversationOnly && (value.files.length || value.clones !== undefined))) invalid("Invalid conversation-only backup");
   const source = checkedBinding(value.binding, descriptor.sourceSessionId);
   if (source.session.id === target.session.id || source.owner.id !== target.owner.id
     || source.session.workspaceId !== target.session.workspaceId) invalid("Backup source, owner, agent, model, or connector mismatch");
@@ -247,7 +252,7 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
   if (paths.has("git/objects/info/alternates") || (markerVersion !== undefined && markerVersion !== 1)) {
     invalid("Backups of sessions checked out from the host repository cache cannot be restored yet");
   }
-  return { manifest: manifest as unknown as RestoreManifest, sqlite, files };
+  return { manifest: manifest as unknown as RestoreManifest, sqlite, files, conversationOnly };
 }
 
 async function privateDirectory(path: string): Promise<FileHandle> {
@@ -437,7 +442,7 @@ export async function restoreSession(config: RestoreConfig, input: RunnerBinding
       await mkdir(dirname(path), { recursive: true, mode: 0o700 });
       await writePrivate(path, file.bytes, file.mode);
     }
-    await prepare(stage, backup.manifest);
+    await prepare(stage, backup.manifest, { conversationOnly: backup.conversationOnly });
     if (stableJson(JSON.parse(await readPrivate(join(stage, "binding.json"), MAX_BYTES))) !== stableJson(binding)) throw new RunnerError(409, "Preparation changed the target binding");
     const sandbox = new Sandbox(binding, join(stage, "sandbox"));
     try { await sandbox.initialize(); } finally { await sandbox.close(); }
