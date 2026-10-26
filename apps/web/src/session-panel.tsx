@@ -244,7 +244,7 @@ export function ApprovalCard({ approval, children }: { approval: ApprovalRecord;
       <ApprovalStatus approval={approval} />
     </div>
     {operation.kind === "permission" ? <PermissionSummary request={operation} pending={approval.status === "pending"} /> : <>
-      {operation.kind === "host.bash" && <Alert variant="error" title="Runs outside the sandbox">This command runs as the host's OS user with access to their files, credentials and network, without CPU, memory or disk quotas. It runs in this session's files, which the agent can change, so builds, package scripts and Git hooks or settings there can run the agent's code on the host too. Only the host owner can approve it. The time limit is {operation.timeoutSeconds} seconds.</Alert>}
+      {operation.kind === "host.bash" && <Alert variant="error" title="Runs outside the sandbox">This command runs as the host's OS user with access to their files, credentials and network, without CPU, memory or disk quotas. It runs in this session's files, which the agent can change, so builds, package scripts and Git hooks or settings there can run the agent's code on the host too. Only the host's owner, or a member granted host commands, can approve it. The time limit is {operation.timeoutSeconds} seconds.</Alert>}
       {operation.kind === "git.repin" && <Alert title="Creates a new private session">Resolves <code>{operation.repository}</code> at <code>{operation.ref}</code>. Other repository pins stay unchanged. This session's files, commits and conversation stay here; they are not copied. Only the session owner can approve.</Alert>}
       {operation.kind === "git.push" && <GitPushSummary operation={operation} />}
       {operation.kind === "github.merge" && <GitHubMergeSummary operation={operation} />}
@@ -269,7 +269,7 @@ function RepinLink({ result }: { result?: string }) {
 const permissionNeedText: Record<PermissionNeed, string> = {
   tool: "A tool this agent doesn't include",
   write: "A change in a Read-only message",
-  "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk.",
+  "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most the host's command time limit, but with no cap on CPU, memory, processes or disk.",
 };
 /** Tools whose effect gets its own approval card after the permission, unless the message auto-approves. */
 const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge", "github_issue", "host_bash", "git_repin"];
@@ -369,6 +369,8 @@ function HostSection({ session, user, hosts }: { session: SessionRecord; user: U
         hint={<>Hosted by {host?.ownerName ?? (session.connectorOwnerId ? <Username id={session.connectorOwnerId} /> : "unknown")}{session.connectorOwnerId === user.id ? " (you)" : ""}</>}
         trailing={hosts.loading ? <Loading>Checking</Loading> : host ? <ConnectionStatus connector={host} /> : session.hostUnsandboxed && <StatusBadge tone="danger">Unsandboxed</StatusBadge>}
       />
+      {session.hostEnvironment && <Row leading={<Icon name="server" size={16} />} title="Runs on the host"
+        hint="No sandbox: its commands run on the host owner's machine, as its user" trailing={<StatusBadge tone="danger">On host</StatusBadge>} />}
       {host && <HostCapabilities connector={host} />}
       {!hosts.loading && !host && !hosts.error && <Row title="Host not in your list" hint="It may be private to its owner, unshared, or revoked. Viewing a session doesn't let you use its host" />}
       <Row title="Connection ID" hint={<code>{session.connectorId}</code>} />

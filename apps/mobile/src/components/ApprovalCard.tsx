@@ -16,7 +16,7 @@ const approvalTone: Record<ApprovalRecord["status"], Tone> = {
 const permissionNeedText: Record<PermissionNeed, string> = {
   tool: "A tool this agent doesn't include",
   write: "A change in a Read-only message",
-  "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk.",
+  "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most the host's command time limit, but with no cap on CPU, memory, processes or disk.",
 };
 /** Tools whose effect gets its own approval card after the permission, unless the message auto-approves. */
 const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge", "github_issue", "host_bash", "git_repin"];

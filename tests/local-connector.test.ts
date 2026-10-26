@@ -156,7 +156,7 @@ test('pairing posts only to the fixed origin and strips extra model/capability s
   assert.equal(request.redirect, 'error');
   assert.equal(request.credentials, 'omit');
   assert.equal(request.headers.get('authorization'), null);
-  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration } });
+  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true } });
   for (const secret of [providerSecret, credentials.token, 'fixture_pairing_code']) assert.equal(request.url.includes(secret), false);
 });
 
@@ -358,7 +358,10 @@ type FixtureOptions = {
   github?: (request: Request) => Response | Promise<Response>;
   execute?: (request: Request, generation: number) => Response | Promise<Response>;
   unblock?: () => void;
-  gitCredentials?: boolean;
+  /** The control plane's answer to the host's configuration request; the defaults without it. */
+  hostConfig?: () => Response | Promise<Response>;
+  /** The GPU device the host could lend; none unless given, whatever this machine has. */
+  gpu?: 'dxg' | 'render';
   /** What the host's Pi settings add to its models. */
   piSettings?: Pick<LocalModels, 'compaction' | 'identity'>;
 };
@@ -377,7 +380,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
   let manifests = 0;
   const connector = createConnector({
     dataDir, server: origin, localModels: { ...localModels([{ ...summary, ...{ apiKey: providerSecret } }]), ...options.piSettings },
-    capabilities: publicCapabilities, reconnectDelayMs: 1, gitCredentials: options.gitCredentials,
+    capabilities: publicCapabilities, reconnectDelayMs: 1, gpu: options.gpu ?? null,
     acquireLease: path => {
       assert.equal(path, dataDir);
       leases.acquired++;
@@ -406,6 +409,10 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
       const request = new Request(input, init);
       const call = { request, body: await request.text() };
       allCalls.push(call);
+      // Asked for at every connection, before the runtime starts: kept out of the ordered calls the tests step through.
+      if (request.url === `${origin}/api/connectors/self/config`) {
+        return options.hostConfig?.() ?? Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off' } });
+      }
       workerCalls.push(call);
       if (request.url === `${origin}/api/connectors/self/manifest`) {
         return options.manifest?.(manifests++) ?? Response.json({ ok: true });
@@ -505,7 +512,7 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   socket.welcome();
   const call = await fixture.workerCalls.next();
   assert.equal(call.request.url, `${origin}/api/connectors/self/manifest`);
-  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration } });
+  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true } });
   assert.equal(call.request.headers.get('x-connection-token'), connectionToken);
   assert.equal(fixture.runtimes.length, 1);
   assert.equal(ready, false);
@@ -516,7 +523,9 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   const config = fixture.runtimes[0]!.config;
   assert.equal(config.dataDir, join(fixture.dataDir, 'runner'));
   assert.equal(config.connectorId, credentials.connectorId);
-  assert.equal(config.hostGitCredential, undefined, 'the host\'s Git credentials stay unused without the owner\'s opt-in');
+  // The host's Git credentials stay unused until its owner turns them on in Pistead.
+  await assert.rejects(config.hostGitCredential!('https://github.com/acme/alpha.git'), /hasn't turned on its Git credentials/);
+  assert.deepEqual(await config.hostConfig!(), { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false });
   assert.equal(config.allowFaux, false);
   assert.equal(config.allowTestShell, false);
   assert.equal(config.compaction, undefined, 'without Pi settings, sessions compact by pi-durable\'s defaults');
@@ -532,14 +541,23 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   assert.deepEqual(fixture.statuses, ['connecting', 'connected', 'stopped']);
 });
 
-test('the owner\'s --git-credentials opt-in is advertised and lets push credentials name the host\'s own Git credentials', { timeout: 10000 }, async t => {
+const advertisedBase = { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true };
+
+test('a host configured in Pistead uses its Git credentials for pushes only while its owner has them on there', { timeout: 10000 }, async t => {
   let issued: unknown;
-  const fixture = await connectorFixture(t, { gitCredentials: true, pushCredential: () => Response.json(issued) });
+  const configured = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const fixture = await connectorFixture(t, { gpu: 'dxg', hostConfig: () => Response.json({ config: configured }), pushCredential: () => Response.json(issued) });
   await startFixture(fixture);
   const manifest = fixture.allCalls.find(call => call.request.url === `${origin}/api/connectors/self/manifest`)!;
-  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, gitCredentials: true });
+  // It takes its configuration from Pistead and says which GPU device it could lend; Git credentials are no capability.
+  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...advertisedBase, gpu: 'dxg' });
   const config = fixture.runtimes[0]!.config;
-  assert.equal(typeof config.hostGitCredential, 'function');
+  assert.deepEqual(await config.hostConfig!(), configured);
+  // The connection asked for it before its runtime started, as every callback is asked: over the current connection.
+  const asked = fixture.allCalls.filter(call => call.request.url === `${origin}/api/connectors/self/config`);
+  assert.equal(asked.length, 1);
+  assert.ok(fixture.allCalls.indexOf(asked[0]!) < fixture.allCalls.indexOf(manifest));
+  await assert.rejects(config.hostGitCredential!('https://github.com/acme/alpha.git'), /hasn't turned on its Git credentials/);
   const request = { sessionId: 'session', approvalId: 'tool-push', actorId: 'owner', admissionId: 'admission',
     operation: { kind: 'git.push', repository: 'acme/alpha', branch: 'feature', commit: 'a'.repeat(40) } } as const;
   const host = { credentialId: 'credential-1', remote: 'https://github.com/acme/alpha.git', hostCredentials: true, expiresAt: new Date().toISOString() };
@@ -548,6 +566,28 @@ test('the owner\'s --git-credentials opt-in is advertised and lets push credenti
   // A credential is either a token or the host's own: never both.
   issued = { ...host, authorization: 'Basic eDp5' };
   await assert.rejects(config.pushCredential!(request));
+});
+
+test('a host keeps the repository cache its configuration names for the whole connection, and says so', { timeout: 10000 }, async t => {
+  const fixture = await connectorFixture(t, { hostConfig: () => Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'owner' } }) });
+  await startFixture(fixture);
+  const manifest = fixture.allCalls.find(call => call.request.url === `${origin}/api/connectors/self/manifest`)!;
+  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...advertisedBase, repositoryCache: true });
+  assert.equal(fixture.runtimes[0]!.config.repositoryCache?.scope, 'owner');
+});
+
+test('without a configuration from the control plane, a host runs with the defaults and keeps no cache', { timeout: 10000 }, async t => {
+  for (const answer of [() => new Response('Not found', { status: 404 }), () => Response.json({ config: { commandTimeoutSeconds: 5, gpu: false, gitCredentials: false, repositoryCache: 'off' } })]) {
+    await t.test(answer().status === 404 ? 'a control plane that predates it' : 'an invalid one', async t => {
+      const fixture = await connectorFixture(t, { hostConfig: answer });
+      await startFixture(fixture);
+      const config = fixture.runtimes[0]!.config;
+      assert.equal(config.repositoryCache, undefined);
+      assert.deepEqual(await config.hostConfig!(), { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false });
+      const manifest = fixture.allCalls.find(call => call.request.url === `${origin}/api/connectors/self/manifest`)!;
+      assert.deepEqual(JSON.parse(manifest.body).capabilities, advertisedBase);
+    });
+  }
 });
 
 test('sessions follow the compaction and attribution settings of the host\'s Pi', { timeout: 10000 }, async t => {

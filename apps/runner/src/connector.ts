@@ -17,9 +17,11 @@ import { modelSummary } from "./local-pi.js";
 import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
 import { parseEgressGrant, relayGitRequest, relayPath } from "./egress.js";
 import { withHostToolCapabilities } from "./host-capabilities.js";
-import { hostGitAuthorization } from "./git-credentials.js";
+import { HostCredentialError, hostGitAuthorization } from "./git-credentials.js";
+import { detectGpu, HostConfigSource } from "./host-config.js";
+import type { GpuKind, RepositoryCacheMode } from "../../../packages/shared/src/host-config.js";
 import { recoverResourceOrphans } from "./resources.js";
-import { RepositoryCache, type RepositoryCacheScope } from "./repo-cache.js";
+import { RepositoryCache } from "./repo-cache.js";
 import { RunnerService, createRunnerApp } from "./server.js";
 import type { RunnerConfig } from "./session.js";
 
@@ -168,27 +170,29 @@ export async function connectorManifest(localModels: LocalModels, allowFaux = fa
   return models;
 }
 
-function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boolean; gitCredentials?: boolean; repositoryCache?: object } = {}): ConnectorCapabilities {
+function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boolean; repositoryCache?: boolean; gpu?: GpuKind } = {}): ConnectorCapabilities {
   const result = value ?? { platform: process.platform, sandbox: false, productionShell: false };
   if (typeof result.platform !== "string" || !/^[A-Za-z0-9_-]{1,40}$/.test(result.platform)
     || typeof result.sandbox !== "boolean" || typeof result.productionShell !== "boolean"
     || (result.productionShell && !result.sandbox)) throw new Error("Invalid connector capabilities");
-  // The owner's opt-ins, not caller-supplied metadata, decide whether isolation is disclosed as absent and whether
-  // pushes may use this host's Git credentials. Every connector of this version applies per-message choices, gives the
-  // model a message's pasted images, pushes, and reads, merges and opens issues on GitHub through the control plane.
-  // So does the owner's choice to keep a repository cache on this host. Every session clones its repositories with plain
-  // Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait for
-  // `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
-  const credentials = { ...(mode.gitCredentials ? { gitCredentials: true } : {}), ...(mode.repositoryCache ? { repositoryCache: true } : {}) };
+  // The owner's consent, not caller-supplied metadata, decides whether isolation is disclosed as absent. Every connector
+  // of this version applies per-message choices, gives the model a message's pasted images, pushes, and reads, merges
+  // and opens issues on GitHub through the control plane, and takes its configuration from Pistead (`hostConfig`), where
+  // its owner decides whether pushes may use this host's Git credentials. It says whether this connection keeps a
+  // repository cache, and which GPU device sandboxed commands could get. Every session clones its repositories with
+  // plain Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait
+  // for `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
+  const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, sessionBranches: true, conversationBackups: true, ...credentials };
+    github: true, githubIssues: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, ...credentials };
+    github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
+    ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
 export async function claimConnectorPairing(options: {
   server: string; pairing: { id: string; code: string }; localModels: LocalModels;
-  capabilities?: ConnectorCapabilities; unsandboxed?: boolean; gitCredentials?: boolean; allowFaux?: boolean; allowInsecureLoopback?: boolean; fetch?: typeof fetch; signal?: AbortSignal;
+  capabilities?: ConnectorCapabilities; unsandboxed?: boolean; gpu?: GpuKind; allowFaux?: boolean; allowInsecureLoopback?: boolean; fetch?: typeof fetch; signal?: AbortSignal;
 }): Promise<ConnectorCredentials> {
   const origin = controlPlaneOrigin(options.server, options.allowInsecureLoopback);
   const { id, code } = options.pairing;
@@ -269,13 +273,12 @@ export interface ConnectorOptions {
   resources?: RunnerConfig["resources"];
   /** Run session work directly on the host without isolation; requires explicit owner consent. */
   unsandboxed?: boolean;
-  /** Let pushes in the owner's own sessions use this host's Git credentials (connect --git-credentials). */
-  gitCredentials?: boolean;
   /**
-   * Check pinned repositories out of a cache on this host, fetched with this host's own Git credentials after the control
-   * plane re-checks each session owner's access (connect --repo-cache). One cache per host, or one per session owner.
+   * The GPU device this host can lend sandboxed commands, where its configuration turns that on; detected on the host
+   * unless given (null for none). Everything else the host's owner and admins configure in Pistead (HostConfig): the
+   * command time limit, the GPU, whether pushes may use this host's Git credentials, and its repository cache.
    */
-  repositoryCache?: { scope?: RepositoryCacheScope };
+  gpu?: GpuKind | null;
   fetch?: typeof fetch;
   createSocket?: (url: string, protocols: string[]) => ConnectorSocket;
   runtimeFactory?: (config: RunnerConfig) => Promise<ConnectorRuntime>;
@@ -318,10 +321,15 @@ export class LocalConnector {
   private releaseLease?: () => Promise<void>;
   private state?: ConnectorCredentials;
   private directory = "";
-  private repositoryCache?: RepositoryCache;
+  /** This host's repository caches, one per scope its configuration has chosen, each opened once and kept. */
+  private readonly repositoryCaches = new Map<Exclude<RepositoryCacheMode, "off">, RepositoryCache>();
+  private readonly gpu?: GpuKind;
 
   constructor(private readonly options: ConnectorOptions) {
     this.ready = this.readiness.promise;
+    // Unsandboxed commands run on the host itself: there is nothing to lend them.
+    const gpu = options.unsandboxed ? undefined : options.gpu === undefined ? detectGpu() : options.gpu;
+    if (gpu) this.gpu = gpu;
     // Consumers may await start() instead of separately attaching to ready.
     void this.ready.catch(() => {});
     if (options.allowTestShell && !options.allowFaux) throw new Error("Test shell requires explicit faux test mode");
@@ -345,10 +353,6 @@ export class LocalConnector {
   private async initialize(): Promise<void> {
     if (process.platform !== "linux" && !this.options.runtimeFactory && !(this.options.unsandboxed && process.platform === "darwin")) throw new Error("Connected runner requires a Linux sandbox and kernel lease; no host-shell fallback");
     this.directory = await privateDirectory(this.options.dataDir);
-    if (this.options.repositoryCache) {
-      // Beside the runner's session storage, in the same private state directory; the cache keeps its own locks.
-      this.repositoryCache = new RepositoryCache({ root: join(this.directory, "repo-cache"), scope: this.options.repositoryCache.scope ?? "host" });
-    }
     this.releaseLease = await (this.options.acquireLease ?? acquireRunnerLease)(this.directory, () => {
       this.lifetime.abort();
       this.disconnect(this.generation);
@@ -367,7 +371,7 @@ export class LocalConnector {
     if (!this.state) {
       if (!origin || !this.options.pairing) throw new ConnectorSetupError("First connection requires --server and --pairing-id");
       // Claimed before anything is written: a wrong, expired or used code keeps the saved pairing.
-      this.state = await claimConnectorPairing({ ...this.options, server: origin, pairing: this.options.pairing, signal: this.lifetime.signal });
+      this.state = await claimConnectorPairing({ ...this.options, gpu: this.gpu, server: origin, pairing: this.options.pairing, signal: this.lifetime.signal });
       await writeConnectorState(this.directory, this.state, this.options.allowInsecureLoopback, replace);
     }
     this.lifetime.signal.throwIfAborted();
@@ -437,6 +441,13 @@ export class LocalConnector {
     try {
       await generation.welcome.promise;
       clearTimeout(timeout);
+      // How the host runs its sessions, as its owner and admins set it in Pistead: asked for now, for the repository cache
+      // this connection keeps, and again within a minute of each change for every command and push. Without an answer
+      // (a control plane that predates it), the defaults.
+      const hostConfig = new HostConfigSource(async () => (await this.callback(generation, "/api/connectors/self/config", {}) as { config?: unknown } | undefined)?.config);
+      const configured = await hostConfig.current();
+      this.requireGeneration(generation);
+      const repositoryCache = configured.repositoryCache === "off" ? undefined : this.repositoryCacheFor(configured.repositoryCache);
       const config: RunnerConfig = {
         dataDir: join(this.directory, "runner"), controlPlaneUrl: state.controlPlaneUrl,
         sharedSecret: this.secret, connectorId: state.connectorId,
@@ -497,7 +508,12 @@ export class LocalConnector {
             z.object({ ...issued, hostCredentials: z.literal(true) }).strict(),
           ]).parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/credential", payload));
         },
-        ...(this.options.gitCredentials ? { hostGitCredential: (remote: string, signal?: AbortSignal) => hostGitAuthorization(remote, { signal }) } : {}),
+        hostConfig: () => hostConfig.current(),
+        // Only while the host's owner has them on in Pistead; the control plane checks that too before it names them.
+        hostGitCredential: async (remote: string, signal?: AbortSignal) => {
+          if (!(await hostConfig.current()).gitCredentials) throw new HostCredentialError("This host's owner hasn't turned on its Git credentials in Pistead (Settings → Hosts → the host → Configuration)");
+          return hostGitAuthorization(remote, { signal });
+        },
         pushComplete: async request => {
           const payload = {
             sessionId: request.sessionId, approvalId: request.approvalId, credentialId: request.credentialId, outcome: request.outcome,
@@ -526,11 +542,12 @@ export class LocalConnector {
           return response;
         },
         readBackup: (restore, target) => this.readBackup(generation, restore, target),
-        ...(this.repositoryCache ? { repositoryCache: this.repositoryCache } : {}),
+        ...(repositoryCache ? { repositoryCache } : {}),
       };
       generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
       this.requireGeneration(generation);
-      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: withHostToolCapabilities(capabilities(this.options.capabilities, this.options)) });
+      const advertised = capabilities(this.options.capabilities, { unsandboxed: this.options.unsandboxed, repositoryCache: repositoryCache !== undefined, gpu: this.gpu });
+      await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: withHostToolCapabilities(advertised) });
       this.requireGeneration(generation);
       generation.runtimeReady.resolve();
       this.options.onStatus?.("connected");
@@ -551,6 +568,13 @@ export class LocalConnector {
       }
       if (this.generation === generation) this.generation = undefined;
     }
+  }
+
+  /** The cache of `scope`, beside the runner's session storage in the same private state directory; it keeps its own locks. */
+  private repositoryCacheFor(scope: Exclude<RepositoryCacheMode, "off">): RepositoryCache {
+    let cache = this.repositoryCaches.get(scope);
+    if (!cache) this.repositoryCaches.set(scope, cache = new RepositoryCache({ root: join(this.directory, "repo-cache"), scope }));
+    return cache;
   }
 
   private requireGeneration(generation: Generation): void {

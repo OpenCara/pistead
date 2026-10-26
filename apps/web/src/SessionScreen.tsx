@@ -17,10 +17,12 @@ import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
+import { decidesHostCommands, HOST_COMMAND_WAITING, isHostCommand } from "../../../packages/client/src/host-commands";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
+import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
 import {
   Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
@@ -110,7 +112,9 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
-      <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>
+      {entry.error.compaction
+        ? <Alert variant="error" title={COMPACTION_FAILED_TITLE}>{compactionFailureText(entry.error.compaction)}</Alert>
+        : <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>}
       {actor && <div className="entry-actor">by {actor}</div>}
     </div>;
   }
@@ -254,13 +258,16 @@ function SessionPane({ id }: { id: string }) {
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={refreshAll} />}
-          {session.hostUnsandboxed && (canWrite || canApprove) && <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>}
+          {session.hostUnsandboxed && (canWrite || canApprove) && (session.hostEnvironment
+            ? <Alert variant="error" title="Runs on the host">This session runs directly on its host, without the sandbox. Approved commands and commits execute on the host owner's machine with their full user permissions, network access and no resource limits; only the host owner, or members they granted host commands, decide them.</Alert>
+            : <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>)}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
-            // Only the session owner can let a call do more than the session allows.
-            const hostCommand = approval.operation.kind === "host.bash";
+            // Only the session owner can let a call do more than the session allows. A host command, as every command of a
+            // session that runs on its host is, is decided by its host's owner or a member granted host commands.
+            const hostCommand = isHostCommand(approval.operation, session);
             const ownerOnly = permission || approval.operation.kind === "git.repin";
-            const decides = canApprove && (hostCommand ? session.connectorOwnerId === user.id : !ownerOnly || isOwner);
+            const decides = canApprove && (hostCommand ? decidesHostCommands(session, host, user.id) : !ownerOnly || isOwner);
             const disabled = approvalAction.busy || !approval.reviewHash;
             return <ApprovalCard approval={approval} key={approval.id}>
               {decides ? <>
@@ -275,7 +282,7 @@ function SessionPane({ id }: { id: string }) {
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
                   <span className="muted small">Runs as {hostCommand ? "the host OS user (outside the sandbox)" : view.owner.displayName} · each approval covers one exact operation and its arguments</span>
                 </div>}
-              </> : <p className="muted small">{hostCommand ? "Waiting for the host owner, who needs approve access to this session" : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
+              </> : <p className="muted small">{hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
           })}
           <Feedback {...approvalAction} />

@@ -132,8 +132,15 @@ export interface SessionRecord {
    * calls cut short, to keep transcripts small. Absent: full tool output. Only the owner changes it.
    */
   toolOutput?: "brief";
-  // Present only on single-session reads: the pinned host explicitly runs without isolation.
+  // Present only on single-session reads: the pinned host explicitly runs without isolation, or this session runs on it
+  // directly (hostEnvironment).
   hostUnsandboxed?: boolean;
+  /**
+   * The session runs directly on its host's own environment, without the sandbox: chosen when its owner, the host's
+   * owner, started it on a host whose configuration accepts that (HostConfig.hostSessions), and fixed for its life.
+   * Its commands run as the host's OS user; deciding them needs host command authority, as host commands do.
+   */
+  hostEnvironment?: true;
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
   activity?: SessionActivity;
   /**
@@ -577,6 +584,12 @@ export interface AutoApprovedCall {
   /** It ran without resource limits, on the owner's own host. */
   unbounded?: true;
 }
+/**
+ * Why Pi could not compact a conversation's context before answering, from Pi's own fixed messages: its summary hit the
+ * summarizer's token limit, the summarizer called a tool, wrote no text, or compaction was aborted. Never provider text.
+ */
+export type CompactionFailure = "token_limit" | "tool_call" | "no_text" | "aborted";
+export const COMPACTION_FAILURES: readonly CompactionFailure[] = ["token_limit", "tool_call", "no_text", "aborted"];
 export interface EntryView {
   id: string;
   kind: string;
@@ -584,8 +597,11 @@ export interface EntryView {
   text: string;
   actorId?: string;
   conversationId?: string;
-  /** The model request behind this entry failed. Only the provider/model and HTTP status cross the boundary, never provider text. */
-  error?: { provider?: string; modelId?: string; status?: number };
+  /**
+   * The model request behind this entry failed. Only the provider/model, HTTP status and, when Pi could not compact the
+   * context first, which fixed compaction failure it was cross the boundary, never provider text.
+   */
+  error?: { provider?: string; modelId?: string; status?: number; compaction?: CompactionFailure };
   /** How long the model took to write this reply, or the tool to run; absent for entries recorded before Pi 1.1.0. */
   durationMs?: number;
   /** This entry's tool calls whose commands ran under auto-approve, in call order; absent from older runners. */

@@ -15,6 +15,7 @@ import { CA_BUNDLE, trustedCertificates } from "./trust-store.js";
 import { runHostShell } from "./host-shell.js";
 import { checkedBrowse, type BrowseResult } from "./file-browser.js";
 import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
+import { commandLimits, gpuMounts, type CommandLimits } from "./host-config.js";
 
 export { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 
@@ -39,7 +40,16 @@ export interface SandboxExecutionOptions {
    * the sandbox's namespaces; provisioned limits are always used when present.
    */
   unbounded?: boolean;
+  /** The command's time limit and per-process limits, from the host's configuration; a 30-second command's without them. */
+  limits?: CommandLimits;
+  /** Lend the command the host's GPU render device, where it has one (HostConfig.gpu; see gpuMounts). */
+  gpu?: boolean;
+  /** Stops the command, as closing the sandbox does: a stopped message or a closing session ends a long one at once. */
+  signal?: AbortSignal;
 }
+
+/** How one shell command runs, besides what every sandboxed step gets. */
+interface CommandOptions { limits?: CommandLimits; gpu?: boolean; signal?: AbortSignal }
 
 export interface SandboxOptions {
   /**
@@ -56,6 +66,8 @@ export interface SandboxOptions {
    * clones of the workspace's repositories borrow from them (see GIT_SHIM).
    */
   mirrors?: () => Promise<readonly MirrorMount[]>;
+  /** Where the host's / is when shell commands look for its GPU (see gpuMounts): the host's own, unless a test gives a stand-in. */
+  gpuRoot?: string;
 }
 
 export interface MirrorMount { source: string; target: string }
@@ -209,15 +221,30 @@ PUSH_KINDS = ('clone-push-prepare', 'clone-push-pack')
 LONG_KINDS = PUSH_KINDS + ('clone-backup', 'clone-restore')
 
 
-def limits(kind):
+def bounded(which, value):
+    # An unprivileged process can't raise a hard limit: never ask for more than the runner itself has.
+    hard = resource.getrlimit(which)[1]
+    value = value if hard == resource.RLIM_INFINITY else min(value, hard)
+    resource.setrlimit(which, (value, value))
+
+
+def limits(request):
     # These remain defense in depth for fixed helpers/test fixtures, NOT session quotas.
-    # Push rewrites and packs and cache checkouts handle whole repositories, so only they get larger bounds.
+    # Push rewrites and packs and cache checkouts handle whole repositories, so only they get larger bounds. A shell
+    # command gets the ones the runner chose for the host's command time limit (commandLimits in host-config.ts).
+    kind = request['kind']
     push = kind in LONG_KINDS
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_CPU, (3600, 3600) if push else (25, 25))
-    size = (16 if push else 1 / 16) * 1024 * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_FSIZE, (int(size), int(size)))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+    cpu, size, files = (3600, 16 * 1024 * 1024 * 1024, 256) if push else (25, 64 * 1024 * 1024, 256)
+    given = request.get('limits') if kind == 'bash' else None
+    if given is not None:
+        values = [given.get(key) for key in ('cpu', 'size', 'files')] if isinstance(given, dict) and len(given) == 3 else []
+        if len(values) != 3 or not all(type(value) is int and 0 < value <= 2 ** 62 for value in values):
+            raise ValueError('invalid command limits')
+        cpu, size, files = values
+    bounded(resource.RLIMIT_CPU, cpu)
+    bounded(resource.RLIMIT_FSIZE, size)
+    bounded(resource.RLIMIT_NOFILE, files)
     # Shell commands inherit these limits, so they get no address-space cap: Go and Node reserve far
     # more address space than they use, and gh and node abort at start-up under 512 MiB. Their memory
     # bound is the session cgroup's memory.max, which the resource supervisor applies and reads back
@@ -1013,7 +1040,7 @@ def main():
     # One JSON line.
     request = json.loads(sys.stdin.buffer.readline())
     kind = request['kind']
-    limits(kind)
+    limits(request)
     if kind == 'initialize':
         try:
             os.stat(os.path.join(WORK, '.git', 'HEAD'), follow_symlinks=False)
@@ -1295,6 +1322,7 @@ export class Sandbox {
   readonly #egressSocket: string | undefined;
   readonly #sessionBranch: string | undefined;
   readonly #mirrors: (() => Promise<readonly MirrorMount[]>) | undefined;
+  readonly #gpuRoot: string;
   /** Whether shell commands get the `git` shim: on a cache host, or where git-lfs is installed, in sessions with a proxy. */
   readonly #shim: boolean;
   #initialization: Promise<void> | undefined;
@@ -1325,6 +1353,7 @@ export class Sandbox {
     this.#egressSocket = options.egressSocket;
     this.#sessionBranch = options.sessionBranch;
     this.#mirrors = options.mirrors;
+    this.#gpuRoot = options.gpuRoot ?? "/";
     this.#shim = options.egressSocket !== undefined && (options.mirrors !== undefined || hostGitLfs() !== undefined);
     const base = `/sessions/${key}`;
     this.#root = resolve(root);
@@ -1412,7 +1441,7 @@ export class Sandbox {
     return this.#initialization;
   }
 
-  async #operation(request: Request, readOnly: boolean, authorize: SandboxAuthorize, gitWritable = false, requireResources = false): Promise<string> {
+  async #operation(request: Request, readOnly: boolean, authorize: SandboxAuthorize, gitWritable = false, requireResources = false, command: CommandOptions = {}): Promise<string> {
     if (typeof authorize !== "function") throw new Error("Sandbox authorization callback is required");
     await this.initialize();
     return this.#exclusive(async () => {
@@ -1420,7 +1449,9 @@ export class Sandbox {
       // Admission-time permission may have been revoked while this operation waited.
       await authorize();
       if (this.#closed) throw new Error("Sandbox is closed");
-      return this.#run(request, readOnly, gitWritable, requireResources, {}, await this.#mirrorMounts(request));
+      // A command stopped while it waited for the sandbox never starts.
+      if (command.signal?.aborted) throw new SandboxProcessError("Command stopped before it started", null, null, "", "");
+      return this.#run(request, readOnly, gitWritable, requireResources, {}, await this.#mirrorMounts(request), command);
     });
   }
 
@@ -1467,7 +1498,8 @@ export class Sandbox {
         if (bounded && !this.#resources) {
           throw new Error("Production bash unavailable: explicitly provisioned cgroup and bounded filesystem resources are required");
         }
-        return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize, false, bounded);
+        return this.#operation({ kind: "bash", command: text(operation.command, "shell command", 64 * 1024, true) }, readOnly, authorize, false, bounded,
+          { limits: options.limits, gpu: options.gpu, signal: options.signal });
       }
       case "github.comment":
       case "github.merge":
@@ -1591,13 +1623,17 @@ export class Sandbox {
     });
   }
 
-  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false, transfer: Transfer = {}, mirrors: readonly MirrorMount[] = []): Promise<string> {
+  #run(request: Request, readOnly: boolean, gitWritable: boolean, requireResources = false, transfer: Transfer = {}, mirrors: readonly MirrorMount[] = [],
+    command: CommandOptions = {}): Promise<string> {
     const mounts = this.#mounts;
     if (!mounts) return Promise.reject(new Error("Sandbox is not initialized"));
     if (readOnly && gitWritable) return Promise.reject(new Error("Invalid read-only mount request"));
     if (requireResources && !this.#resources) return Promise.reject(new Error("Production bash resources are unavailable"));
     const mount = readOnly ? "--ro-bind-fd" : "--bind-fd";
     const egress = request.kind === "bash" || request.kind === "clone-restore" ? this.#egressSocket : undefined;
+    // Only shell commands get the GPU, and only its render device; it is looked up again for each one.
+    const gpu = request.kind === "bash" && command.gpu ? gpuMounts(this.#gpuRoot) : undefined;
+    const limits = request.kind === "bash" ? command.limits : undefined;
     const args = [
       "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
       "--cap-drop", "ALL",
@@ -1616,16 +1652,20 @@ export class Sandbox {
       ...(egress ? ["--ro-bind-try", egress, EGRESS_SOCKET, "--ro-bind", join(this.#root, CA_BUNDLE_FILE), CA_BUNDLE] : []),
       ...(egress && this.#shim ? ["--ro-bind-try", join(this.#root, "bin"), SHIM_DIRECTORY] : []),
       ...mirrors.flatMap(({ source, target }) => ["--ro-bind-try", source, target]),
+      ...(gpu?.args ?? []),
       "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/",
       "--chdir", this.worktree, "--clearenv",
     ];
     for (const [name, value] of Object.entries(this.#environment)) args.push("--setenv", name, value);
     if (egress) for (const [name, value] of Object.entries(egressEnvironment(this.#sessionBranch))) args.push("--setenv", name, value);
     if (egress && this.#shim) args.push("--setenv", "PATH", `${SHIM_DIRECTORY}:${this.#environment.PATH}`);
+    for (const [name, value] of Object.entries(gpu?.env ?? {})) args.push("--setenv", name, value);
     args.push("--", "/usr/bin/python3", "-I", "-c", HELPER);
     const limit = request.kind === "snapshot" || request.kind === "clone-backup" ? MAX_SNAPSHOT_OUTPUT_BYTES : request.kind === "read-content" ? MAX_CONTENT_OUTPUT_BYTES : MAX_OUTPUT_BYTES;
+    const deadline = ["clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"].includes(request.kind)
+      ? PUSH_TIMEOUT_MS : (limits ?? commandLimits(TIMEOUT_MS / 1000)).seconds * 1000;
     const launch = requireResources
-      ? resourceLaunch(this.#resources!, this.#sessionKey, args)
+      ? resourceLaunch(this.#resources!, this.#sessionKey, args, deadline / 1000)
       : { command: "/usr/bin/bwrap", args };
     return new Promise<string>((resolveResult, reject) => {
       // Resource supervisor alone receives root fd 8 and liveness pipe 7. It closes
@@ -1662,8 +1702,12 @@ export class Sandbox {
         kill();
       };
       this.#cancelActive = cancel;
-      const deadline = ["clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"].includes(request.kind)
-        ? PUSH_TIMEOUT_MS : TIMEOUT_MS;
+      const stop = () => {
+        failure ??= "Command stopped";
+        kill();
+      };
+      command.signal?.addEventListener("abort", stop, { once: true });
+      if (command.signal?.aborted) stop();
       const timer = setTimeout(() => {
         failure ??= `Sandbox exceeded ${deadline}ms time limit`;
         kill();
@@ -1701,6 +1745,7 @@ export class Sandbox {
       });
       child.once("close", (code, signal) => {
         clearTimeout(timer);
+        command.signal?.removeEventListener("abort", stop);
         if (this.#cancelActive === cancel) this.#cancelActive = undefined;
         child.stdio.at(7)?.destroy();
         const out = Buffer.concat(stdout).toString("utf8");
@@ -1716,7 +1761,8 @@ export class Sandbox {
           resolveResult(request.kind === "bash" ? out + err : out);
         }
       });
-      const line = JSON.stringify({ ...request, ...(egress ? { egress: { socket: EGRESS_SOCKET, port: EGRESS_PORT } } : {}) });
+      const line = JSON.stringify({ ...request, ...(egress ? { egress: { socket: EGRESS_SOCKET, port: EGRESS_PORT } } : {}),
+        ...(limits ? { limits: { cpu: limits.cpuSeconds, size: limits.fileBytes, files: limits.openFiles } } : {}) });
       const input = transfer.input;
       if (!input) child.stdin!.end(line);
       else {

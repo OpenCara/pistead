@@ -1,5 +1,6 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, initialSelection, modelUnavailable, mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
+  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommands, HOST_COMMAND_WAITING, initialSelection, isHostCommand, modelUnavailable,
+  mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
@@ -115,10 +116,11 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
 
   const pendingApprovalCard = (approval: ApprovalRecord) => {
     const permission = approval.operation.kind === "permission";
-    // Only the session owner can let a call do more than the session allows; a host command is the host owner's to run.
-    const hostCommand = approval.operation.kind === "host.bash";
+    // Only the session owner can let a call do more than the session allows. A host command, as every command of a
+    // session that runs on its host is, is decided by its host's owner or a member granted host commands.
+    const hostCommand = isHostCommand(approval.operation, session ?? {});
     const ownerOnly = permission || approval.operation.kind === "git.repin";
-    const decides = canApprove && (hostCommand ? session?.connectorOwnerId === user.id : !ownerOnly || isOwner);
+    const decides = canApprove && (hostCommand ? decidesHostCommands(session ?? {}, host, user.id) : !ownerOnly || isOwner);
     const disabled = approvalAction.busy || !approval.reviewHash;
     return <ApprovalCard approval={approval} key={approval.id}>
       {decides ? <>
@@ -140,7 +142,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
           </Text>
         </>}
       </> : <Text style={[ui.small, { color: palette.muted }]}>
-        {hostCommand ? "Waiting for the host owner, who needs approve access to this session" : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
+        {hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
       </Text>}
     </ApprovalCard>;
   };
@@ -174,9 +176,13 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
-          {session.hostUnsandboxed && (permissions.includes("write") || canApprove) && <Banner tone="danger" title="Unsandboxed host">
-            This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.
-          </Banner>}
+          {session.hostUnsandboxed && (permissions.includes("write") || canApprove) && (session.hostEnvironment
+            ? <Banner tone="danger" title="Runs on the host">
+              This session runs directly on its host, without the sandbox. Approved commands and commits execute on the host owner's machine with their full user permissions, network access and no resource limits; only the host owner, or members they granted host commands, decide them.
+            </Banner>
+            : <Banner tone="danger" title="Unsandboxed host">
+              This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.
+            </Banner>)}
           {approvals.filter(approval => approval.status === "pending").map(pendingApprovalCard)}
           <Feedback error={approvalAction.error} notice={approvalAction.notice} />
         </>} />}

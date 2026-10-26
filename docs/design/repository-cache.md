@@ -1,6 +1,7 @@
 # Design: host repository cache
 
-Status: implemented, behind the connector flag `--repo-cache`. The cache holds one Git mirror per repository, which
+Status: implemented, behind the host's **Repository cache** setting (HostConfig.repositoryCache, set by its owner in
+Pistead; connectors 0.9.0 and older use `--repo-cache`). The cache holds one Git mirror per repository, which
 clone sessions borrow objects from. How clone sessions use it is in [egress.md](egress.md), phase 3; this document
 covers the cache itself (`apps/runner/src/repo-cache.ts`).
 
@@ -23,8 +24,10 @@ repo-cache/<provider>/<host>/<repositoryId>.git.pistead.lock # holder's pid: one
 - **Key.** A mirror is named by the provider's stable repository id (`mirrorPath`), not the repository's name, so a
   rename keeps its mirror and a different repository under an old name never reuses it. Every component is validated
   before it names a directory.
-- **Scope.** By default one cache serves every session on the host. `--repo-cache-scope=owner` keeps one per session
-  owner, under `repo-cache/owners/<hash of owner>/`, for owners who don't want to share objects.
+- **Scope.** **Shared** (`host`) serves every session on the host from one cache. **Per owner** (`owner`) keeps one
+  per session owner, under `repo-cache/owners/<hash of owner>/`, for owners who don't want to share objects. The
+  connector reads the setting when it connects and keeps it for that connection; a switch leaves the other scope's
+  mirrors on disk until `pistead cache prune` collects them.
 - **Privacy.** The cache root must be a private directory owned by the runner user, or nothing is written.
 
 ## Filling a mirror

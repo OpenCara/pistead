@@ -8,63 +8,56 @@ import { assertConnectorPlatform, assertPrerequisites, checkPrerequisites, defau
 import { ConnectorSetupError } from "./protocol.js";
 import type { ResourceConfig } from "./resources.js";
 
-const HELP = `Usage: pistead connect [options]
+const HELP = `Usage: pistead connect [--server ORIGIN --pairing-id ID [--force]]
 
-Connect your local Pi to a Pistead workspace using outbound WebSocket only.
-Use Node.js 24 on Linux or WSL2 (or macOS with --unsafe-no-sandbox). In the web app,
-configure authorized repositories for your workspace and pair Pi with it, then run:
+Connect this machine to Pistead as a host, using an outbound WebSocket only.
+
+First time: in Pistead, open Settings > Hosts > Pair a host and run the command it shows:
   npx pistead@latest connect --server https://pistead.com --pairing-id PAIRING_ID
-The pairing code is requested privately on a terminal, never as an argument.
-Subsequent runs use the private saved connector token.
-Pairing keeps Pi runtime access private to you; sharing it with teammates is opt-in.
-New sessions are workspace-viewable by default, without granting agent control.
+then type the pairing code at the hidden prompt; it is never accepted as an argument.
+Later runs need no options: the connector reuses its private saved pairing.
+
+Everything else about the host is configured in Pistead by its owner and admins
+(Settings > Hosts > the host): its sharing (it stays private to you until you share it),
+who may run host commands, how long sandboxed commands may run, whether they get its GPU,
+whether pushes in your own sessions may use this machine's Git credentials, and its
+repository cache. Changes reach running sessions within a minute; the repository cache
+changes when the connector next connects.
 
 Options:
-  --server ORIGIN          HTTPS control-plane origin (required for first pairing)
-  --pairing-id ID          One-use pairing id from the web app
+  --server ORIGIN          HTTPS control-plane origin (first pairing only)
+  --pairing-id ID          One-use pairing ID from Pistead
   --force                  With --pairing-id, replace this machine's saved pairing; the
                            old host stays in Pistead, offline, until you remove it there
+  --unsafe-no-sandbox      Run agent work directly on this machine without isolation
+                           (macOS or Linux without bubblewrap); asks for confirmation
+  --help                   Show this help without reading Pi configuration
+
+This machine's own setup, when the defaults don't fit:
   --state-dir PATH         Private connector state (default ~/.local/share/pistead/connector)
   --pi-agent-dir PATH      Pi config/auth directory (default: Pi's own getAgentDir())
   --model PROVIDER/MODEL   Advertise this configured local model (repeatable); without it,
                            the models matched by enabledModels in Pi's settings.json are
                            advertised, or every authenticated Pi model when that is unset
-  --resources PATH        Operator-provisioned resource configuration JSON
+  --resources PATH         Operator-provisioned resource configuration JSON (cgroup v2
+                           limits that let bash run in every session)
+
+Development:
   --allow-insecure-loopback  Permit HTTP/WS only on localhost/127.0.0.1/[::1]
-  --allow-test-shell       Fixture shell opt-in; requires --allow-faux
-  --unsafe-no-sandbox      Run agent work directly on this machine without isolation
-                           (macOS or Linux without bubblewrap); asks for confirmation
-  --git-credentials        Let approved pushes in your own sessions use this machine's Git
-                           credentials (its git credential helpers) where the workspace's
-                           push access chooses the host's Git credentials
-  --repo-cache             Keep a Git mirror of each repository on this machine. Pinned sessions
-                           check out of it, with their full history, fetched with this machine's
-                           Git credentials (its git credential helpers); Pistead still checks each
-                           session owner's own access. Clone sessions borrow its objects, fetched
-                           through Pistead with the session owner's own account. Preview: backups
-                           of pinned sessions using it are not supported yet. See pistead cache
-  --repo-cache-scope SCOPE host (default): one cache for every session on this machine;
-                           owner: a separate cache for each session owner
-  --help                  Show this help without reading Pi configuration
+  --allow-test-shell         Fixture shell opt-in; requires --allow-faux
 
 Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required for the
 isolated sandbox. Native Windows is unsupported; run this command inside WSL2.
 --unsafe-no-sandbox needs only Git on PATH, but approved commands then run as your
 user with access to your files, credentials and network, and no resource limits.
-Session repositories are pinned into private session caches, not your current folder.
 GitLab, Azure DevOps, Bitbucket, Gitea/Forgejo and GitHub Enterprise repositories are
 connected in the web app (Settings > Profile > Git accounts) with personal access tokens;
-the connector receives pinned snapshots, not those tokens. Each approved git_push gets a
-credential for that push only, held in connector memory and sent only to the repository's
-Git host; the sandbox never sees it. It is a short-lived token minted from a workspace app
-or bot or, where the workspace's push access chooses the session owner's account, your
-own account's token, sent only to your own hosts for your own sessions (a GitHub token
-is reset when the push ends). With --git-credentials, your own sessions can push with
-the credentials git on this machine would use instead, read through its credential
-helpers without prompting.
+the connector never receives those tokens. Each approved git_push gets a credential for
+that push only, held in connector memory and sent only to the repository's Git host; the
+sandbox never sees it.
 Production bash additionally requires verified per-session aggregate cgroups and a
-bounded private filesystem;
---resources does not provision these. Missing resource limits never enable host shell.
+bounded private filesystem; --resources does not provision these. Missing resource
+limits never enable host shell.
 Pi model/auth configuration is used locally, including Pi's OAuth refresh. Provider
 credentials, private history and personal extensions are not uploaded or shared.
 Catalogs over 200 models need enabledModels in Pi's settings or --model. Restart to reload config.
@@ -147,6 +140,16 @@ async function confirmUnsandboxed(): Promise<void> {
   }
 }
 
+/** Options that became host configuration in Pistead: still accepted, so existing service units keep starting, and ignored. */
+const MOVED_OPTIONS = ["git-credentials", "repo-cache", "repo-cache-scope"] as const;
+
+/** The notice for moved options someone still passes, or nothing. */
+export function movedOptionsNotice(given: readonly string[]): string {
+  if (!given.length) return "";
+  return `${given.map(name => `--${name}`).join(", ")} ${given.length === 1 ? "is" : "are"} ignored: the host's owner sets ${given.length === 1 ? "it" : "them"} in Pistead now `
+    + "(Settings > Hosts > this host > Configuration). A host that used them keeps them there.\n";
+}
+
 export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   const { values } = parseArgs({ args, strict: true, allowPositionals: false, options: {
     help: { type: "boolean" }, server: { type: "string" }, "pairing-id": { type: "string" }, force: { type: "boolean" },
@@ -156,6 +159,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     "git-credentials": { type: "boolean" }, "repo-cache": { type: "boolean" }, "repo-cache-scope": { type: "string" },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
+  process.stderr.write(movedOptionsNotice(MOVED_OPTIONS.filter(name => values[name] !== undefined)));
   const unsandboxed = values["unsafe-no-sandbox"] === true;
   assertConnectorPlatform();
   if (process.platform === "darwin" && !unsandboxed) {
@@ -163,9 +167,6 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   }
   if (unsandboxed && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
   if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorSetupError("--allow-test-shell requires --allow-faux.");
-  const cacheScope = values["repo-cache-scope"];
-  if (cacheScope !== undefined && !values["repo-cache"]) throw new ConnectorSetupError("--repo-cache-scope requires --repo-cache.");
-  if (cacheScope !== undefined && cacheScope !== "host" && cacheScope !== "owner") throw new ConnectorSetupError("--repo-cache-scope must be host or owner.");
   const pairingId = values["pairing-id"];
   if (pairingId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pairingId)) {
     throw new ConnectorSetupError(/^[A-Za-z0-9_-]{43}$/.test(pairingId)
@@ -200,11 +201,9 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   const code = pairingId ? await promptPairingCode() : "";
   if (pairingId && !code) throw new ConnectorSetupError("No pairing code was entered. Paste the single-use code shown in Pistead at the hidden prompt.");
   const pairing = pairingId ? { id: pairingId, code } : undefined;
-  const gitCredentials = values["git-credentials"] === true;
-  const repositoryCache = values["repo-cache"] ? { scope: cacheScope === "owner" ? "owner" as const : "host" as const } : undefined;
   const connector = createConnector({
     dataDir,
-    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed, gitCredentials, repositoryCache,
+    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed,
     allowInsecureLoopback: values["allow-insecure-loopback"], allowFaux: values["allow-faux"], allowTestShell: values["allow-test-shell"],
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
@@ -215,11 +214,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   process.stderr.write(unsandboxed
     ? "Running unsandboxed: approved commands execute directly on this machine.\n"
     : "Sandbox capability is verified per session; production shell stays disabled without provisioned, verified limits.\n");
-  if (gitCredentials) process.stderr.write("Git credentials: approved pushes in your own sessions may use this machine's Git credential helpers.\n");
-  if (repositoryCache) {
-    process.stderr.write(`Repository cache (${repositoryCache.scope === "owner" ? "one per session owner" : "shared by every session on this machine"}): `
-      + "repositories are fetched with this machine's Git credential helpers, for every session on it, after Pistead checks the session owner's access.\n");
-  }
+  process.stderr.write("Host configuration (command time limit, GPU, Git credentials, repository cache) is set in Pistead: Settings > Hosts > this host.\n");
   const stopped = Promise.withResolvers<void>();
   const stop = () => { void connector.stop().then(() => stopped.resolve(), () => stopped.reject(new Error("Connector shutdown failed"))); };
   process.once("SIGINT", stop);

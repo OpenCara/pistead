@@ -8,8 +8,6 @@ export interface Bounds { x: number; y: number; width: number; height: number }
 export interface Settings {
   server: string;
   windowBounds?: Bounds;
-  /** Let approved pushes in the owner's own sessions use this computer's Git credential helpers. */
-  gitCredentials: boolean;
   /**
    * Present while the owner wants the host running: set when they start it, cleared when they stop it. The app resumes
    * hosting when it opens, with the unsandboxed consent they gave in the dialog at that start.
@@ -21,11 +19,14 @@ const isBounds = (value: unknown): value is Bounds => isRecord(value)
   && [value.x, value.y, value.width, value.height].every(item => typeof item === "number" && Number.isSafeInteger(item))
   && Number(value.width) >= 200 && Number(value.height) >= 200;
 
-/** Unknown or invalid fields fall back to defaults: a damaged file never stops the app from opening. */
+/**
+ * Unknown or invalid fields fall back to defaults: a damaged file never stops the app from opening. A `gitCredentials`
+ * left by older versions is dropped: the host's owner turns Git credentials on in Pistead now.
+ */
 export function parseSettings(value: unknown): Settings {
   const source = isRecord(value) ? value : {};
   const server = typeof source.server === "string" ? parseServerOrigin(source.server) : undefined;
-  const settings: Settings = { server: server?.ok ? server.origin : DEFAULT_SERVER, gitCredentials: source.gitCredentials === true };
+  const settings: Settings = { server: server?.ok ? server.origin : DEFAULT_SERVER };
   if (isBounds(source.windowBounds)) settings.windowBounds = source.windowBounds;
   const resume = source.resumeHost;
   if (isRecord(resume) && typeof resume.unsandboxedConsent === "boolean") settings.resumeHost = { unsandboxedConsent: resume.unsandboxedConsent };

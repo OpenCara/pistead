@@ -200,7 +200,7 @@ function PushIdentitySheet({ path, oidc, redirectUri, initial, close, saved }: {
           {text("audience", "Audience")}
         </>}
         {kind === "owner-account" && <p className="muted small">Agents push as the session owner, with {ownerAccount[provider]} (Settings → Profile → Git accounts). Only sessions on the owner's own hosts push this way: the token is sent to that host for each push and held only in its memory. {provider === "github" ? "Pistead resets it when the push ends, so the host's copy stops working while the owner stays connected." : "It stays valid after the push: these tokens can't be reset."}</p>}
-        {kind === "host-credentials" && <p className="muted small">Agents push with the Git credentials set up on the host running the session, read through its Git credential helpers (for example gh auth setup-git, the macOS keychain or Git Credential Manager). Only the host's owner pushes this way, in sessions on their own host, once they restart its connector with <code>--git-credentials</code>.</p>}
+        {kind === "host-credentials" && <p className="muted small">Agents push with the Git credentials set up on the host running the session, read through its Git credential helpers (for example gh auth setup-git, the macOS keychain or Git Credential Manager). Only the host's owner pushes this way, in sessions on their own host, once they turn on Git credentials in its configuration (Settings → Hosts).</p>}
         <Feedback error={action.error} />
       </form>}
   </Sheet>;

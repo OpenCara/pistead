@@ -21,7 +21,7 @@ const hostRequestSchema: z.ZodType<HostRequest> = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start"), id: requestId, server: z.string().min(1).max(2048),
     pairing: z.object({ id: z.string().regex(pairingIdPattern), code: z.string().regex(pairingCodePattern) }).strict().optional(),
-    replacePairing: z.boolean().optional(), gitCredentials: z.boolean().optional(), unsandboxedConsent: z.boolean().optional(),
+    replacePairing: z.boolean().optional(), unsandboxedConsent: z.boolean().optional(),
     models: z.array(z.object({ provider: z.string().min(1).max(128), modelId: z.string().min(1).max(256) }).strict()).min(1).max(200).optional(),
     ...developmentOptions,
   }).strict(),
@@ -125,7 +125,6 @@ async function start(request: StartRequest): Promise<void> {
   const pairing = request.pairing && { id: request.pairing.id, code: request.pairing.code };
   const connector = createConnector({
     dataDir: stateDir, server, pairing, replacePairing: replace, localModels, unsandboxed,
-    gitCredentials: request.gitCredentials === true,
     allowInsecureLoopback: request.allowInsecureLoopback, allowFaux: request.allowFaux,
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
@@ -146,7 +145,7 @@ async function start(request: StartRequest): Promise<void> {
   log("info", unsandboxed
     ? "Running unsandboxed: approved commands execute directly on this machine."
     : "Sandbox capability is verified per session; production shell stays disabled without provisioned, verified limits.");
-  if (request.gitCredentials) log("info", "Git credentials: approved pushes in your own sessions may use this machine's Git credential helpers.");
+  log("info", "Host configuration (command time limit, GPU, Git credentials, repository cache) is set in Pistead: Settings › Hosts › this host.");
   void connector.start().then(
     () => log("info", `Connected to ${server}.`),
     async (error: unknown) => {

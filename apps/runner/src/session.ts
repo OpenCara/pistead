@@ -8,6 +8,7 @@ import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxD
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
+import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
@@ -27,11 +28,14 @@ import type { RepositoryPreparationItem, RepositoryPreparationView } from "../..
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
+import { compactionFailure, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
 import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
+import { defaultHostConfig, type HostConfig } from "../../../packages/shared/src/host-config.js";
+import { commandLimits, type CommandLimits } from "./host-config.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -52,7 +56,7 @@ type Run = {
   /** Its images were gone or unreadable on the host when it was to run, so it ended without reaching Pi (see endLostInputs). */
   inputsLost?: true;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
-  failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
+  failure?: { reason: "model_error" | "no_model" | "compaction_failed"; provider?: string; modelId?: string; compaction?: CompactionFailure };
   /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
   stopped?: { by: string; pending?: true };
   /** Pi parked its work after host crashes cut it off again and again, so it ended (see endParkedRuns). */
@@ -121,18 +125,21 @@ export type RunnerConfig = {
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
   pushComplete?: (request: PushCompleteRequest) => Promise<PushCompletionResult>;
-  /** Reads this host's own Git credential for a push remote as an Authorization header; set only when its owner opted in (connect --git-credentials). */
+  /**
+   * Reads this host's own Git credential for a push remote as an Authorization header. A connector sets it, and it refuses
+   * (HostCredentialError) unless the host's owner has Git credentials on in its configuration (HostConfig.gitCredentials).
+   */
   hostGitCredential?: (remote: string, signal?: AbortSignal) => Promise<string>;
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
-  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them. */
+  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them, but for reasoning models' room (see hostCompaction). */
   compaction?: CompactionSettings;
   /** How the host's Pi identifies its requests to providers; pi-durable's default (attributed to pi) without it. */
   identity?: ClientIdentity;
   /**
-   * This host's repository cache (connect --repo-cache): a mirror per repository, filled through the control plane's
-   * relay, that clones borrow objects from.
+   * This host's repository cache, when its configuration keeps one (HostConfig.repositoryCache): a mirror per repository,
+   * filled through the control plane's relay, that clones borrow objects from. Fixed for a connection.
    */
   repositoryCache?: RepositoryCache;
   resources?: ResourceConfig;
@@ -145,6 +152,11 @@ export type RunnerConfig = {
   /** A session's network grant and its Git relay, through the connector; without them, the control plane's internal routes. */
   egressGrant?: (sessionId: string) => Promise<EgressGrant>;
   gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
+  /**
+   * How the host runs its sessions, as its owner and admins set it in Pistead (the connector caches it briefly). Read for
+   * each shell command: its time limit and GPU. Without it, the defaults.
+   */
+  hostConfig?: () => Promise<HostConfig>;
 };
 
 /** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
@@ -234,6 +246,17 @@ export class RunnerSession {
    * resumes or runs in it.
    */
   readonly #frozen: boolean;
+  /**
+   * The session runs directly on the host's own environment, with no sandbox: every session of an unsandboxed host, or
+   * one its owner started that way on a host that accepts it (`#hostSession`).
+   */
+  readonly #onHost: boolean;
+  /**
+   * A session its host's owner started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise
+   * sandboxes its sessions: it runs commands only while the host's configuration still accepts that
+   * (HostConfig.hostSessions), and deciding them needs host command authority, as host commands do.
+   */
+  readonly #hostSession: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
   /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
@@ -255,7 +278,14 @@ export class RunnerSession {
     const cache = config.repositoryCache;
     this.#clone = binding.session.repositoryMode === "clone";
     this.#frozen = !this.#clone && (binding.session.repositories ?? []).length > 0;
-    if (config.unsandboxed) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
+    this.#hostSession = binding.session.hostEnvironment === true && config.unsandboxed !== true;
+    this.#onHost = config.unsandboxed === true || this.#hostSession;
+    // Only the host's owner's own sessions ever run on the host itself; the control plane admits no other, and neither
+    // does the host.
+    if (this.#hostSession && (!binding.session.connectorOwnerId || binding.session.connectorOwnerId !== binding.owner.id)) {
+      throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
+    }
+    if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
       this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { egressSocket: this.#egress.socketPath,
@@ -633,10 +663,12 @@ export class RunnerSession {
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
     this.models = resolved.models;
     const models = this.models;
+    // Reasoning models keep more room for their compaction summary than Pi's default, unless the host's Pi says otherwise.
+    const compaction = hostCompaction(this.config.compaction, models.getModels());
     const storage = await this.openStorage();
     try {
       this.harness = await Harness.open(storage, { models, registry,
-        ...(this.config.compaction ? { settings: { compaction: this.config.compaction } } : {}),
+        ...(compaction ? { settings: { compaction } } : {}),
         ...(this.config.identity ? { identity: this.config.identity } : {}) }, context);
     }
     catch (error) { await storage.close(context); throw error; }
@@ -907,8 +939,9 @@ export class RunnerSession {
       const state = await this.metadata();
       const conversation = await harness.conversation(state.runs[key]!.conversationId as ConversationId, context);
       await conversation?.waitForIdle(context);
+      const compaction = settled.status === "unanswered" && settled.reason === "model_error" ? compactionFailure(settled.detail) : undefined;
       const failure: Run["failure"] = settled.status === "unanswered" && (settled.reason === "model_error" || settled.reason === "no_model")
-        ? { reason: settled.reason, ...(await conversation?.agent(context))?.model } : undefined;
+        ? { reason: compaction ? "compaction_failed" : settled.reason, ...(await conversation?.agent(context))?.model, ...(compaction ? { compaction } : {}) } : undefined;
       await this.exclusive(async () => {
         if (generation !== this.generation || this.closing) return;
         await this.mutate(meta => {
@@ -1281,9 +1314,34 @@ export class RunnerSession {
     await this.authorize(attribution.initiatedBy, attribution.mode === "ask" ? "ask" : "write");
   }
 
-  /** Whether shell commands may run here: within provisioned limits, on an owner-consented unsandboxed host, or as a faux test shell. */
+  /**
+   * Whether shell commands may run here: within provisioned limits, on the host itself (an owner-consented unsandboxed
+   * host, or the owner's session on a host that accepts it), or as a faux test shell.
+   */
   private shellAllowed(): boolean {
-    return !!this.config.resources || this.config.unsandboxed === true || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+    return !!this.config.resources || this.#onHost || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+  }
+
+  /**
+   * A session its owner started directly on the host runs commands only while the host's configuration still accepts
+   * that: its owner turning it off stops the session's next command (within the configuration's 30-second refresh).
+   */
+  private async requireHostEnvironment(): Promise<void> {
+    if (this.#hostSession && !(await this.hostConfig()).hostSessions) {
+      throw new RunnerError(403, "This host no longer runs sessions directly on it: its owner turned that off in Pistead (Settings → Hosts → the host → Configuration). "
+        + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+  }
+
+  /** The host's configuration, as Pistead reports it to the connector; the defaults on a runner without one. */
+  private async hostConfig(): Promise<HostConfig> {
+    return this.config.hostConfig ? await this.config.hostConfig() : { ...defaultHostConfig };
+  }
+
+  /** How the next shell command runs, as the host's owner and admins configured it: its time limit and its GPU. */
+  private async commandOptions(): Promise<{ limits: CommandLimits; gpu: boolean }> {
+    const config = await this.hostConfig();
+    return { limits: commandLimits(config.commandTimeoutSeconds), gpu: config.gpu };
   }
 
   /** `unbounded`: the host's owner allowed this command to run without the limits this host lacks. */
@@ -1377,7 +1435,12 @@ export class RunnerSession {
       defineTool({ name: "identity", description: "Return immutable session owner identity and sanitized session environment, not collaborator credentials.", parameters: Type.Object({}), execute: async (_args, api, call) => {
         const attribution = await this.toolActor(api, false);
         await this.permit(api, call, "identity", "");
-        return text({ ...await this.sandbox.identity(() => this.recheckTool(attribution)), ...attribution });
+        const config = await this.hostConfig();
+        // How shell commands run here, as the host's owner and admins configured it.
+        // On the host itself there is no sandbox to lend the GPU to: commands have it already, with everything else there.
+        const commands = { timeoutSeconds: commandLimits(config.commandTimeoutSeconds).seconds, gpu: config.gpu && !this.#onHost,
+          ...(this.#onHost ? { onHost: true } : {}) };
+        return text({ ...await this.sandbox.identity(() => this.recheckTool(attribution)), commands, ...attribution });
       } }),
       defineTool({ name: "read_file", description: "Read a confined worktree file. PNG, JPEG, GIF and WebP images are returned as images, scaled to fit.", parameters: Type.Object({ path: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, false);
@@ -1414,10 +1477,12 @@ export class RunnerSession {
           await this.sandbox.writeFile(args.path, applyEdits(await this.sandbox.readFile(args.path, recheck), args.edits, args.path), recheck);
           return text({ ...attribution, edited: args.path, edits: args.edits.length });
         } }),
-      defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output.", parameters: Type.Object({ command: Type.String() }), execute: async (args, api, call) => {
+      defineTool({ name: "bash", description: "Run an exact shell command in the session worktree. Waits for an exact human approval unless the owner enabled auto-approve for this request; then it runs at once and the result carries its output. It stops at the host's command time limit, which identity reports (commands.timeoutSeconds).", parameters: Type.Object({ command: Type.String() }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, true);
+        // Before any card: a session on a host that no longer accepts that asks nobody for anything.
+        await this.requireHostEnvironment();
         const { unbounded } = await this.permit(api, call, "bash", args.command, { write: true, shell: true });
-        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }), call));
+        return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "bash", command: args.command }, String(api.taskId), { permitted: true, unbounded }, call.abortSignal), call));
       } }),
       defineTool({ name: "github_read", description: "Read a GitHub issue or pull request of one of the workspace's github.com repositories (owner/name) as the session owner, through Pistead: its description and comments and, for a pull request, its merge state, head commit, reviews, review comments and checks. Long threads keep their newest items. The sandbox has no network, so use this instead of gh or curl. Read-only; no credentials enter tools.", parameters: Type.Object({ repository: Type.String(), issue: Type.Integer({ minimum: 1 }) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, false);
@@ -1497,6 +1562,38 @@ export class RunnerSession {
     return entry.done;
   }
 
+  /**
+   * An approved shell command, run in the background for as long as the host's time limit allows and tracked through
+   * shutdown like host commands: closing the session stops it. A refusal or a non-zero exit is a definite outcome the
+   * agent can act on; anything else may have had partial effects.
+   */
+  private startShellOperation(id: string, operation: Extract<Operation, { kind: "bash" }>, unbounded: boolean, recheck: SandboxAuthorize): Promise<void> {
+    const entry = { controller: new AbortController(), done: Promise.resolve() };
+    const generation = this.generation;
+    entry.done = (async () => {
+      let status: "executed" | "failed" | "interrupted";
+      let result: string;
+      try {
+        result = await this.sandbox.execute(operation, false, recheck, {
+          allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded,
+          ...await this.commandOptions(), signal: entry.controller.signal,
+        });
+        status = "executed";
+      } catch (error) {
+        const refused = error instanceof RunnerError && error.status < 500;
+        status = error instanceof SandboxProcessError || refused ? "failed" : "interrupted";
+        result = error instanceof SandboxProcessError ? `${error.message}${error.stdout ? `\n${error.stdout}` : ""}`
+          : refused ? (error as RunnerError).message : "Effect failed or outcome is ambiguous. Inspect external state; automatic retry is prohibited.";
+      }
+      if (generation === this.generation) await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status, result: this.kept(id, result) }); });
+    })().catch(() => { /* Durable executing records become interrupted on reopen. */ }).finally(() => {
+      this.pushes.delete(entry);
+      if (generation === this.generation && !this.closing) this.drainQueue();
+    });
+    this.pushes.add(entry);
+    return entry.done;
+  }
+
   /** A github.com owner/name: a session reads and merges in any github.com repository of its workspace, as the control plane checks. */
   private githubRepository(name: string): string {
     if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(name)) throw new RunnerError(400, "repository must be a github.com owner/name");
@@ -1545,7 +1642,7 @@ export class RunnerSession {
    * `consent.permitted`: a tool call `permit` already let through. `consent.unbounded`: the host's owner allowed this
    * command to run without the resource limits this host lacks.
    */
-  async createApproval(actorId: string, input: Operation, toolTaskId?: string, consent: { permitted?: boolean; unbounded?: boolean } = {}): Promise<ApprovalRecord> {
+  async createApproval(actorId: string, input: Operation, toolTaskId?: string, consent: { permitted?: boolean; unbounded?: boolean } = {}, signal?: AbortSignal): Promise<ApprovalRecord> {
     this.requireUnfrozen();
     const operation = validateOperation(input);
     if (operation.kind === "permission") throw new RunnerError(400, "Permission requests come only from tool calls");
@@ -1606,11 +1703,12 @@ export class RunnerSession {
       throw error;
     }
     // A replayed tool task finds its record and never repeats the effect; reopening marks interrupted executions.
-    if (automatic && created) return this.executeAutomatically(id, actorId);
+    // `signal`: the tool call's, so stopping its message stops a long command it runs.
+    if (automatic && created) return this.executeAutomatically(id, actorId, signal);
     return (await this.metadata()).approvals[id]!;
   }
 
-  private async executeAutomatically(id: string, actorId: string): Promise<ApprovalRecord> {
+  private async executeAutomatically(id: string, actorId: string, signal?: AbortSignal): Promise<ApprovalRecord> {
     const approval = (await this.metadata()).approvals[id]!;
     const operation = approval.operation;
     let status: ApprovalRecord["status"];
@@ -1650,8 +1748,10 @@ export class RunnerSession {
     try {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation, approval.unbounded === true);
+        await this.requireHostEnvironment();
         await this.authorize(actorId, "write");
-      }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true });
+      }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true,
+        ...await this.commandOptions(), signal });
       status = "executed";
     } catch (error) {
       // A non-zero exit is a definite outcome the agent can act on; anything else may have had partial effects.
@@ -1684,6 +1784,10 @@ export class RunnerSession {
       };
       if (approval.operation.kind === "host.bash" && !await this.hostCommandLevel(ticket.actorId, "approve")) {
         throw new RunnerError(403, "Only the host owner, or a member granted host commands on this host, can decide a host command");
+      }
+      // A command of a session that runs directly on the host runs there, as a host command does: so is it decided.
+      if (approval.operation.kind === "bash" && this.#hostSession && !await this.hostCommandLevel(ticket.actorId, "approve")) {
+        throw new RunnerError(403, "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands");
       }
       if (approval.operation.kind === "git.repin" && ticket.actorId !== this.binding.owner.id) {
         throw new RunnerError(403, "Only the session owner can decide a repin");
@@ -1735,6 +1839,22 @@ export class RunnerSession {
         });
         return (await this.metadata()).approvals[id]!;
       }
+      if (approval.operation.kind === "bash") {
+        // A command may run for the host's whole time limit, far past the connector's 30-second RPC deadline: report
+        // executing now and settle in the background, as host commands do. The call waiting on the card gets its outcome.
+        const operation = approval.operation;
+        void this.startShellOperation(id, operation, approval.unbounded === true, async () => {
+          this.requireShellCapability(operation, approval.unbounded === true);
+          await this.requireHostEnvironment();
+          await this.authorize(approval.requestedBy, "write");
+          await this.authorize(ticket.actorId, "approve");
+          // Its decider's host command authority, as it stands when the command starts.
+          if (this.#hostSession && !await this.hostCommandLevel(ticket.actorId, "approve")) {
+            throw new RunnerError(403, "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands");
+          }
+        });
+        return (await this.metadata()).approvals[id]!;
+      }
       if (approval.operation.kind === "git.push") {
         // Pushes can outlast the connector RPC deadline: report executing now and settle in the background.
         const operation = approval.operation;
@@ -1762,11 +1882,7 @@ export class RunnerSession {
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
           result = await this.githubEffect(approval.operation, { sessionId: this.binding.session.id, actorId: ticket.actorId, approvalId: id, capability: input.brokerCapability! });
-        } else result = await this.sandbox.execute(approval.operation, false, async () => {
-          this.requireShellCapability(approval.operation, approval.unbounded === true);
-          await this.authorize(approval.requestedBy, "write");
-          await this.authorize(ticket.actorId, "approve");
-        }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true });
+        } else throw new RunnerError(400, "Unsupported approval operation");
         await this.mutate(meta => { Object.assign(meta.approvals[id]!, { status: "executed", result: this.kept(id, result) }); });
       } catch (error) {
         // GitHub said why it didn't merge or open the issue: nothing changed, so the agent can act on the reason.
@@ -1876,11 +1992,14 @@ export class RunnerSession {
     return undefined;
   }
 
-  /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
+  /**
+   * A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, and which
+   * fixed compaction failure it was, never Pi's detail.
+   */
   private failureView(run: Run, branch: number): SessionView["entries"][number] {
-    const { provider, modelId } = run.failure!;
+    const { provider, modelId, compaction } = run.failure!;
     return { id: `${branch}:failure:${run.key}`, kind: "workspace.run-failure", role: "assistant", text: "", actorId: run.initiatedBy, conversationId: String(branch),
-      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}) } };
+      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}), ...(compaction ? { compaction } : {}) } };
   }
 
   async restart(): Promise<void> {
@@ -2013,9 +2132,9 @@ export class RunnerSession {
     return { status: "executed", result: pushSummary(pushed, completion?.pullRequest) + confirmation };
   }
 
-  /** This host's own Git credential for `remote`: only its owner's sessions use it, and only after the owner opted in on the host. */
+  /** This host's own Git credential for `remote`: only its owner's sessions use it, and only while the owner has it on. */
   private async hostAuthorization(remote: string, signal?: AbortSignal): Promise<string> {
-    if (!this.config.hostGitCredential) throw new PushError("This host does not push with its Git credentials; its owner can restart the connector with --git-credentials");
+    if (!this.config.hostGitCredential) throw new PushError("This host does not push with its Git credentials; its owner can turn them on in Pistead (Settings → Hosts → the host → Configuration)");
     if (this.binding.session.connectorOwnerId !== this.binding.owner.id) throw new PushError("Only the host's owner can push with its Git credentials");
     try {
       return await this.config.hostGitCredential(remote, signal);

@@ -79,6 +79,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const [content, setContent] = useState("");
   const [visibility, setVisibility] = useState<Visibility>("workspace");
   const [trustedHost, setTrustedHost] = useState("");
+  // Where the session runs: in the sandbox, or directly on the host, which only its owner chooses where it accepts that.
+  const [onHost, setOnHost] = useState(false);
   const action = useAction();
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -111,6 +113,9 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repositories = repos.repositories;
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
+  const hostSessions = Boolean(host?.hostSessions && host.ownerId === user.id);
+  const runOnHost = hostSessions && onHost;
+  const unsandboxed = Boolean(host?.capabilities.unsandboxed || runOnHost);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
   const attachments = useAttachments(imagesUnavailable(host));
 
@@ -119,6 +124,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   // A trust acknowledgement covers one host against one repository set.
   useEffect(() => { setTrustedHost(""); }, [hostKey, host?.ownerId, repositories]);
+  // Each host starts in the sandbox: running on one is chosen for it, never carried over from another.
+  useEffect(() => { setOnHost(false); }, [hostKey]);
 
   useLayoutEffect(() => {
     const element = input.current;
@@ -136,14 +143,15 @@ function Composer({ workspace }: { workspace: Workspace }) {
     // The chat box starts on Auto-approve without asking, and it merges too: the first message that would asks first.
     if (mustConfirmAutoApprove(options, autoApproveConfirmed())) {
       confirming.current = true;
-      const confirmed = await confirmAutoApprove(host, Boolean(host.capabilities.unsandboxed)).finally(() => { confirming.current = false; });
+      const confirmed = await confirmAutoApprove(host, unsandboxed).finally(() => { confirming.current = false; });
       // Declined, the chat box asks before acting instead, and nothing starts until the owner sends again.
       if (!confirmed) { setChat({ key: hostKey, value: { ...selection, access: "approval" } }); return; }
     }
     void action.run(async () => {
       // Before the session exists: an image that can't be read stops the start instead of leaving a session behind.
       const images = await encodeImages(pasted);
-      const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, modelId: model.id, title: deriveTitle(content, model.name), visibility, ...(foreign ? { trustedConnectorId: host.id } : {}) } });
+      const result = await api<{ session: SessionRecord }>("/api/sessions", { method: "POST", body: { workspaceId: workspace.id, modelId: model.id, title: deriveTitle(content, model.name), visibility,
+        ...(foreign ? { trustedConnectorId: host.id } : {}), ...(runOnHost ? { hostEnvironment: true } : {}) } });
       const sessionId = result.session.id;
       writeStorage(() => localStorage, LAST_START_KEY, `model:${model.id}`);
       rememberChat(host, selection);
@@ -194,6 +202,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
     { label: "Workspace", icon: "globe" as const, hint: "Members can view", onSelect: () => setVisibility("workspace") },
     { label: "Private", icon: "lock" as const, hint: "Explicit grants only", onSelect: () => setVisibility("private") },
   ];
+  const environmentItems = [
+    { label: "Sandbox", icon: "shield" as const, hint: "Isolated, with the workspace's network access", onSelect: () => setOnHost(false) },
+    { label: "On this host", icon: "server" as const, hint: "No sandbox: runs as the host's user", onSelect: () => setOnHost(true) },
+  ];
 
   return <div className="new-session">
     <div className="new-session-hero">
@@ -215,13 +227,14 @@ function Composer({ workspace }: { workspace: Workspace }) {
             options={hosts.map(item => ({ value: item.id, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` }))}
             onChange={setChoice} />
           <DropdownMenu label="Visibility" align="start" items={visibilityItems} trigger={<><Icon name={visibility === "workspace" ? "globe" : "lock"} size={14} />{visibility === "workspace" ? "Workspace" : "Private"}</>} />
+          {hostSessions && <DropdownMenu label="Where it runs" align="start" items={environmentItems} trigger={<><Icon name={runOnHost ? "server" : "shield"} size={14} />{runOnHost ? "On host" : "Sandbox"}</>} />}
           <InfoTip label="Who can see and do what">
             <div className="stack">
               <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators and admins can also send messages to it; anything more (approving tool calls, managing the session) needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
               <p>You are the session owner; the host owner is a separate role. Viewing never grants access to your Git accounts, and visibility does not share your Pi host or local models.</p>
             </div>
           </InfoTip>
-          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: hostKey, value })} owner showAccess unsandboxed={Boolean(host?.capabilities.unsandboxed)} />
+          <ChatOptionsBar host={host} value={selection} onChange={value => setChat({ key: hostKey, value })} owner showAccess unsandboxed={unsandboxed} />
           <span className="spacer" />
           {action.busy && <Loading>Preparing repositories...</Loading>}
           <Button type="submit" variant="default" icon="send" className="composer-send" aria-label="Start session" title="Start session" disabled={!canStart} />
@@ -229,6 +242,9 @@ function Composer({ workspace }: { workspace: Workspace }) {
       </fieldset>
     </form>
     <Feedback error={action.error} />
+    {runOnHost && host && <Alert variant="warning" title="Runs on your host, without the sandbox">
+      Its commands run on {host.name} as its user, with its files, credentials, network and GPU, and no resource limits; the workspace's network access doesn't apply. Approve them as you would commands you run yourself: people you share the session with can't decide them unless you granted them host commands.
+    </Alert>}
     <div className="new-session-meta">
       {action.busy
         ? <span role="status">Resolving repository commits and downloading snapshots to the Pi host's private session cache. The agent starts once every repository is ready.</span>

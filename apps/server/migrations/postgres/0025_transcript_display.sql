@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0031_transcript_display.sql.
+-- Postgres translation of sqlite/0032_transcript_display.sql.
 
 -- How transcripts leave the control plane (packages/shared/src/transcript-display.ts). Display only: neither is part of a
 -- session's runner binding or policy, and hosts keep sending whole transcripts.

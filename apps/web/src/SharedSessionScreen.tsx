@@ -5,6 +5,7 @@ import { api, ApiError, errorMessage } from "./api";
 import { Icon, Logo, type IconName } from "./icons";
 import { Markdown } from "./markdown";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
+import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
 import { Alert, EmptyState, formatDuration, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
 import "./session.css";
 import "./shared-session.css";
@@ -123,6 +124,12 @@ function SharedEntry({ entry }: { entry: EntryView }) {
     return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{line}</>} text={entry.text} trimmed={entry.trimmed} />;
   }
   if (entry.error) {
+    // A link's viewers can't send the next message, so they get the cause without the advice.
+    if (entry.error.compaction) {
+      return <div className="entry-error" title={entry.kind}>
+        <Alert variant="error" title={COMPACTION_FAILED_TITLE}>{compactionFailureText(entry.error.compaction, { advice: false })}</Alert>
+      </div>;
+    }
     return <div className="entry-error" title={entry.kind}><Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert></div>;
   }
   if (entry.role === "user") return <div className="entry-user" title={entry.kind}><div className="entry-bubble">{entry.text}</div></div>;

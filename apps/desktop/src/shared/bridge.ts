@@ -10,7 +10,6 @@ export const channels = {
   hostRefresh: "host:refresh",
   hostStart: "host:start",
   hostStop: "host:stop",
-  hostGitCredentials: "host:git-credentials",
   hostOpenAtLogin: "host:open-at-login",
   settingsView: "settings:view",
   settingsServer: "settings:server",
@@ -36,7 +35,6 @@ export interface HostView {
   /** The latest failure, cleared by the next start. */
   error?: string;
   logs: LogLine[];
-  gitCredentials: boolean;
   /** Absent where the platform has no login items (Linux). */
   openAtLogin?: boolean;
   /** Development builds may advertise fixture models instead of Pi's. */
@@ -58,7 +56,6 @@ export interface PisteadBridge {
     refresh(): Promise<void>;
     start(input: StartInput): Promise<Outcome>;
     stop(): Promise<Outcome>;
-    setGitCredentials(enabled: boolean): Promise<void>;
     setOpenAtLogin(enabled: boolean): Promise<Outcome>;
     onUpdate(listener: (view: HostView) => void): () => void;
   };

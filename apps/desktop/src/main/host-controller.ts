@@ -46,7 +46,7 @@ export class HostController {
     const settings = this.options.settings.get();
     const view: HostView = {
       title: this.options.title, server: settings.server, state: this.state, inspecting: this.inspecting > 0,
-      logs: [...this.logs], gitCredentials: settings.gitCredentials, fixtureModels: this.options.fixtureModels,
+      logs: [...this.logs], fixtureModels: this.options.fixtureModels,
     };
     if (this.running) view.running = { ...this.running };
     if (this.inspection) view.inspection = this.inspection;
@@ -128,7 +128,7 @@ export class HostController {
     this.error = undefined;
     if (input.pairing) this.log("info", input.replacePairing ? `Replacing this computer's pairing with one for ${server}.` : `Pairing this computer with ${server}.`);
     const result = await this.process.request({
-      type: "start", server, gitCredentials: this.options.settings.get().gitCredentials,
+      type: "start", server,
       ...(input.pairing ? { pairing: input.pairing, replacePairing: input.replacePairing } : {}),
       ...(unsandboxedConsent ? { unsandboxedConsent: true } : {}),
       ...this.developmentOptions(server),
@@ -159,12 +159,6 @@ export class HostController {
     if (!resume) return;
     const outcome = await this.start({ replacePairing: false }, resume);
     if (!outcome.ok) this.options.settings.update({ resumeHost: undefined });
-  }
-
-  setGitCredentials(enabled: boolean): void {
-    this.options.settings.update({ gitCredentials: enabled });
-    if (this.state !== "stopped") this.log("info", `Git credentials ${enabled ? "on" : "off"}: applies the next time the host starts.`);
-    else this.changed();
   }
 
   setOpenAtLogin(enabled: boolean): Outcome {

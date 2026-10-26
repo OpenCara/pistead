@@ -33,7 +33,18 @@ The saved token is replaced only once the new code is accepted. The old host sta
 
 Connector 0.8.0 moved the default state directory from `~/.local/share/opencara/connector` to `~/.local/share/pistead/connector` without moving anything: to keep a pairing made by an older connector, run `npx pistead@latest connect --state-dir ~/.local/share/opencara/connector`, or pair the machine again.
 
-Run `npx pistead connect --help` for all options.
+Run `npx pistead connect --help` for all options. The connector takes only what pairing and this machine's own setup need (`--state-dir`, `--pi-agent-dir`, `--model`, `--resources`, `--unsafe-no-sandbox`).
+
+## Host configuration
+
+Everything else about how the host runs sessions is set in the web app, on the host's page under **Settings → Hosts → the host → Configuration**, and reaches running sessions within a minute:
+
+- **Command time limit**: how long a shell command may run, from 30 seconds (the default) to an hour. A longer limit also lifts the per-process limits of short commands (25 seconds of CPU, 64 MiB per file, 256 open files) so builds fit. Set by the host's owner or its admins.
+- **GPU**: sandboxed commands get the host's GPU render device for offscreen rendering and compute: `/dev/dxg` on WSL2 (install Mesa's `vulkan-dzn` there for Vulkan), or Linux DRM render nodes. Never the screen, windows or input. Offered only where the connector found such a device. Set by the host's owner or its admins.
+- **Git credentials** and **Repository cache**: see below. Only the host's owner changes them.
+- **Sessions on the host**: the host's owner may start sessions that run directly on this machine, without the sandbox, by choosing **Where it runs → On this host** when starting one; members' sessions always run in the sandbox. Only the owner changes it.
+
+`--git-credentials`, `--repo-cache` and `--repo-cache-scope` are still accepted, so existing service units keep starting, but ignored: a host that used them keeps those settings in its configuration.
 
 Workspace repositories can come from GitHub, GitHub Enterprise Server, GitLab (gitlab.com or self-managed), Bitbucket Cloud, Azure DevOps and Gitea/Forgejo. Connect the non-GitHub accounts in the web app under **Settings → Profile → Git accounts** with personal access tokens. Sessions read the repositories through the Pistead server, which uses those tokens; the connector never receives them.
 
@@ -69,12 +80,7 @@ Every command needs an exact human approval unless the session's owner turns on 
 
 ## Repository cache (preview)
 
-Every session starts with an empty worktree, and its agent clones the workspace repositories it needs. With `--repo-cache`, the connector keeps a full mirror of each repository on the host, so clones borrow its objects instead of downloading everything again:
-
-```sh
-npx pistead@latest connect --repo-cache                            # one cache for every session on this host
-npx pistead@latest connect --repo-cache --repo-cache-scope owner   # a separate cache for each session owner
-```
+Every session starts with an empty worktree, and its agent clones the workspace repositories it needs. With **Repository cache** set to **Shared** (one cache for every session on this host) or **Per owner** (a separate cache for each session owner) in the host's configuration, the connector keeps a full mirror of each repository on the host, so clones borrow its objects instead of downloading everything again. A change applies when the connector next connects.
 
 - `git clone` of a workspace repository in a sandboxed session borrows the cached objects (`--reference-if-able`) after bringing the mirror up to date through Pistead, with the session owner's own account. The host uses no Git credential of its own for this. A session sees a mirror, read-only, only while Pistead lets its owner read the repository.
 - `npx pistead@latest cache list` shows the cached repositories and their sizes; `npx pistead@latest cache prune --older-than 30` forgets clone sessions idle for longer and collects what nothing reaches any more (their clones lose the objects they borrowed). Pins of sessions from before every session cloned are kept.
@@ -101,11 +107,7 @@ Except for GitHub, a push token carries everything its identity can reach until 
 Instead of an app or bot, a provider's push identity can be one of these. Both push only from sessions running on the session owner's own hosts, so no one's credentials reach anyone else's machine; elsewhere the push is refused and needs an app or bot identity:
 
 - **Session owner's account**: the push uses the account the session owner connected to Pistead, the GitHub sign-in or the token under **Settings → Profile → Git accounts**, which then needs write scopes (GitHub Enterprise Contents write, GitLab `write_repository`, Bitbucket `write:repository:bitbucket`, Azure DevOps Code (Read & write), Gitea `write:repository`). Your account tokens otherwise never reach the connector: with this identity your own host receives yours for each push in your sessions. Pistead resets a GitHub token through its OAuth app when the push ends, so the host's copy stops working while you stay connected; if the host never reports the push, the reset follows about an hour later. Tokens for the other providers can't be reset and stay valid after the push.
-- **Host's Git credentials** (connector 0.6.0 or newer): the connector reads the HTTPS credentials Git on the host would use for the repository, through its credential helpers (for example after `gh auth setup-git`, or from the macOS keychain or Git Credential Manager), without ever prompting. Pistead sends no credential. The host's owner opts in by running the connector with `--git-credentials`; then only their own sessions on that host push this way:
-
-  ```sh
-  npx pistead@latest connect --git-credentials
-  ```
+- **Host's Git credentials** (connector 0.6.0 or newer): the connector reads the HTTPS credentials Git on the host would use for the repository, through its credential helpers (for example after `gh auth setup-git`, or from the macOS keychain or Git Credential Manager), without ever prompting. Pistead sends no credential. The host's owner turns on **Git credentials** in its configuration; then only their own sessions on that host push this way.
 
 Pull requests are still opened as the session owner, with the owner's connected account.
 
@@ -128,7 +130,7 @@ Agents change files with `edit_file`, which replaces exact text in place, or wit
 
 A new session starts from a host and one of its models, and gets every tool that host supports with no extra instructions. The access mode still decides what runs without asking.
 
-When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes, GitHub comments, merges and issues still need their own approval unless the message auto-approves. A message the session owner sends with **Auto-approve** asks none of this (connector 0.7.1 or newer): its calls go ahead at once, for that message only. Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most 30 seconds, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
+When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes, GitHub comments, merges and issues still need their own approval unless the message auto-approves. A message the session owner sends with **Auto-approve** asks none of this (connector 0.7.1 or newer): its calls go ahead at once, for that message only. Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most the host's command time limit, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
 
 ## Session status
 
