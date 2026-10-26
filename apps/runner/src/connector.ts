@@ -736,11 +736,11 @@ export class LocalConnector {
       this.requireGeneration(generation);
       // A ticket validated on arrival may have expired while queued.
       if (rpc.ticket.exp * 1000 <= Date.now()) throw new Error("Relay ticket expired while queued");
-      const payload = await this.reply(generation, rpc, authorization);
-      // The reply waits for socket output to drain to its own size, not to a worst-case reservation. It always fits
-      // eventually (frameBytes < bufferedBytes), and later requests stay queued behind it, so output stays bounded by
-      // bufferedBytes and queued requests by the relay's own budget.
-      const payloadSize = encoder.encode(payload).length;
+      const { payload, payloadSize } = await this.reply(generation, rpc, authorization);
+      // The reply waits for socket output to drain to its own size, not to a worst-case reservation. Any reply fits once
+      // output drains (frameBytes < bufferedBytes), and later requests stay queued behind it, so output stays bounded by
+      // bufferedBytes and queued requests by the relay's own budget. The wait shares RPC_TIMEOUT with the queue, as the
+      // relay's own deadline does: an uplink that cannot drain the backlog in time still ends the connection.
       while (generation.socket.bufferedAmount + payloadSize > connectorLimits.bufferedBytes) {
         await delay(10, undefined, { signal: generation.abort.signal });
         this.requireGeneration(generation);
@@ -756,10 +756,12 @@ export class LocalConnector {
    * the limit or not UTF-8, a frame too large once escaped) is answered as an error for it, not by ending the connection
    * and every other request with it. Only a lost connection still throws.
    */
-  private async reply(generation: Generation, rpc: ConnectorRpcRequest, authorization: string): Promise<string> {
-    const failed = (status: number, error: string) => JSON.stringify({
+  private async reply(generation: Generation, rpc: ConnectorRpcRequest, authorization: string): Promise<{ payload: string; payloadSize: number }> {
+    // Measured without encoding: a reply can be tens of MiB while output is already backed up.
+    const frame = (payload: string) => ({ payload, payloadSize: Buffer.byteLength(payload, "utf8") });
+    const failed = (status: number, error: string) => frame(JSON.stringify({
       type: "response", id: rpc.id, status, body: JSON.stringify({ error, code: "connector_reply_error" }),
-    } satisfies ConnectorRpcResponse);
+    } satisfies ConnectorRpcResponse));
     let result: ConnectorRpcResponse;
     try {
       const response = await generation.runtime!.fetch(new Request(`http://local.invalid${rpc.path}`, {
@@ -779,10 +781,10 @@ export class LocalConnector {
       return failed(502, "The host could not complete the request.");
     }
     this.requireGeneration(generation);
-    const payload = JSON.stringify(result);
+    const reply = frame(JSON.stringify(result));
     // Escaping can make a body under responseBytes a frame over frameBytes.
-    if (encoder.encode(payload).length > connectorLimits.frameBytes) return failed(502, "The host's reply is too large to relay.");
-    return payload;
+    if (reply.payloadSize > connectorLimits.frameBytes) return failed(502, "The host's reply is too large to relay.");
+    return reply;
   }
 
   stop(): Promise<void> {
