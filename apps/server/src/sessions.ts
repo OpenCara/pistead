@@ -26,6 +26,7 @@ import { mayDecideHostCommands } from './host-access.js';
 import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
 import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
+import { newSessionToolOutput } from './transcript-settings.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host offers: one it advertises that its
@@ -294,7 +295,9 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const agent = await chatAgentVersion(c.env, ownerId, model, capabilities);
     // Its own branch is named for its work, on a connector that pushes the name its binding carries.
     const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone',
-      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0 };
+      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0,
+      // It starts with the tool output its workspace's owners and admins chose for new sessions; its owner can change it.
+      tool_output: await newSessionToolOutput(c.env.DB, workspaceId) };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
     await requireSessionCreator(c.env, workspaceId, ownerId);
@@ -302,8 +305,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     // Admit the session only while its workspace's repositories, membership and host are as they were checked.
     const inserted = await c.env.DB.query(`INSERT INTO sessions
       (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch,
-        host_environment)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        host_environment, tool_output)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE ${sessionCreatorSQL('?')}
       AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
       AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
@@ -331,7 +334,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       RETURNING id`)
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
         row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null, row.branch ?? null,
-        row.host_environment ?? 0,
+        row.host_environment ?? 0, row.tool_output ?? 'full',
         workspaceId, ownerId, workspaceId, resolved.bindingIds,
         // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
         ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,

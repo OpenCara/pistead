@@ -350,7 +350,7 @@ function TranscriptSection({ session, user, changed }: { session: SessionRecord;
   }
   const paging = settings.data?.settings.paging;
   return <Section title="Transcript" info={<div className="stack">
-    <p>With full tool output on, the transcript shows everything each tool printed. Turned off, each tool result shows only its first line and long tool calls are cut short, for everyone viewing the session, its share link included. Long sessions then load much faster. The host keeps the whole output either way, and the agent still sees all of it. Only the session's owner can change this.</p>
+    <p>With full tool output on, the transcript shows everything each tool printed. Turned off, each tool result shows only its first line and long tool calls are cut short, for everyone viewing the session, its share link included. Long sessions then load much faster. The host keeps the whole output either way, and the agent still sees all of it. Only the session's owner can change this; new sessions start with their workspace's choice, under Settings → Workspaces.</p>
     <p>Whether the transcript loads latest messages first is a workspace setting, under Settings → Workspaces.</p>
   </div>}>
     <Row title="Full tool output" hint={full ? "Every tool result in full" : "One line per tool result"} trailing={editable

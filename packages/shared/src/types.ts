@@ -134,7 +134,7 @@ export interface SessionRecord {
   visibility?: "private" | "workspace";
   /**
    * "brief": everyone viewing the session (share links included) sees each tool result as its first line and long tool
-   * calls cut short, to keep transcripts small. Absent: full tool output. Only the owner changes it.
+   * calls cut short, to keep transcripts small. Absent: full tool output. It starts as its workspace sets for new sessions; only the owner changes it.
    */
   toolOutput?: "brief";
   // Present only on single-session reads: the pinned host explicitly runs without isolation, or this session runs on it
