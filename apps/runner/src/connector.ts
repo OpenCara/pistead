@@ -343,6 +343,11 @@ export class LocalConnector {
   private welcomed?: Generation;
   private online = Promise.withResolvers<Generation>();
   private runtime?: Runtime;
+  /**
+   * The runner is being replaced (another repository cache): retiring it waits for the work still executing in it, so
+   * requests that arrive meanwhile are told at once that it is restarting rather than queued behind that work.
+   */
+  private restarting = false;
   /** Runtime requests still executing, including those already answered as timed out: the runtime closes after them. */
   private readonly executing = new Set<Promise<void>>();
   /**
@@ -529,12 +534,18 @@ export class LocalConnector {
   /** The runner for `repositoryCache`, started on the first connection and kept for later ones. */
   private async ensureRuntime(repositoryCache: RepositoryCacheMode): Promise<Runtime> {
     // Another cache means other mounts for every session: as when it was chosen per connection, a new runner opens them.
-    if (this.runtime && this.runtime.repositoryCache !== repositoryCache) await this.retireRuntime();
-    if (!this.runtime) {
-      const cache = repositoryCache === "off" ? undefined : this.repositoryCacheFor(repositoryCache);
-      this.runtime = { value: await (this.options.runtimeFactory ?? defaultRuntime)(this.runnerConfig(cache)), repositoryCache, resumed: false };
+    const replacing = this.runtime !== undefined && this.runtime.repositoryCache !== repositoryCache;
+    if (replacing) this.restarting = true;
+    try {
+      if (replacing) await this.retireRuntime();
+      if (!this.runtime) {
+        const cache = repositoryCache === "off" ? undefined : this.repositoryCacheFor(repositoryCache);
+        this.runtime = { value: await (this.options.runtimeFactory ?? defaultRuntime)(this.runnerConfig(cache)), repositoryCache, resumed: false };
+      }
+      return this.runtime;
+    } finally {
+      if (replacing) this.restarting = false;
     }
-    return this.runtime;
   }
 
   /** Closes the runner once the requests executing in it are done. A failed close leaves SQLite unsafe to reopen. */
@@ -838,13 +849,17 @@ export class LocalConnector {
       generation.active.delete(task);
       generation.incomingBytes -= frameSize;
     });
-    generation.tail = task;
+    // Later requests follow every earlier one, including those answered at once (see execute), so they keep arrival order.
+    generation.tail = Promise.all([previous, task]).then(() => {});
     generation.active.add(task);
   }
 
   private async execute(generation: Generation, value: ConnectorRpcRequest, previous: Promise<void>): Promise<void> {
     const { rpc, authorization } = await validateRelayRequest(value, this.state!.connectorId, this.secret);
     this.requireGeneration(generation);
+    // Answered at once, freeing its slot rather than waiting for the runner; requests behind it still wait for every one
+    // before them (see dispatch).
+    if (this.restarting) return this.send(generation, this.errorFrame(rpc, 503, "The host's runner is restarting; try again shortly."));
     const canceled = Promise.withResolvers<never>();
     generation.waiting.add(canceled);
     try {
@@ -854,11 +869,16 @@ export class LocalConnector {
       generation.waiting.delete(canceled);
     }
     this.requireGeneration(generation);
-    const { payload, payloadSize } = await this.answer(generation, rpc, authorization);
-    // The reply waits for socket output to drain to its own size, not to a worst-case reservation. Any reply fits once
-    // output drains (frameBytes < bufferedBytes), and later requests stay queued behind it, so output stays bounded by
-    // bufferedBytes and queued requests by the relay's own budget. An uplink that cannot drain that far in DRAIN_TIMEOUT
-    // is a broken connection, not a slow request, and ends it.
+    await this.send(generation, await this.answer(generation, rpc, authorization));
+  }
+
+  /**
+   * Sends a reply once socket output has drained to its own size, not to a worst-case reservation. Any reply fits once
+   * output drains (frameBytes < bufferedBytes), and later requests stay queued behind it, so output stays bounded by
+   * bufferedBytes and queued requests by the relay's own budget. An uplink that cannot drain that far in DRAIN_TIMEOUT
+   * is a broken connection, not a slow request, and ends it.
+   */
+  private async send(generation: Generation, { payload, payloadSize }: { payload: string; payloadSize: number }): Promise<void> {
     const drained = Date.now() + DRAIN_TIMEOUT;
     while (generation.socket.bufferedAmount + payloadSize > connectorLimits.bufferedBytes) {
       if (Date.now() >= drained) return this.disconnect(generation, "Socket output did not drain within 30s");

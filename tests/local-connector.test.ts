@@ -1177,3 +1177,87 @@ test('a reconnect whose configuration can\'t be read keeps the runner and its re
     clock.mock.restore();
   }
 });
+
+test('while the runner is replaced, a request is told at once that it is restarting, and later ones reach the new runner', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  let repositoryCache = 'off';
+  const asked = mailbox<void>();
+  const fixture = await connectorFixture(t, {
+    ...runtime,
+    hostConfig: () => { asked.push(); return Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache } }); },
+  });
+  const first = await startFixture(fixture);
+  await asked.next();
+  // Work that outlives its deadline keeps the runner from closing until it is done.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const slow = await rpc('submit', '{}', 'restart-slow');
+  first.receive(slow);
+  const slowExecution = await runtime.started.next();
+  t.mock.timers.tick(30_001);
+  assert.equal((JSON.parse(await first.messages.next()) as ConnectorRpcResponse).status, 504);
+  t.mock.timers.reset();
+  // The cache changed in Pistead: the next connection replaces the runner, which waits for that work.
+  repositoryCache = 'owner';
+  first.close();
+  const second = await fixture.sockets.next();
+  second.open();
+  second.welcome();
+  await asked.next();
+  await nextTurn();
+  assert.equal(fixture.runtimes[0]!.closed, false, 'still waiting for the work executing in it');
+  const during = await rpc('view', '', 'restart-during');
+  second.receive(during);
+  const refused = JSON.parse(await second.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([refused.id, refused.status], [during.id, 503]);
+  assert.match((JSON.parse(refused.body) as { error: string }).error, /restarting; try again shortly/);
+  assert.equal(second.readyState, 1);
+  slowExecution.response.resolve(Response.json({ late: true }));
+  await fixture.connected.next();
+  await fixture.workerCalls.next();
+  assert.equal(fixture.runtimes[0]!.closed, true);
+  assert.equal(fixture.runtimes.length, 2);
+  const after = await rpc('view', '', 'restart-after');
+  second.receive(after);
+  const execution = await runtime.started.next();
+  execution.response.resolve(Response.json({ view: true }));
+  const answered = JSON.parse(await second.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([answered.id, answered.status], [after.id, 200]);
+  assert.deepEqual([fixture.runtimes[0]!.requests.length, fixture.runtimes[1]!.requests.length], [1, 1], 'the refused request reached no runner');
+});
+
+test('a request answered at once still keeps the requests behind it after those before it', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  const fixture = await connectorFixture(t, runtime);
+  const socket = await startFixture(fixture);
+  const before = await rpc('view', '', 'order-before');
+  const refused = await rpc('view', '', 'order-refused');
+  const behind = await rpc('view', '', 'order-behind');
+  socket.receive(before);
+  const execution = await runtime.started.next();
+  // Stand in for a replacement starting while `before` runs: only `refused` arrives during it.
+  const connector = fixture.connector as unknown as { restarting: boolean };
+  connector.restarting = true;
+  socket.receive(refused);
+  assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, refused.id);
+  connector.restarting = false;
+  // Once the request behind is validated and queued, nothing but the request before the refused one holds it.
+  const { generation } = fixture.connector as unknown as { generation: { waiting: Set<unknown> } };
+  const queued = Promise.withResolvers<void>();
+  const add = generation.waiting.add.bind(generation.waiting);
+  const observing = t.mock.method(generation.waiting, 'add', (value: unknown) => {
+    const result = add(value);
+    queued.resolve();
+    return result;
+  });
+  socket.receive(behind);
+  await queued.promise;
+  observing.mock.restore();
+  await nextTurn();
+  assert.equal(fixture.runtimes[0]!.requests.length, 1, 'the request behind waits for the one before the refused one');
+  execution.response.resolve(Response.json({ before: true }));
+  assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, before.id);
+  const next = await runtime.started.next();
+  assert.equal(new URL(next.request.url).pathname, '/v1/sessions/session/view');
+  next.response.resolve(Response.json({ behind: true }));
+  assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, behind.id);
+});

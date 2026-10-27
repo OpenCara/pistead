@@ -148,6 +148,32 @@ test("the host's configuration is asked for again only after a while, and its la
   assert.deepEqual(await empty.current(), defaultHostConfig);
 });
 
+test("a new connection asks again and learns whether the control plane answered; a failed ask leaves the cache in use", async () => {
+  const now = 0;
+  let loads = 0;
+  const answers: unknown[] = [];
+  const source = new HostConfigSource(async () => {
+    loads++;
+    const answer = answers.shift();
+    if (answer instanceof Error) throw answer;
+    return answer;
+  }, { now: () => now, ttlMs: 30_000, staleMs: 300_000 });
+  const first = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "owner", hostSessions: false, compaction: {} };
+  const second = { ...first, repositoryCache: "off" };
+  answers.push(first);
+  assert.deepEqual(await source.refresh(), { config: first, answered: true });
+  answers.push(second);
+  assert.deepEqual(await source.refresh(), { config: second, answered: true }, "asked again though the cached answer was fresh");
+  answers.push(new Error("control plane unreachable"));
+  assert.deepEqual(await source.refresh(), { config: second, answered: false }, "the cached answer, said not to be a new one");
+  assert.equal(loads, 3);
+  assert.deepEqual(await source.current(), second);
+  assert.deepEqual(await source.current(), second);
+  assert.equal(loads, 3, "a failed ask leaves the cache serving callers for the rest of its time, not asking on each call");
+  answers.push({ ...second, commandTimeoutSeconds: 5 });
+  assert.deepEqual(await source.refresh(), { config: second, answered: false }, "an invalid answer is no answer");
+});
+
 test("a GPU is lent as its render device only: WSL's /dev/dxg, or DRM render nodes with their sysfs device", async t => {
   const root = await mkdtemp(join(tmpdir(), "pistead-gpu-"));
   t.after(() => rm(root, { recursive: true, force: true }));
