@@ -62,6 +62,35 @@ test("rate limits and long proxy pages stay short and plain", async () => {
   assert.ok(long.message.length < 500);
 });
 
+test("no markup survives, whether literal, entity-encoded or in tags the page doesn't usually use", async () => {
+  const encoded = await failure(() => new Response("<pre>&lt;b&gt;bold&lt;/b&gt; &amp;lt;i&amp;gt; Tom &amp; Jerry</pre>", { status: 502, headers: { "Content-Type": "text/html" } }));
+  assert.match(encoded.message, /: "bbold\/b &lt;i&gt; Tom & Jerry"/);
+  assert.doesNotMatch(encoded.message, /[<>]/);
+  const h2 = await failure(() => new Response("<h2>Upstream <em>unavailable</em></h2>", { status: 503, headers: { "Content-Type": "text/html" } }));
+  assert.match(h2.message, /: "Upstream unavailable"/);
+  const json = await failure(() => Response.json({ message: "<script>x</script>broken" }, { status: 502 }));
+  assert.doesNotMatch(json.message, /[<>]/);
+});
+
+test("an empty title falls back to the page's heading", async () => {
+  const page = "<html><head><title> </title></head><body><h1>Origin <b>down</b></h1></body></html>";
+  const error = await failure(() => new Response(page, { status: 502, headers: { "Content-Type": "text/html" } }));
+  assert.match(error.message, /: "Origin down"/);
+});
+
+test("proxy JSON quotes a useful field or a bare string, never a bare status word", async () => {
+  const status = await failure(() => Response.json({ status: "error", code: 502 }, { status: 502 }));
+  assert.match(status.message, /\(HTTP 502 Bad Gateway\)\./);
+  const bare = await failure(() => Response.json("no healthy upstream", { status: 503 }));
+  assert.match(bare.message, /HTTP 503 Service Unavailable: "no healthy upstream"/);
+});
+
+test("a successful answer cut off mid-body is described, not a bare SyntaxError", async () => {
+  const error = await failure(() => new Response('{"session":{"id":', { status: 201, headers: { "Content-Type": "application/json" } }));
+  assert.equal(error.code, "BACKEND_UNAVAILABLE");
+  assert.match(error.message, /incomplete or garbled \(HTTP 201\)/);
+});
+
 test("successful JSON answers are returned as before", async () => {
   assert.deepEqual(await answering(() => Response.json({ ok: true }))("/api/test"), { ok: true });
 });

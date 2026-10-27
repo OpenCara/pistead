@@ -37,16 +37,25 @@ const statusNames: Record<number, string> = {
 
 const DETAIL_LIMIT = 200;
 
+const stripTags = (html: string) => html.replace(/<[^>]*>/g, " ");
+
+/** Decodes the common entities; `&amp;` last, so `&amp;lt;` stays the text `&lt;` instead of becoming `<`. */
+const decodeEntities = (text: string) => text.replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+  .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+
 /** One short line of plain text from an upstream answer: an HTML page's title or heading, else its text; never markup. */
 function plainDetail(raw: string): string {
-  const html = /<(?:!doctype|html|head|body|title|h1|div|p)\b/i.test(raw);
   let text = raw;
-  if (html) {
-    const pick = (tag: string) => new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`, "i").exec(raw)?.[1];
-    text = pick("title") ?? pick("h1") ?? raw.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ");
-    text = text.replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  if (/<[a-z!/]/i.test(raw)) {
+    // An element's text, or nothing when it is missing or empty, so an empty <title> falls back to the <h1>.
+    const pick = (tag: string) => {
+      const inner = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`, "i").exec(raw)?.[1];
+      return inner !== undefined && stripTags(inner).trim() ? inner : undefined;
+    };
+    text = stripTags(pick("title") ?? pick("h1") ?? raw.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " "));
   }
+  // Angle brackets are dropped after decoding, so no markup survives, whether it was literal or entity-encoded.
+  text = decodeEntities(text).replace(/[<>]/g, "");
   // Control characters (other than whitespace) are dropped so nothing odd reaches the page.
   text = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
   return text.length > DETAIL_LIMIT ? `${text.slice(0, DETAIL_LIMIT - 1)}…` : text;
@@ -54,15 +63,13 @@ function plainDetail(raw: string): string {
 
 /** The message in a JSON error answer that isn't Pistead's own shape, such as a hosting proxy's `{message}`. */
 function foreignJsonDetail(body: unknown): string {
+  if (typeof body === "string") return plainDetail(body);
   if (!body || typeof body !== "object" || Array.isArray(body)) return "";
   const record = body as Record<string, unknown>;
-  for (const key of ["message", "detail", "error_description", "title", "reason", "status"]) {
+  // Not `status`: proxies put words like "error" there, which say nothing the HTTP status doesn't.
+  for (const key of ["message", "detail", "error_description", "title", "reason"]) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) return plainDetail(value);
-  }
-  const error = record.error;
-  if (error && typeof error === "object" && typeof (error as Record<string, unknown>).message === "string") {
-    return plainDetail((error as { message: string }).message);
   }
   return "";
 }
@@ -100,7 +107,16 @@ async function decode(response: Response): Promise<unknown> {
     const raw = await response.text().catch(() => "");
     throw upstreamError(response, plainDetail(raw));
   }
-  if (response.ok) return await response.json();
+  if (response.ok) {
+    try {
+      return await response.json();
+    } catch (error) {
+      // An abort stays an abort; a body cut off or garbled on the way is described, not thrown as a bare SyntaxError.
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      throw new ApiError(response.status, "BACKEND_UNAVAILABLE", `The Pistead API's answer arrived incomplete or garbled (HTTP ${response.status}). `
+        + "The connection may have dropped; if the request changes something, check the result before retrying.");
+    }
+  }
   const raw = await response.text().catch(() => "");
   let body: unknown;
   try { body = JSON.parse(raw); } catch { throw upstreamError(response, plainDetail(raw)); }
