@@ -319,14 +319,23 @@ test('the owner\'s agent manages schedules with the schedule tool, for a live wr
   // An Auto-approve message passes that check; this session's host takes no access options, so the schedule still can't be auto.
   await refused(tool(admit(ownerId, { access: 'auto' }), { ...create, access: 'auto' }), 400, 'options_unsupported');
   f.sqlite.prepare("UPDATE session_schedules SET access = 'auto' WHERE id = ?").run(schedule.id);
-  await refused(tool(write, { action: 'update', scheduleId: schedule.id, content: 'Do anything' }), 403, 'automatic_schedule_not_admitted');
+  for (const change of [{ content: 'Do anything' }, { enabled: true }, { enabled: false, content: 'Do anything' }, { access: 'auto' }]) {
+    await refused(tool(write, { action: 'update', scheduleId: schedule.id, ...change }), 403, 'automatic_schedule_not_admitted');
+  }
+  // Pausing it, or lowering its access, takes away only what it could do unattended.
+  const pausedAuto = await tool(write, { action: 'update', scheduleId: schedule.id, enabled: false });
+  assert.equal(pausedAuto.status, 200, JSON.stringify(pausedAuto.body));
+  const lowered = await tool(write, { action: 'update', scheduleId: schedule.id, access: 'approval', content: 'Check the build again' });
+  assert.equal(lowered.status, 200, JSON.stringify(lowered.body));
+  assert.deepEqual([(lowered.body.schedule as SessionSchedule).access, (lowered.body.schedule as SessionSchedule).content], ['approval', 'Check the build again']);
+  f.sqlite.prepare("UPDATE session_schedules SET access = 'auto' WHERE id = ?").run(schedule.id);
 
   // Deleting takes no more access than it had.
   const deleted = await tool(write, { action: 'delete', scheduleId: schedule.id });
   assert.deepEqual([deleted.status, deleted.body], [200, { deleted: schedule.id }]);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_schedules').get()!.n, 0);
   const audits = f.sqlite.prepare("SELECT action, actor_id, detail_json FROM audit WHERE action LIKE 'session.schedule.%' ORDER BY rowid").all();
-  assert.deepEqual(audits.map(row => row.action), ['session.schedule.created', 'session.schedule.updated', 'session.schedule.deleted']);
+  assert.deepEqual(audits.map(row => row.action), ['session.schedule.created', 'session.schedule.updated', 'session.schedule.updated', 'session.schedule.updated', 'session.schedule.deleted']);
   for (const row of audits) {
     assert.equal(row.actor_id, ownerId);
     assert.deepEqual((({ agent, callId }) => ({ agent, callId }))(JSON.parse(String(row.detail_json)) as { agent: boolean; callId: string }), { agent: true, callId: 'call-1' });

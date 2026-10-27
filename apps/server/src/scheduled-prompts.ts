@@ -23,8 +23,8 @@ import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
  * - Each enabled schedule's next run is kept on the session (`next_scheduled_at`), which lists show as "Scheduled".
  * - The owner's agent manages them too, with the schedule tool (`agentSchedules`), for a tool call of a write message
  *   the owner sent: what it creates runs as the owner, as theirs from the Schedules tab do. Only a message the owner
- *   sent with Auto-approve creates or changes an auto-approved one, so a message can't leave behind more access than
- *   it had.
+ *   sent with Auto-approve creates an auto-approved one or changes one and leaves it so, so a message can't leave
+ *   behind more access than it had; any of their write messages may pause one, lower its access or delete it.
  */
 
 /** The most schedules a session keeps. */
@@ -260,8 +260,9 @@ type AdmissionRow = { id: string; session_id: string; actor_id: string; mode: st
  * The schedule tool: lists, creates, changes or deletes the session's scheduled prompts for a tool call of a write
  * message the session owner sent within the last hour, as the Schedules tab does for them, with the tool the pinned
  * agent has, or the owner allowed for the session or for this call (`requireToolCall`). Only a message the owner sent
- * with Auto-approve creates an auto-approved schedule, or changes one: a schedule runs later, with nobody watching, and
- * must not carry more access than the message that made it had.
+ * with Auto-approve creates an auto-approved schedule, or changes one and leaves it so: a schedule runs later, with
+ * nobody watching, and must not carry more access than the message that made it had. Any write message may pause one,
+ * lower its access or delete it.
  */
 export async function agentSchedules(c: AppContext, connectorId: string | null): Promise<Response> {
   // Room for a message at its character limit in any script, and JSON's escapes.
@@ -311,7 +312,7 @@ export async function agentSchedules(c: AppContext, connectorId: string | null):
   const change: ScheduleChange = { actorId, callId };
   const requireAutomatic = () => {
     if (admission.access !== 'auto') {
-      fail(403, 'automatic_schedule_not_admitted', 'Only a message the session owner sent with Auto-approve schedules an auto-approved prompt or changes one. Schedule it with approval, or the owner sets it in the Schedules tab.');
+      fail(403, 'automatic_schedule_not_admitted', 'Only a message the session owner sent with Auto-approve schedules an auto-approved prompt, or changes one and leaves it auto-approved. Pause it, lower its access, or have the owner change it in the Schedules tab.');
     }
   };
   if (action === 'create') {
@@ -323,7 +324,10 @@ export async function agentSchedules(c: AppContext, connectorId: string | null):
     await deleteSchedule(c.env, row, change, current);
     return c.json({ deleted: current.id } satisfies ScheduleToolResult);
   }
-  if (current.access === 'auto' || fields.access === 'auto') requireAutomatic();
+  // Changes that leave it auto-approved need the owner's Auto-approve; pausing one, or lowering its access, takes
+  // nothing from it but what it could do unattended.
+  const pausing = Object.keys(fields).length === 1 && fields.enabled === false;
+  if ((fields.access ?? current.access) === 'auto' && !pausing) requireAutomatic();
   return c.json({ schedule: scheduleRecord(await updateSchedule(c.env, row, change, current, fields)) } satisfies ScheduleToolResult);
 }
 
