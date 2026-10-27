@@ -15,7 +15,8 @@ The rules this keeps from today:
 
 - **No credential enters the sandbox.** A sandboxed process can read and send anything it holds, so it holds none.
 - **Session owners read with their own accounts.** On a shared host the host owner's credentials never serve other
-  members' sessions, and owners' tokens never reach other people's hosts.
+  members' sessions, and owners' tokens never reach other people's hosts. (Since direct transfers, below, the control plane may give
+  a host a token that can only read one repository; the owner's own account still reaches only the owner's own hosts.)
 - **Policy is enforced where the agent can't change it:** in the runner, outside the sandbox, and in the control plane.
 
 ## Phases
@@ -355,3 +356,57 @@ audited as `repository.lfs.updated`; the setting is in `WorkspaceRepository.lfs`
   (`session_frozen`), and so are push credentials, GitHub comments and merges, restores of their backups and moves.
   Opening one ends whatever it had queued or at work, and the cards waiting on decisions, as `interrupted`. Their transcript, approvals, backups (to download) and exports stay available; the session
   record says `frozen`, and the web and mobile apps offer nothing that would be refused.
+
+## Direct transfers: Git's data without the control plane
+
+Status: implemented. Relaying every pack, push and LFS object through the control plane spent its bandwidth twice per
+byte (from the forge, then down to the host), and big repositories or many sessions used it up quickly. Now the
+control plane still decides every Git request, but where it can give the host a credential limited enough for that
+host, the host's proxy makes the request at the forge itself.
+
+- **Asking** (`apps/runner/src/git-direct.ts`, `DirectGit`). The session's one Git choke point (`RunnerSession.relay`,
+  which serves the proxy and the host cache's mirror fills) first asks `POST /api/connectors/self/git/direct` (or
+  `/api/internal/git/direct` on the control plane's own runner) with `{ sessionId, bindingId, access }`, `access` being
+  `read`, `lfs` or `push`; a push's request also names its one command, which the proxy has read and checked
+  (`sessionBranchRefusal`). The answer (`GitDirectGrant`) is either `direct: false`, and the request is relayed as
+  before, or a remote, an `Authorization` header (null for none), what kind of credential it is, its expiry and how long
+  it may be reused. A runner configured with a relay of its own and no way to ask relays everything.
+- **Deciding** (`apps/server/src/network.ts`, `gitDirect`). The same authority as for a relayed request
+  (`gitAuthority`: the session, its owner, connector and connection, the binding, the owner's account), then:
+  - reads and LFS downloads verify the repository with the owner's account (`verifyRepository`, so renames and transfers
+    still fail closed) and, for LFS, the workspace's switch. A **public** repository is read without a credential, on
+    any host. A **private** one gets a GitHub App installation token limited to the repository and to `contents: read`
+    (`mintRepositoryReadToken`: the workspace's GitHub App push identity for the host, else the operator's app on
+    github.com), on any host; such tokens are shared while they have 20 minutes left. Without one, the **owner's own
+    account** serves only on the owner's own host or the control plane's own runner. Anything else is relayed.
+  - pushes of the session branch are direct only on the **owner's own host or the control plane's own runner**: a push
+    token can't be limited to one branch, and only the proxy enforces the session branch, so a host shared with the
+    workspace relays its pushes (answered before anything is minted). There, after the relay's own checks
+    (`sessionBranchTarget`: no restore pending, the binding, the owner able to push, the default-branch policy) and the
+    command's, the workspace's push identity is minted for each request. The owner's GitHub sign-in token (which would
+    have to be reset after leaving the server) and the host's own Git credentials stay relayed. A push's command is
+    audited as `git.push.session_branch` with `direct: true`; an installation token comes with its revocation, which the
+    host makes once the forge's answer has been read.
+  - `GIT_DIRECT` lets the operator choose: `on` (default), `own-hosts` (credentials only to owners' own hosts and the
+    control plane's runner; public repositories stay direct everywhere) or `off` (everything relayed).
+- **Transferring** (`packages/shared/src/git-transfer.ts`). The relay and the host make the same requests with the same
+  code: `gitUpstreamHeaders` (Git's own user agent, protocol and request types only), `fetchGit` (manual redirects,
+  fixed credential-free errors) and the LFS batch and download (`lfsProviderBatch`, `lfsDownload`: the credential only
+  for the provider's origin and only when the action brings none, an action's headers never across origins, exactly
+  the pointer's size). On the host, a download that points off the provider's own origin is made only when every address
+  of its name is public, as for the proxy's tunnels, since its content goes to the sandbox, and it connects to exactly
+  the addresses checked (`pinnedFetch`: its own agent, which never resolves the name again or takes a proxy from the
+  environment), so DNS rebinding can't send it elsewhere; otherwise it is relayed.
+  Direct answers keep the relay's form (a Git service's stream, the relay's LFS batch answer and
+  object content), so the proxy and the mirror fills don't change; an internal header marks them for the proxy's log,
+  `(direct <kind>)`, and never reaches the sandbox.
+- **Falling back.** A read grant is reused for a minute at most (`GIT_DIRECT_CACHE_SECONDS`) and never within five
+  minutes of its expiry; a push asks for each request. A read the forge fails is made again through the relay (its
+  request is whole in memory), and a host that can't reach the forge relays that repository for five minutes; an
+  older control plane, or a failed grant request, means relaying for a minute. A push the forge refuses is not retried:
+  its pack has been sent. Why a request was relayed after all shows in the proxy's log (`relayed: …`).
+
+What this gives up, and where: on a host shared with the workspace, the host's owner can take a read token while it
+lasts (an hour at most) and read that one repository with it, where before they could take nothing. Pushes, and the
+owner's own account, still never reach such a host. The sandbox still holds no credential, and LFS download links and
+their tokens still never reach it.

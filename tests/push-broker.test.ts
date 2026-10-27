@@ -5,6 +5,7 @@ import test from 'node:test';
 import { app } from '../apps/server/src/index.js';
 import { listSessionAccess, runnerSessionRecord, sessionAccess, sessionPullRequest, sessionRecord } from '../apps/server/src/db.js';
 import { settlePushCredentials } from '../apps/server/src/push/broker.js';
+import { forgetRepositoryReadTokens } from '../apps/server/src/push/mint.js';
 import { refreshPullRequestStates } from '../apps/server/src/pull-request-states.js';
 import type { Env } from '../apps/server/src/types.js';
 import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
@@ -92,7 +93,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
     JSON.stringify({ key: 'consumer-key' }), await encryptToken(env, 'push-identity:identity-bb', 'consumer-secret'), 'ready', owner, createdAt, createdAt);
 
   const calls: Call[] = [];
-  const state = { canPush: options.canPush ?? true, bitbucketWrite: options.bitbucketWrite ?? true, githubTip: tip, githubPullExists: false, bitbucketPullExists: false,
+  const state = { canPush: options.canPush ?? true, bitbucketWrite: options.bitbucketWrite ?? true, githubTip: tip, githubPrivate: true, githubPullExists: false, bitbucketPullExists: false,
     githubBranch: null as Record<string, unknown> | null, gitlabBranch: null as Record<string, unknown> | null,
     giteaBranch: null as Record<string, unknown> | null, azureAllow: true, resetStatus: 200, resetToken: 'owner-oauth-token-2',
     // Pull requests as GitHub reads them back (pull-request-states.ts), by number; a missing one is a 404. All have head `tip`.
@@ -107,7 +108,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
         return state.githubBranch ? Response.json(state.githubBranch) : Response.json({ message: 'Branch not found' }, { status: 404 });
       }
       if (method === 'GET' && url.pathname === '/repos/owner/repo') {
-        return Response.json({ id: 101, full_name: 'owner/repo', default_branch: 'main', private: true, permissions: { push: state.canPush } });
+        return Response.json({ id: 101, full_name: 'owner/repo', default_branch: 'main', private: state.githubPrivate, permissions: { push: state.canPush } });
       }
       if (method === 'GET' && url.pathname === '/repos/owner/repo/installation') return Response.json({ id: 55 });
       if (method === 'POST' && url.pathname === '/app/installations/55/access_tokens') {
@@ -1075,4 +1076,106 @@ test('a session on a host shows the pull request GitHub has for a branch its hos
   const before = lookups();
   stale(); await refreshPullRequestStates(f.env);
   assert.equal(lookups(), before, 'merged pull requests are not looked up again');
+});
+
+/** A direct Git grant request through the session's host (or the internal route), with its JSON answer. */
+async function direct(f: Awaited<ReturnType<typeof fixture>>, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, any> }> {
+  const response = await f.post('/api/internal/git/direct', { sessionId: 'session', bindingId: 'binding-gh', ...body });
+  return { status: response.status, body: await response.json() as Record<string, any> };
+}
+const installationBasic = 'Basic ' + Buffer.from('x-access-token:ghs_installation_token').toString('base64');
+
+test('direct Git grants: a shared host reads private repositories with a token limited to reading them, and relays its pushes', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t, { host: { owner: approver } });
+  const mints = () => f.calls.filter(call => call.url === 'https://api.github.com/app/installations/55/access_tokens');
+
+  const read = await direct(f, { access: 'read' });
+  assert.equal(read.status, 200, JSON.stringify(read.body));
+  const { expiresAt, ...grant } = read.body;
+  assert.deepEqual(grant, { direct: true, remote: 'https://github.com/owner/repo.git', authorization: installationBasic, kind: 'repository-token', cacheSeconds: 60 });
+  assert.ok(Date.parse(expiresAt) > Date.now());
+  // The token can read this one repository and nothing else, and it is shared until it nears its expiry.
+  assert.deepEqual(mints().map(call => call.body), [{ repository_ids: [101], permissions: { contents: 'read' } }]);
+  assert.equal((await direct(f, { access: 'read' })).body.authorization, installationBasic);
+  assert.equal(mints().length, 1);
+  // Every grant re-verifies the repository with the owner's own account, as a relayed read does.
+  assert.equal(f.calls.filter(call => call.url === 'https://api.github.com/repos/owner/repo').length, 2);
+
+  // A push token can't be limited to the session branch, so a shared host relays its pushes, before anything is minted.
+  const push = await direct(f, { access: 'push' });
+  assert.deepEqual(push.body, { direct: false, reason: 'Pushes from a host shared with the workspace go through Pistead: a push token can\'t be limited to the session branch', cacheSeconds: 60 });
+  assert.equal(mints().length, 1);
+  // LFS follows the workspace's switch, as relayed downloads do.
+  assert.equal((await direct(f, { access: 'lfs' })).body.code, 'lfs_disabled');
+
+  // A public repository needs no credential at all.
+  f.state.githubPrivate = false;
+  const open = await direct(f, { access: 'read' });
+  assert.deepEqual([open.body.direct, open.body.authorization, open.body.kind], [true, null, 'public']);
+
+  // Operators decide: own-hosts gives a shared host no credential (public reads stay direct), off relays everything.
+  f.env.GIT_DIRECT = 'own-hosts';
+  assert.equal((await direct(f, { access: 'read' })).body.kind, 'public');
+  f.state.githubPrivate = true;
+  assert.equal((await direct(f, { access: 'read' })).body.direct, false);
+  f.env.GIT_DIRECT = 'off';
+  f.state.githubPrivate = false;
+  assert.deepEqual((await direct(f, { access: 'read' })).body, { direct: false, reason: 'Direct Git transfers are off on this Pistead server', cacheSeconds: 60 });
+  delete f.env.GIT_DIRECT;
+
+  // Malformed requests, and sessions that lost their authority, get nothing.
+  for (const body of [{ access: 'write' }, { access: 'read', command: { old: '0'.repeat(40), new: tip, ref: 'refs/heads/pistead/session' } },
+    { access: 'read', extra: true }, { access: 'push', command: { old: 'zz', new: tip, ref: 'refs/heads/x' } }]) {
+    const refused = await direct(f, body);
+    assert.deepEqual([refused.status, refused.body.code], [400, 'invalid_direct_request'], JSON.stringify(body));
+  }
+  assert.equal((await direct(f, { access: 'read', bindingId: 'missing' })).body.code, 'repository_not_bound');
+  f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = 'session'").run();
+  const archived = await direct(f, { access: 'read' });
+  assert.deepEqual([archived.status, archived.body.code], [403, 'repository_authority_changed']);
+});
+
+test('direct Git grants: the owner\'s own host reads with the owner\'s account where no app serves, and pushes its session branch itself', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t, { host: { owner } });
+  // GitLab has no tokens limited to reading one repository; on their own host, the owner's own account serves.
+  const gitlab = await direct(f, { bindingId: 'binding-gl', access: 'read' });
+  assert.deepEqual([gitlab.body.direct, gitlab.body.kind, gitlab.body.authorization, gitlab.body.remote],
+    [true, 'owner-account', 'Basic ' + Buffer.from('oauth2:owner-gitlab-token').toString('base64'), 'https://gitlab.com/group/project.git']);
+
+  // The advertisement: the workspace's push identity, which the host revokes once its answer is read; nothing is audited.
+  const refs = await direct(f, { access: 'push' });
+  assert.deepEqual([refs.body.direct, refs.body.kind, refs.body.authorization, refs.body.cacheSeconds, refs.body.remote],
+    [true, 'push-identity', installationBasic, 0, 'https://github.com/owner/repo.git']);
+  assert.deepEqual(refs.body.revoke, { url: 'https://api.github.com/installation/token', authorization: 'Bearer ghs_installation_token' });
+  assert.deepEqual(f.audits('git.push.session_branch'), []);
+  // The push names its one command, which the control plane checks and audits before the host gets a token.
+  const command = { old: '0'.repeat(40), new: tip, ref: 'refs/heads/pistead/session' };
+  assert.equal((await direct(f, { access: 'push', command })).body.direct, true);
+  const audit = f.audits('git.push.session_branch') as { detail_json: string }[];
+  assert.deepEqual(JSON.parse(audit[0]!.detail_json), { bindingId: 'binding-gh', branch: 'pistead/session', old: command.old, new: tip, kind: 'github-app', direct: true });
+  const other = await direct(f, { access: 'push', command: { ...command, ref: 'refs/heads/main' } });
+  assert.deepEqual([other.status, other.body.code], [403, 'session_branch_only']);
+  const deleted = await direct(f, { access: 'push', command: { ...command, new: '0'.repeat(40) } });
+  assert.deepEqual([deleted.status, deleted.body.code], [403, 'session_branch_only']);
+  // The owner must still be able to push the repository themselves, as for a relayed push.
+  f.state.canPush = false;
+  assert.equal((await direct(f, { access: 'push' })).body.code, 'push_permission_required');
+  f.state.canPush = true;
+  // The owner's GitHub sign-in token would have to be reset after a push that took it off the server, and the host's own
+  // Git credentials can't serve the proxy: those pushes stay relayed.
+  f.pushIdentity('github', 'github.com', '', 'owner-account');
+  assert.deepEqual((await direct(f, { access: 'push' })).body, { direct: false, reason: 'This push identity pushes through Pistead', cacheSeconds: 0 });
+  // A pinned session pushes only with git_push.
+  f.sqlite.exec("BEGIN; DROP TRIGGER sessions_repository_mode_immutable; UPDATE sessions SET repository_mode = NULL WHERE id = 'session'; COMMIT;");
+  assert.equal((await direct(f, { access: 'push' })).body.code, 'session_branch_unavailable');
+});
+
+test('direct Git grants: the control plane\'s own runner reads with the owner\'s account where no app serves', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t);
+  const gitlab = await direct(f, { bindingId: 'binding-gl', access: 'read' });
+  assert.deepEqual([gitlab.body.direct, gitlab.body.kind, gitlab.body.authorization],
+    [true, 'owner-account', 'Basic ' + Buffer.from('oauth2:owner-gitlab-token').toString('base64')]);
 });

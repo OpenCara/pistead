@@ -554,6 +554,9 @@ export class LocalConnector {
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/complete", payload));
         },
         egressGrant: async sessionId => parseEgressGrant(await this.brokerCallback(generation, "/api/connectors/self/network", { sessionId })),
+        // A credential for one Git request, which the session's proxy then makes at the forge itself (DirectGit), or the
+        // control plane's word to relay it.
+        gitDirect: async (sessionId, request) => this.brokerCallback(generation, "/api/connectors/self/git/direct", { sessionId, ...request }),
         // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget. A push
         // outlives a replaced connection: once its pack is under way, the forge's answer must reach Git.
         gitRelay: async (sessionId, request) => {

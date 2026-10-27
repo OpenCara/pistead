@@ -1,9 +1,15 @@
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { AppContext, Env } from './types';
+import { GitTransferError } from '../../../packages/shared/src/git-transfer.js';
 
 export function fail(status: ContentfulStatusCode, code: string, message: string): never {
   throw new HTTPException(status, { res: Response.json({ error: message, code }, { status }) });
+}
+/** Rethrows a Git transfer's fixed, credential-free refusal (git-transfer.ts) as this API's error; anything else as it is. */
+export function failTransfer(error: unknown): never {
+  if (error instanceof GitTransferError) fail(error.status as ContentfulStatusCode, error.code, error.message);
+  throw error;
 }
 export async function jsonObject(c: AppContext, maxBytes = 65536): Promise<Record<string, unknown>> {
   const type = c.req.header('content-type')?.split(';')[0]?.trim();

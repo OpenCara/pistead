@@ -11,7 +11,7 @@ import { githubComment, githubIssue, githubMerge, githubRead } from './github-br
 import { agentSchedules } from './scheduled-prompts.js';
 import { legacyRestoreDownload } from './restore-routes.js';
 import { pushComplete, pushCredential } from './push/broker.js';
-import { egressGrant, gitRelay } from './network.js';
+import { egressGrant, gitDirect, gitRelay } from './network.js';
 import { hostAuthority } from './host-access.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
@@ -37,6 +37,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
   app.post('/api/internal/network', c => egressGrant(c, null));
   app.post('/api/internal/git/relay/:bindingId/:service', c => gitRelay(c, null));
+  app.post('/api/internal/git/direct', c => gitDirect(c, null));
 }
 
 export async function authorizeSession(c: AppContext, connectorId: string | null): Promise<Response> {
