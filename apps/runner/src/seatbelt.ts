@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { HELPER, type SandboxRequest } from "./sandbox.js";
-import type { HelperBackend, HelperContext, HelperLaunch, HelperLayout } from "./helper-workspace.js";
+import { egressPort, type HelperBackend, type HelperContext, type HelperLaunch, type HelperLayout } from "./helper-workspace.js";
 import { firstExecutable } from "./platform.js";
 
 /**
@@ -170,10 +170,10 @@ export class SeatbeltBackend implements HelperBackend {
   async prepare(_layout: HelperLayout): Promise<void> {}
 
   async launch(request: SandboxRequest, context: HelperContext, layout: HelperLayout): Promise<HelperLaunch> {
-    const proxy = context.egress ? /^http:\/\/[^@/]+@127\.0\.0\.1:(\d+)$/.exec(context.environment.HTTPS_PROXY ?? "") : null;
+    const port = egressPort(context);
     const { profile, parameters } = seatbeltProfile({
       layout, readOnly: context.readOnly, gitWritable: context.gitWritable, toolRoots: this.#tools.roots,
-      ...(proxy ? { egressPort: Number(proxy[1]) } : {}),
+      ...(port !== undefined ? { egressPort: port } : {}),
     });
     void request;
     return {

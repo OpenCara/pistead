@@ -1,6 +1,6 @@
 import { chmod, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { HelperBackend, HelperContext, HelperLaunch, HelperLayout } from "./helper-workspace.js";
+import { egressPort, type HelperBackend, type HelperContext, type HelperLaunch, type HelperLayout } from "./helper-workspace.js";
 import { NODE_HELPER, NODE_HELPER_KINDS } from "./node-helper.js";
 import { bashPath, gitForWindowsRoot } from "./platform.js";
 import { mxcEntry, mxcInstallHint, validWindowsLimits, type WindowsJobLimits } from "./sandbox-backend.js";
@@ -34,15 +34,18 @@ const pending = [];
 let config;
 let buffered = Buffer.alloc(0);
 const first = new Promise((resolve, reject) => {
-  process.stdin.on("data", chunk => {
-    if (config) { pending.push(chunk); return; }
+  // Reads only the configuration: once it is in, input waits in the stream (paused) until the container takes it.
+  const onData = chunk => {
     buffered = Buffer.concat([buffered, chunk]);
     const end = buffered.indexOf(10);
     if (end < 0) { if (buffered.length > 1024 * 1024) reject(new Error("configuration too large")); return; }
-    config = JSON.parse(buffered.subarray(0, end).toString("utf8"));
+    process.stdin.off("data", onData);
+    process.stdin.pause();
+    try { config = JSON.parse(buffered.subarray(0, end).toString("utf8")); } catch { reject(new Error("invalid configuration")); return; }
     if (buffered.length > end + 1) pending.push(buffered.subarray(end + 1));
     resolve();
-  });
+  };
+  process.stdin.on("data", onData);
   process.stdin.on("end", () => { if (!config) reject(new Error("no configuration")); });
 });
 
@@ -64,9 +67,12 @@ try { child = await sdk.spawn(config.request); } catch (error) { fail("the proce
 const input = child.standardInput;
 if (!input) fail("the process container has no standard input");
 for (const chunk of pending) input.write(chunk);
-process.stdin.on("data", chunk => input.write(chunk));
-process.stdin.on("end", () => input.end());
 if (process.stdin.readableEnded) input.end();
+else {
+  process.stdin.on("data", chunk => input.write(chunk));
+  process.stdin.on("end", () => input.end());
+  process.stdin.resume();
+}
 const copies = [[child.standardOutput, process.stdout], [child.standardError, process.stderr]].filter(([from]) => from).map(([from, to]) =>
   new Promise(resolve => { from.on("data", chunk => to.write(chunk)); from.on("end", resolve); from.on("error", resolve); }));
 const result = await child.wait();
@@ -116,6 +122,8 @@ export class WindowsBackend implements HelperBackend {
     // Written afresh at every open: they may be from an older connector, and the session can only read them.
     for (const [name, source] of [["helper.mjs", NODE_HELPER], ["runner.mjs", WINDOWS_RUNNER]] as const) {
       const path = join(layout.bin, name);
+      // Windows keeps the read-only attribute in the way of deleting it; clear it first.
+      await chmod(path, 0o600).catch(() => undefined);
       await rm(path, { force: true });
       await writeFile(path, source, { mode: 0o400 });
       await chmod(path, 0o400);
@@ -124,7 +132,7 @@ export class WindowsBackend implements HelperBackend {
 
   async launch(request: SandboxRequest, context: HelperContext, layout: HelperLayout): Promise<HelperLaunch> {
     const system = process.env.SystemRoot ?? "C:\\Windows";
-    const proxy = context.egress ? /^http:\/\/[^@/]+@127\.0\.0\.1:(\d+)$/.exec(context.environment.HTTPS_PROXY ?? "") : null;
+    const port = egressPort(context);
     const environment: Record<string, string> = {
       ...context.environment,
       SANDBOX_GITDIR: layout.git, SANDBOX_GIT: this.#git, SANDBOX_BASH: this.#bash, SANDBOX_OWNER_CONFIG: layout.ownerConfig,
@@ -142,8 +150,8 @@ export class WindowsBackend implements HelperBackend {
       containment: { type: "processcontainer" },
       filesystem: { readwritePaths: readwrite, readonlyPaths: readonly, deniedPaths: [] },
       // Proxy-only egress (MXC's "Model 2"): the container reaches only the session's loopback proxy; no proxy, no network.
-      network: proxy
-        ? { egress: { default: "deny" }, ingress: { default: "allow", hostLoopback: "allow" }, runtimeConfig: { networkProxy: `http://127.0.0.1:${proxy[1]}` } }
+      network: port !== undefined
+        ? { egress: { default: "deny" }, ingress: { default: "allow", hostLoopback: "allow" }, runtimeConfig: { networkProxy: `http://127.0.0.1:${port}` } }
         : { egress: { default: "deny" }, ingress: { default: "deny", hostLoopback: "deny" } },
       ui: { disable: true },
       workingDirectory: layout.worktree,

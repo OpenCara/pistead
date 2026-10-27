@@ -8,7 +8,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { assertConnectorPlatform } from "../apps/runner/src/connect-setup.js";
 import { EgressProxy, egressEnvironment, type EgressEndpoint } from "../apps/runner/src/egress.js";
-import { HelperWorkspace, type HelperBackend, type HelperContext, type HelperLaunch, type HelperLayout } from "../apps/runner/src/helper-workspace.js";
+import { egressPort, HelperWorkspace, type HelperBackend, type HelperContext, type HelperLaunch, type HelperLayout } from "../apps/runner/src/helper-workspace.js";
 import { NODE_HELPER, NODE_HELPER_KINDS } from "../apps/runner/src/node-helper.js";
 import { HELPER, type SandboxRequest } from "../apps/runner/src/sandbox.js";
 import { validWindowsLimits } from "../apps/runner/src/sandbox-backend.js";
@@ -209,6 +209,52 @@ test("the platform sandboxes refuse to start anywhere but their own platform, ne
   assert.throws(() => new SeatbeltBackend({ python: "/x", git: "/x", bash: "/x", roots: [], path: "" }), /only on macOS/);
   assert.throws(() => new WindowsBackend({ runtime: "/nowhere", limits: { memoryBytes: 1 << 30, processes: 64, cpuPercent: 50 } }), /only on Windows/);
   assert.throws(() => assertConnectorPlatform({ experimentalSandbox: true }), /for macOS and native Windows/);
+});
+
+test("a workspace opens again over its own read-only files, and a step that should have the network fails without a proxy", { skip: !posix || !python }, async t => {
+  const backend = new Unconfined("reopen", true, "python");
+  const first = await workspace(t, backend);
+  await first.writeFile("kept.txt", "kept", allow);
+  await first.close();
+  const again = new HelperWorkspace(binding("native-reopen"), first.layout.root, backend);
+  t.after(() => again.close());
+  await again.initialize();
+  assert.equal(await again.readFile("kept.txt", allow), "kept");
+  const context = { readOnly: false, gitWritable: false, deadlineMs: 1000 };
+  assert.equal(egressPort({ ...context, egress: false, environment: {} }), undefined);
+  assert.equal(egressPort({ ...context, egress: true, environment: { HTTPS_PROXY: "http://pistead:t@127.0.0.1:41234" } }), 41234);
+  assert.throws(() => egressPort({ ...context, egress: true, environment: {} }), /egress proxy endpoint is missing/);
+  assert.throws(() => egressPort({ ...context, egress: true, environment: { HTTPS_PROXY: "http://127.0.0.1:41234" } }), /egress proxy endpoint is missing/);
+});
+
+/** A stand-in for MXC's SDK: `probe` reports the given tier, and the "container" echoes its input with a prefix. */
+const FAKE_SDK = (tier: string) => `
+import { spawn as start } from "node:child_process";
+export function probe() { return { tier: ${JSON.stringify(tier)}, warnings: [], probes: {} }; }
+export async function spawn(request) {
+  const child = start(process.execPath, ["-e", "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>{process.stdout.write('container:'+s);process.exitCode=7})"], { stdio: ["pipe", "pipe", "pipe"] });
+  return { standardInput: child.stdin, standardOutput: child.stdout, standardError: child.stderr,
+    wait: () => new Promise(resolve => child.on("close", code => resolve({ exitCode: code, timedOut: false }))) };
+}
+`;
+
+test("the Windows runner reads only its configuration, passes everything after it to the container once, and refuses MXC's fallback tiers", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "windows-runner-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, "runner.mjs"), WINDOWS_RUNNER);
+  const run = async (tier: string, input: string) => {
+    await writeFile(join(directory, `sdk-${tier}.mjs`), FAKE_SDK(tier));
+    const config = JSON.stringify({ sdk: join(directory, `sdk-${tier}.mjs`), request: {} });
+    return spawnSync(process.execPath, [join(directory, "runner.mjs")], { input: `${config}\n${input}`, encoding: "utf8" });
+  };
+  const request = `${JSON.stringify({ kind: "read", path: "a" })}\n${"x".repeat(200_000)}`;
+  const passed = await run("base-container", request);
+  assert.equal(passed.status, 7, passed.stderr);
+  assert.equal(passed.stdout, `container:${request}`);
+  const refused = await run("appcontainer-dacl", request);
+  assert.equal(refused.status, 70);
+  assert.match(refused.stderr, /never uses MXC's AppContainer fallbacks/);
+  assert.equal(refused.stdout, "");
 });
 
 test("the Windows runner and helper are valid modules, and job limits are checked", async t => {

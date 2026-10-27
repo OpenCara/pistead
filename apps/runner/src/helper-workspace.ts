@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, rename, rm, writeFile, chmod } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
@@ -178,6 +177,8 @@ export class HelperWorkspace implements IsolatedWorkspace {
       await rm(staged, { force: true });
       await writeFile(staged, trustedCertificates(), { mode: 0o400 });
       await chmod(staged, 0o400);
+      // The previous bundle is read-only, and Windows won't rename over a read-only file; it stays in place until then.
+      await chmod(this.#layout.caBundle, 0o600).catch(() => undefined);
       await rename(staged, this.#layout.caBundle);
       await this.#backend.prepare(this.#layout);
       await this.#run({ kind: "initialize" }, { readOnly: false, gitWritable: true, egress: false });
@@ -408,7 +409,15 @@ export class HelperWorkspace implements IsolatedWorkspace {
   }
 }
 
-/** A stable short key for a session's resources (Seatbelt temp names, Windows container ids). */
-export function sessionKey(binding: RunnerBinding): string {
-  return createHash("sha256").update(JSON.stringify([binding.owner.id, binding.session.id])).digest("hex").slice(0, 32);
+/**
+ * The egress proxy's loopback port for a step that may use the network, from the HTTPS_PROXY its environment carries
+ * (always with the session's credentials, see egressEnvironment); undefined for a step without network. A step that
+ * should have it but doesn't name one fails, rather than running with no way out.
+ */
+export function egressPort(context: HelperContext): number | undefined {
+  if (!context.egress) return undefined;
+  const match = /^http:\/\/[^@/]+@127\.0\.0\.1:(\d{1,5})$/.exec(context.environment.HTTPS_PROXY ?? "");
+  const port = match ? Number(match[1]) : NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("The session's egress proxy endpoint is missing or malformed");
+  return port;
 }
