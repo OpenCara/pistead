@@ -45,6 +45,8 @@ function xcrunFind(tool: string): string | undefined {
 }
 
 export interface SeatbeltTools {
+  /** The macOS SDK, so compilers run directly find it without asking xcrun. */
+  sdk?: string;
   python: string;
   git: string;
   bash: string;
@@ -62,11 +64,16 @@ export function seatbeltTools(): SeatbeltTools {
   const homebrew = ["/opt/homebrew", "/usr/local/Homebrew", "/usr/local/Cellar", "/usr/local/opt", "/usr/local/bin", "/usr/local/lib", "/usr/local/share"].filter(path => existsSync(path));
   const roots = [...new Set([developer, ...homebrew, dirname(dirname(python)), dirname(dirname(git))].filter((path): path is string => !!path)
     .map(path => { try { return realpathSync(path); } catch { return path; } }))];
-  const binaries = [existsSync("/opt/homebrew/bin") ? "/opt/homebrew/bin" : undefined, existsSync("/usr/local/bin") ? "/usr/local/bin" : undefined,
-    developer && !developer.endsWith(".app") ? join(developer, "usr", "bin") : undefined];
+  const binaries = [existsSync("/opt/homebrew/bin") ? "/opt/homebrew/bin" : undefined, existsSync("/usr/local/bin") ? "/usr/local/bin" : undefined];
+  // The developer tools themselves, ahead of the /usr/bin shims: a shim runs xcrun, which wants a cache in the user's
+  // temporary directory (denied), and so runs xcodebuild twice per call (over a second each) and prints errors.
+  const developerBin = (developer?.endsWith(".app") ? join(developer, "Contents", "Developer") : developer);
+  const developerBins = developerBin ? [join(developerBin, "usr", "bin"), join(developerBin, "Toolchains", "XcodeDefault.xctoolchain", "usr", "bin")].filter(path => existsSync(path)) : [];
+  const sdkResult = spawnSync("/usr/bin/xcrun", ["--show-sdk-path"], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
+  const sdk = sdkResult.status === 0 && sdkResult.stdout.trim().startsWith("/") ? sdkResult.stdout.trim() : undefined;
   return {
-    python, git, bash: "/bin/bash", roots,
-    path: ["/usr/bin", "/bin", "/usr/sbin", "/sbin", ...binaries.filter((path): path is string => !!path)].join(":"),
+    ...(sdk ? { sdk } : {}), python, git, bash: "/bin/bash", roots,
+    path: [...developerBins, "/usr/bin", "/bin", "/usr/sbin", "/sbin", ...binaries.filter((path): path is string => !!path)].join(":"),
   };
 }
 
@@ -89,7 +96,7 @@ export interface SeatbeltPolicy {
 export function seatbeltProfile(policy: SeatbeltPolicy): { profile: string; parameters: Record<string, string> } {
   const { layout } = policy;
   const parameters: Record<string, string> = {
-    HOME_DIR: layout.home, WORKTREE: layout.worktree, GIT_DIR: layout.git, GIT_POINTER: join(layout.worktree, ".git"),
+    ROOT: layout.root, HOME_DIR: layout.home, WORKTREE: layout.worktree, GIT_DIR: layout.git, GIT_POINTER: join(layout.worktree, ".git"),
     OWNER_CONFIG: layout.ownerConfig, CA_BUNDLE: layout.caBundle, BIN: layout.bin,
   };
   policy.toolRoots.forEach((root, index) => { parameters[`TOOL_${index}`] = root; });
@@ -105,6 +112,8 @@ export function seatbeltProfile(policy: SeatbeltPolicy): { profile: string; para
     // user database, POSIX semaphores (Python's multiprocessing) and ptys (tools that spawn shells).
     `(allow sysctl-read ${SYSCTLS.map(name => name.endsWith(".") ? `(sysctl-name-prefix "${name}")` : `(sysctl-name "${name}")`).join(" ")})`,
     "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.bsd.dirhelper\"))",
+    // Certificate verification through Security.framework: Go and Swift ignore SSL_CERT_FILE on macOS.
+    "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))",
     "(allow ipc-posix-sem)",
     "(allow pseudo-tty)",
     "(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/ttys[0-9]+$\"))",
@@ -118,13 +127,16 @@ export function seatbeltProfile(policy: SeatbeltPolicy): { profile: string; para
     ...(tools ? [`(allow file-read* ${tools})`] : []),
     // The session: its files, its read-only configuration and helpers.
     "(allow file-read* (subpath (param \"HOME_DIR\")) (subpath (param \"WORKTREE\")) (subpath (param \"GIT_DIR\")) (subpath (param \"BIN\"))"
-      + " (literal (param \"OWNER_CONFIG\")) (literal (param \"CA_BUNDLE\")))",
+      + " (literal (param \"OWNER_CONFIG\")) (literal (param \"CA_BUNDLE\"))"
+      // The root directory itself, not what is below it: snapshots open it to read the owner's config.
+      + " (literal (param \"ROOT\")))",
   ];
   if (!policy.readOnly) {
     lines.push("(allow file-write* (subpath (param \"HOME_DIR\")) (subpath (param \"WORKTREE\")))");
     // Tools talk to their own helpers over Unix sockets in the session's files, never to the host's.
-    lines.push("(allow network-bind (local unix-socket (subpath (param \"HOME_DIR\")) (subpath (param \"WORKTREE\"))))");
-    lines.push("(allow network-outbound (remote unix-socket (subpath (param \"HOME_DIR\")) (subpath (param \"WORKTREE\"))))");
+    // One path per filter: (local unix-socket (subpath A) (subpath B)) matches neither.
+    lines.push("(allow network-bind (local unix-socket (subpath (param \"HOME_DIR\"))) (local unix-socket (subpath (param \"WORKTREE\"))))");
+    lines.push("(allow network-outbound (remote unix-socket (subpath (param \"HOME_DIR\"))) (remote unix-socket (subpath (param \"WORKTREE\"))))");
   }
   if (policy.gitWritable) lines.push("(allow file-write* (subpath (param \"GIT_DIR\")))");
   if (policy.egressPort !== undefined) {
@@ -185,6 +197,8 @@ export class SeatbeltBackend implements HelperBackend {
         SANDBOX_GITDIR: layout.git, SANDBOX_GIT: this.#tools.git, SANDBOX_BASH: this.#tools.bash, SANDBOX_OWNER_CONFIG: layout.ownerConfig,
         // The developer tools' shims and Python look for these; there is no other user directory to find.
         TMPDIR: join(layout.home, ".tmp"),
+        CLANG_MODULE_CACHE_PATH: join(layout.home, ".cache", "clang", "ModuleCache"),
+        ...(this.#tools.sdk ? { SDKROOT: this.#tools.sdk } : {}),
       },
     };
   }

@@ -129,10 +129,13 @@ test("sandboxed commands get the proxy and Git rewrites, without credentials", (
 test("the sandbox's certificates are the host's system store, else Node's bundled one, plus NODE_EXTRA_CA_CERTS", () => {
   const pem = (name: string) => `-----BEGIN CERTIFICATE-----\n${name}\n-----END CERTIFICATE-----`;
   const store = (stores: Partial<Record<"system" | "bundled" | "extra", string[]>>) => (type: "system" | "bundled" | "extra") => stores[type] ?? [];
-  assert.equal(trustedCertificates(store({ system: [pem("system")], bundled: [pem("bundled")], extra: [pem("company")] })),
+  assert.equal(trustedCertificates(store({ system: [pem("system")], bundled: [pem("bundled")], extra: [pem("company")] }), "linux"),
     `${pem("system")}\n${pem("company")}\n`);
   // A host without a system store gets Node's bundled roots; duplicates and anything but certificates are dropped.
-  assert.equal(trustedCertificates(store({ system: [], bundled: [pem("bundled"), `${pem("bundled")}\n`], extra: ["not a certificate"] })), `${pem("bundled")}\n`);
+  assert.equal(trustedCertificates(store({ system: [], bundled: [pem("bundled"), `${pem("bundled")}\n`], extra: ["not a certificate"] }), "linux"), `${pem("bundled")}\n`);
+  // macOS's "system" store is only the keychain's certificates with trust settings, without the system roots.
+  assert.equal(trustedCertificates(store({ system: [pem("keychain")], bundled: [pem("bundled")], extra: [pem("company")] }), "darwin"),
+    `${pem("bundled")}\n${pem("keychain")}\n${pem("company")}\n`);
   // A store that can't be read counts as empty, and the bundle is never empty.
   const certificates = trustedCertificates(() => { throw new Error("unreadable"); });
   assert.ok(certificates.split("-----BEGIN CERTIFICATE-----").length > 50);
