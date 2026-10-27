@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import test, { type TestContext } from 'node:test';
 import { app } from '../apps/server/src/index.js';
 import type { Env } from '../apps/server/src/types.js';
@@ -254,4 +255,89 @@ test('an edit never brings back a run a sweep claimed while it was being saved',
   assert.equal((await moved.json() as { code: string }).code, 'schedule_changed');
   assert.equal(f.sqlite.prepare('SELECT cron FROM session_schedules WHERE id = ?').get(schedule.id)!.cron, '0 9 * * *', 'nothing changed');
   assert.equal((await f.owner.request('PATCH', `${base}/${schedule.id}`, { cron: '0 10 * * *' })).status, 200, 'read again, it saves');
+});
+
+test('the owner\'s agent manages schedules with the schedule tool, for a live write message of the owner, never adding access', async t => {
+  const f = await fixture(t);
+  const ownerId = f.owner.user.id;
+  const admit = (actorId: string, options: { mode?: 'write' | 'ask'; access?: string; expiresAt?: number } = {}) => {
+    const admission = randomBytes(32).toString('base64url');
+    f.sqlite.prepare('INSERT INTO run_admissions (id,session_id,actor_id,mode,access,request_id,content_hash,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(admission, 'scheduled-session', actorId, options.mode ?? 'write', options.access ?? null, `request-${admission}`, 'h'.repeat(43),
+        options.expiresAt ?? Math.floor(Date.now() / 1000) + 3600, new Date().toISOString());
+    return admission;
+  };
+  const tool = async (admissionId: string, body: Record<string, unknown>, actorId = ownerId) => {
+    const response = await app.request('/api/internal/schedules', { method: 'POST',
+      headers: { Authorization: `Bearer ${f.env.RUNNER_SHARED_SECRET}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'scheduled-session', actorId, admissionId, callId: 'call-1', ...body }) }, f.env);
+    return { status: response.status, body: await response.json() as Record<string, unknown> & { code?: string } };
+  };
+  const refused = async (result: Promise<{ status: number; body: { code?: string } }>, status: number, code: string) => {
+    const { status: actual, body } = await result;
+    assert.equal(actual, status, JSON.stringify(body));
+    assert.equal(body.code, code);
+  };
+  const create = { action: 'create', cron: '0 9 * * 1-5', timeZone: 'Europe/Berlin', content: 'Check the nightly build' };
+  const write = admit(ownerId);
+
+  // The agent was made without the tool, and the owner hasn't allowed it.
+  await refused(tool(write, create), 403, 'tool_not_allowed');
+  f.sqlite.prepare('INSERT INTO session_tool_grants (session_id,tool,call_id,approval_id,granted_by,created_at) VALUES (?,?,?,?,?,?)')
+    .run('scheduled-session', 'schedule', '', 'permission-any', ownerId, new Date().toISOString());
+  // A collaborator's message, an ask, an expired message or another's admission schedule nothing: schedules run as the owner.
+  await refused(tool(admit(f.collaborator.user.id), create, f.collaborator.user.id), 403, 'owner_required');
+  for (const admission of [admit(ownerId, { mode: 'ask' }), admit(ownerId, { expiresAt: Math.floor(Date.now() / 1000) - 1 }), admit(f.collaborator.user.id), 'unknown']) {
+    await refused(tool(admission, create), 403, 'schedule_not_admitted');
+  }
+  for (const [bad, code] of [[{ ...create, cron: '* * * * *' }, 'invalid_cron'], [{ ...create, timeZone: 'Mars/Olympus' }, 'invalid_time_zone'],
+    [{ ...create, extra: 1 }, 'invalid_input'], [{ ...create, action: 'run' }, 'invalid_input'], [{ action: 'update' }, 'invalid_input'],
+    [{ action: 'list', cron: '0 9 * * *' }, 'invalid_input'], [{ ...create, enabled: 'yes' }, 'invalid_input']] as const) {
+    await refused(tool(write, bad), 400, code);
+  }
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_schedules').get()!.n, 0);
+
+  const created = await tool(write, create);
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const schedule = created.body.schedule as SessionSchedule;
+  assert.deepEqual([schedule.name, schedule.cron, schedule.timeZone, schedule.access, schedule.enabled, schedule.createdBy],
+    ['Check the nightly build', '0 9 * * 1-5', 'Europe/Berlin', 'approval', true, ownerId]);
+  // The owner sees it in the Schedules tab, and the session list shows it waiting.
+  const listed = await (await f.owner.request('GET', base)).json() as { schedules: SessionSchedule[] };
+  assert.deepEqual(listed.schedules.map(item => item.id), [schedule.id]);
+  assert.equal((await f.session(f.owner)).nextScheduledAt, schedule.nextRunAt);
+  assert.deepEqual(((await tool(write, { action: 'list' })).body.schedules as SessionSchedule[]).map(item => item.id), [schedule.id]);
+
+  const paused = await tool(write, { action: 'update', scheduleId: schedule.id, enabled: false, name: 'Build check' });
+  assert.equal(paused.status, 200, JSON.stringify(paused.body));
+  assert.deepEqual([(paused.body.schedule as SessionSchedule).name, (paused.body.schedule as SessionSchedule).nextRunAt], ['Build check', null]);
+  await refused(tool(write, { action: 'update', scheduleId: 'missing', enabled: true }), 404, 'not_found');
+
+  // Auto-approved schedules come only from the owner's Auto-approve message: not created, and not changed, by any other.
+  await refused(tool(write, { ...create, access: 'auto' }), 403, 'automatic_schedule_not_admitted');
+  await refused(tool(write, { action: 'update', scheduleId: schedule.id, access: 'auto' }), 403, 'automatic_schedule_not_admitted');
+  // An Auto-approve message passes that check; this session's host takes no access options, so the schedule still can't be auto.
+  await refused(tool(admit(ownerId, { access: 'auto' }), { ...create, access: 'auto' }), 400, 'options_unsupported');
+  f.sqlite.prepare("UPDATE session_schedules SET access = 'auto' WHERE id = ?").run(schedule.id);
+  for (const change of [{ content: 'Do anything' }, { enabled: true }, { enabled: false, content: 'Do anything' }, { access: 'auto' }]) {
+    await refused(tool(write, { action: 'update', scheduleId: schedule.id, ...change }), 403, 'automatic_schedule_not_admitted');
+  }
+  // Pausing it, or lowering its access, takes away only what it could do unattended.
+  const pausedAuto = await tool(write, { action: 'update', scheduleId: schedule.id, enabled: false });
+  assert.equal(pausedAuto.status, 200, JSON.stringify(pausedAuto.body));
+  const lowered = await tool(write, { action: 'update', scheduleId: schedule.id, access: 'approval', content: 'Check the build again' });
+  assert.equal(lowered.status, 200, JSON.stringify(lowered.body));
+  assert.deepEqual([(lowered.body.schedule as SessionSchedule).access, (lowered.body.schedule as SessionSchedule).content], ['approval', 'Check the build again']);
+  f.sqlite.prepare("UPDATE session_schedules SET access = 'auto' WHERE id = ?").run(schedule.id);
+
+  // Deleting takes no more access than it had.
+  const deleted = await tool(write, { action: 'delete', scheduleId: schedule.id });
+  assert.deepEqual([deleted.status, deleted.body], [200, { deleted: schedule.id }]);
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM session_schedules').get()!.n, 0);
+  const audits = f.sqlite.prepare("SELECT action, actor_id, detail_json FROM audit WHERE action LIKE 'session.schedule.%' ORDER BY rowid").all();
+  assert.deepEqual(audits.map(row => row.action), ['session.schedule.created', 'session.schedule.updated', 'session.schedule.updated', 'session.schedule.updated', 'session.schedule.deleted']);
+  for (const row of audits) {
+    assert.equal(row.actor_id, ownerId);
+    assert.deepEqual((({ agent, callId }) => ({ agent, callId }))(JSON.parse(String(row.detail_json)) as { agent: boolean; callId: string }), { agent: true, callId: 'call-1' });
+  }
 });

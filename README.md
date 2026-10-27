@@ -352,6 +352,7 @@ The tools an agent can use:
 | `github_comment` | Comment on a GitHub issue or pull request | Approval |
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
+| `schedule` | List, create, change or delete the session's [scheduled prompts](#scheduled-prompts) | A message from the session owner; Auto-approve for auto-approved schedules |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments, merges and issues, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.
@@ -427,12 +428,13 @@ The session panel has five tabs:
 
 #### Scheduled prompts
 
-A scheduled prompt wakes the session's agent on a schedule: the server sends it a message, as the session's owner, as if they typed it in the chat box. Use it for recurring work such as a nightly test run or a weekly dependency report. The session owner manages them in the panel's **Schedules** tab (**New**, **Pause**/**Resume**, **Run now**, **Edit**, **Delete**), and everyone who can view the session sees them.
+A scheduled prompt wakes the session's agent on a schedule: the server sends it a message, as the session's owner, as if they typed it in the chat box. Use it for recurring work such as a nightly test run or a weekly dependency report. The session owner manages them in the panel's **Schedules** tab (**New**, **Pause**/**Resume**, **Run now**, **Edit**, **Delete**), or asks the agent in the chat ("every weekday at 9, check the nightly build"), and everyone who can view the session sees them.
 
 - **When**: a five-field cron expression (minute, hour, day of month, month, day of week, as in crontab, with ranges, steps, lists and names such as `*/30 8-18 * * mon-fri`, or `@hourly`, `@daily`, `@weekly`, `@monthly`), read in an IANA time zone (the browser's by default). Runs are at least 5 minutes apart. The form shows the next three runs as you type.
 - **Access**: **Ask for approval** (the default, as in the chat box), **Read-only** or the owner's **Auto-approve**, which runs commands without anyone watching. Read-only and auto-approve need a host whose connector takes chat options.
 - **Busy sessions**: a run that comes while the agent is working or waiting for an approval is skipped, not queued, and the schedule shows why. Runs missed while the server or host was offline, or the session archived, aren't caught up: the next check sends one and moves on. The session's host must be online for its message to run.
-- Each run is audited as the owner's `session.submit` with the schedule's ID; creating, changing and deleting schedules are audited too. A session keeps at most 20 schedules, and the server checks for due ones every 30 seconds.
+- **From the chat**: the agent's `schedule` tool lists, creates, changes and deletes the session's schedules (connector newer than 0.9.0; in sessions started before it, the agent asks the owner's permission the first time). Only the session owner's messages can use it, since every run is the owner's message; a collaborator's are refused. A schedule with **Auto-approve** access is created, or changed and left so, only from a message the owner sent with Auto-approve, so a message never leaves behind a schedule with more access than it had itself; any of the owner's messages may pause one, lower its access or delete it.
+- Each run is audited as the owner's `session.submit` with the schedule's ID; creating, changing and deleting schedules are audited too, marked with the tool call when the agent did it. A session keeps at most 20 schedules, and the server checks for due ones every 30 seconds.
 
 ### Approvals and permission requests
 

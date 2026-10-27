@@ -19,7 +19,7 @@ export type AssignableWorkspaceRole = (typeof assignableWorkspaceRoles)[number];
 /** The four tiers of access to one session given to one member, least first; sessionRolePermissions (policy.ts) defines them. */
 export const sessionRoles = ["viewer", "member", "collaborator", "admin"] as const;
 export type SessionRole = (typeof sessionRoles)[number];
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue", "schedule"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**
  * Tools of sessions that pinned their repositories, which are read-only now: still valid in stored agents and
@@ -395,6 +395,31 @@ export interface GitHubReadRequest {
   repository: string;
   issue: number;
 }
+/** What the schedule tool does with the session's scheduled prompts. */
+export const scheduleToolActions = ["list", "create", "update", "delete"] as const;
+export type ScheduleToolAction = (typeof scheduleToolActions)[number];
+/**
+ * Runner -> control plane: list, create, change or delete the session's scheduled prompts (SessionSchedule) for a
+ * tool call of the session owner's write message, as the Schedules tab does for them.
+ */
+export interface ScheduleToolRequest {
+  sessionId: string;
+  /** The session owner, who sent the message whose tool call this is; `admissionId` is that message's write admission. */
+  actorId: string;
+  admissionId: string;
+  /** The tool call, so a one-call permission for schedule covers it. */
+  callId: string;
+  action: ScheduleToolAction;
+  /** The schedule an update or delete changes. */
+  scheduleId?: string;
+  name?: string;
+  cron?: string;
+  timeZone?: string;
+  content?: string;
+  access?: AccessMode;
+  enabled?: boolean;
+}
+export type ScheduleToolResult = { schedules: SessionSchedule[] } | { schedule: SessionSchedule } | { deleted: string };
 /** Runner -> control plane: perform one merge, human-approved or under the owner's Auto-approve. */
 export type GitHubMergeRequest = GitHubEffectAuthority & {
   sessionId: string;
