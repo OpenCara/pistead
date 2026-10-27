@@ -295,6 +295,13 @@ export class EgressProxy {
   /** The most recent decisions, newest last. */
   entries(): EgressEntry[] { return [...this.#log]; }
 
+  /** Records why a Git request the host meant to make at the forge itself went to the relay instead (DirectGit). */
+  noteFallback(bindingId: string, reason: string): void {
+    const repository = this.#grant?.value.repositories.find(item => item.bindingId === bindingId);
+    const target = repository ? repositoryKey(bindingRemote(repository).replace(/^https:\/\//, "")) : bindingId;
+    this.#record({ kind: "git", target: target.slice(0, 300), outcome: "allowed", reason: `relayed: ${reason.replace(/[^\x20-\x7e]/g, " ").slice(0, 300)}` });
+  }
+
   #record(entry: Omit<EgressEntry, "at">): void {
     this.#log.push({ at: new Date().toISOString(), ...entry });
     if (this.#log.length > LOG_ENTRIES) this.#log.splice(0, this.#log.length - LOG_ENTRIES);

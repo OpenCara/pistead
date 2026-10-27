@@ -378,7 +378,7 @@ host, the host's proxy makes the request at the forge itself.
     any host. A **private** one gets a GitHub App installation token limited to the repository and to `contents: read`
     (`mintRepositoryReadToken`: the workspace's GitHub App push identity for the host, else the operator's app on
     github.com), on any host; such tokens are shared while they have 20 minutes left. Without one, the **owner's own
-    account** serves only on the owner's own host. Anything else is relayed.
+    account** serves only on the owner's own host or the control plane's own runner. Anything else is relayed.
   - pushes of the session branch are direct only on the **owner's own host or the control plane's own runner**: a push
     token can't be limited to one branch, and only the proxy enforces the session branch, so a host shared with the
     workspace relays its pushes (answered before anything is minted). There, after the relay's own checks
@@ -394,7 +394,9 @@ host, the host's proxy makes the request at the forge itself.
   fixed credential-free errors) and the LFS batch and download (`lfsProviderBatch`, `lfsDownload`: the credential only
   for the provider's origin and only when the action brings none, an action's headers never across origins, exactly
   the pointer's size). On the host, a download that points off the provider's own origin is made only when every address
-  of its name is public, as for the proxy's tunnels, since its content goes to the sandbox; otherwise it is relayed.
+  of its name is public, as for the proxy's tunnels, since its content goes to the sandbox, and it connects to exactly
+  the addresses checked (`pinnedFetch`: its own agent, which never resolves the name again or takes a proxy from the
+  environment), so DNS rebinding can't send it elsewhere; otherwise it is relayed.
   Direct answers keep the relay's form (a Git service's stream, the relay's LFS batch answer and
   object content), so the proxy and the mirror fills don't change; an internal header marks them for the proxy's log,
   `(direct <kind>)`, and never reaches the sandbox.
@@ -402,7 +404,7 @@ host, the host's proxy makes the request at the forge itself.
   minutes of its expiry; a push asks for each request. A read the forge fails is made again through the relay (its
   request is whole in memory), and a host that can't reach the forge relays that repository for five minutes; an
   older control plane, or a failed grant request, means relaying for a minute. A push the forge refuses is not retried:
-  its pack has been sent.
+  its pack has been sent. Why a request was relayed after all shows in the proxy's log (`relayed: …`).
 
 What this gives up, and where: on a host shared with the workspace, the host's owner can take a read token while it
 lasts (an hour at most) and read that one repository with it, where before they could take nothing. Pushes, and the

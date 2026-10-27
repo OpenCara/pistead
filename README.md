@@ -283,7 +283,7 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
   | Request | Any host | The session owner's own host |
   |---|---|---|
   | Read a public repository, or download its Git LFS files | Direct, without a credential | Direct, without a credential |
-  | Read a private repository, or download its LFS files | Direct, with a token that can only read that repository, where a GitHub App serves it (the workspace's under **Push access**, or the server's for github.com); relayed otherwise | Direct, with that token or else the owner's own account |
+  | Read a private repository, or download its LFS files | Direct, with a token that can only read that repository, where a GitHub App serves it (the workspace's under **Push access**, or the server's for github.com); relayed otherwise | Direct, with that token or else the owner's own account (also on the server's own runner) |
   | Push the session branch | Relayed: a push token can't be limited to one branch | Direct, with the workspace's push identity, except the owner's GitHub sign-in account and the host's Git credentials, which stay relayed |
 
   Pistead checks the session's authority for each grant, as for a relayed request, and a host reuses a read grant for a minute at most. A host that can't reach the Git host itself falls back to the relay. The server's operator chooses with `GIT_DIRECT` (see [Configuration](#configuration)): `own-hosts` gives tokens only to session owners' own hosts, and `off` relays everything.

@@ -4,7 +4,9 @@ import { GIT_DIRECT_CACHE_SECONDS, gitDirectAccess, parseLfsBatchRequest, parseL
   from "../../../packages/shared/src/network.js";
 import { RunnerError } from "./protocol.js";
 import { lookup as dnsLookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
+import { isIP, type LookupFunction } from "node:net";
+import { Readable } from "node:stream";
 import { publicAddress, TRANSPORT_HEADER, type RelayRequest } from "./egress.js";
 
 /** After the forge couldn't be reached from this host, its repository's requests are relayed for this long. */
@@ -50,7 +52,38 @@ export interface DirectGitOptions {
   /** Called when a direct transfer fails and the request goes to the relay instead, with the reason (for the log). */
   onFallback?: (request: RelayRequest, reason: string) => void;
   /** Overridable for tests: DNS resolution of where Git LFS downloads point. */
-  lookup?: (host: string) => Promise<{ address: string }[]>;
+  lookup?: (host: string) => Promise<ResolvedAddress[]>;
+  /** Overridable for tests: a request to `url` that connects only to `addresses` (see pinnedFetch). */
+  pinnedFetch?: (url: URL, init: RequestInit | undefined, addresses: ResolvedAddress[]) => Promise<Response>;
+}
+export interface ResolvedAddress { address: string; family: number }
+
+/**
+ * A GET of `url` that connects to one of `addresses`, the ones already checked, and never resolves the name again: a
+ * name whose answer changes between the check and the connection (DNS rebinding) can't send it elsewhere. TLS is still
+ * verified for the name. Redirects come back as they are, for the caller to check. Its own agent never goes through a
+ * proxy from the environment (NODE_USE_ENV_PROXY), which would resolve the name itself.
+ */
+export function pinnedFetch(url: URL, init: RequestInit | undefined, addresses: ResolvedAddress[]): Promise<Response> {
+  if (url.protocol !== "https:" || !addresses.length) return Promise.reject(new TypeError("Only checked https addresses are fetched"));
+  const lookup: LookupFunction = (_host, options, callback) => {
+    if (options.all) (callback as (error: null, addresses: ResolvedAddress[]) => void)(null, addresses);
+    else callback(null, addresses[0]!.address, addresses[0]!.family);
+  };
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest(url, { method: init?.method ?? "GET", headers: Object.fromEntries(new Headers(init?.headers)), lookup,
+      agent: new HttpsAgent({ keepAlive: false, lookup }),
+      ...(init?.signal ? { signal: init.signal } : {}) }, response => {
+      const status = response.statusCode ?? 502;
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(response.headers)) for (const item of [value ?? []].flat()) headers.append(name, item);
+      const empty = status === 204 || status === 205 || status === 304;
+      if (empty) response.resume();
+      resolve(new Response(empty ? null : Readable.toWeb(response) as ReadableStream<Uint8Array>, { status, headers }));
+    });
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 /**
@@ -115,18 +148,19 @@ export class DirectGit {
   #publicOnly(remote: string, fetchImpl: typeof fetch): typeof fetch {
     const origin = new URL(remote).origin;
     const lookup = this.#options.lookup ?? (name => dnsLookup(name, { all: true, verbatim: true }));
+    const pinned = this.#options.pinnedFetch ?? pinnedFetch;
     return (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
-      if (url.origin !== origin) {
-        const host = url.hostname.replace(/^\[|\]$/g, "");
-        let addresses: { address: string }[];
-        try { addresses = isIP(host) ? [{ address: host }] : await lookup(host); }
-        catch { addresses = []; }
-        if (!addresses.length || addresses.some(entry => !publicAddress(entry.address))) {
-          throw new GitTransferError(502, "lfs_unavailable", `${url.hostname.slice(0, 253)} does not resolve to a public address; Git LFS objects are downloaded only from public addresses`);
-        }
+      if (url.origin === origin) return fetchImpl(input, init);
+      const host = url.hostname.replace(/^\[|\]$/g, "");
+      let addresses: ResolvedAddress[];
+      try { addresses = isIP(host) ? [{ address: host, family: isIP(host) }] : await lookup(host); }
+      catch { addresses = []; }
+      if (!addresses.length || addresses.some(entry => !publicAddress(entry.address))) {
+        throw new GitTransferError(502, "lfs_unavailable", `${url.hostname.slice(0, 253)} does not resolve to a public address; Git LFS objects are downloaded only from public addresses`);
       }
-      return fetchImpl(input, init);
+      // Connected to exactly the addresses checked: resolving the name again could give another answer.
+      return pinned(url, init, addresses.slice(0, 8));
     }) as typeof fetch;
   }
 

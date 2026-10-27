@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { EgressProxy, type RelayRequest } from "../apps/runner/src/egress.js";
-import { DirectGit, parseGitDirectGrant } from "../apps/runner/src/git-direct.js";
+import { DirectGit, parseGitDirectGrant, pinnedFetch, type ResolvedAddress } from "../apps/runner/src/git-direct.js";
+import { createServer as createTcpServer, type AddressInfo } from "node:net";
 import { RunnerError } from "../apps/runner/src/protocol.js";
 import type { EgressGrant, GitDirectGrant, GitDirectRequest } from "../packages/shared/src/network.js";
 
@@ -48,10 +49,13 @@ function forge(handler?: (url: string, init: RequestInit) => Response | Promise<
 /** Names the tests' forge points downloads at: public ones, and one inside the host's own network. */
 const addresses: Record<string, string> = { "media.example.com": "93.184.216.34", "internal.example.com": "10.0.0.5" };
 
-function directGit(grant: (request: Omit<GitDirectRequest, "sessionId">) => Promise<unknown>, fetch: typeof globalThis.fetch, fallbacks: string[] = []) {
+function directGit(grant: (request: Omit<GitDirectRequest, "sessionId">) => Promise<unknown>, fetch: typeof globalThis.fetch, fallbacks: string[] = [],
+  pinned: { url: string; addresses: ResolvedAddress[] }[] = []) {
   const asked: Omit<GitDirectRequest, "sessionId">[] = [];
   const direct = new DirectGit({ grant: async request => { asked.push(request); return grant(request); }, fetch, onFallback: (_request, reason) => fallbacks.push(reason),
-    lookup: async host => addresses[host] ? [{ address: addresses[host] }] : [] });
+    lookup: async host => addresses[host] ? [{ address: addresses[host], family: 4 }] : [],
+    // Downloads off the provider's origin connect only to the addresses checked; the tests' forge stands in for them.
+    pinnedFetch: async (url, init, checked) => { pinned.push({ url: url.href, addresses: checked }); return fetch(url, init); } });
   return { direct, asked };
 }
 
@@ -143,7 +147,8 @@ test("a direct push streams its pack to the forge, asks for each request, and re
 
 test("direct Git LFS downloads answer in the relay's own form; the provider's URLs and headers stay on the host", async () => {
   const upstream = forge();
-  const { direct, asked } = directGit(async () => readGrant(), upstream.fetch);
+  const pinned: { url: string; addresses: ResolvedAddress[] }[] = [];
+  const { direct, asked } = directGit(async () => readGrant(), upstream.fetch, [], pinned);
   const json = (value: unknown) => new Uint8Array(Buffer.from(JSON.stringify(value)));
   const batch = await direct.forward({ bindingId: "binding-app", service: "lfs-batch", contentType: "application/json", body: json({ objects: [{ oid, size: 3 }], ref: "refs/heads/main" }) });
   assert.deepEqual(await batch!.json(), { objects: [{ oid, size: 3, download: true }] });
@@ -156,6 +161,8 @@ test("direct Git LFS downloads answer in the relay's own form; the provider's UR
   assert.deepEqual(JSON.parse(batches[0]!.body).ref, { name: "refs/heads/main" });
   // The action's own headers go to its storage; the granted credential never leaves the provider's origin.
   assert.deepEqual(upstream.calls.filter(call => call.url.startsWith("https://media.example.com/")).map(call => [call.authorization, call.signature]), [[null, "signed"]]);
+  // Its storage is reached at the address that was checked, never by resolving the name again.
+  assert.deepEqual(pinned, [{ url: `https://media.example.com/${oid}`, addresses: [{ address: "93.184.216.34", family: 4 }] }]);
 
   // A forge can't make the host download from its own networks: such an object is left to the relay.
   const inward = forge(url => url.endsWith("/info/lfs/objects/batch")
@@ -164,7 +171,21 @@ test("direct Git LFS downloads answer in the relay's own form; the provider's UR
   const guarded = directGit(async () => readGrant(), inward.fetch, fallbacks);
   assert.equal(await guarded.direct.forward({ bindingId: "binding-app", service: "lfs-object", contentType: "application/json", body: json({ oid, size: 3 }) }), undefined);
   assert.ok(!inward.calls.some(call => call.url.startsWith("https://internal.example.com/")));
-  assert.equal(fallbacks.length, 1);
+  // The refusal says why, rather than that the provider couldn't be reached.
+  assert.deepEqual(fallbacks, ["internal.example.com does not resolve to a public address; Git LFS objects are downloaded only from public addresses"]);
+});
+
+test("a pinned download connects to the address that was checked and never resolves the name again", async t => {
+  const connections: string[] = [];
+  const server = createTcpServer(socket => { connections.push(socket.remoteAddress ?? ""); socket.destroy(); });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const { port } = server.address() as AddressInfo;
+  // A name that resolves nowhere: only the pinned address can be reached. The TLS handshake fails against this server.
+  await assert.rejects(pinnedFetch(new URL(`https://lfs.example.invalid:${port}/object`), undefined, [{ address: "127.0.0.1", family: 4 }]));
+  assert.equal(connections.length, 1);
+  await assert.rejects(pinnedFetch(new URL("http://lfs.example.invalid/object"), undefined, [{ address: "127.0.0.1", family: 4 }]), TypeError);
+  await assert.rejects(pinnedFetch(new URL("https://lfs.example.invalid/object"), undefined, []), TypeError);
 });
 
 test("grants from the control plane are parsed strictly", () => {

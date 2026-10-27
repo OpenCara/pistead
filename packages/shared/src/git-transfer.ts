@@ -86,7 +86,8 @@ export async function fetchGit(request: GitUpstreamRequest): Promise<{ body: Rea
       body: request.body, ...(request.body instanceof ReadableStream ? { duplex: "half" } : {}),
       signal: request.signal ?? AbortSignal.timeout(GIT_TRANSFER_TIMEOUT_MS),
     } as RequestInit);
-  } catch {
+  } catch (error) {
+    if (error instanceof GitTransferError) throw error;
     throw new GitTransferError(502, "git_unavailable", `${provider} could not be reached.`);
   }
   const type = upstream.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
@@ -226,7 +227,8 @@ export async function lfsProviderBatch(target: LfsTarget, objects: LfsObject[], 
       headers: { ...(target.authorization ? { Authorization: target.authorization } : {}), Accept: LFS_TYPE, "Content-Type": LFS_TYPE, "User-Agent": "git-lfs/3 (pistead)" },
       body: JSON.stringify({ operation: "download", transfers: ["basic"], objects, ...(ref ? { ref: { name: ref } } : {}), hash_algo: "sha256" }),
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof GitTransferError) throw error;
     throw new GitTransferError(502, "lfs_unavailable", `${provider} could not be reached for Git LFS.`);
   }
   if (response.status !== 200) {
@@ -271,7 +273,10 @@ async function download(target: LfsTarget, action: LfsDownloadAction): Promise<R
   for (let hop = 0; ; hop++) {
     let response: Response;
     try { response = await (target.fetch ?? fetch)(url, { headers, redirect: "manual", signal: AbortSignal.timeout(GIT_TRANSFER_TIMEOUT_MS) }); }
-    catch { throw new GitTransferError(502, "lfs_unavailable", `${provider} could not be reached for a Git LFS object.`); }
+    catch (error) {
+      if (error instanceof GitTransferError) throw error;
+      throw new GitTransferError(502, "lfs_unavailable", `${provider} could not be reached for a Git LFS object.`);
+    }
     if (!REDIRECTS.has(response.status)) return response;
     await response.body?.cancel().catch(() => {});
     const location = response.headers.get("location");

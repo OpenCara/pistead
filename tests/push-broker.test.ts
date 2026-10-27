@@ -1171,3 +1171,11 @@ test('direct Git grants: the owner\'s own host reads with the owner\'s account w
   f.sqlite.exec("BEGIN; DROP TRIGGER sessions_repository_mode_immutable; UPDATE sessions SET repository_mode = NULL WHERE id = 'session'; COMMIT;");
   assert.equal((await direct(f, { access: 'push' })).body.code, 'session_branch_unavailable');
 });
+
+test('direct Git grants: the control plane\'s own runner reads with the owner\'s account where no app serves', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t);
+  const gitlab = await direct(f, { bindingId: 'binding-gl', access: 'read' });
+  assert.deepEqual([gitlab.body.direct, gitlab.body.kind, gitlab.body.authorization],
+    [true, 'owner-account', 'Basic ' + Buffer.from('oauth2:owner-gitlab-token').toString('base64')]);
+});

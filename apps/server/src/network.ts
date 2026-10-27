@@ -187,7 +187,7 @@ export function gitDirectMode(env: Env): 'on' | 'own-hosts' | 'off' {
  * plane.
  * - Reads and LFS downloads of a public repository need no credential, on any host.
  * - A private repository is read with a token limited to it and to reading (mintRepositoryReadToken) on any host, else
- *   with the owner's own account on the owner's own host.
+ *   with the owner's own account on the owner's own host or the control plane's own runner.
  * - A push of the session branch is made with the workspace's push identity, but only on the owner's own host or the
  *   control plane's own runner: its token can't be limited to that branch, which only the proxy enforces there.
  * Anything else is `direct: false`, and the host relays the request as before. The proxy reuses a read grant for at
@@ -271,6 +271,6 @@ export async function gitDirect(c: AppContext, connector: ConnectorRow | null): 
         cacheSeconds: GIT_DIRECT_CACHE_SECONDS });
     }
   }
-  if (ownHost) return grant({ remote, authorization: ownerGitAuthorization(access), kind: 'owner-account', expiresAt: expires(3600), cacheSeconds: GIT_DIRECT_CACHE_SECONDS });
+  if (trusted) return grant({ remote, authorization: ownerGitAuthorization(access), kind: 'owner-account', expiresAt: expires(3600), cacheSeconds: GIT_DIRECT_CACHE_SECONDS });
   return relay(`No credential limited to reading ${binding.full_name} is available for a host shared with the workspace`);
 }
