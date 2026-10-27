@@ -153,6 +153,12 @@ test("the proxy's mirror endpoint serves only workspace repositories, and only w
   const failed = await get(failing.socketPath, "https://github.com/acme/app.git");
   assert.equal(failed.status, 200);
   assert.match(String(lines(failed.body).at(-1)?.error), /403/);
+  assert.equal(lines(failed.body).at(-1)?.retry, undefined, "final: the clone goes ahead without the cache");
+  // A failure another attempt may get past says so: the clone asks again.
+  const { RunnerError } = await import("../apps/runner/src/protocol.js");
+  const busy = await start("busy", async () => { throw new RunnerError(503, "Pistead could not confirm right now that this session's owner can read acme/app"); });
+  assert.deepEqual(lines((await get(busy.socketPath, "https://github.com/acme/app.git")).body).at(-1),
+    { error: "Pistead could not confirm right now that this session's owner can read acme/app", retry: true });
   const filling = new EgressProxy({ socketPath: join(directory, "filling.sock"), grant: async () => grant, relay: async () => assert.fail("no relay"),
     mirror: async (_value, onProgress) => {
       onProgress({ phase: "connecting", percent: null, done: null, total: null, bytes: 0 });
@@ -379,7 +385,7 @@ test("a session's first clone waits for the host to fill its mirror, with the ho
   await refusing.initialize();
   const alone = await provision(refusing, "uncached-clone");
   const output = await shell(alone, "git clone -q https://github.com/acme/app.git app");
-  assert.match(output, /could not fill its repository cache \(This host's Git credentials can't read acme\/app; its owner can set one up for github\.com/);
+  assert.match(output, /cannot fill its repository cache \(This host's Git credentials can't read acme\/app; its owner can set one up for github\.com/);
   assert.equal(await alone.sandbox.readFile("app/README.md", allow), "from upstream\n");
   await assert.rejects(alone.sandbox.readFile("app/.git/objects/info/alternates", allow));
   assert.equal(await cache.filled(repository, "test:alice"), false);
@@ -405,6 +411,75 @@ test("a session's first clone waits for the host to fill its mirror, with the ho
   const again = await shell(session, "git clone -q https://github.com/acme/app.git copy");
   assert.doesNotMatch(again, /pistead:/);
   assert.equal((await session.sandbox.readFile("copy/.git/objects/info/alternates", allow)).trim(), "/repository-mirrors/github/github.com/1701.git/objects");
+});
+
+test("a clone asks again after a failure that may pass, and stops to be run again rather than downloading the repository without the cache", { skip: !sandboxed }, async t => {
+  const u = await upstream(t);
+  const { RunnerError } = await import("../apps/runner/src/protocol.js");
+  const cache = new RepositoryCache({ root: join(u.directory, "cache") });
+  await cache.refresh({ repository, ownerId: "test:alice", sessionId: "earlier", remote: await u.cacheRemote() });
+  const grant: EgressGrant = { policy: { mode: "off", domains: [], packageRegistries: true }, repositories: [repository] };
+  const target = "/repository-mirrors/github/github.com/1701.git";
+  let unavailable = 1, asked = 0;
+  const proxy = new EgressProxy({ socketPath: join(u.directory, "proxy.sock"), grant: async () => grant, relay: u.relay,
+    mirror: async () => {
+      asked++;
+      if (unavailable-- > 0) throw new RunnerError(503, "Pistead could not confirm right now that this session's owner can read acme/app");
+      return target;
+    } });
+  await proxy.start();
+  t.after(() => proxy.close());
+  const sandbox = new Sandbox(binding("transient"), join(u.directory, "session"), undefined, { egressSocket: proxy.socketPath,
+    mirrors: async () => [{ source: cache.mirrorDirectory(repository, "test:alice"), target }] });
+  t.after(() => sandbox.close());
+  await sandbox.initialize();
+  const authorize = async () => {};
+  const shell = (command: string) => sandbox.execute({ kind: "bash", command }, false, authorize, { allowTestShell: true });
+  // Unavailable once: asked again, then borrowed.
+  await shell("git clone -q https://github.com/acme/app.git app");
+  assert.equal(asked, 2);
+  assert.equal((await sandbox.readFile("app/.git/objects/info/alternates", authorize)).trim(), `${target}/objects`);
+  // Unavailable for good: after three tries the clone stops, to be run again, having downloaded nothing.
+  unavailable = Infinity;
+  u.relayed.length = 0;
+  await assert.rejects(shell("git clone -q https://github.com/acme/app.git again"), (error: { stderr?: string }) =>
+    /is not available right now \(Pistead could not confirm right now that this session's owner can read acme\/app\); run the clone again/.test(error.stderr ?? ""));
+  assert.equal(asked, 5);
+  assert.deepEqual(u.relayed, []);
+  await assert.rejects(sandbox.readFile("again/README.md", authorize));
+});
+
+test("a session asks the relay again for its owner's refs after a failure that may pass; a refusal is final", async t => {
+  const u = await upstream(t);
+  const { RunnerSession } = await import("../apps/runner/src/session.js");
+  const { RunnerError } = await import("../apps/runner/src/protocol.js");
+  const cache = new RepositoryCache({ root: join(u.directory, "cache") });
+  const grant: EgressGrant = { policy: { mode: "off", domains: [], packageRegistries: true }, repositories: [repository] };
+  let hiccups = 0, refusing = false;
+  const root = join(u.directory, "listing");
+  const session = new RunnerSession(binding("listing"), root, { dataDir: root, controlPlaneUrl: "https://control.example.test", sharedSecret: "s".repeat(32),
+    allowFaux: true, authorize: async request => ({ allowed: true, ownerId: request.ownerId, policyVersion: 1 }), repositoryCache: cache,
+    cacheRemote: u.cacheRemote, egressGrant: async () => grant,
+    gitRelay: async (_sessionId, request) => {
+      if (refusing) throw new RunnerError(403, "No access");
+      if (hiccups > 0) { hiccups--; throw new RunnerError(502, "The provider could not be reached"); }
+      return u.relay(request);
+    },
+    resolveModels: async () => { throw new Error("model boundary"); } });
+  t.after(() => session.sandbox.close());
+  await assert.rejects(session.open(), /model boundary/);
+  const mirror = (value: typeof repository) => (session as unknown as { mirror(value: typeof repository): Promise<string> }).mirror(value);
+  // Two hiccups: the listing is asked again each time, then the mirror fills.
+  hiccups = 2;
+  assert.equal(await mirror(repository), "/repository-mirrors/github/github.com/1701.git");
+  assert.equal(await cache.filled(repository, "test:alice"), true);
+  // Still failing after its own attempts: the clone is told to ask again (503).
+  hiccups = Infinity;
+  await assert.rejects(mirror(repository), (error: unknown) => error instanceof RunnerError && error.status === 503 && /right now/.test(error.message));
+  // A refusal is final (403): the clone goes ahead without the cache, and the relay refuses that too.
+  hiccups = 0;
+  refusing = true;
+  await assert.rejects(mirror(repository), (error: unknown) => error instanceof RunnerError && error.status === 403);
 });
 
 test("a clone whose mirror its command can't see yet fails, to be run again, rather than downloading the repository", { skip: !sandboxed }, async t => {

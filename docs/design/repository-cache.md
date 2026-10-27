@@ -51,8 +51,9 @@ that listing (`MirrorTarget.refs`): the host's credential only downloads the his
 named, so a mirror never holds what that listing didn't reach, even if the repository's name changed hands in between.
 
 - **Retries.** A ref listing or fetch that fails in a way another attempt may get past (the connection failed or broke
-  off, the remote answered 5xx, 408 or 429; `GitRemoteError.retryable`) is tried twice more, after 2 and 10 seconds. A
-  fetch starts again from what the mirror had: a pack that broke off is not kept.
+  off, the remote answered 5xx, 408 or 429; `GitRemoteError.retryable`) is tried twice more, after 2 and 10 seconds;
+  anything else, an unforeseen error included, is final. A fetch starts again from what the mirror had: a pack that
+  broke off is not kept.
 - **Temporary packs.** index-pack leaves `objects/pack/tmp_*` behind when its pack breaks off. Each fetch removes them
   before it starts and after it fails, and so does a prune, all with the mirror's lock held, so no fetch is writing them.
 - **Ready to borrow** (`RepositoryCache.ready`). A mirror no fill has completed yet (`filled`: it mirrors no branch or

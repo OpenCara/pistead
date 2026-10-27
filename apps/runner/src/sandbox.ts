@@ -94,9 +94,10 @@ export function hostGitLfs(): string | undefined {
  * - on a cache host, first asks the egress proxy for the host's mirror and borrows its objects (--reference-if-able)
  *   instead of downloading them again. It waits for the mirror however long that takes: a mirror's first fill downloads
  *   the whole repository once, with the host's own Git credentials, and the clone never downloads it a second time
- *   beside it. The wait is told on stderr, and the fill goes on if the command stops. Only a mirror that can't be filled
- *   at all lets the clone go ahead without it; one the command can't see yet (mounts are fixed when a command starts)
- *   fails the clone, to be run again;
+ *   beside it. The wait is told on stderr, and the fill goes on if the command stops. A dropped connection or a failure
+ *   that may pass is asked again; only a mirror the host can't fill at all lets the clone go ahead without it. A mirror
+ *   that stays unavailable, or that the command can't see yet (mounts are fixed when a command starts), fails the
+ *   clone, to be run again;
  * - where the workspace turned Git LFS on for the repository and git-lfs is installed, configures the clone's LFS
  *   filters (in its own .git/config), so its checkout downloads LFS files' content through the proxy. Elsewhere clones
  *   keep LFS pointer files, as plain Git does.
@@ -156,12 +157,13 @@ def described(progress):
 
 def mirror(url):
     # The host's mirror of a workspace repository once it is ready to borrow from, however long its fill takes; None where
-    # the host keeps no mirror of the repository, or couldn't fill it. The proxy streams one JSON object per line, with a
-    # heartbeat; a connection that drops is asked again, which joins the fill still under way.
-    started, shown = time.monotonic(), None
-    for attempt in range(3):
-        if attempt:
-            time.sleep(2)
+    # the host keeps no mirror of the repository, or can't fill it at all. The proxy streams one JSON object per line, with
+    # a heartbeat. A connection that drops while the fill goes on is asked again, which joins it; a failure that may pass,
+    # or a proxy that doesn't answer, is asked again twice more. Then the clone stops, to be run again, rather than
+    # downloading the repository without the cache.
+    started, shown, failures, reason = time.monotonic(), None, 0, 'it did not answer'
+    while True:
+        progressed = transient = False
         try:
             with endpoint('mirror', url, 120) as response:
                 for line in response:
@@ -177,8 +179,13 @@ def mirror(url):
                             note('the repository cache is ready; cloning from it')
                         return path
                     if 'error' in answer:
-                        note('the host could not fill its repository cache (%s); cloning without it' % str(answer['error'])[:300])
-                        return None
+                        reason = str(answer['error'])[:300]
+                        if answer.get('retry') is not True:
+                            note('the host cannot fill its repository cache (%s); cloning without it' % reason)
+                            return None
+                        transient = True
+                        break
+                    progressed = True
                     progress, now = answer.get('progress'), time.monotonic()
                     if isinstance(progress, dict) and now - started >= 3 and (shown is None or now - shown >= 30):
                         if shown is None:
@@ -190,9 +197,12 @@ def mirror(url):
             # No repository cache on this host, or not one of the workspace's repositories: a clone as any other.
             return None
         except Exception:
-            pass
-    note('the repository cache did not answer; cloning without it')
-    return None
+            reason = 'it did not answer'
+        failures = failures + 1 if transient or not progressed else 0
+        if failures >= 3:
+            note('the repository cache of ' + url + ' is not available right now (%s); run the clone again' % reason)
+            sys.exit(128)
+        time.sleep(failures or 1)
 
 
 index = 0

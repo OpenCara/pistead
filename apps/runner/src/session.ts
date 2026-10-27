@@ -2,6 +2,7 @@ import type { HostCommandOperation } from "../../../packages/shared/src/types.js
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
@@ -173,6 +174,8 @@ export type RunnerConfig = {
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
 /** How long a clone waits for the refresh of a mirror filled before; then it borrows the mirror as it is (see mirror). */
 const MIRROR_REFRESH_WAIT_MS = 10_000;
+/** Pauses before the relay is asked again for a repository's refs, after a failure another attempt may get past. */
+const OWNER_REFS_RETRY_MS = [500, 2_000];
 
 /**
  * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
@@ -189,13 +192,18 @@ function mirrorRepository(repository: EgressRepository): MirrorRepository & { bi
   return { bindingId: repository.bindingId, provider: repository.provider, host: repository.host, repositoryId: repository.repositoryId, fullName: repository.fullName };
 }
 
-/** Why the host couldn't fill its mirror of `repository`, as the clone waiting for it is told (see GIT_SHIM). */
+/**
+ * Why the host couldn't fill its mirror of `repository`, as the clone waiting for it is told (see GIT_SHIM): 503 for a
+ * failure another attempt may get past, after the cache's own attempts, so the clone asks again or stops to be run again
+ * rather than downloading the repository without the cache; any other status lets it go ahead without the cache.
+ */
 function cacheFailure(error: unknown, repository: EgressRepository): RunnerError {
+  if (error instanceof RunnerError) return error;
   if (error instanceof GitRemoteError && error.status !== undefined && [401, 403, 404].includes(error.status)) {
     return new RunnerError(502, `This host's Git credentials can't read ${repository.fullName}; its owner can set one up for ${repository.host} on it, for example with gh auth setup-git`);
   }
-  if (error instanceof RunnerError) return error;
-  return new RunnerError(502, error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached");
+  const reason = error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached";
+  return new RunnerError(error instanceof GitRemoteError && error.retryable ? 503 : 502, reason);
 }
 
 function preparationFailure(reason: string): string {
@@ -386,14 +394,21 @@ export class RunnerSession {
 
   /**
    * `repository`'s branches and tags as the session owner's own account lists them, through the relay (which checks the
-   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors.
+   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors. A
+   * failure another attempt may get past is asked again (OWNER_REFS_RETRY_MS), then left to the clone to ask again (503).
    */
   private async ownerRefs(value: EgressRepository): Promise<Map<string, string>> {
-    try { return await this.relayRemote(value, AbortSignal.timeout(30_000)).listRefs(); }
-    catch (error) {
-      // A refused read already ended borrowing for this open (see relay).
-      if (refused(error)) throw new RunnerError(403, `Pistead did not confirm that this session's owner can read ${value.fullName}`);
-      throw new RunnerError(502, `Pistead could not confirm that this session's owner can read ${value.fullName}; try again`);
+    for (let failures = 0; ; failures++) {
+      try { return await this.relayRemote(value, AbortSignal.timeout(30_000)).listRefs(); }
+      catch (error) {
+        // A refused read already ended borrowing for this open (see relay).
+        if (refused(error)) throw new RunnerError(403, `Pistead did not confirm that this session's owner can read ${value.fullName}`);
+        const pause = OWNER_REFS_RETRY_MS[failures];
+        if (pause === undefined || !(error instanceof GitRemoteError && error.retryable)) {
+          throw new RunnerError(503, `Pistead could not confirm right now that this session's owner can read ${value.fullName}`);
+        }
+        await sleep(pause);
+      }
     }
   }
 

@@ -200,6 +200,11 @@ test("a ref listing or fetch that breaks off is tried again, and what a broken-o
   const refusing: typeof fetch = async () => { refused++; return new Response(null, { status: 403 }); };
   await assert.rejects(cache.refresh({ ...f.target("s2"), remote: new GitRemote({ url: f.url, authorization: AUTH, fetch: refusing }) }), /403/);
   assert.equal(refused, 1);
+  // So is anything unforeseen: only what GitRemote calls retryable is tried again.
+  let unforeseen = 0;
+  const broken = { listRefs: async () => { unforeseen++; throw new TypeError("listRefs is not a function"); } } as unknown as GitRemote;
+  await assert.rejects(cache.refresh({ ...f.target("s3"), remote: broken }), /not a function/);
+  assert.equal(unforeseen, 1);
 });
 
 test("a refresh given the owner's ref listing mirrors only those tips, fetching their history through its own remote", gitAvailable, async (t) => {

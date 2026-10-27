@@ -165,8 +165,11 @@ which pinned sessions were checked out of until phase 5. Clone sessions borrow f
   A mirror's first fill is waited for however long it takes, and the shim says so on stderr: the clone never downloads
   the repository through the relay beside it. The fill goes on if the command stops (its time limit, say), so running
   the clone again picks it up. A mirror filled before is refreshed first, but borrowed as it is after 10 seconds. Only a
-  mirror the host can't fill at all lets the clone go ahead without it, with the reason. Clones that already chose
-  `--reference`, `--shared` or `--dissociate`, and everything else, run Git unchanged.
+  mirror the host can't fill at all lets the clone go ahead without it, with the reason. A dropped connection is asked
+  again while the fill goes on, and so, twice, is a failure another attempt may get past (answered with `retry`: the
+  relay couldn't confirm access just now, or the host's download kept breaking off); a mirror that stays unavailable
+  stops the clone, to be run again. Clones that already chose `--reference`, `--shared` or `--dissociate`, and
+  everything else, run Git unchanged.
 - **Mounted only while authorized.** A mirror is mounted read-only at `/repository-mirrors/<provider>/<host>/<id>.git`
   (`mirrorPath`) for shell commands and for the steps that run Git in a clone (`clone-head`, `clone-push-*`; a
   borrowing clone can't read its objects without it). Each open creates the mirror of every workspace repository the

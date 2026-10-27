@@ -444,14 +444,12 @@ async function removeTemporaryPacks(directory: string): Promise<void> {
 }
 
 /**
- * Whether another attempt at a ref listing or fetch may get past `error`: the remote's own word (GitRemoteError), or a
- * connection that broke off mid-pack (what fetch throws then). Git refusing what it received, a time limit of the cache's
- * own or a cancellation is final.
+ * Whether another attempt at a ref listing or fetch may get past `error`: only what GitRemote says may, a connection that
+ * failed or broke off mid-pack, or a busy or failing remote. Git refusing what it received, a refusal, a time limit or a
+ * cancellation of the cache's own, and anything unforeseen, are final.
  */
 function retryable(error: unknown): boolean {
-  if (error instanceof GitRemoteError) return error.retryable;
-  if (error instanceof RepositoryCacheError) return false;
-  return !(error instanceof Error && error.name === "AbortError");
+  return error instanceof GitRemoteError && error.retryable;
 }
 
 function errorCode(error: unknown): string | undefined {

@@ -420,8 +420,8 @@ export class EgressProxy {
   /**
    * The host's mirror of a workspace repository, for the `git` shim before a clone. One JSON object per line: `progress`
    * while the mirror fills (Git's numbers only, repeated as a heartbeat while Git reports nothing new), then the mirror's
-   * `path` in the sandbox, or the `error` that kept it from being filled. However long the fill takes, the shim waits; it
-   * goes on if the shim stops listening.
+   * `path` in the sandbox, or the `error` that kept it from being filled, with `retry` when another attempt may get past
+   * it (a RunnerError with status 503). However long the fill takes, the shim waits; it goes on if the shim stops listening.
    */
   async #mirror(response: ServerResponse, remote: string): Promise<void> {
     if (!this.#options.mirror) return refuse(response, 404, "This host keeps no repository cache");
@@ -445,7 +445,7 @@ export class EgressProxy {
     } catch (error) {
       const reason = error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached";
       this.#record({ kind: "git", target: label, outcome: "refused", reason: `mirror: ${reason}` });
-      send({ error: reason });
+      send({ error: reason, ...(error instanceof RunnerError && error.status === 503 ? { retry: true } : {}) });
     } finally {
       clearInterval(heartbeat);
       if (!response.destroyed) response.end();

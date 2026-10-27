@@ -113,4 +113,10 @@ test("a remote without a credential is read anonymously, and failures say whethe
   controller.abort();
   const cancelled = new GitRemote({ url, signal: controller.signal, fetch: (async () => { throw new DOMException("aborted", "AbortError"); }) as typeof fetch });
   await assert.rejects(cancelled.listRefs(), (error: unknown) => error instanceof GitRemoteError && !error.retryable);
+  // The same for a response that breaks off midway: what fetch throws then becomes a GitRemoteError.
+  const breaking = (signal?: AbortSignal) => new GitRemote({ url, ...(signal ? { signal } : {}), fetch: (async () => new Response(new ReadableStream<Uint8Array>({
+    pull(stream) { stream.error(new TypeError("terminated")); },
+  }), { headers: { "Content-Type": "application/x-git-upload-pack-advertisement" } })) as typeof fetch });
+  await assert.rejects(breaking().listRefs(), (error: unknown) => error instanceof GitRemoteError && error.retryable && /broke off/.test(error.message));
+  await assert.rejects(breaking(controller.signal).listRefs(), (error: unknown) => error instanceof GitRemoteError && !error.retryable);
 });

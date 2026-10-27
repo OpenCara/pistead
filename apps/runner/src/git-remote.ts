@@ -177,11 +177,14 @@ class PktReader {
   async close(): Promise<void> { await this.source.return?.(); }
 }
 
-async function* chunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
+async function* chunks(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
   const reader = body.getReader();
   try {
     for (;;) {
-      const next = await reader.read();
+      let next: Awaited<ReturnType<typeof reader.read>>;
+      // A connection that breaks off mid-response may pass another time, unless the caller cancelled it.
+      try { next = await reader.read(); }
+      catch { throw new GitRemoteError("Git remote response broke off", undefined, !signal?.aborted); }
       if (next.done) return;
       yield next.value;
     }
@@ -191,9 +194,9 @@ async function* chunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Ar
   }
 }
 
-function bodyReader(response: Response, limit?: number): PktReader {
+function bodyReader(response: Response, signal: AbortSignal | undefined, limit?: number): PktReader {
   if (!response.body) throw new GitRemoteError("Git remote response has no body");
-  return new PktReader(chunks(response.body), limit);
+  return new PktReader(chunks(response.body, signal), limit);
 }
 
 function streamOf(parts: (Uint8Array | AsyncIterable<Uint8Array>)[]): ReadableStream<Uint8Array> {
@@ -274,7 +277,7 @@ export class GitRemote {
     const headers: Record<string, string> = { Accept: `application/x-${service}-advertisement` };
     if (v2) headers["Git-Protocol"] = "version=2";
     const response = await this.request(`/info/refs?service=${service}`, { method: "GET", headers }, `application/x-${service}-advertisement`);
-    const reader = bodyReader(response, MAX_ADVERTISEMENT);
+    const reader = bodyReader(response, this.signal, MAX_ADVERTISEMENT);
     try {
       let first = await reader.expect();
       if (text(first) === `# service=${service}`) {
@@ -335,7 +338,7 @@ export class GitRemote {
       headers: { "Content-Type": "application/x-git-upload-pack-request", Accept: "application/x-git-upload-pack-result", "Git-Protocol": "version=2" },
       body: streamOf([concat(lines)]),
     }, "application/x-git-upload-pack-result");
-    const reader = bodyReader(response, MAX_ADVERTISEMENT);
+    const reader = bodyReader(response, this.signal, MAX_ADVERTISEMENT);
     try {
       for (let next = await reader.expect(); next.kind !== "flush"; next = await reader.expect()) {
         const line = text(next);
@@ -375,7 +378,7 @@ export class GitRemote {
         headers: { "Content-Type": "application/x-git-upload-pack-request", Accept: "application/x-git-upload-pack-result", "Git-Protocol": "version=2" },
         body: streamOf([concat(lines)]),
       }, "application/x-git-upload-pack-result");
-      const reader = bodyReader(response);
+      const reader = bodyReader(response, this.signal);
       try {
         for (;;) {
           const header = text(await reader.expect());
@@ -410,7 +413,7 @@ export class GitRemote {
       headers: { "Content-Type": "application/x-git-upload-pack-request", Accept: "application/x-git-upload-pack-result" },
       body: streamOf([concat(lines)]),
     }, "application/x-git-upload-pack-result");
-    const reader = bodyReader(response);
+    const reader = bodyReader(response, this.signal);
     try {
       // Without multi_ack the server answers with one ACK for the first common object, or NAK if there is none.
       const answer = text(await reader.expect());
@@ -435,7 +438,7 @@ export class GitRemote {
       headers: { "Content-Type": "application/x-git-receive-pack-request", Accept: "application/x-git-receive-pack-result" },
       body: streamOf(update.new === ZERO_OID ? [head] : [head, pack]),
     }, "application/x-git-receive-pack-result");
-    let reader = bodyReader(response, MAX_REPORT);
+    let reader = bodyReader(response, this.signal, MAX_REPORT);
     try {
       if (sideband) {
         const parts: Uint8Array[] = [];
