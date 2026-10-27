@@ -48,7 +48,7 @@ And around them:
                                               (control plane)                        (a member's host)
 ```
 
-- The **server** keeps workspaces, members, session records, permissions and approvals. It relays sessions' Git reads with the session owner's Git account and their session-branch pushes with the workspace's push identity, issues short-lived push credentials, and acts on GitHub for session owners. It never runs an agent itself.
+- The **server** keeps workspaces, members, session records, permissions and approvals. It decides every Git request of a session: the host then makes it at the Git host itself with a credential the server gives it for that repository, or the server relays it (see [Network access](#network-access)). It issues short-lived push credentials and acts on GitHub for session owners. It never runs an agent itself.
 - A **host** runs the agents. Pi's configuration and model credentials, each session's files and its conversation stay there; the server relays every request to it. While a host is offline, its sessions' conversations can't load and no work runs on them.
 - Everyone watching a session shares the server's reads of it, about one a second, and after the first read the host, the server and the apps send each other only what changed in the conversation.
 - The web app is the complete client; the Mac app shows it in its own window, and the iPhone and iPad app covers sessions (see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)). They all call the same API.
@@ -150,7 +150,7 @@ Connect the accounts that can read your repositories under **Settings → Profil
 | Azure DevOps | Personal access token and organization | Code (Read); opening pull requests or pushing with your account needs Code (Read & write) |
 | Gitea / Forgejo | Personal access token and host | `read:repository` and `read:user`; opening pull requests or pushing with your account needs `write:repository` |
 
-Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's own account, on hosts that have `git-lfs` installed (Pistead uses the host's own). The provider's download links and the tokens that come with them stay on the control plane. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
+Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's access, on hosts that have `git-lfs` installed (Pistead uses the host's own). The host downloads them from the provider itself where Pistead gives it a credential for the repository (see [Network access](#network-access)), else Pistead relays them; either way the provider's download links and the tokens that come with them never reach the sandbox. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
 
 Sessions **clone on demand**: every new session starts with an empty worktree and pins nothing.
 
@@ -275,8 +275,17 @@ Shell commands (`bash`) also need resource limits. A connector started with `--r
 
 A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080`); file tools, commits and every other sandboxed step have no network at all.
 
-- **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. The proxy relays them to Pistead, which reads the repository with the **session owner's own account**; the credential never reaches the host. Pistead re-checks the session and the owner's access on every request.
-- **In a session that clones on demand, pushes of the session's own branch work too:** `git push origin HEAD:$PISTEAD_SESSION_BRANCH` (the branch, such as `pistead/add-dark-mode-1a2b3c4d5e6f`, is in `$PISTEAD_SESSION_BRANCH`). The proxy relays them to Pistead, which pushes with the workspace's [push identity](#push-access); its credential never leaves Pistead. A push of any other branch is rejected, as a Git host rejects one, and goes through `git_push` instead (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). Pinned sessions push only with `git_push`.
+- **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. For each request the proxy asks Pistead, which checks the session and the **session owner's own access** to the repository; the sandbox never holds a credential.
+- **In a session that clones on demand, pushes of the session's own branch work too:** `git push origin HEAD:$PISTEAD_SESSION_BRANCH` (the branch, such as `pistead/add-dark-mode-1a2b3c4d5e6f`, is in `$PISTEAD_SESSION_BRANCH`). They are pushed with the workspace's [push identity](#push-access). A push of any other branch is rejected, as a Git host rejects one, and goes through `git_push` instead (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). Pinned sessions push only with `git_push`.
+- **Where Git's data goes.** So that clones, fetches and pushes don't all go through the server, the host's proxy fetches from the Git host itself when Pistead gives it a credential for that repository; otherwise Pistead relays the request with a credential that never leaves the server:
+
+  | Request | Any host | The session owner's own host |
+  |---|---|---|
+  | Read a public repository, or download its Git LFS files | Direct, without a credential | Direct, without a credential |
+  | Read a private repository, or download its LFS files | Direct, with a token that can only read that repository, where a GitHub App serves it (the workspace's under **Push access**, or the server's for github.com); relayed otherwise | Direct, with that token or else the owner's own account |
+  | Push the session branch | Relayed: a push token can't be limited to one branch | Direct, with the workspace's push identity, except the owner's GitHub sign-in account and the host's Git credentials, which stay relayed |
+
+  Pistead checks the session's authority for each grant, as for a relayed request, and a host reuses a read grant for a minute at most. A host that can't reach the Git host itself falls back to the relay. The server's operator chooses with `GIT_DIRECT` (see [Configuration](#configuration)): `own-hosts` gives tokens only to session owners' own hosts, and `off` relays everything.
 - **Everything else follows the workspace's network access**, under **Settings → Workspaces →** the workspace **→ Network access** (owners and admins):
 
   | Access | HTTPS reaches |
@@ -289,7 +298,7 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
 
   Shell commands verify these hosts against the certificates the **host** trusts (its system store, or Node.js's bundled one where it has none, plus the connector's `NODE_EXTRA_CA_CERTS`): the connector copies them into the session when it opens, and the sandbox sees them read-only at `/etc/ssl/certs/ca-certificates.crt`, which `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` name. Nothing else of the host's `/etc` is visible. A certificate added on the host reaches a session the next time it opens.
 
-`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the repositories the proxy relays and its recent decisions. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
+`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the workspace's repositories and its recent decisions, with `(direct …)` on the Git requests the host made itself. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
 
 #### Running without the sandbox
 
@@ -622,7 +631,7 @@ Put a reverse proxy with TLS in front of it (Caddy, nginx, Traefik, a cloud load
 ### GitHub sign-in and apps
 
 - **Sign-in** needs a GitHub OAuth app whose callback URL is `<APP_ORIGIN>/api/auth/github/callback`; put its id and secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. Without it, the sign-in page says GitHub sign-in isn't configured. The same app resets session owners' GitHub tokens after pushes that used them.
-- **github.com pushes** can use an operator GitHub App with Repository contents read & write: set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_PRIVATE_KEY`. Without it, each workspace adds its own GitHub App under **Push access**.
+- **github.com pushes** can use an operator GitHub App with Repository contents read & write: set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_PRIVATE_KEY`. Without it, each workspace adds its own GitHub App under **Push access**. Either app also gives hosts read-only tokens for single repositories, so that sessions' clones of private repositories don't go through the server.
 - **Azure DevOps and Forgejo push identities** trust Pistead as an OIDC issuer at `APP_ORIGIN` (`/.well-known/openid-configuration`, `/.well-known/jwks.json`): set `OIDC_SIGNING_KEY` to an RSA key (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072`).
 
 ### Configuration
@@ -646,6 +655,7 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | none | GitHub OAuth app for sign-in |
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | none | Operator GitHub App for github.com pushes (PEM as one line with `\n` escapes) |
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
+| `GIT_DIRECT` | `on` | Where sessions' Git data goes (see [Network access](#network-access)): `on` lets hosts fetch from Git hosts themselves with credentials limited to a repository, `own-hosts` gives credentials only to session owners' own hosts, `off` relays every Git request through the server |
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |

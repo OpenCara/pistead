@@ -10,7 +10,7 @@ import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
 import { egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize, type EgressGitService, type EgressGrant,
   type EgressRepository, type LfsBatchResult } from "../../../packages/shared/src/network.js";
-import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
+import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal, type PushCommand } from "../../../packages/shared/src/git-push.js";
 import { RunnerError } from "./protocol.js";
 import { CA_BUNDLE, CA_BUNDLE_VARIABLES } from "./trust-store.js";
 
@@ -36,19 +36,27 @@ const LOG_ENTRIES = 200;
 
 /**
  * One Git request for the control plane's relay, which adds the credential: the session owner's for reads, the
- * workspace's push identity for a push of the session branch. A push's pack streams.
+ * workspace's push identity for a push of the session branch. A push's pack streams. The session may instead make it
+ * at the forge itself, with a direct grant from the control plane (git-direct.ts).
  */
 export interface RelayRequest {
   bindingId: string; service: EgressGitService;
   userAgent?: string; gitProtocol?: string; contentType?: string; contentEncoding?: string;
   body?: Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>;
+  /** A push's one command, as the proxy read it: a direct grant names it, for the control plane's checks and audit. */
+  command?: PushCommand;
 }
+/** How the answer reached the proxy, when the host made the request at the forge itself (git-direct.ts). */
+export const TRANSPORT_HEADER = "x-pistead-transport";
 export interface EgressEntry { at: string; kind: "git" | "connect" | "http"; target: string; outcome: "allowed" | "refused"; reason?: string }
 export interface EgressOptions {
   socketPath: string;
   /** The session's current grant from the control plane. */
   grant: () => Promise<EgressGrant>;
-  /** Forwards one Git read to the control plane's relay; refusals throw a RunnerError with the control plane's reason. */
+  /**
+   * Forwards one Git request to the control plane's relay, or makes it at the forge with a direct grant; refusals throw a
+   * RunnerError with the control plane's (or the forge's) credential-free reason.
+   */
   relay: (request: RelayRequest) => Promise<Response>;
   /** Overridable for tests: DNS resolution and outbound TCP. */
   lookup?: (host: string) => Promise<{ address: string; family: number }[]>;
@@ -150,6 +158,12 @@ function json(value: unknown): Uint8Array<ArrayBuffer> {
   return new Uint8Array(Buffer.from(JSON.stringify(value), "utf8"));
 }
 
+/** How an answer reached the proxy, for its log: " (direct …)" when the host made the request at the forge itself. */
+function transport(response: Response): string {
+  const value = response.headers.get(TRANSPORT_HEADER);
+  return value && /^direct [a-z-]{1,40}$/.test(value) ? ` (${value})` : "";
+}
+
 /** The status a relay refusal is passed on with: the control plane's own, else a gateway error. */
 function relayStatus(error: unknown): number {
   return error instanceof RunnerError && error.status >= 400 && error.status < 600 ? error.status : 502;
@@ -216,9 +230,10 @@ function refuse(response: ServerResponse, status: number, message: string): void
 /**
  * One session's way out of its sandbox. It listens on a Unix socket that only that session's sandbox can reach, so every
  * request it serves is that session's, and it:
- * - relays Git reads of the workspace's repositories to the control plane, which adds the session owner's credential
- *   (the host never holds it) and re-checks the session's authority, and pushes of the session branch, which the
- *   control plane makes with the workspace's push identity;
+ * - sends Git reads of the workspace's repositories, and pushes of the session branch, through `relay`: to the control
+ *   plane, which adds the credential (the session owner's for reads, the workspace's push identity for pushes) and
+ *   re-checks the session's authority, or, where the control plane grants it, to the forge directly from this host
+ *   (git-direct.ts) with a credential limited as the control plane decides;
  * - opens HTTPS tunnels (CONNECT, port 443) to hosts the workspace's network policy allows, never to private,
  *   loopback or link-local addresses, without looking inside them;
  * - refuses everything else with a reason, and answers `/__pistead/status` with the policy and recent decisions.
@@ -403,8 +418,9 @@ export class EgressProxy {
       ...(error ? { error } : {}),
       repositories: grant?.repositories.map(repository => bindingRemote(repository)) ?? [],
       lfs: grant?.repositories.filter(repository => repository.lfs).map(repository => bindingRemote(repository)) ?? [],
-      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's account`
-        + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : ""),
+      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's access`
+        + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : "")
+        + ". The host fetches them from the forge itself when Pistead grants it a credential (\"direct\" in recent), else Pistead relays them",
       sessionBranch: this.#options.sessionBranch ?? null,
       recent: this.#log.slice(-50),
     }, null, 2)}\n`);
@@ -502,7 +518,7 @@ export class EgressProxy {
       response.writeHead(200, { "Content-Type": "application/x-git-receive-pack-result", "Cache-Control": "no-store" });
       return void response.end(rejection);
     }
-    const pushed = this.#relay(request, response, repository, service, label, boundedStream(parsed.body, PUSH_REQUEST_BYTES, "The push is too large"));
+    const pushed = this.#relay(request, response, repository, service, label, boundedStream(parsed.body, PUSH_REQUEST_BYTES, "The push is too large"), parsed.commands[0]);
     this.#pushes.add(pushed);
     try { await pushed; } finally { this.#pushes.delete(pushed); }
   }
@@ -510,8 +526,9 @@ export class EgressProxy {
   /**
    * git-lfs downloads of a workspace repository whose workspace turned LFS on. The batch request goes to the control
    * plane, which asks the provider with the session owner's credential and answers only which objects exist; the proxy
-   * then points each download at itself, and relays it to the control plane, which downloads the object. The provider's
-   * download URLs and the tokens in their headers never reach the host, and uploads are refused.
+   * then points each download at itself, and relays it to the control plane, which downloads the object. With a direct
+   * grant, the host makes both requests at the provider itself instead. Either way the provider's download URLs and the
+   * tokens in their headers never reach the sandbox, and uploads are refused.
    */
   async #lfs(request: IncomingMessage, response: ServerResponse, url: URL, lfs: NonNullable<ReturnType<typeof lfsRequest>>): Promise<void> {
     const target = lfs.target.replace(/^[^@/]*@/, "");
@@ -566,7 +583,7 @@ export class EgressProxy {
     catch { return deny(502, "The control plane returned an invalid Git LFS answer"); }
     // Downloads come back to this proxy, under the same path, so they are the same repository's and checked again.
     const base = `${EGRESS_GIT_BASE}${target}/info/lfs/objects/`;
-    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `lfs batch (${result.objects.length} objects)` });
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `lfs batch (${result.objects.length} objects)${transport(upstream)}` });
     response.writeHead(200, { "Content-Type": LFS_TYPE, "Cache-Control": "no-store" });
     response.end(`${JSON.stringify({
       transfer: "basic", hash_algo: "sha256",
@@ -581,12 +598,12 @@ export class EgressProxy {
     let upstream: Response;
     try { upstream = await this.#options.relay({ bindingId: repository.bindingId, service, contentType: "application/json", body: json(object) }); }
     catch (error) { return deny(relayStatus(error), error instanceof RunnerError ? error.message : "The control plane could not relay the request"); }
-    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `lfs object ${object.oid.slice(0, 12)}` });
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `lfs object ${object.oid.slice(0, 12)}${transport(upstream)}` });
     return this.#stream(response, upstream, "application/octet-stream");
   }
 
   async #relay(request: IncomingMessage, response: ServerResponse, repository: EgressRepository, service: EgressGitService, label: string,
-    stream?: ReadableStream<Uint8Array>): Promise<void> {
+    stream?: ReadableStream<Uint8Array>, command?: PushCommand): Promise<void> {
     const header = (name: string) => { const value = request.headers[name]; return typeof value === "string" ? value : undefined; };
     if (service === "upload-pack" && request.method !== "POST") return refuse(response, 405, "Git fetches use POST");
     const body = service === "upload-pack" ? await boundedBody(request, UPLOAD_REQUEST_BYTES) : stream;
@@ -595,14 +612,14 @@ export class EgressProxy {
       upstream = await this.#options.relay({
         bindingId: repository.bindingId, service,
         userAgent: header("user-agent"), gitProtocol: header("git-protocol"),
-        contentType: header("content-type"), contentEncoding: header("content-encoding"), ...(body ? { body } : {}),
+        contentType: header("content-type"), contentEncoding: header("content-encoding"), ...(body ? { body } : {}), ...(command ? { command } : {}),
       });
     } catch (error) {
       const reason = error instanceof RunnerError ? error.message : "The control plane could not relay the request";
       this.#record({ kind: "git", target: label, outcome: "refused", reason });
       return refuse(response, relayStatus(error), reason);
     }
-    this.#record({ kind: "git", target: label, outcome: "allowed", reason: service === "receive-pack" ? `push ${this.#options.sessionBranch}` : service });
+    this.#record({ kind: "git", target: label, outcome: "allowed", reason: `${service === "receive-pack" ? `push ${this.#options.sessionBranch}` : service}${transport(upstream)}` });
     return this.#stream(response, upstream, upstream.headers.get("content-type") ?? "application/octet-stream");
   }
 

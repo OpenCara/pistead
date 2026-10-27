@@ -5,7 +5,7 @@ import { useResource } from "./ui";
 /** Condensed clone, access and host facts for an `info` tip about repositories. */
 export function RepositoryClonePolicy() {
   return <div className="stack">
-    <p>Each session starts with an empty worktree, and its agent clones the workspace repositories it needs with Git, through the session's relay: reads use the session owner's connected Git account and pushes go only to the session's own branches. On a host without a sandbox, the host owner's sessions clone with the host's own Git. Sessions created before sessions cloned keep their pinned snapshots, read-only.</p>
+    <p>Each session starts with an empty worktree, and its agent clones the workspace repositories it needs with Git, through the session's egress proxy: reads use the session owner's access to the repository and pushes go only to the session's own branches. On a host without a sandbox, the host owner's sessions clone with the host's own Git. Sessions created before sessions cloned keep their pinned snapshots, read-only.</p>
     <p>Binding a repository grants teammates no access to your Git accounts. Tokens stay on the server; only a push with your own account, where a workspace's push access uses it, sends yours to your own host. The operator of the host running a session can see its files and prompts, including private source.</p>
     <p className="muted small">Limit: {repositoryLimits.repositories} repositories per workspace.</p>
   </div>;

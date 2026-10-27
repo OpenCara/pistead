@@ -1,4 +1,4 @@
-import { egressGrant, gitRelay } from './network.js';
+import { egressGrant, gitDirect, gitRelay } from './network.js';
 import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
@@ -384,6 +384,8 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   // every 30 seconds (HostConfigSource), so a change reaches running sessions within a minute.
   app.post('/api/connectors/self/config', async c => c.json({ config: await connectorHostConfig(c.env, (await authenticateConnector(c)).id) }));
   app.post('/api/connectors/self/git/relay/:bindingId/:service', async c => gitRelay(c, await authenticateConnector(c)));
+  // A credential for the host's egress proxy to make one Git request at the forge itself, or the word to relay it.
+  app.post('/api/connectors/self/git/direct', async c => gitDirect(c, await authenticateConnector(c)));
 }
 
 export function registerConnectors(app: Hono<WorkerEnv>): void {

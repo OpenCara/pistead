@@ -506,10 +506,10 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
   for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/github/read', '/api/internal/github/merge', '/api/internal/github/issue',
-    '/api/internal/restores/unknown/download']) {
+    '/api/internal/restores/unknown/download', '/api/internal/git/direct']) {
     await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
   }
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download', 'git/direct']) {
     await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
     await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
     await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
@@ -520,7 +520,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const oldConnection = connector.connectionToken;
   connector.connectionToken = token();
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download', 'git/direct']) {
     await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
   }
   await json(await self(f, connector, 'manifest', manifest));

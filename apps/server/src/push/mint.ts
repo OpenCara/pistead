@@ -184,7 +184,8 @@ function githubHeaders(bearer: string): Record<string, string> {
   return { Authorization: `Bearer ${bearer}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
 }
 
-async function mintGitHub(target: MintTarget, app: GitHubApp, identityId: string | null): Promise<MintedToken> {
+async function mintGitHub(target: Pick<MintTarget, 'provider' | 'host' | 'fullName' | 'repositoryId'>, app: GitHubApp, identityId: string | null,
+  permissions: Record<string, 'read' | 'write'> = { contents: 'write' }): Promise<MintedToken> {
   const repositoryId = Number(target.repositoryId);
   if (!/^[1-9]\d{0,15}$/.test(target.repositoryId) || !Number.isSafeInteger(repositoryId)) fail(400, 'invalid_repository', 'A GitHub numeric repository identity is required.');
   const api = githubApiBase(target.provider, target.host);
@@ -197,7 +198,7 @@ async function mintGitHub(target: MintTarget, app: GitHubApp, identityId: string
   if (typeof installationId !== 'number' || !Number.isSafeInteger(installationId) || installationId <= 0) unavailable('mint');
   const issued = expectStatus('mint', await upstream('mint', `${api}/app/installations/${installationId}/access_tokens`, {
     method: 'POST', headers: { ...githubHeaders(jwt), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ repository_ids: [repositoryId], permissions: { contents: 'write' } }),
+    body: JSON.stringify({ repository_ids: [repositoryId], permissions }),
   }), 201);
   const installationToken = token('mint', issued.token);
   const expiry = typeof issued.expires_at === 'string' ? Math.floor(Date.parse(issued.expires_at) / 1000) : NaN;
@@ -356,6 +357,51 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
       return { kind: row.kind, identityId: row.id, authorization: null, expiresAt: expiresAt(undefined, 3600) };
     }
   }
+}
+
+/** A repository read token handed out again while it outlives the longest Git command by a wide margin. */
+const readReuseSeconds = 20 * 60;
+const readTokens = new Map<string, MintedToken>();
+
+/**
+ * A token that can only read one repository, for a host's direct Git reads (GitDirectGrant): a GitHub App installation
+ * token limited to the repository and to `contents: read`, from the workspace's GitHub App push identity for the host or
+ * the operator's app on github.com. Null when there is none, the app isn't installed on the repository, or the provider
+ * has no such tokens; the read is then relayed, or made with the owner's account on their own host. Tokens are shared
+ * by the sessions that read the same repository with the same app, for as long as they last; the caller has checked
+ * the session's authority for this request.
+ */
+export async function mintRepositoryReadToken(env: Env, target: { workspaceId: string; provider: GitProvider; host: string; fullName: string; repositoryId: string })
+  : Promise<MintedToken | null> {
+  if (target.provider !== 'github' && target.provider !== 'github-enterprise') return null;
+  const row = await env.DB.query<PushIdentityRow>("SELECT * FROM push_identities WHERE workspace_id = ? AND provider = ? AND host = ? AND scope = ''")
+    .bind(target.workspaceId, target.provider, target.host).first();
+  let app: GitHubApp;
+  let identityId: string | null = null;
+  if (row?.kind === 'github-app' && row.status === 'ready') {
+    const config = JSON.parse(row.config_json) as Record<string, string>;
+    app = { appId: config.appId!, slug: config.slug!, privateKey: await identitySecret(env, row) };
+    identityId = row.id;
+  } else if (target.provider === 'github' && env.GITHUB_APP_ID && env.GITHUB_APP_SLUG && env.GITHUB_APP_PRIVATE_KEY) {
+    app = { appId: env.GITHUB_APP_ID, slug: env.GITHUB_APP_SLUG, privateKey: env.GITHUB_APP_PRIVATE_KEY };
+  } else return null;
+  const key = `${target.provider}\0${target.host}\0${app.appId}\0${target.repositoryId}`;
+  const cached = readTokens.get(key);
+  if (cached && cached.expiresAt - Math.floor(Date.now() / 1000) > readReuseSeconds) return cached;
+  readTokens.delete(key);
+  let minted: MintedToken;
+  try { minted = await mintGitHub(target, app, identityId, { contents: 'read' }); }
+  catch { return null; }
+  // Shared tokens are never revoked by one session's request; they expire within the hour.
+  const token: MintedToken = { kind: minted.kind, identityId: minted.identityId, authorization: minted.authorization, expiresAt: minted.expiresAt };
+  if (readTokens.size >= 1000) readTokens.clear();
+  readTokens.set(key, token);
+  return token;
+}
+
+/** Forgets the shared read tokens (tests). */
+export function forgetRepositoryReadTokens(): void {
+  readTokens.clear();
 }
 
 /**

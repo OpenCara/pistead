@@ -28,6 +28,11 @@ export interface Env {
   GITHUB_APP_ID?: string;
   GITHUB_APP_SLUG?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /**
+   * Direct Git transfers (network.ts gitDirect): `on` (default), `own-hosts` (credentials only to session owners' own hosts;
+   * public repositories are still read directly everywhere) or `off` (every Git request is relayed through the server).
+   */
+  GIT_DIRECT?: string;
   /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */

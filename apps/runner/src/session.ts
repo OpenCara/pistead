@@ -33,7 +33,8 @@ import { compactionFailure, configuredCompaction, hostCompaction } from "./compa
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { DirectGit } from "./git-direct.js";
+import { egressReadServices, type EgressGrant, type EgressRepository, type GitDirectRequest } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 import { defaultHostConfig, type HostCompaction, type HostConfig } from "../../../packages/shared/src/host-config.js";
 import { commandLimits, type CommandLimits } from "./host-config.js";
@@ -156,6 +157,11 @@ export type RunnerConfig = {
   egressGrant?: (sessionId: string) => Promise<EgressGrant>;
   gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
   /**
+   * A direct grant for one of a session's Git requests (GitDirectGrant), through the connector; without it, the control
+   * plane's internal route. The host then makes the request at the forge itself, so it doesn't cross the control plane.
+   */
+  gitDirect?: (sessionId: string, request: Omit<GitDirectRequest, "sessionId">) => Promise<unknown>;
+  /**
    * How the host runs its sessions, as its owner and admins set it in Pistead (the connector caches it briefly). Read for
    * each shell command: its time limit and GPU. Without it, the defaults.
    */
@@ -242,6 +248,8 @@ export class RunnerSession {
   readonly #activity: ActivityReporter | undefined;
   /** The sandbox's only way out (see EgressProxy); listening while the session is open. Host mode has no sandbox to confine. */
   readonly #egress: EgressProxy | undefined;
+  /** Git requests this host makes at the forge itself, where the control plane grants it (see DirectGit). */
+  readonly #direct: DirectGit | undefined;
   /** A clone session: no pins; the agent clones the workspace's repositories with plain Git through the egress proxy. */
   readonly #clone: boolean;
   /**
@@ -294,6 +302,12 @@ export class RunnerSession {
     if (this.#hostSession && (!binding.session.connectorOwnerId || binding.session.connectorOwnerId !== binding.owner.id)) {
       throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
     }
+    // Grants come the way relayed requests go: through the connector, or the control plane's internal route. A runner
+    // given a relay of its own and no way to ask for grants relays everything.
+    const directGrant = config.gitDirect ? (request: Omit<GitDirectRequest, "sessionId">) => config.gitDirect!(binding.session.id, request)
+      : config.gitRelay ? undefined
+      : (request: Omit<GitDirectRequest, "sessionId">) => this.controlPlane("/api/internal/git/direct", { sessionId: binding.session.id, ...request });
+    this.#direct = directGrant && new DirectGit({ grant: directGrant });
     if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
     else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
@@ -322,12 +336,15 @@ export class RunnerSession {
   }
 
   /**
-   * One Git request through the control plane's relay: a read with the session owner's access, or a push of the session
-   * branch. A refused read also stops this session borrowing from the host's mirror of that repository.
+   * One Git request: a read with the session owner's access, or a push of the session branch. It goes to the forge from
+   * this host when the control plane grants a credential for it (DirectGit), else through the control plane's relay. A
+   * refused read also stops this session borrowing from the host's mirror of that repository.
    */
   private async relay(request: RelayRequest): Promise<Response> {
     const sessionId = this.binding.session.id;
     try {
+      const direct = await this.#direct?.forward(request);
+      if (direct) return direct;
       return await (this.config.gitRelay ? this.config.gitRelay(sessionId, request)
         : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
           { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
