@@ -75,10 +75,12 @@ First run on Windows 11 25H2 build 26200.9445 (MXC 1.0.1 reports `base-container
   are denied; direct egress and other loopback ports are blocked while the session's proxy port is reachable; the job's
   memory and process limits reach into the container, and closing the job ends it.
 - Open:
-  - MSYS2 programs (Git for Windows' `bash.exe`, `sh.exe`, coreutils) die in DLL initialization inside the container,
-    so shell commands can't run;
-  - Git for Windows can't get its working directory unless every ancestor folder is readable (it needs traversal
-    without read, `enumeratePaths`, which this build lacks);
+  - MSYS2 programs (Git for Windows' `bash.exe`, `sh.exe`, coreutils) can't start inside the container: the runtime's
+    `NtCreateDirectoryObject(\BaseNamedObjects\msys-2.0S5-…)` is denied (`0xC0000022`), so shell commands can't run.
+    busybox-w32 (also Git for Windows' MinGit-busybox flavor) and PowerShell do start;
+  - Git for Windows can't get its working directory: its `getcwd` calls `GetFinalPathNameByHandleW` with
+    `VOLUME_NAME_DOS`, which the container is denied (`VOLUME_NAME_NT` and `VOLUME_NAME_NONE` work), and has no
+    fallback;
   - MXC replaces `HTTPS_PROXY` with `http://127.0.0.1:<port>`, dropping the session token, so proxied requests get 407;
   - a loopback server inside the container can't be connected to (expected before .9550);
   - unsandboxed: stopping a command leaves the background processes MSYS2 bash started (`taskkill /T` can't follow
