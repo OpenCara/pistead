@@ -16,7 +16,7 @@ export interface TranscriptSettings {
   toolOutput: ToolOutput;
 }
 
-/** Owner/admin authority, re-checked inside the write (binds workspace id, user id). */
+/** Owner/admin authority, re-checked inside the write, on insert and on update alike (binds workspace id, user id). */
 const adminSql = `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))`;
 
 interface SettingsRow { paging: number; tool_output: string }
@@ -62,8 +62,8 @@ export function registerTranscriptSettings(app: Hono<WorkerEnv>): void {
       'updated_by = excluded.updated_by', 'updated_at = excluded.updated_at'];
     const saved = await c.env.DB.query<SettingsRow>(`INSERT INTO workspace_transcript_settings (workspace_id, paging, tool_output, updated_by, updated_at)
       SELECT ?,?,?,?,? WHERE ${adminSql}
-      ON CONFLICT (workspace_id) DO UPDATE SET ${updates.join(', ')}
-      RETURNING paging, tool_output`).bind(workspaceId, paging ? 1 : 0, toolOutput ?? 'full', actor, now(), workspaceId, actor).first();
+      ON CONFLICT (workspace_id) DO UPDATE SET ${updates.join(', ')} WHERE ${adminSql}
+      RETURNING paging, tool_output`).bind(workspaceId, paging ? 1 : 0, toolOutput ?? 'full', actor, now(), workspaceId, actor, workspaceId, actor).first();
     if (!saved) fail(403, 'forbidden', 'Workspace administrator access is required.');
     const settings = settingsOf(saved);
     await auditStatement(c.env, actor, 'workspace.transcripts.updated', workspaceId, null,
