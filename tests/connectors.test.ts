@@ -9,7 +9,7 @@ import { authorizeConnectorTicket, type ConnectorRelayEnvelope } from '../apps/s
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
-import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostModelSettings } from '../packages/shared/src/connector.js';
+import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostCommandGrant, HostModelSettings } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, RunnerTicket, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
@@ -2993,13 +2993,62 @@ test('a host\'s owner starts a session directly on the host only where its confi
   await denied(await start({ hostEnvironment: true }), 400, 'host_unsandboxed');
 });
 
-test('only a host\'s owner starts sessions directly on it, never a member it is shared with', async t => {
+test('a member it is shared with starts sessions directly on a host only with a grant from its owner that includes them', async t => {
   const f = await fixture(t); const s = await sharedHost(f);
-  const id = s.connector.connectorId;
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: true } }));
+  const id = s.connector.connectorId; const grants = `/api/connectors/${id}/host-grants/${s.team.id}`;
+  const capabilities = { ...manifest.capabilities, hostConfig: true, hostCommands: true, hostGrants: true };
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities }));
   await json(await s.host.request('PATCH', `/api/connectors/${id}/config`, { hostSessions: true }));
-  const shared = (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
-  assert.equal(shared.find(item => item.id === id)?.hostSessions, undefined);
-  await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true }), 403, 'host_owner_required');
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n, 0);
+  const start = () => s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true });
+  const offered = async () => (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors
+    .find(item => item.id === id)?.hostSessions;
+  const onHost = () => f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n;
+
+  // Without a grant, or with one of host commands alone, a member always gets the sandbox.
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await json(await s.host.request('PUT', grants, { level: 'auto', userId: s.creator.user.id }));
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await denied(await s.host.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: 'yes' }), 400, 'invalid_grant');
+
+  // Only the owner adds sessions on the host to a grant; an admin's change keeps what the grant had, or takes them away.
+  await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.admin.user.id}`));
+  await denied(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: true }), 403, 'host_owner_required');
+  const given = await json<{ hostGrants: HostCommandGrant[] }>(await s.host.request('PUT', grants, { level: 'approve', userId: s.creator.user.id, hostSessions: true }));
+  assert.equal(given.hostGrants.find(grant => grant.userId === s.creator.user.id)?.hostSessions, true);
+  const kept = await json<{ hostGrants: HostCommandGrant[] }>(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id }));
+  assert.equal(kept.hostGrants.find(grant => grant.userId === s.creator.user.id)?.hostSessions, true, 'an admin changing its level keeps them');
+  const audit = f.sqlite.prepare(`SELECT detail_json FROM audit WHERE action = 'host.grant.set' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get()!;
+  assert.equal(JSON.parse(String(audit.detail_json)).hostSessions, true);
+
+  // A connector that runs only its owner's sessions on the host can't run theirs: they are refused, never sandboxed.
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 409, 'connector_update_required');
+  assert.equal(onHost(), 0);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostSessionGrants: true } }));
+  assert.equal(await offered(), true);
+  const { session } = await json<{ session: SessionRecord }>(await start(), 201);
+  assert.equal(session.hostEnvironment, true);
+  assert.equal(session.ownerId, s.creator.user.id);
+  assert.equal((JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding).session.hostEnvironment, true);
+
+  // The host learns it with its owner's authority, and only when it asks: older connectors parse the reply strictly.
+  const asked = (body: Record<string, unknown>) => self(f, s.connector, 'authorize', { ...authorization(session), permission: 'write', ...body });
+  const reply = await json<{ hostCommands?: string; hostSessions?: true }>(await asked({ host: true, hostSessions: true }));
+  assert.deepEqual([reply.hostCommands, reply.hostSessions], ['auto', true]);
+  assert.equal(Object.hasOwn(await json(await asked({ host: true })), 'hostSessions'), false);
+  await denied(await asked({ hostSessions: true }), 400, 'invalid_authorization');
+
+  // Their grant without sessions on the host, or the host not accepting them, ends it; the session keeps what it was.
+  await json(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: false }));
+  assert.equal(Object.hasOwn(await json(await asked({ host: true, hostSessions: true })), 'hostSessions'), false);
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await json(await s.host.request('PUT', grants, { level: 'approve', hostSessions: true }));
+  assert.equal(await offered(), true, 'a workspace-wide grant counts too');
+  await json(await s.host.request('PATCH', `/api/connectors/${id}/config`, { hostSessions: false }));
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 409, 'host_sessions_off');
+  assert.equal(onHost(), 1);
 });

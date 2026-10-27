@@ -42,7 +42,7 @@ Everything else about how the host runs sessions is set in the web app, on the h
 - **Command time limit**: how long a shell command may run, from 30 seconds (the default) to an hour. A longer limit also lifts the per-process limits of short commands (25 seconds of CPU, 64 MiB per file, 256 open files) so builds fit. Set by the host's owner or its admins.
 - **GPU**: sandboxed commands get the host's GPU render device for offscreen rendering and compute: `/dev/dxg` on WSL2 (install Mesa's `vulkan-dzn` there for Vulkan), or Linux DRM render nodes. Never the screen, windows or input. Offered only where the connector found such a device. Set by the host's owner or its admins.
 - **Git credentials** and **Repository cache**: see below. Only the host's owner changes them.
-- **Sessions on the host**: the host's owner may start sessions that run directly on this machine, without the sandbox, by choosing **Where it runs → On this host** when starting one; members' sessions always run in the sandbox. Only the owner changes it.
+- **Sessions on the host**: the host's owner may start sessions that run directly on this machine, without the sandbox, by choosing **Where it runs → On this host** when starting one. Members' sessions run in the sandbox unless the owner's host command grant to them includes **Sessions on the host**. Only the owner changes it.
 
 `--git-credentials`, `--repo-cache` and `--repo-cache-scope` are still accepted, so existing service units keep starting, but ignored: a host that used them keeps those settings in its configuration.
 

@@ -80,7 +80,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const [content, setContent] = useState("");
   const [visibility, setVisibility] = useState<Visibility>("workspace");
   const [trustedHost, setTrustedHost] = useState("");
-  // Where the session runs: in the sandbox, or directly on the host, which only its owner chooses where it accepts that.
+  // Where the session runs: in the sandbox, or directly on the host, which only its owner, or a member they granted that,
+  // chooses where it accepts that.
   const [onHost, setOnHost] = useState(false);
   const action = useAction();
   const input = useRef<HTMLTextAreaElement>(null);
@@ -114,7 +115,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repositories = repos.repositories;
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
-  const hostSessions = Boolean(host?.hostSessions && host.ownerId === user.id);
+  // The listing offers it to the host's owner, and to members whose grant in this workspace includes it.
+  const hostSessions = Boolean(host?.hostSessions);
   const runOnHost = hostSessions && onHost;
   const unsandboxed = Boolean(host?.capabilities.unsandboxed || runOnHost);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
@@ -243,8 +245,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
       </fieldset>
     </form>
     <Feedback error={action.error} />
-    {runOnHost && host && <Alert variant="warning" title="Runs on your host, without the sandbox">
-      Its commands run on {host.name} as its user, with its files, credentials, network and GPU, and no resource limits; the workspace's network access doesn't apply. Approve them as you would commands you run yourself: people you share the session with can't decide them unless you granted them host commands.
+    {runOnHost && host && <Alert variant="warning" title={foreign ? `Runs on ${host.ownerName}'s host, without the sandbox` : "Runs on your host, without the sandbox"}>
+      {foreign && <>{host.ownerName} granted you sessions on {host.name}. </>}Its commands run on {host.name} as its user, with its files, credentials, network and GPU, and no resource limits; the workspace's network access doesn't apply. Approve them as you would commands you run yourself: {foreign
+        ? `people you share the session with can decide them only if they also hold host commands on ${host.name}.`
+        : "people you share the session with can't decide them unless you granted them host commands."}
     </Alert>}
     <div className="new-session-meta">
       {action.busy

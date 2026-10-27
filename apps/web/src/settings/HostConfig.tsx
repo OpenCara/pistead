@@ -108,12 +108,12 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
             options={(["off", "host", "owner"] as const).map(value => ({ value, label: cacheLabels[value], hint: cacheHints[value] }))} />
           : <StatusBadge tone={saved.repositoryCache === "off" ? "neutral" : "success"}>{cacheLabels[saved.repositoryCache]}</StatusBadge>} />
       <Row title="Sessions on the host" hint={unsandboxed ? "This host runs every session without the sandbox"
-        : owner ? "You may start sessions that run directly on this machine, without the sandbox, as its user. Turning it off stops their commands within half a minute" : "Only the host's owner changes this"}
+        : owner ? "You, and members you grant it under Host command access, may start sessions that run directly on this machine, without the sandbox, as its user. Turning it off stops their commands within half a minute" : "Only the host's owner changes this"}
         trailing={unsandboxed ? <StatusBadge tone="danger">Every session</StatusBadge>
           : owner
           ? <label className="check-row small"><input type="checkbox" className="checkbox" checked={config.hostSessions} disabled={!editable}
-            onChange={event => setConfig({ ...config, hostSessions: event.target.checked })} /><span>Allow my sessions</span></label>
-          : <StatusBadge tone={saved.hostSessions ? "danger" : "neutral"}>{saved.hostSessions ? "Owner's sessions" : "Off"}</StatusBadge>} />
+            onChange={event => setConfig({ ...config, hostSessions: event.target.checked })} /><span>Allow sessions on the host</span></label>
+          : <StatusBadge tone={saved.hostSessions ? "danger" : "neutral"}>{saved.hostSessions ? "On" : "Off"}</StatusBadge>} />
       {!connector.capabilities.hostConfig && <Row title="Update the host's connector" hint="This host's connector predates configuration in Pistead and keeps its connect options until it is updated (npx pistead@latest connect). What you save here applies then." />}
       {(changed || action.error || action.notice) && <CardBody>
         <div className="stack">
