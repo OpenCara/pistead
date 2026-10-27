@@ -186,7 +186,7 @@ Each person can hold at most five unexpired pairing codes and 20 active hosts. T
 npx pistead@latest connect
 ```
 
-Keep it running, for example in `tmux` or under your service manager: it reconnects by itself after network failures, and sessions on the host work only while it runs. Restart it after changing Pi's configuration, and run it with `@latest` to update it; newer features need a newer connector, and the web app says when a host's is too old.
+Keep it running, for example in `tmux` or under your service manager: it reconnects by itself after network failures, without interrupting the sessions at work on the host, and sessions on the host work only while it runs. When it starts again, sessions that were at work when it stopped carry on without waiting for someone to open them. Restart it after changing Pi's configuration, and run it with `@latest` to update it; newer features need a newer connector, and the web app says when a host's is too old.
 
 To pair a machine again (after revoking its host, or to move it to another server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
 

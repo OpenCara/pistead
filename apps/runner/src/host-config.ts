@@ -15,16 +15,19 @@ const CONFIG_STALE_MS = 5 * 60_000;
 export class HostConfigSource {
   #cached?: { value: HostConfig; at: number };
   #refresh?: Promise<HostConfig>;
+  /** Set by `refresh`: the next answer is asked for, though the cached one may still be served if asking fails. */
+  #expired = false;
 
   constructor(private readonly load: () => Promise<unknown>, private readonly options: { ttlMs?: number; staleMs?: number; now?: () => number } = {}) {}
 
   async current(): Promise<HostConfig> {
     const now = this.options.now ?? Date.now;
     const cached = this.#cached;
-    if (cached && now() - cached.at < (this.options.ttlMs ?? CONFIG_TTL_MS)) return cached.value;
+    if (cached && !this.#expired && now() - cached.at < (this.options.ttlMs ?? CONFIG_TTL_MS)) return cached.value;
     this.#refresh ??= this.load().then(value => {
       const config = readHostConfig(value);
       this.#cached = { value: config, at: now() };
+      this.#expired = false;
       return config;
     }).finally(() => { this.#refresh = undefined; });
     try { return await this.#refresh; }
@@ -32,6 +35,12 @@ export class HostConfigSource {
       if (cached && now() - cached.at < (this.options.staleMs ?? CONFIG_STALE_MS)) return cached.value;
       return { ...defaultHostConfig };
     }
+  }
+
+  /** Asks again now, whatever the cache holds: a new connection may bring a configuration changed while it was away. */
+  refresh(): Promise<HostConfig> {
+    this.#expired = true;
+    return this.current();
   }
 }
 
