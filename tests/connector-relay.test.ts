@@ -427,18 +427,44 @@ test('aggregate response buffering rejects overflow even below individual respon
   await Promise.all(responses.map(response => response.body!.cancel()));
 });
 
-test('deadline closes ambiguous generation and late replies never replay effects', async t => {
+test('a missed deadline answers only that request; its late reply frees its slot and the connection stays', async t => {
   const f = await fixture(t);
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const pending = f.rpc(await f.envelope('submit', '{}'));
   const wire = await f.initial.socket.nextRequest();
   t.mock.timers.tick(30001);
-  assert.equal((await pending).status, 504);
+  const timedOut = await pending;
+  assert.equal(timedOut.status, 504);
+  assert.match((await timedOut.json() as { error: string }).error, /timed out; inspect the session before retrying/);
   t.mock.timers.reset();
-  assert.deepEqual(await f.initial.socket.closed, { code: 1008, reason: 'Connector timed out' });
+  assert.equal(f.initial.socket.readyState, WebSocket.OPEN, 'one slow request must not end every session\'s requests');
+  // The host still owes that reply, so the request keeps its slot until it comes.
+  const others: Promise<Response>[] = [];
+  const otherWires: ConnectorRpcRequest[] = [];
+  for (let i = 1; i < connectorLimits.pendingRequests; i++) {
+    others.push(f.rpc(await f.envelope()));
+    otherWires.push(await f.initial.socket.nextRequest());
+  }
+  assert.equal((await f.rpc(await f.envelope())).status, 429);
+  // Late, it goes nowhere: it is never replayed as an effect, and the connection goes on. Frames keep their order, so
+  // once the reply sent after it is through, the relay has read the late one too.
   f.reply(f.initial.socket, wire, '{"late":true}');
-  assert.equal(f.initial.socket.requests.length, 0);
-  assert.equal(f.initial.socket.messages.filter(raw => raw.startsWith('{') && JSON.parse(raw).type === 'request').length, 1);
+  f.reply(f.initial.socket, otherWires[0]!);
+  const answered = await others[0]!;
+  assert.equal(answered.status, 200);
+  await answered.body!.cancel();
+  // Both slots are free again: exactly two more requests fit.
+  const more = [f.rpc(await f.envelope()), f.rpc(await f.envelope())];
+  const moreWires = [await f.initial.socket.nextRequest(), await f.initial.socket.nextRequest()];
+  assert.equal((await f.rpc(await f.envelope())).status, 429);
+  f.reply(f.initial.socket, moreWires[0]!, '{"next":true}');
+  assert.deepEqual(await (await more[0]!).json(), { next: true });
+  for (const other of [...otherWires.slice(1), moreWires[1]!]) f.reply(f.initial.socket, other);
+  for (const response of await Promise.all([...others.slice(1), more[1]!])) { assert.equal(response.status, 200); await response.body!.cancel(); }
+  assert.equal(f.initial.socket.readyState, WebSocket.OPEN);
+  // A second answer to it is unsolicited, as for any finished request.
+  f.reply(f.initial.socket, wire, '{"again":true}');
+  assert.deepEqual(await f.initial.socket.closed, { code: 1008, reason: 'Unsolicited connector response' });
 });
 
 test('revoke is namespace scoped, requires database revocation and drains active requests', async t => {

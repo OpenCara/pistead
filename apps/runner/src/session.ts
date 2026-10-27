@@ -1,5 +1,6 @@
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -232,6 +233,12 @@ type ProgressUpdate = (path: string, change: Partial<Omit<RepositoryPreparationI
 /** What the transcript says after a run that the host's crashes ended (see endParkedRuns). */
 const CRASHED_TEXT = "Stopped: the host crashed repeatedly while working on this message. Send it again to retry.";
 
+/**
+ * Beside a session's storage while its agent is working or waiting on a decision, and gone once it isn't: a runner that
+ * starts again opens just these sessions, so their work goes on without someone opening them (RunnerService.resume).
+ */
+export const WORK_MARKER = "working";
+
 /** Whether the model request behind a transcript entry failed, which the session view shows as a failed model turn. */
 function modelFailed(entry: EntryRecord): boolean {
   return (entry.model ?? []).some(message => message.role === "assistant" && message.stopReason === "error");
@@ -360,9 +367,20 @@ export class RunnerSession {
     const report = config.reportActivity;
     // Once the agent stops working, its clones are as it left them: a session on the host reports their branches then.
     this.#activity = report && new ActivityReporter(() => this.activity(), async activity => {
+      // Marked first: a report that fails (the host is reconnecting) is retried, and the mark must not wait for it. The mark
+      // only saves someone opening the session after a restart, so failing to write it never holds the report up.
+      await this.markWork(activity).catch(() => {});
       await report(binding.session.id, activity);
       if (activity !== "working") this.reportBranches();
     });
+  }
+
+  /** Keeps WORK_MARKER in step with `activity`. Only the host writes the session's directory, never its sandbox. */
+  private async markWork(activity: SessionActivity): Promise<void> {
+    const marker = join(this.directory, WORK_MARKER);
+    if (activity !== "working" && activity !== "waiting") return rm(marker, { force: true });
+    const file = await open(marker, constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    await file.close();
   }
 
   /** The session's network grant from the control plane: its workspace's repositories and network policy. */

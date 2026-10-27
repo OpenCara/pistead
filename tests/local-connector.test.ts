@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
-import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, LocalModelSummary } from '../packages/shared/src/connector.js';
+import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary } from '../packages/shared/src/connector.js';
 import type { AuthorizationRequest, ModelDefinition, RunnerAction, RunnerBinding } from '../packages/shared/src/types.js';
 import type { ConnectorRuntime, ConnectorSocket, LocalConnector } from '../apps/runner/src/connector.js';
 import type { LocalModels } from '../apps/runner/src/local-pi.js';
@@ -350,7 +350,7 @@ function mailbox<T>(): Mailbox<T> {
 }
 
 type WorkerCall = { request: Request; body: string };
-type RuntimeRecord = { config: RunnerConfig; requests: Request[]; closed: boolean };
+type RuntimeRecord = { config: RunnerConfig; requests: Request[]; closed: boolean; resumes: number };
 type FixtureOptions = {
   manifest?: (generation: number) => Response | Promise<Response>;
   authorize?: () => Response | Promise<Response>;
@@ -395,7 +395,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
     },
     runtimeFactory: config => {
       const generation = runtimes.length;
-      const record: RuntimeRecord = { config, requests: [], closed: false };
+      const record: RuntimeRecord = { config, requests: [], closed: false, resumes: 0 };
       runtimes.push(record);
       const runtime: ConnectorRuntime = {
         fetch: request => {
@@ -403,6 +403,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
           return options.execute?.(request, generation) ?? Response.json({ ok: true });
         },
         close: () => { record.closed = true; return Promise.resolve(); },
+        resume: () => { record.resumes++; return Promise.resolve(); },
       };
       return Promise.resolve(runtime);
     },
@@ -870,7 +871,7 @@ test('stop drains the active request but never executes or publishes queued work
   assert.deepEqual(fixture.leases, { acquired: 1, released: 1 });
 });
 
-test('a ticket that expires in the queue is rejected before runtime dispatch', { timeout: 10000 }, async t => {
+test('a ticket that expires in the queue is refused on its own before runtime dispatch, and the connection stays', { timeout: 10000 }, async t => {
   const runtime = deferredRuntime();
   const fixture = await connectorFixture(t, runtime);
   const socket = await startFixture(fixture);
@@ -900,10 +901,14 @@ test('a ticket that expires in the queue is rejected before runtime dispatch', {
     now = queued.ticket.exp * 1000;
     execution.response.resolve(new Response('active completed'));
     assert.equal(JSON.parse(await socket.messages.next()).id, active.id);
-    await socket.closed.promise;
+    const refused = JSON.parse(await socket.messages.next()) as ConnectorRpcResponse;
+    assert.equal(refused.id, queued.id);
+    assert.equal(refused.status, 504);
+    assert.match((JSON.parse(refused.body) as { error: string }).error, /waited too long on the host/);
+    assert.equal(socket.readyState, 1, 'an expired ticket ends its own request, not the connection');
     await fixture.connector.stop();
     assert.equal(fixture.runtimes[0]!.requests.length, 1);
-    assert.equal(socket.sent.length, 1);
+    assert.equal(socket.sent.length, 2);
   } finally {
     clock.mock.restore();
   }
@@ -933,32 +938,32 @@ for (const duplicate of ['request ID', 'ticket ID'] as const) {
   });
 }
 
-test('reconnect drains an ambiguous in-flight effect without retry and rejects old callbacks and replay', { timeout: 15000 }, async t => {
+test('reconnect keeps the runner: an ambiguous in-flight effect drains without retry, callbacks move to the next connection, and replay is refused', { timeout: 15000 }, async t => {
   const effectStarted = Promise.withResolvers<Request>();
   const effectFinished = Promise.withResolvers<Response>();
   const authorizeFinished = Promise.withResolvers<void>();
+  let holdAuthorize = true;
   const fixture = await connectorFixture(t, {
     execute: request => { effectStarted.resolve(request); return effectFinished.promise; },
-    authorize: async () => { await authorizeFinished.promise; return Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' }); },
+    authorize: async () => {
+      if (holdAuthorize) await authorizeFinished.promise;
+      return Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' });
+    },
     unblock: () => {
       effectFinished.resolve(Response.json({ effect: 'already-applied' }));
       authorizeFinished.resolve();
     },
   });
-  const starting = fixture.connector.start();
-  void starting.catch(() => {});
-  const first = await fixture.sockets.next();
-  first.open();
-  first.welcome();
-  await starting;
-  await fixture.connected.next();
-  await fixture.workerCalls.next();
-  const oldRuntime = fixture.runtimes[0]!;
-  assert.ok(oldRuntime.config.authorize);
-  const oldAuthorization = assert.rejects(oldRuntime.config.authorize(authorizationRequest), /generation is no longer authorized|aborted/i);
+  const first = await startFixture(fixture);
+  const runtime = fixture.runtimes[0]!;
+  const config = runtime.config;
+  assert.ok(config.authorize);
+  // A callback under way when its connection ends fails: its answer came under that connection's authority.
+  const oldAuthorization = assert.rejects(config.authorize(authorizationRequest), /generation is no longer authorized|aborted/i);
   const callback = await fixture.workerCalls.next();
   assert.equal(callback.request.url, `${origin}/api/connectors/self/authorize`);
   assert.deepEqual(JSON.parse(callback.body), authorizationRequest);
+  assert.equal(callback.request.headers.get('x-connection-token'), connectionToken);
 
   const request = await rpc('submit', '{"requestId":"fixture-effect","text":"fixture only"}', 'ambiguous-effect');
   first.receive(request);
@@ -969,7 +974,7 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
   assert.ok(localAuthorization?.startsWith('Bearer '));
   assert.ok(localAuthorization);
   const localTicket = localAuthorization.slice('Bearer '.length);
-  assert.deepEqual(await verifyRunnerTicket(localTicket, oldRuntime.config.sharedSecret, 'submit', 'session', request.body), request.ticket);
+  assert.deepEqual(await verifyRunnerTicket(localTicket, config.sharedSecret, 'submit', 'session', request.body), request.ticket);
   assert.equal(localRequest.headers.get('x-connection-token'), null);
 
   const queued = await rpc('submit', '{"requestId":"queued-effect","text":"never execute"}', 'queued-effect');
@@ -980,59 +985,44 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
   assert.equal(localRequest.signal.aborted, true);
   assert.equal(callback.request.signal.aborted, true);
   await nextTurn();
-  assert.equal(oldRuntime.closed, false, 'ambiguous local work must drain before runtime retirement');
-  assert.equal(fixture.allSockets.length, 1, 'a replacement must not race the old runtime');
-  assert.equal(oldRuntime.requests.length, 1);
+  assert.equal(fixture.allSockets.length, 1, 'the next connection takes requests only once this one\'s are answered');
+  assert.equal(runtime.closed, false, 'the runner and its sessions\' work outlive the connection');
+  assert.equal(runtime.requests.length, 1);
   authorizeFinished.resolve();
   await oldAuthorization;
+  // A callback made while the host reconnects waits for the next connection instead of failing the work it serves.
+  holdAuthorize = false;
+  const waiting = config.authorize(authorizationRequest);
   effectFinished.resolve(Response.json({ effect: 'already-applied' }));
 
   const second = await fixture.sockets.next();
-  assert.equal(oldRuntime.closed, true);
   second.open();
   const secondToken = 'fixture_second_connection_token_0123456789abcdef';
   second.welcome(secondToken);
   await fixture.connected.next();
-  const secondManifest = await fixture.workerCalls.next();
-  assert.equal(secondManifest.request.headers.get('x-connection-token'), secondToken);
-  assert.equal(fixture.runtimes.length, 2);
-  assert.equal(fixture.runtimes[1]!.requests.length, 0, 'reconnect must not retry an ambiguous effect');
-  assert.deepEqual(first.sent, [], 'the lost generation must not publish a late effect response');
-  const currentAuthorize = fixture.runtimes[1]!.config.authorize;
-  assert.ok(currentAuthorize);
-  assert.deepEqual(await currentAuthorize(authorizationRequest), { allowed: true, policyVersion: 1, ownerId: 'owner' });
+  assert.deepEqual(await waiting, { allowed: true, policyVersion: 1, ownerId: 'owner' });
+  const resumed = [await fixture.workerCalls.next(), await fixture.workerCalls.next()];
+  assert.deepEqual(resumed.map(call => new URL(call.request.url).pathname).sort(), ['/api/connectors/self/authorize', '/api/connectors/self/manifest']);
+  for (const call of resumed) assert.equal(call.request.headers.get('x-connection-token'), secondToken);
+  assert.equal(fixture.runtimes.length, 1, 'reconnecting keeps the runner');
+  assert.equal(runtime.closed, false);
+  assert.equal(runtime.resumes, 1, 'what was at work when the runner last stopped resumes once per runner, not per connection');
+  assert.equal(runtime.requests.length, 1, 'reconnect must not retry an ambiguous effect');
+  assert.deepEqual(first.sent, [], 'the lost connection must not publish a late effect response');
+  assert.deepEqual(await config.authorize(authorizationRequest), { allowed: true, policyVersion: 1, ownerId: 'owner' });
   const currentCallback = await fixture.workerCalls.next();
   assert.equal(currentCallback.request.headers.get('x-connection-token'), secondToken);
 
-  const count = fixture.allCalls.length;
-  const oldConfig = oldRuntime.config;
-  assert.ok(oldConfig.resolveModels);
-  assert.ok(oldConfig.githubComment);
-  assert.ok(oldConfig.readBackup);
-  await assert.rejects(async () => oldConfig.authorize!(authorizationRequest), /generation is no longer authorized/);
-  await assert.rejects(async () => oldConfig.resolveModels!(model), /generation is no longer authorized/);
-  await assert.rejects(oldConfig.githubComment({
-    sessionId: 'session', actorId: 'owner', approvalId: 'approval', capability: 'fixture-capability',
-    repository: 'fixture/repository', issue: 1, body: 'fixture only',
-  }), /generation is no longer authorized/);
-  await assert.rejects(oldConfig.readBackup({
-    id: 'restore', sourceSessionId: 'source', backupId: 'backup', size: 1,
-    sha256: await sha256('x'), downloadToken: 'fixture_download_token_0123456789abcdef',
-  }, 'session'), /generation is no longer authorized/);
-  assert.equal(fixture.allCalls.length, count, 'retired callbacks must fail before Worker fetch');
-
   first.receive(await rpc('submit', '{}', 'late-old-message'));
   await nextTurn();
-  assert.equal(oldRuntime.requests.length, 1);
-  assert.equal(fixture.runtimes[1]!.requests.length, 0);
+  assert.equal(runtime.requests.length, 1);
 
   // A new request ID cannot reuse an already-dispatched ticket after reconnect.
   second.receive({ ...request, id: 'new-envelope-same-ticket' });
   await second.closed.promise;
-  assert.equal(fixture.runtimes[1]!.requests.length, 0);
+  assert.equal(runtime.requests.length, 1);
 
   const third = await fixture.sockets.next();
-  assert.equal(fixture.runtimes[1]!.closed, true);
   third.open();
   third.welcome('fixture_third_connection_token_0123456789abcdef');
   await fixture.connected.next();
@@ -1041,7 +1031,7 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
   const freshTicket = await rpc('submit', request.body, 'fresh-ticket');
   third.receive({ ...freshTicket, id: request.id });
   await third.closed.promise;
-  assert.equal(fixture.runtimes[2]!.requests.length, 0);
+  assert.equal(runtime.requests.length, 1);
 
   // Admission burns queued IDs too, even though disconnect prevented their runtime execution.
   const freshQueuedTicket = await rpc('submit', queued.body, 'fresh-queued-ticket');
@@ -1053,10 +1043,259 @@ test('reconnect drains an ambiguous in-flight effect without retry and rejects o
     await fixture.workerCalls.next();
     socket.receive(replay);
     await socket.closed.promise;
-    assert.equal(fixture.runtimes.at(-1)!.requests.length, 0, 'queued replay must fail before runtime execution');
+    assert.equal(runtime.requests.length, 1, 'queued replay must fail before runtime execution');
   }
-  assertWorkerBoundary(fixture.allCalls, fixture.allSockets, [oldConfig.sharedSecret, localTicket]);
+  assert.equal(fixture.runtimes.length, 1);
+  assert.equal(runtime.resumes, 1);
+  assertWorkerBoundary(fixture.allCalls, fixture.allSockets, [config.sharedSecret, localTicket]);
   await fixture.connector.stop();
-  assert.equal(fixture.runtimes.reduce((count, runtime) => count + runtime.requests.length, 0), 1);
+  assert.equal(runtime.closed, true, 'the runner closes when the connector stops');
   assert.deepEqual(fixture.leases, { acquired: 1, released: 1 });
+  // A stopped connector's callbacks fail at once, before any Worker fetch.
+  const count = fixture.allCalls.length;
+  await assert.rejects(async () => config.authorize!(authorizationRequest), /not connected/);
+  await assert.rejects(async () => config.resolveModels!(model), /Connector has stopped/);
+  await assert.rejects(config.githubComment!({
+    sessionId: 'session', actorId: 'owner', approvalId: 'approval', capability: 'fixture-capability',
+    repository: 'fixture/repository', issue: 1, body: 'fixture only',
+  }), /not connected/);
+  await assert.rejects(config.readBackup!({
+    id: 'restore', sourceSessionId: 'source', backupId: 'backup', size: 1,
+    sha256: await sha256('x'), downloadToken: 'fixture_download_token_0123456789abcdef',
+  }, 'session'), /not connected/);
+  assert.equal(fixture.allCalls.length, count);
+});
+
+test('a request that misses its deadline is answered as timed out on its own; the next one\'s deadline starts when it leaves the queue', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  const fixture = await connectorFixture(t, runtime);
+  const socket = await startFixture(fixture);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const slow = await rpc('submit', '{}', 'deadline-slow');
+  const next = await rpc('view', '', 'deadline-next');
+  socket.receive(slow);
+  const slowExecution = await runtime.started.next();
+  socket.receive(next);
+  t.mock.timers.tick(30_001);
+  const timedOut = JSON.parse(await socket.messages.next()) as ConnectorRpcResponse;
+  assert.equal(timedOut.id, slow.id);
+  assert.equal(timedOut.status, 504);
+  assert.match((JSON.parse(timedOut.body) as { error: string }).error, /did not answer in time; inspect the session before retrying/);
+  assert.equal(socket.readyState, 1, 'one slow request must not end every session\'s requests');
+  // The request behind it waited 30s in the queue, which doesn't count against its own deadline.
+  const nextExecution = await runtime.started.next();
+  assert.equal(nextExecution.request.url, 'http://local.invalid/v1/sessions/session/view');
+  t.mock.timers.tick(29_000);
+  await nextTurn();
+  assert.equal(socket.sent.length, 1);
+  nextExecution.response.resolve(Response.json({ view: true }));
+  const answered = JSON.parse(await socket.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([answered.id, answered.status, answered.body], [next.id, 200, '{"view":true}']);
+  // The slow request's work may still finish; its late answer is not sent, and the runner closes only once it is done.
+  const stopping = fixture.connector.stop();
+  await socket.closed.promise;
+  await nextTurn();
+  assert.equal(fixture.runtimes[0]!.closed, false, 'the runner closes after the work still executing in it');
+  slowExecution.response.resolve(Response.json({ late: true }));
+  await stopping;
+  assert.equal(fixture.runtimes[0]!.closed, true);
+  assert.deepEqual(socket.sent.map(frame => (JSON.parse(frame) as ConnectorRpcResponse).id), [slow.id, next.id]);
+  t.mock.timers.reset();
+});
+
+test('a backup gets the relay\'s 90s deadline rather than an ordinary request\'s 30s', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  const fixture = await connectorFixture(t, runtime);
+  const socket = await startFixture(fixture);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const backup = await rpc('backup', '{}', 'deadline-backup');
+  socket.receive(backup);
+  const execution = await runtime.started.next();
+  t.mock.timers.tick(60_000);
+  await nextTurn();
+  assert.deepEqual(socket.sent, [], 'still within its deadline');
+  t.mock.timers.tick(30_001);
+  const timedOut = JSON.parse(await socket.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([timedOut.id, timedOut.status], [backup.id, 504]);
+  assert.equal(socket.readyState, 1);
+  t.mock.timers.reset();
+  execution.response.resolve(Response.json({ late: true }));
+});
+
+test('the runner is replaced only when a new connection brings another repository cache, and each runner resumes once', { timeout: 10000 }, async t => {
+  let repositoryCache = 'off';
+  const fixture = await connectorFixture(t, { hostConfig: () => Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache } }) });
+  const first = await startFixture(fixture);
+  assert.equal(fixture.runtimes.length, 1);
+  assert.equal(fixture.runtimes[0]!.config.repositoryCache, undefined);
+  assert.equal(fixture.runtimes[0]!.resumes, 1);
+  // Reconnecting with the same configuration keeps the runner, and with it its sessions' work.
+  first.close();
+  const second = await fixture.sockets.next();
+  second.open();
+  second.welcome();
+  await fixture.connected.next();
+  await fixture.workerCalls.next();
+  assert.equal(fixture.runtimes.length, 1);
+  assert.equal(fixture.runtimes[0]!.closed, false);
+  // The cache changed in Pistead while the host was away: the next connection asks again and opens a runner for it.
+  repositoryCache = 'owner';
+  second.close();
+  const third = await fixture.sockets.next();
+  third.open();
+  third.welcome();
+  await fixture.connected.next();
+  const manifest = await fixture.workerCalls.next();
+  assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...advertisedBase, repositoryCache: true });
+  assert.equal(fixture.runtimes.length, 2);
+  assert.equal(fixture.runtimes[0]!.closed, true, 'the previous runner closes before another opens the same storage');
+  assert.equal(fixture.runtimes[1]!.config.repositoryCache?.scope, 'owner');
+  assert.equal(fixture.runtimes[1]!.resumes, 1);
+  assert.equal(fixture.allCalls.filter(call => call.request.url === `${origin}/api/connectors/self/config`).length, 3, 'asked at every connection');
+});
+
+test('a reconnect whose configuration can\'t be read keeps the runner and its repository cache', { timeout: 10000 }, async t => {
+  let answer = () => Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'owner' } });
+  const fixture = await connectorFixture(t, { hostConfig: () => answer() });
+  const first = await startFixture(fixture);
+  assert.equal(fixture.runtimes[0]!.config.repositoryCache?.scope, 'owner');
+  // Away long enough that the last configuration is too old to serve, so a failed read falls back to the defaults.
+  const now = Date.now() + 6 * 60_000;
+  const clock = t.mock.method(Date, 'now', () => now);
+  try {
+    answer = () => new Response('unavailable', { status: 503 });
+    first.close();
+    const second = await fixture.sockets.next();
+    second.open();
+    second.welcome();
+    await fixture.connected.next();
+    const manifest = await fixture.workerCalls.next();
+    assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...advertisedBase, repositoryCache: true });
+    assert.equal(fixture.runtimes.length, 1, 'a fallback configuration must not replace the runner and end its sessions\' work');
+    assert.equal(fixture.runtimes[0]!.closed, false);
+  } finally {
+    clock.mock.restore();
+  }
+});
+
+test('while the runner is replaced, a request is told at once that it is restarting, and later ones reach the new runner', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  let repositoryCache = 'off';
+  const asked = mailbox<void>();
+  const fixture = await connectorFixture(t, {
+    ...runtime,
+    hostConfig: () => { asked.push(); return Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache } }); },
+  });
+  const first = await startFixture(fixture);
+  await asked.next();
+  // Work that outlives its deadline keeps the runner from closing until it is done.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const slow = await rpc('submit', '{}', 'restart-slow');
+  first.receive(slow);
+  const slowExecution = await runtime.started.next();
+  t.mock.timers.tick(30_001);
+  assert.equal((JSON.parse(await first.messages.next()) as ConnectorRpcResponse).status, 504);
+  t.mock.timers.reset();
+  // The cache changed in Pistead: the next connection replaces the runner, which waits for that work.
+  repositoryCache = 'owner';
+  first.close();
+  const second = await fixture.sockets.next();
+  second.open();
+  second.welcome();
+  await asked.next();
+  await nextTurn();
+  assert.equal(fixture.runtimes[0]!.closed, false, 'still waiting for the work executing in it');
+  const during = await rpc('view', '', 'restart-during');
+  second.receive(during);
+  const refused = JSON.parse(await second.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([refused.id, refused.status], [during.id, 503]);
+  assert.match((JSON.parse(refused.body) as { error: string }).error, /restarting; try again shortly/);
+  assert.equal(second.readyState, 1);
+  slowExecution.response.resolve(Response.json({ late: true }));
+  await fixture.connected.next();
+  await fixture.workerCalls.next();
+  assert.equal(fixture.runtimes[0]!.closed, true);
+  assert.equal(fixture.runtimes.length, 2);
+  const after = await rpc('view', '', 'restart-after');
+  second.receive(after);
+  const execution = await runtime.started.next();
+  execution.response.resolve(Response.json({ view: true }));
+  const answered = JSON.parse(await second.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([answered.id, answered.status], [after.id, 200]);
+  assert.deepEqual([fixture.runtimes[0]!.requests.length, fixture.runtimes[1]!.requests.length], [1, 1], 'the refused request reached no runner');
+});
+
+test('a request answered at once still keeps the requests behind it after those before it', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  const fixture = await connectorFixture(t, runtime);
+  const socket = await startFixture(fixture);
+  const before = await rpc('view', '', 'order-before');
+  const refused = await rpc('view', '', 'order-refused');
+  const behind = await rpc('view', '', 'order-behind');
+  socket.receive(before);
+  const execution = await runtime.started.next();
+  // Stand in for a replacement starting while `before` runs: only `refused` arrives during it.
+  const connector = fixture.connector as unknown as { restarting: boolean };
+  connector.restarting = true;
+  socket.receive(refused);
+  assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, refused.id);
+  connector.restarting = false;
+  // Once the request behind is validated and queued, nothing but the request before the refused one holds it.
+  const { generation } = fixture.connector as unknown as { generation: { waiting: Set<unknown> } };
+  const queued = Promise.withResolvers<void>();
+  const add = generation.waiting.add.bind(generation.waiting);
+  const observing = t.mock.method(generation.waiting, 'add', (value: unknown) => {
+    const result = add(value);
+    queued.resolve();
+    return result;
+  });
+  socket.receive(behind);
+  await queued.promise;
+  observing.mock.restore();
+  await nextTurn();
+  assert.equal(fixture.runtimes[0]!.requests.length, 1, 'the request behind waits for the one before the refused one');
+  execution.response.resolve(Response.json({ before: true }));
+  assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, before.id);
+  const next = await runtime.started.next();
+  assert.equal(new URL(next.request.url).pathname, '/v1/sessions/session/view');
+  next.response.resolve(Response.json({ behind: true }));
+  assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, behind.id);
+});
+
+test('a request already waiting when the runner is replaced is told it is restarting too, and reaches neither runner', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  const configured = (repositoryCache: string) => Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache } });
+  let answer: () => Response | Promise<Response> = () => configured('off');
+  const fixture = await connectorFixture(t, { ...runtime, hostConfig: () => answer() });
+  const first = await startFixture(fixture);
+  // The next connection's configuration names another cache, and is still on its way when a request arrives.
+  const config = Promise.withResolvers<Response>();
+  answer = () => config.promise;
+  first.close();
+  const second = await fixture.sockets.next();
+  const { generation } = fixture.connector as unknown as { generation: { waiting: Set<unknown> } };
+  const queued = Promise.withResolvers<void>();
+  const add = generation.waiting.add.bind(generation.waiting);
+  const observing = t.mock.method(generation.waiting, 'add', (value: unknown) => {
+    const result = add(value);
+    queued.resolve();
+    return result;
+  });
+  second.open();
+  second.welcome();
+  const early = await rpc('view', '', 'replace-early');
+  second.receive(early);
+  await queued.promise;
+  observing.mock.restore();
+  config.resolve(configured('owner'));
+  const refused = JSON.parse(await second.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([refused.id, refused.status], [early.id, 503]);
+  assert.match((JSON.parse(refused.body) as { error: string }).error, /restarting; try again shortly/);
+  await fixture.connected.next();
+  await fixture.workerCalls.next();
+  assert.equal(fixture.runtimes.length, 2);
+  assert.equal(fixture.runtimes[0]!.closed, true);
+  assert.deepEqual(fixture.runtimes.map(record => record.requests.length), [0, 0], 'the waiting request ran on neither runner');
+  assert.equal(second.readyState, 1);
+  assert.equal(second.sent.length, 1);
 });

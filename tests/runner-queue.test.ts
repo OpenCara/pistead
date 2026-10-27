@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -15,7 +15,7 @@ import type { AuthorizationRequest, Permission, RunnerAction, RunnerBinding, Run
 import { requestKey, RunnerError } from "../apps/runner/src/protocol.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 import { RunnerService } from "../apps/runner/src/server.js";
-import { RunnerSession, type RunnerConfig } from "../apps/runner/src/session.js";
+import { RunnerSession, WORK_MARKER, type RunnerConfig } from "../apps/runner/src/session.js";
 import { defaultHostConfig, type HostCompaction } from "../packages/shared/src/host-config.js";
 
 // These are integration-style source tests: real pi Harness, SQLite and sandbox tools.
@@ -174,6 +174,14 @@ async function fixture(t: TestContext, { reportActivity = false, config: overrid
       service = new RunnerService(config);
       await service.initialize();
       return service.get(input.session.id);
+    },
+    /** Starts a runner again as a connector does: nothing asks for the session, the runner resumes what was at work. */
+    async restart() {
+      assert.equal(service, undefined, "close the previous service before opening its SQLite database");
+      service = new RunnerService(config);
+      await service.initialize();
+      await service.resume();
+      return (service as unknown as { sessions: Map<string, Promise<RunnerSession>> }).sessions;
     },
   };
 }
@@ -434,6 +442,29 @@ test("connected runners report what the agent is doing as it changes, as their v
   assert.equal((await idle(f.session)).activity, "done");
   await f.reported("done");
   assert.deepEqual(f.reports.map(([, activity]) => activity), ["idle", "working", "done"], "one report per change");
+});
+
+test("a session at work when its runner stops resumes when a runner starts again, without anyone opening it", options, async t => {
+  const f = await fixture(t, { reportActivity: true });
+  const marker = join(f.session.directory, WORK_MARKER);
+  const marked = () => lstat(marker).then(stat => stat.isFile(), () => false);
+  await f.reported("idle");
+  assert.equal(await marked(), false, "an idle session has nothing to resume");
+  // Queued when the runner stops: durable, but nothing would run it until someone opened the session.
+  await pauseQueue(f.session);
+  await submit(f.session, OWNER, "write", { content: "TEST_WRITE resumed.txt\nran after the restart", requestId: "resumed" });
+  await f.reported("working");
+  assert.equal(await marked(), true, "marked while at work");
+  await f.stop();
+  const opened = await f.restart();
+  assert.deepEqual([...opened.keys()], [f.session.binding.session.id], "only the marked session opens");
+  await f.reported("done");
+  assert.equal(await file(f.session, "resumed.txt"), "ran after the restart");
+  assert.equal(await marked(), false, "done, so nothing to resume next time");
+  // A runner that starts again now opens nothing, and passes over what isn't a session.
+  await f.stop();
+  await writeFile(join(f.session.directory, "..", "not-a-session"), "");
+  assert.equal((await f.restart()).size, 0);
 });
 
 test("a shared message stopped before it ran leaves the session failed", options, async t => {

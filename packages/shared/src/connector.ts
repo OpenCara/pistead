@@ -239,6 +239,15 @@ export const connectorLimits = {
   models: 200,
 } as const;
 
+/**
+ * How long one relayed request may take, by its ticket's action: a backup or restore moves a whole session, everything
+ * else is a single session operation. The relay and the host apply the same deadline, and missing it ends only that
+ * request, never the connection.
+ */
+export function connectorRequestTimeoutMs(action: string): number {
+  return action === "backup" || action === "restore" ? 90_000 : 30_000;
+}
+
 export interface RestoreDescriptor {
   id: string;
   sourceSessionId: string;
