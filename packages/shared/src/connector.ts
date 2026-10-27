@@ -85,6 +85,12 @@ export interface ConnectorCapabilities {
    */
   hostGrants?: boolean;
   /**
+   * The connector lets its owner decide the host commands (host_bash) of any session on it they can read, without
+   * approve permission on the session: the command runs as the host's OS user, so deciding it is theirs. Absent on older
+   * connectors, which check approve permission on every decision, so there the owner also needs it.
+   */
+  hostOwnerDecides?: boolean;
+  /**
    * The connector lists the session worktree's directories and previews its files, read-only, for the session panel's
    * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
    */

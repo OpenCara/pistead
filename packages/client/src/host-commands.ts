@@ -21,5 +21,33 @@ export function decidesHostCommands(session: Pick<SessionRecord, "connectorOwner
   return (session.connectorOwnerId !== undefined && session.connectorOwnerId === userId) || host?.hostCommandAccess !== undefined;
 }
 
-/** What a host command's card says while it waits for someone who may decide it. */
-export const HOST_COMMAND_WAITING = "Waiting for the host's owner, or a member granted host commands, with approve access to this session";
+/** The session's host as a host listing reports it, for what host command decisions need of it. */
+type ListedHost = Pick<ConnectorInfo, "hostCommandAccess"> & { capabilities?: Pick<ConnectorInfo["capabilities"], "hostOwnerDecides"> };
+
+/**
+ * Whether the host's owner decides `operation` without approve permission on the session, as the control plane and the
+ * host let them: a host_bash card, once the host's connector lets its owner decide those so (`hostOwnerDecides`; older
+ * ones check approve permission on every decision). The commands of a session that runs directly on its host are its
+ * owner's own, who decides them with the approve permission they hold there, like every other card.
+ */
+function hostOwnerDecides(operation: Pick<Operation, "kind">, host: ListedHost | undefined): boolean {
+  return operation.kind === "host.bash" && host?.capabilities?.hostOwnerDecides === true;
+}
+
+/**
+ * Whether `userId` decides host command `operation` (see `isHostCommand`) in a session they can see, as the control plane
+ * lets them: with approve permission on it (`canApprove`) and host command authority there (see `decidesHostCommands`);
+ * or, as the owner of its host, a host_bash card without approve permission where the host lets them (see
+ * `hostOwnerDecides`). The caller still leaves out archived and read-only sessions.
+ */
+export function decidesHostCommand(operation: Pick<Operation, "kind">, session: Pick<SessionRecord, "connectorOwnerId">,
+  host: ListedHost | undefined, userId: string, canApprove: boolean): boolean {
+  const hostOwner = session.connectorOwnerId !== undefined && session.connectorOwnerId === userId;
+  return (canApprove && decidesHostCommands(session, host, userId)) || (hostOwner && hostOwnerDecides(operation, host));
+}
+
+/** What host command `operation`'s card says while it waits for someone who may decide it (see `decidesHostCommand`). */
+export function hostCommandWaiting(operation: Pick<Operation, "kind">, host: ListedHost | undefined): string {
+  return hostOwnerDecides(operation, host) ? "Waiting for the host's owner, or a member granted host commands with approve access to this session"
+    : "Waiting for the host's owner or a member granted host commands, either with approve access to this session";
+}

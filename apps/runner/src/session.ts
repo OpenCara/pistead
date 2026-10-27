@@ -1814,6 +1814,16 @@ export class RunnerSession {
     return (await this.metadata()).approvals[id]!;
   }
 
+  /**
+   * The permission `actorId` needs on the session to decide an approval of `operation`: approve, except that the host's
+   * owner decides its host commands (host_bash), which run as the host's OS user, with any access to the session.
+   * Whether they may decide host commands at all is checked with the card (see hostCommandLevel).
+   */
+  private decisionPermission(actorId: string, operation: Pick<Operation, "kind"> | undefined): Permission {
+    const hostOwner = this.binding.session.connectorOwnerId;
+    return operation?.kind === "host.bash" && !!hostOwner && actorId === hostOwner ? "read" : "approve";
+  }
+
   /** `scope` applies to permission requests: allow the one call (default), or the same need for the rest of the session. */
   async decide(ticket: RunnerTicket, id: string, input: { decision: "approve" | "deny"; operation: Operation; brokerCapability?: string; scope?: "call" | "session" }): Promise<ApprovalRecord> {
     this.requireUnfrozen();
@@ -1821,7 +1831,9 @@ export class RunnerSession {
     if (input.decision !== "approve" && input.decision !== "deny") throw new RunnerError(400, "Invalid approval decision");
     if (input.scope !== undefined && input.scope !== "call" && input.scope !== "session") throw new RunnerError(400, "Invalid approval scope");
     return this.exclusive(async () => {
-      await this.authorize(ticket.actorId, "approve", ticket.policyVersion);
+      // The operation the caller names must be the card's (checked below), so it says what deciding it needs.
+      const permission = this.decisionPermission(ticket.actorId, input.operation);
+      await this.authorize(ticket.actorId, permission, ticket.policyVersion);
       const state = await this.metadata();
       const approval = state.approvals[id];
       if (!approval) throw new RunnerError(404, "Approval not found");
@@ -1887,7 +1899,7 @@ export class RunnerSession {
         // Long host builds must not hold the connector's 30-second RPC queue.
         void this.startHostOperation(id, approval.operation, { actorId: ticket.actorId, capability: input.brokerCapability }, async () => {
           await this.authorize(approval.requestedBy, "write");
-          await this.authorize(ticket.actorId, "approve");
+          await this.authorize(ticket.actorId, permission);
         });
         return (await this.metadata()).approvals[id]!;
       }
