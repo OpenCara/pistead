@@ -37,10 +37,14 @@ export class HostConfigSource {
     }
   }
 
-  /** Asks again now, whatever the cache holds: a new connection may bring a configuration changed while it was away. */
-  refresh(): Promise<HostConfig> {
+  /**
+   * Asks again now, whatever the cache holds: a new connection may bring a configuration changed while it was away.
+   * `answered` says whether the control plane gave it, rather than it being the cached or default fallback.
+   */
+  async refresh(): Promise<{ config: HostConfig; answered: boolean }> {
     this.#expired = true;
-    return this.current();
+    const config = await this.current();
+    return { config, answered: !this.#expired };
   }
 }
 

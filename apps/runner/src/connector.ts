@@ -493,9 +493,10 @@ export class LocalConnector {
       await generation.welcome.promise;
       clearTimeout(timeout);
       // Asked again at every connection, before requests run: the host's configuration may have changed while it was away.
-      const configured = await this.hostConfig.refresh();
+      const { config: configured, answered } = await this.hostConfig.refresh();
       this.requireGeneration(generation);
-      const runtime = await this.ensureRuntime(configured.repositoryCache);
+      // Only a configuration the control plane gave replaces the runner: a fallback (it didn't answer) keeps its cache.
+      const runtime = await this.ensureRuntime(answered || !this.runtime ? configured.repositoryCache : this.runtime.repositoryCache);
       this.requireGeneration(generation);
       const advertised = capabilities(this.options.capabilities, { unsandboxed: this.options.unsandboxed, repositoryCache: runtime.repositoryCache !== "off", gpu: this.gpu });
       await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: withHostToolCapabilities(advertised) });

@@ -1153,3 +1153,27 @@ test('the runner is replaced only when a new connection brings another repositor
   assert.equal(fixture.runtimes[1]!.resumes, 1);
   assert.equal(fixture.allCalls.filter(call => call.request.url === `${origin}/api/connectors/self/config`).length, 3, 'asked at every connection');
 });
+
+test('a reconnect whose configuration can\'t be read keeps the runner and its repository cache', { timeout: 10000 }, async t => {
+  let answer = () => Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'owner' } });
+  const fixture = await connectorFixture(t, { hostConfig: () => answer() });
+  const first = await startFixture(fixture);
+  assert.equal(fixture.runtimes[0]!.config.repositoryCache?.scope, 'owner');
+  // Away long enough that the last configuration is too old to serve, so a failed read falls back to the defaults.
+  const now = Date.now() + 6 * 60_000;
+  const clock = t.mock.method(Date, 'now', () => now);
+  try {
+    answer = () => new Response('unavailable', { status: 503 });
+    first.close();
+    const second = await fixture.sockets.next();
+    second.open();
+    second.welcome();
+    await fixture.connected.next();
+    const manifest = await fixture.workerCalls.next();
+    assert.deepEqual(JSON.parse(manifest.body).capabilities, { ...advertisedBase, repositoryCache: true });
+    assert.equal(fixture.runtimes.length, 1, 'a fallback configuration must not replace the runner and end its sessions\' work');
+    assert.equal(fixture.runtimes[0]!.closed, false);
+  } finally {
+    clock.mock.restore();
+  }
+});
