@@ -9,7 +9,7 @@ import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
-import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
+import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity } from "../../../packages/shared/src/types.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
@@ -29,6 +29,8 @@ const STATE_FILE = "connector.json";
 const CALLBACK_LIMIT = 64 * 1024;
 /** A github_read result; the control plane keeps its view within 96 KiB of JSON. */
 const GITHUB_READ_LIMIT = 128 * 1024;
+/** A schedule tool result: up to every schedule of the session, each with its message (MAX_SCHEDULES_PER_SESSION, server). */
+const SCHEDULES_LIMIT = 4 * 1024 * 1024;
 const RPC_TIMEOUT = 30_000;
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -184,9 +186,9 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // for `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
   const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
+    github: true, githubIssues: true, schedules: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
+    github: true, githubIssues: true, schedules: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
     ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
@@ -502,6 +504,13 @@ export class LocalConnector {
           return z.object({
             number: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+$/),
           }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/issue", payload));
+        },
+        // The control plane's refusal (not the owner's message, an invalid cron expression) comes back with its reason.
+        schedules: async request => {
+          const result = await this.brokerCallback(generation, "/api/connectors/self/schedules", request, SCHEDULES_LIMIT);
+          z.union([z.looseObject({ schedules: z.array(z.looseObject({ id: z.string() })) }), z.looseObject({ schedule: z.looseObject({ id: z.string() }) }),
+            z.object({ deleted: z.string() }).strict()]).parse(result);
+          return result as ScheduleToolResult;
         },
         // Minting can take several upstream calls, so push callbacks get the full RPC budget.
         pushCredential: async request => {

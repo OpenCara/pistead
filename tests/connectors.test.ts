@@ -1936,7 +1936,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // There is no agent catalog: agents can't be listed, revised or published.
@@ -1948,21 +1948,21 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule'].includes(tool)));
 
-  // A host that also carries GitHub reads and merges offers those; opening issues needs its own capability, which
-  // connectors from before github_issue don't advertise.
+  // A host that also carries GitHub reads and merges offers those; opening issues and managing schedules need their
+  // own capabilities, which connectors from before github_issue and schedule don't advertise.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue'));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue' && tool !== 'schedule'));
 
   // A current host gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, hostCommands: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, schedules: true, hostCommands: true } }));
   const { session: fourth } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(fourth.agentVersionId, third.agentVersionId);
   assert.deepEqual(startedAgent().tools, offered);
-  assert.ok(offered.includes('github_issue'));
+  assert.ok(offered.includes('github_issue') && offered.includes('schedule'));
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {

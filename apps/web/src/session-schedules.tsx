@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { AccessMode, SessionRecord, SessionSchedule } from "../../../packages/shared/src/types";
 import { CronError, isTimeZone, MIN_CRON_INTERVAL_MINUTES, nextCronTime, parseCron } from "../../../packages/shared/src/cron";
 import { api, segment } from "./api";
@@ -78,6 +78,16 @@ export function SchedulesPanel({ session, changed }: { session: SessionRecord; c
   const [editing, setEditing] = useState<SessionSchedule | "new" | null>(null);
   const canManage = Boolean(listing.data?.canManage) && !session.frozen;
   const after = () => { listing.refresh(); refreshSessions(); changed(); };
+  // The agent changes schedules too (its schedule tool): read them again when the session's next run or what its agent
+  // is doing changes, rather than only when asked.
+  const watched = `${session.nextScheduledAt ?? ""}|${session.activity ?? ""}`;
+  const seen = useRef(watched);
+  const { refresh } = listing;
+  useEffect(() => {
+    if (seen.current === watched) return;
+    seen.current = watched;
+    refresh();
+  }, [watched, refresh]);
 
   function toggle(schedule: SessionSchedule) {
     void action.run(async () => {

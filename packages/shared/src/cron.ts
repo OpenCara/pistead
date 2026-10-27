@@ -1,3 +1,5 @@
+import type { ScheduleToolRequest } from "./types.js";
+
 /**
  * Cron schedules for scheduled prompts: the standard five fields (minute hour day-of-month month day-of-week), read in
  * an IANA time zone. Each field takes `*`, numbers, ranges (`1-5`), steps (`*\/15`, `0-30/10`, `5/20`) and lists of them;
@@ -184,4 +186,25 @@ export function nextCronTime(schedule: CronSchedule | string, timeZone: string, 
     wall += MINUTE;
   }
   return null;
+}
+
+/** The longest target a schedule tool call shows on its permission card. */
+const SCHEDULE_TARGET_LIMIT = 4000;
+
+/**
+ * What a schedule tool call does, as its permission card shows the session owner, and as the control plane checks a
+ * one-call permission against: the runner and the control plane both build it from the call's own fields, so a grant
+ * covers only the change the owner saw.
+ */
+export function scheduleToolTarget(request: Pick<ScheduleToolRequest, "action" | "scheduleId" | "name" | "cron" | "timeZone" | "content" | "access" | "enabled">): string {
+  const parts: string[] = [request.action];
+  if (request.scheduleId !== undefined) parts.push(request.scheduleId);
+  if (request.cron !== undefined) parts.push(`cron ${request.cron}`);
+  if (request.timeZone !== undefined) parts.push(`in ${request.timeZone}`);
+  if (request.access !== undefined) parts.push(`access ${request.access}`);
+  if (request.enabled !== undefined) parts.push(request.enabled ? "enabled" : "paused");
+  if (request.name !== undefined) parts.push(`name ${JSON.stringify(request.name)}`);
+  let target = parts.join(" ");
+  if (request.content !== undefined) target += `: ${request.content}`;
+  return target.length > SCHEDULE_TARGET_LIMIT ? `${target.slice(0, SCHEDULE_TARGET_LIMIT - 1)}…` : target;
 }
