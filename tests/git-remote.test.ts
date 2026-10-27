@@ -87,3 +87,36 @@ test("redirects are refused and non-https remotes rejected", async (t) => {
   assert.equal(hits, 1);
   assert.throws(() => new GitRemote({ url: "http://example.com/repo.git", authorization: AUTH }), GitRemoteError);
 });
+
+test("a remote without a credential is read anonymously, and failures say whether another attempt may pass", async (t) => {
+  const seen: (string | undefined)[] = [];
+  let status = 200;
+  const server = createServer((request, response) => {
+    seen.push(request.headers.authorization);
+    if (status !== 200) return void response.writeHead(status).end();
+    response.writeHead(200, { "Content-Type": "application/x-git-upload-pack-advertisement" }).end("001e# service=git-upload-pack\n0000" + "0000");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/repo.git`;
+  // No refs at all is an empty repository: what matters is the request carried no Authorization header.
+  assert.deepEqual(await new GitRemote({ url }).listRefs(), new Map());
+  assert.deepEqual(seen, [undefined]);
+  for (const [code, retryable] of [[503, true], [429, true], [408, true], [404, false], [401, false]] as const) {
+    status = code;
+    await assert.rejects(new GitRemote({ url, authorization: AUTH }).listRefs(), (error: unknown) => error instanceof GitRemoteError && error.status === code && error.retryable === retryable);
+  }
+  // A connection that can't be made may pass another time; a request the caller cancelled is final.
+  const unreachable = new GitRemote({ url, fetch: (async () => { throw new TypeError("fetch failed"); }) as typeof fetch });
+  await assert.rejects(unreachable.listRefs(), (error: unknown) => error instanceof GitRemoteError && error.retryable);
+  const controller = new AbortController();
+  controller.abort();
+  const cancelled = new GitRemote({ url, signal: controller.signal, fetch: (async () => { throw new DOMException("aborted", "AbortError"); }) as typeof fetch });
+  await assert.rejects(cancelled.listRefs(), (error: unknown) => error instanceof GitRemoteError && !error.retryable);
+  // The same for a response that breaks off midway: what fetch throws then becomes a GitRemoteError.
+  const breaking = (signal?: AbortSignal) => new GitRemote({ url, ...(signal ? { signal } : {}), fetch: (async () => new Response(new ReadableStream<Uint8Array>({
+    pull(stream) { stream.error(new TypeError("terminated")); },
+  }), { headers: { "Content-Type": "application/x-git-upload-pack-advertisement" } })) as typeof fetch });
+  await assert.rejects(breaking().listRefs(), (error: unknown) => error instanceof GitRemoteError && error.retryable && /broke off/.test(error.message));
+  await assert.rejects(breaking(controller.signal).listRefs(), (error: unknown) => error instanceof GitRemoteError && !error.retryable);
+});
