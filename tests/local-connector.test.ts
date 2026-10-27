@@ -581,6 +581,17 @@ test('a host keeps the repository cache its configuration names for the whole co
   assert.equal(fixture.runtimes[0]!.config.repositoryCache?.scope, 'owner');
 });
 
+test('a host reads the largest configuration the control plane saves: compaction counts for every model, with the longest names', { timeout: 10000 }, async t => {
+  const modelOverrides = Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`${String(index).padStart(80, 'p')}/${'m'.repeat(200)}`,
+    { reserveTokens: 10_000_000, keepRecentTokens: 10_000_000 }]));
+  const configured = { commandTimeoutSeconds: 600, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: { reserveTokens: 10_000_000, modelOverrides } };
+  const body = JSON.stringify({ config: configured });
+  assert.ok(body.length > 64 * 1024, 'more than other callbacks take');
+  const fixture = await connectorFixture(t, { hostConfig: () => new Response(body, { headers: { 'content-type': 'application/json' } }) });
+  await startFixture(fixture);
+  assert.deepEqual(await fixture.runtimes[0]!.config.hostConfig!(), configured);
+});
+
 test('without a configuration from the control plane, a host runs with the defaults and keeps no cache', { timeout: 10000 }, async t => {
   for (const answer of [() => new Response('Not found', { status: 404 }), () => Response.json({ config: { commandTimeoutSeconds: 5, gpu: false, gitCredentials: false, repositoryCache: 'off' } })]) {
     await t.test(answer().status === 404 ? 'a control plane that predates it' : 'an invalid one', async t => {
