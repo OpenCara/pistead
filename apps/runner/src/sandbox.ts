@@ -91,16 +91,19 @@ export function hostGitLfs(): string | undefined {
 
 /**
  * `git` for clone sessions on a host with a repository cache or git-lfs. A clone of a workspace repository:
- * - on a cache host, first asks the egress proxy to bring the host's mirror up to date, then borrows its objects
- *   (--reference-if-able) instead of downloading them again; if the mirror is not ready within 20 seconds, the clone goes
- *   ahead on its own;
+ * - on a cache host, first asks the egress proxy for the host's mirror and borrows its objects (--reference-if-able)
+ *   instead of downloading them again. It waits for the mirror however long that takes: a mirror's first fill downloads
+ *   the whole repository once, with the host's own Git credentials, and the clone never downloads it a second time
+ *   beside it. The wait is told on stderr, and the fill goes on if the command stops. Only a mirror that can't be filled
+ *   at all lets the clone go ahead without it; one the command can't see yet (mounts are fixed when a command starts)
+ *   fails the clone, to be run again;
  * - where the workspace turned Git LFS on for the repository and git-lfs is installed, configures the clone's LFS
  *   filters (in its own .git/config), so its checkout downloads LFS files' content through the proxy. Elsewhere clones
  *   keep LFS pointer files, as plain Git does.
  * Everything else runs Git unchanged.
  */
 const GIT_SHIM = String.raw`#!/usr/bin/python3 -I
-import json, os, sys, urllib.parse, urllib.request
+import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 args = sys.argv[1:]
 VALUED = {'-o', '--origin', '-b', '--branch', '-u', '--upload-pack', '--template', '-c', '--config', '--depth', '--shallow-since',
@@ -111,15 +114,85 @@ VALUED = {'-o', '--origin', '-b', '--branch', '-u', '--upload-pack', '--template
 LFS = next((path for path in ${JSON.stringify(GIT_LFS_PATHS)} if os.access(path, os.X_OK)), None)
 
 
-def ask(endpoint, url, timeout):
+def endpoint(name, url, timeout):
     query = urllib.parse.urlencode({'remote': url})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/' + name + '?' + query, timeout=timeout)
+
+
+def ask(name, url, timeout):
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/' + endpoint + '?' + query, timeout=timeout) as response:
+        with endpoint(name, url, timeout) as response:
             answer = json.load(response)
             return answer if isinstance(answer, dict) else {}
     except Exception:
         return {}
+
+
+def note(text):
+    try:
+        sys.stderr.write('pistead: ' + text + '\n')
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def described(progress):
+    phase = progress.get('phase')
+    text = phase if isinstance(phase, str) and phase.isalpha() else 'filling'
+    percent = progress.get('percent')
+    if type(percent) is int:
+        text += ' %d%%' % percent
+    count = progress.get('bytes')
+    if type(count) is int and count > 0:
+        size, unit = float(count), 'bytes'
+        for bigger in ('KiB', 'MiB', 'GiB'):
+            if size < 1024:
+                break
+            size, unit = size / 1024, bigger
+        text += ', %s received' % ('%d bytes' % count if unit == 'bytes' else '%.1f %s' % (size, unit))
+    return text
+
+
+def mirror(url):
+    # The host's mirror of a workspace repository once it is ready to borrow from, however long its fill takes; None where
+    # the host keeps no mirror of the repository, or couldn't fill it. The proxy streams one JSON object per line, with a
+    # heartbeat; a connection that drops is asked again, which joins the fill still under way.
+    started, shown = time.monotonic(), None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2)
+        try:
+            with endpoint('mirror', url, 120) as response:
+                for line in response:
+                    try:
+                        answer = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(answer, dict):
+                        continue
+                    path = answer.get('path')
+                    if isinstance(path, str) and path:
+                        if shown is not None:
+                            note('the repository cache is ready; cloning from it')
+                        return path
+                    if 'error' in answer:
+                        note('the host could not fill its repository cache (%s); cloning without it' % str(answer['error'])[:300])
+                        return None
+                    progress, now = answer.get('progress'), time.monotonic()
+                    if isinstance(progress, dict) and now - started >= 3 and (shown is None or now - shown >= 30):
+                        if shown is None:
+                            note('waiting for the host to fill its repository cache of ' + url + ': it downloads the repository once,'
+                                 ' then every clone borrows from it, and it goes on if this command stops')
+                        note('repository cache: ' + described(progress))
+                        shown = now
+        except urllib.error.HTTPError:
+            # No repository cache on this host, or not one of the workspace's repositories: a clone as any other.
+            return None
+        except Exception:
+            pass
+    note('the repository cache did not answer; cloning without it')
+    return None
 
 
 index = 0
@@ -141,8 +214,12 @@ if index < len(args) and args[index] == 'clone':
     borrowing = any(argument.startswith('--reference') or argument in ('-s', '--shared', '--dissociate') for argument in rest)
     extra = []
     if url and not borrowing:
-        path = ask('mirror', url, 20).get('path')
-        if isinstance(path, str) and path:
+        path = mirror(url)
+        if path and not os.path.isdir(path):
+            # Mounted from the next command on: cloning without it would download the whole repository again.
+            note('the repository cache of ' + url + ' is ready, but this command started before it could see it; run the clone again')
+            sys.exit(128)
+        if path:
             extra += ['--reference-if-able', path]
     if url and LFS and ask('lfs', url, 10).get('lfs') is True:
         extra += ['-c', 'filter.lfs.process=' + LFS + ' filter-process', '-c', 'filter.lfs.smudge=' + LFS + ' smudge -- %f',

@@ -7,7 +7,7 @@ import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
-import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
+import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, repositoryPreparationPhases, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
 import { scheduleToolTarget } from "../../../packages/shared/src/cron.js";
 import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
@@ -22,7 +22,7 @@ import {
 } from "./sandbox.js";
 import { IMAGE_BUSY, IMAGE_ERROR, imageType, prepareImage } from "./images.js";
 import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
-import { HostCredentialError } from "./git-credentials.js";
+import { HostCredentialError, hostGitAuthorization } from "./git-credentials.js";
 import { GitRemote, GitRemoteError } from "./git-remote.js";
 import { mirrorPath, type MirrorRepository, type RepositoryCache } from "./repo-cache.js";
 import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
@@ -32,7 +32,7 @@ import { applyEdits } from "./edits.js";
 import { compactionFailure, configuredCompaction, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
-import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
+import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type MirrorProgress, type RelayRequest } from "./egress.js";
 import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 import { defaultHostConfig, type HostCompaction, type HostConfig } from "../../../packages/shared/src/host-config.js";
@@ -142,9 +142,16 @@ export type RunnerConfig = {
   identity?: ClientIdentity;
   /**
    * This host's repository cache, when its configuration keeps one (HostConfig.repositoryCache): a mirror per repository,
-   * filled through the control plane's relay, that clones borrow objects from. Fixed for a connection.
+   * filled straight from its provider with this host's own Git credentials (see cacheRemote), that clones borrow objects
+   * from once the control plane's relay confirms their owner may read it. Fixed for a connection.
    */
   repositoryCache?: RepositoryCache;
+  /**
+   * How the repository cache reads a workspace repository: by default directly from its provider, with the credential Git
+   * on this host would use (its credential helpers), or anonymously where it has none for the provider. Never through the
+   * relay. Tests stand in their own remote.
+   */
+  cacheRemote?: (repository: EgressRepository) => Promise<GitRemote>;
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
@@ -164,6 +171,8 @@ export type RunnerConfig = {
 
 /** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
+/** How long a clone waits for the refresh of a mirror filled before; then it borrows the mirror as it is (see mirror). */
+const MIRROR_REFRESH_WAIT_MS = 10_000;
 
 /**
  * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
@@ -178,6 +187,15 @@ function refused(error: unknown): boolean {
 function mirrorRepository(repository: EgressRepository): MirrorRepository & { bindingId: string } {
   if (repository.repositoryId === undefined) throw new RunnerError(409, "Update the Pistead server to cache this repository on the host");
   return { bindingId: repository.bindingId, provider: repository.provider, host: repository.host, repositoryId: repository.repositoryId, fullName: repository.fullName };
+}
+
+/** Why the host couldn't fill its mirror of `repository`, as the clone waiting for it is told (see GIT_SHIM). */
+function cacheFailure(error: unknown, repository: EgressRepository): RunnerError {
+  if (error instanceof GitRemoteError && error.status !== undefined && [401, 403, 404].includes(error.status)) {
+    return new RunnerError(502, `This host's Git credentials can't read ${repository.fullName}; its owner can set one up for ${repository.host} on it, for example with gh auth setup-git`);
+  }
+  if (error instanceof RunnerError) return error;
+  return new RunnerError(502, error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached");
 }
 
 function preparationFailure(reason: string): string {
@@ -316,7 +334,7 @@ export class RunnerSession {
       socketPath,
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
-      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
+      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository, onProgress: (progress: MirrorProgress) => void) => this.mirror(repository, onProgress) } : {}),
       ...(this.#clone ? { sessionBranch: sessionBranch(this.binding.session) } : {}),
     });
   }
@@ -338,16 +356,56 @@ export class RunnerSession {
     }
   }
 
-  /** A workspace repository read through the relay, for the host cache: the relay itself adds the owner's credential. */
+  /**
+   * A workspace repository read through the relay, where the relay itself adds the owner's credential: how this session
+   * confirms that its owner may read a repository before it borrows the host's mirror of it. Mirrors are never filled so.
+   */
   private relayRemote(repository: EgressRepository, signal?: AbortSignal): GitRemote {
     return new GitRemote({ url: bindingRemote(repository), authorization: "Bearer relay", fetch: relayFetch(repository.bindingId, request => this.relay(request)), signal });
   }
 
-  /** Refreshes the host's mirror of `repository` for this session and lets its shell commands borrow from it. */
-  private async mirror(value: EgressRepository): Promise<string> {
+  /**
+   * Makes the host's mirror of `repository` ready and lets this session's shell commands borrow from it. The relay first
+   * lists the repository's branches and tags with the session owner's own account, which confirms they may read it; then
+   * the mirror fetches those tips straight from the provider with this host's own Git credentials (cacheRemote), never
+   * through the relay. A mirror no fill has completed yet is waited for, however long its first fill takes; a filled one
+   * for at most MIRROR_REFRESH_WAIT_MS, then it is borrowed as it is while its refresh goes on.
+   */
+  private async mirror(value: EgressRepository, onProgress?: (progress: MirrorProgress) => void): Promise<string> {
     const repository = mirrorRepository(value);
-    await this.config.repositoryCache!.refresh({ repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: this.relayRemote(value) });
-    return this.allowMirror(repository, Date.now());
+    const refs = await this.ownerRefs(value);
+    const confirmedAt = Date.now();
+    try {
+      const target = { repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: await this.cacheRemote(value), refs };
+      await this.config.repositoryCache!.ready(target, { ...(onProgress ? { onProgress } : {}), wait: MIRROR_REFRESH_WAIT_MS });
+    } catch (error) {
+      throw cacheFailure(error, value);
+    }
+    return this.allowMirror(repository, confirmedAt);
+  }
+
+  /**
+   * `repository`'s branches and tags as the session owner's own account lists them, through the relay (which checks the
+   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors.
+   */
+  private async ownerRefs(value: EgressRepository): Promise<Map<string, string>> {
+    try { return await this.relayRemote(value, AbortSignal.timeout(30_000)).listRefs(); }
+    catch (error) {
+      // A refused read already ended borrowing for this open (see relay).
+      if (refused(error)) throw new RunnerError(403, `Pistead did not confirm that this session's owner can read ${value.fullName}`);
+      throw new RunnerError(502, `Pistead could not confirm that this session's owner can read ${value.fullName}; try again`);
+    }
+  }
+
+  /** How the host's repository cache reads `repository` (see RunnerConfig.cacheRemote). */
+  private async cacheRemote(repository: EgressRepository): Promise<GitRemote> {
+    if (this.config.cacheRemote) return this.config.cacheRemote(repository);
+    const url = bindingRemote(repository);
+    let authorization: string | undefined;
+    // A host with no credential for the provider still fills public repositories.
+    try { authorization = await hostGitAuthorization(url); }
+    catch (error) { if (!(error instanceof HostCredentialError)) throw error; }
+    return new GitRemote({ url, ...(authorization ? { authorization } : {}) });
   }
 
   private allowMirror(repository: MirrorRepository & { bindingId: string }, confirmedAt: number): string {
@@ -387,8 +445,10 @@ export class RunnerSession {
   }
 
   /**
-   * After a reopen, clones made earlier still borrow from mirrors that exist on this host. Each is listed again, but
-   * mounted only once the relay confirms the owner can still read its repository (see mirrorMounts).
+   * Lists the mirror of every workspace repository for this open, creating the ones this host doesn't have yet, empty:
+   * each is mounted only once the relay confirms the owner can read its repository (see mirrorMounts). Created before any
+   * command runs, so the command that first clones a repository already mounts the mirror its clone waits to fill (see
+   * GIT_SHIM), and clones made earlier still borrow from theirs after a reopen.
    */
   private async restoreMirrors(repositories: readonly EgressRepository[]): Promise<void> {
     const cache = this.config.repositoryCache;
@@ -397,7 +457,8 @@ export class RunnerSession {
     for (const value of repositories) {
       if (value.repositoryId === undefined) continue;
       const repository = mirrorRepository(value);
-      try { await lstat(join(cache.mirrorDirectory(repository, this.binding.owner.id), "HEAD")); }
+      // A cache root that isn't private can't be used; the clone hears why when it asks for the mirror.
+      try { await cache.prepare(repository, this.binding.owner.id); }
       catch { continue; }
       this.allowMirror(repository, 0);
     }
@@ -553,7 +614,10 @@ export class RunnerSession {
           if (!repository) throw new RunnerError(409, "its origin is not one of this workspace's repositories");
           let reference: string | null = null;
           if (this.config.repositoryCache && repository.repositoryId !== undefined) {
-            try { reference = await this.mirror(repository); } catch { /* cloned without borrowing */ }
+            const progress = ({ phase, percent, done, total, bytes }: MirrorProgress) => {
+              if (repositoryPreparationPhases.includes(phase as RepositoryPreparationItem["phase"])) update(entry.path, { phase: phase as RepositoryPreparationItem["phase"], percent, done, total, bytes });
+            };
+            try { reference = await this.mirror(repository, progress); } catch { /* cloned without borrowing */ }
           }
           update(entry.path, { phase: "receiving" });
           await (this.sandbox as Sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);

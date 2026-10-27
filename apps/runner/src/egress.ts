@@ -33,6 +33,10 @@ const UPLOAD_REQUEST_BYTES = 64 * 1024 * 1024;
 const LFS_BATCH_BYTES = 1024 * 1024;
 const LFS_TYPE = "application/vnd.git-lfs+json";
 const LOG_ENTRIES = 200;
+/** How often a clone waiting for a mirror hears from the proxy while Git reports nothing new: it never sits silent. */
+const MIRROR_HEARTBEAT_MS = 5_000;
+/** At most one progress line per interval to a clone waiting for a mirror, besides each change of phase. */
+const MIRROR_PROGRESS_MS = 1_000;
 
 /**
  * One Git request for the control plane's relay, which adds the credential: the session owner's for reads, the
@@ -44,6 +48,8 @@ export interface RelayRequest {
   body?: Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>;
 }
 export interface EgressEntry { at: string; kind: "git" | "connect" | "http"; target: string; outcome: "allowed" | "refused"; reason?: string }
+/** How far a mirror's fill is, as a clone waiting for it hears: Git's numbers only (see RepositoryCacheProgress). */
+export interface MirrorProgress { phase: string; percent: number | null; done: number | null; total: number | null; bytes: number }
 export interface EgressOptions {
   socketPath: string;
   /** The session's current grant from the control plane. */
@@ -54,10 +60,11 @@ export interface EgressOptions {
   lookup?: (host: string) => Promise<{ address: string; family: number }[]>;
   connect?: (port: number, address: string) => Duplex;
   /**
-   * Brings the host's mirror of a workspace repository up to date and returns where the sandbox sees it; set only
-   * where the host keeps a repository cache. The `git` shim asks for it before a clone, to borrow its objects.
+   * Makes the host's mirror of a workspace repository ready to borrow from, telling `onProgress` how its fill goes, and
+   * returns where the sandbox sees it; set only where the host keeps a repository cache. The `git` shim asks for it before
+   * a clone, and waits for it.
    */
-  mirror?: (repository: EgressRepository) => Promise<string>;
+  mirror?: (repository: EgressRepository, onProgress: (progress: MirrorProgress) => void) => Promise<string>;
   /**
    * The branch this session may push without approval (a clone session's own branch, see sessionBranch); pushes of it are
    * relayed to the control plane, which pushes with the workspace's push identity. Without it, every push is refused.
@@ -410,21 +417,39 @@ export class EgressProxy {
     }, null, 2)}\n`);
   }
 
+  /**
+   * The host's mirror of a workspace repository, for the `git` shim before a clone. One JSON object per line: `progress`
+   * while the mirror fills (Git's numbers only, repeated as a heartbeat while Git reports nothing new), then the mirror's
+   * `path` in the sandbox, or the `error` that kept it from being filled. However long the fill takes, the shim waits; it
+   * goes on if the shim stops listening.
+   */
   async #mirror(response: ServerResponse, remote: string): Promise<void> {
     if (!this.#options.mirror) return refuse(response, 404, "This host keeps no repository cache");
     const repository = repositoryForRemote((await this.#currentGrant()).repositories, remote.slice(0, 2048));
     if (!repository) return refuse(response, 404, "Not one of this workspace's repositories");
     const label = bindingRemote(repository).slice(0, 300);
-    let path: string;
-    try { path = await this.#options.mirror(repository); }
-    catch (error) {
+    response.writeHead(200, { "Content-Type": "application/x-ndjson", "Cache-Control": "no-store" });
+    const send = (line: object) => { if (!response.writableEnded && !response.destroyed) response.write(`${JSON.stringify(line)}\n`); };
+    let last: MirrorProgress = { phase: "waiting", percent: null, done: null, total: null, bytes: 0 };
+    let sent = 0;
+    const progress = (value: MirrorProgress) => {
+      const changed = value.phase !== last.phase;
+      last = { phase: value.phase, percent: value.percent, done: value.done, total: value.total, bytes: value.bytes };
+      if (changed || Date.now() - sent >= MIRROR_PROGRESS_MS) { sent = Date.now(); send({ progress: last }); }
+    };
+    const heartbeat = setInterval(() => { sent = Date.now(); send({ progress: last }); }, MIRROR_HEARTBEAT_MS);
+    try {
+      const path = await this.#options.mirror(repository, progress);
+      this.#record({ kind: "git", target: label, outcome: "allowed", reason: "mirror" });
+      send({ path });
+    } catch (error) {
       const reason = error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached";
       this.#record({ kind: "git", target: label, outcome: "refused", reason: `mirror: ${reason}` });
-      return refuse(response, 502, reason);
+      send({ error: reason });
+    } finally {
+      clearInterval(heartbeat);
+      if (!response.destroyed) response.end();
     }
-    this.#record({ kind: "git", target: label, outcome: "allowed", reason: "mirror" });
-    response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    response.end(`${JSON.stringify({ path })}\n`);
   }
 
   /** Whether clones of `remote` should download Git LFS objects: asked by the `git` shim before a clone. */
@@ -690,8 +715,8 @@ export async function relayGitRequest(fetchImpl: typeof fetch, url: string, auth
 }
 
 /**
- * A `fetch` for GitRemote that sends its Git reads of one workspace repository through the control plane's relay, so
- * the host's mirror is filled with the session owner's access and every read is checked. Anything else is refused.
+ * A `fetch` for GitRemote that sends its Git reads of one workspace repository through the control plane's relay, with
+ * the session owner's access: how the host confirms that a session may borrow a mirror. Anything else is refused.
  */
 export function relayFetch(bindingId: string, relay: (request: RelayRequest) => Promise<Response>): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {

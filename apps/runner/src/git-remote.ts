@@ -1,4 +1,5 @@
-// Git smart-HTTP client used to push session commits directly to the forge. The credential lives only in this object.
+// Git smart-HTTP client that pushes session commits to the forge and fills the host's repository cache from it. The
+// credential lives only in this object.
 export const ZERO_OID = "0".repeat(40);
 const OID = /^[0-9a-f]{40}$/;
 const MAX_PKT = 65520;
@@ -44,10 +45,24 @@ function mirrorableRef(ref: string): boolean {
 }
 
 export class GitRemoteError extends Error {
-  constructor(message: string, readonly status?: number) { super(message); this.name = "GitRemoteError"; }
+  /**
+   * Whether another attempt may get past it: the connection failed or broke off, or the remote was busy or failing (HTTP
+   * 5xx, 408, 429). A refusal, or a response Git can't use, is final.
+   */
+  readonly retryable: boolean;
+  constructor(message: string, readonly status?: number, retryable?: boolean) {
+    super(message);
+    this.name = "GitRemoteError";
+    this.retryable = retryable ?? (status !== undefined && (status >= 500 || status === 408 || status === 429));
+  }
 }
 
-export interface GitRemoteOptions { url: string; authorization: string; fetch?: typeof fetch; signal?: AbortSignal; userAgent?: string }
+export interface GitRemoteOptions {
+  url: string;
+  /** Sent as the Authorization header; without it, the remote is read anonymously (a public repository). */
+  authorization?: string;
+  fetch?: typeof fetch; signal?: AbortSignal; userAgent?: string;
+}
 
 type Pkt = { kind: "data"; data: Uint8Array } | { kind: "flush" | "delim" | "end" };
 
@@ -113,7 +128,7 @@ class PktReader {
   /** Next pkt, or null at a clean end of stream. */
   async read(): Promise<Pkt | null> {
     if (!(await this.fill(4))) {
-      if (this.buffer.length > this.offset) throw new GitRemoteError("Git remote response ended mid-packet");
+      if (this.buffer.length > this.offset) throw new GitRemoteError("Git remote response ended mid-packet", undefined, true);
       return null;
     }
     const header = decoder.decode(this.take(4));
@@ -123,7 +138,7 @@ class PktReader {
     if (size === 1) return { kind: "delim" };
     if (size === 2) return { kind: "end" };
     if (size < 4 || size > MAX_PKT) throw new GitRemoteError("Git remote sent a malformed pkt-line");
-    if (!(await this.fill(size - 4))) throw new GitRemoteError("Git remote response ended mid-packet");
+    if (!(await this.fill(size - 4))) throw new GitRemoteError("Git remote response ended mid-packet", undefined, true);
     const data = this.take(size - 4).slice();
     if (data.length >= 4 && decoder.decode(data.subarray(0, 4)) === "ERR ") throw new GitRemoteError("Git remote reported an error");
     return { kind: "data", data };
@@ -131,7 +146,7 @@ class PktReader {
 
   async expect(): Promise<Pkt> {
     const next = await this.read();
-    if (!next) throw new GitRemoteError("Git remote response ended early");
+    if (!next) throw new GitRemoteError("Git remote response ended early", undefined, true);
     return next;
   }
 
@@ -202,7 +217,7 @@ interface Advertisement { version: 0 | 2; refs: Map<string, string>; capabilitie
 
 export class GitRemote {
   private readonly url: URL;
-  private readonly authorization: string;
+  private readonly authorization: string | undefined;
   private readonly fetcher: typeof fetch;
   private readonly signal?: AbortSignal;
   private readonly agent: string;
@@ -228,7 +243,7 @@ export class GitRemote {
     try {
       response = await this.fetcher(target, {
         method: init.method,
-        headers: { ...init.headers, Authorization: this.authorization, "User-Agent": `git/${this.agent}` },
+        headers: { ...init.headers, ...(this.authorization ? { Authorization: this.authorization } : {}), "User-Agent": `git/${this.agent}` },
         body: init.body,
         redirect: "manual",
         signal: this.signal,
@@ -236,7 +251,8 @@ export class GitRemote {
       } as RequestInit);
     } catch (error) {
       if (error instanceof GitRemoteError) throw error;
-      throw new GitRemoteError("Git remote request failed");
+      // Aborted by the caller's own signal: final. Otherwise the connection failed, which another attempt may get past.
+      throw new GitRemoteError("Git remote request failed", undefined, !this.signal?.aborted);
     }
     if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
       await response.body?.cancel();
