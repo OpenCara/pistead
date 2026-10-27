@@ -16,6 +16,7 @@ import { runHostShell } from "./host-shell.js";
 import { checkedBrowse, type BrowseResult } from "./file-browser.js";
 import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 import { commandLimits, gpuMounts, type CommandLimits } from "./host-config.js";
+import type { IsolatedWorkspace } from "./workspace.js";
 
 export { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 
@@ -1312,7 +1313,8 @@ export async function pinOwnerConfig(path: string, configText: string): Promise<
  * execute() takes the exact approved Operation, never a reconstructed shell command.
  * No host-shell, host-Git, or host-filesystem-tool fallback exists.
  */
-export class Sandbox {
+export class Sandbox implements IsolatedWorkspace {
+  readonly isolated = true;
   readonly #root: string;
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;

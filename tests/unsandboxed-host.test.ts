@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
 import { Sandbox, type SandboxAuthorize } from "../apps/runner/src/sandbox.js";
+import { isolatedWorkspace } from "../apps/runner/src/workspace.js";
 import type { SessionRepository } from "../packages/shared/src/repositories.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 
@@ -32,6 +33,12 @@ async function hostWorkspace(t: TestContext, repositories: SessionRepository[] =
 
 test("the Linux sandbox never falls back to host execution on other platforms", { skip: process.platform === "linux" }, () => {
   assert.throws(() => new Sandbox(binding("implicit"), join(tmpdir(), "pistead-implicit")), /requires Linux/);
+});
+
+test("a host workspace is not isolated, so the sandbox's clone steps are refused rather than run on the host", hostMode, async t => {
+  const { workspace } = await hostWorkspace(t);
+  assert.equal(workspace.isolated, false);
+  assert.throws(() => isolatedWorkspace(workspace), /needs the sandbox/);
 });
 
 test("unsandboxed file tools stay inside the session worktree", hostMode, async t => {

@@ -13,6 +13,7 @@ import {
 } from "./sandbox.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { browseDirectory, browseFile, checkedBrowse, type BrowseResult } from "./file-browser.js";
+import type { SessionWorkspace } from "./workspace.js";
 
 const MAX_ENTRIES = 10_000;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
@@ -31,7 +32,8 @@ type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?:
  * that could race these checks is an approved command, which already has full user
  * authority on the host.
  */
-export class HostWorkspace {
+export class HostWorkspace implements SessionWorkspace {
+  readonly isolated = false;
   readonly #root: string;
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;

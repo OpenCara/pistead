@@ -15,6 +15,7 @@ import { messageHash, parseChatImages, type ChatImage } from "../../../packages/
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
+import { isolatedWorkspace, type SessionWorkspace } from "./workspace.js";
 import {
   hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
 } from "./sandbox.js";
@@ -198,7 +199,7 @@ function activityEntry(entry: EntryRecord | undefined): ActivityEntry | undefine
 }
 
 export class RunnerSession {
-  readonly sandbox: Sandbox | HostWorkspace;
+  readonly sandbox: SessionWorkspace;
   readonly sqlitePath: string;
   private harness!: Harness;
   private root!: Conversation;
@@ -545,7 +546,7 @@ export class RunnerSession {
             try { reference = await this.mirror(repository); } catch { /* cloned without borrowing */ }
           }
           update(entry.path, { phase: "receiving" });
-          await (this.sandbox as Sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
+          await isolatedWorkspace(this.sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
         } catch (error) {
           if (controller.signal.aborted) throw error;
           const reason = error instanceof RunnerError ? error.message
@@ -648,7 +649,7 @@ export class RunnerSession {
       // Only a restore writes the list (in the worktree's .git, which shell commands can't change), so a session that
       // has none needs no sandbox to tell.
       if (await lstat(join(this.directory, "sandbox", "git", "pistead-clones", "manifest.json")).then(() => true, () => false)) {
-        const pending = await (this.sandbox as Sandbox).clonePending(async () => {});
+        const pending = await isolatedWorkspace(this.sandbox).clonePending(async () => {});
         if (pending.length) this.prepareClones(pending);
       }
     }
@@ -1410,7 +1411,7 @@ export class RunnerSession {
       if (!validCloneDirectory(args.directory)) throw new RunnerError(400, "directory must be a clone's path in the worktree, such as app or src/app");
       if (args.tag !== undefined && !validPushTag(args.tag)) throw new RunnerError(400, "tag must be a plain tag name, such as v1.2.3, not refs/tags/v1.2.3");
       if (args.tag !== undefined && args.pull_request) throw new RunnerError(400, "a tag push opens no pull request");
-      const head = await (this.sandbox as Sandbox).cloneHead(args.directory, () => this.recheckTool(attribution));
+      const head = await isolatedWorkspace(this.sandbox).cloneHead(args.directory, () => this.recheckTool(attribution));
       if (!head.origin) throw new RunnerError(400, `${args.directory} has no origin remote; push only clones of this workspace's repositories`);
       const repository = repositoryForRemote((await this.#egress!.grant()).repositories, head.origin);
       if (!repository) throw new RunnerError(403, `${args.directory} was cloned from ${head.origin.slice(0, 200)}, which is not one of this workspace's repositories`);
@@ -2023,8 +2024,8 @@ export class RunnerSession {
         // again from their origin.
         // On an unsandboxed host the worktree is kept as files, and a session with a clone in it can't be backed up.
         const sandboxed = this.#clone && this.#egress;
-        const { clones, found } = sandboxed ? await (this.sandbox as Sandbox).cloneBackup(authorize) : { clones: [], found: [] };
-        const files = sandboxed ? await (this.sandbox as Sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
+        const { clones, found } = sandboxed ? await isolatedWorkspace(this.sandbox).cloneBackup(authorize) : { clones: [], found: [] };
+        const files = sandboxed ? await isolatedWorkspace(this.sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
         return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files, ...(clones.length ? { clones } : {}),
           createdAt: new Date().toISOString() };
       } finally { await this.open(); }
@@ -2102,7 +2103,7 @@ export class RunnerSession {
     let failure: { status: "failed" | "interrupted"; result: string } | undefined;
     try {
       const authorization = "hostCredentials" in credential ? await this.hostAuthorization(credential.remote, signal) : credential.authorization;
-      pushed = await performClonePush({ workspace: this.sandbox as Sandbox, operation, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
+      pushed = await performClonePush({ workspace: isolatedWorkspace(this.sandbox), operation, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
     } catch (error) {
       failure = error instanceof PushError && !signal?.aborted
         ? { status: "failed", result: `Push failed: ${error.message}. Nothing was pushed.` }
