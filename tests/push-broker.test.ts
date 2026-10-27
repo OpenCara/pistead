@@ -96,7 +96,9 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
     githubBranch: null as Record<string, unknown> | null, gitlabBranch: null as Record<string, unknown> | null,
     giteaBranch: null as Record<string, unknown> | null, azureAllow: true, resetStatus: 200, resetToken: 'owner-oauth-token-2',
     // Pull requests as GitHub reads them back (pull-request-states.ts), by number; a missing one is a 404. All have head `tip`.
-    githubPulls: {} as Record<number, { state: string; merged: boolean; draft: boolean; reviews: unknown[]; checkRuns: unknown[]; statuses: unknown[] }> };
+    githubPulls: {} as Record<number, { state: string; merged: boolean; draft: boolean; reviews: unknown[]; checkRuns: unknown[]; statuses: unknown[] }>,
+    // Pull requests GitHub lists for a head (owner:branch), newest first (session-branches.ts).
+    branchPulls: {} as Record<string, { number: number; html_url: string; created_at: string }[]> };
   const routes: Route[] = [
     (url, init) => {
       if (url.origin !== 'https://api.github.com') return undefined;
@@ -134,6 +136,7 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
         return state.githubPullExists ? Response.json({ message: 'exists' }, { status: 422 })
           : Response.json({ number: 5, html_url: 'https://github.com/owner/repo/pull/5' }, { status: 201 });
       }
+      if (method === 'GET' && url.pathname === '/repos/owner/repo/pulls' && url.searchParams.get('state') === 'all') return Response.json(state.branchPulls[url.searchParams.get('head')!] ?? []);
       if (method === 'GET' && url.pathname === '/repos/owner/repo/pulls') return Response.json([{ number: 4, html_url: 'https://github.com/owner/repo/pull/4' }]);
       return undefined;
     },
@@ -1009,4 +1012,67 @@ test('a session that pinned its repositories is read-only: it gets no push crede
   assert.equal(response.status, 409);
   assert.equal(await code(response), 'session_frozen');
   assert.deepEqual(f.ledger(), []);
+});
+
+test('a session on a host shows the pull request GitHub has for a branch its host reported, with its state', async t => {
+  const f = await fixture(t, { host: { owner } });
+  f.sqlite.prepare('UPDATE sessions SET host_environment = 1 WHERE id = ?').run('session');
+  const branches = '/api/internal/branches';
+  const record = async () => sessionRecord((await sessionAccess(f.env, 'session', owner))!.row).pullRequest;
+  const rows = () => f.sqlite.prepare('SELECT * FROM session_branches ORDER BY repository, branch').all() as Record<string, unknown>[];
+  const stale = () => f.sqlite.prepare('UPDATE session_branches SET pull_request_checked_at = ?').run('2000-01-01T00:00:00.000Z');
+  const lookups = () => f.calls.filter(call => call.url.startsWith('https://api.github.com/repos/owner/repo/pulls?')).length;
+
+  // Only the workspace's github.com repositories are kept, by the workspace's name for them.
+  const reported = await f.post(branches, { sessionId: 'session', branches: [{ repository: 'Owner/Repo', branch: 'feature' }, { repository: 'other/repo', branch: 'x' }] });
+  assert.equal(reported.status, 200);
+  assert.deepEqual(rows().map(row => [row.repository, row.branch]), [['owner/repo', 'feature']]);
+  for (const body of [{ sessionId: 'session', branches: [{ repository: 'owner/repo', branch: '-x' }] }, { sessionId: 'session', branches: 'feature' },
+    { sessionId: 'session', branches: [], extra: true }, { sessionId: 'session', branches: Array.from({ length: 21 }, (_, i) => ({ repository: 'owner/repo', branch: `b${i}` })) }]) {
+    assert.equal((await f.post(branches, body)).status, 400, JSON.stringify(body).slice(0, 80));
+  }
+  const unscoped = await app.request('/api/connectors/self/branches', { method: 'POST', body: JSON.stringify({ sessionId: 'session', branches: [] }),
+    headers: { Authorization: `Bearer ${connectorToken}`, 'x-connection-token': 'stale'.padEnd(43, 'z'), 'Content-Type': 'application/json' } }, f.env);
+  assert.notEqual(unscoped.status, 200, 'only over the connector\'s current connection');
+
+  // No pull request yet: the branch is looked up, and nothing shows.
+  await refreshPullRequestStates(f.env);
+  assert.equal(lookups(), 1);
+  const lookup = f.calls.find(call => call.url.startsWith('https://api.github.com/repos/owner/repo/pulls?'))!;
+  assert.equal(new URL(lookup.url).searchParams.get('head'), 'owner:feature');
+  assert.equal(lookup.authorization, 'Bearer owner-oauth-token', 'looked up as the session owner');
+  assert.equal(await record(), undefined);
+
+  // One opened before the session started is another session's, as is one whose time can't be read; the one opened
+  // since is this session's.
+  const created = String(f.sqlite.prepare('SELECT created_at FROM sessions WHERE id = ?').get('session')!.created_at);
+  f.state.branchPulls['owner:feature'] = [
+    { number: 6, html_url: 'https://github.com/owner/repo/pull/6', created_at: 'not a time' },
+    { number: 5, html_url: 'https://github.com/owner/repo/pull/5', created_at: new Date(Date.parse(created) + 1000).toISOString() },
+    { number: 3, html_url: 'https://github.com/owner/repo/pull/3', created_at: '2000-01-01T00:00:00Z' }];
+  f.state.githubPulls[5] = { state: 'open', merged: false, draft: false, reviews: [], checkRuns: [{ name: 'test', status: 'completed', conclusion: 'failure' }], statuses: [] };
+  await refreshPullRequestStates(f.env);
+  assert.equal(lookups(), 1, 'a fresh lookup is not repeated');
+  stale(); await refreshPullRequestStates(f.env);
+  assert.deepEqual(await record(), { url: 'https://github.com/owner/repo/pull/5', number: 5, state: 'failing' });
+
+  // A branch no longer checked out keeps the pull request it found; one that found none is forgotten.
+  assert.equal((await f.post(branches, { sessionId: 'session', branches: [{ repository: 'owner/repo', branch: 'other' }] })).status, 200);
+  assert.deepEqual(rows().map(row => [row.branch, row.pull_request_url]), [['feature', 'https://github.com/owner/repo/pull/5'], ['other', null]]);
+  // Even when the next report comes within the same millisecond.
+  const realNow = Date.prototype.toISOString;
+  const frozen = new Date().toISOString();
+  Date.prototype.toISOString = function () { return frozen; };
+  try {
+    assert.equal((await f.post(branches, { sessionId: 'session', branches: [{ repository: 'owner/repo', branch: 'third' }] })).status, 200);
+    assert.equal((await f.post(branches, { sessionId: 'session', branches: [] })).status, 200);
+  } finally { Date.prototype.toISOString = realNow; }
+  assert.deepEqual(rows().map(row => row.branch), ['feature']);
+
+  f.state.githubPulls[5] = { ...f.state.githubPulls[5]!, state: 'closed', merged: true };
+  stale(); await refreshPullRequestStates(f.env);
+  assert.deepEqual(await record(), { url: 'https://github.com/owner/repo/pull/5', number: 5, state: 'merged' });
+  const before = lookups();
+  stale(); await refreshPullRequestStates(f.env);
+  assert.equal(lookups(), before, 'merged pull requests are not looked up again');
 });

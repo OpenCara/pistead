@@ -95,6 +95,11 @@ export interface AgentVersion {
  */
 export const sessionActivities = ["idle", "working", "waiting", "done", "failed"] as const;
 export type SessionActivity = (typeof sessionActivities)[number];
+/**
+ * A branch a session on a host has checked out in its clone of one of the workspace's github.com repositories (owner/name),
+ * as its host reports it so that the control plane finds the branch's pull request.
+ */
+export interface SessionBranch { repository: string; branch: string }
 export interface SessionRecord {
   id: string;
   workspaceId: string;

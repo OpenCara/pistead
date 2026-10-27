@@ -92,3 +92,20 @@ test("an unsandboxed clone session's Git uses the host user's own credential hel
   await cloned.execute({ kind: "bash", command: "git init -q app" }, false, authorize);
   await assert.rejects(cloned.snapshot(authorize), /need a host with the sandbox/);
 });
+
+test("a host clone session reads the branches its clones have checked out, as Git leaves them", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-branches-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const clone = binding("host-branches");
+  clone.session.repositoryMode = "clone";
+  const workspace = new HostWorkspace(clone, join(directory, "session"));
+  t.after(() => workspace.close());
+  await workspace.initialize();
+  const upstream = join(directory, "upstream");
+  await mkdir(upstream);
+  const run = (command: string) => workspace.execute({ kind: "bash", command }, false, authorize);
+  await run(`git init -q -b main ${upstream} && git -C ${upstream} commit -q --allow-empty -m initial`);
+  await run(`git clone -q ${upstream} app && git clone -q ${upstream} other && git -C app switch -q -c fix/parser`);
+  assert.deepEqual(await workspace.cloneBranches(authorize), [{ directory: "app", origin: upstream, branch: "fix/parser" }],
+    "a clone on its origin's default branch has no pull request of its own");
+});

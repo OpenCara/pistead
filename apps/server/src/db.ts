@@ -61,7 +61,9 @@ export function successorBranch(row: Pick<SessionRow, 'id' | 'title' | 'reposito
 }
 
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
-  const pullRequest = sessionPullRequest(row.pull_request_url, row.pull_request_state);
+  // A session pushes through Pistead or, on a host, with the host's own Git (session-branches.ts); a push's comes first.
+  const pullRequest = row.pull_request_url ? sessionPullRequest(row.pull_request_url, row.pull_request_state)
+    : sessionPullRequest(row.branch_pull_request_url, row.branch_pull_request_state);
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
@@ -105,12 +107,17 @@ type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: W
 
 // Membership, visibility and explicit grants must come from the same policy snapshot. A suspended account opens no
 // session, and nobody opens the sessions it owns, as if it had left the workspace.
-// The newest pull request a push opened or found comes along for session lists and headers, with its last read state.
+// The newest pull request a push opened or found comes along for session lists and headers, with its last read state;
+// for a session on a host, which pushes with the host's own Git, the one found last for a branch it reported.
 const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role,
   (SELECT pr.pull_request_url FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
     ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_url,
   (SELECT pr.pull_request_state FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
-    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_state FROM sessions s
+    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_state,
+  (SELECT b.pull_request_url FROM session_branches b WHERE b.session_id = s.id AND b.pull_request_url IS NOT NULL
+    ORDER BY b.pull_request_found_at DESC, b.repository, b.branch LIMIT 1) AS branch_pull_request_url,
+  (SELECT b.pull_request_state FROM session_branches b WHERE b.session_id = s.id AND b.pull_request_url IS NOT NULL
+    ORDER BY b.pull_request_found_at DESC, b.repository, b.branch LIMIT 1) AS branch_pull_request_state FROM sessions s
   INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
   INNER JOIN workspace_members owner ON owner.workspace_id = s.workspace_id AND owner.user_id = s.owner_id
   INNER JOIN users actor_user ON actor_user.id = actor.user_id
