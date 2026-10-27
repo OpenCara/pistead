@@ -320,7 +320,11 @@ type Generation = {
   /** Requests admitted and not yet answered, which the relay counts against its pending limit too. */
   active: Set<Promise<void>>;
   tail: Promise<void>;
-  waiting: Set<PromiseWithResolvers<never>>;
+  /**
+   * Requests validated and waiting for their turn: a lost connection rejects them, and a runner replacement starting
+   * wakes them to be answered that it is restarting (see execute).
+   */
+  waiting: Set<PromiseWithResolvers<"restarting">>;
   incomingBytes: number;
   /** The first reason this connection was ended for. */
   reason?: string;
@@ -501,7 +505,7 @@ export class LocalConnector {
       const { config: configured, answered } = await this.hostConfig.refresh();
       this.requireGeneration(generation);
       // Only a configuration the control plane gave replaces the runner: a fallback (it didn't answer) keeps its cache.
-      const runtime = await this.ensureRuntime(answered || !this.runtime ? configured.repositoryCache : this.runtime.repositoryCache);
+      const runtime = await this.ensureRuntime(generation, answered || !this.runtime ? configured.repositoryCache : this.runtime.repositoryCache);
       this.requireGeneration(generation);
       const advertised = capabilities(this.options.capabilities, { unsandboxed: this.options.unsandboxed, repositoryCache: runtime.repositoryCache !== "off", gpu: this.gpu });
       await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: withHostToolCapabilities(advertised) });
@@ -532,10 +536,14 @@ export class LocalConnector {
   }
 
   /** The runner for `repositoryCache`, started on the first connection and kept for later ones. */
-  private async ensureRuntime(repositoryCache: RepositoryCacheMode): Promise<Runtime> {
+  private async ensureRuntime(generation: Generation, repositoryCache: RepositoryCacheMode): Promise<Runtime> {
     // Another cache means other mounts for every session: as when it was chosen per connection, a new runner opens them.
     const replacing = this.runtime !== undefined && this.runtime.repositoryCache !== repositoryCache;
-    if (replacing) this.restarting = true;
+    if (replacing) {
+      this.restarting = true;
+      // Requests that arrived before this, while the configuration was still being asked for, are told so too.
+      for (const waiting of generation.waiting) waiting.resolve("restarting");
+    }
     try {
       if (replacing) await this.retireRuntime();
       if (!this.runtime) {
@@ -859,16 +867,19 @@ export class LocalConnector {
     this.requireGeneration(generation);
     // Answered at once, freeing its slot rather than waiting for the runner; requests behind it still wait for every one
     // before them (see dispatch).
-    if (this.restarting) return this.send(generation, this.errorFrame(rpc, 503, "The host's runner is restarting; try again shortly."));
-    const canceled = Promise.withResolvers<never>();
-    generation.waiting.add(canceled);
+    if (this.restarting) return this.send(generation, this.restartingFrame(rpc));
+    const interrupt = Promise.withResolvers<"restarting">();
+    generation.waiting.add(interrupt);
+    let woke: "ready" | "restarting";
     try {
       // Validate promptly, but effects and replies follow arrival order.
-      await Promise.race([Promise.all([previous, generation.runtimeReady.promise]), canceled.promise]);
+      woke = await Promise.race([Promise.all([previous, generation.runtimeReady.promise]).then(() => "ready" as const), interrupt.promise]);
     } finally {
-      generation.waiting.delete(canceled);
+      generation.waiting.delete(interrupt);
     }
     this.requireGeneration(generation);
+    // Waiting when a runner replacement started: answered as if it had arrived during it, and never run by either runner.
+    if (woke === "restarting") return this.send(generation, this.restartingFrame(rpc));
     await this.send(generation, await this.answer(generation, rpc, authorization));
   }
 
@@ -907,6 +918,10 @@ export class LocalConnector {
     });
     try { return await Promise.race([work, expired]); }
     finally { clearTimeout(timer); }
+  }
+
+  private restartingFrame(rpc: ConnectorRpcRequest): { payload: string; payloadSize: number } {
+    return this.errorFrame(rpc, 503, "The host's runner is restarting; try again shortly.");
   }
 
   /** A reply frame saying why this one request failed, in fixed connector text. */

@@ -1261,3 +1261,41 @@ test('a request answered at once still keeps the requests behind it after those 
   next.response.resolve(Response.json({ behind: true }));
   assert.equal((JSON.parse(await socket.messages.next()) as ConnectorRpcResponse).id, behind.id);
 });
+
+test('a request already waiting when the runner is replaced is told it is restarting too, and reaches neither runner', { timeout: 10000 }, async t => {
+  const runtime = deferredRuntime();
+  const configured = (repositoryCache: string) => Response.json({ config: { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache } });
+  let answer: () => Response | Promise<Response> = () => configured('off');
+  const fixture = await connectorFixture(t, { ...runtime, hostConfig: () => answer() });
+  const first = await startFixture(fixture);
+  // The next connection's configuration names another cache, and is still on its way when a request arrives.
+  const config = Promise.withResolvers<Response>();
+  answer = () => config.promise;
+  first.close();
+  const second = await fixture.sockets.next();
+  const { generation } = fixture.connector as unknown as { generation: { waiting: Set<unknown> } };
+  const queued = Promise.withResolvers<void>();
+  const add = generation.waiting.add.bind(generation.waiting);
+  const observing = t.mock.method(generation.waiting, 'add', (value: unknown) => {
+    const result = add(value);
+    queued.resolve();
+    return result;
+  });
+  second.open();
+  second.welcome();
+  const early = await rpc('view', '', 'replace-early');
+  second.receive(early);
+  await queued.promise;
+  observing.mock.restore();
+  config.resolve(configured('owner'));
+  const refused = JSON.parse(await second.messages.next()) as ConnectorRpcResponse;
+  assert.deepEqual([refused.id, refused.status], [early.id, 503]);
+  assert.match((JSON.parse(refused.body) as { error: string }).error, /restarting; try again shortly/);
+  await fixture.connected.next();
+  await fixture.workerCalls.next();
+  assert.equal(fixture.runtimes.length, 2);
+  assert.equal(fixture.runtimes[0]!.closed, true);
+  assert.deepEqual(fixture.runtimes.map(record => record.requests.length), [0, 0], 'the waiting request ran on neither runner');
+  assert.equal(second.readyState, 1);
+  assert.equal(second.sent.length, 1);
+});
