@@ -2609,7 +2609,7 @@ test('host owners add admins who manage sharing and host command grants, and gra
 test('host owners and admins configure how the host runs sessions, and only the owner decides whose credentials it uses', async t => {
   const f = await fixture(t); const s = await sharedHost(f); const outsider = await f.client('outsider');
   const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
-  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: {} };
   const listed = async (client: Client) => (await json<{ connectors: ConnectorInfo[] }>(await client.request('GET', '/api/connectors'))).connectors
     .find(item => item.id === id)?.config;
   // Its owner and the connector itself read it; members of a workspace it is shared with neither see nor change it.
@@ -2627,7 +2627,7 @@ test('host owners and admins configure how the host runs sessions, and only the 
     await denied(await host.request('PATCH', path, invalid), 400, 'invalid_host_config');
   }
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_configs').get()!.n, 0);
-  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true };
+  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true, compaction: {} };
   assert.deepEqual(await json(await host.request('PATCH', path, owned)), { config: owned });
   assert.deepEqual(await listed(host), owned);
   assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: owned });
@@ -2660,7 +2660,7 @@ test('a save changes only the settings it names, so what someone else saved mean
   // An admin's form loaded the defaults; then the owner turns on Git credentials and the cache.
   await json(await host.request('PATCH', path, { gitCredentials: true, repositoryCache: 'host' }));
   // The admin's save of the time limit names none of the owner's settings: it is neither refused nor undoes theirs.
-  const both = { commandTimeoutSeconds: 120, gpu: false, gitCredentials: true, repositoryCache: 'host', hostSessions: false };
+  const both = { commandTimeoutSeconds: 120, gpu: false, gitCredentials: true, repositoryCache: 'host', hostSessions: false, compaction: {} };
   assert.deepEqual(await json(await creator.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: both });
   // Nor does the owner's next save undo the admin's time limit.
   assert.deepEqual(await json(await host.request('PATCH', path, { gpu: true })), { config: { ...both, gpu: true } });
@@ -2676,10 +2676,37 @@ test('an admin\'s first configuration of a host leaves the owner\'s settings at 
   const f = await fixture(t); const s = await sharedHost(f);
   const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
   await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.creator.user.id}`));
-  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: {} };
   assert.deepEqual(await json(await s.creator.request('PATCH', path, config)), { config });
   assert.deepEqual({ ...f.sqlite.prepare('SELECT git_credentials, repository_cache, host_sessions, updated_by FROM connector_configs WHERE connector_id = ?').get(id) },
     { git_credentials: 0, repository_cache: 'off', host_sessions: 0, updated_by: s.creator.user.id });
+});
+
+test('a host\'s owner and admins set its compaction token counts, which its connector reads with the rest of its configuration', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  for (const invalid of [{ compaction: null }, { compaction: [] }, { compaction: { reserveTokens: -1 } }, { compaction: { reserveTokens: 1.5 } },
+    { compaction: { reserveTokens: 10_000_001 } }, { compaction: { enabled: false } }, { compaction: { modelOverrides: { model: { reserveTokens: 1 } } } },
+    { compaction: { modelOverrides: { 'anthropic/opus': { keepRecentTokens: '1' } } } }]) {
+    await denied(await host.request('PATCH', path, invalid), 400, 'invalid_host_config');
+  }
+  // Kept as it is read back: models sorted, and a model without counts left out.
+  const compaction = { reserveTokens: 32_768, modelOverrides: { 'openai/gpt-5': { keepRecentTokens: 4000 }, 'anthropic/opus': { reserveTokens: 65_536, keepRecentTokens: 20_000 }, 'faux/none': {} } };
+  const kept = { reserveTokens: 32_768, modelOverrides: { 'anthropic/opus': { reserveTokens: 65_536, keepRecentTokens: 20_000 }, 'openai/gpt-5': { keepRecentTokens: 4000 } } };
+  assert.deepEqual(await json(await host.request('PATCH', path, { compaction })), { config: { ...defaults, compaction: kept } });
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, compaction: kept } });
+  assert.equal(f.sqlite.prepare('SELECT compaction_json FROM connector_configs WHERE connector_id = ?').get(id)!.compaction_json, JSON.stringify(kept));
+  // A save of another setting keeps it; an admin changes it, as a whole, for as many models as a host offers.
+  assert.deepEqual(await json(await host.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: kept } });
+  await json(await host.request('PUT', `/api/connectors/${id}/admins/${creator.user.id}`));
+  const many = { modelOverrides: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`provider-${index}/${'m'.repeat(150)}`, { reserveTokens: 100_000 + index, keepRecentTokens: 9_999_999 }])) };
+  const saved = await json<{ config: { compaction: { modelOverrides: Record<string, unknown> } } }>(await creator.request('PATCH', path, { compaction: many }));
+  assert.equal(Object.keys(saved.config.compaction.modelOverrides).length, 200);
+  assert.deepEqual(await json(await creator.request('PATCH', path, { compaction: {} })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
+  // A setting the database no longer reads as valid is none.
+  f.sqlite.prepare('UPDATE connector_configs SET compaction_json = ? WHERE connector_id = ?').run('{"reserveTokens":"lots"}', id);
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
 });
 
 test('a host\'s owner and admins disable its models for everyone: a disabled model is neither listed, started from nor chosen', async t => {

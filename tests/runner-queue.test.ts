@@ -16,6 +16,7 @@ import { requestKey, RunnerError } from "../apps/runner/src/protocol.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 import { RunnerService } from "../apps/runner/src/server.js";
 import { RunnerSession, type RunnerConfig } from "../apps/runner/src/session.js";
+import { defaultHostConfig, type HostCompaction } from "../packages/shared/src/host-config.js";
 
 // These are integration-style source tests: real pi Harness, SQLite and sandbox tools.
 // Linux needs working bwrap FD mounts/user namespaces, Python 3 and Git, as in runner.test.ts.
@@ -768,6 +769,28 @@ test("sessions compact by the host's Pi compaction settings, per model where it 
   assert.equal(await compactions({ modelOverrides: { "faux/other-model": always } }), 0, "another model's override does not apply");
   assert.ok(await compactions(always) > 0, "a host-wide threshold applies to every model");
   assert.equal(await compactions({ ...always, enabled: false }), 0, "the host's Pi can turn automatic compaction off");
+});
+
+test("sessions compact by the token counts set in Pistead over the host's Pi settings, from their next message on", options, async t => {
+  let configured: HostCompaction = {};
+  // The host's Pi never compacts this conversation; Pistead's configuration of the host decides.
+  const f = await fixture(t, { config: { compaction: { reserveTokens: 0 }, hostConfig: async () => ({ ...defaultHostConfig, compaction: configured }) } });
+  const compactions = async () => (await f.session.view()).entries.filter(entry => entry.kind === "pi.compaction").length;
+  for (const requestId of ["first", "second"]) {
+    await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId });
+    await idle(f.session);
+  }
+  assert.equal(await compactions(), 0, "the host's Pi settings apply while Pistead sets nothing");
+  // A threshold no context fits under, keeping nothing verbatim, for the session's model alone.
+  configured = { modelOverrides: { "faux/queue-faux": { reserveTokens: 10_000_000, keepRecentTokens: 0 } } };
+  await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId: "third" });
+  await idle(f.session);
+  const compacted = await compactions();
+  assert.ok(compacted > 0, "the next message compacts by the configured counts");
+  configured = {};
+  await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId: "fourth" });
+  await idle(f.session);
+  assert.equal(await compactions(), compacted, "clearing them goes back to the host's Pi settings");
 });
 
 test("parked background work, such as a compaction, is aborted without ending the message that is running", options, async t => {

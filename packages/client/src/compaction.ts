@@ -19,5 +19,6 @@ export function compactionFailureText(failure: CompactionFailure, options: { adv
   if (options.advice === false) return cause;
   if (failure === "aborted") return `${cause} Send the message again to retry.`;
   return `${cause} Retrying at the same reasoning level will fail the same way: send the next message with a lower reasoning level, `
-    + "or continue in a new session. The host owner can also raise Pi's compaction.reserveTokens for this model.";
+    + "or continue in a new session. The host's owner or an admin can also raise this model's reserve tokens under Settings → Hosts → "
+    + "the host → Compaction (Pi's compaction.reserveTokens).";
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compactionFailure, hostCompaction, reasoningReserveTokens } from "../apps/runner/src/compaction.js";
+import { compactionFailure, configuredCompaction, hostCompaction, reasoningReserveTokens } from "../apps/runner/src/compaction.js";
 import { sharedView } from "../apps/server/src/session-links.js";
 import { compactionFailureText } from "../packages/client/src/compaction.js";
 import type { SessionView } from "../packages/shared/src/types.js";
@@ -25,6 +25,7 @@ test("a compaction failure says what happened and that retrying as before won't 
   assert.match(text, /lower reasoning level/);
   assert.match(text, /new session/);
   assert.match(text, /reserveTokens/);
+  assert.match(text, /Settings → Hosts → the host → Compaction/);
   assert.doesNotMatch(compactionFailureText("token_limit", { advice: false }), /reasoning level/);
 });
 
@@ -66,4 +67,23 @@ test("the host's own compaction settings win over the reasoning default", () => 
     enabled: true,
     modelOverrides: { "anthropic/opus": { reserveTokens: 16_384 }, "anthropic/sonnet": { reserveTokens: 20_000, keepRecentTokens: 1000 } },
   });
+});
+
+test("token counts set in Pistead replace the host's Pi settings, count by count and model by model", () => {
+  const pi = { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000, modelOverrides: { "anthropic/opus": { reserveTokens: 40_000, keepRecentTokens: 5000 } } };
+  assert.equal(configuredCompaction(pi, undefined), pi, "nothing set in Pistead keeps the host's settings");
+  assert.equal(configuredCompaction(pi, {}), pi);
+  assert.equal(configuredCompaction(undefined, {}), undefined);
+  assert.deepEqual(configuredCompaction(pi, { reserveTokens: 32_768, modelOverrides: { "anthropic/opus": { reserveTokens: 65_536 }, "openai/gpt-5": { keepRecentTokens: 1000 } } }), {
+    enabled: true, reserveTokens: 32_768, keepRecentTokens: 20_000,
+    modelOverrides: { "anthropic/opus": { reserveTokens: 65_536, keepRecentTokens: 5000 }, "openai/gpt-5": { keepRecentTokens: 1000 } },
+  });
+  assert.deepEqual(configuredCompaction(undefined, { keepRecentTokens: 0 }), { keepRecentTokens: 0 });
+  // Through the reasoning default: a count for every model set in Pistead turns it off, as one in Pi's settings does.
+  const models = [{ provider: "anthropic", id: "sonnet", reasoning: true, contextWindow: 200_000 }];
+  assert.deepEqual(hostCompaction(configuredCompaction(undefined, { reserveTokens: 16_384 }), models), { reserveTokens: 16_384 });
+  assert.deepEqual(hostCompaction(configuredCompaction(undefined, { modelOverrides: { "anthropic/sonnet": { reserveTokens: 50_000 } } }), models),
+    { modelOverrides: { "anthropic/sonnet": { reserveTokens: 50_000 } } });
+  assert.deepEqual(hostCompaction(configuredCompaction(undefined, { keepRecentTokens: 4000 }), models),
+    { keepRecentTokens: 4000, modelOverrides: { "anthropic/sonnet": { reserveTokens: 20_000 } } });
 });

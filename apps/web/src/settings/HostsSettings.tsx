@@ -10,6 +10,7 @@ import { Icon } from "../icons";
 import { href, navigate } from "../router";
 import { Alert, Button, CardBody, Collapsible, Combobox, confirmDialog, CopyField, EmptyState, Feedback, Field, Loading, ResourceState, Row, Section, Sheet, StatusDot, Timestamp, useAction, useResource, type ActionState } from "../ui";
 import { HostAdminsSection, HostCommandGrantsSection } from "./HostAccess";
+import { HostCompactionSection } from "./HostCompaction";
 import { HostConfigSection } from "./HostConfig";
 import "./settings.css";
 
@@ -232,6 +233,7 @@ function HostSections({ connector, refresh }: { connector: ConnectorInfo; refres
       <Feedback error={shareAction.error} notice={shareAction.notice} />
     </Section>
     <HostConfigSection connector={connector} refresh={refresh} />
+    {connector.config && <HostCompactionSection connector={connector} refresh={refresh} />}
     {connector.capabilities.hostCommands && <HostCommandGrantsSection connector={connector} refresh={refresh} />}
     <HostAdminsSection connector={connector} refresh={refresh} />
     <Section title="Details">

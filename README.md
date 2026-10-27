@@ -209,6 +209,8 @@ The setting stays with the host until someone enables the model again, even if P
 Sessions on a host also follow two more of its Pi settings:
 
 - **Compaction**: `compaction` (`enabled`, `reserveTokens`, `keepRecentTokens`) decides when a long conversation is summarized, and `compaction.modelOverrides` sets the token values per exact `provider/modelId`, so a session that switches between a small-window and a large-window model compacts in time for each. Pi's defaults apply where these are unset, with one exception: a reasoning model keeps a tenth of its context window, between 16K and 64K tokens, as `reserveTokens` instead of Pi's 16K. Pi summarizes at the conversation's reasoning level within 80% of `reserveTokens`, so at 16K a model thinking at a high level can spend the whole budget thinking, and once the context is past the threshold every message fails the same compaction. Set `reserveTokens` (overall or for the model) to use another value.
+
+  The host's owner and its admins can also set these token counts in Pistead, without touching the machine: under **Settings → Hosts →** the host **→ Compaction**, enter **Reserve** and **Keep recent** tokens for all models, or for single models under **Per model**. Each count set there replaces the one in the host's `settings.json`; an empty one keeps it. Sessions use a change from their next message, without restarting the connector. This needs a connector from this release or later.
 - **Provider attribution**: with Pi's `enableInstallTelemetry` set to `false` (or `PI_TELEMETRY=0`), sessions' model requests carry no attribution headers to pi, as Pi's own don't.
 
 The connector reads these when it starts; restart it after changing them.

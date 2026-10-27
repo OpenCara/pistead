@@ -1,5 +1,6 @@
 import type { CompactionSettings } from "@earendil-works/pi-durable";
 import type { CompactionFailure } from "../../../packages/shared/src/types.js";
+import type { HostCompaction } from "../../../packages/shared/src/host-config.js";
 
 /**
  * Pi's own fixed text for a blocking compaction that failed (pi-durable harness/generation and harness/compaction),
@@ -53,4 +54,18 @@ export function hostCompaction(host: CompactionSettings | undefined, models: Ite
   const modelOverrides: Record<string, Partial<Omit<CompactionSettings, "modelOverrides">>> = { ...overrides };
   for (const [key, override] of Object.entries(host?.modelOverrides ?? {})) modelOverrides[key] = { ...overrides[key], ...override };
   return { ...host, modelOverrides };
+}
+
+/**
+ * The host's Pi `compaction` setting with the token counts its owner and admins set in Pistead (HostConfig.compaction)
+ * over it: each count set there replaces Pi's, for every model and for each model by itself, and Pi's other fields
+ * (`enabled`, say) stay. A count set for every model in Pistead still gives way to a model's own one in Pi's settings,
+ * as Pi's model overrides always win over its harness-wide counts.
+ */
+export function configuredCompaction(pi: CompactionSettings | undefined, configured: HostCompaction | undefined): CompactionSettings | undefined {
+  if (!configured || (configured.reserveTokens === undefined && configured.keepRecentTokens === undefined && !configured.modelOverrides)) return pi;
+  const { modelOverrides: overrides, ...overall } = configured;
+  const merged: Record<string, Partial<Omit<CompactionSettings, "modelOverrides">>> = { ...pi?.modelOverrides };
+  for (const [model, tokens] of Object.entries(overrides ?? {})) merged[model] = { ...merged[model], ...tokens };
+  return { ...pi, ...overall, ...(Object.keys(merged).length ? { modelOverrides: merged } : {}) };
 }
