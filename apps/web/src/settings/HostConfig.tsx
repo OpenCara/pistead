@@ -64,7 +64,7 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
       })) return;
       if (config.repositoryCache !== "off" && saved.repositoryCache === "off" && !await confirmDialog({
         title: "Keep a repository cache on this host?",
-        message: `${connector.name} will keep a full mirror of each repository its sessions clone, in its state directory, and their clones will borrow objects from it. Clone sessions fill it through Pistead with their owner's own access; sessions that pinned their repositories fetch with this machine's Git credentials.`,
+        message: `${connector.name} will keep a full mirror of each repository its sessions clone, in its state directory, and their clones will borrow objects from it. It fills the mirrors straight from the repositories' hosts with the credentials Git on that machine would use (its credential helpers), and a session borrows from one only once Pistead confirms that the session's owner can read the repository with their own account.`,
         confirmLabel: "Keep a cache",
       })) return;
       if (config.hostSessions && !saved.hostSessions && !await confirmDialog({

@@ -25,7 +25,7 @@ The rules this keeps from today:
    follows a per-workspace network policy (off, allowlist, open).
 2. **Repositories on demand, no pins.** Sessions start empty; the agent clones what it needs with plain Git. The
    commits served and pushed are recorded for audit instead of pins. Branches are plain Git.
-3. **Host cache.** A bare mirror per repository on the host, filled by the proxy and mounted read-only into sandboxes
+3. **Host cache.** A bare mirror per repository on the host, filled by the host and mounted read-only into sandboxes
    authorized for it; sessions borrow its objects through `objects/info/alternates` (a `git` shim adds
    `--reference-if-able` to clones of bound repositories). Keep refs per live session, prune with a grace period,
    `pistead cache add` / `pistead cache prune`. Sparse checkout and partial clone served from the mirror.
@@ -152,23 +152,35 @@ the insert, but resolves nothing with the owner's accounts. The relay checks the
 Hosts whose configuration keeps a repository cache keep one bare mirror per repository ([repository-cache.md](repository-cache.md)),
 which pinned sessions were checked out of until phase 5. Clone sessions borrow from the same mirrors.
 
-- **Filled through the relay.** `RepositoryCache.refresh` fetches every branch and tag the remote advertises that the
-  mirror lacks, with a `GitRemote` whose `fetch` is `relayFetch`: every read goes through the control plane's relay,
-  with the session owner's own account and the relay's checks. Refreshes are serialized per repository with a lock,
-  and report progress.
-- **Asked for by the clone.** Clone sessions' shell commands get a `git` shim first on `PATH`. For `git clone` of a
-  URL, it asks the proxy's `/__pistead/mirror?remote=…` (up to 20 seconds), which maps the URL to a workspace
-  repository, refreshes its mirror and answers its path in the sandbox; the shim then adds `--reference-if-able`.
-  Clones that already chose `--reference`, `--shared` or `--dissociate`, and everything else, run Git unchanged.
+- **Filled with the host's own Git credentials.** Before a session asks for a mirror, the relay lists the repository's
+  branches and tags with the session owner's own account, which confirms they may read it. `RepositoryCache.refresh`
+  then fetches the history of the listed tips the mirror lacks straight from the provider, with the credential Git on
+  the host would use (or anonymously, for a public repository on a host without one), and mirrors that listing. No
+  pack goes through the relay for the cache. Refreshes are serialized per repository with a lock, report progress, and
+  try again after a failure another attempt may get past.
+- **Waited for by the clone.** Clone sessions' shell commands get a `git` shim first on `PATH`. For `git clone` of a
+  URL, it asks the proxy's `/__pistead/mirror?remote=…`, which maps the URL to a workspace repository, confirms the
+  owner's access, makes its mirror ready (`RepositoryCache.ready`) and answers its path in the sandbox, streaming the
+  fill's progress until then (one JSON object per line, with a heartbeat); the shim then adds `--reference-if-able`.
+  A mirror's first fill is waited for however long it takes, and the shim says so on stderr: the clone never downloads
+  the repository through the relay beside it. The fill goes on if the command stops (its time limit, say), so running
+  the clone again picks it up. A mirror filled before is refreshed first, but borrowed as it is after 10 seconds. Only a
+  mirror the host can't fill at all (its credential can't read the repository, or the relay's listing of it fails the
+  same way every time) lets the clone go ahead without it, with the reason. A dropped connection is asked again while
+  the fill goes on, and so, twice, is a failure another attempt may get past (answered with `retry`: the relay was busy,
+  failing or too slow to list the repository just now, or the host's download kept breaking off); a mirror that stays
+  unavailable stops the clone, to be run again. Relayed reads keep to their caller's time limit (`relayFetch` honours
+  its signal), so a relay that hangs is a failure to ask again rather than a wait without end. Clones that already chose `--reference`, `--shared` or `--dissociate`, and
+  everything else, run Git unchanged.
 - **Mounted only while authorized.** A mirror is mounted read-only at `/repository-mirrors/<provider>/<host>/<id>.git`
   (`mirrorPath`) for shell commands and for the steps that run Git in a clone (`clone-head`, `clone-push-*`; a
-  borrowing clone can't read its objects without it). It is mounted only while the repository is in the session's
-  grant and the relay let the owner read it in the last 10 minutes: after this open's refresh of it, or, for a mirror
-  that already existed when the session was reopened, after a ref listing through the relay confirms it (asked for
-  again every 10 minutes, at the next step that needs it). A refusal from the relay (a 4xx other than a timeout or rate
-  limit), or the grant dropping the repository, unmounts it for the rest of the open; a timeout, a rate limit or an
-  outage only leaves it out of that step. Mounts are fixed when a step starts, so a mirror the session's
-  first clone created is visible from its next command on.
+  borrowing clone can't read its objects without it). Each open creates the mirror of every workspace repository the
+  host lacks, empty, before any command runs. It is mounted only while the repository is in the session's grant and the
+  relay let the owner read it in the last 10 minutes: after a ref listing through the relay confirms it, at the first
+  step that needs it and again every 10 minutes, or when a clone asks for it. A refusal from the relay (a 4xx other than
+  a timeout or rate limit), or the grant dropping the repository, unmounts it for the rest of the open; a timeout, a
+  rate limit or an outage only leaves it out of that step. Mounts are fixed when a step starts: a mirror the command's
+  step couldn't mount fails its clone with a message to run it again, rather than cloning without it.
 - **Kept and pruned.** Each refresh moves the session's keep ref (`refs/pistead/sessions/<hash>`) to a new commit whose
   parents are its previous keep commit and the branch tips it saw (500 per commit, chained), so the objects its clones
   borrowed stay reachable; each confirmation moves it on too (`touch`), dating its last use. `pistead cache prune
@@ -179,8 +191,8 @@ which pinned sessions were checked out of until phase 5. Clone sessions borrow f
 ### Not in phase 3
 
 - Shell commands still stop after the host's command time limit (30 seconds by default). A first clone of a big
-  repository can outlast that; its mirror keeps filling in the runner, so a later clone borrows from it.
-- Pre-filling a mirror without a session: every fill needs a session's owner and the relay.
+  repository can outlast that; its mirror keeps filling in the runner, so the clone run again borrows from it.
+- Pre-filling a mirror without a session: which repositories to fill, and when, needs a session to say.
 
 ## Phase 4: pushing the session branch
 
@@ -245,9 +257,10 @@ clones that borrow from the host's mirror.
   list of pending clones are staged in the worktree's `.git/pistead-clones`, which shell commands see read-only.
 - **Opening the restored session.** Pending clones are cloned again in the background, as a cache host prepares pinned
   repositories, and runs wait for it. For each (`clone-restore`, with the proxy socket and the mirrors): its origin must
-  be one of the workspace's repositories; the mirror is refreshed through the relay where the host keeps a cache and
-  borrowed from; `git clone --no-checkout` goes through the proxy into a staging directory; commits the bundle builds on
-  that the origin no longer lists (a branch merged and deleted) are fetched by commit; the bundle is fetched; branches
+  be one of the workspace's repositories; where the host keeps a cache, the mirror is made ready (with the host's own Git
+  credentials, once the relay confirms the owner's access) and borrowed from; `git clone --no-checkout` goes through the
+  proxy into a staging directory; commits the bundle builds on that the origin no longer lists (a branch merged and
+  deleted) are fetched by commit; the bundle is fetched; branches
   and HEAD are set; the working tree is checked out from the backup commit and the index reset to HEAD, so the changes
   show as uncommitted again; and the clone is moved into place. A path already taken is never overwritten, unless it is
   this restoration's own result (a marker in its `.git`), left by a runner that stopped before updating the list. A

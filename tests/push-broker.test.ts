@@ -1059,7 +1059,14 @@ test('a session on a host shows the pull request GitHub has for a branch its hos
   // A branch no longer checked out keeps the pull request it found; one that found none is forgotten.
   assert.equal((await f.post(branches, { sessionId: 'session', branches: [{ repository: 'owner/repo', branch: 'other' }] })).status, 200);
   assert.deepEqual(rows().map(row => [row.branch, row.pull_request_url]), [['feature', 'https://github.com/owner/repo/pull/5'], ['other', null]]);
-  assert.equal((await f.post(branches, { sessionId: 'session', branches: [] })).status, 200);
+  // Even when the next report comes within the same millisecond.
+  const realNow = Date.prototype.toISOString;
+  const frozen = new Date().toISOString();
+  Date.prototype.toISOString = function () { return frozen; };
+  try {
+    assert.equal((await f.post(branches, { sessionId: 'session', branches: [{ repository: 'owner/repo', branch: 'third' }] })).status, 200);
+    assert.equal((await f.post(branches, { sessionId: 'session', branches: [] })).status, 200);
+  } finally { Date.prototype.toISOString = realNow; }
   assert.deepEqual(rows().map(row => row.branch), ['feature']);
 
   f.state.githubPulls[5] = { ...f.state.githubPulls[5]!, state: 'closed', merged: true };

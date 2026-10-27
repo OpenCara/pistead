@@ -47,8 +47,13 @@ export async function reportSessionBranches(c: AppContext, connectorId: string):
   const statements = [...branches.values()].map(item => c.env.DB.query(`INSERT INTO session_branches (session_id, repository, branch, reported_at)
     VALUES (?, ?, ?, ?) ON CONFLICT (session_id, repository, branch) DO UPDATE SET reported_at = excluded.reported_at`)
     .bind(row.id, item.repository, item.branch, at));
-  // Branches no longer checked out are forgotten, unless they found a pull request.
-  statements.push(c.env.DB.query('DELETE FROM session_branches WHERE session_id = ? AND reported_at < ? AND pull_request_url IS NULL').bind(row.id, at));
+  // Branches no longer checked out are forgotten, unless they found a pull request. They're told apart by name rather
+  // than by report time, which two reports in the same millisecond share.
+  const keys = [...branches.keys()];
+  statements.push(keys.length
+    ? c.env.DB.query(`DELETE FROM session_branches WHERE session_id = ? AND pull_request_url IS NULL
+      AND repository || ? || branch NOT IN (${keys.map(() => '?').join(', ')})`).bind(row.id, '\n', ...keys)
+    : c.env.DB.query('DELETE FROM session_branches WHERE session_id = ? AND pull_request_url IS NULL').bind(row.id));
   await c.env.DB.batch(statements);
   return c.json({ ok: true });
 }

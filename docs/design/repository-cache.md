@@ -33,14 +33,34 @@ repo-cache/<provider>/<host>/<repositoryId>.git.pistead.lock # holder's pid: one
 ## Filling a mirror
 
 `RepositoryCache.refresh` brings a mirror up to date with every branch and tag the remote advertises: it lists the
-remote's refs, fetches the tips the mirror lacks with their full history (`GitRemote.fetchHistory`, offering the tips
-it already has), checks the result is complete as `git fetch` does (`rev-list --objects`), and updates
+remote's refs (or takes the listing it is given), fetches the tips the mirror lacks with their full history
+(`GitRemote.fetchHistory`, offering the tips it already has), checks the result is complete as `git fetch` does (`rev-list --objects`), and updates
 `refs/upstream/*`. A remote that refuses a ref (a hidden one) just leaves it out.
 
-Every fetch goes through a `GitRemote` the caller supplies. For clone sessions that is the session's relay
-(`relayFetch`): the control plane reads the repository with the session owner's own account and checks the session's
-access on every request. The host uses no credential of its own and the cache decides no access; a session can borrow
-a mirror only while the relay confirms its owner may read the repository (see [egress.md](egress.md), phase 3).
+Every fetch goes through a `GitRemote` the caller supplies. For clone sessions (`RunnerSession.cacheRemote`) it reads
+the repository straight from its provider with the credential Git on the host would use (`hostGitAuthorization`: its
+credential helpers), or anonymously where the host has none for the provider. Mirrors were once filled through the
+control plane's relay, which carried every pack from the provider to the host: an order of magnitude slower than the
+host's own network, cut off with every reconnect of the connector, and never resumed.
+
+The cache decides no access. Before a session asks for a mirror, the relay lists the repository's branches and tags with
+the session owner's own account (checking a rename or transfer, as every relayed read does), which confirms that they
+may read it; a session borrows a mirror only while that confirmation is recent (see [egress.md](egress.md), phase 3).
+The fill comes after it, so a session can't have the host download a repository its owner can't read, and it mirrors
+that listing (`MirrorTarget.refs`): the host's credential only downloads the history of the tips the owner's listing
+named, so a mirror never holds what that listing didn't reach, even if the repository's name changed hands in between.
+
+- **Retries.** A ref listing or fetch that fails in a way another attempt may get past (the connection failed or broke
+  off, the remote answered 5xx, 408 or 429; `GitRemoteError.retryable`) is tried twice more, after 2 and 10 seconds;
+  anything else, an unforeseen error included, is final. A fetch starts again from what the mirror had: a pack that
+  broke off is not kept.
+- **Temporary packs.** index-pack leaves `objects/pack/tmp_*` behind when its pack breaks off. Each fetch removes them
+  before it starts and after it fails, and so does a prune, all with the mirror's lock held, so no fetch is writing them.
+- **Ready to borrow** (`RepositoryCache.ready`). A mirror no fill has completed yet (`filled`: it mirrors no branch or
+  tag) is filled first, however long that takes. A filled one is refreshed too, but answered as it is after a bounded
+  wait or a failed refresh, while the refresh goes on: a clone borrows what it has and fetches only the rest.
+- **Created up front** (`RepositoryCache.prepare`). A session creates the empty mirror of each workspace repository when
+  it opens, so the command that first clones one already mounts the mirror its clone waits to fill.
 
 Only the runner writes to the cache, outside any sandbox. Sandboxes mount a mirror read-only.
 
@@ -69,4 +89,7 @@ network traffic goes through `GitRemote`.
 ## Open questions
 
 - A size budget per host, evicting whole mirrors no session has used for longest.
-- Pre-filling a mirror without a session: every fill needs a session's owner and the relay.
+- Pre-filling a mirror without a session. Fills need no relay any more, but which repositories to fill, and when, needs
+  a session (or a setting) to say.
+- Resuming a fill that broke off from where it was, rather than from what the mirror had: with the host's own network
+  a fill rarely takes long enough for it to matter.
