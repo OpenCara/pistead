@@ -166,12 +166,16 @@ export async function requireSession(c: AppContext, sessionId: string, permissio
   const access = await sessionAccess(c.env, sessionId, c.get('auth').userId);
   if (!access) fail(404, 'not_found', 'Session not found.');
   if (!hasPermission(access.permissions, permission)) fail(403, 'forbidden', `Session ${permission} permission is required.`);
-  if (access.row.status === 'archived' && permission !== 'read') fail(409, 'session_archived', 'Session is archived.');
-  if (permission !== 'read' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
+  if (permission !== 'read') await requireActiveSession(c.env, access.row);
+  return access;
+}
+/** What anything but a read of a session waits for: it isn't archived, being restored into, or moving to another host. */
+export async function requireActiveSession(env: Env, row: Pick<SessionRow, 'id' | 'status'>): Promise<void> {
+  if (row.status === 'archived') fail(409, 'session_archived', 'Session is archived.');
+  if (await env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
-  if (permission !== 'read') await requireNoMigration(c.env, sessionId);
-  return access;
+  await requireNoMigration(env, row.id);
 }
 /**
  * A session moving to another host, and its successor until the move completes, accept nothing but reads.

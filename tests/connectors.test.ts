@@ -1252,6 +1252,67 @@ test('only the session owner answers a permission request, for one call or the s
   await denied(await s.creator.request('POST', `${path}/operations`, { kind: 'permission', tool: 'bash', target: '', needs: ['tool'] }), 400, 'invalid_operation');
 });
 
+test('the host\'s owner decides host commands in a session on it they can read, once its connector lets them; nothing else and nobody else without approve', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'host_bash', 'github_comment']);
+  const path = `/api/sessions/${s.session.id}`;
+  const pending = (id: string, operation: Operation): ApprovalRecord => ({
+    id, sessionId: s.session.id, requestedBy: s.creator.user.id, operation, status: 'pending', createdAt: new Date().toISOString(),
+  });
+  const command = pending('tool-call-1', { kind: 'host.bash', command: 'dotnet --info', timeoutSeconds: 300 });
+  const comment = pending('tool-call-2', { kind: 'github.comment', repository: 'owner/repo', issue: 3, body: 'Looks good.' });
+  let approvals = [command, comment];
+  const decisions: { approvalId: string; actorId: string; decision: string }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const { admissionId } = JSON.parse(envelope.request.body) as { admissionId: string };
+      approvals = approvals.map(approval => ({ ...approval, admissionId }));
+      return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: true,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string; decision: string };
+    decisions.push({ approvalId: input.approvalId, actorId: envelope.request.ticket.actorId, decision: input.decision });
+    const decided: ApprovalRecord = { ...approvals.find(approval => approval.id === input.approvalId)!, status: input.decision === 'approve' ? 'executing' : 'denied',
+      decidedBy: envelope.request.ticket.actorId };
+    approvals = approvals.map(approval => approval.id === decided.id ? decided : approval);
+    return Response.json({ approval: decided });
+  });
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Comment, then check the SDK', requestId: 'host-owner-write' }), 202);
+  // The host's owner follows the workspace-visible session with read access only, and no session role.
+  const { session } = await json<{ session: SessionRecord }>(await s.host.request('GET', path));
+  assert.deepEqual(session.permissions, ['read']);
+  const presented = new Map((await json<{ view: SessionView }>(await s.host.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
+  const decide = (client: typeof s.creator, approval: ApprovalRecord, decision = 'approve') =>
+    client.request('POST', `${path}/approvals/${approval.id}`, { decision, reviewHash: presented.get(approval.id)!.reviewHash });
+
+  // A connector that predates it checks approve permission on every decision, its owner's included.
+  await denied(await decide(s.host, command), 403, 'forbidden');
+  const capabilities = { ...manifest.capabilities, hostCommands: true, hostGrants: true };
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostOwnerDecides: 'yes' } }), 400);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostOwnerDecides: true } }), 400);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostOwnerDecides: true } }));
+  // Now the host command is its owner's to decide; anything else still needs approve permission.
+  await denied(await decide(s.host, comment, 'deny'), 403, 'forbidden');
+  // A member granted host commands, here the workspace's owner, still needs approve permission on the session.
+  await json(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/host-grants/${s.team.id}`, { level: 'approve', userId: s.admin.user.id }));
+  await denied(await decide(s.admin, command), 403, 'forbidden');
+  assert.deepEqual(decisions, []);
+  const approved = await json<{ approval: ApprovalRecord }>(await decide(s.host, command));
+  assert.deepEqual([approved.approval.status, approved.approval.decidedBy], ['executing', s.host.user.id]);
+  assert.deepEqual(decisions, [{ approvalId: command.id, actorId: s.host.user.id, decision: 'approve' }]);
+  await denied(await decide(s.host, command), 409, 'approval_already_decided');
+  // An archived session takes no decisions, its host's owner's included.
+  approvals = approvals.map(approval => approval.id === command.id ? { ...approval, status: 'pending' as const, decidedBy: undefined } : approval);
+  f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = ?").run(s.session.id);
+  await denied(await decide(s.host, command), 409, 'session_archived');
+  assert.equal(decisions.length, 1);
+});
+
 test('per-message chat options are checked against the session host, mode and owner before reaching the runtime', async t => {
   const f = await fixture(t); const s = await sharedSession(f);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'ask', 'write'] }));

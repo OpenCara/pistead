@@ -8,11 +8,11 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { RunnerService } from "../apps/runner/src/server.js";
+import { RunnerService, createRunnerApp } from "../apps/runner/src/server.js";
 import { RunnerError } from "../apps/runner/src/protocol.js";
 import type { RunnerSession } from "../apps/runner/src/session.js";
 import type { AuthorizationRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubReadRequest, RunnerAction, RunnerBinding, RunnerTicket } from "../packages/shared/src/types.js";
-import { sha256 } from "../packages/shared/src/crypto.js";
+import { sha256, signToken } from "../packages/shared/src/crypto.js";
 
 const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
 const head = "c".repeat(40);
@@ -287,6 +287,67 @@ test("host_bash auto-approves only on the session owner's own host; shared hosts
       await assert.rejects(session.decide(await claims("approve", hostOwner), approval.id, { decision: "approve", operation: approval.operation }), /already been decided/);
     }
   });
+});
+
+test("the host's owner decides a host command with read access to someone else's session; anything else still needs approve permission", hostMode, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-host-owner-")));
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("github_comment", { repository: "acme/alpha", issue: 7, body: "Looks good." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("host_bash", { command: "printf host-owner-marker", timeout_seconds: 10 })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Done."),
+  ]);
+  const models = createModels(); models.setProvider(faux.provider);
+  const target = binding("host-owner-decides");
+  target.agent.tools = ["github_comment", "host_bash"];
+  target.session.connectorId = target.model.connectorId = "host-connector";
+  target.session.connectorOwnerId = target.model.connectorOwnerId = "test:bob";
+  const secret = "host-owner-decides-secret-not-for-deployment";
+  // bob follows alice's session, as a workspace-visible one, without approve permission on it.
+  const asked: string[] = [];
+  const service = new RunnerService({
+    dataDir: directory, sharedSecret: secret, controlPlaneUrl: "http://127.0.0.1:8787",
+    connectorId: "host-connector", allowFaux: true, unsandboxed: true,
+    authorize: async input => {
+      if (input.actorId === "test:bob") asked.push(input.permission);
+      return { allowed: input.actorId === "test:alice" || input.permission === "read", ownerId: input.ownerId, policyVersion: 1 };
+    },
+    resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
+  });
+  await service.initialize();
+  t.after(async () => { await service.close(); await rm(directory, { recursive: true, force: true }); });
+  const claims = async (action: RunnerAction, actorId = "test:alice") => ({ ...await ticket(target.session.id, action), actorId, connectorId: "host-connector" });
+  const session = await service.provision(target, await claims("create"));
+  const app = createRunnerApp(service);
+  // bob's decisions reach the host as the control plane sends them, through the runner's own permission check.
+  const decide = async (approvalId: string, body: Record<string, unknown>) => {
+    const serialized = JSON.stringify({ approvalId, ...body });
+    const token = await signToken({ ...await claims("approve", "test:bob"), bodyHash: await sha256(serialized) }, secret);
+    return app.request(`/v1/sessions/${target.session.id}/approvals/${approvalId}`, { method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: serialized });
+  };
+  await session.submit(await claims("submit"), { content: "Comment, then run on the host", requestId: "host-owner", admissionId: await sha256("host-owner-admission"),
+    options: { access: "approval" } }, "write");
+
+  // The comment runs as alice, so it is hers to decide: bob's read access doesn't, nor does calling it a host command.
+  const comment = await pendingApproval(session);
+  assert.equal(comment.operation.kind, "github.comment");
+  assert.equal((await decide(comment.id, { decision: "deny", operation: comment.operation })).status, 403);
+  assert.equal((await decide(comment.id, { decision: "deny", operation: { kind: "host.bash", command: "true", timeoutSeconds: 10 } })).status, 409);
+  assert.equal((await session.view()).approvals.find(approval => approval.id === comment.id)!.status, "pending");
+  await session.decide(await claims("approve"), comment.id, { decision: "deny", operation: comment.operation });
+
+  // The host command runs as bob's OS user: read access to the session is enough to decide it, and when it runs.
+  const command = await pendingApproval(session);
+  assert.deepEqual(command.operation, { kind: "host.bash", command: "printf host-owner-marker", timeoutSeconds: 10 });
+  asked.length = 0;
+  const response = await decide(command.id, { decision: "approve", operation: command.operation });
+  assert.equal(response.status, 200, await response.clone().text());
+  await idle(session);
+  const settled = (await session.view()).approvals.find(approval => approval.id === command.id)!;
+  assert.deepEqual([settled.status, settled.decidedBy], ["executed", "test:bob"]);
+  assert.match(settled.result!, /host-owner-marker/);
+  assert.ok(asked.length >= 2 && asked.every(permission => permission === "read"), `bob is asked only for read access: ${asked.join()}`);
 });
 
 test("host commands outside the agent are allowed one call at a time, never for the session", hostMode, async t => {

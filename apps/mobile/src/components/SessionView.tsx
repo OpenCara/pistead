@@ -1,5 +1,5 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommands, HOST_COMMAND_WAITING, initialSelection, isHostCommand, modelUnavailable,
+  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommand, HOST_COMMAND_WAITING, initialSelection, isHostCommand, modelUnavailable,
   mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
@@ -75,9 +75,21 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   useEffect(() => { setLiveActivity(viewActivity ? { sessionId: id, activity: viewActivity } : null); }, [id, viewActivity, setLiveActivity]);
   useEffect(() => () => { setLiveActivity(null); refreshSessions(); }, [setLiveActivity, refreshSessions]);
 
+  /**
+   * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
+   * command, as every command of a session that runs on its host is, is decided by its host's owner, or a member granted
+   * host commands with approve permission here; everything else by anyone with approve permission.
+   */
+  function decides(approval: ApprovalRecord): boolean {
+    if (readOnly) return false;
+    if (isHostCommand(approval.operation, session ?? {})) return decidesHostCommand(session ?? {}, host, user.id, permissions.includes("approve"));
+    const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
+    return canApprove && (!ownerOnly || isOwner);
+  }
+
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
-    if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
+    if (!decides(approval) || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
     // The card is the prompt: it shows the exact operation, who it runs as, its resource limits and any unsandboxed-host warning, so a tap decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
@@ -116,14 +128,11 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
 
   const pendingApprovalCard = (approval: ApprovalRecord) => {
     const permission = approval.operation.kind === "permission";
-    // Only the session owner can let a call do more than the session allows. A host command, as every command of a
-    // session that runs on its host is, is decided by its host's owner or a member granted host commands.
     const hostCommand = isHostCommand(approval.operation, session ?? {});
     const ownerOnly = permission || approval.operation.kind === "git.repin";
-    const decides = canApprove && (hostCommand ? decidesHostCommands(session ?? {}, host, user.id) : !ownerOnly || isOwner);
     const disabled = approvalAction.busy || !approval.reviewHash;
     return <ApprovalCard approval={approval} key={approval.id}>
-      {decides ? <>
+      {decides(approval) ? <>
         {!approval.reviewHash && <Banner tone="warning" title="No verified review commitment" actions={<Button small label="Refresh approval" disabled={approvalAction.busy} onPress={live.refresh} />}>
           Refresh before deciding; the server must bind the displayed operation and requester.
         </Banner>}

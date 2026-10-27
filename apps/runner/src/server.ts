@@ -209,7 +209,9 @@ export function createRunnerApp(service: RunnerService): Hono {
     }
     const session = await service.get(id);
     if (ticket.ownerId !== session.binding.owner.id) throw new RunnerError(403, "Ticket owner mismatch");
-    await session.authorize(ticket.actorId, permissionFor(action), ticket.policyVersion);
+    // A decision needs approve permission, but the host's owner decides a host command with any access to the session:
+    // decide() checks which one the card's operation needs.
+    await session.authorize(ticket.actorId, action === "approve" ? "read" : permissionFor(action), ticket.policyVersion);
     if (action === "operations" || action === "restart" || action === "backup") await session.consumeTicket(ticket);
     if (action === "view") {
       let views = revisions.get(session);

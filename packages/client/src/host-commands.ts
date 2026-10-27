@@ -21,5 +21,18 @@ export function decidesHostCommands(session: Pick<SessionRecord, "connectorOwner
   return (session.connectorOwnerId !== undefined && session.connectorOwnerId === userId) || host?.hostCommandAccess !== undefined;
 }
 
+/**
+ * Whether `userId` decides a host command card of the session they can see, as the control plane lets them: with approve
+ * permission on it (`canApprove`) and host command authority there (see `decidesHostCommands`); or, as the owner of its
+ * host, without approve permission, once the host's connector lets its owner decide them so (`hostOwnerDecides`; older
+ * ones check approve permission on every decision). The caller still leaves out archived and read-only sessions.
+ */
+export function decidesHostCommand(session: Pick<SessionRecord, "connectorOwnerId">,
+  host: (Pick<ConnectorInfo, "hostCommandAccess"> & { capabilities?: Pick<ConnectorInfo["capabilities"], "hostOwnerDecides"> }) | undefined,
+  userId: string, canApprove: boolean): boolean {
+  const hostOwner = session.connectorOwnerId !== undefined && session.connectorOwnerId === userId;
+  return (canApprove && decidesHostCommands(session, host, userId)) || (hostOwner && host?.capabilities?.hostOwnerDecides === true);
+}
+
 /** What a host command's card says while it waits for someone who may decide it. */
-export const HOST_COMMAND_WAITING = "Waiting for the host's owner, or a member granted host commands, with approve access to this session";
+export const HOST_COMMAND_WAITING = "Waiting for the host's owner, or a member granted host commands with approve access to this session";

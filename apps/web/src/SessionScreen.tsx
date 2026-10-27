@@ -18,7 +18,7 @@ import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
-import { decidesHostCommands, HOST_COMMAND_WAITING, isHostCommand } from "../../../packages/client/src/host-commands";
+import { decidesHostCommand, HOST_COMMAND_WAITING, isHostCommand } from "../../../packages/client/src/host-commands";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
@@ -210,9 +210,21 @@ function SessionPane({ id }: { id: string }) {
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
 
+  /**
+   * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
+   * command, as every command of a session that runs on its host is, is decided by its host's owner, or a member granted
+   * host commands with approve permission here; everything else by anyone with approve permission.
+   */
+  function decides(approval: ApprovalRecord): boolean {
+    if (!session || archived || frozen) return false;
+    if (isHostCommand(approval.operation, session)) return decidesHostCommand(session, host, user.id, permissions.includes("approve"));
+    const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
+    return canApprove && (!ownerOnly || isOwner);
+  }
+
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
-    if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
+    if (!decides(approval) || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
     // The card is the prompt: it shows the exact operation, who it runs as, its resource limits and any unsandboxed-host warning, so a click decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
@@ -264,14 +276,11 @@ function SessionPane({ id }: { id: string }) {
             : <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>)}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
-            // Only the session owner can let a call do more than the session allows. A host command, as every command of a
-            // session that runs on its host is, is decided by its host's owner or a member granted host commands.
             const hostCommand = isHostCommand(approval.operation, session);
             const ownerOnly = permission || approval.operation.kind === "git.repin";
-            const decides = canApprove && (hostCommand ? decidesHostCommands(session, host, user.id) : !ownerOnly || isOwner);
             const disabled = approvalAction.busy || !approval.reviewHash;
             return <ApprovalCard approval={approval} key={approval.id}>
-              {decides ? <>
+              {decides(approval) ? <>
                 {!approval.reviewHash && <Alert variant="warning" title="No verified review commitment" actions={<Button variant="outline" size="sm" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</Button>}>Refresh before deciding; the server must bind the displayed operation and requester.</Alert>}
                 {permission ? <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "call")}>Allow once</Button>

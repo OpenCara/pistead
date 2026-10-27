@@ -1,11 +1,11 @@
 import { HTTPException } from 'hono/http-exception';
 import { connectorLimits, type ConnectorRpcRequest } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
-import { hasPermission } from '../../../packages/shared/src/policy.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import type { Permission, RunnerAction, RunnerTicket } from '../../../packages/shared/src/types.js';
 import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
+import { mayRequestAction } from './host-access.js';
 import { fail, id } from './http.js';
 import type { AppContext, Env, SessionRow } from './types.js';
 
@@ -65,7 +65,7 @@ export async function authorizeConnectorTicket(env: Env, ticket: RunnerTicket, c
   if (!permission || !Object.hasOwn(connectorPermissions, ticket.action) || !ticket.connectorId) fail(403, 'invalid_ticket', 'Invalid connector ticket.');
   const access = await sessionAccess(env, ticket.sessionId, ticket.actorId);
   if (!access || access.row.owner_id !== ticket.ownerId || access.row.connector_id !== ticket.connectorId ||
-      !hasPermission(access.permissions, permission) || access.row.policy_version !== ticket.policyVersion) {
+      !mayRequestAction(access, ticket.actorId, ticket.action, permission) || access.row.policy_version !== ticket.policyVersion) {
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && ticket.action !== 'view' && ticket.action !== 'events') fail(409, 'session_archived', 'Session is archived.');

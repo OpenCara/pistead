@@ -445,7 +445,7 @@ Commands, pushes, GitHub comments, merges and issues, and host commands each nee
 | Operation | Who can decide |
 |---|---|
 | Commands, commits, pushes, GitHub comments, merges | Anyone with approve permission on the session (the owner always has it) |
-| Host commands | Only the host's owner, who also needs approve permission on the session |
+| Host commands | The host's owner, in any session on their host they can see (connector newer than 0.9.0; with an older one they also need approve permission on the session), or a member they [granted host commands](#host-admins-and-host-command-grants) who has approve permission on the session |
 
 The agent's tool call waits for the decision, and its message waits with it (connector 0.9.0 or newer). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. Commands, pushes and host commands run in the background (connector newer than 0.9.0 for commands), so the card shows them running until they end. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
@@ -495,7 +495,7 @@ sequenceDiagram
 | **Viewer** | `read` | Viewing the session, its side asks, approvals and activity |
 | **Member** | `read`, `ask` | Also sending side asks |
 | **Collaborator** | `read`, `ask`, `write` | Also sending shared messages, stopping work and requesting operations |
-| **Admin** | `read`, `ask`, `write`, `approve`, `manage` | Also deciding approvals (host commands need the host's owner; permission requests, the session owner) and managing who has a session role |
+| **Admin** | `read`, `ask`, `write`, `approve`, `manage` | Also deciding approvals (host commands also need a host command grant, and the host's owner decides them without this role; permission requests need the session owner) and managing who has a session role |
 
 The API takes a tier (`POST /api/sessions/:id/grants` with `{ userId, role }`) or, as before, an explicit permission list (`{ userId, permissions }`). A grant that matches no tier, such as one made before tiers existed, shows as **Custom** until someone chooses a tier for it.
 
@@ -566,7 +566,7 @@ Comments, issues and merges wait for a human decision, unless the session owner 
 
 ### Host commands
 
-Host commands need connector 0.8.0 or newer. When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the approval of the **host owner**, or of a member they [granted host commands](#host-admins-and-host-command-grants); on a shared host, the approver also needs approve permission on the session. The session owner's **Auto-approve** skips this only on their own host, or where they hold an automatic host command grant.
+Host commands need connector 0.8.0 or newer. When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the approval of the **host owner**, or of a member they [granted host commands](#host-admins-and-host-command-grants) who also has approve permission on the session. The command runs as the host's OS user, so the host owner decides it in any session on their host they can see, without a session role (connector newer than 0.9.0; an older one also asks them for approve permission on the session). The session owner's **Auto-approve** skips this only on their own host, or where they hold an automatic host command grant.
 
 Host commands run **outside the sandbox, as the connector's OS user**, in the session's worktree: they can read and change host files and credentials, use the network, and run without CPU, memory, process or disk limits. The agent can change the worktree's files and Git configuration, so builds, package scripts and Git hooks there can run its code on the host, even for a command as harmless-looking as `git status`. Approve a host command only if you would run it yourself in that directory. Commands get the host's `PATH` and `HOME`, not the connector's whole environment, and Bash starts without shell profiles.
 

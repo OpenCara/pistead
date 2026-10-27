@@ -1,8 +1,8 @@
 import type { Hono } from 'hono';
-import type { ConnectorAdmin, HostCommandGrant } from '../../../packages/shared/src/connector.js';
-import { readOnlyRoles } from '../../../packages/shared/src/policy.js';
-import { hostCommandLevels, type HostCommandLevel } from '../../../packages/shared/src/types.js';
-import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
+import type { ConnectorAdmin, ConnectorCapabilities, HostCommandGrant } from '../../../packages/shared/src/connector.js';
+import { hasPermission, readOnlyRoles } from '../../../packages/shared/src/policy.js';
+import { hostCommandLevels, type HostCommandLevel, type Permission, type RunnerAction } from '../../../packages/shared/src/types.js';
+import type { AppContext, Env, SessionAccess, SessionRow, WorkerEnv } from './types.js';
 import type { ConnectorRow } from './connectors.js';
 import { auditStatement, requireMember } from './db.js';
 import { fail, identifier, jsonObject, now, text, userIdentifier } from './http.js';
@@ -67,6 +67,33 @@ export async function hostCommandAuthority(env: Env, row: Pick<SessionRow, 'conn
 /** Whether `userId` may decide host commands in `row` (the owner, or a grant of either level). */
 export async function mayDecideHostCommands(env: Env, row: SessionRow, userId: string): Promise<boolean> {
   return (await hostCommandAuthority(env, row, userId)) !== undefined;
+}
+
+/** Whether `userId` owns the host session `row` runs on. */
+export function ownsSessionHost(row: Pick<SessionRow, 'connector_id' | 'connector_owner_id'>, userId: string): boolean {
+  return !!row.connector_id && !!row.connector_owner_id && row.connector_owner_id === userId;
+}
+
+/**
+ * Whether `userId` decides the host commands of session `row` as its host's owner with any access to the session,
+ * without approve permission on it: a host command runs as the host's OS user, so deciding it is theirs. Members granted
+ * host commands still need approve permission, as does everything else. Only on a connector that checks decisions so
+ * (`hostOwnerDecides`); an older one asks for approve permission on every decision, its owner's included.
+ */
+export async function hostOwnerDecides(env: Env, row: Pick<SessionRow, 'connector_id' | 'connector_owner_id'>, userId: string): Promise<boolean> {
+  if (!row.connector_id || !ownsSessionHost(row, userId)) return false;
+  const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(row.connector_id).first();
+  try { return (JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).hostOwnerDecides === true; }
+  catch { return false; }
+}
+
+/**
+ * Whether `access` lets its actor send the runner `action`, which needs `permission`. A decision also goes for the
+ * session's host owner with any access to it, who decides its host commands (see hostOwnerDecides): the approvals route
+ * and the host check which operation it decides, and the host whether its owner may.
+ */
+export function mayRequestAction(access: SessionAccess, actorId: string, action: RunnerAction, permission: Permission): boolean {
+  return hasPermission(access.permissions, permission) || (action === 'approve' && ownsSessionHost(access.row, actorId));
 }
 
 export async function connectorAdmins(env: Env, connectorId: string): Promise<ConnectorAdmin[]> {
