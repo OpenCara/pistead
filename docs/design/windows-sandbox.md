@@ -1,7 +1,9 @@
 # Design: a native Windows 11 sandbox for the connector
 
-Status: investigation. Nothing here is implemented. The cross-platform decision is in
-[Choosing](#choosing-across-windows-linux-and-macos-from-the-requirements-alone). Native Windows is refused today
+Status: experimental implementation behind `pistead connect --experimental-sandbox` (macOS and native Windows), and
+native Windows without a sandbox (`--unsafe-no-sandbox`); not yet run on either platform. See
+[Implementation](#implementation-experimental) for what exists and what the first runs must check. The cross-platform
+decision is in [Choosing](#choosing-across-windows-linux-and-macos-from-the-requirements-alone). Native Windows is refused today
 (`apps/runner/src/connect-setup.ts`), and Windows hosts run the connector inside WSL2.
 
 This note sets out what a native backend has to guarantee, the Windows primitives that can provide it, how three
@@ -16,6 +18,53 @@ open-source sandboxes build on those primitives, and a recommended path. Sources
 
 Points marked *(unverified)* come from general Windows knowledge, not from those sources. Nothing here has been
 run on Windows yet; see [Spikes](#spikes-before-committing).
+
+## Implementation (experimental)
+
+What exists, in `apps/runner/src`:
+
+| Piece | Where | Notes |
+|---|---|---|
+| One interface for every backend | `workspace.ts` | `SessionWorkspace` (every backend), `IsolatedWorkspace` (clone, backup and push steps that run inside the boundary) |
+| A workspace for helper-per-step backends | `helper-workspace.ts` | Same checks, queueing, limits and output caps as `Sandbox`. The session's Git directory is `root/git`, with a runner-written `gitdir:` file at `worktree/.git` that steps can't change |
+| Loopback egress with a token | `egress.ts` (`tcp`, `endpoint`, `egressEnvironment(branch, endpoint, caBundle)`) | An ephemeral `127.0.0.1` port. Requests need `pistead:<token>` as Basic credentials (401 for the proxy's own endpoints, 407 for proxying); `HTTPS_PROXY` and the Git rewrites carry them |
+| macOS | `seatbelt.ts` | `sandbox-exec` with a generated, deny-by-default profile, with paths passed as `-D` parameters; the Linux Python helper, told where things are (`SANDBOX_GITDIR`, `SANDBOX_GIT`, `SANDBOX_BASH`, `SANDBOX_OWNER_CONFIG`) |
+| Windows | `windows-sandbox.ts`, `windows-job.ts`, `node-helper.ts` | A per-step Node runner in a job object (koffi) loads MXC, refuses any tier but `base-container`, and runs the Node helper in the container |
+| Native Windows without a sandbox | `platform.ts`, `lease.ts`, `host-workspace.ts`, `host-shell.ts`, `file-browser.ts`, `connector.ts` | A named-pipe lease, Git for Windows' bash, `taskkill /T`, no POSIX mode checks |
+| CLI | `connect-cli.ts`, `connect-setup.ts` | `--experimental-sandbox`, `--memory-limit`, `--process-limit`, `--cpu-limit`; per-platform prerequisites |
+
+Tested on Linux (`tests/native-sandboxes.test.ts`): both helpers run unconfined through `HelperWorkspace` (files,
+`.git` protection, shell, clone head, push preparation and pack, snapshot, backup), the token-guarded proxy, the
+Seatbelt profile's rules, and the Windows scripts' syntax. Nothing here has run under Seatbelt or PSEC.
+
+Where the implementation departs from the decision above:
+
+- **The proxy is authenticated by a per-session token on both platforms**, not by looking up the peer process
+  (`GetExtendedTcpTable` + `IsProcessInJob`). The kernel fences (Seatbelt's port rule, PSEC's per-container filter)
+  keep sessions off each other's ports; the token keeps other programs on the host off them. A peer check can be
+  added on Windows later.
+- **macOS uses our own Seatbelt profile**, not MXC's. That avoids a 108 MB dependency and native code loaded
+  through FFI, and the profile is in the repository to review. Its rules follow MXC's and Codex's documented ones.
+- **Not yet:** the repository cache and GPU on both, and clone-session backups and moves on Windows (the Node helper
+  has no `clone-backup`/`clone-restore`; the workspace refuses them by name).
+
+What the first runs must check, beyond [Spikes](#spikes-before-committing):
+
+- macOS:
+  - the profile lets Python (from the developer tools), Git over the proxy, bash, node and Homebrew tools start;
+  - nothing outside the session is readable;
+  - `curl`/`git` send the proxy credentials from the URL (the 407 path), and Go tools' TLS (no `trustd` lookups are
+    allowed);
+  - xcrun caches and `/private/var/folders` writes are denied without breaking tools.
+- Windows:
+  - whether MXC replaces our `HTTPS_PROXY` (which carries the token) with its own `networkProxy` value; if so, tunnels
+    get 407s, and the token has to go another way or be replaced by the peer check;
+  - whether a read-only grant inside a read-write one (`worktree\.git`) and grants of single files (owner config,
+    CA bundle) work under PSEC;
+  - that MXC's container stays inside the runner's job (no breakaway) and the job's limits hold;
+  - Git for Windows' bash and coreutils inside the container;
+  - the named-pipe lease;
+  - unsandboxed sessions end to end.
 
 ## What the Linux sandbox guarantees today
 

@@ -1,8 +1,8 @@
-import { constants } from "node:fs";
 import { lstat, open, readdir, type FileHandle } from "node:fs/promises";
 import { checkBrowseResult, type BrowseResult } from "../../../packages/shared/src/file-browser.js";
 import { fileBrowserLimits, type FileEntry } from "../../../packages/shared/src/types.js";
 import { imageType } from "./images.js";
+import { OPEN_DIRECTORY, OPEN_FILE, windows } from "./platform.js";
 
 /**
  * The session panel's read-only file browser (the `files` runner action). The sandbox helper (`browse` in sandbox.ts)
@@ -11,8 +11,8 @@ import { imageType } from "./images.js";
  */
 export type { BrowseResult };
 
-const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
-const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const FILE_FLAGS = OPEN_FILE;
+const DIRECTORY_FLAGS = OPEN_DIRECTORY;
 /** More entries than this in one directory are refused rather than listed in part: listing them would take too long. */
 const MAX_LISTED = 100_000;
 
@@ -52,9 +52,11 @@ async function readablePath(directory: string, handle: FileHandle): Promise<{ pa
  * and listed through that descriptor: a symlink swapped in after the caller's checks can't redirect the listing.
  */
 export async function browseDirectory(directory: string): Promise<BrowseResult> {
-  const handle = await open(directory, DIRECTORY_FLAGS);
+  // Windows can't open a directory as a file: there the path is listed, and checked before and after to still be the
+  // same real directory.
+  const handle = windows ? undefined : await open(directory, DIRECTORY_FLAGS);
   try {
-    const { path: opened, check } = await readablePath(directory, handle);
+    const { path: opened, check } = handle ? await readablePath(directory, handle) : await windowsDirectory(directory);
     const names = await readdir(opened);
     if (names.length > MAX_LISTED) throw new Error("directory has too many entries");
     const entries: FileEntry[] = [];
@@ -69,8 +71,18 @@ export async function browseDirectory(directory: string): Promise<BrowseResult> 
     sortEntries(entries);
     return { type: "directory", entries: entries.slice(0, fileBrowserLimits.entries), total: entries.length, truncated: entries.length > fileBrowserLimits.entries };
   } finally {
-    await handle.close();
+    await handle?.close();
   }
+}
+
+async function windowsDirectory(directory: string): Promise<{ path: string; check(): Promise<void> }> {
+  const opened = await lstat(directory, { bigint: true });
+  if (!opened.isDirectory()) throw new Error("not a directory");
+  const check = async () => {
+    const now = await lstat(directory, { bigint: true });
+    if (!now.isDirectory() || now.dev !== opened.dev || now.ino !== opened.ino) throw new Error("directory changed while being read; retry the operation");
+  };
+  return { path: directory, check };
 }
 
 /** A preview of `file`, which the caller confined to the worktree; opened without following a symlink. */

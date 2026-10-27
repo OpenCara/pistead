@@ -1,5 +1,5 @@
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
@@ -16,6 +16,10 @@ import { requestKey, RunnerError, stableJson, validateOperation } from "./protoc
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
 import { isolatedWorkspace, type SessionWorkspace } from "./workspace.js";
+import type { SandboxBackendConfig } from "./sandbox-backend.js";
+import { HelperWorkspace } from "./helper-workspace.js";
+import { SeatbeltBackend } from "./seatbelt.js";
+import { WindowsBackend } from "./windows-sandbox.js";
 import {
   hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
 } from "./sandbox.js";
@@ -30,7 +34,7 @@ import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
-import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
+import { EgressProxy, egressEnvironment, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
 import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 import { defaultHostConfig, type HostConfig } from "../../../packages/shared/src/host-config.js";
@@ -144,6 +148,8 @@ export type RunnerConfig = {
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
+  /** The sandbox of a macOS or native Windows host (see sandbox-backend.ts); Linux hosts use bubblewrap without it. */
+  sandboxBackend?: SandboxBackendConfig;
   /** Opens a session's Pi storage; defaults to the SQLite file in its directory. */
   openStorage?: (path: string) => Promise<Storage>;
   /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
@@ -285,7 +291,19 @@ export class RunnerSession {
       throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
     }
     if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
-    else {
+    else if (config.sandboxBackend) {
+      // macOS and native Windows sandboxes share the host's network: the proxy listens on a loopback port that wants
+      // this session's token. They keep no host repository cache.
+      const egress = this.egressProxy(egressSocketPath(binding.session.id, directory), randomBytes(24).toString("base64url"));
+      this.#egress = egress;
+      const backend = config.sandboxBackend.kind === "seatbelt" ? new SeatbeltBackend()
+        : new WindowsBackend({ runtime: config.sandboxBackend.runtime, limits: config.sandboxBackend.limits });
+      const branch = this.#clone ? sessionBranch(binding.session) : undefined;
+      const workspace: HelperWorkspace = new HelperWorkspace(binding, join(directory, "sandbox"), backend, {
+        egressEnvironment: () => { const endpoint = egress.endpoint; return endpoint && egressEnvironment(branch, endpoint, workspace.layout.caBundle); },
+      });
+      this.sandbox = workspace;
+    } else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
       this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { egressSocket: this.#egress.socketPath,
         ...(this.#clone ? { sessionBranch: sessionBranch(binding.session) } : {}),
@@ -301,9 +319,10 @@ export class RunnerSession {
     return parseEgressGrant(this.config.egressGrant ? await this.config.egressGrant(sessionId) : await this.controlPlane("/api/internal/network", { sessionId }));
   }
 
-  private egressProxy(socketPath: string): EgressProxy {
+  private egressProxy(socketPath: string, token?: string): EgressProxy {
     return new EgressProxy({
       socketPath,
+      ...(token ? { tcp: { token } } : {}),
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
       ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
@@ -1311,11 +1330,12 @@ export class RunnerSession {
   }
 
   /**
-   * Whether shell commands may run here: within provisioned limits, on the host itself (an owner-consented unsandboxed
-   * host, or the owner's session on a host that accepts it), or as a faux test shell.
+   * Whether shell commands may run here: within provisioned limits (Linux --resources, or the Windows sandbox's job
+   * objects; macOS has none), on the host itself (an owner-consented unsandboxed host, or the owner's session on a host
+   * that accepts it), or as a faux test shell.
    */
   private shellAllowed(): boolean {
-    return !!this.config.resources || this.#onHost || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+    return (!!this.config.resources && !this.config.sandboxBackend) || (!this.#onHost && this.config.sandboxBackend?.kind === "windows") || this.#onHost || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
   }
 
   /**

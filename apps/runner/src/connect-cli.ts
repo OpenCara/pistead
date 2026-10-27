@@ -7,6 +7,7 @@ import { createConnector, controlPlaneOrigin } from "./connector.js";
 import { assertConnectorPlatform, assertPrerequisites, checkPrerequisites, defaultStateDir, loadConnectorModels, savedPairing, unsandboxedWarning } from "./connect-setup.js";
 import { ConnectorSetupError } from "./protocol.js";
 import type { ResourceConfig } from "./resources.js";
+import { DEFAULT_WINDOWS_LIMITS, validWindowsLimits, windowsRuntimeDirectory, type SandboxBackendConfig } from "./sandbox-backend.js";
 
 const HELP = `Usage: pistead connect [--server ORIGIN --pairing-id ID [--force]]
 
@@ -30,7 +31,11 @@ Options:
   --force                  With --pairing-id, replace this machine's saved pairing; the
                            old host stays in Pistead, offline, until you remove it there
   --unsafe-no-sandbox      Run agent work directly on this machine without isolation
-                           (macOS or Linux without bubblewrap); asks for confirmation
+                           (macOS, Windows, or Linux without bubblewrap); asks for confirmation
+  --experimental-sandbox   macOS and native Windows: run sessions in this platform's own
+                           sandbox (macOS Seatbelt; Windows 11 process containers through
+                           Microsoft's MXC SDK). Experimental and not yet verified; see
+                           docs/design/windows-sandbox.md
   --help                   Show this help without reading Pi configuration
 
 This machine's own setup, when the defaults don't fit:
@@ -41,13 +46,20 @@ This machine's own setup, when the defaults don't fit:
                            advertised, or every authenticated Pi model when that is unset
   --resources PATH         Operator-provisioned resource configuration JSON (cgroup v2
                            limits that let bash run in every session)
+  --memory-limit MIB       Windows sandbox: memory for each sandboxed step's processes (4096)
+  --process-limit N        Windows sandbox: processes per step (256)
+  --cpu-limit PERCENT      Windows sandbox: share of this machine's CPU per step (50)
 
 Development:
   --allow-insecure-loopback  Permit HTTP/WS only on localhost/127.0.0.1/[::1]
   --allow-test-shell         Fixture shell opt-in; requires --allow-faux
 
 Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required for the
-isolated sandbox. Native Windows is unsupported; run this command inside WSL2.
+isolated sandbox. On native Windows run this command inside WSL2, or try
+--experimental-sandbox (Windows 11 24H2/25H2 build .9550+, Git for Windows, and
+Microsoft's MXC SDK, which it tells you how to install). On macOS,
+--experimental-sandbox needs the developer tools (xcode-select --install); its shell
+commands have no hard memory limits, so only you can let them run, in your own sessions.
 --unsafe-no-sandbox needs only Git on PATH, but approved commands then run as your
 user with access to your files, credentials and network, and no resource limits.
 GitLab, Azure DevOps, Bitbucket, Gitea/Forgejo and GitHub Enterprise repositories are
@@ -124,6 +136,25 @@ async function resourceConfig(path: string): Promise<ResourceConfig> {
   };
 }
 
+/** The macOS or Windows sandbox --experimental-sandbox asks for, with the Windows limits given. */
+function experimentalBackend(dataDir: string, values: { "memory-limit"?: string; "process-limit"?: string; "cpu-limit"?: string }): SandboxBackendConfig {
+  if (process.platform === "darwin") return { kind: "seatbelt" };
+  const number = (value: string | undefined, name: string, fallback: number) => {
+    if (value === undefined) return fallback;
+    if (!/^\d{1,9}$/.test(value)) throw new ConnectorSetupError(`--${name} must be a whole number.`);
+    return Number(value);
+  };
+  try {
+    return { kind: "windows", runtime: windowsRuntimeDirectory(dataDir), limits: validWindowsLimits({
+      memoryBytes: number(values["memory-limit"], "memory-limit", DEFAULT_WINDOWS_LIMITS.memoryBytes / 1024 ** 2) * 1024 ** 2,
+      processes: number(values["process-limit"], "process-limit", DEFAULT_WINDOWS_LIMITS.processes),
+      cpuPercent: number(values["cpu-limit"], "cpu-limit", DEFAULT_WINDOWS_LIMITS.cpuPercent),
+    }) };
+  } catch (error) {
+    throw error instanceof ConnectorSetupError ? error : new ConnectorSetupError(error instanceof Error ? `${error.message}.` : "Invalid Windows sandbox limits.");
+  }
+}
+
 async function confirmUnsandboxed(): Promise<void> {
   process.stderr.write(unsandboxedWarning());
   if (!process.stdin.isTTY || !process.stderr.isTTY) {
@@ -157,15 +188,22 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     resources: { type: "string" }, "allow-insecure-loopback": { type: "boolean" },
     "allow-faux": { type: "boolean" }, "allow-test-shell": { type: "boolean" }, "unsafe-no-sandbox": { type: "boolean" },
     "git-credentials": { type: "boolean" }, "repo-cache": { type: "boolean" }, "repo-cache-scope": { type: "string" },
+    "experimental-sandbox": { type: "boolean" }, "memory-limit": { type: "string" }, "process-limit": { type: "string" }, "cpu-limit": { type: "string" },
   } });
   if (values.help) { process.stdout.write(HELP); return; }
   process.stderr.write(movedOptionsNotice(MOVED_OPTIONS.filter(name => values[name] !== undefined)));
   const unsandboxed = values["unsafe-no-sandbox"] === true;
-  assertConnectorPlatform();
-  if (process.platform === "darwin" && !unsandboxed) {
-    throw new ConnectorSetupError("macOS has no isolated sandbox: it needs Linux or WSL2 with bubblewrap. To run agent work directly on this Mac, re-run with --unsafe-no-sandbox and read its warning.");
+  const experimental = values["experimental-sandbox"] === true;
+  if (unsandboxed && experimental) throw new ConnectorSetupError("Choose one: --experimental-sandbox runs sessions in this platform's sandbox, --unsafe-no-sandbox runs them without one.");
+  assertConnectorPlatform({ unsandboxed, experimentalSandbox: experimental });
+  if (process.platform === "darwin" && !unsandboxed && !experimental) {
+    throw new ConnectorSetupError("macOS has no default sandbox: the isolated sandbox needs Linux or WSL2 with bubblewrap. Try macOS's own sandbox with --experimental-sandbox, or run agent work directly on this Mac with --unsafe-no-sandbox and read its warning.");
   }
   if (unsandboxed && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits and cannot be combined with --unsafe-no-sandbox.");
+  if (experimental && values.resources) throw new ConnectorSetupError("--resources configures Linux sandbox limits; the Windows sandbox takes --memory-limit, --process-limit and --cpu-limit.");
+  if ((values["memory-limit"] || values["process-limit"] || values["cpu-limit"]) && !(experimental && process.platform === "win32")) {
+    throw new ConnectorSetupError("--memory-limit, --process-limit and --cpu-limit apply only to the Windows sandbox (--experimental-sandbox on Windows).");
+  }
   if (values["allow-test-shell"] && !values["allow-faux"]) throw new ConnectorSetupError("--allow-test-shell requires --allow-faux.");
   const pairingId = values["pairing-id"];
   if (pairingId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(pairingId)) {
@@ -179,7 +217,10 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
     try { controlPlaneOrigin(values.server, values["allow-insecure-loopback"]); }
     catch { throw new ConnectorSetupError("--server must be an HTTPS origin such as https://pistead.com."); }
   }
-  assertPrerequisites(await checkPrerequisites(unsandboxed), unsandboxed, " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first.");
+  const dataDir = values["state-dir"] ?? defaultStateDir();
+  assertPrerequisites(await checkPrerequisites(unsandboxed, experimental ? { stateDir: dataDir } : undefined), unsandboxed,
+    " Without bubblewrap you can run --unsafe-no-sandbox instead; read its warning first.");
+  const sandboxBackend = experimental ? experimentalBackend(dataDir, values) : undefined;
   const models = values.model?.map(reference => {
     const slash = reference.indexOf("/");
     if (slash < 1 || slash === reference.length - 1) throw new ConnectorSetupError("--model expects PROVIDER/MODEL.");
@@ -187,7 +228,6 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   });
   const localModels = await loadConnectorModels({ allowFaux: values["allow-faux"], piAgentDir: values["pi-agent-dir"], models });
   const resources = values.resources ? await resourceConfig(values.resources) : undefined;
-  const dataDir = values["state-dir"] ?? defaultStateDir();
   // Checked before any prompt, so no pairing code is typed for nothing; the connector checks again under its lease.
   // --force never reads the saved pairing: it may be revoked, unreadable or bound to another server.
   const paired = !values.force && await savedPairing(dataDir, values["allow-insecure-loopback"]) !== undefined;
@@ -203,7 +243,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   const pairing = pairingId ? { id: pairingId, code } : undefined;
   const connector = createConnector({
     dataDir,
-    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed,
+    server: values.server, pairing, replacePairing: values.force, localModels, resources, unsandboxed, ...(sandboxBackend ? { sandboxBackend } : {}),
     allowInsecureLoopback: values["allow-insecure-loopback"], allowFaux: values["allow-faux"], allowTestShell: values["allow-test-shell"],
     // Binary presence cannot attest a working namespace or a per-session resource
     // domain. Advertise conservatively; each actual operation verifies isolation.
@@ -213,6 +253,7 @@ export async function connectMain(args = process.argv.slice(2)): Promise<void> {
   });
   process.stderr.write(unsandboxed
     ? "Running unsandboxed: approved commands execute directly on this machine.\n"
+    : sandboxBackend ? `Experimental ${sandboxBackend.kind === "seatbelt" ? "macOS (Seatbelt)" : "Windows (process container)"} sandbox: not yet verified; report what breaks.\n`
     : "Sandbox capability is verified per session; production shell stays disabled without provisioned, verified limits.\n");
   process.stderr.write("Host configuration (command time limit, GPU, Git credentials, repository cache) is set in Pistead: Settings > Hosts > this host.\n");
   const stopped = Promise.withResolvers<void>();
