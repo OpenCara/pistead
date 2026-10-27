@@ -22,7 +22,7 @@ import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
-import { hostOwnerDecides, mayDecideHostCommands } from './host-access.js';
+import { hostAuthority, hostOwnerDecides, mayDecideHostCommands } from './host-access.js';
 import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
 import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
@@ -285,17 +285,18 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (session.connector_id && capabilities.plainGit !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
     }
-    // A session may run directly on its host, without the sandbox: only the host's owner starts one, only where the host's
-    // configuration accepts that, and only on a connector that runs it there. Anything else is refused, never quietly
-    // sandboxed, so the owner never believes a session is somewhere it isn't.
+    // A session may run directly on its host, without the sandbox: only the host's owner, or a member they granted that
+    // in this workspace, starts one, only where the host's configuration accepts that, and only on a connector that runs
+    // it there. Anything else is refused, never quietly sandboxed, so nobody believes a session is somewhere it isn't.
     if (input.hostEnvironment !== undefined && typeof input.hostEnvironment !== 'boolean') fail(400, 'invalid_input', 'hostEnvironment must be true or false.');
     const onHost = input.hostEnvironment === true;
     if (onHost) {
-      if (!session.connector_id || session.connector_owner_id !== ownerId) {
-        fail(403, 'host_owner_required', 'Only a host\'s owner starts sessions that run directly on it.');
+      const granted = session.connector_owner_id !== ownerId;
+      if (!session.connector_id || (granted && (await hostAuthority(c.env, session, ownerId))?.sessions !== true)) {
+        fail(403, 'host_owner_required', 'Only a host\'s owner, or a member they granted sessions on the host, starts sessions that run directly on it.');
       }
       if (capabilities.unsandboxed === true) fail(400, 'host_unsandboxed', 'This host runs every session without the sandbox already.');
-      if (!hostSessionsSupported(capabilities)) {
+      if (!hostSessionsSupported(capabilities, granted)) {
         fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to run sessions directly on it.');
       }
       if (!(await connectorHostConfig(c.env, session.connector_id)).hostSessions) {

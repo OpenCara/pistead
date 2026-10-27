@@ -91,6 +91,12 @@ export interface ConnectorCapabilities {
    */
   hostOwnerDecides?: boolean;
   /**
+   * The connector runs sessions directly on the host for members its owner granted that (HostCommandGrant.hostSessions),
+   * not only for its owner, checking the grant before each of their commands. Absent on older connectors, which run
+   * only their owner's sessions there.
+   */
+  hostSessionGrants?: boolean;
+  /**
    * The connector lists the session worktree's directories and previews its files, read-only, for the session panel's
    * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
    */
@@ -127,6 +133,11 @@ export interface HostCommandGrant {
   /** The member's display name; absent for a workspace-wide grant. */
   userName?: string;
   level: HostCommandLevel;
+  /**
+   * The member may also start their own sessions directly on the host, without the sandbox (SessionRecord.hostEnvironment),
+   * where its configuration accepts those (HostConfig.hostSessions). Absent: they get the sandbox, as before.
+   */
+  hostSessions?: true;
   /** When the grant lapses; null for no expiry. */
   expiresAt: string | null;
   createdBy: string;
@@ -157,8 +168,9 @@ export interface ConnectorInfo {
   /** How the host runs its sessions; listed to its owner and admins. */
   config?: HostConfig;
   /**
-   * Listed to its owner only: sessions they start on it may run directly on the host, without the sandbox (its
-   * configuration accepts them and its connector runs them; see SessionRecord.hostEnvironment).
+   * Sessions the viewer starts on it may run directly on the host, without the sandbox: its configuration accepts them,
+   * its connector runs them, and the viewer owns it or holds a grant in the listed workspace that includes sessions on
+   * the host (see SessionRecord.hostEnvironment). Listed to nobody else.
    */
   hostSessions?: true;
   /**

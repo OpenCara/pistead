@@ -574,9 +574,6 @@ test("a session its host's owner started on the host runs there while the host a
     value.session.hostEnvironment = true;
     return value;
   };
-  // Only its owner's own sessions run on a host itself.
-  await assert.rejects(runner.provision(onHost("host-foreign", "test:host"), { ...await ticket("host-foreign", "create"), connectorId }),
-    rejectedWith(403, /host's owner's sessions run directly on the host/));
   const session = await runner.provision(onHost("host-own", "test:alice"), { ...await ticket("host-own", "create"), connectorId });
   assert.ok(session.sandbox instanceof HostWorkspace, "no sandbox is created for it");
   await session.submit({ ...await ticket("host-own", "submit"), connectorId }, { content: "TEST_BASH pwd", requestId: "host-own", admissionId }, "write");
@@ -596,6 +593,57 @@ test("a session its host's owner started on the host runs there while the host a
   const view = await session.view();
   assert.equal(view.approvals.filter(approval => approval.status === "pending").length, 0);
   assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("no longer runs sessions directly on it")));
+});
+
+test("a member the host's owner granted sessions on the host runs one there only while their grant includes it, and without approval only with automatic host commands", { skip: process.platform !== "linux" }, async t => {
+  const { service, grants } = await fixture(t);
+  const connectorId = "member-host-sessions-connector";
+  // What the control plane reports of alice's grant on test:host's host; asked for sessions on the host only by this host.
+  const grant: { hostCommands?: "approve" | "auto"; hostSessions?: true } = { hostCommands: "approve", hostSessions: true };
+  const asked: AuthorizationRequest[] = [];
+  const authorize = async (input: AuthorizationRequest) => {
+    asked.push(input);
+    const allowed = grants[input.actorId]?.includes(input.permission) ?? false;
+    return { allowed, ownerId: input.ownerId, policyVersion: 1,
+      ...(allowed && input.host && input.actorId === "test:alice" && grant.hostCommands ? { hostCommands: grant.hostCommands } : {}),
+      ...(allowed && input.host && input.hostSessions && input.actorId === "test:alice" && grant.hostSessions ? { hostSessions: true as const } : {}) };
+  };
+  const runner = new RunnerService({ ...service.config, connectorId, allowTestShell: false, authorize, hostConfig: async () => ({ ...defaultHostConfig, hostSessions: true }) });
+  await runner.initialize();
+  t.after(() => runner.close());
+  const admissionId = await sha256("member host session write admission");
+  const value = binding("host-member");
+  value.session.connectorId = value.model.connectorId = connectorId;
+  value.session.connectorOwnerId = value.model.connectorOwnerId = "test:host";
+  value.session.hostEnvironment = true;
+  const session = await runner.provision(value, { ...await ticket("host-member", "create"), connectorId });
+  assert.ok(session.sandbox instanceof HostWorkspace, "no sandbox is created for it");
+
+  // With approve access to host commands, their Auto-approve still asks: they decide each command themselves.
+  await session.submit({ ...await ticket("host-member", "submit"), connectorId }, { content: "TEST_BASH echo member-approved", requestId: "approved", admissionId, options: { access: "auto" } }, "write");
+  const [command] = await operationRequests(session);
+  assert.equal(command!.operation.kind, "bash");
+  await session.decide({ ...await ticket("host-member", "approve"), connectorId }, command!.id, { decision: "approve", operation: command!.operation });
+  const ran = await settledCard(session, command!.id);
+  assert.equal(ran.status, "executed", ran.result);
+  assert.match(ran.result ?? "", /member-approved/);
+  assert.ok(asked.some(input => input.actorId === "test:alice" && input.host && input.hostSessions), "the host checks the grant before their command");
+  await idle(session);
+
+  // With automatic host commands, it runs at once.
+  grant.hostCommands = "auto";
+  await session.submit({ ...await ticket("host-member", "submit"), connectorId }, { content: "TEST_BASH echo member-automatic", requestId: "automatic", admissionId, options: { access: "auto" } }, "write");
+  await idle(session);
+  assert.deepEqual(autoApproved(await session.view()), [{ tool: "bash", status: "executed" }]);
+
+  // Once their grant no longer includes sessions on the host, the next command stops before any card asks anyone.
+  delete grant.hostSessions;
+  await session.submit({ ...await ticket("host-member", "submit"), connectorId }, { content: "TEST_BASH echo never-ran", requestId: "ended", admissionId, options: { access: "auto" } }, "write");
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.approvals.filter(approval => approval.status === "pending").length, 0);
+  assert.ok(view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("grant that let them has ended")));
+  assert.ok(!view.entries.some(entry => entry.role === "toolResult" && entry.text.includes("never-ran\n")));
 });
 
 test("shell commands may reserve address space they never touch, as gh and node do when they start", { skip: process.platform !== "linux" }, async t => {

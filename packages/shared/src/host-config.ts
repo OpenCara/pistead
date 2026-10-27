@@ -52,8 +52,8 @@ export interface HostConfig {
    */
   repositoryCache: RepositoryCacheMode;
   /**
-   * The host's owner may start sessions that run directly on the host's own environment, without the sandbox
-   * (SessionRecord.hostEnvironment): their commands run as the connector's OS user, with its files, credentials,
+   * The host's owner, and members they granted that (HostCommandGrant.hostSessions), may start sessions that run
+   * directly on the host's own environment, without the sandbox (SessionRecord.hostEnvironment): their commands run as the connector's OS user, with its files, credentials,
    * network and GPU. Turning it off stops those sessions' commands at once.
    */
   hostSessions: boolean;

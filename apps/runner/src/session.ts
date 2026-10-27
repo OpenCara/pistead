@@ -279,13 +279,14 @@ export class RunnerSession {
   readonly #frozen: boolean;
   /**
    * The session runs directly on the host's own environment, with no sandbox: every session of an unsandboxed host, or
-   * one its owner started that way on a host that accepts it (`#hostSession`).
+   * one started that way on a host that accepts it (`#hostSession`).
    */
   readonly #onHost: boolean;
   /**
-   * A session its host's owner started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise
-   * sandboxes its sessions: it runs commands only while the host's configuration still accepts that
-   * (HostConfig.hostSessions), and deciding them needs host command authority, as host commands do.
+   * A session started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise sandboxes its
+   * sessions, by its owner or by a member they granted that: it runs commands only while the host's configuration still
+   * accepts that (HostConfig.hostSessions) and, for a member's, while their grant still includes it; deciding them
+   * needs host command authority, as host commands do.
    */
   readonly #hostSession: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
@@ -317,10 +318,11 @@ export class RunnerSession {
     this.#frozen = !this.#clone && (binding.session.repositories ?? []).length > 0;
     this.#hostSession = binding.session.hostEnvironment === true && config.unsandboxed !== true;
     this.#onHost = config.unsandboxed === true || this.#hostSession;
-    // Only the host's owner's own sessions ever run on the host itself; the control plane admits no other, and neither
-    // does the host.
-    if (this.#hostSession && (!binding.session.connectorOwnerId || binding.session.connectorOwnerId !== binding.owner.id)) {
-      throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
+    // Only sessions of the host's owner, or of a member they granted that, run on the host itself: the control plane
+    // admits no other, and the host checks a member's grant again before each of their commands
+    // (requireHostEnvironment).
+    if (this.#hostSession && !binding.session.connectorOwnerId) {
+      throw new RunnerError(403, "Only sessions of the host's owner, or of members they granted that, run directly on the host");
     }
     if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
     else {
@@ -494,9 +496,13 @@ export class RunnerSession {
       throw new RunnerError(403, "Ticket session, owner, or connector mismatch");
   }
 
-  /** `host`: also ask for the actor's authority over host commands on this host (`hostCommands`). */
-  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false): Promise<AuthorizationResult> {
-    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission, ...(host ? { host: true } : {}) };
+  /**
+   * `host`: also ask for the actor's authority over host commands on this host (`hostCommands`); `hostSessions`, also
+   * whether they may run their own sessions directly on it.
+   */
+  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false, hostSessions = false): Promise<AuthorizationResult> {
+    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission,
+      ...(host ? { host: true } : {}), ...(host && hostSessions ? { hostSessions: true } : {}) };
     let result: AuthorizationResult;
     try {
       if (this.config.authorize) result = await this.config.authorize(body);
@@ -1433,13 +1439,25 @@ export class RunnerSession {
   }
 
   /**
-   * A session its owner started directly on the host runs commands only while the host's configuration still accepts
-   * that: its owner turning it off stops the session's next command (within the configuration's 30-second refresh).
+   * A session started directly on the host runs commands only while the host's configuration still accepts that: its
+   * owner turning it off stops the session's next command (within the configuration's 30-second refresh). A member's
+   * session also needs their grant to still include sessions on the host, and a command that runs without anyone
+   * approving it (`automatic`), automatic host commands too: a grant that ends or shrinks stops their next command.
    */
-  private async requireHostEnvironment(): Promise<void> {
-    if (this.#hostSession && !(await this.hostConfig()).hostSessions) {
+  private async requireHostEnvironment(automatic = false): Promise<void> {
+    if (!this.#hostSession) return;
+    if (!(await this.hostConfig()).hostSessions) {
       throw new RunnerError(403, "This host no longer runs sessions directly on it: its owner turned that off in Pistead (Settings → Hosts → the host → Configuration). "
         + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+    if (this.binding.session.connectorOwnerId === this.binding.owner.id) return;
+    const result = await this.authorize(this.binding.owner.id, "write", undefined, true, true);
+    if (result.hostSessions !== true) {
+      throw new RunnerError(403, "The session's owner may no longer run sessions directly on this host: the grant that let them has ended. "
+        + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+    if (automatic && result.hostCommands !== "auto") {
+      throw new RunnerError(403, "This session runs directly on its host, and its owner no longer holds automatic host commands there: commands need approval. Nothing ran.");
     }
   }
 
@@ -1828,7 +1846,10 @@ export class RunnerSession {
       automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id
         && (!github || (admissionId !== undefined && (operation.kind !== "github.merge" || run.options?.autoMerge === true)))
         && (operation.kind !== "git.push" || admissionId !== undefined)
-        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
+        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto")
+        // A command of a session on its host runs there as a host command does: without approval only for an owner who
+        // holds automatic host commands on it.
+        && (operation.kind !== "bash" || !this.#hostSession || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -1889,7 +1910,7 @@ export class RunnerSession {
     try {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation, approval.unbounded === true);
-        await this.requireHostEnvironment();
+        await this.requireHostEnvironment(true);
         await this.authorize(actorId, "write");
       }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true,
         ...await this.commandOptions(), signal });
