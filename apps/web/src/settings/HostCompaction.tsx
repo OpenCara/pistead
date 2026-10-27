@@ -61,7 +61,7 @@ const compactionInfo = <div className="stack">
   <p>Pi summarizes a long conversation once it comes within <em>reserve</em> tokens of the model's context window, and keeps the most recent <em>keep recent</em> tokens word for word. The summary may use up to 80% of the reserve, thinking included.</p>
   <p>Counts set here replace those of Pi's settings.json on the host (compaction.reserveTokens, compaction.keepRecentTokens and compaction.modelOverrides); an empty one keeps the host's setting, or the default. A model's own count wins over the one for all models, here or in the host's settings.</p>
   <p>By default a reasoning model reserves a tenth of its context window, from 16K to 64K tokens. If messages fail because Pi's summary hit its token limit, raise the reserve for that model.</p>
-  <p>Sessions on the host use a change from their next message.</p>
+  <p>Sessions on the host pick up a change within a minute, from the next message they send after it.</p>
 </div>;
 
 function TokenInputs({ value, onChange, disabled, label }: { value: Draft; onChange: (value: Draft) => void; disabled: boolean; label: string }) {
@@ -105,7 +105,7 @@ export function HostCompactionSection({ connector, refresh }: { connector: Conne
     void action.run(async () => {
       await api(`/api/connectors/${segment(connector.id)}/config`, { method: "PATCH", body: { compaction: current } });
       refresh();
-    }, "Compaction saved. Sessions on the host use it from their next message.");
+    }, "Compaction saved. Sessions on the host pick it up within a minute.");
   }
 
   const modelRow = (model: LocalModelSummary | string) => {

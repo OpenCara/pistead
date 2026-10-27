@@ -267,7 +267,8 @@ export class RunnerSession {
   #conversationOnlyRestore = false;
   /**
    * The compaction token counts of the host's configuration as last read (HostConfig.compaction), which the harness's
-   * settings put over the host's Pi settings at each use: a change applies from the next message on.
+   * settings put over the host's Pi settings at each use: a change applies from the first message after the connector's
+   * configuration refresh (HostConfigSource, 30 seconds).
    */
   #configuredCompaction: HostCompaction | undefined;
   /**

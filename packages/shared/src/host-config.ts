@@ -57,7 +57,7 @@ export interface HostConfig {
    * network and GPU. Turning it off stops those sessions' commands at once.
    */
   hostSessions: boolean;
-  /** Compaction token counts over the host's Pi settings; empty keeps those. Sessions pick a change up with their next message. */
+  /** Compaction token counts over the host's Pi settings; empty keeps those. Sessions pick a change up within a minute (the connector's refresh), with their next message. */
   compaction: HostCompaction;
 }
 

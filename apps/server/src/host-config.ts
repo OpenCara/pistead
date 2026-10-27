@@ -56,7 +56,8 @@ export function registerHostConfig(app: Hono<WorkerEnv>): void {
     const row = await managedConnector(c);
     if (row.revoked_at) fail(409, 'connector_revoked', 'Connector is revoked.');
     let change: Partial<HostConfig>;
-    try { change = parseHostConfigChange(await jsonObject(c, 65_536)); }
+    // Room for compaction counts of the most models, with the longest names a host advertises (about 67 KB).
+    try { change = parseHostConfigChange(await jsonObject(c, 131_072)); }
     catch (error) { return fail(400, 'invalid_host_config', error instanceof Error ? error.message : 'Invalid host configuration.'); }
     const current = await connectorHostConfig(c.env, row.id);
     let settings = Object.keys(change) as (keyof HostConfig)[];

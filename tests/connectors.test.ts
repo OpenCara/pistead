@@ -2697,10 +2697,10 @@ test('a host\'s owner and admins set its compaction token counts, which its conn
   assert.deepEqual(await json(await host.request('PATCH', path, { compaction })), { config: { ...defaults, compaction: kept } });
   assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, compaction: kept } });
   assert.equal(f.sqlite.prepare('SELECT compaction_json FROM connector_configs WHERE connector_id = ?').get(id)!.compaction_json, JSON.stringify(kept));
-  // A save of another setting keeps it; an admin changes it, as a whole, for as many models as a host offers.
+  // A save of another setting keeps it; an admin changes it, as a whole, for as many models as a host offers, with the longest names.
   assert.deepEqual(await json(await host.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: kept } });
   await json(await host.request('PUT', `/api/connectors/${id}/admins/${creator.user.id}`));
-  const many = { modelOverrides: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`provider-${index}/${'m'.repeat(150)}`, { reserveTokens: 100_000 + index, keepRecentTokens: 9_999_999 }])) };
+  const many = { modelOverrides: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`${String(index).padStart(80, 'p')}/${'m'.repeat(200)}`, { reserveTokens: 1_000_000 + index, keepRecentTokens: 9_999_999 }])) };
   const saved = await json<{ config: { compaction: { modelOverrides: Record<string, unknown> } } }>(await creator.request('PATCH', path, { compaction: many }));
   assert.equal(Object.keys(saved.config.compaction.modelOverrides).length, 200);
   assert.deepEqual(await json(await creator.request('PATCH', path, { compaction: {} })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
