@@ -716,7 +716,8 @@ export async function relayGitRequest(fetchImpl: typeof fetch, url: string, auth
 
 /**
  * A `fetch` for GitRemote that sends its Git reads of one workspace repository through the control plane's relay, with
- * the session owner's access: how the host confirms that a session may borrow a mirror. Anything else is refused.
+ * the session owner's access: how the host confirms that a session may borrow a mirror. Anything else is refused. The
+ * caller's signal is honoured, so its time limit holds.
  */
 export function relayFetch(bindingId: string, relay: (request: RelayRequest) => Promise<Response>): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -724,18 +725,38 @@ export function relayFetch(bindingId: string, relay: (request: RelayRequest) => 
     const service: EgressGitService | undefined = url.pathname.endsWith("/info/refs") && url.searchParams.get("service") === "git-upload-pack" ? "info-refs"
       : url.pathname.endsWith("/git-upload-pack") && !url.search ? "upload-pack" : undefined;
     if (!service) throw new RunnerError(403, "Only Git reads go through the relay");
+    const signal = init?.signal ?? undefined;
+    signal?.throwIfAborted();
     const headers = new Headers(init?.headers);
     const body = init?.body ? new Uint8Array(await new Response(init.body).arrayBuffer()) : undefined;
     if (body && body.byteLength > UPLOAD_REQUEST_BYTES) throw new RunnerError(413, "The Git request is too large");
     try {
-      return await relay({ bindingId, service, userAgent: headers.get("user-agent") ?? undefined, gitProtocol: headers.get("git-protocol") ?? undefined,
+      const answer = relay({ bindingId, service, userAgent: headers.get("user-agent") ?? undefined, gitProtocol: headers.get("git-protocol") ?? undefined,
         contentType: headers.get("content-type") ?? undefined, contentEncoding: headers.get("content-encoding") ?? undefined, ...(body ? { body } : {}) });
+      return await (signal ? abandonable(answer, signal) : answer);
     } catch (error) {
       // GitRemote reports a status as a failed request; the control plane's reason stays with the caller's own log.
       if (error instanceof RunnerError) return new Response(null, { status: error.status >= 400 && error.status < 600 ? error.status : 502 });
       throw error;
     }
   }) as typeof fetch;
+}
+
+/**
+ * `answer`, unless `signal` aborts first. A relayed request can't be called back once sent, so an answer that comes after
+ * its caller gave up is closed unread.
+ */
+function abandonable(answer: Promise<Response>, signal: AbortSignal): Promise<Response> {
+  return new Promise<Response>((resolve, reject) => {
+    const abort = () => {
+      reject(signal.reason);
+      void answer.then(response => response.body?.cancel(), () => {});
+    };
+    if (signal.aborted) return abort();
+    signal.addEventListener("abort", abort, { once: true });
+    answer.then(response => { signal.removeEventListener("abort", abort); resolve(response); },
+      error => { signal.removeEventListener("abort", abort); reject(error); });
+  });
 }
 
 /** The relay route for one Git read, below the connector or internal prefix. */

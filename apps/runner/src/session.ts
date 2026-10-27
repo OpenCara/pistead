@@ -174,8 +174,10 @@ export type RunnerConfig = {
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
 /** How long a clone waits for the refresh of a mirror filled before; then it borrows the mirror as it is (see mirror). */
 const MIRROR_REFRESH_WAIT_MS = 10_000;
-/** Pauses before the relay is asked again for a repository's refs, after a failure another attempt may get past. */
+/** Pauses before the relay is asked again for a repository's refs, after a quick failure another attempt may get past. */
 const OWNER_REFS_RETRY_MS = [500, 2_000];
+/** How long one listing of a repository's refs through the relay may take. */
+const OWNER_REFS_TIMEOUT_MS = 30_000;
 
 /**
  * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
@@ -394,19 +396,27 @@ export class RunnerSession {
 
   /**
    * `repository`'s branches and tags as the session owner's own account lists them, through the relay (which checks the
-   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors. A
-   * failure another attempt may get past is asked again (OWNER_REFS_RETRY_MS), then left to the clone to ask again (503).
+   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors.
+   * - A refusal is final (403).
+   * - A failure another attempt may get past (the relay busy or failing, its connection failing or breaking off, or the
+   *   listing running out of its time) ends in 503, which the clone asks again: a quick one only once the relay was asked
+   *   again (OWNER_REFS_RETRY_MS), one that ran out of its time at once.
+   * - Anything else will fail again just the same: 502, so the clone goes ahead without the cache, through the relay,
+   *   where Git says what is wrong.
    */
   private async ownerRefs(value: EgressRepository): Promise<Map<string, string>> {
     for (let failures = 0; ; failures++) {
-      try { return await this.relayRemote(value, AbortSignal.timeout(30_000)).listRefs(); }
+      const timeout = AbortSignal.timeout(OWNER_REFS_TIMEOUT_MS);
+      try { return await this.relayRemote(value, timeout).listRefs(); }
       catch (error) {
         // A refused read already ended borrowing for this open (see relay).
         if (refused(error)) throw new RunnerError(403, `Pistead did not confirm that this session's owner can read ${value.fullName}`);
-        const pause = OWNER_REFS_RETRY_MS[failures];
-        if (pause === undefined || !(error instanceof GitRemoteError && error.retryable)) {
-          throw new RunnerError(503, `Pistead could not confirm right now that this session's owner can read ${value.fullName}`);
+        // GitRemote calls a request its caller's signal aborted final; here that signal is the listing's own time limit.
+        if (!timeout.aborted && !(error instanceof GitRemoteError && error.retryable)) {
+          throw new RunnerError(502, `Pistead could not list ${value.fullName} for this session's owner`);
         }
+        const pause = timeout.aborted ? undefined : OWNER_REFS_RETRY_MS[failures];
+        if (pause === undefined) throw new RunnerError(503, `Pistead could not confirm right now that this session's owner can read ${value.fullName}`);
         await sleep(pause);
       }
     }

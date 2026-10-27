@@ -455,7 +455,7 @@ test("a session asks the relay again for its owner's refs after a failure that m
   const { RunnerError } = await import("../apps/runner/src/protocol.js");
   const cache = new RepositoryCache({ root: join(u.directory, "cache") });
   const grant: EgressGrant = { policy: { mode: "off", domains: [], packageRegistries: true }, repositories: [repository] };
-  let hiccups = 0, refusing = false;
+  let hiccups = 0, refusing = false, garbled = 0;
   const root = join(u.directory, "listing");
   const session = new RunnerSession(binding("listing"), root, { dataDir: root, controlPlaneUrl: "https://control.example.test", sharedSecret: "s".repeat(32),
     allowFaux: true, authorize: async request => ({ allowed: true, ownerId: request.ownerId, policyVersion: 1 }), repositoryCache: cache,
@@ -463,6 +463,7 @@ test("a session asks the relay again for its owner's refs after a failure that m
     gitRelay: async (_sessionId, request) => {
       if (refusing) throw new RunnerError(403, "No access");
       if (hiccups > 0) { hiccups--; throw new RunnerError(502, "The provider could not be reached"); }
+      if (garbled > 0) { garbled++; return new Response("<html>not Git</html>", { headers: { "Content-Type": "text/html" } }); }
       return u.relay(request);
     },
     resolveModels: async () => { throw new Error("model boundary"); } });
@@ -476,10 +477,36 @@ test("a session asks the relay again for its owner's refs after a failure that m
   // Still failing after its own attempts: the clone is told to ask again (503).
   hiccups = Infinity;
   await assert.rejects(mirror(repository), (error: unknown) => error instanceof RunnerError && error.status === 503 && /right now/.test(error.message));
-  // A refusal is final (403): the clone goes ahead without the cache, and the relay refuses that too.
+  // A listing that will fail just the same every time (no Git answer at all) is final, after one attempt, and not 503: the
+  // clone goes ahead without the cache, through the relay, where Git says what is wrong.
   hiccups = 0;
+  garbled = 1;
+  await assert.rejects(mirror(repository), (error: unknown) => error instanceof RunnerError && error.status === 502);
+  assert.equal(garbled, 2, "asked once");
+  // A refusal is final (403): the clone goes ahead without the cache, and the relay refuses that too.
+  garbled = 0;
   refusing = true;
   await assert.rejects(mirror(repository), (error: unknown) => error instanceof RunnerError && error.status === 403);
+});
+
+test("a relayed read its caller gives up on fails at once, and an answer that comes after is closed unread", async () => {
+  let answer: ((response: Response) => void) | undefined;
+  const read = relayFetch(repository.bindingId, () => new Promise<Response>(resolve => { answer = resolve; }));
+  const controller = new AbortController();
+  const pending = read("https://github.com/acme/app.git/info/refs?service=git-upload-pack", { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === "AbortError");
+  let cancelled = false;
+  answer!(new Response(new ReadableStream({ cancel() { cancelled = true; } })));
+  for (let attempt = 0; attempt < 50 && !cancelled; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(cancelled, true);
+  // A listing through the relay keeps to its time limit, and says another attempt is the caller's to decide.
+  const { GitRemoteError } = await import("../apps/runner/src/git-remote.js");
+  const started = Date.now();
+  const hung = new GitRemote({ url: "https://github.com/acme/app.git", authorization: "Bearer relay", signal: AbortSignal.timeout(100),
+    fetch: relayFetch(repository.bindingId, () => new Promise<Response>(() => {})) });
+  await assert.rejects(hung.listRefs(), (error: unknown) => error instanceof GitRemoteError && !error.retryable);
+  assert.ok(Date.now() - started < 5_000);
 });
 
 test("a clone whose mirror its command can't see yet fails, to be run again, rather than downloading the repository", { skip: !sandboxed }, async t => {
