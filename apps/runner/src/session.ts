@@ -2,12 +2,13 @@ import type { HostCommandOperation } from "../../../packages/shared/src/types.js
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
-import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionBranch, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, repositoryPreparationPhases, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
 import { scheduleToolTarget } from "../../../packages/shared/src/cron.js";
 import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
@@ -17,12 +18,13 @@ import { messageHash, parseChatImages, type ChatImage } from "../../../packages/
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
+import { reportedBranches } from "./clone-branches.js";
 import {
   hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
 } from "./sandbox.js";
 import { IMAGE_BUSY, IMAGE_ERROR, imageType, prepareImage } from "./images.js";
 import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
-import { HostCredentialError } from "./git-credentials.js";
+import { HostCredentialError, hostGitAuthorization } from "./git-credentials.js";
 import { GitRemote, GitRemoteError } from "./git-remote.js";
 import { mirrorPath, type MirrorRepository, type RepositoryCache } from "./repo-cache.js";
 import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
@@ -32,7 +34,7 @@ import { applyEdits } from "./edits.js";
 import { compactionFailure, configuredCompaction, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
-import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
+import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type MirrorProgress, type RelayRequest } from "./egress.js";
 import { DirectGit } from "./git-direct.js";
 import { egressReadServices, type EgressGrant, type EgressRepository, type GitDirectRequest } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
@@ -143,9 +145,16 @@ export type RunnerConfig = {
   identity?: ClientIdentity;
   /**
    * This host's repository cache, when its configuration keeps one (HostConfig.repositoryCache): a mirror per repository,
-   * filled through the control plane's relay, that clones borrow objects from. Fixed for a connection.
+   * filled straight from its provider with this host's own Git credentials (see cacheRemote), that clones borrow objects
+   * from once the control plane's relay confirms their owner may read it. Fixed for a connection.
    */
   repositoryCache?: RepositoryCache;
+  /**
+   * How the repository cache reads a workspace repository: by default directly from its provider, with the credential Git
+   * on this host would use (its credential helpers), or anonymously where it has none for the provider. Never through the
+   * relay. Tests stand in their own remote.
+   */
+  cacheRemote?: (repository: EgressRepository) => Promise<GitRemote>;
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
@@ -153,6 +162,11 @@ export type RunnerConfig = {
   openStorage?: (path: string) => Promise<Storage>;
   /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
   reportActivity?: (sessionId: string, activity: SessionActivity) => Promise<void>;
+  /**
+   * Tells the control plane which branches a session on the host has checked out in its clones of the workspace's
+   * github.com repositories, so that it finds their pull requests (clone-branches.ts); connected runners only.
+   */
+  reportBranches?: (sessionId: string, branches: SessionBranch[]) => Promise<void>;
   /** A session's network grant and its Git relay, through the connector; without them, the control plane's internal routes. */
   egressGrant?: (sessionId: string) => Promise<EgressGrant>;
   gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
@@ -170,6 +184,12 @@ export type RunnerConfig = {
 
 /** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
+/** How long a clone waits for the refresh of a mirror filled before; then it borrows the mirror as it is (see mirror). */
+const MIRROR_REFRESH_WAIT_MS = 10_000;
+/** Pauses before the relay is asked again for a repository's refs, after a quick failure another attempt may get past. */
+const OWNER_REFS_RETRY_MS = [500, 2_000];
+/** How long one listing of a repository's refs through the relay may take. */
+const OWNER_REFS_TIMEOUT_MS = 30_000;
 
 /**
  * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
@@ -184,6 +204,20 @@ function refused(error: unknown): boolean {
 function mirrorRepository(repository: EgressRepository): MirrorRepository & { bindingId: string } {
   if (repository.repositoryId === undefined) throw new RunnerError(409, "Update the Pistead server to cache this repository on the host");
   return { bindingId: repository.bindingId, provider: repository.provider, host: repository.host, repositoryId: repository.repositoryId, fullName: repository.fullName };
+}
+
+/**
+ * Why the host couldn't fill its mirror of `repository`, as the clone waiting for it is told (see GIT_SHIM): 503 for a
+ * failure another attempt may get past, after the cache's own attempts, so the clone asks again or stops to be run again
+ * rather than downloading the repository without the cache; any other status lets it go ahead without the cache.
+ */
+function cacheFailure(error: unknown, repository: EgressRepository): RunnerError {
+  if (error instanceof RunnerError) return error;
+  if (error instanceof GitRemoteError && error.status !== undefined && [401, 403, 404].includes(error.status)) {
+    return new RunnerError(502, `This host's Git credentials can't read ${repository.fullName}; its owner can set one up for ${repository.host} on it, for example with gh auth setup-git`);
+  }
+  const reason = error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached";
+  return new RunnerError(error instanceof GitRemoteError && error.retryable ? 503 : 502, reason);
 }
 
 function preparationFailure(reason: string): string {
@@ -259,19 +293,26 @@ export class RunnerSession {
   readonly #frozen: boolean;
   /**
    * The session runs directly on the host's own environment, with no sandbox: every session of an unsandboxed host, or
-   * one its owner started that way on a host that accepts it (`#hostSession`).
+   * one started that way on a host that accepts it (`#hostSession`).
    */
   readonly #onHost: boolean;
   /**
-   * A session its host's owner started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise
-   * sandboxes its sessions: it runs commands only while the host's configuration still accepts that
-   * (HostConfig.hostSessions), and deciding them needs host command authority, as host commands do.
+   * A session started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise sandboxes its
+   * sessions, by its owner or by a member they granted that: it runs commands only while the host's configuration still
+   * accepts that (HostConfig.hostSessions) and, for a member's, while their grant still includes it; deciding them
+   * needs host command authority, as host commands do.
    */
   readonly #hostSession: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
   /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
   #lfsRepositories: string[] = [];
+  /** A clone session on the host: the workspace's repositories, whose checked-out branches it reports (reportBranches). */
+  #branchRepositories: EgressRepository[] = [];
+  /** The branches last reported, as JSON, and whether a report runs or another is wanted after it. */
+  #branchesSent: string | undefined;
+  #branchesReporting = false;
+  #branchesWanted = false;
   /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
   #cloneFailures: { path: string; reason: string }[] = [];
   /** Restored from a conversation-only backup (Metadata.conversationOnlyRestore), for the agent's instructions. */
@@ -297,10 +338,11 @@ export class RunnerSession {
     this.#frozen = !this.#clone && (binding.session.repositories ?? []).length > 0;
     this.#hostSession = binding.session.hostEnvironment === true && config.unsandboxed !== true;
     this.#onHost = config.unsandboxed === true || this.#hostSession;
-    // Only the host's owner's own sessions ever run on the host itself; the control plane admits no other, and neither
-    // does the host.
-    if (this.#hostSession && (!binding.session.connectorOwnerId || binding.session.connectorOwnerId !== binding.owner.id)) {
-      throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
+    // Only sessions of the host's owner, or of a member they granted that, run on the host itself: the control plane
+    // admits no other, and the host checks a member's grant again before each of their commands
+    // (requireHostEnvironment).
+    if (this.#hostSession && !binding.session.connectorOwnerId) {
+      throw new RunnerError(403, "Only sessions of the host's owner, or of members they granted that, run directly on the host");
     }
     // Grants come the way relayed requests go: through the connector, or the control plane's internal route. A runner
     // given a relay of its own and no way to ask for grants relays everything.
@@ -316,7 +358,11 @@ export class RunnerSession {
         ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
     const report = config.reportActivity;
-    this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
+    // Once the agent stops working, its clones are as it left them: a session on the host reports their branches then.
+    this.#activity = report && new ActivityReporter(() => this.activity(), async activity => {
+      await report(binding.session.id, activity);
+      if (activity !== "working") this.reportBranches();
+    });
   }
 
   /** The session's network grant from the control plane: its workspace's repositories and network policy. */
@@ -330,7 +376,7 @@ export class RunnerSession {
       socketPath,
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
-      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
+      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository, onProgress: (progress: MirrorProgress) => void) => this.mirror(repository, onProgress) } : {}),
       ...(this.#clone ? { sessionBranch: sessionBranch(this.binding.session) } : {}),
     });
   }
@@ -355,16 +401,71 @@ export class RunnerSession {
     }
   }
 
-  /** A workspace repository read through the relay, for the host cache: the relay itself adds the owner's credential. */
+  /**
+   * A workspace repository read through the relay, where the relay itself adds the owner's credential: how this session
+   * confirms that its owner may read a repository before it borrows the host's mirror of it. Mirrors are never filled so.
+   */
   private relayRemote(repository: EgressRepository, signal?: AbortSignal): GitRemote {
     return new GitRemote({ url: bindingRemote(repository), authorization: "Bearer relay", fetch: relayFetch(repository.bindingId, request => this.relay(request)), signal });
   }
 
-  /** Refreshes the host's mirror of `repository` for this session and lets its shell commands borrow from it. */
-  private async mirror(value: EgressRepository): Promise<string> {
+  /**
+   * Makes the host's mirror of `repository` ready and lets this session's shell commands borrow from it. The relay first
+   * lists the repository's branches and tags with the session owner's own account, which confirms they may read it; then
+   * the mirror fetches those tips straight from the provider with this host's own Git credentials (cacheRemote), never
+   * through the relay. A mirror no fill has completed yet is waited for, however long its first fill takes; a filled one
+   * for at most MIRROR_REFRESH_WAIT_MS, then it is borrowed as it is while its refresh goes on.
+   */
+  private async mirror(value: EgressRepository, onProgress?: (progress: MirrorProgress) => void): Promise<string> {
     const repository = mirrorRepository(value);
-    await this.config.repositoryCache!.refresh({ repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: this.relayRemote(value) });
-    return this.allowMirror(repository, Date.now());
+    const refs = await this.ownerRefs(value);
+    const confirmedAt = Date.now();
+    try {
+      const target = { repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: await this.cacheRemote(value), refs };
+      await this.config.repositoryCache!.ready(target, { ...(onProgress ? { onProgress } : {}), wait: MIRROR_REFRESH_WAIT_MS });
+    } catch (error) {
+      throw cacheFailure(error, value);
+    }
+    return this.allowMirror(repository, confirmedAt);
+  }
+
+  /**
+   * `repository`'s branches and tags as the session owner's own account lists them, through the relay (which checks the
+   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors.
+   * - A refusal is final (403).
+   * - A failure another attempt may get past (the relay busy or failing, its connection failing or breaking off, or the
+   *   listing running out of its time) ends in 503, which the clone asks again: a quick one only once the relay was asked
+   *   again (OWNER_REFS_RETRY_MS), one that ran out of its time at once.
+   * - Anything else will fail again just the same: 502, so the clone goes ahead without the cache, through the relay,
+   *   where Git says what is wrong.
+   */
+  private async ownerRefs(value: EgressRepository): Promise<Map<string, string>> {
+    for (let failures = 0; ; failures++) {
+      const timeout = AbortSignal.timeout(OWNER_REFS_TIMEOUT_MS);
+      try { return await this.relayRemote(value, timeout).listRefs(); }
+      catch (error) {
+        // A refused read already ended borrowing for this open (see relay).
+        if (refused(error)) throw new RunnerError(403, `Pistead did not confirm that this session's owner can read ${value.fullName}`);
+        // GitRemote calls a request its caller's signal aborted final; here that signal is the listing's own time limit.
+        if (!timeout.aborted && !(error instanceof GitRemoteError && error.retryable)) {
+          throw new RunnerError(502, `Pistead could not list ${value.fullName} for this session's owner`);
+        }
+        const pause = timeout.aborted ? undefined : OWNER_REFS_RETRY_MS[failures];
+        if (pause === undefined) throw new RunnerError(503, `Pistead could not confirm right now that this session's owner can read ${value.fullName}`);
+        await sleep(pause);
+      }
+    }
+  }
+
+  /** How the host's repository cache reads `repository` (see RunnerConfig.cacheRemote). */
+  private async cacheRemote(repository: EgressRepository): Promise<GitRemote> {
+    if (this.config.cacheRemote) return this.config.cacheRemote(repository);
+    const url = bindingRemote(repository);
+    let authorization: string | undefined;
+    // A host with no credential for the provider still fills public repositories.
+    try { authorization = await hostGitAuthorization(url); }
+    catch (error) { if (!(error instanceof HostCredentialError)) throw error; }
+    return new GitRemote({ url, ...(authorization ? { authorization } : {}) });
   }
 
   private allowMirror(repository: MirrorRepository & { bindingId: string }, confirmedAt: number): string {
@@ -404,8 +505,10 @@ export class RunnerSession {
   }
 
   /**
-   * After a reopen, clones made earlier still borrow from mirrors that exist on this host. Each is listed again, but
-   * mounted only once the relay confirms the owner can still read its repository (see mirrorMounts).
+   * Lists the mirror of every workspace repository for this open, creating the ones this host doesn't have yet, empty:
+   * each is mounted only once the relay confirms the owner can read its repository (see mirrorMounts). Created before any
+   * command runs, so the command that first clones a repository already mounts the mirror its clone waits to fill (see
+   * GIT_SHIM), and clones made earlier still borrow from theirs after a reopen.
    */
   private async restoreMirrors(repositories: readonly EgressRepository[]): Promise<void> {
     const cache = this.config.repositoryCache;
@@ -414,7 +517,8 @@ export class RunnerSession {
     for (const value of repositories) {
       if (value.repositoryId === undefined) continue;
       const repository = mirrorRepository(value);
-      try { await lstat(join(cache.mirrorDirectory(repository, this.binding.owner.id), "HEAD")); }
+      // A cache root that isn't private can't be used; the clone hears why when it asks for the mirror.
+      try { await cache.prepare(repository, this.binding.owner.id); }
       catch { continue; }
       this.allowMirror(repository, 0);
     }
@@ -425,9 +529,13 @@ export class RunnerSession {
       throw new RunnerError(403, "Ticket session, owner, or connector mismatch");
   }
 
-  /** `host`: also ask for the actor's authority over host commands on this host (`hostCommands`). */
-  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false): Promise<AuthorizationResult> {
-    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission, ...(host ? { host: true } : {}) };
+  /**
+   * `host`: also ask for the actor's authority over host commands on this host (`hostCommands`); `hostSessions`, also
+   * whether they may run their own sessions directly on it.
+   */
+  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false, hostSessions = false): Promise<AuthorizationResult> {
+    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission,
+      ...(host ? { host: true } : {}), ...(host && hostSessions ? { hostSessions: true } : {}) };
     let result: AuthorizationResult;
     try {
       if (this.config.authorize) result = await this.config.authorize(body);
@@ -570,7 +678,10 @@ export class RunnerSession {
           if (!repository) throw new RunnerError(409, "its origin is not one of this workspace's repositories");
           let reference: string | null = null;
           if (this.config.repositoryCache && repository.repositoryId !== undefined) {
-            try { reference = await this.mirror(repository); } catch { /* cloned without borrowing */ }
+            const progress = ({ phase, percent, done, total, bytes }: MirrorProgress) => {
+              if (repositoryPreparationPhases.includes(phase as RepositoryPreparationItem["phase"])) update(entry.path, { phase: phase as RepositoryPreparationItem["phase"], percent, done, total, bytes });
+            };
+            try { reference = await this.mirror(repository, progress); } catch { /* cloned without borrowing */ }
           }
           update(entry.path, { phase: "receiving" });
           await (this.sandbox as Sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
@@ -665,7 +776,8 @@ export class RunnerSession {
   private async openHarness(): Promise<void> {
     await this.initializeRepositories();
     if (this.#clone && !this.#egress) {
-      this.#cloneRepositories = await this.requestGrant().then(grant => grant.repositories.map(repository => bindingRemote(repository)), () => []);
+      this.#branchRepositories = await this.requestGrant().then(grant => grant.repositories, () => []);
+      this.#cloneRepositories = this.#branchRepositories.map(repository => bindingRemote(repository));
     } else if (this.#clone) {
       const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
       this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
@@ -937,6 +1049,39 @@ export class RunnerSession {
     if (result === undefined || !settled(approval)) return approval;
     this.#wholeResults.delete(approval.id);
     return { ...approval, result };
+  }
+
+  /**
+   * Reports the branches a clone session on the host has checked out in its clones of the workspace's github.com
+   * repositories, when they changed since the last report. A session on the host pushes and opens pull requests with
+   * the host's own Git, so this is how the control plane learns which pull requests are its. A report that fails is
+   * sent again the next time the agent stops.
+   */
+  private reportBranches(): void {
+    const send = this.config.reportBranches;
+    if (!send || !this.#onHost || !this.#clone || this.closing) return;
+    if (this.#branchesReporting) { this.#branchesWanted = true; return; }
+    this.#branchesReporting = true;
+    void (async () => {
+      try {
+        do {
+          this.#branchesWanted = false;
+          // A grant that failed when the session opened is asked for again, rather than leaving the session unreported.
+          if (!this.#branchRepositories.length) this.#branchRepositories = (await this.requestGrant()).repositories;
+          if (!this.#branchRepositories.length) break;
+          const clones = await (this.sandbox as HostWorkspace).cloneBranches(async () => {});
+          const branches = reportedBranches(clones, this.#branchRepositories);
+          const json = JSON.stringify(branches);
+          if (json === this.#branchesSent) continue;
+          await send(this.binding.session.id, branches);
+          this.#branchesSent = json;
+        } while (this.#branchesWanted && !this.closing);
+      } catch (error) {
+        // Sent again the next time the agent stops.
+        console.warn(`Session ${this.binding.session.id}: could not report its clones' branches: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      finally { this.#branchesReporting = false; }
+    })();
   }
 
   /** What the agent is doing now (see SessionActivity). */
@@ -1361,13 +1506,25 @@ export class RunnerSession {
   }
 
   /**
-   * A session its owner started directly on the host runs commands only while the host's configuration still accepts
-   * that: its owner turning it off stops the session's next command (within the configuration's 30-second refresh).
+   * A session started directly on the host runs commands only while the host's configuration still accepts that: its
+   * owner turning it off stops the session's next command (within the configuration's 30-second refresh). A member's
+   * session also needs their grant to still include sessions on the host, and a command that runs without anyone
+   * approving it (`automatic`), automatic host commands too: a grant that ends or shrinks stops their next command.
    */
-  private async requireHostEnvironment(): Promise<void> {
-    if (this.#hostSession && !(await this.hostConfig()).hostSessions) {
+  private async requireHostEnvironment(automatic = false): Promise<void> {
+    if (!this.#hostSession) return;
+    if (!(await this.hostConfig()).hostSessions) {
       throw new RunnerError(403, "This host no longer runs sessions directly on it: its owner turned that off in Pistead (Settings → Hosts → the host → Configuration). "
         + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+    if (this.binding.session.connectorOwnerId === this.binding.owner.id) return;
+    const result = await this.authorize(this.binding.owner.id, "write", undefined, true, true);
+    if (result.hostSessions !== true) {
+      throw new RunnerError(403, "The session's owner may no longer run sessions directly on this host: the grant that let them has ended. "
+        + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+    if (automatic && result.hostCommands !== "auto") {
+      throw new RunnerError(403, "This session runs directly on its host, and its owner no longer holds automatic host commands there: commands need approval. Nothing ran.");
     }
   }
 
@@ -1756,7 +1913,10 @@ export class RunnerSession {
       automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id
         && (!github || (admissionId !== undefined && (operation.kind !== "github.merge" || run.options?.autoMerge === true)))
         && (operation.kind !== "git.push" || admissionId !== undefined)
-        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
+        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto")
+        // A command of a session on its host runs there as a host command does: without approval only for an owner who
+        // holds automatic host commands on it.
+        && (operation.kind !== "bash" || !this.#hostSession || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -1817,7 +1977,7 @@ export class RunnerSession {
     try {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation, approval.unbounded === true);
-        await this.requireHostEnvironment();
+        await this.requireHostEnvironment(true);
         await this.authorize(actorId, "write");
       }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true,
         ...await this.commandOptions(), signal });
@@ -1831,6 +1991,16 @@ export class RunnerSession {
     return (await this.metadata()).approvals[id]!;
   }
 
+  /**
+   * The permission `actorId` needs on the session to decide an approval of `operation`: approve, except that the host's
+   * owner decides its host commands (host_bash), which run as the host's OS user, with any access to the session.
+   * Whether they may decide host commands at all is checked with the card (see hostCommandLevel).
+   */
+  private decisionPermission(actorId: string, operation: Pick<Operation, "kind"> | undefined): Permission {
+    const hostOwner = this.binding.session.connectorOwnerId;
+    return operation?.kind === "host.bash" && !!hostOwner && actorId === hostOwner ? "read" : "approve";
+  }
+
   /** `scope` applies to permission requests: allow the one call (default), or the same need for the rest of the session. */
   async decide(ticket: RunnerTicket, id: string, input: { decision: "approve" | "deny"; operation: Operation; brokerCapability?: string; scope?: "call" | "session" }): Promise<ApprovalRecord> {
     this.requireUnfrozen();
@@ -1838,7 +2008,9 @@ export class RunnerSession {
     if (input.decision !== "approve" && input.decision !== "deny") throw new RunnerError(400, "Invalid approval decision");
     if (input.scope !== undefined && input.scope !== "call" && input.scope !== "session") throw new RunnerError(400, "Invalid approval scope");
     return this.exclusive(async () => {
-      await this.authorize(ticket.actorId, "approve", ticket.policyVersion);
+      // The operation the caller names must be the card's (checked below), so it says what deciding it needs.
+      const permission = this.decisionPermission(ticket.actorId, input.operation);
+      await this.authorize(ticket.actorId, permission, ticket.policyVersion);
       const state = await this.metadata();
       const approval = state.approvals[id];
       if (!approval) throw new RunnerError(404, "Approval not found");
@@ -1904,7 +2076,7 @@ export class RunnerSession {
         // Long host builds must not hold the connector's 30-second RPC queue.
         void this.startHostOperation(id, approval.operation, { actorId: ticket.actorId, capability: input.brokerCapability }, async () => {
           await this.authorize(approval.requestedBy, "write");
-          await this.authorize(ticket.actorId, "approve");
+          await this.authorize(ticket.actorId, permission);
         });
         return (await this.metadata()).approvals[id]!;
       }

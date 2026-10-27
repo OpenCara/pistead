@@ -1,7 +1,7 @@
 import type { Permission, RunnerAction, RunnerTicket } from '../../../packages/shared/src/types.js';
 import { sha256, signToken } from '../../../packages/shared/src/crypto.js';
-import { hasPermission } from '../../../packages/shared/src/policy.js';
 import { requireNoMigration, requireUnfrozen, sessionAccess } from './db.js';
+import { mayRequestAction } from './host-access.js';
 import type { AppContext, SessionRow } from './types.js';
 import { fail, id, testMode } from './http.js';
 import { connectorRequest, type ConnectionPin } from './connector-transport.js';
@@ -26,7 +26,7 @@ export function ownerViewRequest(c: AppContext, row: SessionRow): Promise<Respon
 /** What every runner request checks first: the actor may still do `action` on the session, and no restore or move is under way. */
 export async function requireRunnerAccess(c: AppContext, actorId: string, row: SessionRow, action: RunnerAction): Promise<SessionRow> {
   const access = await sessionAccess(c.env, row.id, actorId);
-  if (!access || !hasPermission(access.permissions, actionPermissions[action]) || access.row.owner_id !== row.owner_id) {
+  if (!access || access.row.owner_id !== row.owner_id || !await mayRequestAction(c.env, access, actorId, action, actionPermissions[action])) {
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && action !== 'view' && action !== 'events') fail(409, 'session_archived', 'Session is archived.');

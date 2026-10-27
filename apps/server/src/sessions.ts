@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
-import type { ApprovalRecord, ChatOptions, Permission, RunnerBinding, SessionRole, SessionView, SubmitResult, WorkspaceRole } from '../../../packages/shared/src/types.js';
+import type { ApprovalRecord, ChatOptions, Operation, Permission, RunnerBinding, SessionRole, SessionView, SubmitResult, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { accessModes, permissions, sessionRoles, thinkingLevels } from '../../../packages/shared/src/types.js';
 import { connectorLimits, type ConnectorCapabilities, type LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { parseChatImages, type ChatImage } from '../../../packages/shared/src/chat-images.js';
@@ -9,7 +9,7 @@ import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import { hasPermission, normalizePermissions, roleSessionCeiling, sessionRoleOf, sessionRolePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import { redactApproval } from '../../../packages/shared/src/redaction.js';
 import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireMember, requireSession, requireSessionCreator, sessionCreatorSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
+import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireActiveSession, requireMember, requireSession, requireSessionCreator, sessionCreatorSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { sessionBranchName } from '../../../packages/shared/src/git-push.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
@@ -22,10 +22,11 @@ import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
-import { mayDecideHostCommands } from './host-access.js';
+import { hostAuthority, hostOwnerDecides, mayDecideHostCommands } from './host-access.js';
 import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
 import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
+import { newSessionToolOutput } from './transcript-settings.js';
 
 /**
  * Per-message model, reasoning and access. The model must be one the session's own host offers: one it advertises that its
@@ -160,6 +161,22 @@ function sessionVisibility(value: unknown): 'private' | 'workspace' {
 }
 
 /**
+ * Session `sessionId`, when the caller may decide its approvals: with approve permission on it, or as the owner of its
+ * host with any access to it, for host commands only (`operation`, once the reviewed one is known), where the host lets
+ * its owner decide them so (hostOwnerDecides). Like any change, a decision waits while the session is archived,
+ * restored into or moving.
+ */
+async function requireDecider(c: AppContext, sessionId: string, operation?: Operation): Promise<SessionRow> {
+  const { row, permissions: held } = await requireSession(c, sessionId, 'read');
+  if (!hasPermission(held, 'approve')) {
+    const hostCommand = operation === undefined || operation.kind === 'host.bash';
+    if (!hostCommand || !await hostOwnerDecides(c.env, row, c.get('auth').userId)) fail(403, 'forbidden', 'Session approve permission is required.');
+  }
+  await requireActiveSession(c.env, row);
+  return row;
+}
+
+/**
  * Snapshots of the session's view. A client that passes `since` (empty when it holds no view yet) understands patches:
  * after a whole `view` event it gets `patch` events with only what changed since the revision it holds, and a patch
  * with no changes while nothing did. Clients without `since` get the whole view every time, as before patches.
@@ -268,17 +285,18 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (session.connector_id && capabilities.plainGit !== true) {
       fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
     }
-    // A session may run directly on its host, without the sandbox: only the host's owner starts one, only where the host's
-    // configuration accepts that, and only on a connector that runs it there. Anything else is refused, never quietly
-    // sandboxed, so the owner never believes a session is somewhere it isn't.
+    // A session may run directly on its host, without the sandbox: only the host's owner, or a member they granted that
+    // in this workspace, starts one, only where the host's configuration accepts that, and only on a connector that runs
+    // it there. Anything else is refused, never quietly sandboxed, so nobody believes a session is somewhere it isn't.
     if (input.hostEnvironment !== undefined && typeof input.hostEnvironment !== 'boolean') fail(400, 'invalid_input', 'hostEnvironment must be true or false.');
     const onHost = input.hostEnvironment === true;
     if (onHost) {
-      if (!session.connector_id || session.connector_owner_id !== ownerId) {
-        fail(403, 'host_owner_required', 'Only a host\'s owner starts sessions that run directly on it.');
+      const granted = session.connector_owner_id !== ownerId;
+      if (!session.connector_id || (granted && (await hostAuthority(c.env, session, ownerId))?.sessions !== true)) {
+        fail(403, 'host_owner_required', 'Only a host\'s owner, or a member they granted sessions on the host, starts sessions that run directly on it.');
       }
       if (capabilities.unsandboxed === true) fail(400, 'host_unsandboxed', 'This host runs every session without the sandbox already.');
-      if (!hostSessionsSupported(capabilities)) {
+      if (!hostSessionsSupported(capabilities, granted)) {
         fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to run sessions directly on it.');
       }
       if (!(await connectorHostConfig(c.env, session.connector_id)).hostSessions) {
@@ -294,7 +312,9 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const agent = await chatAgentVersion(c.env, ownerId, model, capabilities);
     // Its own branch is named for its work, on a connector that pushes the name its binding carries.
     const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone',
-      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0 };
+      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0,
+      // It starts with the tool output its workspace's owners and admins chose for new sessions; its owner can change it.
+      tool_output: await newSessionToolOutput(c.env.DB, workspaceId) };
     const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
     const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
     await requireSessionCreator(c.env, workspaceId, ownerId);
@@ -302,8 +322,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     // Admit the session only while its workspace's repositories, membership and host are as they were checked.
     const inserted = await c.env.DB.query(`INSERT INTO sessions
       (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch,
-        host_environment)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        host_environment, tool_output)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE ${sessionCreatorSQL('?')}
       AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
       AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
@@ -331,7 +351,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       RETURNING id`)
       .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
         row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null, row.branch ?? null,
-        row.host_environment ?? 0,
+        row.host_environment ?? 0, row.tool_output ?? 'full',
         workspaceId, ownerId, workspaceId, resolved.bindingIds,
         // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
         ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
@@ -513,7 +533,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   });
 
   app.post('/api/sessions/:id/approvals/:approvalId', async c => {
-    const { row } = await requireSession(c, identifier(c.req.param('id')), 'approve');
+    const row = await requireDecider(c, identifier(c.req.param('id')));
     requireUnfrozen(row);
     const approvalId = identifier(c.req.param('approvalId'), 'approvalId');
     const input = await jsonObject(c);
@@ -521,6 +541,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (input.scope !== undefined && input.scope !== 'call' && input.scope !== 'session') fail(400, 'invalid_decision', 'Expected the call or session scope.');
     // The browser echoes its displayed commitment. A later runtime view can only confirm it, never replace it.
     const review = await reviewedApproval(c, row, approvalId, input.reviewHash);
+    // Without approve permission, the host's owner decides host commands only.
+    await requireDecider(c, row.id, review.operation);
     const result = await runnerJSON<{ view: SessionView }>(await runnerRequest(c, row, 'view'));
     if (!result?.view || result.view.sessionId !== row.id || result.view.owner?.id !== row.owner_id || !Array.isArray(result.view.approvals)) fail(502, 'invalid_runner_response', 'The runner returned an inconsistent session view.');
     const candidate = result.view.approvals.find(item => item.id === approvalId && item.sessionId === row.id);
@@ -528,9 +550,10 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (!approval) fail(404, 'not_found', 'Approval request not found.');
     if (approval.status !== 'pending') fail(409, 'approval_already_decided', 'This approval request is no longer pending.');
     const operation = review.operation;
-    // The host's owner decides host commands, as does a member they (or a host admin) granted host commands to.
+    // The host's owner decides host commands, as does a member they (or a host admin) granted host commands to who has
+    // approve permission here.
     if (operation.kind === 'host.bash' && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
-      fail(403, 'host_owner_required', 'Only the host owner, or a member granted host commands on this host, can decide host commands. Grant them approve access to this session first.');
+      fail(403, 'host_owner_required', 'Only the host owner, or a member granted host commands on this host, can decide host commands.');
     }
     // A session that runs directly on its host runs its commands there, as host commands: they are decided the same way.
     if (operation.kind === 'bash' && Number(row.host_environment ?? 0) === 1 && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
@@ -551,8 +574,8 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
       const writer = await sessionAccess(c.env, row.id, review.requested_by);
       if (!writer || !hasPermission(writer.permissions, 'write')) fail(403, 'requester_revoked', 'The operation requester no longer has write permission.');
       await reviewedApproval(c, row, approvalId, input.reviewHash);
-      const fresh = await requireSession(c, row.id, 'approve');
-      if (fresh.row.connector_id) await requireConnectorSession(c.env, fresh.row.connector_id, fresh.row);
+      const fresh = await requireDecider(c, row.id, operation);
+      if (fresh.connector_id) await requireConnectorSession(c.env, fresh.connector_id, fresh);
       if (operation.kind === 'github.comment' || operation.kind === 'github.merge' || operation.kind === 'github.issue' || operation.kind === 'git.push') {
         const existing = await c.env.DB.query('SELECT token_hash FROM broker_capabilities WHERE session_id = ? AND approval_id = ?').bind(row.id, approvalId).first();
         if (existing) fail(409, 'approval_attempt_exists', 'This operation already has an approval attempt. Inspect its outcome before creating a new request.');

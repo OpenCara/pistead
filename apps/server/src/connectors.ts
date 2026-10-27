@@ -16,9 +16,10 @@ import { agentSchedules } from './scheduled-prompts.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
 import { legacyRepositoryFixture, requireConfiguredWorkspace } from './repositories.js';
-import { connectorAdmins, connectorHostGrants, managedConnector, requireManagedWorkspace, viewerHostCommands } from './host-access.js';
+import { connectorAdmins, connectorHostGrants, managedConnector, requireManagedWorkspace, viewerHostAuthority } from './host-access.js';
 import { connectorHostConfig } from './host-config.js';
 import { disabledModelKeys, hostModelSettings } from './host-models.js';
+import { reportSessionBranches } from './session-branches.js';
 
 export interface ConnectorRow {
   id: string; owner_id: string; name: string; credential_hash: string; revoked_at: string | null;
@@ -201,9 +202,10 @@ type InfoViewer = { userId: string; role?: 'owner' | 'admin'; workspaceId?: stri
 /**
  * Whether a host's connector runs a session directly on the host when its binding asks (SessionRecord.hostEnvironment):
  * one that takes its configuration from Pistead, on a sandboxed host. An unsandboxed host runs every session that way.
+ * `granted`: for a member the host's owner granted that, which needs a connector that honors such grants.
  */
-export function hostSessionsSupported(capabilities: ConnectorCapabilities): boolean {
-  return capabilities.hostConfig === true && capabilities.unsandboxed !== true;
+export function hostSessionsSupported(capabilities: ConnectorCapabilities, granted = false): boolean {
+  return capabilities.hostConfig === true && capabilities.unsandboxed !== true && (!granted || capabilities.hostSessionGrants === true);
 }
 async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewer): Promise<ConnectorInfo> {
   const ownerName = row.owner_name ?? (await env.DB.query<{ display_name: string }>('SELECT display_name FROM users WHERE id = ?')
@@ -222,14 +224,15 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
       online = await env.CONNECTOR_HUB.status(row.id, 2000);
     } catch { /* Offline is safe metadata; do not expose transport errors. */ }
   }
-  // The host's owner learns, in every listing, whether their sessions may run directly on it.
+  // The host's owner learns, in every listing, whether their sessions may run directly on it; a member granted that, in
+  // the listing of the workspace their grant is in.
   const owner = viewer?.userId === row.owner_id;
-  const [admins, grants, disabled, config, hostCommandAccess, memberships] = await Promise.all([
+  const [admins, grants, disabled, config, authority, memberships] = await Promise.all([
     viewer?.role ? connectorAdmins(env, row.id) : undefined,
     viewer?.role ? connectorHostGrants(env, row.id) : undefined,
     disabledModelKeys(env, row.id),
-    viewer?.role || owner ? connectorHostConfig(env, row.id) : undefined,
-    viewer?.workspaceId ? viewerHostCommands(env, row, viewer.workspaceId, viewer.userId) : undefined,
+    viewer?.role || owner || viewer?.workspaceId ? connectorHostConfig(env, row.id) : undefined,
+    viewer?.workspaceId ? viewerHostAuthority(env, row, viewer.workspaceId, viewer.userId) : undefined,
     // An admin sees the owner's workspaces only where they are a member too.
     viewer?.role === 'admin' ? env.DB.query<{ workspace_id: string }>('SELECT workspace_id FROM workspace_members WHERE user_id = ?')
       .bind(viewer.userId).all().then(items => new Set(items.map(item => item.workspace_id))) : undefined,
@@ -238,7 +241,9 @@ async function connectorInfo(env: Env, row: ConnectorInfoRow, viewer?: InfoViewe
   const hostGrants = grants?.filter(grant => visible(grant.workspaceId));
   const { models, disabledModels } = hostModelSettings(JSON.parse(row.models_json), disabled);
   const capabilities = JSON.parse(row.capabilities_json) as ConnectorCapabilities;
-  const hostSessions = owner && !row.revoked_at && config?.hostSessions === true && hostSessionsSupported(capabilities);
+  const hostCommandAccess = authority?.level;
+  const hostSessions = (owner || authority?.sessions === true) && !row.revoked_at && config?.hostSessions === true
+    && hostSessionsSupported(capabilities, !owner);
   return { id: row.id, ownerId: row.owner_id, ownerName, name: row.name,
     createdAt: row.created_at, revokedAt: row.revoked_at, online, models,
     workspaceIds: workspaceIds.filter(visible), connectedWorkspaceIds: connectedWorkspaceIds.filter(visible), capabilities,
@@ -371,6 +376,7 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   });
   app.post('/api/connectors/self/authorize', async c => authorizeSession(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/activity', async c => reportSessionActivity(c, (await authenticateConnector(c)).id));
+  app.post('/api/connectors/self/branches', async c => reportSessionBranches(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/comment', async c => githubComment(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/read', async c => githubRead(c, (await authenticateConnector(c)).id));
   app.post('/api/connectors/self/github/merge', async c => githubMerge(c, (await authenticateConnector(c)).id));

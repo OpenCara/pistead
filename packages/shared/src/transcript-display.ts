@@ -5,8 +5,8 @@ import type { EntryView, SessionView } from "./types.js";
  * How the control plane shows a session's transcript to the people viewing it. Hosts always send the whole transcript;
  * these change only what leaves the control plane, so they work with every connector.
  *
- * - Tool output (per session, `SessionRecord.toolOutput`): "brief" shows each tool result as its first line and cuts
- *   long tool calls short.
+ * - Tool output (per session, `SessionRecord.toolOutput`, starting as its workspace sets for new sessions): "brief" shows
+ *   each tool result as its first line and cuts long tool calls short.
  * - Paging (per workspace): views hold only each conversation's latest entries, and clients read earlier ones a page at
  *   a time as people scroll up.
  */

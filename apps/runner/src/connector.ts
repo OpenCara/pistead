@@ -9,7 +9,8 @@ import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
-import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity } from "../../../packages/shared/src/types.js";
+import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity, SessionBranch } from "../../../packages/shared/src/types.js";
+import { MAX_CLONE_BRANCHES } from "./clone-branches.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
@@ -476,6 +477,7 @@ export class LocalConnector {
         compaction: this.options.localModels.compaction, identity: this.options.localModels.identity,
         authorize: request => this.authorize(generation, request),
         reportActivity: (sessionId, activity) => this.reportActivity(generation, sessionId, activity),
+        reportBranches: (sessionId, branches) => this.reportBranches(generation, sessionId, branches),
         githubComment: async request => {
           const payload = {
             sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
@@ -664,9 +666,11 @@ export class LocalConnector {
   }
 
   private async authorize(generation: Generation, request: AuthorizationRequest): Promise<AuthorizationResult> {
-    const payload = { sessionId: request.sessionId, actorId: request.actorId, ownerId: request.ownerId, permission: request.permission, ...(request.host ? { host: true } : {}) };
+    const payload = { sessionId: request.sessionId, actorId: request.actorId, ownerId: request.ownerId, permission: request.permission, ...(request.host ? { host: true } : {}),
+      ...(request.host && request.hostSessions ? { hostSessions: true } : {}) };
     const result = z.object({
       allowed: z.boolean(), ownerId: actorSchema, policyVersion: z.number().int().positive(), hostCommands: z.enum(["approve", "auto"]).optional(),
+      hostSessions: z.literal(true).optional(),
     }).strict().parse(await this.callback(generation, "/api/connectors/self/authorize", payload));
     if (result.ownerId !== request.ownerId) throw new Error("Invalid authorization response");
     return result;
@@ -689,6 +693,25 @@ export class LocalConnector {
     await response.body?.cancel();
     this.requireGeneration(generation);
     if (!response.ok && (response.status >= 500 || response.status === 408 || response.status === 429)) throw new Error("Activity report unavailable");
+  }
+
+  /**
+   * Tells the control plane which branches a session on this host has checked out (clone-branches.ts). A refusal is
+   * final, as for activity: a control plane that predates these reports refuses them all. Anything else throws, so the
+   * session reports again.
+   */
+  private async reportBranches(generation: Generation, sessionId: string, branches: SessionBranch[]): Promise<void> {
+    if (!IDENTIFIER.test(sessionId) || branches.length > MAX_CLONE_BRANCHES) throw new Error("Invalid branch report");
+    this.requireGeneration(generation);
+    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)]);
+    const response = await (this.options.fetch ?? fetch)(`${this.state!.controlPlaneUrl}/api/connectors/self/branches`, {
+      method: "POST", redirect: "error", credentials: "omit",
+      headers: { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken!, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId, branches: branches.map(({ repository, branch }) => ({ repository, branch })) }), signal,
+    });
+    await response.body?.cancel();
+    this.requireGeneration(generation);
+    if (!response.ok && (response.status >= 500 || response.status === 408 || response.status === 429)) throw new Error("Branch report unavailable");
   }
 
   private async readBackup(generation: Generation, restore: RestoreDescriptor, targetSessionId: string): Promise<Uint8Array> {

@@ -95,6 +95,10 @@ export interface SessionRow {
   pull_request_url?: string | null;
   /** Only on rows read through session access: that pull request's state as last read (pull-request-states.ts). */
   pull_request_state?: string | null;
+  /** Only on rows read through session access: the pull request found last for a branch its host reported (session-branches.ts). */
+  branch_pull_request_url?: string | null;
+  /** Only on rows read through session access: that pull request's state as last read. */
+  branch_pull_request_state?: string | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;

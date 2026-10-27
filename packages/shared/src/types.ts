@@ -95,6 +95,11 @@ export interface AgentVersion {
  */
 export const sessionActivities = ["idle", "working", "waiting", "done", "failed"] as const;
 export type SessionActivity = (typeof sessionActivities)[number];
+/**
+ * A branch a session on a host has checked out in its clone of one of the workspace's github.com repositories (owner/name),
+ * as its host reports it so that the control plane finds the branch's pull request.
+ */
+export interface SessionBranch { repository: string; branch: string }
 export interface SessionRecord {
   id: string;
   workspaceId: string;
@@ -129,16 +134,17 @@ export interface SessionRecord {
   visibility?: "private" | "workspace";
   /**
    * "brief": everyone viewing the session (share links included) sees each tool result as its first line and long tool
-   * calls cut short, to keep transcripts small. Absent: full tool output. Only the owner changes it.
+   * calls cut short, to keep transcripts small. Absent: full tool output. It starts as its workspace sets for new sessions; only the owner changes it.
    */
   toolOutput?: "brief";
   // Present only on single-session reads: the pinned host explicitly runs without isolation, or this session runs on it
   // directly (hostEnvironment).
   hostUnsandboxed?: boolean;
   /**
-   * The session runs directly on its host's own environment, without the sandbox: chosen when its owner, the host's
-   * owner, started it on a host whose configuration accepts that (HostConfig.hostSessions), and fixed for its life.
-   * Its commands run as the host's OS user; deciding them needs host command authority, as host commands do.
+   * The session runs directly on its host's own environment, without the sandbox: chosen when its owner started it on
+   * a host whose configuration accepts that (HostConfig.hostSessions), as the host's owner or a member they granted
+   * sessions on the host (HostCommandGrant.hostSessions), and fixed for its life. Its commands run as the host's OS
+   * user; deciding them needs host command authority, as host commands do.
    */
   hostEnvironment?: true;
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
@@ -248,6 +254,11 @@ export interface AuthorizationRequest {
   ownerId: string;
   /** Also report the actor's authority over host commands on the session's host (`hostCommands`). */
   host?: boolean;
+  /**
+   * With `host`, also report whether the actor may run their own sessions directly on the session's host
+   * (`hostSessions`). Asked only by connectors that honor such grants, so older ones never receive the field.
+   */
+  hostSessions?: boolean;
 }
 /**
  * What a member may do with host_bash on a host: `approve` decides each host command; `auto` also runs the host
@@ -262,6 +273,11 @@ export interface AuthorizationResult {
   ownerId: string;
   /** Present only when requested (`host`) and the actor holds some authority over the session's host commands. */
   hostCommands?: HostCommandLevel;
+  /**
+   * Present only when requested (`hostSessions`) and the actor may run their own sessions directly on the session's
+   * host: they own it, or hold a grant there that includes sessions on the host (HostCommandGrant.hostSessions).
+   */
+  hostSessions?: true;
 }
 /** A pull request the control plane opens as the session owner after a successful push. `base` defaults to the default branch. */
 export interface PullRequestRequest {
