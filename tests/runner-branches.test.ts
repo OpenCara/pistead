@@ -46,13 +46,15 @@ test("a clone session on the host reports its clones' branches of the workspace'
   const models = createModels();
   models.setProvider(faux.provider);
   const reports: [string, SessionBranch[]][] = [];
+  let grants = 0;
   const grant = { policy: { mode: "off" as const, domains: [], packageRegistries: true },
     repositories: [{ bindingId: "repo-1", provider: "github" as const, host: "github.com", repositoryId: "1", fullName: "acme/alpha" }] };
   const service = new RunnerService({
     dataDir: directory, sharedSecret: "runner-branches-test-secret-not-a-production-secret", controlPlaneUrl: "http://127.0.0.1:8787", allowFaux: true, unsandboxed: true,
     authorize: async (input: AuthorizationRequest) => ({ allowed: true, ownerId: input.ownerId, policyVersion: 1 }),
     resolveModels: async model => ({ models, provider: model.provider, modelId: model.modelId }),
-    egressGrant: async () => grant,
+    // The grant fails when the session opens, and is asked for again when it reports.
+    egressGrant: async () => { if (grants++ === 0) throw new Error("control plane unavailable"); return grant; },
     reportActivity: async () => {},
     reportBranches: async (sessionId, branches) => { reports.push([sessionId, branches]); },
   });
@@ -67,6 +69,7 @@ test("a clone session on the host reports its clones' branches of the workspace'
   // Opened with no clone yet.
   await reported(1);
   assert.deepEqual(reports[0], [id, []]);
+  assert.equal(grants, 2, "the grant that failed at open was asked for again");
 
   // The agent clones and switches to a branch with the host's own Git; then it stops.
   const git = join((session.sandbox as HostWorkspace).worktree, "alpha", ".git");

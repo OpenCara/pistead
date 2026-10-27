@@ -1043,9 +1043,11 @@ test('a session on a host shows the pull request GitHub has for a branch its hos
   assert.equal(lookup.authorization, 'Bearer owner-oauth-token', 'looked up as the session owner');
   assert.equal(await record(), undefined);
 
-  // One opened before the session started is another session's; the one opened since is this session's.
+  // One opened before the session started is another session's, as is one whose time can't be read; the one opened
+  // since is this session's.
   const created = String(f.sqlite.prepare('SELECT created_at FROM sessions WHERE id = ?').get('session')!.created_at);
   f.state.branchPulls['owner:feature'] = [
+    { number: 6, html_url: 'https://github.com/owner/repo/pull/6', created_at: 'not a time' },
     { number: 5, html_url: 'https://github.com/owner/repo/pull/5', created_at: new Date(Date.parse(created) + 1000).toISOString() },
     { number: 3, html_url: 'https://github.com/owner/repo/pull/3', created_at: '2000-01-01T00:00:00Z' }];
   f.state.githubPulls[5] = { state: 'open', merged: false, draft: false, reviews: [], checkRuns: [{ name: 'test', status: 'completed', conclusion: 'failure' }], statuses: [] };

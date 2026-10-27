@@ -947,13 +947,16 @@ export class RunnerSession {
    */
   private reportBranches(): void {
     const send = this.config.reportBranches;
-    if (!send || !this.#onHost || !this.#clone || !this.#branchRepositories.length || this.closing) return;
+    if (!send || !this.#onHost || !this.#clone || this.closing) return;
     if (this.#branchesReporting) { this.#branchesWanted = true; return; }
     this.#branchesReporting = true;
     void (async () => {
       try {
         do {
           this.#branchesWanted = false;
+          // A grant that failed when the session opened is asked for again, rather than leaving the session unreported.
+          if (!this.#branchRepositories.length) this.#branchRepositories = (await this.requestGrant()).repositories;
+          if (!this.#branchRepositories.length) break;
           const clones = await (this.sandbox as HostWorkspace).cloneBranches(async () => {});
           const branches = reportedBranches(clones, this.#branchRepositories);
           const json = JSON.stringify(branches);
@@ -961,7 +964,10 @@ export class RunnerSession {
           await send(this.binding.session.id, branches);
           this.#branchesSent = json;
         } while (this.#branchesWanted && !this.closing);
-      } catch { /* sent again the next time the agent stops */ }
+      } catch (error) {
+        // Sent again the next time the agent stops.
+        console.warn(`Session ${this.binding.session.id}: could not report its clones' branches: ${error instanceof Error ? error.message : String(error)}`);
+      }
       finally { this.#branchesReporting = false; }
     })();
   }

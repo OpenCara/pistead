@@ -44,6 +44,10 @@ test("the worktree's clones report their checked-out branches of the workspace's
   await clone(root, "elsewhere", { branch: "x", url: "https://gitlab.com/owner/repo.git" });
   // A clone's own directories are its work, and symlinks are not followed.
   await clone(root, "app/nested", { branch: "inner", url: "https://github.com/owner/repo" });
+  // A linked worktree or submodule has a .git file: neither it nor what's under it is reported.
+  await mkdir(join(root, "linked-worktree"), { recursive: true });
+  await writeFile(join(root, "linked-worktree", ".git"), "gitdir: /elsewhere/.git/worktrees/linked\n");
+  await clone(root, "linked-worktree/inner", { branch: "inner", url: "https://github.com/owner/repo" });
   await clone(join(root, ".."), `${root.split("/").at(-1)}-outside`, { branch: "outside", url: "https://github.com/owner/repo" });
   t.after(() => rm(`${root}-outside`, { recursive: true, force: true }));
   await symlink(`${root}-outside`, join(root, "linked"));

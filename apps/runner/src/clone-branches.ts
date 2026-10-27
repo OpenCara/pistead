@@ -68,7 +68,8 @@ export function originUrl(config: string): string | undefined {
 
 /**
  * The checked-out branches of the clones in `worktree`, in directory order: directories up to MAX_DEPTH deep with a
- * .git directory of their own (the worktree's own .git is Pistead's), not followed through symlinks. A clone on a
+ * .git directory of their own (the worktree's own .git is Pistead's), not followed through symlinks. A directory with a
+ * .git file (a linked worktree or submodule) is neither reported nor looked into. A clone on a
  * detached HEAD, without an origin, or on its origin's default branch (refs/remotes/origin/HEAD, which git clone
  * records; main or master when it didn't) is left out: such work has no pull request of its own.
  */
@@ -79,7 +80,11 @@ export async function readCloneBranches(worktree: string): Promise<CloneBranch[]
     if (depth > MAX_DEPTH || visited++ >= MAX_DIRECTORIES || found.length >= MAX_CLONE_BRANCHES) return;
     let names: string[];
     try { names = (await readdir(directory)).sort(); } catch { return; }
-    if (relative && names.includes(".git") && (await lstat(join(directory, ".git")).catch(() => undefined))?.isDirectory()) {
+    const metadata = relative && names.includes(".git") ? await lstat(join(directory, ".git")).catch(() => undefined) : undefined;
+    // A .git file is a linked worktree or a submodule: its metadata lives elsewhere, so it isn't read, but its directory
+    // is still a repository's work, not a place for more clones.
+    if (metadata && !metadata.isDirectory()) return;
+    if (metadata) {
       const git = join(directory, ".git");
       const branch = headBranch(await readSmall(join(git, "HEAD")));
       const origin = originUrl(await readSmall(join(git, "config")) ?? "");

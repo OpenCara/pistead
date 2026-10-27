@@ -139,7 +139,9 @@ export async function findBranchPullRequest(token: string, fullName: string, bra
   for (const item of list.map(object)) {
     const number = item.number;
     const url = string(item.html_url);
-    if (!Number.isSafeInteger(number) || Date.parse(string(item.created_at)) < sinceMs) continue;
+    // Only a pull request known to be opened since: a missing or unreadable time is no match.
+    const created = Date.parse(string(item.created_at));
+    if (!Number.isSafeInteger(number) || !(created >= sinceMs)) continue;
     const pull = githubPullRequest(url);
     if (pull && pull.fullName.toLowerCase() === fullName.toLowerCase() && pull.number === number) return { url, number: number as number };
   }
