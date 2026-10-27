@@ -45,17 +45,23 @@ const decodeEntities = (text: string) => text.replace(/&nbsp;/g, " ").replace(/&
 
 /** One short line of plain text from an upstream answer: an HTML page's title or heading, else its text; never markup. */
 function plainDetail(raw: string): string {
-  let text = raw;
-  if (/<[a-z!/]/i.test(raw)) {
-    // An element's text, or nothing when it is missing or empty, so an empty <title> falls back to the <h1>.
+  const looksLikeMarkup = (value: string) => /<[a-z!/]/i.test(value);
+  // Entities are decoded first, so entity-encoded tags are stripped like literal ones; then scripts, styles and tags go.
+  const toText = (value: string) => {
+    const decoded = decodeEntities(value);
+    return looksLikeMarkup(decoded) ? stripTags(decoded.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ")) : decoded;
+  };
+  let source = raw;
+  if (looksLikeMarkup(raw)) {
+    // An element's content, or nothing when it is missing or has no text, so an empty <title> falls back to the <h1>.
     const pick = (tag: string) => {
       const inner = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`, "i").exec(raw)?.[1];
-      return inner !== undefined && stripTags(inner).trim() ? inner : undefined;
+      return inner !== undefined && toText(inner).trim() ? inner : undefined;
     };
-    text = stripTags(pick("title") ?? pick("h1") ?? raw.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " "));
+    source = pick("title") ?? pick("h1") ?? raw;
   }
-  // Angle brackets are dropped after decoding, so no markup survives, whether it was literal or entity-encoded.
-  text = decodeEntities(text).replace(/[<>]/g, "");
+  // Any angle bracket left (a stray `<` in plain text, say) is dropped, so no markup survives.
+  let text = toText(source).replace(/[<>]/g, "");
   // Control characters (other than whitespace) are dropped so nothing odd reaches the page.
   text = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
   return text.length > DETAIL_LIMIT ? `${text.slice(0, DETAIL_LIMIT - 1)}…` : text;

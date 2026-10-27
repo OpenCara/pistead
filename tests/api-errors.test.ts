@@ -64,7 +64,9 @@ test("rate limits and long proxy pages stay short and plain", async () => {
 
 test("no markup survives, whether literal, entity-encoded or in tags the page doesn't usually use", async () => {
   const encoded = await failure(() => new Response("<pre>&lt;b&gt;bold&lt;/b&gt; &amp;lt;i&amp;gt; Tom &amp; Jerry</pre>", { status: 502, headers: { "Content-Type": "text/html" } }));
-  assert.match(encoded.message, /: "bbold\/b &lt;i&gt; Tom & Jerry"/);
+  assert.match(encoded.message, /: "bold &lt;i&gt; Tom & Jerry"/);
+  const encodedScript = await failure(() => Response.json({ message: "&lt;script&gt;alert(1)&lt;/script&gt;Origin down" }, { status: 502 }));
+  assert.match(encodedScript.message, /: "Origin down"/);
   assert.doesNotMatch(encoded.message, /[<>]/);
   const h2 = await failure(() => new Response("<h2>Upstream <em>unavailable</em></h2>", { status: 503, headers: { "Content-Type": "text/html" } }));
   assert.match(h2.message, /: "Upstream unavailable"/);
