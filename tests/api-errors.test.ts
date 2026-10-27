@@ -67,6 +67,8 @@ test("no markup survives, whether literal, entity-encoded or in tags the page do
   assert.match(encoded.message, /: "bold &lt;i&gt; Tom & Jerry"/);
   const encodedScript = await failure(() => Response.json({ message: "&lt;script&gt;alert(1)&lt;/script&gt;Origin down" }, { status: 502 }));
   assert.match(encodedScript.message, /: "Origin down"/);
+  const lessThan = await failure(() => new Response("<pre>retry if n &lt; 3</pre>", { status: 502, headers: { "Content-Type": "text/html" } }));
+  assert.match(lessThan.message, /: "retry if n 3"/);
   assert.doesNotMatch(encoded.message, /[<>]/);
   const h2 = await failure(() => new Response("<h2>Upstream <em>unavailable</em></h2>", { status: 503, headers: { "Content-Type": "text/html" } }));
   assert.match(h2.message, /: "Upstream unavailable"/);

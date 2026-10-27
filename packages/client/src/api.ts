@@ -37,7 +37,8 @@ const statusNames: Record<number, string> = {
 
 const DETAIL_LIMIT = 200;
 
-const stripTags = (html: string) => html.replace(/<[^>]*>/g, " ");
+// Only real tags (a name after `<`), so a bare `<` in text such as `n < 3` doesn't swallow everything up to the next `>`.
+const stripTags = (html: string) => html.replace(/<\/?[a-z!][^>]*>/gi, " ");
 
 /** Decodes the common entities; `&amp;` last, so `&amp;lt;` stays the text `&lt;` instead of becoming `<`. */
 const decodeEntities = (text: string) => text.replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
