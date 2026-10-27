@@ -103,24 +103,33 @@ export function HostCommandGrantsSection({ connector, refresh }: { connector: Co
   const eligible = (members.data?.members ?? []).filter(member => member.userId !== connector.ownerId && member.role !== "viewer");
   const [grantee, setGrantee] = useState(EVERYONE);
   const [level, setLevel] = useState<HostCommandLevel>("approve");
-  // Sessions on the host, which only the owner grants.
-  const [sessions, setSessions] = useState(false);
   const accepting = connector.config?.hostSessions === true && !connector.capabilities.unsandboxed;
   const [expiry, setExpiry] = useState<Expiry>("7");
   const member = eligible.find(item => item.userId === grantee);
   const who = member ? usernameWithId(memberPerson(member)) : `every member of ${target?.name ?? "the workspace"}`;
+  // The grant this form would replace, if any: granting again replaces it as a whole.
+  const existing = grants.find(item => item.workspaceId === target?.id && (item.userId ?? EVERYONE) === (member?.userId ?? EVERYONE));
+  // Sessions on the host, which only the owner grants: the checkbox starts from what the grant already includes, so
+  // changing its level or expiry keeps them unless the owner clears it.
+  const grantKey = `${target?.id ?? ""}:${member?.userId ?? EVERYONE}`;
+  const [sessionsChoice, setSessionsChoice] = useState<{ key: string; value: boolean } | null>(null);
+  const sessions = sessionsChoice?.key === grantKey ? sessionsChoice.value : existing?.hostSessions === true;
+  const setSessions = (value: boolean) => setSessionsChoice({ key: grantKey, value });
 
   function grant() {
     if (!target) return;
     void (async () => {
       const auto = level === "auto";
       const withSessions = owner && sessions;
+      // Granting again without sessions takes them away: say so rather than drop them quietly.
+      const dropsSessions = owner && !sessions && existing?.hostSessions === true;
       if (!await confirmDialog({
         title: withSessions ? "Grant sessions on the host?" : auto ? "Grant automatic host commands?" : "Grant host command approval?",
         message: (auto
           ? `${who} will be able to run host_bash on ${connector.name} OUTSIDE the sandbox without anyone approving each command, whenever they send a message with Auto-approve. Commands run on the owner's machine as its user, with its files, credentials and network, and no resource limits.`
           : `${who} will be able to approve host_bash commands on ${connector.name}, which run OUTSIDE the sandbox on the owner's machine with its files, credentials and network.`)
-          + (withSessions ? ` They will also be able to start their own sessions directly on ${connector.name}, without the sandbox: every command of those sessions runs as its user${auto ? ", without asking under their Auto-approve" : ", once approved"}, and their clones use its Git and credentials.` : ""),
+          + (withSessions ? ` They will also be able to start their own sessions directly on ${connector.name}, without the sandbox: every command of those sessions runs as its user${auto ? ", without asking under their Auto-approve" : ", once approved"}, and their clones use its Git and credentials.` : "")
+          + (dropsSessions ? ` This replaces their current grant, which includes sessions on the host: they will no longer start sessions directly on ${connector.name}, and the next command of any they have there will stop.` : ""),
         confirmLabel: "Grant", destructive: auto || withSessions,
       })) return;
       const days = expiries.find(item => item.value === expiry)!.days;
@@ -128,6 +137,7 @@ export function HostCommandGrantsSection({ connector, refresh }: { connector: Co
         await api(`/api/connectors/${segment(connector.id)}/host-grants/${segment(target.id)}`, { method: "PUT", body: {
           ...(member ? { userId: member.userId } : {}), level, ...(owner ? { hostSessions: sessions } : {}), ...(days ? { expiresAt: new Date(Date.now() + days * 86_400_000).toISOString() } : {}),
         } });
+        setSessionsChoice(null);
         refresh();
       }, "Host command access granted.");
     })();
