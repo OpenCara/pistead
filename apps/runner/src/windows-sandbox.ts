@@ -138,6 +138,8 @@ export class WindowsBackend implements HelperBackend {
       SANDBOX_GITDIR: layout.git, SANDBOX_GIT: this.#git, SANDBOX_BASH: this.#bash, SANDBOX_OWNER_CONFIG: layout.ownerConfig,
       SystemRoot: system, windir: system, PATH: this.path,
       TEMP: join(layout.home, ".tmp"), TMP: join(layout.home, ".tmp"), USERPROFILE: layout.home,
+      // MXC refuses to start a process container whose environment lacks LOCALAPPDATA (presence-only); keep it in home.
+      LOCALAPPDATA: join(layout.home, "AppData", "Local"), APPDATA: join(layout.home, "AppData", "Roaming"),
       // Git for Windows' bash starts in HOME and keeps its /tmp in TEMP.
       MSYSTEM: "MINGW64", CHERE_INVOKING: "1",
     };
@@ -146,14 +148,17 @@ export class WindowsBackend implements HelperBackend {
     const readwrite = context.readOnly ? [] : [layout.home, layout.worktree, ...(context.gitWritable ? [layout.git] : [])];
     if (context.readOnly) readonly.push(layout.home, layout.worktree);
     const containerRequest = {
-      command: `"${process.execPath}" "${join(layout.bin, "helper.mjs")}"`,
+      // The container can't lstat the drive root, which Node's realpath of the entry script needs; skip that walk.
+      command: `"${process.execPath}" --preserve-symlinks-main --preserve-symlinks "${join(layout.bin, "helper.mjs")}"`,
       containment: { type: "processcontainer" },
       filesystem: { readwritePaths: readwrite, readonlyPaths: readonly, deniedPaths: [] },
       // Proxy-only egress (MXC's "Model 2"): the container reaches only the session's loopback proxy; no proxy, no network.
       network: port !== undefined
         ? { egress: { default: "deny" }, ingress: { default: "allow", hostLoopback: "allow" }, runtimeConfig: { networkProxy: `http://127.0.0.1:${port}` } }
         : { egress: { default: "deny" }, ingress: { default: "deny", hostLoopback: "deny" } },
-      ui: { disable: true },
+      // `disable: true` turns Win32k off, and node.exe, git.exe and whoami.exe then die in DLL init (0xC0000142). The
+      // rest of MXC's UI policy (own desktop, no clipboard, no input injection) still applies.
+      ui: { disable: false },
       workingDirectory: layout.worktree,
       environment,
       inheritDefaultEnvironment: false,

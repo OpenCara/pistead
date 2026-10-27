@@ -66,6 +66,24 @@ What the first runs must check, beyond [Spikes](#spikes-before-committing):
   - the named-pipe lease;
   - unsandboxed sessions end to end.
 
+First run on Windows 11 25H2 build 26200.9445 (MXC 1.0.1 reports `base-container` there):
+
+- Fixed: the container's environment needs `LOCALAPPDATA` (MXC refuses to start without it); `ui.disable: true` turns
+  Win32k off, so `node.exe` and `git.exe` die in DLL initialization (`0xC0000142`); Node needs
+  `--preserve-symlinks-main` because the container can't `lstat` the drive root.
+- Holds: other sessions' folders, the host user's profile, `C:\ProgramData`, `C:\Users\Public` and `C:\Windows\Temp`
+  are denied; direct egress and other loopback ports are blocked while the session's proxy port is reachable; the job's
+  memory and process limits reach into the container, and closing the job ends it.
+- Open:
+  - MSYS2 programs (Git for Windows' `bash.exe`, `sh.exe`, coreutils) die in DLL initialization inside the container,
+    so shell commands can't run;
+  - Git for Windows can't get its working directory unless every ancestor folder is readable (it needs traversal
+    without read, `enumeratePaths`, which this build lacks);
+  - MXC replaces `HTTPS_PROXY` with `http://127.0.0.1:<port>`, dropping the session token, so proxied requests get 407;
+  - a loopback server inside the container can't be connected to (expected before .9550);
+  - unsandboxed: stopping a command leaves the background processes MSYS2 bash started (`taskkill /T` can't follow
+    them), so a time limit or cancel waits for them to finish.
+
 ## What the Linux sandbox guarantees today
 
 These come from `apps/runner/src/sandbox.ts` (bubblewrap), `resources.ts` (cgroup v2) and `egress.ts`. A Windows
