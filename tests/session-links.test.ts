@@ -455,11 +455,13 @@ test('brief tool output and paged transcripts change what views carry, not what 
 
   // Paging is the workspace's: members see it, owners and admins change it.
   const settingsPath = `/api/workspaces/${s.team.id}/transcripts`;
-  assert.deepEqual(await json(await s.member.request('GET', settingsPath)), { settings: { paging: false } });
+  assert.deepEqual(await json(await s.member.request('GET', settingsPath)), { settings: { paging: false, toolOutput: 'full' } });
   await denied(await s.member.request('PUT', settingsPath, { paging: true }), 403, 'forbidden');
   await denied(await s.outsider.request('GET', settingsPath), 404, 'not_found');
   await denied(await s.owner.request('PUT', settingsPath, { paging: 'yes' }), 400, 'invalid_input');
-  assert.deepEqual(await json(await s.owner.request('PUT', settingsPath, { paging: true })), { settings: { paging: true } });
+  await denied(await s.owner.request('PUT', settingsPath, { toolOutput: 'short' }), 400, 'invalid_input');
+  await denied(await s.owner.request('PUT', settingsPath, {}), 400, 'invalid_input');
+  assert.deepEqual(await json(await s.owner.request('PUT', settingsPath, { paging: true })), { settings: { paging: true, toolOutput: 'full' } });
 
   // A paged view holds each conversation's latest 50 entries, and says what comes before.
   const paged = await read();
@@ -485,4 +487,29 @@ test('brief tool output and paged transcripts change what views carry, not what 
   assert.equal(restored.entries.length, 63);
   assert.equal(shown(restored, '0:2').text, 'first of 2\nsecond\nthird');
   assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', path))).session.toolOutput, undefined);
+});
+
+// A workspace's owners and admins choose the tool output its new sessions start with; existing sessions keep theirs.
+test('new sessions start with the tool output their workspace sets', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const settingsPath = `/api/workspaces/${s.team.id}/transcripts`;
+  assert.equal(s.session.toolOutput, undefined, 'Full tool output until the workspace says otherwise');
+  await denied(await s.member.request('PUT', settingsPath, { toolOutput: 'brief' }), 403, 'forbidden');
+  await json(await s.owner.request('PUT', settingsPath, { paging: true }));
+  // Either setting alone leaves the other as it was.
+  assert.deepEqual(await json(await s.owner.request('PUT', settingsPath, { toolOutput: 'brief' })), { settings: { paging: true, toolOutput: 'brief' } });
+  assert.deepEqual(await json(await s.member.request('GET', settingsPath)), { settings: { paging: true, toolOutput: 'brief' } });
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE workspace_id = ? AND action = 'workspace.transcripts.updated'").get(s.team.id)!.n, 2);
+
+  const { session: next } = await json<{ session: SessionRecord }>(await s.owner.request('POST', '/api/sessions', s.input), 201);
+  assert.equal(next.toolOutput, 'brief');
+  assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', `/api/sessions/${next.id}`))).session.toolOutput, 'brief');
+  assert.equal((await json<{ session: SessionRecord }>(await s.owner.request('GET', `/api/sessions/${s.session.id}`))).session.toolOutput, undefined);
+  // Its owner still changes their own session's.
+  const { session: shown } = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', `/api/sessions/${next.id}`, { toolOutput: 'full' }));
+  assert.equal(shown.toolOutput, undefined);
+
+  assert.deepEqual(await json(await s.owner.request('PUT', settingsPath, { toolOutput: 'full', paging: false })), { settings: { paging: false, toolOutput: 'full' } });
+  const { session: last } = await json<{ session: SessionRecord }>(await s.owner.request('POST', '/api/sessions', s.input), 201);
+  assert.equal(last.toolOutput, undefined);
 });
