@@ -6,7 +6,7 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionBranch, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
 import { scheduleToolTarget } from "../../../packages/shared/src/cron.js";
 import type { CompactionFailure } from "../../../packages/shared/src/types.js";
@@ -17,6 +17,7 @@ import { messageHash, parseChatImages, type ChatImage } from "../../../packages/
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
+import { reportedBranches } from "./clone-branches.js";
 import {
   hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
 } from "./sandbox.js";
@@ -152,6 +153,11 @@ export type RunnerConfig = {
   openStorage?: (path: string) => Promise<Storage>;
   /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
   reportActivity?: (sessionId: string, activity: SessionActivity) => Promise<void>;
+  /**
+   * Tells the control plane which branches a session on the host has checked out in its clones of the workspace's
+   * github.com repositories, so that it finds their pull requests (clone-branches.ts); connected runners only.
+   */
+  reportBranches?: (sessionId: string, branches: SessionBranch[]) => Promise<void>;
   /** A session's network grant and its Git relay, through the connector; without them, the control plane's internal routes. */
   egressGrant?: (sessionId: string) => Promise<EgressGrant>;
   gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
@@ -264,6 +270,12 @@ export class RunnerSession {
   #cloneRepositories: string[] = [];
   /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
   #lfsRepositories: string[] = [];
+  /** A clone session on the host: the workspace's repositories, whose checked-out branches it reports (reportBranches). */
+  #branchRepositories: EgressRepository[] = [];
+  /** The branches last reported, as JSON, and whether a report runs or another is wanted after it. */
+  #branchesSent: string | undefined;
+  #branchesReporting = false;
+  #branchesWanted = false;
   /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
   #cloneFailures: { path: string; reason: string }[] = [];
   /** Restored from a conversation-only backup (Metadata.conversationOnlyRestore), for the agent's instructions. */
@@ -302,7 +314,11 @@ export class RunnerSession {
         ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
     const report = config.reportActivity;
-    this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
+    // Once the agent stops working, its clones are as it left them: a session on the host reports their branches then.
+    this.#activity = report && new ActivityReporter(() => this.activity(), async activity => {
+      await report(binding.session.id, activity);
+      if (activity !== "working") this.reportBranches();
+    });
   }
 
   /** The session's network grant from the control plane: its workspace's repositories and network policy. */
@@ -648,7 +664,8 @@ export class RunnerSession {
   private async openHarness(): Promise<void> {
     await this.initializeRepositories();
     if (this.#clone && !this.#egress) {
-      this.#cloneRepositories = await this.requestGrant().then(grant => grant.repositories.map(repository => bindingRemote(repository)), () => []);
+      this.#branchRepositories = await this.requestGrant().then(grant => grant.repositories, () => []);
+      this.#cloneRepositories = this.#branchRepositories.map(repository => bindingRemote(repository));
     } else if (this.#clone) {
       const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
       this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
@@ -920,6 +937,33 @@ export class RunnerSession {
     if (result === undefined || !settled(approval)) return approval;
     this.#wholeResults.delete(approval.id);
     return { ...approval, result };
+  }
+
+  /**
+   * Reports the branches a clone session on the host has checked out in its clones of the workspace's github.com
+   * repositories, when they changed since the last report. A session on the host pushes and opens pull requests with
+   * the host's own Git, so this is how the control plane learns which pull requests are its. A report that fails is
+   * sent again the next time the agent stops.
+   */
+  private reportBranches(): void {
+    const send = this.config.reportBranches;
+    if (!send || !this.#onHost || !this.#clone || !this.#branchRepositories.length || this.closing) return;
+    if (this.#branchesReporting) { this.#branchesWanted = true; return; }
+    this.#branchesReporting = true;
+    void (async () => {
+      try {
+        do {
+          this.#branchesWanted = false;
+          const clones = await (this.sandbox as HostWorkspace).cloneBranches(async () => {});
+          const branches = reportedBranches(clones, this.#branchRepositories);
+          const json = JSON.stringify(branches);
+          if (json === this.#branchesSent) continue;
+          await send(this.binding.session.id, branches);
+          this.#branchesSent = json;
+        } while (this.#branchesWanted && !this.closing);
+      } catch { /* sent again the next time the agent stops */ }
+      finally { this.#branchesReporting = false; }
+    })();
   }
 
   /** What the agent is doing now (see SessionActivity). */
