@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0035_session_branches.sql.
+-- Postgres translation of sqlite/0036_session_branches.sql.
 
 -- The branches a session that runs directly on a host has checked out in its clones of the workspace's github.com
 -- repositories, as its host reports them (session-branches.ts). Such a session pushes and opens pull requests with the
