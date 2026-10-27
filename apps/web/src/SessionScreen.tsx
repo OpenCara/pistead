@@ -18,7 +18,7 @@ import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
-import { decidesHostCommand, HOST_COMMAND_WAITING, isHostCommand } from "../../../packages/client/src/host-commands";
+import { decidesHostCommand, hostCommandWaiting, isHostCommand } from "../../../packages/client/src/host-commands";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
 import { navigate } from "./router";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
@@ -212,12 +212,12 @@ function SessionPane({ id }: { id: string }) {
 
   /**
    * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
-   * command, as every command of a session that runs on its host is, is decided by its host's owner, or a member granted
-   * host commands with approve permission here; everything else by anyone with approve permission.
+   * command, as every command of a session that runs on its host is, needs host command authority (see decidesHostCommand:
+   * the host's owner decides host_bash without approve permission here); everything else, approve permission.
    */
   function decides(approval: ApprovalRecord): boolean {
     if (!session || archived || frozen) return false;
-    if (isHostCommand(approval.operation, session)) return decidesHostCommand(session, host, user.id, permissions.includes("approve"));
+    if (isHostCommand(approval.operation, session)) return decidesHostCommand(approval.operation, session, host, user.id, permissions.includes("approve"));
     const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
     return canApprove && (!ownerOnly || isOwner);
   }
@@ -292,7 +292,7 @@ function SessionPane({ id }: { id: string }) {
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
                   <span className="muted small">Runs as {hostCommand ? "the host OS user (outside the sandbox)" : view.owner.displayName} · each approval covers one exact operation and its arguments</span>
                 </div>}
-              </> : <p className="muted small">{hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
+              </> : <p className="muted small">{hostCommand ? hostCommandWaiting(approval.operation, host) : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
           })}
           <Feedback {...approvalAction} />

@@ -1,5 +1,5 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommand, HOST_COMMAND_WAITING, initialSelection, isHostCommand, modelUnavailable,
+  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommand, hostCommandWaiting, initialSelection, isHostCommand, modelUnavailable,
   mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
@@ -77,12 +77,12 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
 
   /**
    * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
-   * command, as every command of a session that runs on its host is, is decided by its host's owner, or a member granted
-   * host commands with approve permission here; everything else by anyone with approve permission.
+   * command, as every command of a session that runs on its host is, needs host command authority (see decidesHostCommand:
+   * the host's owner decides host_bash without approve permission here); everything else, approve permission.
    */
   function decides(approval: ApprovalRecord): boolean {
     if (readOnly) return false;
-    if (isHostCommand(approval.operation, session ?? {})) return decidesHostCommand(session ?? {}, host, user.id, permissions.includes("approve"));
+    if (isHostCommand(approval.operation, session ?? {})) return decidesHostCommand(approval.operation, session ?? {}, host, user.id, permissions.includes("approve"));
     const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
     return canApprove && (!ownerOnly || isOwner);
   }
@@ -151,7 +151,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
           </Text>
         </>}
       </> : <Text style={[ui.small, { color: palette.muted }]}>
-        {hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
+        {hostCommand ? hostCommandWaiting(approval.operation, host) : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
       </Text>}
     </ApprovalCard>;
   };

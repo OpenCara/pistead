@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decidesHostCommand, decidesHostCommands, isHostCommand } from "../packages/client/src/host-commands.js";
+import { decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "../packages/client/src/host-commands.js";
 
 test("a host command is host_bash, or any command of a session that runs on its host", () => {
   const sandboxed = {};
@@ -25,20 +25,34 @@ test("the host's owner and members granted host commands decide them, as the con
   assert.equal(decidesHostCommands({}, {}, "github:2"), false);
 });
 
-test("the host's owner decides its host commands without approve permission once the host lets them; anyone else still needs it", () => {
+test("the host's owner decides host_bash without approve permission once the host lets them; anything else, and anyone else, still needs it", () => {
   const session = { connectorOwnerId: "github:1" };
+  const hostBash = { kind: "host.bash" } as const;
+  // A command of a session that runs on its host is a host command too, but the host's owner decides it with the approve
+  // permission they hold on their own session, as the control plane and the host check it.
+  const hostSessionBash = { kind: "bash" } as const;
   const current = { hostCommandAccess: "owner" as const, capabilities: { hostOwnerDecides: true } };
   const older = { hostCommandAccess: "owner" as const, capabilities: {} };
-  assert.equal(decidesHostCommand(session, current, "github:1", false), true);
+  assert.equal(decidesHostCommand(hostBash, session, current, "github:1", false), true);
+  assert.equal(decidesHostCommand(hostSessionBash, session, current, "github:1", false), false);
+  assert.equal(decidesHostCommand(hostSessionBash, session, current, "github:1", true), true);
   // An older connector checks approve permission on every decision, its owner's too; before the listing loads, so does the app.
-  assert.equal(decidesHostCommand(session, older, "github:1", false), false);
-  assert.equal(decidesHostCommand(session, undefined, "github:1", false), false);
-  assert.equal(decidesHostCommand(session, older, "github:1", true), true);
+  assert.equal(decidesHostCommand(hostBash, session, older, "github:1", false), false);
+  assert.equal(decidesHostCommand(hostBash, session, undefined, "github:1", false), false);
+  assert.equal(decidesHostCommand(hostBash, session, older, "github:1", true), true);
   // A member granted host commands decides them only with approve permission on the session, wherever the host stands.
   for (const level of ["approve", "auto"] as const) {
     const host = { hostCommandAccess: level, capabilities: { hostOwnerDecides: true } };
-    assert.equal(decidesHostCommand(session, host, "github:2", false), false, level);
-    assert.equal(decidesHostCommand(session, host, "github:2", true), true, level);
+    assert.equal(decidesHostCommand(hostBash, session, host, "github:2", false), false, level);
+    assert.equal(decidesHostCommand(hostBash, session, host, "github:2", true), true, level);
   }
-  assert.equal(decidesHostCommand(session, { capabilities: { hostOwnerDecides: true } }, "github:2", true), false);
+  assert.equal(decidesHostCommand(hostBash, session, { capabilities: { hostOwnerDecides: true } }, "github:2", true), false);
+});
+
+test("a host command's card says whether approve access is needed of the host's owner too", () => {
+  const current = { capabilities: { hostOwnerDecides: true } };
+  assert.equal(hostCommandWaiting({ kind: "host.bash" }, current), "Waiting for the host's owner, or a member granted host commands with approve access to this session");
+  for (const [operation, host] of [[{ kind: "host.bash" }, { capabilities: {} }], [{ kind: "host.bash" }, undefined], [{ kind: "bash" }, current]] as const) {
+    assert.equal(hostCommandWaiting(operation, host), "Waiting for the host's owner or a member granted host commands, either with approve access to this session");
+  }
 });

@@ -65,7 +65,7 @@ export async function authorizeConnectorTicket(env: Env, ticket: RunnerTicket, c
   if (!permission || !Object.hasOwn(connectorPermissions, ticket.action) || !ticket.connectorId) fail(403, 'invalid_ticket', 'Invalid connector ticket.');
   const access = await sessionAccess(env, ticket.sessionId, ticket.actorId);
   if (!access || access.row.owner_id !== ticket.ownerId || access.row.connector_id !== ticket.connectorId ||
-      !mayRequestAction(access, ticket.actorId, ticket.action, permission) || access.row.policy_version !== ticket.policyVersion) {
+      access.row.policy_version !== ticket.policyVersion || !await mayRequestAction(env, access, ticket.actorId, ticket.action, permission)) {
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && ticket.action !== 'view' && ticket.action !== 'events') fail(409, 'session_archived', 'Session is archived.');

@@ -89,11 +89,12 @@ export async function hostOwnerDecides(env: Env, row: Pick<SessionRow, 'connecto
 
 /**
  * Whether `access` lets its actor send the runner `action`, which needs `permission`. A decision also goes for the
- * session's host owner with any access to it, who decides its host commands (see hostOwnerDecides): the approvals route
- * and the host check which operation it decides, and the host whether its owner may.
+ * session's host owner with any access to it, on a host that lets its owner decide host commands so (hostOwnerDecides):
+ * the approvals route and the host check that it decides a host command.
  */
-export function mayRequestAction(access: SessionAccess, actorId: string, action: RunnerAction, permission: Permission): boolean {
-  return hasPermission(access.permissions, permission) || (action === 'approve' && ownsSessionHost(access.row, actorId));
+export async function mayRequestAction(env: Env, access: SessionAccess, actorId: string, action: RunnerAction, permission: Permission): Promise<boolean> {
+  if (hasPermission(access.permissions, permission)) return true;
+  return action === 'approve' && await hostOwnerDecides(env, access.row, actorId);
 }
 
 export async function connectorAdmins(env: Env, connectorId: string): Promise<ConnectorAdmin[]> {
