@@ -38,6 +38,8 @@ export interface ConnectorCapabilities {
   github?: boolean;
   /** The connector opens GitHub issues through the control plane once a human approves each (github_issue). Absent on older connectors. */
   githubIssues?: boolean;
+  /** The connector's agents manage their session's scheduled prompts through the control plane (schedule). Absent on older connectors. */
+  schedules?: boolean;
   /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
    * docs/design/repository-cache.md). Absent on older connectors and on hosts whose cache is off, for this connection.

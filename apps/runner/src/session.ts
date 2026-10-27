@@ -6,8 +6,9 @@ import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
-import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
+import { scheduleToolTarget } from "../../../packages/shared/src/cron.js";
 import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
@@ -121,6 +122,8 @@ export type RunnerConfig = {
   githubMerge?: (request: GitHubMergeRequest) => Promise<GitHubMergeResult>;
   /** Opens one issue, as githubComment; a refusal GitHub stated throws a RunnerError with status 422 and its reason. */
   githubIssue?: (request: GitHubIssueRequest) => Promise<GitHubIssueResult>;
+  /** Lists, creates, changes or deletes the session's scheduled prompts, as the schedule tool asks; the control plane's refusal throws a RunnerError with its reason. */
+  schedules?: (request: ScheduleToolRequest) => Promise<ScheduleToolResult>;
   /** Issues the credential for one approved push; a token is held only in this process's memory. */
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
@@ -1518,6 +1521,30 @@ export class RunnerSession {
         await this.permit(api, call, "github_issue", `${repository}: ${args.title}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.issue", repository, title: args.title, body: args.body }, String(api.taskId), { permitted: true }), call));
       } }),
+      defineTool({ name: "schedule", description: "Manage this session's scheduled prompts: messages Pistead sends this session's agent on a cron schedule, as the session owner, so the session wakes up and works on its own (a nightly check, a weekly report). Use it when the user asks to do something every hour, day or week, or at a later time. action list takes nothing; create takes message (what the agent is told each time) and cron (five fields: minute hour day-of-month month day-of-week, such as '0 9 * * 1-5'; runs at least 5 minutes apart), and optionally name, time_zone (IANA, such as Europe/Berlin; UTC otherwise, so ask the user for theirs when the time of day matters), access (approval, the default: commands wait for a human; read; auto, only in a message the owner sent with auto-approve) and enabled; update takes id and only the fields to change (an auto-approved schedule is changed, other than paused or lowered in access, only in a message the owner sent with auto-approve); delete takes id. Only the session owner's messages can use it. A run due while the agent is busy is skipped. The owner sees and edits them in the session panel's Schedules tab.", parameters: Type.Object({
+        action: StringEnum(scheduleToolActions), id: Type.Optional(Type.String()), message: Type.Optional(Type.String()), cron: Type.Optional(Type.String()),
+        time_zone: Type.Optional(Type.String()), name: Type.Optional(Type.String()), access: Type.Optional(StringEnum(accessModes)), enabled: Type.Optional(Type.Boolean()),
+      }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        const fields = Object.fromEntries(Object.entries({ scheduleId: args.id, name: args.name, cron: args.cron, timeZone: args.time_zone, content: args.message,
+          access: args.access, enabled: args.enabled }).filter(([, value]) => value !== undefined)) as Omit<ScheduleToolRequest, "sessionId" | "actorId" | "admissionId" | "callId" | "action">;
+        if (Object.values(fields).some(value => typeof value === "string" && value.includes("\0"))) throw new RunnerError(400, "Schedule fields must not contain NUL characters");
+        const state = await this.metadata();
+        const run = state.runs[state.toolActors[String(api.taskId)]!.runKey]!;
+        // A schedule runs as the session owner, with nobody watching: only the owner's own messages make one, and only a
+        // message with their Auto-approve an auto-approved one (the control plane checks both, and changes to one).
+        if (run.initiatedBy !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner's messages schedule prompts. Ask the owner to send this request, or to add it in the Schedules tab.");
+        if (args.access === "auto" && run.options?.access !== "auto") {
+          throw new RunnerError(403, "Only a message the session owner sent with auto-approve schedules an auto-approved prompt. Use access approval, or ask the owner to set it in the Schedules tab.");
+        }
+        if (!run.admissionId) throw new RunnerError(403, "Scheduling needs a write message");
+        await this.permit(api, call, "schedule", scheduleToolTarget({ action: args.action, ...fields }), { write: args.action !== "list" });
+        await this.authorize(run.initiatedBy, "write");
+        const request: ScheduleToolRequest = { sessionId: this.binding.session.id, actorId: run.initiatedBy, admissionId: run.admissionId, callId: String(api.taskId),
+          action: args.action, ...fields };
+        const result = this.config.schedules ? await this.config.schedules(request) : await this.internalBroker("schedules", request) as ScheduleToolResult;
+        return text({ ...attribution, ...result });
+      } }),
       defineTool({ name: "host_bash", executionMode: "sequential",
         description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact approval by the host owner or a member they granted host commands; auto-approve skips it only in the session of the host owner or of a member granted automatic host commands. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
         parameters: Type.Object({ command: Type.String(), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600 })) }),
@@ -1626,7 +1653,12 @@ export class RunnerSession {
 
   /** The control plane's GitHub broker for runners without a connector, with the shared secret; refusals keep their status and reason. */
   private async internalGitHub(action: "comment" | "read" | "merge" | "issue", request: object): Promise<unknown> {
-    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/github/${action}`, {
+    return this.internalBroker(`github/${action}`, request);
+  }
+
+  /** One of the control plane's internal broker routes, as internalGitHub. */
+  private async internalBroker(path: "schedules" | `github/${string}`, request: object): Promise<unknown> {
+    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/${path}`, {
       method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
       body: JSON.stringify(request), signal: AbortSignal.timeout(30_000), redirect: "error",
     });
