@@ -29,13 +29,13 @@ import type { RepositoryPreparationItem, RepositoryPreparationView } from "../..
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
-import { compactionFailure, hostCompaction } from "./compaction.js";
+import { compactionFailure, configuredCompaction, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
 import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
 import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
-import { defaultHostConfig, type HostConfig } from "../../../packages/shared/src/host-config.js";
+import { defaultHostConfig, type HostCompaction, type HostConfig } from "../../../packages/shared/src/host-config.js";
 import { commandLimits, type CommandLimits } from "./host-config.js";
 
 type Run = {
@@ -268,6 +268,12 @@ export class RunnerSession {
   #cloneFailures: { path: string; reason: string }[] = [];
   /** Restored from a conversation-only backup (Metadata.conversationOnlyRestore), for the agent's instructions. */
   #conversationOnlyRestore = false;
+  /**
+   * The compaction token counts of the host's configuration as last read (HostConfig.compaction), which the harness's
+   * settings put over the host's Pi settings at each use: a change applies from the first message after the connector's
+   * configuration refresh (HostConfigSource, 30 seconds).
+   */
+  #configuredCompaction: HostCompaction | undefined;
   /**
    * The host cache's mirrors this clone session may borrow from, by sandbox path, and when the relay last let its owner
    * read each (0: not yet in this open). Mounted only while confirmed in the last MIRROR_CONFIRM_MS (see mirrorMounts).
@@ -666,12 +672,22 @@ export class RunnerSession {
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
     this.models = resolved.models;
     const models = this.models;
-    // Reasoning models keep more room for their compaction summary than Pi's default, unless the host's Pi says otherwise.
-    const compaction = hostCompaction(this.config.compaction, models.getModels());
+    // Reasoning models keep more room for their compaction summary than Pi's default, unless the host's Pi or its
+    // configuration in Pistead says otherwise. The configuration is read now and with each message, and the harness reads
+    // the settings at each use.
+    await this.hostConfig();
+    const catalog = models.getModels();
+    let current: { from: HostCompaction | undefined; settings: { compaction: CompactionSettings } | undefined } | undefined;
+    const settings = () => {
+      if (!current || current.from !== this.#configuredCompaction) {
+        const compaction = hostCompaction(configuredCompaction(this.config.compaction, this.#configuredCompaction), catalog);
+        current = { from: this.#configuredCompaction, settings: compaction ? { compaction } : undefined };
+      }
+      return current.settings;
+    };
     const storage = await this.openStorage();
     try {
-      this.harness = await Harness.open(storage, { models, registry,
-        ...(compaction ? { settings: { compaction } } : {}),
+      this.harness = await Harness.open(storage, { models, registry, settings,
         ...(this.config.identity ? { identity: this.config.identity } : {}) }, context);
     }
     catch (error) { await storage.close(context); throw error; }
@@ -1200,6 +1216,8 @@ export class RunnerSession {
       const preparation = this.#repositories;
       if (preparation.status === "failed") throw new RunnerError(502, preparationFailure(preparation.reason));
       await this.authorize(ticket.actorId, mode === "ask" ? "ask" : "write", ticket.policyVersion);
+      // The message compacts its conversation, if it must, by the host's configuration as it is now.
+      await this.hostConfig();
       const options = await this.chatOptions(input.options, mode, ticket.actorId);
       if (prepared.length) await this.requireImageModel(options);
       const key = await requestKey(ticket.actorId, mode, input.requestId);
@@ -1338,7 +1356,9 @@ export class RunnerSession {
 
   /** The host's configuration, as Pistead reports it to the connector; the defaults on a runner without one. */
   private async hostConfig(): Promise<HostConfig> {
-    return this.config.hostConfig ? await this.config.hostConfig() : { ...defaultHostConfig };
+    const config = this.config.hostConfig ? await this.config.hostConfig() : { ...defaultHostConfig };
+    this.#configuredCompaction = config.compaction;
+    return config;
   }
 
   /** How the next shell command runs, as the host's owner and admins configured it: its time limit and its GPU. */

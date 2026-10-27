@@ -5,7 +5,7 @@ import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultHostConfig, parseHostConfig, parseHostConfigChange, readHostConfig } from "../packages/shared/src/host-config.js";
+import { defaultHostConfig, parseHostCompaction, parseHostConfig, parseHostConfigChange, readHostConfig } from "../packages/shared/src/host-config.js";
 import { commandLimits, detectGpu, gpuMounts, HostConfigSource } from "../apps/runner/src/host-config.js";
 import { movedOptionsNotice } from "../apps/runner/src/connect-cli.js";
 import { Sandbox } from "../apps/runner/src/sandbox.js";
@@ -44,36 +44,61 @@ function fauxBinding(id: string): RunnerBinding {
 }
 
 test("a host configuration is whole and within bounds, or refused", () => {
-  const config = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true };
+  const config = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true,
+    compaction: { reserveTokens: 32_768, modelOverrides: { "anthropic/opus": { keepRecentTokens: 20_000 } } } };
   assert.deepEqual(parseHostConfig(config), config);
-  assert.deepEqual(parseHostConfig({ ...defaultHostConfig }), { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false });
+  assert.deepEqual(parseHostConfig({ ...defaultHostConfig }), { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false, compaction: {} });
   for (const invalid of [undefined, null, [], "config", { ...config, commandTimeoutSeconds: 29 }, { ...config, commandTimeoutSeconds: 3601 },
     { ...config, commandTimeoutSeconds: 60.5 }, { ...config, commandTimeoutSeconds: "60" }, { ...config, gpu: 1 }, { ...config, gitCredentials: "true" },
     { ...config, repositoryCache: "shared" }, { ...config, hostSessions: "true" }, { ...config, extra: true },
-    { commandTimeoutSeconds: 60, gpu: false, gitCredentials: false, repositoryCache: "off" },
+    { ...config, compaction: undefined }, { ...config, compaction: { reserveTokens: -1 } },
+    { commandTimeoutSeconds: 60, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false },
     { ...config, toString: "x" }]) {
-    assert.throws(() => parseHostConfig(invalid), /host configuration|time limit|setting/, JSON.stringify(invalid));
+    assert.throws(() => parseHostConfig(invalid), /host configuration|time limit|setting|token counts/, JSON.stringify(invalid));
   }
 });
 
 test("a change of configuration names one or more valid settings, and only those", () => {
   assert.deepEqual(parseHostConfigChange({ commandTimeoutSeconds: 120 }), { commandTimeoutSeconds: 120 });
   assert.deepEqual(parseHostConfigChange({ gpu: true, repositoryCache: "host" }), { gpu: true, repositoryCache: "host" });
-  const whole = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true };
+  assert.deepEqual(parseHostConfigChange({ compaction: { keepRecentTokens: 8000 } }), { compaction: { keepRecentTokens: 8000 } });
+  const whole = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: "owner", hostSessions: true, compaction: {} };
   assert.deepEqual(parseHostConfigChange(whole), whole);
   for (const invalid of [undefined, null, [], "config", {}, { commandTimeoutSeconds: 29 }, { commandTimeoutSeconds: "60" }, { gpu: 1 },
-    { repositoryCache: "shared" }, { hostSessions: "true" }, { gpu: true, extra: true }, { toString: "x" }, JSON.parse('{"__proto__": {"gpu": true}}')]) {
-    assert.throws(() => parseHostConfigChange(invalid), /host configuration|time limit|setting/, JSON.stringify(invalid));
+    { repositoryCache: "shared" }, { hostSessions: "true" }, { gpu: true, extra: true }, { toString: "x" }, JSON.parse('{"__proto__": {"gpu": true}}'),
+    { compaction: null }, { compaction: { reserveTokens: "8192" } }]) {
+    assert.throws(() => parseHostConfigChange(invalid), /host configuration|time limit|setting|token counts/, JSON.stringify(invalid));
   }
 });
 
 test("a connector reads what it knows of a configuration: newer settings are left out, missing ones keep their defaults", () => {
-  const sent = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "host", hostSessions: true };
+  const sent = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "host", hostSessions: true, compaction: { reserveTokens: 20_000 } };
   assert.deepEqual(readHostConfig({ ...sent, someLaterSetting: "on" }), sent);
-  assert.deepEqual(readHostConfig({ commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "host" }), { ...sent, hostSessions: false });
+  assert.deepEqual(readHostConfig({ commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "host" }), { ...sent, hostSessions: false, compaction: {} });
   assert.deepEqual(readHostConfig({}), defaultHostConfig);
   // What it does read must hold, or none of it is used.
-  for (const invalid of [undefined, null, [], { ...sent, hostSessions: "yes" }, { ...sent, commandTimeoutSeconds: 5 }]) assert.throws(() => readHostConfig(invalid));
+  for (const invalid of [undefined, null, [], { ...sent, hostSessions: "yes" }, { ...sent, commandTimeoutSeconds: 5 }, { ...sent, compaction: { reserveTokens: 1.5 } }]) {
+    assert.throws(() => readHostConfig(invalid));
+  }
+});
+
+test("compaction token counts are whole numbers in bounds, for every model and per provider/modelId, kept in one order", () => {
+  assert.deepEqual(parseHostCompaction({}), {});
+  assert.deepEqual(parseHostCompaction({ keepRecentTokens: 0, reserveTokens: 10_000_000 }), { reserveTokens: 10_000_000, keepRecentTokens: 0 });
+  // Models are sorted, and one with no counts is left out.
+  const parsed = parseHostCompaction({ modelOverrides: { "openai/gpt-5": { reserveTokens: 30_000 }, "anthropic/claude-opus-4": { keepRecentTokens: 1, reserveTokens: 65_536 },
+    "relay/org/model": {}, "openrouter/meta/llama-4": { keepRecentTokens: 2000 } } });
+  assert.deepEqual(parsed, { modelOverrides: { "anthropic/claude-opus-4": { reserveTokens: 65_536, keepRecentTokens: 1 }, "openai/gpt-5": { reserveTokens: 30_000 },
+    "openrouter/meta/llama-4": { keepRecentTokens: 2000 } } });
+  assert.equal(JSON.stringify(parsed), '{"modelOverrides":{"anthropic/claude-opus-4":{"reserveTokens":65536,"keepRecentTokens":1},"openai/gpt-5":{"reserveTokens":30000},"openrouter/meta/llama-4":{"keepRecentTokens":2000}}}');
+  assert.deepEqual(parseHostCompaction({ modelOverrides: { "a/b": {} } }), {});
+  const many = Object.fromEntries(Array.from({ length: 201 }, (_, index) => [`p/m${index}`, { reserveTokens: 1 }]));
+  for (const invalid of [undefined, null, [], "{}", { reserveTokens: -1 }, { reserveTokens: 10_000_001 }, { reserveTokens: 1.5 }, { reserveTokens: "8192" },
+    { keepRecentTokens: null }, { enabled: true }, { backgroundTokens: 1 }, { modelOverrides: [] }, { modelOverrides: { "no-slash": { reserveTokens: 1 } } },
+    { modelOverrides: { "/model": { reserveTokens: 1 } } }, { modelOverrides: { "a/b c": { reserveTokens: 1 } } }, { modelOverrides: { "a/b": { reserveTokens: -5 } } },
+    { modelOverrides: { "a/b": { modelOverrides: {} } } }, { modelOverrides: { "a/b": 5 } }, { modelOverrides: many }, JSON.parse('{"__proto__": {"reserveTokens": 1}}')]) {
+    assert.throws(() => parseHostCompaction(invalid), /compaction|Compaction/, JSON.stringify(invalid));
+  }
 });
 
 test("a longer command time limit gives builds room; the default keeps the short-command limits", () => {
@@ -98,7 +123,7 @@ test("the host's configuration is asked for again only after a while, and its la
     if (answer instanceof Error) throw answer;
     return answer;
   }, { now: () => now, ttlMs: 30_000, staleMs: 300_000 });
-  const first = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "off", hostSessions: false };
+  const first = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: "off", hostSessions: false, compaction: {} };
   const second = { ...first, commandTimeoutSeconds: 1800 };
   answers.push(first);
   assert.deepEqual(await source.current(), first);

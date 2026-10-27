@@ -29,6 +29,11 @@ const STATE_FILE = "connector.json";
 const CALLBACK_LIMIT = 64 * 1024;
 /** A github_read result; the control plane keeps its view within 96 KiB of JSON. */
 const GITHUB_READ_LIMIT = 128 * 1024;
+/**
+ * The host's configuration, as large as the control plane saves it: compaction counts for 200 models with the longest
+ * names take about 67 KB (the save takes 128 KiB).
+ */
+const HOST_CONFIG_LIMIT = 128 * 1024;
 /** A schedule tool result: up to every schedule of the session, each with its message (MAX_SCHEDULES_PER_SESSION, server). */
 const SCHEDULES_LIMIT = 4 * 1024 * 1024;
 const RPC_TIMEOUT = 30_000;
@@ -180,15 +185,16 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // The owner's consent, not caller-supplied metadata, decides whether isolation is disclosed as absent. Every connector
   // of this version applies per-message choices, gives the model a message's pasted images, pushes, and reads, merges
   // and opens issues on GitHub through the control plane, and takes its configuration from Pistead (`hostConfig`), where
-  // its owner decides whether pushes may use this host's Git credentials. It says whether this connection keeps a
-  // repository cache, and which GPU device sandboxed commands could get. Every session clones its repositories with
-  // plain Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait
-  // for `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
+  // its owner decides whether pushes may use this host's Git credentials, compaction token counts included
+  // (`compactionConfig`). It says whether this connection keeps a repository cache, and which GPU device sandboxed
+  // commands could get. Every session clones its repositories with plain Git: in the sandbox through its egress proxy
+  // (verified per session, like all isolation, so this doesn't wait for `sandbox`), or with the host's own Git where its
+  // owner runs it unsandboxed.
   const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, schedules: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
+    github: true, githubIssues: true, schedules: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, schedules: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
+    github: true, githubIssues: true, schedules: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache,
     ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
@@ -457,7 +463,7 @@ export class LocalConnector {
       // How the host runs its sessions, as its owner and admins set it in Pistead: asked for now, for the repository cache
       // this connection keeps, and again within a minute of each change for every command and push. Without an answer
       // (a control plane that predates it), the defaults.
-      const hostConfig = new HostConfigSource(async () => (await this.callback(generation, "/api/connectors/self/config", {}) as { config?: unknown } | undefined)?.config);
+      const hostConfig = new HostConfigSource(async () => (await this.callback(generation, "/api/connectors/self/config", {}, HOST_CONFIG_LIMIT) as { config?: unknown } | undefined)?.config);
       const configured = await hostConfig.current();
       this.requireGeneration(generation);
       const repositoryCache = configured.repositoryCache === "off" ? undefined : this.repositoryCacheFor(configured.repositoryCache);
@@ -624,9 +630,9 @@ export class LocalConnector {
     return response;
   }
 
-  private async callback(generation: Generation, path: string, body: unknown): Promise<unknown> {
+  private async callback(generation: Generation, path: string, body: unknown, limit = CALLBACK_LIMIT): Promise<unknown> {
     const response = await this.callbackResponse(generation, path, body);
-    const bytes = await boundedBody(response, CALLBACK_LIMIT, AbortSignal.any([generation.abort.signal, AbortSignal.timeout(15_000)]));
+    const bytes = await boundedBody(response, limit, AbortSignal.any([generation.abort.signal, AbortSignal.timeout(15_000)]));
     this.requireGeneration(generation);
     return bytes.length ? decodeJson(bytes) : undefined;
   }

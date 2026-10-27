@@ -18,7 +18,8 @@ function duration(seconds: number): string {
   return `${seconds} seconds`;
 }
 
-const settings = Object.keys(defaultHostConfig) as (keyof HostConfig)[];
+/** The settings this form changes; compaction has its own section (HostCompaction). */
+const settings = (Object.keys(defaultHostConfig) as (keyof HostConfig)[]).filter(key => key !== "compaction");
 
 const cacheLabels: Record<RepositoryCacheMode, string> = { off: "Off", host: "Shared", owner: "Per owner" };
 const cacheHints: Record<RepositoryCacheMode, string> = {

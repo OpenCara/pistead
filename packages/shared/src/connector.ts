@@ -95,6 +95,11 @@ export interface ConnectorCapabilities {
    * connectors, which keep their options.
    */
   hostConfig?: boolean;
+  /**
+   * The connector's sessions summarize long conversations by the compaction token counts set in Pistead
+   * (HostConfig.compaction) over its Pi settings. Absent on older connectors, which follow their Pi settings alone.
+   */
+  compactionConfig?: boolean;
   /** The GPU device this host can lend its sandboxed commands (HostConfig.gpu). Absent when it has none, or runs unsandboxed. */
   gpu?: GpuKind;
 }

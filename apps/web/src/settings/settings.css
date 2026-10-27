@@ -15,3 +15,14 @@
     .env-row > .muted { display: none; }
   }
 }
+
+@layer screens {
+  /* A host's compaction token counts: two short numeric fields, each labelled above. */
+  .token-inputs { display: flex; align-items: flex-end; gap: var(--space-2); }
+  .token-field { display: grid; gap: 2px; }
+  .token-input { width: 112px; height: var(--control-sm); }
+  .token-input[aria-invalid="true"] { border-color: var(--status-danger); }
+  @media (max-width: 640px) {
+    .token-input { width: 88px; }
+  }
+}
