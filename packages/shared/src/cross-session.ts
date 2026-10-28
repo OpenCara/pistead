@@ -207,10 +207,13 @@ export function messageOutcome(view: Pick<SessionView, "entries" | "queue" | "ap
   }
   const answers = after.filter(entry => entry.role === "assistant" && !entry.error && entry.text.trim());
   const failed = after.some(entry => entry.error !== undefined);
-  // A message that never reached the queue view (an older runner) is done once its answer and nothing else follows.
-  const done = doneStatuses.has(status);
+  // A message the view's queue doesn't list (an older runner, which lists none) is done once an answer is the last thing
+  // after it and no card waits.
+  const pendingCard = view.approvals.some(approval => approval.status === "pending");
+  const done = doneStatuses.has(status)
+    || (status === "unknown" && answers.length > 0 && after.at(-1) === answers.at(-1) && !pendingCard);
   const last = answers.at(-1)?.text;
-  const waiting = !done && view.approvals.some(approval => approval.status === "pending");
+  const waiting = !done && pendingCard;
   return { status, done, ...(waiting ? { waiting: true as const } : {}), ...(failed ? { failed: true as const } : {}),
     ...(last !== undefined ? { reply: cut(last, crossSessionLimits.replyChars) } : {}) };
 }

@@ -1782,7 +1782,9 @@ export class RunnerSession {
         const result = this.config.schedules ? await this.config.schedules(request) : await this.internalBroker("schedules", request) as ScheduleToolResult;
         return text({ ...attribution, ...result });
       } }),
-      defineTool({ name: "sessions", description: SESSIONS_TOOL_DESCRIPTION, parameters: Type.Object({
+      defineTool({ name: "sessions", description: SESSIONS_TOOL_DESCRIPTION,
+        // One call at a time: each counts against its message's sends and its session's new sessions.
+        executionMode: "sequential", parameters: Type.Object({
         action: StringEnum(sessionsToolActions), session: Type.Optional(Type.String()), message: Type.Optional(Type.String()),
         access: Type.Optional(StringEnum(accessModes)), notify: Type.Optional(Type.Boolean()), title: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
         visibility: Type.Optional(StringEnum(["private", "workspace"] as const)), message_id: Type.Optional(Type.String()),

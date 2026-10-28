@@ -32,7 +32,8 @@ CREATE TABLE session_messages (
 CREATE INDEX session_messages_origin ON session_messages (origin_session_id, created_at);
 CREATE INDEX session_messages_target ON session_messages (target_session_id, created_at);
 CREATE INDEX session_messages_admission ON session_messages (origin_admission_id);
-CREATE INDEX session_messages_notify ON session_messages (created_at) WHERE notify_status = 'pending';
+-- The notification sweep's order.
+CREATE INDEX session_messages_notify ON session_messages (updated_at, id) WHERE notify_status = 'pending';
 
 -- The session whose agent started this one with the sessions tool; null for every other session. Immutable.
 ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id);

@@ -1,5 +1,5 @@
 import type { Hono } from 'hono';
-import { accessModes, type AccessMode, type SessionView } from '../../../packages/shared/src/types.js';
+import { accessModes, type AccessMode, type SessionView, type SubmitResult } from '../../../packages/shared/src/types.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
 import {
   audienceTarget, crossSessionHeader, crossSessionLimits, cut, messageOutcome, sessionsBrokerActions, sessionsToolTarget, sessionsWriteActions,
@@ -145,7 +145,9 @@ export async function agentSessions(c: AppContext, connectorId: string | null): 
   const notify = input.notify === true;
   if (notify && message === undefined) fail(400, 'invalid_input', 'Only a message is notified about.');
   if (access !== undefined && message === undefined) fail(400, 'invalid_input', 'Access is a message\'s.');
-  const title = input.title === undefined ? undefined : text(input.title, 'title', 200).trim();
+  // The card showed the title as the agent sent it; the session gets it trimmed.
+  const sentTitle = input.title === undefined ? undefined : text(input.title, 'title', 200);
+  const title = sentTitle?.trim();
   if (title !== undefined && (!title || /[\r\n]/.test(title))) fail(400, 'invalid_input', 'The title is one non-empty line.');
   const modelId = input.modelId === undefined ? undefined : identifier(input.modelId, 'modelId');
   if (input.visibility !== undefined && input.visibility !== 'private' && input.visibility !== 'workspace') fail(400, 'invalid_input', 'Visibility is private or workspace.');
@@ -156,7 +158,7 @@ export async function agentSessions(c: AppContext, connectorId: string | null): 
   }
   const limit = (input.limit as number | undefined) ?? crossSessionLimits.defaultEntries;
   // What the permission card showed the owner, built from the call's own fields, as the runner does.
-  const target = sessionsToolTarget({ action, targetSessionId, message, access, notify, title, modelId, visibility, messageId });
+  const target = sessionsToolTarget({ action, targetSessionId, message, access, notify, title: sentTitle, modelId, visibility, messageId });
 
   const originAccess = await sessionAccess(c.env, sessionId, actorId);
   if (!originAccess || originAccess.row.status === 'archived' || !hasPermission(originAccess.permissions, 'write')) {
@@ -240,7 +242,7 @@ async function read(call: Call, targetId: string, messageId: string | undefined,
   const consent = await audienceConsent(call, other, ['in']);
   if (consent) return consent;
   const message = messageId === undefined ? undefined : await c.env.DB.query<MessageRow>(
-    'SELECT * FROM session_messages WHERE id = ? AND origin_session_id = ? AND target_session_id = ?').bind(messageId, origin.id, other.id).first();
+    "SELECT * FROM session_messages WHERE id = ? AND origin_session_id = ? AND target_session_id = ? AND submission_id <> ''").bind(messageId, origin.id, other.id).first();
   if (messageId !== undefined && !message) fail(404, 'not_found', 'This session sent that session no such message.');
   const view = await asActor(c.env, actorId, async inner => (await sessionView(inner, other, { display: await transcriptDisplay(inner, other) })).view);
   // Never answer with what was read after access was revoked.
@@ -263,10 +265,17 @@ async function requireSendable(call: Call, targetId: string | null): Promise<voi
   if (targetId !== null && (targetId === call.origin.id || call.chain.sessions.includes(targetId))) {
     fail(409, 'session_loop', 'This message came from that session, directly or through others: answer it with a notification or a read instead.');
   }
+  // Checked here so that nothing starts (create) once it is reached; `deliver` reserves each message's place for good.
+  if (await sentByMessage(call) >= crossSessionLimits.perMessage) perMessageLimit();
+}
+
+async function sentByMessage(call: Call): Promise<number> {
   const sent = await call.c.env.DB.query<{ n: number }>('SELECT COUNT(*) AS n FROM session_messages WHERE origin_admission_id = ?').bind(call.admission.id).first();
-  if (Number(sent?.n ?? 0) >= crossSessionLimits.perMessage) {
-    fail(429, 'cross_session_limit', `One message sends at most ${crossSessionLimits.perMessage} messages to other sessions.`);
-  }
+  return Number(sent?.n ?? 0);
+}
+
+function perMessageLimit(): never {
+  fail(429, 'cross_session_limit', `One message sends at most ${crossSessionLimits.perMessage} messages to other sessions.`);
 }
 
 /** Sends `message` to `target` as the actor, opened by the line naming its origin (crossSessionHeader), and records it. */
@@ -279,35 +288,53 @@ async function deliver(call: Call, target: SessionRow, kind: 'ask' | 'send' | 'c
   const hops = chain.hops + 1;
   const actor = await getUser(c.env, actorId);
   const content = `${crossSessionHeader({ id: messageId, kind, hops }, origin, { id: actorId, login: actor?.github_login })}\n\n${message}`;
-  const result = await asActor(c.env, actorId, async inner => {
-    const { row } = await requireSession(inner, target.id, kind === 'ask' ? 'ask' : 'write');
-    // Like a scheduled prompt's, a shared message waits for nobody: a session at work or waiting on a card is busy.
-    if (kind !== 'ask' && busyActivities.includes(row.activity ?? '')) {
-      fail(409, 'session_busy', 'That session is working or waiting on an approval. Read it, or try again once it is done.');
-    }
-    return submitMessage(inner, row, kind === 'ask' ? 'ask' : 'submit', {
-      content, requestId: `xs:${messageId}`, ...(access && access !== 'approval' ? { options: { access } } : {}),
-    }, { crossSession: messageId, originSessionId: origin.id });
-  });
-  const at = now();
-  const row: MessageRow = { id: messageId, workspace_id: origin.workspace_id, origin_session_id: origin.id, target_session_id: target.id, actor_id: actorId, kind,
-    origin_admission_id: admission.id, origin_call_id: callId, submission_id: result.submissionId, conversation_id: result.conversationId, hops,
-    chain_json: JSON.stringify([...chain.sessions, origin.id]), access: kind === 'ask' ? null : access ?? 'approval', notify_status: notify ? 'pending' : null,
-    notify_error: null, notify_message_id: null, reply_to: null, created_at: at, updated_at: at };
+  const created = now();
+  const chainJson = JSON.stringify([...chain.sessions, origin.id]);
+  const recordedAccess = kind === 'ask' ? null : access ?? 'approval';
+  // Its place among the message's sends is taken before it goes, in the statement that counts them, so calls made at
+  // the same time never send more than the limit. Until it is sent it has no submission, and nothing shows or reads it.
+  const reserved = await c.env.DB.query(`INSERT INTO session_messages (id, workspace_id, origin_session_id, target_session_id, actor_id, kind, origin_admission_id,
+      origin_call_id, submission_id, conversation_id, hops, chain_json, access, created_at, updated_at)
+    SELECT ?,?,?,?,?,?,?,?,'','',?,?,?,?,? WHERE (SELECT COUNT(*) FROM session_messages WHERE origin_admission_id = ?) < ?`)
+    .bind(messageId, origin.workspace_id, origin.id, target.id, actorId, kind, admission.id, callId, hops, chainJson, recordedAccess, created, created,
+      admission.id, crossSessionLimits.perMessage).run();
+  if (!reserved.changes) perMessageLimit();
+  let result: SubmitResult;
+  try {
+    result = await asActor(c.env, actorId, async inner => {
+      const { row } = await requireSession(inner, target.id, kind === 'ask' ? 'ask' : 'write');
+      // Like a scheduled prompt's, a shared message waits for nobody: a session at work or waiting on a card is busy.
+      if (kind !== 'ask' && busyActivities.includes(row.activity ?? '')) {
+        fail(409, 'session_busy', 'That session is working or waiting on an approval. Read it, or try again once it is done.');
+      }
+      return submitMessage(inner, row, kind === 'ask' ? 'ask' : 'submit', {
+        content, requestId: `xs:${messageId}`, ...(access && access !== 'approval' ? { options: { access } } : {}),
+      }, { crossSession: messageId, originSessionId: origin.id });
+    });
+  } catch (error) {
+    // Refused or failed before it went: the place is free again.
+    await c.env.DB.query("DELETE FROM session_messages WHERE id = ? AND submission_id = ''").bind(messageId).run();
+    throw error;
+  }
+  const updated = now();
   await c.env.DB.batch([
-    c.env.DB.query(`INSERT INTO session_messages (id, workspace_id, origin_session_id, target_session_id, actor_id, kind, origin_admission_id, origin_call_id,
-      submission_id, conversation_id, hops, chain_json, access, notify_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .bind(row.id, row.workspace_id, row.origin_session_id, row.target_session_id, row.actor_id, row.kind, row.origin_admission_id, row.origin_call_id,
-        row.submission_id, row.conversation_id, row.hops, row.chain_json, row.access, row.notify_status, row.created_at, row.updated_at),
+    c.env.DB.query('UPDATE session_messages SET submission_id = ?, conversation_id = ?, notify_status = ?, updated_at = ? WHERE id = ?')
+      .bind(result.submissionId, result.conversationId, notify ? 'pending' : null, updated, messageId),
     auditStatement(c.env, actorId, 'session.cross_session.sent', origin.workspace_id, origin.id, { messageId, kind, targetSessionId: target.id, hops, callId,
       ...(notify ? { notify: true } : {}) }),
   ]);
+  const row: MessageRow = { id: messageId, workspace_id: origin.workspace_id, origin_session_id: origin.id, target_session_id: target.id, actor_id: actorId, kind,
+    origin_admission_id: admission.id, origin_call_id: callId, submission_id: result.submissionId, conversation_id: result.conversationId, hops,
+    chain_json: chainJson, access: recordedAccess, notify_status: notify ? 'pending' : null, notify_error: null, notify_message_id: null, reply_to: null,
+    created_at: created, updated_at: updated };
   return messageRecord(row);
 }
 
 async function createChild(call: Call, options: { message?: string; access?: AccessMode; notify: boolean; title?: string; modelId?: string; visibility?: 'private' | 'workspace' }): Promise<Response> {
   const { c, origin, actorId } = call;
   await requireSessionCreator(c.env, origin.workspace_id, actorId);
+  // One message's calls run one at a time on the host (the tool is sequential) and a session runs one message at a time,
+  // so the count can't race its own creates.
   const children = await c.env.DB.query<{ n: number }>('SELECT COUNT(*) AS n FROM sessions WHERE parent_session_id = ?').bind(origin.id).first();
   if (Number(children?.n ?? 0) >= crossSessionLimits.children) fail(429, 'cross_session_limit', `A session starts at most ${crossSessionLimits.children} sessions.`);
   if (options.message !== undefined) await requireSendable(call, null);
@@ -408,6 +435,8 @@ async function notify(env: Env, message: MessageRow): Promise<{ delivered: strin
       if (!granted) fail(403, 'audience_changed', 'The two sessions\' readers changed since the message was sent.');
     }
     // One notification per message, however many sweeps try: its id, and so its request id, comes from the message's.
+    // It keeps the message's chain as it is, without the target: the origin's agent, working on it, may follow up with
+    // the session that answered, one hop further, while the hop limit still ends every chain (docs/design/cross-session.md).
     const notifyId = `${message.id}-n`;
     const actor = await getUser(env, message.actor_id);
     const header = crossSessionHeader({ id: notifyId, kind: 'notify', hops: Number(message.hops) + 1 }, target, { id: message.actor_id, login: actor?.github_login }, { id: message.id });
@@ -440,7 +469,7 @@ export function registerCrossSession(app: Hono<WorkerEnv>): void {
       const access = await open(child.id);
       if (access) children.push(summary(access));
     }
-    const rows = await c.env.DB.query<MessageRow>(`SELECT * FROM session_messages WHERE origin_session_id = ? OR target_session_id = ?
+    const rows = await c.env.DB.query<MessageRow>(`SELECT * FROM session_messages WHERE (origin_session_id = ? OR target_session_id = ?) AND submission_id <> ''
       ORDER BY created_at DESC, id DESC LIMIT 50`).bind(row.id, row.id).all();
     const messages: SessionConnections['messages'] = [];
     for (const message of rows) {

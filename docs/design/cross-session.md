@@ -83,12 +83,16 @@ tool call it makes, back to the message (`messageChain`). The text tells the age
 - **Loops**: each message records the sessions it came through (`chain_json`); none goes to a session in its chain or
   back to itself. A notification keeps its message's chain, so the coordinator can follow up with the worker that
   notified it, one hop further.
-- **Fan-out**: one message sends at most 10 messages, asks and opening messages; a session starts at most 20 sessions.
+- **Fan-out**: one message sends at most 10 messages, asks and opening messages; each takes its place in the same
+  statement that counts them, so calls made at once can't exceed it, and a refused one gives it back. A session starts
+  at most 20 sessions; the runner makes the tool's calls one at a time.
 - **Busy targets**: like scheduled prompts, a shared message to a session that is working or waiting is refused, not
   queued; side asks go.
 
 A message's outcome is read from its target's view: its queue status, and the target agent's last answer after the
 message's own entry (found by `xs:<id> `) and before the next message of that conversation (`messageOutcome`).
+A runner too old to list its queue gives no status: its message counts as done once an answer is the last entry
+after it and no card waits.
 
 ## Data
 

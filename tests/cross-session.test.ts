@@ -30,7 +30,11 @@ test('a delivered message names its origin and sender, and its outcome is the an
   assert.deepEqual(messageOutcome(view, message), { status: 'settled', done: true, reply: 'Done: it works.' });
   // A message id that is the prefix of another's never matches it.
   assert.equal(messageOutcome(view, { ...message, id: 'm' }).reply, undefined);
-  assert.equal(messageOutcome({ ...view, queue: [] }, message).status, 'unknown');
+  // An older runner lists no queue: the message is done once an answer is the last thing after it, and no card waits.
+  const older = { entries: view.entries.slice(0, 6), approvals: [] as SessionView['approvals'] };
+  assert.deepEqual(messageOutcome(older, message), { status: 'unknown', done: true, reply: 'Done: it works.' });
+  assert.equal(messageOutcome({ ...older, entries: view.entries.slice(0, 5) }, message).done, false, 'a tool result last: still at work');
+  assert.equal(messageOutcome({ ...older, approvals: [{ status: 'pending' } as SessionView['approvals'][number]] }, message).done, false);
   // What a permission card shows stays within what the host and the control plane both keep whole.
   const long = sessionsToolTarget({ action: 'send', targetSessionId: 'b', message: 'x'.repeat(100_000) });
   assert.ok(long.length < 8192 && long.startsWith('send · session b · message:\n'));
@@ -253,12 +257,19 @@ test('messages go out as their sender, named, recorded and bounded: access, busy
   assert.equal((await f.tool('session-c', ownerId, inThird, { action: 'read', targetSessionId: 'session-d' })).status, 200);
   await f.refused(f.tool('session-a', ownerId, f.admit('session-a', ownerId, { requestId: 'xs:made-up' }), { action: 'send', targetSessionId: 'session-d', message: 'x' }), 403, 'hop_limit');
 
-  // One message sends at most so many.
+  // One message sends at most so many, even when its calls come at once.
   const busy = f.admit('session-a', ownerId);
-  for (let index = 0; index < crossSessionLimits.perMessage; index++) {
-    assert.equal((await f.tool('session-a', ownerId, busy, { action: 'ask', targetSessionId: 'session-d', message: `q${index}` })).status, 202);
-  }
-  await f.refused(f.tool('session-a', ownerId, busy, { action: 'ask', targetSessionId: 'session-d', message: 'one more' }), 429, 'cross_session_limit');
+  const burst = await Promise.all(Array.from({ length: crossSessionLimits.perMessage + 3 }, (_, index) =>
+    f.tool('session-a', ownerId, busy, { action: 'ask', targetSessionId: 'session-d', message: `q${index}` })));
+  assert.equal(burst.filter(result => result.status === 202).length, crossSessionLimits.perMessage);
+  assert.deepEqual([...new Set(burst.filter(result => result.status !== 202).map(result => result.body.code))], ['cross_session_limit']);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM session_messages WHERE origin_admission_id = ?").get(busy)!.n, crossSessionLimits.perMessage);
+  // A refused send gives its place back.
+  const refusedOnce = f.admit('session-a', ownerId);
+  f.sqlite.prepare("UPDATE sessions SET activity = 'working' WHERE id = 'session-d'").run();
+  await f.refused(f.tool('session-a', ownerId, refusedOnce, { action: 'send', targetSessionId: 'session-d', message: 'busy' }), 409, 'session_busy');
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM session_messages WHERE origin_admission_id = ?").get(refusedOnce)!.n, 0);
+  f.sqlite.prepare("UPDATE sessions SET activity = NULL WHERE id = 'session-d'").run();
 
   // A collaborator's message acts with the collaborator's own access: none to a private session of the owner's.
   assert.equal((await f.owner.request('POST', '/api/sessions/session-a/grants', { userId: f.collaborator.user.id, role: 'collaborator' })).status, 200);
@@ -279,6 +290,18 @@ test('an agent stops and archives sessions as its sender may, and starts linked 
   assert.deepEqual([stopped.status, stopped.body], [200, { stopped: 1 }]);
   assert.equal(f.fake('session-b').stopped, 1);
 
+  // A Read-only message starts a session once the owner allowed that very call, its title shown as the agent sent it.
+  const readOnly = f.admit('session-a', ownerId, { access: 'read' });
+  const spaced = { action: 'create', title: '  Spaced title  ' } as const;
+  f.sqlite.prepare("INSERT INTO approval_reviews (session_id,approval_id,requested_by,operation_json,source,admission_id,review_hash,created_at) VALUES (?,?,?,?,?,?,?,?)")
+    .run('session-a', 'permission-create-1', ownerId, JSON.stringify({ kind: 'permission', tool: 'sessions', target: sessionsToolTarget(spaced), needs: ['write'] }),
+      'model', readOnly, 'r'.repeat(43), new Date().toISOString());
+  f.allow('session-a', 'sessions:write', 'create-1', 'permission-create-1');
+  const spacedChild = await f.tool('session-a', ownerId, readOnly, spaced, 'create-1');
+  assert.equal(spacedChild.status, 201, JSON.stringify(spacedChild.body));
+  assert.equal((spacedChild.body.session as CrossSessionSummary).title, 'Spaced title');
+  await f.refused(f.tool('session-a', ownerId, readOnly, spaced, 'create-2'), 403, 'write_not_allowed');
+
   // A private session starts only private ones.
   await f.refused(f.tool('session-a', ownerId, write, { action: 'create', title: 'Wide', visibility: 'workspace' }), 403, 'visibility_wider');
   const created = await f.tool('session-a', ownerId, write, { action: 'create', title: 'Write the docs', message: 'Document the API', notify: true });
@@ -292,7 +315,7 @@ test('an agent stops and archives sessions as its sender may, and starts linked 
   const record = (await (await f.owner.request('GET', `/api/sessions/${child.id}`)).json() as { session: SessionRecord }).session;
   assert.equal(record.parentSessionId, 'session-a');
   const connections = await (await f.owner.request('GET', '/api/sessions/session-a/connections')).json() as SessionConnections;
-  assert.deepEqual(connections.children.map(item => item.id), [child.id]);
+  assert.deepEqual(connections.children.map(item => item.id).sort(), [child.id, (spacedChild.body.session as CrossSessionSummary).id].sort());
   assert.deepEqual(connections.messages.map(item => [item.id, item.otherTitle]), [[opening.id, 'Write the docs']]);
   const fromChild = await (await f.owner.request('GET', `/api/sessions/${child.id}/connections`)).json() as SessionConnections;
   assert.equal(fromChild.parent?.id, 'session-a');
@@ -303,7 +326,7 @@ test('an agent stops and archives sessions as its sender may, and starts linked 
   assert.deepEqual([archived.status, archived.body], [200, { archived: child.id }]);
   assert.equal(f.sqlite.prepare('SELECT status FROM sessions WHERE id = ?').get(child.id)!.status, 'archived');
   const actions = f.sqlite.prepare("SELECT action FROM audit WHERE action LIKE 'session.cross_session.%' ORDER BY rowid").all().map(row => row.action);
-  assert.deepEqual(actions, ['session.cross_session.stopped', 'session.cross_session.created', 'session.cross_session.sent', 'session.cross_session.archived']);
+  assert.deepEqual(actions, ['session.cross_session.stopped', 'session.cross_session.created', 'session.cross_session.created', 'session.cross_session.sent', 'session.cross_session.archived']);
 
   // Its outcome would come back to people the new session isn't shown to: the owner decides first, and nothing starts.
   assert.equal((await f.owner.request('POST', '/api/sessions/session-a/grants', { userId: f.collaborator.user.id, role: 'viewer' })).status, 200);
@@ -314,7 +337,7 @@ test('an agent stops and archives sessions as its sender may, and starts linked 
 
   // A session starts only so many.
   f.sqlite.prepare("UPDATE sessions SET parent_session_id = 'session-a' WHERE id = 'session-b'").run();
-  for (let index = 2; index < crossSessionLimits.children; index++) {
+  for (let index = 3; index < crossSessionLimits.children; index++) {
     f.seed(`filler-${index}`, 'filler');
     f.sqlite.prepare("UPDATE sessions SET parent_session_id = 'session-a' WHERE id = ?").run(`filler-${index}`);
   }
