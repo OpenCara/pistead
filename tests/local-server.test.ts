@@ -8,7 +8,7 @@ import { ConfigurationError, loadConfig } from "../apps/server/src/config.js";
 import { app } from "../apps/server/src/index.js";
 import { startLocalHost } from "../apps/server/src/local/host.js";
 import { startLocalServer } from "../apps/server/src/local/launch.js";
-import { loadLocalState, LocalStateError } from "../apps/server/src/local/state.js";
+import { loadLocalState, LocalStateError, openLocalState, peekLocalState } from "../apps/server/src/local/state.js";
 import type { Env } from "../apps/server/src/types.js";
 import { createFauxLocalModels } from "../apps/runner/src/local-pi.js";
 import { testDatabase } from "./helpers/control-plane.js";
@@ -52,6 +52,21 @@ test("processes creating a local server's state at once all get the same secrets
   const github = { clientId: "Ov23liAbCdEf", clientSecret: "0123456789abcdef0123456789abcdef01234567" };
   await Promise.all([loadLocalState(stateDir, { github }), loadLocalState(stateDir, { port: 9001 })]);
   assert.deepEqual(await loadLocalState(stateDir), { ...states[0], github, port: 9001 });
+});
+
+test("a running local server holds its state's lease: another can't open it, a left-over lock file doesn't stop the next", async t => {
+  const stateDir = join(await directory(t), "server");
+  // A lock file a crashed holder left: the kernel lock it named went with that process.
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await writeFile(join(stateDir, "runner.lock"), "4242", { mode: 0o600 });
+  const held = await openLocalState(stateDir);
+  t.after(() => held.release());
+  await assert.rejects(openLocalState(stateDir), /already running with this state directory/);
+  // Reading it needs no lease, and creates nothing.
+  assert.deepEqual(await peekLocalState(stateDir), held.state);
+  assert.equal(await peekLocalState(join(stateDir, "other")), undefined);
+  await held.release();
+  assert.deepEqual(await loadLocalState(stateDir), held.state);
 });
 
 test("a local server refuses state others could read or that a symlink points to", async t => {

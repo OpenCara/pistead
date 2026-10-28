@@ -1,9 +1,9 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, rename, stat, unlink } from 'node:fs/promises';
-import { setTimeout as delay } from 'node:timers/promises';
+import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { acquireRunnerLease, RunnerLeaseBusyError } from '../../../runner/src/lease.js';
 
 // A local server's private state: the secrets it was set up with (generated once, never shown), the GitHub OAuth app its
 // owner registered for it, and the port it listens on. The database, backups and this machine's host live beside it.
@@ -11,10 +11,6 @@ import { join, resolve } from 'node:path';
 export const defaultLocalStateDir = (): string => join(homedir(), '.local', 'share', 'pistead', 'server');
 export const DEFAULT_LOCAL_PORT = 7878;
 const STATE_FILE = 'server.json';
-const LOCK_FILE = 'server.json.lock';
-/** A lock this old was left by a process that died holding it: reading and writing the state takes milliseconds. */
-const STALE_LOCK_MS = 30_000;
-const LOCK_WAIT_MS = 10_000;
 const SECRET = /^[A-Za-z0-9_-]{43}$/;
 /** GitHub OAuth app client IDs (`Ov23li…`, older 20 hex digits) and secrets (40 hex digits). */
 const CLIENT_ID = /^[A-Za-z0-9._-]{1,100}$/;
@@ -99,43 +95,52 @@ async function writeState(directory: string, state: LocalState): Promise<void> {
 }
 
 /**
- * Runs `work` holding the state's lock: `pistead serve` and the desktop app share the directory, and two of them creating
- * the state at once must not each write their own secrets (the vault key the loser's server used would be lost).
+ * Holds the state directory's kernel lease (flock on Linux, lockf on macOS, as the connector's runner lease): a
+ * `pistead serve` and a desktop app sharing the directory never both create or change the state, nor both run its
+ * server. The kernel drops the lease when its holder exits, however it exits, so a crash leaves nothing stale behind.
  */
-async function locked<T>(directory: string, work: () => Promise<T>): Promise<T> {
-  const path = join(directory, LOCK_FILE);
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      const file = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-      await file.writeFile(String(process.pid));
-      await file.close();
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw new LocalStateError('The local server state could not be locked.');
-      const held = await stat(path).catch(() => undefined);
-      if (held && Date.now() - held.mtimeMs > STALE_LOCK_MS) { await unlink(path).catch(() => {}); continue; }
-      if (Date.now() > deadline) throw new LocalStateError('Another Pistead is changing its state in this directory; try again in a moment.');
-      await delay(25 + Math.random() * 50);
-    }
+async function lease(directory: string): Promise<() => Promise<void>> {
+  try { return await acquireRunnerLease(directory, () => {}); }
+  catch (error) {
+    if (error instanceof RunnerLeaseBusyError) throw new LocalStateError('Pistead is already running with this state directory, for example `pistead serve` in a terminal or the Pistead app. Stop it there first.');
+    throw new LocalStateError('The local server state could not be locked: this needs flock (Linux, util-linux) or lockf (macOS).');
   }
-  try { return await work(); } finally { await unlink(path).catch(() => {}); }
+}
+
+function changed(state: LocalState | undefined, changes: { github?: GitHubOAuthApp; port?: number }): LocalState {
+  if (changes.github !== undefined && !validGitHubApp(changes.github)) throw new LocalStateError('That is not a GitHub OAuth app client ID and secret.');
+  if (changes.port !== undefined && !validPort(changes.port)) throw new LocalStateError('The port must be a number from 1024 to 65535.');
+  const base: LocalState = state ?? { version: 1, sessionSecret: secret(), vaultKey: secret(), claimSecret: secret(), port: DEFAULT_LOCAL_PORT };
+  return { ...base, ...(changes.github ? { github: { ...changes.github } } : {}), ...(changes.port ? { port: changes.port } : {}) };
+}
+
+/** The saved state, read without the lease and without creating it: what a running server or the next start uses. */
+export async function peekLocalState(directory: string): Promise<LocalState | undefined> {
+  return readState(await privateStateDirectory(directory));
 }
 
 /**
- * The state in `directory`, created with fresh secrets the first time. `changes` (a GitHub OAuth app, a port) are saved
- * before it is returned; the secrets never change once written. Reading, creating and changing it all hold its lock,
- * so whoever creates it first wins and everyone else reads what they wrote.
+ * The state in `directory`, created with fresh secrets the first time, with `changes` (a GitHub OAuth app, a port)
+ * saved before it is returned; the secrets never change once written. It holds the directory's lease until `release`:
+ * a local server keeps it for as long as it runs, so whoever holds it is the only one creating or changing the state.
  */
-export async function loadLocalState(directory: string, changes: { github?: GitHubOAuthApp; port?: number } = {}): Promise<LocalState> {
-  if (changes.github !== undefined && !validGitHubApp(changes.github)) throw new LocalStateError('That is not a GitHub OAuth app client ID and secret.');
-  if (changes.port !== undefined && !validPort(changes.port)) throw new LocalStateError('The port must be a number from 1024 to 65535.');
+export async function openLocalState(directory: string, changes: { github?: GitHubOAuthApp; port?: number } = {}): Promise<{ state: LocalState; release(): Promise<void> }> {
   const path = await privateStateDirectory(directory);
-  return locked(path, async () => {
+  const release = await lease(path);
+  try {
     const saved = await readState(path);
-    const state: LocalState = saved ?? { version: 1, sessionSecret: secret(), vaultKey: secret(), claimSecret: secret(), port: DEFAULT_LOCAL_PORT };
-    const next: LocalState = { ...state, ...(changes.github ? { github: { ...changes.github } } : {}), ...(changes.port ? { port: changes.port } : {}) };
-    if (!saved || JSON.stringify(next) !== JSON.stringify(saved)) await writeState(path, next);
-    return next;
-  });
+    const state = changed(saved, changes);
+    if (!saved || JSON.stringify(state) !== JSON.stringify(saved)) await writeState(path, state);
+    return { state, release };
+  } catch (error) {
+    await release();
+    throw error;
+  }
+}
+
+/** openLocalState, released at once: for changes made while no server runs. */
+export async function loadLocalState(directory: string, changes: { github?: GitHubOAuthApp; port?: number } = {}): Promise<LocalState> {
+  const { state, release } = await openLocalState(directory, changes);
+  await release();
+  return state;
 }

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { LocalServerEvent } from "../apps/server/src/local/desktop-protocol.js";
-import { loadLocalState } from "../apps/server/src/local/state.js";
+import { loadLocalState, peekLocalState } from "../apps/server/src/local/state.js";
 
 const repository = fileURLToPath(new URL("../", import.meta.url));
 
@@ -96,7 +96,7 @@ test("the desktop app's local server refuses malformed requests, needs a GitHub 
   assert.equal(started.type === "result" && started.ok, true);
   const running = await server.next(event => event.type === "status" && event.state === "running", count);
   assert.ok(running.type === "status");
-  const state = await loadLocalState(stateDir);
+  const state = (await peekLocalState(stateDir))!;
   assert.equal(running.origin, `http://127.0.0.1:${state.port}`);
   assert.equal(running.claimUrl, `${running.origin}/api/auth/local/claim?token=${state.claimSecret}`);
   assert.equal(state.github?.clientId, "Ov23liDesktop");
@@ -113,4 +113,6 @@ test("the desktop app's local server refuses malformed requests, needs a GitHub 
   assert.equal(stopped.type === "result" && stopped.ok, true);
   await server.next(event => event.type === "status" && event.state === "stopped", before);
   await assert.rejects(fetch(`${running.origin}/api/health`));
+  // Stopped, it no longer holds the state's lease.
+  assert.equal((await loadLocalState(stateDir)).claimSecret, state.claimSecret);
 });

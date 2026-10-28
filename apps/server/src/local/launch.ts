@@ -37,6 +37,8 @@ export interface LocalServerOptions {
   staticDir?: string;
   /** Tests and development only: settings added to the server's (test mode, say). */
   extraEnv?: Record<string, string>;
+  /** Releases the state's lease (state.ts openLocalState): called once the server has closed, or failed to start. */
+  release?: () => Promise<void>;
 }
 
 export interface LocalServer {
@@ -53,6 +55,11 @@ export interface LocalServer {
 export class LocalServerError extends Error {}
 
 export async function startLocalServer(options: LocalServerOptions): Promise<LocalServer> {
+  try { return await start(options); }
+  catch (error) { await options.release?.(); throw error; }
+}
+
+async function start(options: LocalServerOptions): Promise<LocalServer> {
   const { state } = options;
   // Absolute, so the database and storage URLs below name it whatever the working directory.
   const stateDir = resolve(options.stateDir);
@@ -84,7 +91,9 @@ export async function startLocalServer(options: LocalServerOptions): Promise<Loc
     async claimUrl() {
       return await localOwner(env) ? null : `${origin}/api/auth/local/claim?token=${state.claimSecret}`;
     },
-    close: () => server.close(),
+    async close() {
+      try { await server.close(); } finally { await options.release?.(); }
+    },
   };
 }
 

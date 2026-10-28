@@ -6,7 +6,7 @@ import { ConnectorSetupError } from '../../../runner/src/protocol.js';
 import { ConfigurationError } from '../config.js';
 import { startLocalHost, type LocalHost, type LocalHostOptions } from './host.js';
 import { githubOAuthAppInstructions, LocalServerError, startLocalServer } from './launch.js';
-import { defaultLocalStateDir, loadLocalState, LocalStateError, validGitHubApp, type GitHubOAuthApp } from './state.js';
+import { defaultLocalStateDir, LocalStateError, openLocalState, peekLocalState, validGitHubApp, type GitHubOAuthApp } from './state.js';
 
 const HELP = `Usage: pistead serve [options]
 
@@ -108,13 +108,14 @@ export async function serveMain(args = process.argv.slice(2)): Promise<void> {
   let server;
   let host: LocalHost | undefined;
   try {
-    const existing = await loadLocalState(stateDir);
-    const github = await githubApp(values['github-client-id'], existing.github !== undefined);
+    const existing = await peekLocalState(stateDir);
+    const github = await githubApp(values['github-client-id'], existing?.github !== undefined);
     // Checked (and consent asked) before anything starts, as `pistead connect` does.
     const hostSetup = values['no-host'] ? undefined : await hostOptions(values);
-    const state = await loadLocalState(stateDir, { ...(github ? { github } : {}), ...(port ? { port } : {}) });
+    // Held while the server runs: nothing else creates, changes or serves this state meanwhile.
+    const { state, release } = await openLocalState(stateDir, { ...(github ? { github } : {}), ...(port ? { port } : {}) });
     const testSecret = values['test-mode'] ? Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url') : undefined;
-    server = await startLocalServer({ stateDir, state, ...(testSecret ? { extraEnv: {
+    server = await startLocalServer({ stateDir, state, release, ...(testSecret ? { extraEnv: {
       TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: testSecret, TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 24 * 3600_000).toISOString() } } : {}) });
     const claim = await server.claimUrl();
     process.stderr.write(`\nPistead is running at ${server.origin} (this computer only).\n`);

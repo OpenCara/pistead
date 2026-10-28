@@ -8,7 +8,7 @@ import { ConfigurationError } from '../config.js';
 import type { LocalHostState, LocalInspection, LocalServerEvent, LocalServerRequest, LocalStartRequest, LocalStatus } from './desktop-protocol.js';
 import { startLocalHost, type LocalHost } from './host.js';
 import { LocalServerError, startLocalServer, type LocalServer } from './launch.js';
-import { defaultLocalStateDir, loadLocalState, LocalStateError } from './state.js';
+import { DEFAULT_LOCAL_PORT, defaultLocalStateDir, LocalStateError, openLocalState, peekLocalState } from './state.js';
 
 // The local server run by a desktop app instead of `pistead serve` in a terminal: the same server, state and host,
 // with requests arriving over the parent's IPC channel and status and logs going back the same way.
@@ -68,11 +68,12 @@ async function hostCheck(testMode: boolean): Promise<{ mode: LocalInspection['ho
 }
 
 async function inspect(): Promise<LocalInspection> {
-  const state = await loadLocalState(stateDir);
+  // Read only: a server running from this state (here or in a terminal) holds its lease, and nothing is created yet.
+  const state = await peekLocalState(stateDir);
   const host = await hostCheck(false);
   return {
-    stateDir, port: state.port, hostMode: host.mode,
-    ...(state.github ? { githubClientId: state.github.clientId } : {}),
+    stateDir, port: state?.port ?? DEFAULT_LOCAL_PORT, hostMode: host.mode,
+    ...(state?.github ? { githubClientId: state.github.clientId } : {}),
     ...(host.mode === 'unsandboxed' ? { unsandboxedWarning: unsandboxedWarning() } : {}),
     ...(host.problem ? { hostProblem: host.problem } : {}),
   };
@@ -83,11 +84,12 @@ async function start(request: LocalStartRequest): Promise<void> {
   starting = true;
   try {
     const github = request.github && { clientId: request.github.clientId.trim(), clientSecret: request.github.clientSecret.trim() };
-    const state = await loadLocalState(stateDir, github ? { github } : {});
-    if (!state.github) throw new LocalFailure('Add your GitHub OAuth app first: Pistead signs you in with it.');
+    // Held while the server runs: nothing else creates, changes or serves this state meanwhile.
+    const { state, release } = await openLocalState(stateDir, github ? { github } : {});
+    if (!state.github) { await release(); throw new LocalFailure('Add your GitHub OAuth app first: Pistead signs you in with it.'); }
     const testMode = request.testMode === true;
-    const host = await hostCheck(testMode);
-    const server = await startLocalServer({ stateDir, state, ...(staticDir ? { staticDir } : {}), ...(testMode ? { extraEnv: {
+    const host = await hostCheck(testMode).catch(async (error: unknown) => { await release(); throw error; });
+    const server = await startLocalServer({ stateDir, state, release, ...(staticDir ? { staticDir } : {}), ...(testMode ? { extraEnv: {
       TEST_AUTH_ENABLED: 'true', TEST_AUTH_SECRET: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url'),
       TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 24 * 3600_000).toISOString() } } : {}) });
     const current: Running = { server, hostState: 'off', stopping: false };
