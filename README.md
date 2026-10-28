@@ -37,6 +37,7 @@ And around them:
   - [Backups, restores and exports](#backups-restores-and-exports)
   - [Moving a session to another host](#moving-a-session-to-another-host)
   - [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)
+- [Running Pistead on your own computer](#running-pistead-on-your-own-computer)
 - [Running the server](#running-the-server)
 - [Development](#development)
 - [Layout](#layout)
@@ -65,6 +66,8 @@ And around them:
 | Permission request | A card asking the session owner to let a tool call do more than the session allows. |
 
 ## Quick start
+
+Just for yourself, on one computer? `npx pistead@latest serve` runs all of it there, with no server to deploy: see [Running Pistead on your own computer](#running-pistead-on-your-own-computer). For a team:
 
 1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
@@ -385,7 +388,7 @@ Select a workspace in the sidebar (or open **New session** in it):
 - **Where it runs** (on your own host, or one whose owner granted you **Sessions on the host**, once its [configuration](#host-configuration) allows **Sessions on the host**): **Sandbox** (the default) or **On this host**, without the sandbox. See [Sessions on the host](#sessions-on-the-host).
 - The model, reasoning level and access for the first message (see [Chat options](#chat-options)). The info tips show the host, the model and the repositories the session will pin.
 
-Press Enter to start (Shift+Enter adds a line). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares it, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).
+Press Enter to start (Shift+Enter adds a line; on a phone, Enter adds a line and the send button starts it). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares it, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).
 
 #### Shared messages and side asks
 
@@ -398,7 +401,7 @@ Shared messages and side asks share one queue: up to 64 waiting or running, with
 
 #### Images
 
-Paste images, such as screenshots, into the composer: into a new session's first message, a shared message or a side ask. They show as thumbnails above the text; **×** removes one. A message carries up to 4 images, and can be images alone. The browser scales each image to at most 1568 pixels on its longest edge and compresses it until the message fits what the host takes in one request; the host decodes and prepares each image again, and the model gets them after the message's text. The images stay on the host: the transcript notes each one as `[image image/png]`.
+Paste images, such as screenshots, into the composer, or pick them with its image button (on a phone, from the photo library or camera): into a new session's first message, a shared message or a side ask. They show as thumbnails above the text; **×** removes one. A message carries up to 4 images, and can be images alone. The browser scales each image to at most 1568 pixels on its longest edge and compresses it until the message fits what the host takes in one request; the host decodes and prepares each image again, and the model gets them after the message's text. The images stay on the host: the transcript notes each one as `[image image/png]`.
 
 Images need a connector that supports them on the session's host (update it with `npx pistead@latest connect`) and a model that accepts images; otherwise the composer or the send says why.
 
@@ -626,9 +629,27 @@ While both hosts are connected, a session's owner can move it to a model on anot
 ### iPhone, iPad and Mac apps
 
 - **iPhone and iPad** ([`apps/mobile`](apps/mobile/README.md), Expo): your sessions grouped by workspace with their status; a session opens live with its transcript, queue, pending approvals to decide, and the chat box for shared messages and side asks; new sessions start from the app. It isn't on the App Store or TestFlight yet: build it from source as a development build.
-- **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal. Pair it with a pairing ID and code from **Settings → Hosts**. It shares the command-line connector's state, so a Mac paired with `pistead connect` is adopted as is, and only one of the two can run at a time. macOS has no sandbox, so starting the host asks for the same consent as `--unsafe-no-sandbox`.
+- **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal. Pair it with a pairing ID and code from **Settings → Hosts**. It shares the command-line connector's state, so a Mac paired with `pistead connect` is adopted as is, and only one of the two can run at a time. macOS has no sandbox, so starting the host asks for the same consent as `--unsafe-no-sandbox`. **Settings → Pistead on this computer** runs Pistead itself on the Mac instead of using a server (see [Running Pistead on your own computer](#running-pistead-on-your-own-computer)).
 
 The apps sign in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. Each app sign-in lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out.
+
+## Running Pistead on your own computer
+
+For one person, Pistead can run entirely on their own computer: the server, the web app and the computer itself as the host that runs the sessions. Nothing is deployed and no account at a Pistead service is needed; it is the same server, so everything in [Using Pistead](#using-pistead) works, for its one user.
+
+```sh
+npx pistead@latest serve
+```
+
+Or, in the Mac app, **Settings → Pistead on this computer → Run on This Computer**: the app runs the same server with the same data, and its Pistead window shows it while it runs.
+
+- **Sign-in** is with GitHub, through a GitHub OAuth app of your own, registered once at <https://github.com/settings/applications/new> with the homepage `http://127.0.0.1` and the callback URL `http://127.0.0.1/api/auth/github/callback` (GitHub accepts it on any port of 127.0.0.1). The first `pistead serve` asks for its client ID and, at a hidden prompt, its secret (or takes `--github-client-id` with the secret in `PISTEAD_GITHUB_CLIENT_SECRET`); the app has fields for them.
+- **One owner.** The first run prints a sign-in link (the app opens it in its window). The GitHub account that signs in through it becomes the owner, and from then on the only account that can sign in: any other is refused before its GitHub token is stored. Keep the link private until you have used it.
+- **This computer only.** It listens on `http://127.0.0.1:7878` (`--port` changes it), so nothing else on the network reaches it.
+- **This computer is the host.** Once the owner has signed in, the computer pairs itself with the server, with no code to copy, and appears under **Settings → Hosts**. It runs sessions as `pistead connect` would: in the bubblewrap sandbox on Linux with its prerequisites, otherwise only with `--unsafe-no-sandbox` (the app asks for the same consent). `--no-host` serves without it.
+- **Its data** (the SQLite database, session backups, the secrets it was set up with, and this computer's pairing) is in `~/.local/share/pistead/server` (`--state-dir` chooses another), private to your user. It is separate from `pistead connect`'s, so a computer connected to a team's server stays connected. One Pistead at a time runs from it: `pistead serve` and the Mac app share it, and whichever starts second says the other is running.
+
+Run `npx pistead serve --help` for every option. The server is the one [Running the server](#running-the-server) describes, started with `LOCAL_MODE` (see [Configuration](#configuration)).
 
 ## Running the server
 
@@ -659,10 +680,10 @@ Settings are environment variables, read once at start-up; secrets are never log
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `APP_ORIGIN` | required | Public origin of the server (scheme and host, no path); HTTPS outside local test mode |
+| `APP_ORIGIN` | required | Public origin of the server (scheme and host, no path); HTTPS outside local test mode and `LOCAL_MODE` |
 | `SESSION_SECRET` | required | Random string of at least 32 characters |
 | `VAULT_KEY` | required | Base64url 32-byte key that encrypts stored tokens and secrets; keep it stable, since secrets stored with one key can't be read with another |
-| `HOST`, `PORT` | `0.0.0.0`, `8787` | Listening address |
+| `HOST`, `PORT` | `0.0.0.0` (`127.0.0.1` with `LOCAL_MODE`), `8787` | Listening address |
 | `TRUST_PROXY` | `false` | Honor `X-Forwarded-Proto`/`X-Forwarded-Host` from a trusted proxy |
 | `STATIC_DIR` | `dist/web` | Built web app |
 | `DATABASE_URL` | `sqlite:///data/pistead.sqlite` | Control-plane database |
@@ -678,6 +699,7 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |
+| `LOCAL_MODE`, `LOCAL_CLAIM_SECRET` | off | A server for one person on their own computer, as `pistead serve` runs it: plain HTTP on loopback only, and only the GitHub account that signs in through `/api/auth/local/claim?token=LOCAL_CLAIM_SECRET` first (a base64url 32-byte value) can sign in |
 
 ### Administration
 
@@ -788,9 +810,9 @@ await fetch("/api/auth/test", { method: "POST", headers: { Authorization: "Beare
 
 ## Layout
 
-- `apps/server`: the control plane (Hono on Node). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/connector-hub.ts` the WebSocket relay to connected hosts.
+- `apps/server`: the control plane (Hono on Node); `src/local` runs it on one person's own computer (`pistead serve` and the desktop app). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/connector-hub.ts` the WebSocket relay to connected hosts.
 - `apps/web`: the React UI.
 - `apps/mobile`: the iPhone and iPad app (Expo; Android later). `apps/desktop`: the macOS app (Electron; Linux and Windows later).
-- `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` and bundled into the desktop app.
+- `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` (with the server, for `pistead serve`) and bundled into the desktop app.
 - `packages/shared`: types and policy shared by all of the above. `packages/client`: the API client, live session updates and chat-option rules shared by the web and the apps.
 - `docs/design`: design notes, such as the [repository cache](docs/design/repository-cache.md).

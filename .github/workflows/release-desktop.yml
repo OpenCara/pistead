@@ -47,6 +47,8 @@ jobs:
         env:
           VERSION: ${{ needs.check.outputs.version }}
         run: node scripts/set-release-version.mjs "$VERSION" desktop
+      # The web app, which the app ships for Pistead on this computer.
+      - run: pnpm build
       - run: pnpm --filter @pistead/desktop build
       - name: Stage the connector
         working-directory: apps/desktop

@@ -45,7 +45,8 @@ export function PullRequestTag({ pull }: { pull: SessionPullRequest }) {
 
 /** The open session's header: a link to its pull request. */
 export function PullRequestLink({ pull }: { pull: SessionPullRequest }) {
-  return <a className={`badge session-pull-link${pull.state ? ` ${pullRequestStateTones[pull.state]}` : ""}`} href={pull.url} target="_blank" rel="noreferrer" title={pullRequestTitle(pull)}>
-    <Icon name="git-pull-request" size={12} />{pull.number === undefined ? "Pull request" : `PR #${pull.number}`}{pull.state && <> · <PullRequestState pull={pull} /></>}<Icon name="external" size={12} />
+  // On phones only the icon, in the state's color, and the number show (session.css): the label names it all.
+  return <a className={`badge session-pull-link${pull.state ? ` ${pullRequestStateTones[pull.state]}` : ""}`} href={pull.url} target="_blank" rel="noreferrer" title={pullRequestTitle(pull)} aria-label={pullRequestTitle(pull)}>
+    <Icon name="git-pull-request" size={12} />{pull.number === undefined ? "Pull request" : <><span className="session-pull-prefix">PR </span>#{pull.number}</>}{pull.state && <span className="session-pull-state"> · <PullRequestState pull={pull} /></span>}<Icon name="external" size={12} />
   </a>;
 }

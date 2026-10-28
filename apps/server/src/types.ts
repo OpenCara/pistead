@@ -37,6 +37,10 @@ export interface Env {
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */
   ADMIN_USER_IDS?: string;
+  /** `true` on a local server (http.ts localMode): loopback only, and only the GitHub account that claimed it signs in. */
+  LOCAL_MODE?: string;
+  /** The local server's claim secret (base64url, 32 bytes): a sign-in carrying it may claim an unclaimed local server. */
+  LOCAL_CLAIM_SECRET?: string;
 }
 export interface AuthIdentity {
   userId: string;

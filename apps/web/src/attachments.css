@@ -22,5 +22,8 @@
     border-radius: var(--radius-full);
   }
   .composer-attachment-remove.btn.icon-only svg { width: 12px; height: 12px; }
+  @media (pointer: coarse) {
+    .composer-attachment-remove.btn.icon-only { width: 24px; height: 24px; }
+  }
   .composer-notice { color: var(--foreground-muted); font-size: var(--font-xs); padding: 0 var(--space-1); }
 }

@@ -2,6 +2,8 @@
 
 Connect your Linux or WSL2 Pi host to a [Pistead](https://pistead.com) workspace. The connector uses outbound WebSocket only; no inbound port or tunnel is needed.
 
+Or run Pistead itself on your own computer, for yourself: `npx pistead@latest serve` (see [Running Pistead on your own computer](#running-pistead-on-your-own-computer)).
+
 ## Requirements
 
 - Linux or WSL2 (native Windows is unsupported)
@@ -139,3 +141,13 @@ The session list shows what each session's agent is doing, as its host reports i
 ## License
 
 MIT
+
+## Running Pistead on your own computer
+
+```sh
+npx pistead@latest serve
+```
+
+runs the Pistead server and its web app on `http://127.0.0.1:7878`, reachable from this computer only, with this computer as the host that runs your sessions. You sign in with GitHub through an OAuth app of your own: register one once at <https://github.com/settings/applications/new> with the homepage `http://127.0.0.1` and the callback URL `http://127.0.0.1/api/auth/github/callback`, and the first run asks for its client ID and secret (hidden). It then prints a sign-in link: the GitHub account that signs in through it becomes the owner, and the only account that can sign in. Once you have, this computer pairs itself as your host, sandboxed as with `connect` (or with `--unsafe-no-sandbox`; `--no-host` serves without it).
+
+Everything is kept in `~/.local/share/pistead/server` (`--state-dir`), apart from `connect`'s own state, so later runs need no options. Run `npx pistead serve --help` for the rest.
