@@ -30,6 +30,9 @@ export function trackVisualViewport(): void {
   const update = () => {
     if (Math.abs(viewport.scale - 1) > 0.01) return;
     root.style.setProperty("--viewport-height", `${Math.round(viewport.height)}px`);
+    // What `@media (max-height: 500px)` would say of the visible height: iOS doesn't shrink the layout for its keyboard,
+    // so that query never matches there while typing (session.css keys its short-screen rules on both).
+    root.classList.toggle("short-viewport", viewport.height <= 500);
     // iOS pans the page to reveal a focused field even when it is already visible; the app fits the viewport, so undo it.
     if (window.scrollY !== 0 && document.body.scrollHeight <= viewport.height + 1) window.scrollTo(0, 0);
   };

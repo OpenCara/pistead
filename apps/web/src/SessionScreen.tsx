@@ -370,6 +370,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
   const [scrolledUp, setScrolledUp] = useState(false);
   // Set while the button's smooth scroll runs: its frames are on the way down, not the reader scrolling up.
   const jumping = useRef(false);
+  const jumpTimer = useRef<number | undefined>(undefined);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
@@ -426,6 +427,20 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     if (element.firstElementChild) observer.observe(element.firstElementChild);
     return () => observer.disconnect();
   }, []);
+  /** Following and the jump button, from where the transcript is scrolled now. */
+  function track(element: HTMLElement) {
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    stick.current = distance < 80;
+    // A little further up than following stops, so the button doesn't flicker in and out at the bottom.
+    const up = distance > 240;
+    setScrolledUp(current => current === up ? current : up);
+  }
+  function endJump() {
+    jumping.current = false;
+    window.clearTimeout(jumpTimer.current);
+    jumpTimer.current = undefined;
+  }
+  useEffect(() => () => window.clearTimeout(jumpTimer.current), []);
   function jumpToLatest() {
     const element = transcript.current;
     if (!element) return;
@@ -433,8 +448,18 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     jumping.current = true;
     setScrolledUp(false);
     element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
-    // A reader who stops the scroll halfway (a touch, the wheel) leaves it short of the bottom: their scrolling counts again soon.
-    window.setTimeout(() => { jumping.current = false; }, 1000);
+    // However the scroll ends (cut short by layout, say), after a second where it stands decides again; a second jump restarts it.
+    window.clearTimeout(jumpTimer.current);
+    jumpTimer.current = window.setTimeout(() => {
+      endJump();
+      if (transcript.current) track(transcript.current);
+    }, 1000);
+  }
+  /** The reader takes over (a touch, the wheel, a key): a jump under way ends where they stop it, and they aren't pulled down. */
+  function interrupt() {
+    if (!jumping.current) return;
+    endJump();
+    if (transcript.current) track(transcript.current);
   }
   useLayoutEffect(() => {
     stick.current = true;
@@ -515,18 +540,14 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
 
   return <>
     <div className="session-transcript-frame">
-      <div className="session-transcript" ref={transcript} onScroll={event => {
+      <div className="session-transcript" ref={transcript} onWheel={interrupt} onTouchStart={interrupt} onKeyDown={interrupt} onScroll={event => {
         const element = event.currentTarget;
-        const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
         if (jumping.current) {
           // Following and the hidden button stand until the scroll lands; entries that arrive meanwhile are followed.
-          if (distance < 80) jumping.current = false;
+          if (element.scrollHeight - element.scrollTop - element.clientHeight < 80) endJump();
           else return;
         }
-        stick.current = distance < 80;
-        // A little further up than following stops, so the button doesn't flicker in and out at the bottom.
-        const up = distance > 240;
-        setScrolledUp(current => current === up ? current : up);
+        track(element);
         // Near the top of a transcript that has earlier entries: read the next page before the reader gets there.
         if (element.scrollTop < 240 && olderCount > 0) loadEarlier();
       }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>

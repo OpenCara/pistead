@@ -396,14 +396,21 @@
     .session-panel, .session-screen.panel-wide .session-panel { width: 100%; border-left: 0; }
     .session-panel-body { padding: var(--space-3) var(--space-3) var(--space-8); }
   }
+  /*
+   * Short of height, the conversation and the chat box come first: the cards get a third of it, scrolling; while typing,
+   * the draft and the cards share what's left, so some conversation stays in view. The same rules twice: by the media
+   * query, and by .short-viewport, which touch.ts sets from the visible height that an iOS keyboard leaves.
+   */
   @media (max-height: 500px) {
-    /* Short of height, the conversation and the chat box come first: the cards get a third of it, scrolling. */
     .session-pinned { max-height: 33vh; max-height: calc(var(--viewport-height, 100dvh) * 0.33); }
-    /* While typing there, the draft and the cards share what's left, so some conversation stays in view. */
     .composer > textarea { max-height: calc(var(--viewport-height, 100dvh) * 0.25); }
     .session-bottom:has(.composer:focus-within) .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.2); }
     .session-transcript > .chat-column { padding-top: var(--space-2); padding-bottom: var(--space-2); }
   }
+  .short-viewport .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.33); }
+  .short-viewport .composer > textarea { max-height: calc(var(--viewport-height, 100dvh) * 0.25); }
+  .short-viewport .session-bottom:has(.composer:focus-within) .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.2); }
+  .short-viewport .session-transcript > .chat-column { padding-top: var(--space-2); padding-bottom: var(--space-2); }
 }
 
 /* Scheduled prompts (session-schedules.tsx). */
