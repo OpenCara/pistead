@@ -184,6 +184,8 @@ const layout: HelperLayout = { root: "/s", home: "/s/home", worktree: "/s/worktr
 test("the Seatbelt profile denies by default, passes paths as parameters, and opens writes and the network per step", () => {
   const read = seatbeltProfile({ layout, readOnly: true, gitWritable: false, toolRoots: ["/opt/homebrew"] });
   assert.match(read.profile, /^\(version 1\)\n\(deny default\)\n/);
+  // trustd would fetch certificate URLs on the host's network, outside the egress proxy.
+  assert.ok(!read.profile.includes("trustd"), "no trustd lookup");
   assert.ok(!read.profile.includes("/s/"), "no session path is spliced into the profile");
   assert.equal(read.parameters.WORKTREE, "/s/worktree");
   assert.equal(read.parameters.TOOL_0, "/opt/homebrew");

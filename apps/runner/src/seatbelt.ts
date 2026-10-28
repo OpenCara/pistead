@@ -18,7 +18,8 @@ import { firstExecutable } from "./platform.js";
  * - The network is the session's egress proxy only: outbound connections to its loopback port, which wants the
  *   session's token. Seatbelt's `localhost` also covers the host's other addresses on that port, which is why the token
  *   is required. No other loopback port is reachable, so a session can't reach its own servers either: tests that
- *   start a local server fail on this backend.
+ *   start a local server fail on this backend. Nor is trustd, which would fetch certificate URLs outside the proxy, so
+ *   Go and Swift programs can't verify TLS (curl, Git, Node and Python use the session's CA bundle and work).
  * - No hard memory or process limits (macOS has no cgroups), so shell commands run only where the host's owner allows.
  * - `sandbox_init`/`sandbox-exec` are deprecated in Apple's headers but still ship, and Chromium, Codex and others
  *   depend on them.
@@ -112,8 +113,9 @@ export function seatbeltProfile(policy: SeatbeltPolicy): { profile: string; para
     // user database, POSIX semaphores (Python's multiprocessing) and ptys (tools that spawn shells).
     `(allow sysctl-read ${SYSCTLS.map(name => name.endsWith(".") ? `(sysctl-name-prefix "${name}")` : `(sysctl-name "${name}")`).join(" ")})`,
     "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.bsd.dirhelper\"))",
-    // Certificate verification through Security.framework: Go and Swift ignore SSL_CERT_FILE on macOS.
-    "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))",
+    // Never com.apple.trustd.agent: trustd fetches the AIA, OCSP and CRL URLs a certificate names on the host's own
+    // network, outside the egress proxy, so a step could send data the network policy refuses. Go and Swift, which
+    // verify TLS only through it on macOS (they ignore SSL_CERT_FILE), can't make HTTPS connections here.
     "(allow ipc-posix-sem)",
     "(allow pseudo-tty)",
     "(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\") (regex #\"^/dev/ttys[0-9]+$\"))",

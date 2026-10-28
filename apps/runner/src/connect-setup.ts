@@ -41,7 +41,7 @@ export async function checkPrerequisites(unsandboxed: boolean, experimental?: { 
     const runtime = windowsRuntimeDirectory(experimental.stateDir);
     const build = Number(release().split(".")[2] ?? 0);
     return [{ name: "Git for Windows (git on PATH)", ok: gitForWindowsRoot() !== undefined },
-      { name: `busybox-w32, the sandbox's shell (${SANDBOX_SHELL_HINT}; or set PISTEAD_BASH)`, ok: sandboxShellPath() !== undefined },
+      { name: `busybox-w32, the sandbox's shell (${SANDBOX_SHELL_HINT}; or set PISTEAD_SANDBOX_SHELL)`, ok: sandboxShellPath() !== undefined },
       { name: `Windows 11 24H2 or later (build 26100+, found ${build || "unknown"}; the sandbox checks the update level itself)`, ok: build >= 26100 },
       { name: `Microsoft MXC SDK ${MXC_SDK_VERSION} in ${runtime} (install: ${mxcInstallHint(runtime)})`, ok: mxcEntry(runtime) !== undefined }];
   }

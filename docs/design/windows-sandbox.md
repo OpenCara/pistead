@@ -45,6 +45,10 @@ Where the implementation departs from the decision above:
   added on Windows later.
 - **macOS uses our own Seatbelt profile**, not MXC's. That avoids a 108 MB dependency and native code loaded
   through FFI, and the profile is in the repository to review. Its rules follow MXC's and Codex's documented ones.
+- **macOS: no Go or Swift TLS.** They verify certificates only through `com.apple.trustd.agent`, which fetches the
+  AIA, OCSP and CRL URLs a certificate names on the host's own network, outside the egress proxy: a step could send
+  data the network policy refuses. The profile doesn't allow it, so the only way out stays the proxy; curl, Git, Node
+  and Python use the session's CA bundle and work. (The first macOS run allowed it; that was reverted.)
 - **Not yet:** the repository cache and GPU on both, and clone-session backups and moves on Windows (the Node helper
   has no `clone-backup`/`clone-restore`; the workspace refuses them by name).
 
@@ -53,8 +57,7 @@ What the first runs must check, beyond [Spikes](#spikes-before-committing):
 - macOS:
   - the profile lets Python (from the developer tools), Git over the proxy, bash, node and Homebrew tools start;
   - nothing outside the session is readable;
-  - `curl`/`git` send the proxy credentials from the URL (the 407 path), and Go tools' TLS (no `trustd` lookups are
-    allowed);
+  - `curl`/`git` send the proxy credentials from the URL (the 407 path);
   - xcrun caches and `/private/var/folders` writes are denied without breaking tools.
 - Windows:
   - whether MXC replaces our `HTTPS_PROXY` (which carries the token) with its own `networkProxy` value; if so, tunnels

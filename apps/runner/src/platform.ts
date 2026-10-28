@@ -58,13 +58,14 @@ export function bashPath(): string | undefined {
 
 /**
  * The shell for the Windows sandbox's commands. MSYS2 programs, Git for Windows' bash among them, can't start in Windows'
- * process container (their runtime is denied its global named objects), so it is busybox-w32: from PISTEAD_BASH, the
+ * process container (their runtime is denied its global named objects), so it is busybox-w32: from PISTEAD_SANDBOX_SHELL, the
  * per-user install at %LOCALAPPDATA%\Programs\busybox, or Git for Windows' MinGit-busybox flavor. Only that one file is
  * granted to the container, so it must be the executable itself (not a launcher such as a Scoop shim).
  */
 export function sandboxShellPath(): string | undefined {
   if (!windows) return undefined;
-  if (process.env.PISTEAD_BASH) return firstExecutable([process.env.PISTEAD_BASH]);
+  // Its own variable: PISTEAD_BASH is Git for Windows' bash for unsandboxed and host commands, which take bash's flags.
+  if (process.env.PISTEAD_SANDBOX_SHELL) return firstExecutable([process.env.PISTEAD_SANDBOX_SHELL]);
   const root = gitForWindowsRoot();
   return firstExecutable([
     process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs", "busybox", "busybox.exe"),
