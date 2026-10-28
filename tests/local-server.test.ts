@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -159,6 +159,7 @@ test("pistead serve's server pairs this computer as its owner's host once claime
   const state = await loadLocalState(stateDir, { port: await freePort() });
   const web = await directory(t);
   await writeFile(join(web, "index.html"), "<!doctype html><title>Pistead</title>");
+  await mkdir(join(web, "assets"));
   // Test mode lets the host offer the fixture model; everything else is the local server as `pistead serve` runs it.
   const testMode = { TEST_AUTH_ENABLED: "true", TEST_AUTH_SECRET: "t".repeat(43), TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600_000).toISOString() };
   const hostOptions = {

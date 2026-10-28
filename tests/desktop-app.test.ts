@@ -7,7 +7,7 @@ import type { HostInspection } from "../apps/runner/src/desktop-protocol.js";
 import { HostController } from "../apps/desktop/src/main/host-controller.js";
 import type { HostProcess } from "../apps/desktop/src/main/host-process.js";
 import { navigationDecision, parseServerOrigin, windowOpenDecision } from "../apps/desktop/src/main/origin.js";
-import { isLocalPage, parseStartInput } from "../apps/desktop/src/main/requests.js";
+import { isLocalPage, parseLocalStartInput, parseStartInput } from "../apps/desktop/src/main/requests.js";
 import { parseSettings, SettingsStore } from "../apps/desktop/src/main/settings.js";
 
 const pairingId = "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed";
@@ -66,6 +66,20 @@ test("start requests from the page are checked field by field, and a pasted code
   assert.match(refused({ replacePairing: false, pairing: { id: pairingId, code: "has spaces in it" } }), /not valid/);
 });
 
+test("Pistead on this computer starts with the GitHub OAuth app the page sent, checked, or with the saved one", () => {
+  const secret = "0123456789abcdef0123456789abcdef01234567";
+  assert.deepEqual(parseLocalStartInput({}), { ok: true, value: {} });
+  assert.deepEqual(parseLocalStartInput({ github: { clientId: " ", clientSecret: "" } }), { ok: true, value: {} });
+  assert.deepEqual(parseLocalStartInput({ github: { clientId: " Ov23liAbC ", clientSecret: `${secret}\n` } }),
+    { ok: true, value: { github: { clientId: "Ov23liAbC", clientSecret: secret } } });
+  for (const value of [undefined, [], { github: { clientId: "a" } }, { github: { clientId: "a", clientSecret: "b", extra: 1 } }, { github: {}, port: 1 }]) {
+    assert.equal(parseLocalStartInput(value).ok, false, JSON.stringify(value));
+  }
+  const refused = (value: unknown) => { const parsed = parseLocalStartInput(value); return parsed.ok ? "" : parsed.error; };
+  assert.match(refused({ github: { clientId: "has space", clientSecret: secret } }), /client ID/);
+  assert.match(refused({ github: { clientId: "Ov23liAbC", clientSecret: "" } }), /client secret/);
+});
+
 test("a damaged settings file falls back to defaults field by field, never to an unchecked server", () => {
   assert.deepEqual(parseSettings(undefined), { server: "https://pistead.com" });
   assert.deepEqual(parseSettings({ server: "http://evil.example", windowBounds: { x: 0, y: 0, width: 10, height: 10 }, resumeHost: {} }),
@@ -73,6 +87,8 @@ test("a damaged settings file falls back to defaults field by field, never to an
   // Git credentials an older version kept here are dropped: the host's owner turns them on in Pistead now.
   assert.deepEqual(parseSettings({ server: "http://127.0.0.1:8789/", gitCredentials: true, windowBounds: { x: 10, y: 20, width: 900, height: 700 }, resumeHost: { unsandboxedConsent: true } }),
     { server: "http://127.0.0.1:8789", windowBounds: { x: 10, y: 20, width: 900, height: 700 }, resumeHost: { unsandboxedConsent: true } });
+  assert.deepEqual(parseSettings({ localServer: { unsandboxedConsent: false } }), { server: "https://pistead.com", localServer: { unsandboxedConsent: false } });
+  assert.deepEqual(parseSettings({ localServer: true }), { server: "https://pistead.com" });
 });
 
 test("resuming at launch reuses only the consent given at the owner's last start; a failure or the owner's stop ends it", async t => {
