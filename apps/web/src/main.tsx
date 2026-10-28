@@ -16,9 +16,12 @@ import { SettingsScreen } from "./SettingsScreen";
 import { SharedSessionScreen } from "./SharedSessionScreen";
 import { Sidebar } from "./Sidebar";
 import { applyTheme, useTheme } from "./theme";
+import { NavigationProvider } from "./navigation";
+import { trackVisualViewport } from "./touch";
 import { Alert, Button, PageLoading, useResource } from "./ui";
 
 applyTheme();
+trackVisualViewport();
 
 const skipLink = <a href="#main-content" className="btn secondary sm skip-link" onClick={event => { event.preventDefault(); document.getElementById("main-content")?.focus(); }}>Skip to content</a>;
 
@@ -91,7 +94,9 @@ function Shell() {
     : route.name === "sessions" ? <SessionsScreen />
     : route.name === "settings" ? <SettingsScreen key={`${route.section}/${route.id ?? ""}`} section={route.section} id={route.id} />
     : <Home />;
-  return <div className={`app${sidebarOpen ? " sidebar-open" : ""}`}>{skipLink}
+  // The session screen has its own header, with the navigation button in it on narrow screens: one header, not two.
+  const ownHeader = route.name === "session";
+  return <NavigationProvider value={{ open: () => setSidebarOpen(true), expanded: sidebarOpen }}><div className={`app${sidebarOpen ? " sidebar-open" : ""}${ownHeader ? " own-header" : ""}`}>{skipLink}
     <header className="mobile-header">
       <button type="button" className="btn ghost sm icon-only" aria-label="Open navigation" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Icon name="menu" /></button>
       <span className="screen-title">Pistead</span>
@@ -99,7 +104,7 @@ function Shell() {
     <Sidebar route={route} onNavigate={() => setSidebarOpen(false)} />
     <div className="scrim" onClick={() => setSidebarOpen(false)} aria-hidden="true" />
     <main id="main-content" className={`main${route.name === "session" ? " no-scroll" : ""}`} tabIndex={-1}>{screen}</main>
-  </div>;
+  </div></NavigationProvider>;
 }
 
 function App() {

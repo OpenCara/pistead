@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { api, errorMessage } from "./api";
 import { Icon, type IconName } from "./icons";
 import { Popover } from "./popover";
+import { coarsePointer } from "./touch";
 
 /* ---------- Data hooks ---------- */
 
@@ -238,7 +239,8 @@ export function Combobox<T extends string>({ value, options, onChange, placehold
       <span className="truncate">{selected?.label ?? placeholder}</span><Icon name="chevron-down" size={14} />
     </button>
     {open && <Popover anchor={ref} side={side} role="dialog" label={label} className="listbox-popover">
-      {options.length > 7 && <input className="input listbox-search" autoFocus placeholder="Search" value={query} onChange={event => setQuery(event.target.value)} aria-label={`Search ${label}`} />}
+      {/* On a touch screen the keyboard would open over the list: search is a tap away there. */}
+      {options.length > 7 && <input className="input listbox-search" autoFocus={!coarsePointer()} placeholder="Search" value={query} onChange={event => setQuery(event.target.value)} aria-label={`Search ${label}`} />}
       <div role="listbox" className="listbox">
         {filtered.length ? filtered.map(option => <button key={option.value} type="button" role="option" aria-selected={option.value === value} disabled={option.disabled} className="menu-item" onClick={() => { onChange(option.value); close(); }}>
           <span className="truncate">{option.label}</span>{option.hint && <span className="menu-hint">{option.hint}</span>}

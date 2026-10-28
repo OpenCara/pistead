@@ -5,7 +5,7 @@ import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResul
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
+import { AttachButton, AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
 import {
   accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, modelUnavailable, mustConfirmAutoApprove, rememberChat,
   type ChatSelection,
@@ -20,7 +20,9 @@ import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
 import { decidesHostCommand, hostCommandWaiting, isHostCommand } from "../../../packages/client/src/host-commands";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
+import { NavigationButton } from "./navigation";
 import { navigate } from "./router";
+import { enterSends } from "./touch";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
 import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
@@ -52,17 +54,26 @@ function useLiveSession(id: string) {
 }
 
 const PANEL_KEY = "pistead.sessionPanel";
+/** Where the panel is a column beside the conversation (session.css); narrower, it covers the conversation. */
+const PANEL_BESIDE = "(min-width: 1100px)";
 
+/**
+ * Whether the session panel is open. Beside the conversation, the choice is remembered; where it would cover the
+ * conversation (a phone, a narrow window), each session opens on its conversation and the remembered choice stays
+ * the wide screen's.
+ */
 function usePanelOpen() {
   const [open, setOpen] = useState(() => {
+    if (!window.matchMedia(PANEL_BESIDE).matches) return false;
     try {
       const stored = localStorage.getItem(PANEL_KEY);
       if (stored) return stored === "open";
     } catch { /* Storage unavailable: fall back to the viewport default. */ }
-    return window.matchMedia("(min-width: 1100px)").matches;
+    return true;
   });
   const set = useCallback((value: boolean) => {
     setOpen(value);
+    if (!window.matchMedia(PANEL_BESIDE).matches) return;
     try { localStorage.setItem(PANEL_KEY, value ? "open" : "closed"); } catch { /* Keep the in-memory choice. */ }
   }, []);
   return [open, set] as const;
@@ -244,6 +255,7 @@ function SessionPane({ id }: { id: string }) {
   return <PeopleProvider people={people}><div className={panelOpen && session ? `session-screen panel-open${tab === "files" ? " panel-wide" : ""}` : "session-screen"}>
     <div className="session-pane">
       <ScreenHeader
+        leading={<NavigationButton />}
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
@@ -354,6 +366,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  // Shown while the reader has scrolled up from the latest entry: a button back down to it.
+  const [scrolledUp, setScrolledUp] = useState(false);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
@@ -399,6 +413,24 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     const element = transcript.current;
     if (element && stick.current) element.scrollTop = element.scrollHeight;
   }, [lastEntryId, entries.length]);
+  // The transcript shrinks when the chat box grows, a card is pinned above it or a phone's keyboard opens: a reader at
+  // the latest entry stays there instead of having it slide under the chat box. So does one whose entry grows as it streams.
+  useEffect(() => {
+    const element = transcript.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const follow = () => { if (stick.current) element.scrollTop = element.scrollHeight; };
+    const observer = new ResizeObserver(follow);
+    observer.observe(element);
+    if (element.firstElementChild) observer.observe(element.firstElementChild);
+    return () => observer.disconnect();
+  }, []);
+  function jumpToLatest() {
+    const element = transcript.current;
+    if (!element) return;
+    stick.current = true;
+    setScrolledUp(false);
+    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+  }
   useLayoutEffect(() => {
     stick.current = true;
     anchor.current = null;
@@ -477,21 +509,28 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     : <>Idle</>;
 
   return <>
-    <div className="session-transcript" ref={transcript} onScroll={event => {
-      const element = event.currentTarget;
-      stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-      // Near the top of a transcript that has earlier entries: read the next page before the reader gets there.
-      if (element.scrollTop < 240 && olderCount > 0) loadEarlier();
-    }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
-      <div className="chat-column">
-        {olderCount > 0 && <div className="transcript-earlier">
-          <Button variant="ghost" size="sm" icon="chevron-up" disabled={loadingOlder} onClick={loadEarlier}>
-            {loadingOlder ? "Loading earlier messages..." : `Show earlier messages (${olderCount})`}
-          </Button>
-        </div>}
-        {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
-          : <EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}</EmptyState>}
+    <div className="session-transcript-frame">
+      <div className="session-transcript" ref={transcript} onScroll={event => {
+        const element = event.currentTarget;
+        const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+        stick.current = distance < 80;
+        // A little further up than following stops, so the button doesn't flicker in and out at the bottom.
+        const up = distance > 240;
+        setScrolledUp(current => current === up ? current : up);
+        // Near the top of a transcript that has earlier entries: read the next page before the reader gets there.
+        if (element.scrollTop < 240 && olderCount > 0) loadEarlier();
+      }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
+        <div className="chat-column">
+          {olderCount > 0 && <div className="transcript-earlier">
+            <Button variant="ghost" size="sm" icon="chevron-up" disabled={loadingOlder} onClick={loadEarlier}>
+              {loadingOlder ? "Loading earlier messages..." : `Show earlier messages (${olderCount})`}
+            </Button>
+          </div>}
+          {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
+            : <EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}</EmptyState>}
+        </div>
       </div>
+      {scrolledUp && <Button variant="secondary" size="sm" icon="arrow-down" className="jump-to-latest" aria-label="Jump to the latest message" title="Jump to the latest message" onClick={jumpToLatest} />}
     </div>
     <div className="session-bottom">
       <div className="chat-column stack">
@@ -525,6 +564,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
           label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
           placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
           sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
+          hintRequired={!permitted || actualMode === "ask"}
           hint={archived ? "Read-only · this session is archived" : frozen ? "Read-only · this session pinned its repositories when it started" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
             : actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks"
             : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}
@@ -544,13 +584,17 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
   </>;
 }
 
-/** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. */
+/** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. On a phone, */
+/** whose keyboard has no Shift, Enter adds a line and the send button sends (touch.ts). */
 /** `onStop`, while the agent works and the person may stop it, shows a stop button beside send; messages can still be queued. */
-/** With `attachments`, images pasted into it go with the message, which may then have no text. */
-function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
+/** With `attachments`, images pasted into it or picked with its image button go with the message, which may then have no text. */
+/** `hint` is hidden on phones to keep the chat box to one toolbar row, unless `hintRequired` (it says why sending is */
+/** unavailable, or who can see what is sent). */
+function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, hintRequired, tools }: {
   value: string; onChange: (value: string) => void; onSubmit: () => void; attachments?: Attachments; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
-  label: string; placeholder: string; sendLabel: string; hint: ReactNode; tools?: ReactNode;
+  label: string; placeholder: string; sendLabel: string; hint: ReactNode; hintRequired?: boolean; tools?: ReactNode;
 }) {
+  const [sendsOnEnter] = useState(enterSends);
   const sendable = Boolean(value.trim() || attachments?.images.length);
   const input = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
@@ -564,16 +608,19 @@ function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stoppin
     if (!disabled && !busy && sendable) onSubmit();
   }
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event);
+    if (sendsOnEnter && event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event);
   }
   return <form className="composer" onSubmit={submit}>
     {attachments && <AttachmentStrip attachments={attachments} disabled={busy || disabled} />}
     <textarea ref={input} rows={1} required={!attachments?.images.length} value={value} disabled={busy || disabled} aria-label={label} placeholder={placeholder}
-      onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments?.paste} />
+      enterKeyHint={sendsOnEnter ? "send" : "enter"} onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments?.paste} />
     {attachments?.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
     <div className="composer-toolbar">
-      {tools}
-      <span className="composer-hint">{hint}</span>
+      {(attachments && !disabled || tools) && <span className="composer-tools">
+        {attachments && !disabled && <AttachButton attachments={attachments} disabled={busy} />}
+        {tools}
+      </span>}
+      <span className={hintRequired ? "composer-hint required" : "composer-hint"}>{hint}</span>
       <span className="composer-actions">
         {onStop && <Button variant="outline" size="sm" icon="stop" className="composer-stop" aria-label={stopping ? "Stopping..." : "Stop"} title="Stop the running message and those queued" disabled={stopping} onClick={onStop} />}
         <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !sendable} />
@@ -640,6 +687,7 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
           label="Message the agent"
           placeholder={canRestart ? "Message the agent to start the session again" : "Message the agent"}
           sendLabel={canRestart ? "Restart and send" : "Sending is unavailable"}
+          hintRequired
           hint={action.busy ? "Starting the session and preparing repositories..." : canRestart ? "Restarts the session, then sends" : failed ? "Only the owner can restart this session" : canWrite ? "Waiting for the host" : "Read-only — submitting needs write permission"}
         />
         <Feedback error={action.error} />

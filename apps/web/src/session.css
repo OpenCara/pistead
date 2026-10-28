@@ -15,6 +15,22 @@
   .chat-column { width: 100%; max-width: var(--chat-width); margin: 0 auto; padding: 0 var(--space-4); }
 
   .session-transcript { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  /* Holds the transcript and, while the reader has scrolled up, a button back down floating over its bottom edge. */
+  .session-transcript-frame { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
+  .jump-to-latest.btn {
+    position: absolute;
+    bottom: var(--space-3);
+    left: 50%;
+    z-index: 2;
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--surface1);
+    box-shadow: var(--shadow);
+    transform: translateX(-50%);
+  }
+  .jump-to-latest.btn:hover:not(:disabled) { background: var(--surface2); }
   .session-transcript > .chat-column { display: grid; gap: var(--space-4); align-content: start; padding-top: var(--space-6); padding-bottom: var(--space-6); }
   .session-transcript .empty-state { margin-top: var(--space-12); }
 
@@ -140,11 +156,19 @@
   .composer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); min-width: 0; }
   .composer-toolbar .menu-anchor { min-width: 0; max-width: 100%; }
   .composer-toolbar .menu-anchor > .btn { max-width: 100%; }
+  /* The attach button and pickers: part of the toolbar's own wrapping row here, one sideways-scrolling strip on phones. */
+  .composer-tools { display: contents; }
+  .composer-attach.btn.icon-only.sm { color: var(--foreground-muted); }
   /* The hint takes what is left of the row; below ~160px it wraps to its own line rather than truncating. */
   .composer-hint { flex: 1 1 160px; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
   /* Stop and send stay together at the end of the row. */
   .composer-actions { display: flex; flex: 0 0 auto; gap: var(--space-1); margin-left: auto; }
   .composer-send.btn, .composer-stop.btn { width: var(--control-sm); padding: 0; border-radius: var(--radius-full); }
+
+  @media (pointer: coarse) {
+    /* Send and stop are the chat box's most-used targets: a full fingertip each. */
+    .composer-send.btn, .composer-stop.btn { width: var(--control-md); height: var(--control-md); }
+  }
 
   /* Right panel: pinned column on wide screens, overlay below. */
   .session-panel {
@@ -157,6 +181,10 @@
     background: var(--background);
   }
   .session-panel-header { display: flex; align-items: center; gap: var(--space-2); min-height: 48px; padding: 0 var(--space-3); border-bottom: 1px solid var(--border); }
+  /* Five tabs don't fit a phone's width: they scroll sideways rather than push the close button off screen. */
+  .session-panel-header > .segmented { flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .session-panel-header > .segmented::-webkit-scrollbar { display: none; }
+  .session-panel-header > .segmented > button { flex: 0 0 auto; }
   .session-panel-body { min-height: 0; padding: var(--space-4) var(--space-4) var(--space-8); overflow-y: auto; }
   .session-panel .card > .alert { margin: var(--space-3); }
   .backup-detail { padding: 0 var(--space-4) var(--space-4); }
@@ -322,8 +350,38 @@
 
   @media (max-width: 600px) {
     .session-badges > .badge:not(:first-child) { display: none; }
+    /* The live status keeps its dot; its word stays for screen readers. */
+    .session-badges > .badge:first-child:has(> .dot) { gap: 0; padding: 0 7px; font-size: 0; }
+    .session-badges { margin-right: 0; }
     .session-pull-link > .icon:last-child { display: none; }
+    .session-screen .screen-subtitle { display: none; }
     .chat-column { padding: 0 var(--space-3); }
+    .session-transcript > .chat-column { padding-top: var(--space-4); padding-bottom: var(--space-4); }
+    .entry-bubble { max-width: 90%; }
+    .session-alerts { padding: var(--space-2) var(--space-3) 0; }
+    .session-bottom { padding: var(--space-2) 0; }
+    .composer { padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3); }
+    .composer > textarea { max-height: 30vh; max-height: 30dvh; }
+    /* One toolbar row: the tools scroll sideways in what send and stop leave of it. */
+    .composer-tools {
+      display: flex;
+      flex: 1 1 0;
+      align-items: center;
+      gap: var(--space-1);
+      min-width: 0;
+      margin-left: calc(-1 * var(--space-1));
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .composer-tools::-webkit-scrollbar { display: none; }
+    .composer-tools > * { flex: 0 0 auto; }
+    .composer-tools .menu-anchor { max-width: 55vw; }
+    /* "Runs as" can wait for a wider screen; why the box is read-only, or who sees a side ask, can't. */
+    .composer-hint:not(.required) { display: none; }
+    .composer-hint.required { flex-basis: 100%; order: 3; }
+    /* The panel covers the whole conversation rather than leave a sliver of it beside. */
+    .session-panel, .session-screen.panel-wide .session-panel { width: 100%; border-left: 0; }
+    .session-panel-body { padding: var(--space-3) var(--space-3) var(--space-8); }
   }
 }
 
