@@ -78,7 +78,8 @@ async function run(action: () => Promise<{ ok: true } | { ok: false; error: stri
   render(await bridge.view());
   try {
     const outcome = await action();
-    if (outcome.ok) local.clientSecret.value = "";
+    // The saved app is used from now on: an ID left in its field would come back with no secret at the next start.
+    if (outcome.ok) { local.clientId.value = ""; local.clientSecret.value = ""; }
     const view = await bridge.view();
     render(view);
     if (!outcome.ok) show(local.message, outcome.error, "error");
@@ -94,7 +95,8 @@ local.form.addEventListener("submit", event => {
   event.preventDefault();
   const clientId = local.clientId.value.trim();
   const clientSecret = local.clientSecret.value.trim();
-  void run(() => bridge.startLocal(clientId || clientSecret ? { github: { clientId, clientSecret } } : {}));
+  // An ID without a secret means the saved app; the page asks for both only to replace it.
+  void run(() => bridge.startLocal(clientSecret ? { github: { clientId, clientSecret } } : {}));
 });
 local.stop.addEventListener("click", () => { void run(() => bridge.stopLocal()); });
 bridge.onUpdate(render);

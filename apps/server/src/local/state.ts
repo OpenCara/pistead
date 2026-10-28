@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -10,6 +11,10 @@ import { join, resolve } from 'node:path';
 export const defaultLocalStateDir = (): string => join(homedir(), '.local', 'share', 'pistead', 'server');
 export const DEFAULT_LOCAL_PORT = 7878;
 const STATE_FILE = 'server.json';
+const LOCK_FILE = 'server.json.lock';
+/** A lock this old was left by a process that died holding it: reading and writing the state takes milliseconds. */
+const STALE_LOCK_MS = 30_000;
+const LOCK_WAIT_MS = 10_000;
 const SECRET = /^[A-Za-z0-9_-]{43}$/;
 /** GitHub OAuth app client IDs (`Ov23li…`, older 20 hex digits) and secrets (40 hex digits). */
 const CLIENT_ID = /^[A-Za-z0-9._-]{1,100}$/;
@@ -94,16 +99,43 @@ async function writeState(directory: string, state: LocalState): Promise<void> {
 }
 
 /**
+ * Runs `work` holding the state's lock: `pistead serve` and the desktop app share the directory, and two of them creating
+ * the state at once must not each write their own secrets (the vault key the loser's server used would be lost).
+ */
+async function locked<T>(directory: string, work: () => Promise<T>): Promise<T> {
+  const path = join(directory, LOCK_FILE);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const file = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      await file.writeFile(String(process.pid));
+      await file.close();
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw new LocalStateError('The local server state could not be locked.');
+      const held = await stat(path).catch(() => undefined);
+      if (held && Date.now() - held.mtimeMs > STALE_LOCK_MS) { await unlink(path).catch(() => {}); continue; }
+      if (Date.now() > deadline) throw new LocalStateError('Another Pistead is changing its state in this directory; try again in a moment.');
+      await delay(25 + Math.random() * 50);
+    }
+  }
+  try { return await work(); } finally { await unlink(path).catch(() => {}); }
+}
+
+/**
  * The state in `directory`, created with fresh secrets the first time. `changes` (a GitHub OAuth app, a port) are saved
- * before it is returned; the secrets never change once written.
+ * before it is returned; the secrets never change once written. Reading, creating and changing it all hold its lock,
+ * so whoever creates it first wins and everyone else reads what they wrote.
  */
 export async function loadLocalState(directory: string, changes: { github?: GitHubOAuthApp; port?: number } = {}): Promise<LocalState> {
-  const path = await privateStateDirectory(directory);
-  const saved = await readState(path);
-  const state: LocalState = saved ?? { version: 1, sessionSecret: secret(), vaultKey: secret(), claimSecret: secret(), port: DEFAULT_LOCAL_PORT };
   if (changes.github !== undefined && !validGitHubApp(changes.github)) throw new LocalStateError('That is not a GitHub OAuth app client ID and secret.');
   if (changes.port !== undefined && !validPort(changes.port)) throw new LocalStateError('The port must be a number from 1024 to 65535.');
-  const next: LocalState = { ...state, ...(changes.github ? { github: { ...changes.github } } : {}), ...(changes.port ? { port: changes.port } : {}) };
-  if (!saved || JSON.stringify(next) !== JSON.stringify(saved)) await writeState(path, next);
-  return next;
+  const path = await privateStateDirectory(directory);
+  return locked(path, async () => {
+    const saved = await readState(path);
+    const state: LocalState = saved ?? { version: 1, sessionSecret: secret(), vaultKey: secret(), claimSecret: secret(), port: DEFAULT_LOCAL_PORT };
+    const next: LocalState = { ...state, ...(changes.github ? { github: { ...changes.github } } : {}), ...(changes.port ? { port: changes.port } : {}) };
+    if (!saved || JSON.stringify(next) !== JSON.stringify(saved)) await writeState(path, next);
+    return next;
+  });
 }

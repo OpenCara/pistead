@@ -43,6 +43,17 @@ test("a local server's state is created once, owner-only, and keeps its secrets 
   await assert.rejects(loadLocalState(stateDir), /damaged/);
 });
 
+test("processes creating a local server's state at once all get the same secrets", async t => {
+  const stateDir = join(await directory(t), "server");
+  const states = await Promise.all(Array.from({ length: 8 }, () => loadLocalState(stateDir)));
+  for (const state of states) assert.deepEqual(state, states[0]);
+  assert.deepEqual(await loadLocalState(stateDir), states[0]);
+  // Concurrent changes are each applied to the state the last one left.
+  const github = { clientId: "Ov23liAbCdEf", clientSecret: "0123456789abcdef0123456789abcdef01234567" };
+  await Promise.all([loadLocalState(stateDir, { github }), loadLocalState(stateDir, { port: 9001 })]);
+  assert.deepEqual(await loadLocalState(stateDir), { ...states[0], github, port: 9001 });
+});
+
 test("a local server refuses state others could read or that a symlink points to", async t => {
   const parent = await directory(t);
   const stateDir = join(parent, "server");
@@ -74,7 +85,7 @@ test("LOCAL_MODE listens on loopback only and needs its claim secret", async () 
 
 /** GitHub's token exchange, user and verified email: the account signing in is `account.id`. */
 async function localFixture(t: TestContext, local = true) {
-  const { db, sqlite } = await testDatabase();
+  const { db, sqlite, setBeforeQuery } = await testDatabase();
   t.after(() => db.close());
   const env: Env = { DB: db, APP_ORIGIN: origin, VAULT_KEY: Buffer.alloc(32, 7).toString("base64url"),
     GITHUB_CLIENT_ID: "local-client", GITHUB_CLIENT_SECRET: "local-secret",
@@ -97,10 +108,29 @@ async function localFixture(t: TestContext, local = true) {
     return request(`/api/auth/github/callback?code=github-code&state=${state}`, { Cookie: cookies(begun).join("; ") });
   }
   const health = async () => (await (await request("/api/health")).json() as { localServer?: { claimed: boolean } }).localServer;
-  return { env, sqlite, account, request, signIn, health, cookies };
+  return { env, sqlite, setBeforeQuery, account, request, signIn, health, cookies };
 }
 
 const errorCode = async (response: Response) => (await response.json() as { code: string }).code;
+
+test("two claims at once leave one owner: the later sign-in is undone before its token is stored", async t => {
+  const f = await localFixture(t);
+  // Another claim's user is written between this callback's owner check and its own user's insert.
+  let raced = false;
+  f.setBeforeQuery(sql => {
+    if (raced || !sql.trimStart().startsWith("INSERT INTO users")) return;
+    raced = true;
+    f.sqlite.prepare(`INSERT INTO users (id, github_id, github_login, display_name, git_name, git_email, env_json, auth_kind, created_at)
+      VALUES ('github:1', '1', 'early', 'Early', 'Early', 'e@example.test', '{}', 'github', '2000-01-01T00:00:00.000Z')`).run();
+  });
+  const late = await f.signIn(`/api/auth/local/claim?token=${claimSecret}`);
+  assert.ok(raced);
+  assert.equal(late.status, 403);
+  assert.equal(await errorCode(late), "local_server_owner_only");
+  assert.deepEqual(f.sqlite.prepare("SELECT id FROM users").all().map(row => row.id), ["github:1"]);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM github_tokens").get()!.n, 0);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM auth_sessions").get()!.n, 0);
+});
 
 test("a local server admits the GitHub account that claims it with its sign-in link, and no one else", async t => {
   const f = await localFixture(t);
@@ -153,6 +183,21 @@ async function freePort(): Promise<number> {
   await new Promise(resolve => server.close(resolve));
   return port;
 }
+
+test("a relative state directory still names its database and backups correctly", async t => {
+  const parent = await directory(t);
+  const previous = process.cwd();
+  process.chdir(parent);
+  t.after(() => process.chdir(previous));
+  const state = await loadLocalState("server", { port: await freePort() });
+  const web = join(parent, "web");
+  await mkdir(join(web, "assets"), { recursive: true });
+  await writeFile(join(web, "index.html"), "<!doctype html>");
+  const server = await startLocalServer({ stateDir: "server", state, staticDir: web });
+  await server.close();
+  assert.ok((await stat(join(parent, "server", "pistead.sqlite"))).isFile());
+  assert.ok((await stat(join(parent, "server", "backups"))).isDirectory());
+});
 
 test("pistead serve's server pairs this computer as its owner's host once claimed, and reuses that pairing", async t => {
   const stateDir = join(await directory(t), "server");

@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { localOwner } from '../auth.js';
 import { loadConfig } from '../config.js';
 import { startServer } from '../serve.js';
@@ -53,7 +53,9 @@ export interface LocalServer {
 export class LocalServerError extends Error {}
 
 export async function startLocalServer(options: LocalServerOptions): Promise<LocalServer> {
-  const { stateDir, state } = options;
+  const { state } = options;
+  // Absolute, so the database and storage URLs below name it whatever the working directory.
+  const stateDir = resolve(options.stateDir);
   const staticDir = options.staticDir ?? defaultStaticDir();
   if (!staticDir) throw new LocalServerError('The Pistead web app is missing from this installation. Reinstall it, or run `pnpm build` in a source checkout.');
   const backups = join(stateDir, 'backups');
@@ -61,7 +63,7 @@ export async function startLocalServer(options: LocalServerOptions): Promise<Loc
   const origin = `http://${LOCAL_ORIGIN_HOST}:${state.port}`;
   const settings: Record<string, string> = {
     APP_ORIGIN: origin, HOST: LOCAL_ORIGIN_HOST, PORT: String(state.port), TRUST_PROXY: 'false',
-    DATABASE_URL: `sqlite://${join(stateDir, 'pistead.sqlite')}`, STORAGE_URL: `file://${backups}`, STATIC_DIR: staticDir,
+    DATABASE_URL: `sqlite://${join(stateDir, 'pistead.sqlite')}`, STORAGE_URL: pathToFileURL(backups).href, STATIC_DIR: staticDir,
     SESSION_SECRET: state.sessionSecret, VAULT_KEY: state.vaultKey, LOCAL_MODE: 'true', LOCAL_CLAIM_SECRET: state.claimSecret,
     ...(state.github ? { GITHUB_CLIENT_ID: state.github.clientId, GITHUB_CLIENT_SECRET: state.github.clientSecret } : {}),
     ...options.extraEnv,

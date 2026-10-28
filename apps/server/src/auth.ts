@@ -344,6 +344,7 @@ async function githubUser(c: AppContext, config: GitHubConfig, code: string, ver
   if (!user || user.auth_kind !== 'github' || user.id.startsWith('test:')) {
     fail(409, 'identity_conflict', 'GitHub identity cannot be used for this account.');
   }
+  if (localMode(c.env)) await settleLocalClaim(c.env, user.id);
   // Refused before the new token is stored, so a suspended account keeps none it didn't already have.
   if (user.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   const ciphertext = await encryptToken(c.env, user.id, exchange.access_token);
@@ -373,6 +374,20 @@ async function admitLocalOwner(c: AppContext, githubId: string): Promise<void> {
   if (!claim || !OPAQUE_TOKEN.test(claim) || !constantTimeEqual(claim, c.env.LOCAL_CLAIM_SECRET!)) {
     fail(403, 'local_server_unclaimed', 'Nobody has set up this Pistead yet. Sign in with the link it printed when it started (or from the Pistead app), which makes your GitHub account its owner.');
   }
+}
+
+/**
+ * Two claims at once (both holding the claim secret) could each pass admitLocalOwner before either user exists: once
+ * this sign-in's user is written, only the server's owner, its first GitHub user, goes on. A later one is removed again,
+ * before any token of its own is stored.
+ */
+async function settleLocalClaim(env: Env, userId: string): Promise<void> {
+  const owner = await localOwner(env);
+  if (owner?.id === userId) return;
+  await dbResult(env.DB.query(`DELETE FROM users WHERE id = ? AND auth_kind = 'github'
+    AND NOT EXISTS (SELECT 1 FROM github_tokens WHERE user_id = ?) AND NOT EXISTS (SELECT 1 FROM auth_sessions WHERE user_id = ?)`)
+    .bind(userId, userId, userId).run());
+  fail(403, 'local_server_owner_only', 'This Pistead runs on its owner\'s computer, and only the GitHub account that set it up can sign in.');
 }
 
 /**
