@@ -6,9 +6,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket as CompressingSocket } from "ws";
 import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
-import { connectorLimits } from "../../../packages/shared/src/connector.js";
+import { connectorLimits, connectorRequestTimeoutMs } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
-import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
+import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity, SessionBranch } from "../../../packages/shared/src/types.js";
+import type { SessionsToolResult } from "../../../packages/shared/src/cross-session.js";
+import { MAX_CLONE_BRANCHES } from "./clone-branches.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { SandboxBackendConfig } from "./sandbox-backend.js";
@@ -30,7 +32,21 @@ const STATE_FILE = "connector.json";
 const CALLBACK_LIMIT = 64 * 1024;
 /** A github_read result; the control plane keeps its view within 96 KiB of JSON. */
 const GITHUB_READ_LIMIT = 128 * 1024;
+/**
+ * The host's configuration, as large as the control plane saves it: compaction counts for 200 models with the longest
+ * names take about 67 KB (the save takes 128 KiB).
+ */
+const HOST_CONFIG_LIMIT = 128 * 1024;
+/** A schedule tool result: up to every schedule of the session, each with its message (MAX_SCHEDULES_PER_SESSION, server). */
+const SCHEDULES_LIMIT = 4 * 1024 * 1024;
+/** A sessions tool result: a list of up to 200 sessions, or a read of up to 50 entries of 2000 characters and a reply. */
+const SESSIONS_LIMIT = 2 * 1024 * 1024;
+/** The budget of a broker callback, whose upstream work can take several calls: as long as a relayed request may take. */
 const RPC_TIMEOUT = 30_000;
+/** How long a reply may wait for socket output to drain enough to fit; an uplink that can't is a broken connection. */
+const DRAIN_TIMEOUT = 30_000;
+/** How long a callback waits for the host to reconnect before it fails, so work that outlives a connection carries on. */
+const RECONNECT_WAIT = 15_000;
 const TOKEN = /^[A-Za-z0-9_-]{32,512}$/;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const encoder = new TextEncoder();
@@ -179,15 +195,16 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // The owner's consent, not caller-supplied metadata, decides whether isolation is disclosed as absent. Every connector
   // of this version applies per-message choices, gives the model a message's pasted images, pushes, and reads, merges
   // and opens issues on GitHub through the control plane, and takes its configuration from Pistead (`hostConfig`), where
-  // its owner decides whether pushes may use this host's Git credentials. It says whether this connection keeps a
-  // repository cache, and which GPU device sandboxed commands could get. Every session clones its repositories with
-  // plain Git: in the sandbox through its egress proxy (verified per session, like all isolation, so this doesn't wait
-  // for `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
+  // its owner decides whether pushes may use this host's Git credentials, compaction token counts included
+  // (`compactionConfig`). It says whether this connection keeps a repository cache, and which GPU device sandboxed
+  // commands could get. Every session clones its repositories with plain Git: in the sandbox through its egress proxy
+  // (verified per session, like all isolation, so this doesn't wait for `sandbox`), or with the host's own Git where its
+  // owner runs it unsandboxed.
   const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
+    github: true, githubIssues: true, schedules: true, crossSessions: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
+    github: true, githubIssues: true, schedules: true, crossSessions: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache,
     ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
@@ -258,6 +275,8 @@ export interface ConnectorSocket {
 export interface ConnectorRuntime {
   fetch(request: Request): Response | Promise<Response>;
   close(): Promise<void>;
+  /** Opens the sessions that had work in progress when the runner last stopped, so it goes on (RunnerService.resume). */
+  resume?(): Promise<void>;
 }
 
 export interface ConnectorOptions {
@@ -287,9 +306,16 @@ export interface ConnectorOptions {
   runtimeFactory?: (config: RunnerConfig) => Promise<ConnectorRuntime>;
   acquireLease?: typeof acquireRunnerLease;
   reconnectDelayMs?: number;
-  onStatus?: (status: "connecting" | "connected" | "disconnected" | "stopped") => void;
+  /** With "disconnected", why the last connection ended, in fixed connector text, when it is known. */
+  onStatus?: (status: "connecting" | "connected" | "disconnected" | "stopped", reason?: string) => void;
   onWarning?: (warning: "resources-unavailable") => void;
 }
+
+/**
+ * The runner, which outlives connections: a dropped connection doesn't end its sessions' work, it carries on and its
+ * callbacks go over the next connection. Only another repository cache, or the connector stopping, retires it.
+ */
+type Runtime = { value: ConnectorRuntime; repositoryCache: RepositoryCacheMode; resumed: boolean };
 
 type Generation = {
   socket: ConnectorSocket;
@@ -297,12 +323,17 @@ type Generation = {
   done: PromiseWithResolvers<void>;
   welcome: PromiseWithResolvers<string>;
   connectionToken?: string;
-  runtime?: ConnectorRuntime;
+  /** Requests admitted and not yet answered, which the relay counts against its pending limit too. */
   active: Set<Promise<void>>;
   tail: Promise<void>;
-  waiting: Set<PromiseWithResolvers<never>>;
+  /**
+   * Requests validated and waiting for their turn: a lost connection rejects them, and a runner replacement starting
+   * wakes them to be answered that it is restarting (see execute).
+   */
+  waiting: Set<PromiseWithResolvers<"restarting">>;
   incomingBytes: number;
-  responsesReserved: number;
+  /** The first reason this connection was ended for. */
+  reason?: string;
   runtimeReady: PromiseWithResolvers<void>;
 };
 
@@ -318,6 +349,24 @@ export class LocalConnector {
   private readonly secret = Buffer.from(randomBytes(48)).toString("base64url");
   private readonly seen = new Map<string, number>();
   private generation?: Generation;
+  /** The current connection once the relay has welcomed it; `online` resolves with the next one while there is none. */
+  private welcomed?: Generation;
+  private online = Promise.withResolvers<Generation>();
+  private runtime?: Runtime;
+  /**
+   * The runner is being replaced (another repository cache): retiring it waits for the work still executing in it, so
+   * requests that arrive meanwhile are told at once that it is restarting rather than queued behind that work.
+   */
+  private restarting = false;
+  /** Runtime requests still executing, including those already answered as timed out: the runtime closes after them. */
+  private readonly executing = new Set<Promise<void>>();
+  /**
+   * How the host runs its sessions, as its owner and admins set it in Pistead: asked for at every connection, and again
+   * within a minute of each change for every command and push. Without an answer (a control plane that predates it), the
+   * defaults.
+   */
+  private readonly hostConfig = new HostConfigSource(async () => (await this.callback(await this.connection(), "/api/connectors/self/config", {}, HOST_CONFIG_LIMIT) as { config?: unknown } | undefined)?.config);
+  private lastReason?: string;
   private loop?: Promise<void>;
   private starting?: Promise<void>;
   private stopping?: Promise<void>;
@@ -362,7 +411,7 @@ export class LocalConnector {
     this.directory = await privateDirectory(this.options.dataDir);
     this.releaseLease = await (this.options.acquireLease ?? acquireRunnerLease)(this.directory, () => {
       this.lifetime.abort();
-      this.disconnect(this.generation);
+      this.disconnect(this.generation, "Runner lease lost");
       void this.stop().catch(() => {});
     });
     this.lifetime.signal.throwIfAborted();
@@ -386,9 +435,14 @@ export class LocalConnector {
     void this.loop.catch(() => { this.readiness.reject(new Error("Connector stopped before becoming ready")); });
   }
 
-  private disconnect(generation?: Generation): void {
+  private disconnect(generation?: Generation, reason = "Connection ended"): void {
     if (!generation || generation.abort.signal.aborted) return;
+    generation.reason ??= reason;
     generation.abort.abort();
+    if (this.welcomed === generation) {
+      this.welcomed = undefined;
+      this.online = Promise.withResolvers<Generation>();
+    }
     for (const waiting of generation.waiting) waiting.reject(new Error("Connector connection lost"));
     generation.waiting.clear();
     generation.welcome.reject(new Error("Connector connection lost"));
@@ -400,10 +454,11 @@ export class LocalConnector {
   private async connectLoop(): Promise<void> {
     let failures = 0;
     while (!this.lifetime.signal.aborted) {
+      this.lastReason = undefined;
       try { await this.connectOnce(); failures = 0; }
       catch { failures++; }
       if (this.lifetime.signal.aborted) break;
-      this.options.onStatus?.("disconnected");
+      this.options.onStatus?.("disconnected", this.lastReason);
       const wait = this.options.reconnectDelayMs ?? Math.min(30_000, 500 * 2 ** Math.min(failures, 6)) + Math.floor(Math.random() * 250);
       try { await delay(wait, undefined, { signal: this.lifetime.signal }); } catch { break; }
     }
@@ -415,31 +470,39 @@ export class LocalConnector {
     const url = new URL("/api/connectors/socket", state.controlPlaneUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = (this.options.createSocket ?? defaultSocket)(url.href, ["opencara-pi-v1", `bearer.${state.token}`]);
-    const generation: Generation = { socket, abort: new AbortController(), done: Promise.withResolvers<void>(), welcome: Promise.withResolvers<string>(), active: new Set(), tail: Promise.resolve(), waiting: new Set(), incomingBytes: 0, responsesReserved: 0, runtimeReady: Promise.withResolvers<void>() };
+    const generation: Generation = { socket, abort: new AbortController(), done: Promise.withResolvers<void>(), welcome: Promise.withResolvers<string>(), active: new Set(), tail: Promise.resolve(), waiting: new Set(), incomingBytes: 0, runtimeReady: Promise.withResolvers<void>() };
     void generation.runtimeReady.promise.catch(() => {});
     this.generation = generation;
-    const timeout = setTimeout(() => this.disconnect(generation), 15_000);
+    const timeout = setTimeout(() => this.disconnect(generation, "Relay did not welcome the connection within 15s"), 15_000);
     let lastPong = Date.now();
     const heartbeat = setInterval(() => {
-      if (Date.now() - lastPong > 65_000) return this.disconnect(generation);
-      if (socket.readyState === 1 && generation.incomingBytes + generation.responsesReserved + socket.bufferedAmount + 4 <= connectorLimits.bufferedBytes) {
-        try { socket.send("ping"); } catch { this.disconnect(generation); }
+      if (Date.now() - lastPong > 65_000) return this.disconnect(generation, "No pong from the relay for 65s");
+      // Skipped while output is backed up: a ping would only queue behind it.
+      if (socket.readyState === 1 && socket.bufferedAmount + 4 <= connectorLimits.bufferedBytes) {
+        try { socket.send("ping"); } catch { this.disconnect(generation, "Ping could not be sent"); }
       }
     }, 20_000);
-    socket.addEventListener("error", () => this.disconnect(generation));
-    socket.addEventListener("close", () => this.disconnect(generation));
+    socket.addEventListener("error", () => this.disconnect(generation, "Socket error"));
+    socket.addEventListener("close", event => {
+      const { code, reason } = event as Partial<CloseEvent>;
+      // The relay's close reason is short fixed text (connector-hub.ts); keep it to one bounded line.
+      const detail = typeof reason === "string" ? reason.replace(/[^\x20-\x7e]/g, "").slice(0, 120) : "";
+      this.disconnect(generation, `Relay closed the connection${typeof code === "number" ? ` (${code}${detail ? ` ${detail}` : ""})` : ""}`);
+    });
     socket.addEventListener("message", event => {
       if (generation.abort.signal.aborted) return;
       const data: unknown = "data" in event ? event.data : undefined;
       if (data === "pong") { lastPong = Date.now(); return; }
-      if (typeof data !== "string" || encoder.encode(data).length > connectorLimits.frameBytes) return this.disconnect(generation);
+      if (typeof data !== "string" || encoder.encode(data).length > connectorLimits.frameBytes) return this.disconnect(generation, "Invalid relay frame");
       let value: unknown;
-      try { value = JSON.parse(data); } catch { return this.disconnect(generation); }
+      try { value = JSON.parse(data); } catch { return this.disconnect(generation, "Invalid relay frame"); }
       if (!generation.connectionToken) {
         const welcome = welcomeSchema.safeParse(value);
         if (!welcome.success || welcome.data.connectorId !== state.connectorId
-          || socket.protocol !== "opencara-pi-v1") return this.disconnect(generation);
+          || socket.protocol !== "opencara-pi-v1") return this.disconnect(generation, "Invalid relay welcome");
         generation.connectionToken = welcome.data.connectionToken;
+        this.welcomed = generation;
+        this.online.resolve(generation);
         generation.welcome.resolve(welcome.data.connectionToken);
         return;
       }
@@ -448,135 +511,220 @@ export class LocalConnector {
     try {
       await generation.welcome.promise;
       clearTimeout(timeout);
-      // How the host runs its sessions, as its owner and admins set it in Pistead: asked for now, for the repository cache
-      // this connection keeps, and again within a minute of each change for every command and push. Without an answer
-      // (a control plane that predates it), the defaults.
-      const hostConfig = new HostConfigSource(async () => (await this.callback(generation, "/api/connectors/self/config", {}) as { config?: unknown } | undefined)?.config);
-      const configured = await hostConfig.current();
+      // Asked again at every connection, before requests run: the host's configuration may have changed while it was away.
+      const { config: configured, answered } = await this.hostConfig.refresh();
       this.requireGeneration(generation);
-      // The macOS and Windows sandboxes keep no host repository cache (their sessions can't mount its mirrors).
-      const repositoryCache = configured.repositoryCache === "off" || this.options.sandboxBackend ? undefined : this.repositoryCacheFor(configured.repositoryCache);
-      const config: RunnerConfig = {
-        dataDir: join(this.directory, "runner"), controlPlaneUrl: state.controlPlaneUrl,
-        sharedSecret: this.secret, connectorId: state.connectorId,
-        allowFaux: this.options.allowFaux === true, allowTestShell: this.options.allowTestShell === true,
-        resources: this.options.resources, unsandboxed: this.options.unsandboxed === true,
-        ...(this.options.sandboxBackend && !this.options.unsandboxed ? { sandboxBackend: this.options.sandboxBackend } : {}),
-        resolveModels: model => { this.requireGeneration(generation); return this.options.localModels.resolve(model); },
-        compaction: this.options.localModels.compaction, identity: this.options.localModels.identity,
-        authorize: request => this.authorize(generation, request),
-        reportActivity: (sessionId, activity) => this.reportActivity(generation, sessionId, activity),
-        githubComment: async request => {
-          const payload = {
-            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
-            repository: request.repository, issue: request.issue, body: request.body,
-          };
-          return z.object({
-            id: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
-          }).strict().parse(await this.callback(generation, "/api/connectors/self/github/comment", payload));
-        },
-        // Reads and merges pass the control plane's refusal on (a repository not pinned, GitHub's reason not to merge).
-        githubRead: async request => {
-          const payload = { sessionId: request.sessionId, actorId: request.actorId, admissionId: request.admissionId, callId: request.callId, repository: request.repository, issue: request.issue };
-          const view = await this.brokerCallback(generation, "/api/connectors/self/github/read", payload, GITHUB_READ_LIMIT);
-          z.looseObject({ repository: z.string(), number: z.number().int().positive(), title: z.string(), comments: z.array(z.unknown()) }).parse(view);
-          return view as GitHubIssueView;
-        },
-        githubMerge: async request => {
-          const payload = {
-            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
-            repository: request.repository, pull: request.pull, sha: request.sha, method: request.method,
-          };
-          return z.object({
-            sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
-          }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/merge", payload));
-        },
-        // Like merges, an issue GitHub refused comes back with its reason.
-        githubIssue: async request => {
-          const payload = {
-            sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
-            repository: request.repository, title: request.title, body: request.body,
-          };
-          return z.object({
-            number: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+$/),
-          }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/github/issue", payload));
-        },
-        // Minting can take several upstream calls, so push callbacks get the full RPC budget.
-        pushCredential: async request => {
-          const payload = {
-            sessionId: request.sessionId, approvalId: request.approvalId, actorId: request.actorId, operation: request.operation,
-            ...(request.capability !== undefined ? { capability: request.capability } : {}),
-            ...(request.admissionId !== undefined ? { admissionId: request.admissionId } : {}),
-          };
-          const issued = {
-            credentialId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), remote: z.string().max(2048).regex(/^https:\/\/[^/@\s]+\/\S*$/), expiresAt: z.string().datetime(),
-          };
-          return z.union([
-            z.object({ ...issued, authorization: z.string().regex(/^(Basic|Bearer) [A-Za-z0-9+/=._~-]{1,8000}$/) }).strict(),
-            // Push access with the host's own Git credentials: the session reads them here, so none comes from the control plane.
-            z.object({ ...issued, hostCredentials: z.literal(true) }).strict(),
-          ]).parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/credential", payload));
-        },
-        hostConfig: () => hostConfig.current(),
-        // Only while the host's owner has them on in Pistead; the control plane checks that too before it names them.
-        hostGitCredential: async (remote: string, signal?: AbortSignal) => {
-          if (!(await hostConfig.current()).gitCredentials) throw new HostCredentialError("This host's owner hasn't turned on its Git credentials in Pistead (Settings → Hosts → the host → Configuration)");
-          return hostGitAuthorization(remote, { signal });
-        },
-        pushComplete: async request => {
-          const payload = {
-            sessionId: request.sessionId, approvalId: request.approvalId, credentialId: request.credentialId, outcome: request.outcome,
-            ...(request.tip !== undefined ? { tip: request.tip } : {}),
-          };
-          return z.object({
-            pullRequest: z.object({
-              url: z.string().max(2048).regex(/^https:\/\/\S+$/), number: z.number().int().positive(), created: z.boolean(),
-            }).strict().optional(),
-          }).strict().parse(await this.brokerCallback(generation, "/api/connectors/self/git/push/complete", payload));
-        },
-        egressGrant: async sessionId => parseEgressGrant(await this.brokerCallback(generation, "/api/connectors/self/network", { sessionId })),
-        // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget. A push
-        // outlives a replaced connection: once its pack is under way, the forge's answer must reach Git.
-        gitRelay: async (sessionId, request) => {
-          this.requireGeneration(generation);
-          const push = request.service === "receive-pack";
-          const response = await relayGitRequest(this.options.fetch ?? fetch, `${this.state!.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
-            { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken! }, request,
-            AbortSignal.any([...(push ? [] : [generation.abort.signal]), this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
-          // Like every callback, an answer to a connection that has since been replaced is not used, except a push's: the
-          // forge has taken it by then, and Git must hear how it went.
-          if (push) return response;
-          try { this.requireGeneration(generation); }
-          catch (error) { await response.body?.cancel(); throw error; }
-          return response;
-        },
-        readBackup: (restore, target) => this.readBackup(generation, restore, target),
-        ...(repositoryCache ? { repositoryCache } : {}),
-      };
-      generation.runtime = await (this.options.runtimeFactory ?? defaultRuntime)(config);
+      // Only a configuration the control plane gave replaces the runner: a fallback (it didn't answer) keeps its cache.
+      const runtime = await this.ensureRuntime(generation, answered || !this.runtime ? configured.repositoryCache : this.runtime.repositoryCache);
       this.requireGeneration(generation);
-      const advertised = capabilities(this.options.capabilities, { unsandboxed: this.options.unsandboxed, repositoryCache: repositoryCache !== undefined, gpu: this.gpu });
+      const advertised = capabilities(this.options.capabilities, { unsandboxed: this.options.unsandboxed, repositoryCache: runtime.repositoryCache !== "off", gpu: this.gpu });
       await this.callback(generation, "/api/connectors/self/manifest", { models: await connectorManifest(this.options.localModels, this.options.allowFaux), capabilities: withHostToolCapabilities(advertised) });
       this.requireGeneration(generation);
       generation.runtimeReady.resolve();
       this.options.onStatus?.("connected");
       this.readiness.resolve();
+      // Once per runner, connected: what was at work when the runner last stopped goes on without anyone opening it.
+      if (!runtime.resumed) {
+        runtime.resumed = true;
+        void runtime.value.resume?.().catch(() => {});
+      }
       await generation.done.promise;
+    } catch (error) {
+      // A callback, the runtime or the manifest failed before or while connecting.
+      this.disconnect(generation, "Connection setup failed");
+      throw error;
     } finally {
       clearTimeout(timeout);
       clearInterval(heartbeat);
       this.disconnect(generation);
-      // Retire the old harness before a new generation can open the same SQLite files.
+      this.lastReason = generation.reason;
+      // The next connection takes requests once this one's are answered or out of time, so they keep arrival order. The
+      // runner stays open: its sessions' work carries on across the reconnect.
       await Promise.allSettled([...generation.active]);
-      try { await generation.runtime?.close(); }
-      catch {
-        // An uncertain SQLite/runtime shutdown cannot safely be reopened.
-        this.lifetime.abort();
-        this.readiness.reject(new Error("Connector runtime could not be safely retired"));
-        throw new Error("Connector runtime could not be safely retired");
-      }
       if (this.generation === generation) this.generation = undefined;
     }
+  }
+
+  /** The runner for `repositoryCache`, started on the first connection and kept for later ones. */
+  private async ensureRuntime(generation: Generation, repositoryCache: RepositoryCacheMode): Promise<Runtime> {
+    // Another cache means other mounts for every session: as when it was chosen per connection, a new runner opens them.
+    const replacing = this.runtime !== undefined && this.runtime.repositoryCache !== repositoryCache;
+    if (replacing) {
+      this.restarting = true;
+      // Requests that arrived before this, while the configuration was still being asked for, are told so too.
+      for (const waiting of generation.waiting) waiting.resolve("restarting");
+    }
+    try {
+      if (replacing) await this.retireRuntime();
+      if (!this.runtime) {
+        // The macOS and Windows sandboxes keep no host repository cache (their sessions can't mount its mirrors).
+        const cache = repositoryCache === "off" || this.options.sandboxBackend ? undefined : this.repositoryCacheFor(repositoryCache);
+        this.runtime = { value: await (this.options.runtimeFactory ?? defaultRuntime)(this.runnerConfig(cache)), repositoryCache, resumed: false };
+      }
+      return this.runtime;
+    } finally {
+      if (replacing) this.restarting = false;
+    }
+  }
+
+  /** Closes the runner once the requests executing in it are done. A failed close leaves SQLite unsafe to reopen. */
+  private async retireRuntime(): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    this.runtime = undefined;
+    await Promise.allSettled([...this.executing]);
+    try { await runtime.value.close(); }
+    catch {
+      this.lifetime.abort();
+      this.readiness.reject(new Error("Connector runtime could not be safely retired"));
+      throw new Error("Connector runtime could not be safely retired");
+    }
+  }
+
+  /**
+   * The connection a callback goes over: the current one, or the next while the host reconnects, for up to
+   * RECONNECT_WAIT. A callback stays with the connection it started on (see requireGeneration): one that connection
+   * outlived fails, as before, and the next callback goes over the new one.
+   */
+  private async connection(): Promise<Generation> {
+    const deadline = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(RECONNECT_WAIT)]);
+    for (;;) {
+      const current = this.welcomed;
+      if (current && !current.abort.signal.aborted) return current;
+      if (deadline.aborted) throw new Error("Connector is not connected");
+      const online = this.online.promise;
+      await new Promise<void>(resolve => {
+        const done = () => { deadline.removeEventListener("abort", done); resolve(); };
+        deadline.addEventListener("abort", done, { once: true });
+        void online.then(done);
+      });
+    }
+  }
+
+  private runnerConfig(repositoryCache: RepositoryCache | undefined): RunnerConfig {
+    const state = this.state!;
+    const hostConfig = this.hostConfig;
+    return {
+      dataDir: join(this.directory, "runner"), controlPlaneUrl: state.controlPlaneUrl,
+      sharedSecret: this.secret, connectorId: state.connectorId,
+      allowFaux: this.options.allowFaux === true, allowTestShell: this.options.allowTestShell === true,
+      resources: this.options.resources, unsandboxed: this.options.unsandboxed === true,
+      ...(this.options.sandboxBackend && !this.options.unsandboxed ? { sandboxBackend: this.options.sandboxBackend } : {}),
+      resolveModels: model => {
+        if (this.lifetime.signal.aborted) throw new Error("Connector has stopped");
+        return this.options.localModels.resolve(model);
+      },
+      compaction: this.options.localModels.compaction, identity: this.options.localModels.identity,
+      authorize: async request => this.authorize(await this.connection(), request),
+      reportActivity: async (sessionId, activity) => this.reportActivity(await this.connection(), sessionId, activity),
+      reportBranches: async (sessionId, branches) => this.reportBranches(await this.connection(), sessionId, branches),
+      githubComment: async request => {
+        const payload = {
+          sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
+          repository: request.repository, issue: request.issue, body: request.body,
+        };
+        return z.object({
+          id: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
+        }).strict().parse(await this.callback(await this.connection(), "/api/connectors/self/github/comment", payload));
+      },
+      // Reads and merges pass the control plane's refusal on (a repository not pinned, GitHub's reason not to merge).
+      githubRead: async request => {
+        const payload = { sessionId: request.sessionId, actorId: request.actorId, admissionId: request.admissionId, callId: request.callId, repository: request.repository, issue: request.issue };
+        const view = await this.brokerCallback(await this.connection(), "/api/connectors/self/github/read", payload, GITHUB_READ_LIMIT);
+        z.looseObject({ repository: z.string(), number: z.number().int().positive(), title: z.string(), comments: z.array(z.unknown()) }).parse(view);
+        return view as GitHubIssueView;
+      },
+      githubMerge: async request => {
+        const payload = {
+          sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
+          repository: request.repository, pull: request.pull, sha: request.sha, method: request.method,
+        };
+        return z.object({
+          sha: z.string().regex(/^[0-9a-f]{40}$/), url: z.string().max(2048).regex(/^https:\/\/github\.com\//),
+        }).strict().parse(await this.brokerCallback(await this.connection(), "/api/connectors/self/github/merge", payload));
+      },
+      // Like merges, an issue GitHub refused comes back with its reason.
+      githubIssue: async request => {
+        const payload = {
+          sessionId: request.sessionId, actorId: request.actorId, approvalId: request.approvalId, ...effectAuthority(request),
+          repository: request.repository, title: request.title, body: request.body,
+        };
+        return z.object({
+          number: z.number().int().positive(), url: z.string().max(2048).regex(/^https:\/\/github\.com\/[^/]+\/[^/]+\/issues\/\d+$/),
+        }).strict().parse(await this.brokerCallback(await this.connection(), "/api/connectors/self/github/issue", payload));
+      },
+      // The control plane's refusal (not the owner's message, an invalid cron expression) comes back with its reason.
+      schedules: async request => {
+        const result = await this.brokerCallback(await this.connection(), "/api/connectors/self/schedules", request, SCHEDULES_LIMIT);
+        z.union([z.looseObject({ schedules: z.array(z.looseObject({ id: z.string() })) }), z.looseObject({ schedule: z.looseObject({ id: z.string() }) }),
+          z.object({ deleted: z.string() }).strict()]).parse(result);
+        return result as ScheduleToolResult;
+      },
+      // Like schedules, the control plane's refusal (no access there, a loop, the hop limit) comes back with its reason.
+      crossSessions: async request => {
+        const result = await this.brokerCallback(await this.connection(), "/api/connectors/self/sessions", request, SESSIONS_LIMIT);
+        z.union([z.looseObject({ sessions: z.array(z.looseObject({ id: z.string() })), models: z.array(z.unknown()) }),
+          z.looseObject({ session: z.looseObject({ id: z.string() }) }), z.looseObject({ message: z.looseObject({ id: z.string() }) }),
+          z.object({ stopped: z.number().int().nonnegative() }).strict(), z.object({ archived: z.string() }).strict(),
+          z.object({ consent: z.literal("audience"), target: z.string().max(8192), reason: z.string().max(1024) }).strict()]).parse(result);
+        return result as SessionsToolResult;
+      },
+      // Minting can take several upstream calls, so push callbacks get the full RPC budget.
+      pushCredential: async request => {
+        const payload = {
+          sessionId: request.sessionId, approvalId: request.approvalId, actorId: request.actorId, operation: request.operation,
+          ...(request.capability !== undefined ? { capability: request.capability } : {}),
+          ...(request.admissionId !== undefined ? { admissionId: request.admissionId } : {}),
+        };
+        const issued = {
+          credentialId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/), remote: z.string().max(2048).regex(/^https:\/\/[^/@\s]+\/\S*$/), expiresAt: z.string().datetime(),
+        };
+        return z.union([
+          z.object({ ...issued, authorization: z.string().regex(/^(Basic|Bearer) [A-Za-z0-9+/=._~-]{1,8000}$/) }).strict(),
+          // Push access with the host's own Git credentials: the session reads them here, so none comes from the control plane.
+          z.object({ ...issued, hostCredentials: z.literal(true) }).strict(),
+        ]).parse(await this.brokerCallback(await this.connection(), "/api/connectors/self/git/push/credential", payload));
+      },
+      hostConfig: () => hostConfig.current(),
+      // Only while the host's owner has them on in Pistead; the control plane checks that too before it names them.
+      hostGitCredential: async (remote: string, signal?: AbortSignal) => {
+        if (!(await hostConfig.current()).gitCredentials) throw new HostCredentialError("This host's owner hasn't turned on its Git credentials in Pistead (Settings → Hosts → the host → Configuration)");
+        return hostGitAuthorization(remote, { signal });
+      },
+      pushComplete: async request => {
+        const payload = {
+          sessionId: request.sessionId, approvalId: request.approvalId, credentialId: request.credentialId, outcome: request.outcome,
+          ...(request.tip !== undefined ? { tip: request.tip } : {}),
+        };
+        return z.object({
+          pullRequest: z.object({
+            url: z.string().max(2048).regex(/^https:\/\/\S+$/), number: z.number().int().positive(), created: z.boolean(),
+          }).strict().optional(),
+        }).strict().parse(await this.brokerCallback(await this.connection(), "/api/connectors/self/git/push/complete", payload));
+      },
+      egressGrant: async sessionId => parseEgressGrant(await this.brokerCallback(await this.connection(), "/api/connectors/self/network", { sessionId })),
+      // A credential for one Git request, which the session's proxy then makes at the forge itself (DirectGit), or the
+      // control plane's word to relay it.
+      gitDirect: async (sessionId, request) => this.brokerCallback(await this.connection(), "/api/connectors/self/git/direct", { sessionId, ...request }),
+      // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget. A push
+      // outlives a replaced connection: once its pack is under way, the forge's answer must reach Git.
+      gitRelay: async (sessionId, request) => {
+        const generation = await this.connection();
+        this.requireGeneration(generation);
+        const push = request.service === "receive-pack";
+        const response = await relayGitRequest(this.options.fetch ?? fetch, `${state.controlPlaneUrl}${relayPath("/api/connectors/self", sessionId, request)}`,
+          { authorization: `Bearer ${state.token}`, "x-connection-token": generation.connectionToken! }, request,
+          AbortSignal.any([...(push ? [] : [generation.abort.signal]), this.lifetime.signal, AbortSignal.timeout(60 * 60 * 1000)]));
+        // Like every callback, an answer to a connection that has since been replaced is not used, except a push's: the
+        // forge has taken it by then, and Git must hear how it went.
+        if (push) return response;
+        try { this.requireGeneration(generation); }
+        catch (error) { await response.body?.cancel(); throw error; }
+        return response;
+      },
+      readBackup: async (restore, target) => this.readBackup(await this.connection(), restore, target),
+      ...(repositoryCache ? { repositoryCache } : {}),
+    };
   }
 
   /** The cache of `scope`, beside the runner's session storage in the same private state directory; it keeps its own locks. */
@@ -608,9 +756,9 @@ export class LocalConnector {
     return response;
   }
 
-  private async callback(generation: Generation, path: string, body: unknown): Promise<unknown> {
+  private async callback(generation: Generation, path: string, body: unknown, limit = CALLBACK_LIMIT): Promise<unknown> {
     const response = await this.callbackResponse(generation, path, body);
-    const bytes = await boundedBody(response, CALLBACK_LIMIT, AbortSignal.any([generation.abort.signal, AbortSignal.timeout(15_000)]));
+    const bytes = await boundedBody(response, limit, AbortSignal.any([generation.abort.signal, AbortSignal.timeout(15_000)]));
     this.requireGeneration(generation);
     return bytes.length ? decodeJson(bytes) : undefined;
   }
@@ -639,9 +787,11 @@ export class LocalConnector {
   }
 
   private async authorize(generation: Generation, request: AuthorizationRequest): Promise<AuthorizationResult> {
-    const payload = { sessionId: request.sessionId, actorId: request.actorId, ownerId: request.ownerId, permission: request.permission, ...(request.host ? { host: true } : {}) };
+    const payload = { sessionId: request.sessionId, actorId: request.actorId, ownerId: request.ownerId, permission: request.permission, ...(request.host ? { host: true } : {}),
+      ...(request.host && request.hostSessions ? { hostSessions: true } : {}) };
     const result = z.object({
       allowed: z.boolean(), ownerId: actorSchema, policyVersion: z.number().int().positive(), hostCommands: z.enum(["approve", "auto"]).optional(),
+      hostSessions: z.literal(true).optional(),
     }).strict().parse(await this.callback(generation, "/api/connectors/self/authorize", payload));
     if (result.ownerId !== request.ownerId) throw new Error("Invalid authorization response");
     return result;
@@ -666,6 +816,25 @@ export class LocalConnector {
     if (!response.ok && (response.status >= 500 || response.status === 408 || response.status === 429)) throw new Error("Activity report unavailable");
   }
 
+  /**
+   * Tells the control plane which branches a session on this host has checked out (clone-branches.ts). A refusal is
+   * final, as for activity: a control plane that predates these reports refuses them all. Anything else throws, so the
+   * session reports again.
+   */
+  private async reportBranches(generation: Generation, sessionId: string, branches: SessionBranch[]): Promise<void> {
+    if (!IDENTIFIER.test(sessionId) || branches.length > MAX_CLONE_BRANCHES) throw new Error("Invalid branch report");
+    this.requireGeneration(generation);
+    const signal = AbortSignal.any([generation.abort.signal, this.lifetime.signal, AbortSignal.timeout(15_000)]);
+    const response = await (this.options.fetch ?? fetch)(`${this.state!.controlPlaneUrl}/api/connectors/self/branches`, {
+      method: "POST", redirect: "error", credentials: "omit",
+      headers: { authorization: `Bearer ${this.state!.token}`, "x-connection-token": generation.connectionToken!, "content-type": "application/json" },
+      body: JSON.stringify({ sessionId, branches: branches.map(({ repository, branch }) => ({ repository, branch })) }), signal,
+    });
+    await response.body?.cancel();
+    this.requireGeneration(generation);
+    if (!response.ok && (response.status >= 500 || response.status === 408 || response.status === 429)) throw new Error("Branch report unavailable");
+  }
+
   private async readBackup(generation: Generation, restore: RestoreDescriptor, targetSessionId: string): Promise<Uint8Array> {
     const ids = [restore.id, restore.sourceSessionId, restore.backupId, targetSessionId];
     if (ids.some(id => typeof id !== "string" || !IDENTIFIER.test(id))
@@ -683,73 +852,141 @@ export class LocalConnector {
   }
 
   private dispatch(generation: Generation, value: unknown, frameSize: number): void {
-    if (generation.active.size >= connectorLimits.pendingRequests
-      || generation.incomingBytes + generation.responsesReserved + frameSize + generation.socket.bufferedAmount > connectorLimits.bufferedBytes) return this.disconnect(generation);
+    // Only what the relay itself bounds ends the connection here: its pending count and the request bytes it has charged
+    // (connector-hub.ts). This host's own response output is not the relay's to know; requests wait for it in execute().
+    if (generation.active.size >= connectorLimits.pendingRequests) return this.disconnect(generation, "Relay exceeded the pending request limit");
+    if (generation.incomingBytes + frameSize > connectorLimits.bufferedBytes) return this.disconnect(generation, "Relay exceeded the queued request byte limit");
     const parsed = requestSchema.safeParse(value);
-    if (!parsed.success) return this.disconnect(generation);
+    if (!parsed.success) return this.disconnect(generation, "Invalid relay request");
     const rpc = parsed.data;
     const now = Date.now();
     for (const [key, expiry] of this.seen) if (expiry <= now) this.seen.delete(key);
     const keys = [`request:${rpc.id}`, `ticket:${rpc.ticket.jti}`];
-    if (keys.some(key => this.seen.has(key)) || this.seen.size > 8192) return this.disconnect(generation);
+    if (keys.some(key => this.seen.has(key)) || this.seen.size > 8192) return this.disconnect(generation, "Replayed relay request");
     // Claim queued IDs too: reconnect must not turn an admitted ticket into a retry.
     // Bound provisional claims to the 60s ticket lifetime, 5s clock skew and 5s replay grace.
     const replayExpiry = Math.min((rpc.ticket.exp + 5) * 1000, now + 70_000);
     for (const key of keys) this.seen.set(key, replayExpiry);
     generation.incomingBytes += frameSize;
     const previous = generation.tail;
-    const task = this.execute(generation, rpc, previous).catch(() => this.disconnect(generation)).finally(() => {
+    const task = this.execute(generation, rpc, previous).catch((error: unknown) => {
+      // Validation, ordering or a lost generation; runtime failures became error replies instead. Only plain fixed
+      // connector text is shown: a parser's message could quote the request.
+      const message = error instanceof Error && /^[A-Za-z][A-Za-z ]{0,119}$/.test(error.message) ? error.message : "";
+      this.disconnect(generation, message ? `Relay request failed: ${message}` : "Relay request failed");
+    }).finally(() => {
       generation.active.delete(task);
       generation.incomingBytes -= frameSize;
     });
-    generation.tail = task;
+    // Later requests follow every earlier one, including those answered at once (see execute), so they keep arrival order.
+    generation.tail = Promise.all([previous, task]).then(() => {});
     generation.active.add(task);
   }
 
   private async execute(generation: Generation, value: ConnectorRpcRequest, previous: Promise<void>): Promise<void> {
-    const timeout = setTimeout(() => this.disconnect(generation), RPC_TIMEOUT);
-    let reservation = 0;
+    const { rpc, authorization } = await validateRelayRequest(value, this.state!.connectorId, this.secret);
+    this.requireGeneration(generation);
+    // Answered at once, freeing its slot rather than waiting for the runner; requests behind it still wait for every one
+    // before them (see dispatch).
+    if (this.restarting) return this.send(generation, this.restartingFrame(rpc));
+    const interrupt = Promise.withResolvers<"restarting">();
+    generation.waiting.add(interrupt);
+    let woke: "ready" | "restarting";
     try {
-      const { rpc, authorization } = await validateRelayRequest(value, this.state!.connectorId, this.secret);
+      // Validate promptly, but effects and replies follow arrival order.
+      woke = await Promise.race([Promise.all([previous, generation.runtimeReady.promise]).then(() => "ready" as const), interrupt.promise]);
+    } finally {
+      generation.waiting.delete(interrupt);
+    }
+    this.requireGeneration(generation);
+    // Waiting when a runner replacement started: answered as if it had arrived during it, and never run by either runner.
+    if (woke === "restarting") return this.send(generation, this.restartingFrame(rpc));
+    await this.send(generation, await this.answer(generation, rpc, authorization));
+  }
+
+  /**
+   * Sends a reply once socket output has drained to its own size, not to a worst-case reservation. Any reply fits once
+   * output drains (frameBytes < bufferedBytes), and later requests stay queued behind it, so output stays bounded by
+   * bufferedBytes and queued requests by the relay's own budget. An uplink that cannot drain that far in DRAIN_TIMEOUT
+   * is a broken connection, not a slow request, and ends it.
+   */
+  private async send(generation: Generation, { payload, payloadSize }: { payload: string; payloadSize: number }): Promise<void> {
+    const drained = Date.now() + DRAIN_TIMEOUT;
+    while (generation.socket.bufferedAmount + payloadSize > connectorLimits.bufferedBytes) {
+      if (Date.now() >= drained) return this.disconnect(generation, "Socket output did not drain within 30s");
+      await delay(10, undefined, { signal: generation.abort.signal });
       this.requireGeneration(generation);
-      const canceled = Promise.withResolvers<never>();
-      generation.waiting.add(canceled);
-      try {
-        // Validate promptly, but effects and response reservations follow arrival order.
-        await Promise.race([Promise.all([previous, generation.runtimeReady.promise]), canceled.promise]);
-      } finally {
-        generation.waiting.delete(canceled);
-      }
-      this.requireGeneration(generation);
-      while (generation.incomingBytes + connectorLimits.responseBytes + generation.socket.bufferedAmount > connectorLimits.bufferedBytes) {
-        // Incoming frames cannot drain while the FIFO head is blocked.
-        if (generation.incomingBytes + connectorLimits.responseBytes > connectorLimits.bufferedBytes) throw new Error("Relay request backpressure limit");
-        await delay(10, undefined, { signal: generation.abort.signal });
-        this.requireGeneration(generation);
-      }
-      // A ticket validated on arrival may have expired while queued or draining output.
-      if (rpc.ticket.exp * 1000 <= Date.now()) throw new Error("Relay ticket expired while queued");
-      reservation = connectorLimits.responseBytes;
-      generation.responsesReserved += reservation;
-      const response = await generation.runtime!.fetch(new Request(`http://local.invalid${rpc.path}`, {
+    }
+    generation.socket.send(payload);
+  }
+
+  /**
+   * The reply to an admitted request, within its deadline (connectorRequestTimeoutMs), which starts when the request
+   * leaves the queue rather than when it arrived, so time spent behind others doesn't count against it. A request that
+   * misses it, or whose ticket expired while it was queued, is answered as timed out on its own: the connection and
+   * every other session's requests carry on. Its work may still finish in the runner, as an interrupted request's may;
+   * it no longer holds the requests behind it, and the runner closes only once it is done.
+   */
+  private async answer(generation: Generation, rpc: ConnectorRpcRequest, authorization: string): Promise<{ payload: string; payloadSize: number }> {
+    if (rpc.ticket.exp * 1000 <= Date.now()) return this.errorFrame(rpc, 504, "The request waited too long on the host; inspect the session before retrying.");
+    const work = this.reply(generation, rpc, authorization);
+    const executing = work.then(() => {}, () => {});
+    this.executing.add(executing);
+    void executing.finally(() => this.executing.delete(executing));
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<{ payload: string; payloadSize: number }>(resolve => {
+      timer = setTimeout(() => resolve(this.errorFrame(rpc, 504, "The host did not answer in time; inspect the session before retrying.")), connectorRequestTimeoutMs(rpc.ticket.action));
+    });
+    try { return await Promise.race([work, expired]); }
+    finally { clearTimeout(timer); }
+  }
+
+  private restartingFrame(rpc: ConnectorRpcRequest): { payload: string; payloadSize: number } {
+    return this.errorFrame(rpc, 503, "The host's runner is restarting; try again shortly.");
+  }
+
+  /** A reply frame saying why this one request failed, in fixed connector text. */
+  private errorFrame(rpc: ConnectorRpcRequest, status: number, error: string): { payload: string; payloadSize: number } {
+    const payload = JSON.stringify({
+      type: "response", id: rpc.id, status, body: JSON.stringify({ error, code: "connector_reply_error" }),
+    } satisfies ConnectorRpcResponse);
+    return { payload, payloadSize: Buffer.byteLength(payload, "utf8") };
+  }
+
+  /**
+   * The reply frame for an admitted request. What goes wrong with this one request (the runtime failing, a body over
+   * the limit or not UTF-8, a frame too large once escaped) is answered as an error for it, not by ending the connection
+   * and every other request with it. Only a lost connection still throws.
+   */
+  private async reply(generation: Generation, rpc: ConnectorRpcRequest, authorization: string): Promise<{ payload: string; payloadSize: number }> {
+    // Measured without encoding: a reply can be tens of MiB while output is already backed up.
+    const frame = (payload: string) => ({ payload, payloadSize: Buffer.byteLength(payload, "utf8") });
+    const failed = (status: number, error: string) => this.errorFrame(rpc, status, error);
+    const runtime = this.runtime;
+    if (!runtime) return failed(503, "The host's runner is restarting; try again.");
+    let result: ConnectorRpcResponse;
+    try {
+      const response = await runtime.value.fetch(new Request(`http://local.invalid${rpc.path}`, {
         method: rpc.method, headers: { authorization: `Bearer ${authorization}`, "content-type": "application/json" },
         ...(rpc.method === "POST" ? { body: rpc.body } : {}), signal: generation.abort.signal,
       }));
-      const bytes = await boundedBody(response, connectorLimits.responseBytes, generation.abort.signal);
+      let bytes: Uint8Array;
+      try { bytes = await boundedBody(response, connectorLimits.responseBytes, generation.abort.signal); }
+      catch (error) {
+        this.requireGeneration(generation);
+        if (error instanceof Error && error.message === "Response exceeds connector limit") return failed(502, "The host's reply is too large to relay.");
+        throw error;
+      }
+      result = { type: "response", id: rpc.id, status: response.status, body: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    } catch {
       this.requireGeneration(generation);
-      const result: ConnectorRpcResponse = { type: "response", id: rpc.id, status: response.status, body: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
-      const payload = JSON.stringify(result);
-      const payloadSize = encoder.encode(payload).length;
-      if (payloadSize > connectorLimits.frameBytes
-        || generation.incomingBytes + generation.socket.bufferedAmount + payloadSize > connectorLimits.bufferedBytes) throw new Error("Relay response backpressure limit");
-      // Transfer the executing reservation to the socket's actual output charge.
-      generation.responsesReserved -= reservation;
-      reservation = 0;
-      generation.socket.send(payload);
-    } finally {
-      generation.responsesReserved -= reservation;
-      clearTimeout(timeout);
+      return failed(502, "The host could not complete the request.");
     }
+    this.requireGeneration(generation);
+    const reply = frame(JSON.stringify(result));
+    // Escaping can make a body under responseBytes a frame over frameBytes.
+    if (reply.payloadSize > connectorLimits.frameBytes) return failed(502, "The host's reply is too large to relay.");
+    return reply;
   }
 
   stop(): Promise<void> {
@@ -761,8 +998,12 @@ export class LocalConnector {
     this.lifetime.abort();
     this.disconnect(this.generation);
     this.readiness.reject(new Error("Connector stopped before becoming ready"));
-    try { await this.starting?.catch(() => {}); await this.loop; }
-    finally { await this.releaseLease?.(); this.releaseLease = undefined; this.options.onStatus?.("stopped"); }
+    try {
+      await this.starting?.catch(() => {});
+      await this.loop;
+      // The runner outlives connections, so it closes once the last one is done, after the requests still executing.
+      await this.retireRuntime().catch(() => {});
+    } finally { await this.releaseLease?.(); this.releaseLease = undefined; this.options.onStatus?.("stopped"); }
   }
 }
 
@@ -784,7 +1025,7 @@ async function defaultRuntime(config: RunnerConfig): Promise<ConnectorRuntime> {
   const service = new RunnerService(config);
   await service.initialize();
   const app = createRunnerApp(service);
-  return { fetch: request => app.fetch(request), close: () => service.close() };
+  return { fetch: request => app.fetch(request), close: () => service.close(), resume: () => service.resume() };
 }
 
 export function createConnector(options: ConnectorOptions): LocalConnector { return new LocalConnector(options); }

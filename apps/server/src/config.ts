@@ -4,7 +4,6 @@ import { ConnectorHubRegistry } from './connector-hub.js';
 import { openDatabase } from './db/index.js';
 import { openStorage } from './storage/index.js';
 import type { Env } from './types.js';
-import { PostgresWorkspaceDatabases } from './workspace-databases/postgres.js';
 
 export interface ServerConfig {
   env: Env;
@@ -31,8 +30,10 @@ export const defaultDatabaseUrl = 'sqlite:///data/pistead.sqlite';
 const stringVars = [
   'APP_ORIGIN', 'RUNNER_URL', 'RUNNER_EVENT_TRANSPORT', 'RUNNER_SHARED_SECRET', 'SESSION_SECRET', 'VAULT_KEY',
   'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'TEST_AUTH_ENABLED', 'TEST_AUTH_SECRET', 'TEST_AUTH_EXPIRES_AT',
-  'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS',
+  'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS', 'GIT_DIRECT',
+  'LOCAL_MODE', 'LOCAL_CLAIM_SECRET',
 ] as const;
+const LOOPBACK = ['127.0.0.1', '::1', 'localhost'];
 
 /**
  * Builds `Env` from process environment variables: opens the database named by `DATABASE_URL` and, only when it is set,
@@ -59,6 +60,16 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   if (env.ADMIN_USER_IDS && env.ADMIN_USER_IDS.split(',').some(item => !adminUserId(env, item.trim()))) {
     throw new ConfigurationError('ADMIN_USER_IDS must list user IDs such as github:12345, separated by commas.');
   }
+  const listenHost = processEnv.HOST || (env.LOCAL_MODE === 'true' ? '127.0.0.1' : '0.0.0.0');
+  // A local server is reachable from this machine only, and admits only the GitHub account that claimed it.
+  if (env.LOCAL_MODE !== undefined) {
+    if (!['true', 'false'].includes(env.LOCAL_MODE)) throw new ConfigurationError('LOCAL_MODE must be "true" or "false".');
+    if (env.LOCAL_MODE === 'true') {
+      if (!env.LOCAL_CLAIM_SECRET || !/^[A-Za-z0-9_-]{43}$/.test(env.LOCAL_CLAIM_SECRET)) throw new ConfigurationError('LOCAL_MODE needs LOCAL_CLAIM_SECRET, a base64url-encoded random 32-byte value.');
+      if (!LOOPBACK.includes(new URL(env.APP_ORIGIN).hostname.replace(/^\[|\]$/g, ''))) throw new ConfigurationError('LOCAL_MODE needs APP_ORIGIN on this machine, such as http://127.0.0.1:8787.');
+      if (!LOOPBACK.includes(listenHost)) throw new ConfigurationError('LOCAL_MODE listens on loopback only: leave HOST unset or set it to 127.0.0.1.');
+    }
+  }
   const port = Number(processEnv.PORT ?? '8787');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new ConfigurationError('PORT must be a TCP port number.');
   const trustProxyValue = processEnv.TRUST_PROXY ?? 'false';
@@ -73,11 +84,15 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   const storageUrl = processEnv.STORAGE_URL || null;
   if (storageUrl) env.BUCKET = openStorage(storageUrl, processEnv);
   env.DB = await openDatabase(databaseUrl);
-  if (workspaceDatabases) env.WORKSPACE_DATABASES = new PostgresWorkspaceDatabases({ privateHosts: workspaceDatabasePrivateHosts });
+  // Loaded only when enabled, so a server without them (a local one, say) needs no Postgres driver installed.
+  if (workspaceDatabases) {
+    const { PostgresWorkspaceDatabases } = await import('./workspace-databases/postgres.js');
+    env.WORKSPACE_DATABASES = new PostgresWorkspaceDatabases({ privateHosts: workspaceDatabasePrivateHosts });
+  }
   env.CONNECTOR_HUB = new ConnectorHubRegistry(env);
   return {
     env, port, databaseUrl, storageUrl,
-    host: processEnv.HOST || '0.0.0.0',
+    host: listenHost,
     trustProxy: trustProxyValue === 'true',
     staticDir: resolve(processEnv.STATIC_DIR || 'dist/web'),
   };

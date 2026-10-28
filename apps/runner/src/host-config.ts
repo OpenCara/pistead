@@ -15,23 +15,42 @@ const CONFIG_STALE_MS = 5 * 60_000;
 export class HostConfigSource {
   #cached?: { value: HostConfig; at: number };
   #refresh?: Promise<HostConfig>;
+  /**
+   * Set by `refresh` for one attempt: the next caller asks again, whatever the cache's age. Cleared once that attempt
+   * ends either way, so a failed one leaves the cache serving callers for the rest of its time, not asking on each call.
+   */
+  #expired = false;
+  /** Answers the control plane has given, so `refresh` can tell its answer from the cached or default fallback. */
+  #answers = 0;
 
   constructor(private readonly load: () => Promise<unknown>, private readonly options: { ttlMs?: number; staleMs?: number; now?: () => number } = {}) {}
 
   async current(): Promise<HostConfig> {
     const now = this.options.now ?? Date.now;
     const cached = this.#cached;
-    if (cached && now() - cached.at < (this.options.ttlMs ?? CONFIG_TTL_MS)) return cached.value;
+    if (cached && !this.#expired && now() - cached.at < (this.options.ttlMs ?? CONFIG_TTL_MS)) return cached.value;
     this.#refresh ??= this.load().then(value => {
       const config = readHostConfig(value);
       this.#cached = { value: config, at: now() };
+      this.#answers++;
       return config;
-    }).finally(() => { this.#refresh = undefined; });
+    }).finally(() => { this.#refresh = undefined; this.#expired = false; });
     try { return await this.#refresh; }
     catch {
       if (cached && now() - cached.at < (this.options.staleMs ?? CONFIG_STALE_MS)) return cached.value;
       return { ...defaultHostConfig };
     }
+  }
+
+  /**
+   * Asks again now, whatever the cache holds: a new connection may bring a configuration changed while it was away.
+   * `answered` says whether the control plane gave it, rather than it being the cached or default fallback.
+   */
+  async refresh(): Promise<{ config: HostConfig; answered: boolean }> {
+    const answers = this.#answers;
+    this.#expired = true;
+    const config = await this.current();
+    return { config, answered: this.#answers !== answers };
   }
 }
 

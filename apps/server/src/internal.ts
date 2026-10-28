@@ -8,10 +8,12 @@ import { sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, userIdentifier } from './http.js';
 import { requireCallbackScope } from './connectors.js';
 import { githubComment, githubIssue, githubMerge, githubRead } from './github-broker.js';
+import { agentSchedules } from './scheduled-prompts.js';
+import { agentSessions } from './cross-session.js';
 import { legacyRestoreDownload } from './restore-routes.js';
 import { pushComplete, pushCredential } from './push/broker.js';
-import { egressGrant, gitRelay } from './network.js';
-import { hostCommandAuthority } from './host-access.js';
+import { egressGrant, gitDirect, gitRelay } from './network.js';
+import { hostAuthority } from './host-access.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   const configured = c.env.RUNNER_SHARED_SECRET;
@@ -30,11 +32,14 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/github/read', c => githubRead(c, null));
   app.post('/api/internal/github/merge', c => githubMerge(c, null));
   app.post('/api/internal/github/issue', c => githubIssue(c, null));
+  app.post('/api/internal/schedules', c => agentSchedules(c, null));
+  app.post('/api/internal/sessions', c => agentSessions(c, null));
   app.post('/api/internal/git/push/credential', c => pushCredential(c, null));
   app.post('/api/internal/git/push/complete', c => pushComplete(c, null));
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);
   app.post('/api/internal/network', c => egressGrant(c, null));
   app.post('/api/internal/git/relay/:bindingId/:service', c => gitRelay(c, null));
+  app.post('/api/internal/git/direct', c => gitDirect(c, null));
 }
 
 export async function authorizeSession(c: AppContext, connectorId: string | null): Promise<Response> {
@@ -46,10 +51,13 @@ export async function authorizeSession(c: AppContext, connectorId: string | null
     const access = await sessionAccess(c.env, sessionId, actorId);
     if (access) await requireCallbackScope(c, access.row, connectorId);
     if (input.host !== undefined && input.host !== true) fail(400, 'invalid_authorization', 'Invalid authorization request.');
+    if (input.hostSessions !== undefined && (input.hostSessions !== true || input.host !== true)) fail(400, 'invalid_authorization', 'Invalid authorization request.');
     const allowed = !!access && access.row.owner_id === ownerId && access.row.status !== 'archived' && hasPermission(access.permissions, input.permission as Permission);
     const result: AuthorizationResult = { allowed, policyVersion: access?.row.policy_version ?? 0, ownerId: access?.row.owner_id ?? '' };
     // The host's owner holds every level; to the runner, that is `auto`.
-    const host = allowed && input.host === true ? await hostCommandAuthority(c.env, access!.row, actorId) : undefined;
-    if (host) result.hostCommands = host === 'owner' ? 'auto' : host;
+    const host = allowed && input.host === true ? await hostAuthority(c.env, access!.row, actorId) : undefined;
+    if (host) result.hostCommands = host.level === 'owner' ? 'auto' : host.level;
+    // Only to a connector that asks: older ones parse the reply strictly and know no such field.
+    if (host?.sessions && input.hostSessions === true) result.hostSessions = true;
     return c.json(result);
 }

@@ -5,6 +5,7 @@ import { useApp } from "./app-context";
 import { PullRequestTag } from "./pull-request";
 import { href, navigate } from "./router";
 import { sessionStatus } from "../../../packages/client/src/session-status";
+import { nestSessions } from "../../../packages/client/src/session-tree";
 import { Button, EmptyState, Feedback, Field, IdentityBadge, InfoTip, LinkButton, PageLoading, RelativeTime, Row, ScreenHeader, Section, Sheet, StatusDot, useAction } from "./ui";
 import "./new-session.css";
 
@@ -59,13 +60,13 @@ export function SessionsScreen() {
       {!groups.length ? <EmptyState title={!query.trim() && !showArchived ? "All sessions are archived" : "No matching sessions"} /> : groups.map(group => {
         const limit = limits[group.id] ?? PAGE_SIZE;
         return <Section key={group.id} title={<span className="inline"><IdentityBadge name={group.name} id={group.id} />{group.name}</span>}>
-          {group.sessions.slice(0, limit).map(session => {
+          {nestSessions(group.sessions).slice(0, limit).map(({ session, depth }) => {
             const isOwner = session.ownerId === user.id;
             const viewerOnly = !isOwner && session.permissions?.includes("read") && session.permissions.every(permission => permission === "read");
             const status = sessionStatus(session);
             return <Row key={session.id} href={href({ name: "session", sessionId: session.id })} chevron
-              leading={<StatusDot tone={status.tone} label={status.label ? undefined : session.status} />}
-              title={<span className="truncate">{session.title}</span>}
+              leading={<StatusDot tone={status.tone} icon={status.icon} label={status.label ? undefined : session.status} />}
+              title={<span className="truncate">{depth > 0 && <span className="muted" aria-label="Started by the session above">{"  ".repeat(depth - 1)}↳ </span>}{session.title}</span>}
               hint={<>{status.label && <><span className={`session-status ${status.tone}`}>{status.label}</span> · </>}{session.pullRequest && <><PullRequestTag pull={session.pullRequest} /> · </>}{isOwner ? "Yours" : viewerOnly ? "Viewer" : "Shared"} · {session.visibility === "workspace" ? "Workspace-visible" : "Private"} · <RelativeTime value={session.createdAt} /></>} />;
           })}
           {group.sessions.length > limit && <div className="sessions-more"><Button variant="ghost" size="sm" block onClick={() => setLimits(current => ({ ...current, [group.id]: limit + PAGE_SIZE }))}>Load more</Button></div>}

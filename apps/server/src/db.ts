@@ -61,7 +61,9 @@ export function successorBranch(row: Pick<SessionRow, 'id' | 'title' | 'reposito
 }
 
 export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRecord {
-  const pullRequest = sessionPullRequest(row.pull_request_url, row.pull_request_state);
+  // A session pushes through Pistead or, on a host, with the host's own Git (session-branches.ts); a push's comes first.
+  const pullRequest = row.pull_request_url ? sessionPullRequest(row.pull_request_url, row.pull_request_state)
+    : sessionPullRequest(row.branch_pull_request_url, row.branch_pull_request_state);
   return { id: row.id, workspaceId: row.workspace_id, ownerId: row.owner_id, agentVersionId: row.agent_version_id,
     title: row.title, visibility: row.visibility ?? 'private', policyVersion: row.policy_version, status: row.status, createdAt: row.created_at,
     repositories: JSON.parse(row.repositories_json ?? '[]'),
@@ -72,12 +74,17 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     ...(row.connector_id ? { connectorId: row.connector_id, connectorOwnerId: row.connector_owner_id! } : {}),
     ...(grants ? { permissions: grants } : {}),
     ...(row.activity ? { activity: row.activity } : {}),
+    ...(row.next_scheduled_at ? { nextScheduledAt: row.next_scheduled_at } : {}),
+    ...(row.tool_output === 'brief' ? { toolOutput: 'brief' as const } : {}),
+    ...(row.parent_session_id ? { parentSessionId: row.parent_session_id } : {}),
     ...(pullRequest ? { pullRequest } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest'> {
-  // Visibility is live control-plane policy, and activity and the pull request are what the host and pushes report, so
-  // none of them is part of the immutable runner binding.
-  const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, pullRequest: _pullRequest, ...record } = sessionRecord(row);
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest' | 'toolOutput' | 'nextScheduledAt' | 'parentSessionId'> {
+  // Visibility is live control-plane policy, activity and the pull request are what the host and pushes report, tool
+  // output is how the control plane shows the transcript, the next scheduled prompt is the owner's schedule, and the
+  // parent session is how the control plane links sessions, so none of them is part of the immutable runner binding.
+  const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, pullRequest: _pullRequest,
+    toolOutput: _toolOutput, nextScheduledAt: _nextScheduledAt, parentSessionId: _parentSessionId, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {
@@ -101,12 +108,17 @@ type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: W
 
 // Membership, visibility and explicit grants must come from the same policy snapshot. A suspended account opens no
 // session, and nobody opens the sessions it owns, as if it had left the workspace.
-// The newest pull request a push opened or found comes along for session lists and headers, with its last read state.
+// The newest pull request a push opened or found comes along for session lists and headers, with its last read state;
+// for a session on a host, which pushes with the host's own Git, the one found last for a branch it reported.
 const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor.role AS actor_role,
   (SELECT pr.pull_request_url FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
     ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_url,
   (SELECT pr.pull_request_state FROM push_credentials pr WHERE pr.session_id = s.id AND pr.pull_request_url IS NOT NULL
-    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_state FROM sessions s
+    ORDER BY pr.completed_at DESC, pr.created_at DESC, pr.id DESC LIMIT 1) AS pull_request_state,
+  (SELECT b.pull_request_url FROM session_branches b WHERE b.session_id = s.id AND b.pull_request_url IS NOT NULL
+    ORDER BY b.pull_request_found_at DESC, b.repository, b.branch LIMIT 1) AS branch_pull_request_url,
+  (SELECT b.pull_request_state FROM session_branches b WHERE b.session_id = s.id AND b.pull_request_url IS NOT NULL
+    ORDER BY b.pull_request_found_at DESC, b.repository, b.branch LIMIT 1) AS branch_pull_request_state FROM sessions s
   INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?
   INNER JOIN workspace_members owner ON owner.workspace_id = s.workspace_id AND owner.user_id = s.owner_id
   INNER JOIN users actor_user ON actor_user.id = actor.user_id
@@ -137,6 +149,25 @@ export async function sessionAccess(env: Env, sessionId: string, actorId: string
   return accessFromSnapshot(snapshot, actorId);
 }
 
+// The same policy snapshot as SESSION_ACCESS_SQL, for every member of the session's workspace at once.
+const actorJoin = 'INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?';
+if (!SESSION_ACCESS_SQL.includes(actorJoin)) throw new Error('Session access SQL changed: update SESSION_READERS_SQL.');
+const SESSION_READERS_SQL = SESSION_ACCESS_SQL.replace(actorJoin, 'INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id')
+  .replace('SELECT s.*,', 'SELECT s.*, actor.user_id AS reader_id,');
+
+/**
+ * Everyone who can read the session now, by the rules `sessionAccess` applies to each of them (its owner, its
+ * workspace's members where it is shared with the workspace, explicit grants; suspended accounts never). Share links
+ * aren't people: callers that care ask `isLinkShared` too.
+ */
+export async function sessionReaders(env: Env, sessionId: string): Promise<Set<string>> {
+  const snapshots = await env.DB.query<SessionPolicyRow & { reader_id: string }>(`${SESSION_READERS_SQL} AND s.id = ?`)
+    .bind(testMode(env) ? 1 : 0, sessionId).all();
+  const readers = new Set<string>();
+  for (const { reader_id, ...snapshot } of snapshots) if (accessFromSnapshot(snapshot, reader_id)) readers.add(reader_id);
+  return readers;
+}
+
 export async function listSessionAccess(env: Env, actorId: string): Promise<SessionAccess[]> {
   const snapshots = await env.DB.query<SessionPolicyRow>(`${SESSION_ACCESS_SQL}
     AND (s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL)
@@ -162,12 +193,16 @@ export async function requireSession(c: AppContext, sessionId: string, permissio
   const access = await sessionAccess(c.env, sessionId, c.get('auth').userId);
   if (!access) fail(404, 'not_found', 'Session not found.');
   if (!hasPermission(access.permissions, permission)) fail(403, 'forbidden', `Session ${permission} permission is required.`);
-  if (access.row.status === 'archived' && permission !== 'read') fail(409, 'session_archived', 'Session is archived.');
-  if (permission !== 'read' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(sessionId).first()) {
+  if (permission !== 'read') await requireActiveSession(c.env, access.row);
+  return access;
+}
+/** What anything but a read of a session waits for: it isn't archived, being restored into, or moving to another host. */
+export async function requireActiveSession(env: Env, row: Pick<SessionRow, 'id' | 'status'>): Promise<void> {
+  if (row.status === 'archived') fail(409, 'session_archived', 'Session is archived.');
+  if (await env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
-  if (permission !== 'read') await requireNoMigration(c.env, sessionId);
-  return access;
+  await requireNoMigration(env, row.id);
 }
 /**
  * A session moving to another host, and its successor until the move completes, accept nothing but reads.

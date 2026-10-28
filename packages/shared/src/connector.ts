@@ -38,6 +38,13 @@ export interface ConnectorCapabilities {
   github?: boolean;
   /** The connector opens GitHub issues through the control plane once a human approves each (github_issue). Absent on older connectors. */
   githubIssues?: boolean;
+  /** The connector's agents manage their session's scheduled prompts through the control plane (schedule). Absent on older connectors. */
+  schedules?: boolean;
+  /**
+   * The connector's agents list, read, message, start, stop and archive the workspace's other sessions through the
+   * control plane, as the person whose message they work on (sessions; see cross-session.ts). Absent on older connectors.
+   */
+  crossSessions?: boolean;
   /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
    * docs/design/repository-cache.md). Absent on older connectors and on hosts whose cache is off, for this connection.
@@ -83,6 +90,18 @@ export interface ConnectorCapabilities {
    */
   hostGrants?: boolean;
   /**
+   * The connector lets its owner decide the host commands (host_bash) of any session on it they can read, without
+   * approve permission on the session: the command runs as the host's OS user, so deciding it is theirs. Absent on older
+   * connectors, which check approve permission on every decision, so there the owner also needs it.
+   */
+  hostOwnerDecides?: boolean;
+  /**
+   * The connector runs sessions directly on the host for members its owner granted that (HostCommandGrant.hostSessions),
+   * not only for its owner, checking the grant before each of their commands. Absent on older connectors, which run
+   * only their owner's sessions there.
+   */
+  hostSessionGrants?: boolean;
+  /**
    * The connector lists the session worktree's directories and previews its files, read-only, for the session panel's
    * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
    */
@@ -93,6 +112,11 @@ export interface ConnectorCapabilities {
    * connectors, which keep their options.
    */
   hostConfig?: boolean;
+  /**
+   * The connector's sessions summarize long conversations by the compaction token counts set in Pistead
+   * (HostConfig.compaction) over its Pi settings. Absent on older connectors, which follow their Pi settings alone.
+   */
+  compactionConfig?: boolean;
   /** The GPU device this host can lend its sandboxed commands (HostConfig.gpu). Absent when it has none, or runs unsandboxed. */
   gpu?: GpuKind;
 }
@@ -114,6 +138,11 @@ export interface HostCommandGrant {
   /** The member's display name; absent for a workspace-wide grant. */
   userName?: string;
   level: HostCommandLevel;
+  /**
+   * The member may also start their own sessions directly on the host, without the sandbox (SessionRecord.hostEnvironment),
+   * where its configuration accepts those (HostConfig.hostSessions). Absent: they get the sandbox, as before.
+   */
+  hostSessions?: true;
   /** When the grant lapses; null for no expiry. */
   expiresAt: string | null;
   createdBy: string;
@@ -144,8 +173,9 @@ export interface ConnectorInfo {
   /** How the host runs its sessions; listed to its owner and admins. */
   config?: HostConfig;
   /**
-   * Listed to its owner only: sessions they start on it may run directly on the host, without the sandbox (its
-   * configuration accepts them and its connector runs them; see SessionRecord.hostEnvironment).
+   * Sessions the viewer starts on it may run directly on the host, without the sandbox: its configuration accepts them,
+   * its connector runs them, and the viewer owns it or holds a grant in the listed workspace that includes sessions on
+   * the host (see SessionRecord.hostEnvironment). Listed to nobody else.
    */
   hostSessions?: true;
   /**
@@ -213,6 +243,15 @@ export const connectorLimits = {
   pendingRequests: 32,
   models: 200,
 } as const;
+
+/**
+ * How long one relayed request may take, by its ticket's action: a backup or restore moves a whole session, everything
+ * else is a single session operation. The relay and the host apply the same deadline, and missing it ends only that
+ * request, never the connection.
+ */
+export function connectorRequestTimeoutMs(action: string): number {
+  return action === "backup" || action === "restore" ? 90_000 : 30_000;
+}
 
 export interface RestoreDescriptor {
   id: string;

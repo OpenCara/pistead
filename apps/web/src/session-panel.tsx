@@ -11,6 +11,8 @@ import { Icon } from "./icons";
 import { Username, usePeople } from "./people";
 import { RepositoryClonePolicy } from "./repositories";
 import { FilesPanel } from "./session-files";
+import { SchedulesPanel } from "./session-schedules";
+import { ConnectionsSection } from "./session-connections";
 import { href } from "./router";
 import {
   Alert, Button, CardBody, Collapsible, confirmDialog, CopyField, EmptyState, Feedback, Field, LinkButton, Loading, RelativeTime,
@@ -19,7 +21,7 @@ import {
 import { userIdFromInput, usernameWithId, withUsernames, type Person } from "../../../packages/client/src/usernames";
 
 export type AuditEvent = { id: string; actorId: string; action: string; detail: unknown; createdAt: string };
-export type PanelTab = "details" | "approvals" | "files" | "activity";
+export type PanelTab = "details" | "approvals" | "files" | "schedules" | "activity";
 
 /** Session-level mutations reachable from both the header menu and the panel. */
 export interface SessionActions {
@@ -195,6 +197,7 @@ export function SessionPanel(props: PanelProps) {
         { value: "details", label: "Details" },
         { value: "approvals", label: pendingCount ? `Approvals ${pendingCount}` : "Approvals" },
         { value: "files", label: "Files" },
+        { value: "schedules", label: "Schedules" },
         { value: "activity", label: "Activity" },
       ]} />
       <span className="spacer" />
@@ -209,6 +212,7 @@ export function SessionPanel(props: PanelProps) {
         </div>
         : view ? <EmptyState title="No approvals">{AUTO_APPROVED_NOTE}</EmptyState> : <Loading />)}
       {tab === "files" && <FilesPanel session={props.session} />}
+      {tab === "schedules" && <SchedulesPanel key={props.session.id} session={props.session} changed={() => { audit.refresh(); props.refresh(); }} />}
       {tab === "activity" && <Section title="Audit log" action={<Button variant="ghost" size="xs" icon="refresh" aria-label="Refresh activity" title="Refresh" disabled={audit.loading} onClick={audit.refresh} />} bare>
         <ResourceState {...audit} retry={audit.refresh}>
           {!audit.data?.events.length ? <EmptyState title="No activity" /> : <div className="card">
@@ -270,6 +274,7 @@ const permissionNeedText: Record<PermissionNeed, string> = {
   tool: "A tool this agent doesn't include",
   write: "A change in a Read-only message",
   "unbounded-shell": "No resource limits: this host has none set up for commands. The command still runs in the sandbox, offline and for at most the host's command time limit, but with no cap on CPU, memory, processes or disk.",
+  audience: "Sharing another session: this session's readers would see what the agent reads from a session they can't open themselves.",
 };
 /** Tools whose effect gets its own approval card after the permission, unless the message auto-approves. */
 const approvedTools: readonly string[] = ["bash", "git_commit", "git_push", "github_comment", "github_merge", "github_issue", "host_bash", "git_repin"];
@@ -320,12 +325,44 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
     <HostSection session={session} user={user} hosts={hosts} />
     <RepositoriesSection session={session} refresh={refresh} />
     <PeopleSection session={session} user={user} actions={actions} changed={changed} />
+    <TranscriptSection session={session} user={user} changed={changed} />
+    <ConnectionsSection session={session} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
     {isOwner && session.status !== "archived" && !session.frozen && session.connectorId && <MoveHostSection session={session} user={user} hosts={hosts} openSession={openSession} changed={changed} />}
     {canWrite && session.status !== "archived" && !session.frozen && <OperationSection session={session} changed={changed} />}
     {isOwner && <ExportSection session={session} />}
     <AccessSection session={session} view={view} user={user} />
   </div>;
+}
+
+/**
+ * How the transcript shows: the session's own tool output (its owner's choice), and whether its workspace loads
+ * transcripts latest first (the workspace's owners' and admins').
+ */
+function TranscriptSection({ session, user, changed }: { session: SessionRecord; user: UserProfile; changed: () => void }) {
+  const action = useAction();
+  const settings = useResource<{ settings: { paging: boolean } }>(`/api/workspaces/${segment(session.workspaceId)}/transcripts`);
+  const full = session.toolOutput !== "brief";
+  const editable = session.ownerId === user.id && session.status !== "archived";
+  function setFull(next: boolean) {
+    if (!editable || action.busy || next === full) return;
+    void action.run(async () => {
+      await api(`/api/sessions/${segment(session.id)}`, { method: "PATCH", body: { toolOutput: next ? "full" : "brief" } });
+      changed();
+    }, next ? "Full tool output is on for everyone viewing this session." : "Tool output is brief for everyone viewing this session: one line per tool result.");
+  }
+  const paging = settings.data?.settings.paging;
+  return <Section title="Transcript" info={<div className="stack">
+    <p>With full tool output on, the transcript shows everything each tool printed. Turned off, each tool result shows only its first line and long tool calls are cut short, for everyone viewing the session, its share link included. Long sessions then load much faster. The host keeps the whole output either way, and the agent still sees all of it. Only the session's owner can change this; new sessions start with their workspace's choice, under Settings → Workspaces.</p>
+    <p>Whether the transcript loads latest messages first is a workspace setting, under Settings → Workspaces.</p>
+  </div>}>
+    <Row title="Full tool output" hint={full ? "Every tool result in full" : "One line per tool result"} trailing={editable
+      ? <input type="checkbox" className="checkbox" role="switch" aria-label="Full tool output" checked={full} disabled={action.busy} onChange={event => setFull(event.target.checked)} />
+      : <StatusBadge tone="neutral">{full ? "On" : "Off"}</StatusBadge>} />
+    <Row title="Loading" hint={paging === undefined ? (settings.error ? "Couldn't check the workspace setting" : <Loading>Checking</Loading>)
+      : paging ? "Latest messages first; earlier ones load as you scroll up" : "The whole transcript at once"} />
+    {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+  </Section>;
 }
 
 function HostSection({ session, user, hosts }: { session: SessionRecord; user: UserProfile; hosts: ConnectionsResource }) {

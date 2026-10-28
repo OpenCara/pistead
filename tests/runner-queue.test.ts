@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -15,7 +15,8 @@ import type { AuthorizationRequest, Permission, RunnerAction, RunnerBinding, Run
 import { requestKey, RunnerError } from "../apps/runner/src/protocol.js";
 import { runnerModels } from "../apps/runner/src/provider.js";
 import { RunnerService } from "../apps/runner/src/server.js";
-import { RunnerSession, type RunnerConfig } from "../apps/runner/src/session.js";
+import { RunnerSession, WORK_MARKER, type RunnerConfig } from "../apps/runner/src/session.js";
+import { defaultHostConfig, type HostCompaction } from "../packages/shared/src/host-config.js";
 
 // These are integration-style source tests: real pi Harness, SQLite and sandbox tools.
 // Linux needs working bwrap FD mounts/user namespaces, Python 3 and Git, as in runner.test.ts.
@@ -173,6 +174,14 @@ async function fixture(t: TestContext, { reportActivity = false, config: overrid
       service = new RunnerService(config);
       await service.initialize();
       return service.get(input.session.id);
+    },
+    /** Starts a runner again as a connector does: nothing asks for the session, the runner resumes what was at work. */
+    async restart() {
+      assert.equal(service, undefined, "close the previous service before opening its SQLite database");
+      service = new RunnerService(config);
+      await service.initialize();
+      await service.resume();
+      return (service as unknown as { sessions: Map<string, Promise<RunnerSession>> }).sessions;
     },
   };
 }
@@ -433,6 +442,29 @@ test("connected runners report what the agent is doing as it changes, as their v
   assert.equal((await idle(f.session)).activity, "done");
   await f.reported("done");
   assert.deepEqual(f.reports.map(([, activity]) => activity), ["idle", "working", "done"], "one report per change");
+});
+
+test("a session at work when its runner stops resumes when a runner starts again, without anyone opening it", options, async t => {
+  const f = await fixture(t, { reportActivity: true });
+  const marker = join(f.session.directory, WORK_MARKER);
+  const marked = () => lstat(marker).then(stat => stat.isFile(), () => false);
+  await f.reported("idle");
+  assert.equal(await marked(), false, "an idle session has nothing to resume");
+  // Queued when the runner stops: durable, but nothing would run it until someone opened the session.
+  await pauseQueue(f.session);
+  await submit(f.session, OWNER, "write", { content: "TEST_WRITE resumed.txt\nran after the restart", requestId: "resumed" });
+  await f.reported("working");
+  assert.equal(await marked(), true, "marked while at work");
+  await f.stop();
+  const opened = await f.restart();
+  assert.deepEqual([...opened.keys()], [f.session.binding.session.id], "only the marked session opens");
+  await f.reported("done");
+  assert.equal(await file(f.session, "resumed.txt"), "ran after the restart");
+  assert.equal(await marked(), false, "done, so nothing to resume next time");
+  // A runner that starts again now opens nothing, and passes over what isn't a session.
+  await f.stop();
+  await writeFile(join(f.session.directory, "..", "not-a-session"), "");
+  assert.equal((await f.restart()).size, 0);
 });
 
 test("a shared message stopped before it ran leaves the session failed", options, async t => {
@@ -768,6 +800,28 @@ test("sessions compact by the host's Pi compaction settings, per model where it 
   assert.equal(await compactions({ modelOverrides: { "faux/other-model": always } }), 0, "another model's override does not apply");
   assert.ok(await compactions(always) > 0, "a host-wide threshold applies to every model");
   assert.equal(await compactions({ ...always, enabled: false }), 0, "the host's Pi can turn automatic compaction off");
+});
+
+test("sessions compact by the token counts set in Pistead over the host's Pi settings, from their next message on", options, async t => {
+  let configured: HostCompaction = {};
+  // The host's Pi never compacts this conversation; Pistead's configuration of the host decides.
+  const f = await fixture(t, { config: { compaction: { reserveTokens: 0 }, hostConfig: async () => ({ ...defaultHostConfig, compaction: configured }) } });
+  const compactions = async () => (await f.session.view()).entries.filter(entry => entry.kind === "pi.compaction").length;
+  for (const requestId of ["first", "second"]) {
+    await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId });
+    await idle(f.session);
+  }
+  assert.equal(await compactions(), 0, "the host's Pi settings apply while Pistead sets nothing");
+  // A threshold no context fits under, keeping nothing verbatim, for the session's model alone.
+  configured = { modelOverrides: { "faux/queue-faux": { reserveTokens: 10_000_000, keepRecentTokens: 0 } } };
+  await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId: "third" });
+  await idle(f.session);
+  const compacted = await compactions();
+  assert.ok(compacted > 0, "the next message compacts by the configured counts");
+  configured = {};
+  await submit(f.session, OWNER, "write", { content: "TEST_HOLD 0", requestId: "fourth" });
+  await idle(f.session);
+  assert.equal(await compactions(), compacted, "clearing them goes back to the host's Pi settings");
 });
 
 test("parked background work, such as a compaction, is aborted without ending the message that is running", options, async t => {

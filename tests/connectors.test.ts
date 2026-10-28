@@ -5,12 +5,12 @@ import test, { type TestContext } from 'node:test';
 import { HTTPException } from 'hono/http-exception';
 import { app } from '../apps/server/src/index.js';
 import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
-import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
+import { authorizeConnectorTicket, type ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
-import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostModelSettings } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostCommandGrant, HostModelSettings } from '../packages/shared/src/connector.js';
+import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, RunnerTicket, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { diffView } from '../packages/shared/src/view-patch.js';
@@ -506,10 +506,10 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
   for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/github/read', '/api/internal/github/merge', '/api/internal/github/issue',
-    '/api/internal/restores/unknown/download']) {
+    '/api/internal/restores/unknown/download', '/api/internal/git/direct']) {
     await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
   }
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download', 'git/direct']) {
     await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
     await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
     await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
@@ -520,7 +520,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const oldConnection = connector.connectionToken;
   connector.connectionToken = token();
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download', 'git/direct']) {
     await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
   }
   await json(await self(f, connector, 'manifest', manifest));
@@ -1252,6 +1252,78 @@ test('only the session owner answers a permission request, for one call or the s
   await denied(await s.creator.request('POST', `${path}/operations`, { kind: 'permission', tool: 'bash', target: '', needs: ['tool'] }), 400, 'invalid_operation');
 });
 
+test('the host\'s owner decides host commands in a session on it they can read, once its connector lets them; nothing else and nobody else without approve', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'host_bash', 'github_comment']);
+  const path = `/api/sessions/${s.session.id}`;
+  const pending = (id: string, operation: Operation): ApprovalRecord => ({
+    id, sessionId: s.session.id, requestedBy: s.creator.user.id, operation, status: 'pending', createdAt: new Date().toISOString(),
+  });
+  const command = pending('tool-call-1', { kind: 'host.bash', command: 'dotnet --info', timeoutSeconds: 300 });
+  const comment = pending('tool-call-2', { kind: 'github.comment', repository: 'owner/repo', issue: 3, body: 'Looks good.' });
+  let approvals = [command, comment];
+  const decisions: { approvalId: string; actorId: string; decision: string }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const { admissionId } = JSON.parse(envelope.request.body) as { admissionId: string };
+      approvals = approvals.map(approval => ({ ...approval, admissionId }));
+      return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: true,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string; decision: string };
+    decisions.push({ approvalId: input.approvalId, actorId: envelope.request.ticket.actorId, decision: input.decision });
+    const decided: ApprovalRecord = { ...approvals.find(approval => approval.id === input.approvalId)!, status: input.decision === 'approve' ? 'executing' : 'denied',
+      decidedBy: envelope.request.ticket.actorId };
+    approvals = approvals.map(approval => approval.id === decided.id ? decided : approval);
+    return Response.json({ approval: decided });
+  });
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Comment, then check the SDK', requestId: 'host-owner-write' }), 202);
+  // The host's owner follows the workspace-visible session with read access only, and no session role.
+  const { session } = await json<{ session: SessionRecord }>(await s.host.request('GET', path));
+  assert.deepEqual(session.permissions, ['read']);
+  const presented = new Map((await json<{ view: SessionView }>(await s.host.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
+  const decide = (client: typeof s.creator, approval: ApprovalRecord, decision = 'approve') =>
+    client.request('POST', `${path}/approvals/${approval.id}`, { decision, reviewHash: presented.get(approval.id)!.reviewHash });
+
+  // The host's own decision ticket, as the transport checks it on the way to the host and again with its answer.
+  const decisionTicket = async (): Promise<RunnerTicket> => {
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const { policy_version } = f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id) as { policy_version: number };
+    return { aud: 'runner', sessionId: s.session.id, actorId: s.host.user.id, ownerId: s.creator.user.id, connectorId: s.connector.connectorId,
+      action: 'approve', policyVersion: policy_version, iat: issuedAt, exp: issuedAt + 60, jti: token(), bodyHash: await sha256('') };
+  };
+  const refused = (error: unknown) => error instanceof HTTPException && error.status === 403;
+
+  // A connector that predates it checks approve permission on every decision, its owner's included, and so does the transport.
+  await denied(await decide(s.host, command), 403, 'forbidden');
+  await assert.rejects(authorizeConnectorTicket(f.env, await decisionTicket()), refused);
+  const capabilities = { ...manifest.capabilities, hostCommands: true, hostGrants: true };
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostOwnerDecides: 'yes' } }), 400);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostOwnerDecides: true } }), 400);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostOwnerDecides: true } }));
+  await authorizeConnectorTicket(f.env, await decisionTicket());
+  // Now the host command is its owner's to decide; anything else still needs approve permission.
+  await denied(await decide(s.host, comment, 'deny'), 403, 'forbidden');
+  // A member granted host commands, here the workspace's owner, still needs approve permission on the session.
+  await json(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/host-grants/${s.team.id}`, { level: 'approve', userId: s.admin.user.id }));
+  await denied(await decide(s.admin, command), 403, 'forbidden');
+  assert.deepEqual(decisions, []);
+  const approved = await json<{ approval: ApprovalRecord }>(await decide(s.host, command));
+  assert.deepEqual([approved.approval.status, approved.approval.decidedBy], ['executing', s.host.user.id]);
+  assert.deepEqual(decisions, [{ approvalId: command.id, actorId: s.host.user.id, decision: 'approve' }]);
+  await denied(await decide(s.host, command), 409, 'approval_already_decided');
+  // An archived session takes no decisions, its host's owner's included.
+  approvals = approvals.map(approval => approval.id === command.id ? { ...approval, status: 'pending' as const, decidedBy: undefined } : approval);
+  f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = ?").run(s.session.id);
+  await denied(await decide(s.host, command), 409, 'session_archived');
+  assert.equal(decisions.length, 1);
+});
+
 test('per-message chat options are checked against the session host, mode and owner before reaching the runtime', async t => {
   const f = await fixture(t); const s = await sharedSession(f);
   await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'ask', 'write'] }));
@@ -1936,7 +2008,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // There is no agent catalog: agents can't be listed, revised or published.
@@ -1948,21 +2020,21 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions'].includes(tool)));
 
-  // A host that also carries GitHub reads and merges offers those; opening issues needs its own capability, which
-  // connectors from before github_issue don't advertise.
+  // A host that also carries GitHub reads and merges offers those; opening issues, managing schedules and working with
+  // other sessions need their own capabilities, which connectors from before github_issue, schedule and sessions don't advertise.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue'));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue' && tool !== 'schedule' && tool !== 'sessions'));
 
   // A current host gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, hostCommands: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, schedules: true, crossSessions: true, hostCommands: true } }));
   const { session: fourth } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(fourth.agentVersionId, third.agentVersionId);
   assert.deepEqual(startedAgent().tools, offered);
-  assert.ok(offered.includes('github_issue'));
+  assert.ok(offered.includes('github_issue') && offered.includes('schedule') && offered.includes('sessions'));
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {
@@ -2609,7 +2681,7 @@ test('host owners add admins who manage sharing and host command grants, and gra
 test('host owners and admins configure how the host runs sessions, and only the owner decides whose credentials it uses', async t => {
   const f = await fixture(t); const s = await sharedHost(f); const outsider = await f.client('outsider');
   const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
-  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: {} };
   const listed = async (client: Client) => (await json<{ connectors: ConnectorInfo[] }>(await client.request('GET', '/api/connectors'))).connectors
     .find(item => item.id === id)?.config;
   // Its owner and the connector itself read it; members of a workspace it is shared with neither see nor change it.
@@ -2627,7 +2699,7 @@ test('host owners and admins configure how the host runs sessions, and only the 
     await denied(await host.request('PATCH', path, invalid), 400, 'invalid_host_config');
   }
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_configs').get()!.n, 0);
-  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true };
+  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true, compaction: {} };
   assert.deepEqual(await json(await host.request('PATCH', path, owned)), { config: owned });
   assert.deepEqual(await listed(host), owned);
   assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: owned });
@@ -2660,7 +2732,7 @@ test('a save changes only the settings it names, so what someone else saved mean
   // An admin's form loaded the defaults; then the owner turns on Git credentials and the cache.
   await json(await host.request('PATCH', path, { gitCredentials: true, repositoryCache: 'host' }));
   // The admin's save of the time limit names none of the owner's settings: it is neither refused nor undoes theirs.
-  const both = { commandTimeoutSeconds: 120, gpu: false, gitCredentials: true, repositoryCache: 'host', hostSessions: false };
+  const both = { commandTimeoutSeconds: 120, gpu: false, gitCredentials: true, repositoryCache: 'host', hostSessions: false, compaction: {} };
   assert.deepEqual(await json(await creator.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: both });
   // Nor does the owner's next save undo the admin's time limit.
   assert.deepEqual(await json(await host.request('PATCH', path, { gpu: true })), { config: { ...both, gpu: true } });
@@ -2676,10 +2748,37 @@ test('an admin\'s first configuration of a host leaves the owner\'s settings at 
   const f = await fixture(t); const s = await sharedHost(f);
   const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
   await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.creator.user.id}`));
-  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: {} };
   assert.deepEqual(await json(await s.creator.request('PATCH', path, config)), { config });
   assert.deepEqual({ ...f.sqlite.prepare('SELECT git_credentials, repository_cache, host_sessions, updated_by FROM connector_configs WHERE connector_id = ?').get(id) },
     { git_credentials: 0, repository_cache: 'off', host_sessions: 0, updated_by: s.creator.user.id });
+});
+
+test('a host\'s owner and admins set its compaction token counts, which its connector reads with the rest of its configuration', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  for (const invalid of [{ compaction: null }, { compaction: [] }, { compaction: { reserveTokens: -1 } }, { compaction: { reserveTokens: 1.5 } },
+    { compaction: { reserveTokens: 10_000_001 } }, { compaction: { enabled: false } }, { compaction: { modelOverrides: { model: { reserveTokens: 1 } } } },
+    { compaction: { modelOverrides: { 'anthropic/opus': { keepRecentTokens: '1' } } } }]) {
+    await denied(await host.request('PATCH', path, invalid), 400, 'invalid_host_config');
+  }
+  // Kept as it is read back: models sorted, and a model without counts left out.
+  const compaction = { reserveTokens: 32_768, modelOverrides: { 'openai/gpt-5': { keepRecentTokens: 4000 }, 'anthropic/opus': { reserveTokens: 65_536, keepRecentTokens: 20_000 }, 'faux/none': {} } };
+  const kept = { reserveTokens: 32_768, modelOverrides: { 'anthropic/opus': { reserveTokens: 65_536, keepRecentTokens: 20_000 }, 'openai/gpt-5': { keepRecentTokens: 4000 } } };
+  assert.deepEqual(await json(await host.request('PATCH', path, { compaction })), { config: { ...defaults, compaction: kept } });
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, compaction: kept } });
+  assert.equal(f.sqlite.prepare('SELECT compaction_json FROM connector_configs WHERE connector_id = ?').get(id)!.compaction_json, JSON.stringify(kept));
+  // A save of another setting keeps it; an admin changes it, as a whole, for as many models as a host offers, with the longest names.
+  assert.deepEqual(await json(await host.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: kept } });
+  await json(await host.request('PUT', `/api/connectors/${id}/admins/${creator.user.id}`));
+  const many = { modelOverrides: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`${String(index).padStart(80, 'p')}/${'m'.repeat(200)}`, { reserveTokens: 1_000_000 + index, keepRecentTokens: 9_999_999 }])) };
+  const saved = await json<{ config: { compaction: { modelOverrides: Record<string, unknown> } } }>(await creator.request('PATCH', path, { compaction: many }));
+  assert.equal(Object.keys(saved.config.compaction.modelOverrides).length, 200);
+  assert.deepEqual(await json(await creator.request('PATCH', path, { compaction: {} })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
+  // A setting the database no longer reads as valid is none.
+  f.sqlite.prepare('UPDATE connector_configs SET compaction_json = ? WHERE connector_id = ?').run('{"reserveTokens":"lots"}', id);
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
 });
 
 test('a host\'s owner and admins disable its models for everyone: a disabled model is neither listed, started from nor chosen', async t => {
@@ -2894,13 +2993,62 @@ test('a host\'s owner starts a session directly on the host only where its confi
   await denied(await start({ hostEnvironment: true }), 400, 'host_unsandboxed');
 });
 
-test('only a host\'s owner starts sessions directly on it, never a member it is shared with', async t => {
+test('a member it is shared with starts sessions directly on a host only with a grant from its owner that includes them', async t => {
   const f = await fixture(t); const s = await sharedHost(f);
-  const id = s.connector.connectorId;
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: true } }));
+  const id = s.connector.connectorId; const grants = `/api/connectors/${id}/host-grants/${s.team.id}`;
+  const capabilities = { ...manifest.capabilities, hostConfig: true, hostCommands: true, hostGrants: true };
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities }));
   await json(await s.host.request('PATCH', `/api/connectors/${id}/config`, { hostSessions: true }));
-  const shared = (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
-  assert.equal(shared.find(item => item.id === id)?.hostSessions, undefined);
-  await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true }), 403, 'host_owner_required');
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n, 0);
+  const start = () => s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true });
+  const offered = async () => (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors
+    .find(item => item.id === id)?.hostSessions;
+  const onHost = () => f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n;
+
+  // Without a grant, or with one of host commands alone, a member always gets the sandbox.
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await json(await s.host.request('PUT', grants, { level: 'auto', userId: s.creator.user.id }));
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await denied(await s.host.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: 'yes' }), 400, 'invalid_grant');
+
+  // Only the owner adds sessions on the host to a grant; an admin's change keeps what the grant had, or takes them away.
+  await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.admin.user.id}`));
+  await denied(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: true }), 403, 'host_owner_required');
+  const given = await json<{ hostGrants: HostCommandGrant[] }>(await s.host.request('PUT', grants, { level: 'approve', userId: s.creator.user.id, hostSessions: true }));
+  assert.equal(given.hostGrants.find(grant => grant.userId === s.creator.user.id)?.hostSessions, true);
+  const kept = await json<{ hostGrants: HostCommandGrant[] }>(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id }));
+  assert.equal(kept.hostGrants.find(grant => grant.userId === s.creator.user.id)?.hostSessions, true, 'an admin changing its level keeps them');
+  const audit = f.sqlite.prepare(`SELECT detail_json FROM audit WHERE action = 'host.grant.set' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get()!;
+  assert.equal(JSON.parse(String(audit.detail_json)).hostSessions, true);
+
+  // A connector that runs only its owner's sessions on the host can't run theirs: they are refused, never sandboxed.
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 409, 'connector_update_required');
+  assert.equal(onHost(), 0);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostSessionGrants: true } }));
+  assert.equal(await offered(), true);
+  const { session } = await json<{ session: SessionRecord }>(await start(), 201);
+  assert.equal(session.hostEnvironment, true);
+  assert.equal(session.ownerId, s.creator.user.id);
+  assert.equal((JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding).session.hostEnvironment, true);
+
+  // The host learns it with its owner's authority, and only when it asks: older connectors parse the reply strictly.
+  const asked = (body: Record<string, unknown>) => self(f, s.connector, 'authorize', { ...authorization(session), permission: 'write', ...body });
+  const reply = await json<{ hostCommands?: string; hostSessions?: true }>(await asked({ host: true, hostSessions: true }));
+  assert.deepEqual([reply.hostCommands, reply.hostSessions], ['auto', true]);
+  assert.equal(Object.hasOwn(await json(await asked({ host: true })), 'hostSessions'), false);
+  await denied(await asked({ hostSessions: true }), 400, 'invalid_authorization');
+
+  // Their grant without sessions on the host, or the host not accepting them, ends it; the session keeps what it was.
+  await json(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: false }));
+  assert.equal(Object.hasOwn(await json(await asked({ host: true, hostSessions: true })), 'hostSessions'), false);
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await json(await s.host.request('PUT', grants, { level: 'approve', hostSessions: true }));
+  assert.equal(await offered(), true, 'a workspace-wide grant counts too');
+  await json(await s.host.request('PATCH', `/api/connectors/${id}/config`, { hostSessions: false }));
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 409, 'host_sessions_off');
+  assert.equal(onHost(), 1);
 });

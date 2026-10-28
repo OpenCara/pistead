@@ -2,7 +2,7 @@ import { STATUS_CODES, type IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { HTTPException } from 'hono/http-exception';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
-import { connectorLimits, type ConnectorRpcResponse } from '../../../packages/shared/src/connector.js';
+import { connectorLimits, connectorRequestTimeoutMs, type ConnectorRpcResponse } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import type { ConnectorHub } from './connector-hub-types.js';
 import {
@@ -21,6 +21,11 @@ type Pending = {
   cancelTimer: () => void;
   bytes: number;
   responding: boolean;
+  /**
+   * Its deadline passed and its caller was answered: the host still owes a reply, which only frees its slot. The host
+   * answers every request it was sent, if need be as timed out itself, so the entry never outlives the connection.
+   */
+  expired?: boolean;
 };
 const encoder = new TextEncoder();
 
@@ -129,11 +134,9 @@ class ConnectorRelay {
       await this.checkAuthority(connection, relayed);
       if (this.current !== connection || connection.socket.readyState !== WebSocket.OPEN) fail(503, 'connector_replaced', 'The connector connection changed.');
       if (relayed.request.ticket.exp <= Math.floor(Date.now() / 1000)) fail(403, 'ticket_expired', 'Connector authorization expired.');
-      const timeout = ['backup', 'restore'].includes(relayed.request.ticket.action) ? 90000 : 30000;
       const { promise: response, resolve } = Promise.withResolvers<Response>();
-      const timer = setTimeout(() => {
-        void this.disconnect(connection, 504, 'Connector timed out').catch(() => {});
-      }, timeout);
+      // One slow request ends with a timeout for its caller, not with the connection and every session's request on it.
+      const timer = setTimeout(() => this.expire(wireId), connectorRequestTimeoutMs(relayed.request.ticket.action));
       const pending: Pending = { connection, envelope: relayed, resolve, bytes, responding: false, cancelTimer: () => clearTimeout(timer) };
       this.pending.set(wireId, pending);
       reserved = 0;
@@ -208,6 +211,8 @@ class ConnectorRelay {
       if (!pending || pending.responding || pending.connection !== connection) {
         await this.disconnect(connection, 502, 'Unsolicited connector response'); return;
       }
+      // The late reply to a request whose caller already heard it timed out: it frees the slot and goes nowhere.
+      if (pending.expired) { this.finish(reply.id, new Response(null, { status: 204 })); return; }
       pending.responding = true;
       try {
         await this.checkAuthority(connection, pending.envelope);
@@ -282,6 +287,17 @@ class ConnectorRelay {
         if (denied) throw new SessionAuthorizationError(denied.status, { res: denied.getResponse() });
       })()]);
     } finally { clearTimeout(timer); }
+  }
+
+  /**
+   * A request past its deadline: its caller hears it timed out, and the effect may or may not have happened. Its entry
+   * stays, holding its slot and bytes, until the host's own answer arrives (see `Pending.expired`).
+   */
+  private expire(requestId: string): void {
+    const pending = this.pending.get(requestId);
+    if (!pending || pending.responding || pending.expired) return;
+    pending.expired = true;
+    pending.resolve(this.errorResponse(504, 'Connector timed out; inspect the session before retrying'));
   }
 
   private finish(requestId: string, response: Response): void {

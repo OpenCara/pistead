@@ -1,9 +1,15 @@
 import { HTTPException } from 'hono/http-exception';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { AppContext, Env } from './types';
+import { GitTransferError } from '../../../packages/shared/src/git-transfer.js';
 
 export function fail(status: ContentfulStatusCode, code: string, message: string): never {
   throw new HTTPException(status, { res: Response.json({ error: message, code }, { status }) });
+}
+/** Rethrows a Git transfer's fixed, credential-free refusal (git-transfer.ts) as this API's error; anything else as it is. */
+export function failTransfer(error: unknown): never {
+  if (error instanceof GitTransferError) fail(error.status as ContentfulStatusCode, error.code, error.message);
+  throw error;
 }
 export async function jsonObject(c: AppContext, maxBytes = 65536): Promise<Record<string, unknown>> {
   const type = c.req.header('content-type')?.split(';')[0]?.trim();
@@ -58,11 +64,22 @@ export function testMode(env: Env): boolean {
   return env.TEST_AUTH_ENABLED === 'true' &&
     !!env.TEST_AUTH_SECRET && env.TEST_AUTH_SECRET.length >= 32 && Number.isFinite(expiry) && expiry > Date.now();
 }
+/**
+ * A local server (`pistead serve`, or the desktop app's server on this computer): it listens on loopback only and admits
+ * one GitHub account, the one that claimed it with the secret the launcher printed or opened (see local/claim.ts).
+ */
+export function localMode(env: Env): boolean {
+  return env.LOCAL_MODE === 'true' && !!env.LOCAL_CLAIM_SECRET && /^[A-Za-z0-9_-]{43}$/.test(env.LOCAL_CLAIM_SECRET);
+}
+const LOOPBACK_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]'];
+/** Plain HTTP is only for loopback, and only in test mode or on a local server, which never leaves this machine. */
+export function loopbackHttp(env: Env, url: URL): boolean {
+  return url.protocol === 'http:' && LOOPBACK_HOSTNAMES.includes(url.hostname) && (testMode(env) || localMode(env));
+}
 export function appOrigin(env: Env): string {
   let url: URL;
   try { url = new URL(env.APP_ORIGIN); } catch { fail(503, 'configuration_error', 'Application origin is not configured.'); }
-  if (url.origin !== env.APP_ORIGIN || url.username || url.password ||
-      (url.protocol !== 'https:' && !(testMode(env) && url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)))) {
+  if (url.origin !== env.APP_ORIGIN || url.username || url.password || (url.protocol !== 'https:' && !loopbackHttp(env, url))) {
     fail(503, 'configuration_error', 'Application origin is not configured securely.');
   }
   return url.origin;

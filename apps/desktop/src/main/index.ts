@@ -5,9 +5,10 @@ import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent } from "el
 import { channels, type HostView, type SettingsView } from "../shared/bridge.js";
 import { HostController } from "./host-controller.js";
 import { HostProcess } from "./host-process.js";
+import { LocalServerController } from "./local-server.js";
 import { HostTray, installAppMenu, type MenuActions } from "./menu.js";
 import { DEFAULT_SERVER, parseServerOrigin } from "./origin.js";
-import { isLocalPage, parseBoolean, parseStartInput, parseString } from "./requests.js";
+import { isLocalPage, parseBoolean, parseLocalStartInput, parseStartInput, parseString } from "./requests.js";
 import { SettingsStore } from "./settings.js";
 import { createLocalWindow, createMainWindow, hardenRemoteSession, registerLocalScheme, serveLocalPages } from "./windows.js";
 
@@ -19,6 +20,7 @@ const development = !app.isPackaged;
 const developmentEnv = (name: string) => development ? process.env[name] || undefined : undefined;
 const fixtureModels = developmentEnv("PISTEAD_DESKTOP_ALLOW_FAUX") === "1";
 const stateDir = developmentEnv("PISTEAD_DESKTOP_STATE_DIR");
+const serverStateDir = developmentEnv("PISTEAD_DESKTOP_SERVER_STATE_DIR");
 const userData = developmentEnv("PISTEAD_DESKTOP_USER_DATA");
 /** Writes PNGs of the windows into this directory, then quits: launch verification for any build. */
 const smokeDirectory = process.env.PISTEAD_DESKTOP_SMOKE || undefined;
@@ -40,7 +42,6 @@ function main(): void {
   const preload = join(__dirname, "preload.js");
   const settings = new SettingsStore(join(app.getPath("userData"), "settings.json"));
   serveLocalPages(join(__dirname, "renderer"));
-  hardenRemoteSession(() => settings.get().server);
 
   let mainWindow: BrowserWindow | undefined;
   let hostWindow: BrowserWindow | undefined;
@@ -70,6 +71,28 @@ function main(): void {
   const hostEntry = app.isPackaged
     ? join(process.resourcesPath, "connector", "dist", "desktop-host.mjs")
     : join(appRoot, "dist", "host", "desktop-host.mjs");
+  // Pistead on this computer: the local server, staged beside the connector host (it shares its dependencies).
+  const serverEntry = app.isPackaged
+    ? join(process.resourcesPath, "connector", "dist", "desktop-server.mjs")
+    : join(appRoot, "dist", "host", "desktop-server.mjs");
+  const localServer = new LocalServerController({
+    entry: serverEntry, args: serverStateDir ? ["--state-dir", serverStateDir] : [], settings, testMode: fixtureModels,
+    async confirmUnsandboxed(warning) {
+      const options = {
+        type: "warning" as const, buttons: ["Cancel", "Run Unsandboxed"], defaultId: 0, cancelId: 0, noLink: true,
+        title: "Run sessions without a sandbox?",
+        message: mac ? "This Mac has no isolated sandbox. Run your sessions directly on it?" : "This computer has no isolated sandbox. Run your sessions directly on it?",
+        detail: `${warning.trim()}\n\nWithout your consent, Pistead still runs here, and you can pair another machine to run sessions.`,
+      };
+      const parent = settingsWindow && !settingsWindow.isDestroyed() ? settingsWindow : undefined;
+      const { response } = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options);
+      return response === 1;
+    },
+  });
+  // Pistead on this computer while it runs, else the configured server: what the Pistead window shows.
+  const activeServer = () => localServer.origin ?? settings.get().server;
+  hardenRemoteSession(activeServer);
+
   const hostProcess = new HostProcess({
     entry: hostEntry, args: stateDir ? ["--state-dir", stateDir] : [],
     onEvent: event => {
@@ -91,7 +114,7 @@ function main(): void {
   const openMain = () => {
     if (mainWindow && !mainWindow.isDestroyed()) { showWindow(mainWindow); return; }
     if (mac) void app.dock?.show();
-    mainWindow = createMainWindow(settings, icon);
+    mainWindow = createMainWindow(settings, icon, activeServer, localServer.claimUrl ?? activeServer());
     mainWindow.on("closed", () => { mainWindow = undefined; });
   };
   const openHost = () => {
@@ -104,8 +127,9 @@ function main(): void {
   const openSettings = () => {
     if (settingsWindow && !settingsWindow.isDestroyed()) { showWindow(settingsWindow); return; }
     if (mac) void app.dock?.show();
-    settingsWindow = createLocalWindow("settings.html", { title: "Settings", width: 520, height: 300, preload, icon });
+    settingsWindow = createLocalWindow("settings.html", { title: "Settings", width: 560, height: 720, preload, icon });
     settingsWindow.on("closed", () => { settingsWindow = undefined; });
+    void localServer.inspect();
   };
   const startFromMenu = () => {
     void controller.start({ replacePairing: false }).then(outcome => { if (!outcome.ok) openHost(); });
@@ -121,6 +145,18 @@ function main(): void {
   };
   controller.onChange(publish);
   publish();
+
+  const settingsView = (): SettingsView => ({ server: settings.get().server, defaultServer: DEFAULT_SERVER, local: localServer.view() });
+  // The Pistead window follows Pistead on this computer: there once it runs (its sign-in link while nobody has claimed
+  // it), and back to the configured server once it stops.
+  let shown = activeServer();
+  localServer.onChange(() => {
+    if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.webContents.send(channels.settingsUpdate, settingsView());
+    const next = activeServer();
+    if (next === shown) return;
+    shown = next;
+    if (mainWindow && !mainWindow.isDestroyed()) void mainWindow.loadURL(localServer.claimUrl ?? next).catch(() => {});
+  });
 
   /** Every call must come from the main frame of the named local window, still showing its bundled page. */
   const handle = <T>(channel: string, page: string, window: () => BrowserWindow | undefined, run: (payload: unknown) => T) => {
@@ -146,7 +182,12 @@ function main(): void {
     const enabled = parseBoolean(payload);
     return enabled.ok ? controller.setOpenAtLogin(enabled.value) : refused;
   });
-  handle(channels.settingsView, "settings.html", () => settingsWindow, (): SettingsView => ({ server: settings.get().server, defaultServer: DEFAULT_SERVER }));
+  handle(channels.settingsView, "settings.html", () => settingsWindow, settingsView);
+  handle(channels.localStart, "settings.html", () => settingsWindow, payload => {
+    const input = parseLocalStartInput(payload);
+    return input.ok ? localServer.start(input.value.github) : { ok: false, error: input.error };
+  });
+  handle(channels.localStop, "settings.html", () => settingsWindow, () => localServer.stop());
   handle(channels.settingsServer, "settings.html", () => settingsWindow, payload => {
     const input = parseString(payload, 2048);
     if (!input.ok) return refused;
@@ -154,7 +195,8 @@ function main(): void {
     if (!origin.ok) return origin;
     if (origin.origin !== settings.get().server) {
       settings.update({ server: origin.origin });
-      if (mainWindow && !mainWindow.isDestroyed()) void mainWindow.loadURL(origin.origin).catch(() => {});
+      shown = activeServer();
+      if (mainWindow && !mainWindow.isDestroyed() && !localServer.origin) void mainWindow.loadURL(origin.origin).catch(() => {});
       void controller.refresh();
     }
     return { ok: true as const };
@@ -163,16 +205,16 @@ function main(): void {
   app.on("second-instance", openMain);
   app.on("activate", () => { if (!BrowserWindow.getAllWindows().some(window => window.isVisible())) openMain(); });
   app.on("window-all-closed", () => {
-    // A running host keeps the app alive in the menu bar (macOS keeps it anyway, by convention).
-    if (controller.hostState !== "stopped") { if (mac) app.dock?.hide(); return; }
+    // A running host, or Pistead running on this computer, keeps the app alive in the menu bar (macOS keeps it anyway).
+    if (controller.hostState !== "stopped" || localServer.running) { if (mac) app.dock?.hide(); return; }
     if (!mac) app.quit();
   });
   let quitting = false;
   app.on("before-quit", event => {
-    if (quitting || !hostProcess.running) return;
+    if (quitting || (!hostProcess.running && !localServer.running)) return;
     event.preventDefault();
     quitting = true;
-    void hostProcess.shutdown(10_000).finally(() => app.quit());
+    void Promise.all([hostProcess.shutdown(10_000), localServer.shutdown(10_000)]).finally(() => app.quit());
   });
 
   openMain();
@@ -182,6 +224,7 @@ function main(): void {
     return;
   }
   void controller.resume();
+  void localServer.resume();
 }
 
 /** Captures the Pistead, host and Settings windows once they have rendered, then quits. */

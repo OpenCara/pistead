@@ -8,7 +8,8 @@ import { Button, Combobox, confirmDialog, Feedback, Row, Section, StatusBadge, T
 
 /*
  * Host sharing beyond its owner: admins, who manage the host's shares and host command grants, and the grants
- * themselves, which let members of a shared workspace decide host commands or run their own without asking.
+ * themselves, which let members of a shared workspace decide host commands or run their own without asking, and, where
+ * the owner includes it, start their own sessions directly on the host.
  */
 
 const levelLabels: Record<HostCommandLevel, { label: string; hint: string }> = {
@@ -85,13 +86,14 @@ export function HostAdminsSection({ connector, refresh }: { connector: Connector
 }
 
 function grantHint(grant: HostCommandGrant) {
-  return <>{levelLabels[grant.level].hint}{grant.expiresAt ? <> · expires <Timestamp value={grant.expiresAt} /></> : " · no expiry"}</>;
+  return <>{levelLabels[grant.level].hint}{grant.hostSessions ? " · may start sessions on the host" : ""}{grant.expiresAt ? <> · expires <Timestamp value={grant.expiresAt} /></> : " · no expiry"}</>;
 }
 
 /** Who may decide host commands, or run their own without asking, in the workspaces this host is shared with. */
 export function HostCommandGrantsSection({ connector, refresh }: { connector: ConnectorInfo; refresh: () => void }) {
   const { workspaces } = useApp();
   const action = useAction();
+  const owner = connector.role === "owner";
   const grants = connector.hostGrants ?? [];
   const names = new Map(workspaces.map(workspace => [workspace.id, workspace.name]));
   const shared = workspaces.filter(workspace => connector.workspaceIds.includes(workspace.id));
@@ -101,26 +103,41 @@ export function HostCommandGrantsSection({ connector, refresh }: { connector: Co
   const eligible = (members.data?.members ?? []).filter(member => member.userId !== connector.ownerId && member.role !== "viewer");
   const [grantee, setGrantee] = useState(EVERYONE);
   const [level, setLevel] = useState<HostCommandLevel>("approve");
+  const accepting = connector.config?.hostSessions === true && !connector.capabilities.unsandboxed;
   const [expiry, setExpiry] = useState<Expiry>("7");
   const member = eligible.find(item => item.userId === grantee);
   const who = member ? usernameWithId(memberPerson(member)) : `every member of ${target?.name ?? "the workspace"}`;
+  // The grant this form would replace, if any: granting again replaces it as a whole.
+  const existing = grants.find(item => item.workspaceId === target?.id && (item.userId ?? EVERYONE) === (member?.userId ?? EVERYONE));
+  // Sessions on the host, which only the owner grants: the checkbox starts from what the grant already includes, so
+  // changing its level or expiry keeps them unless the owner clears it.
+  const grantKey = `${target?.id ?? ""}:${member?.userId ?? EVERYONE}`;
+  const [sessionsChoice, setSessionsChoice] = useState<{ key: string; value: boolean } | null>(null);
+  const sessions = sessionsChoice?.key === grantKey ? sessionsChoice.value : existing?.hostSessions === true;
+  const setSessions = (value: boolean) => setSessionsChoice({ key: grantKey, value });
 
   function grant() {
     if (!target) return;
     void (async () => {
       const auto = level === "auto";
+      const withSessions = owner && sessions;
+      // Granting again without sessions takes them away: say so rather than drop them quietly.
+      const dropsSessions = owner && !sessions && existing?.hostSessions === true;
       if (!await confirmDialog({
-        title: auto ? "Grant automatic host commands?" : "Grant host command approval?",
-        message: auto
+        title: withSessions ? "Grant sessions on the host?" : auto ? "Grant automatic host commands?" : "Grant host command approval?",
+        message: (auto
           ? `${who} will be able to run host_bash on ${connector.name} OUTSIDE the sandbox without anyone approving each command, whenever they send a message with Auto-approve. Commands run on the owner's machine as its user, with its files, credentials and network, and no resource limits.`
-          : `${who} will be able to approve host_bash commands on ${connector.name}, which run OUTSIDE the sandbox on the owner's machine with its files, credentials and network.`,
-        confirmLabel: "Grant", destructive: auto,
+          : `${who} will be able to approve host_bash commands on ${connector.name}, which run OUTSIDE the sandbox on the owner's machine with its files, credentials and network.`)
+          + (withSessions ? ` They will also be able to start their own sessions directly on ${connector.name}, without the sandbox: every command of those sessions runs as its user${auto ? ", without asking under their Auto-approve" : ", once approved"}, and their clones use its Git and credentials.` : "")
+          + (dropsSessions ? ` This replaces their current grant, which includes sessions on the host: they will no longer start sessions directly on ${connector.name}, and the next command of any they have there will stop.` : ""),
+        confirmLabel: "Grant", destructive: auto || withSessions,
       })) return;
       const days = expiries.find(item => item.value === expiry)!.days;
       await action.run(async () => {
         await api(`/api/connectors/${segment(connector.id)}/host-grants/${segment(target.id)}`, { method: "PUT", body: {
-          ...(member ? { userId: member.userId } : {}), level, ...(days ? { expiresAt: new Date(Date.now() + days * 86_400_000).toISOString() } : {}),
+          ...(member ? { userId: member.userId } : {}), level, ...(owner ? { hostSessions: sessions } : {}), ...(days ? { expiresAt: new Date(Date.now() + days * 86_400_000).toISOString() } : {}),
         } });
+        setSessionsChoice(null);
         refresh();
       }, "Host command access granted.");
     })();
@@ -133,7 +150,7 @@ export function HostCommandGrantsSection({ connector, refresh }: { connector: Co
     }, "Host command access removed.");
   }
 
-  return <Section title="Host command access" bare info="host_bash runs OUTSIDE the sandbox, on this machine as its user. By default only the owner decides those commands. Grant members of a shared workspace the right to approve them, or to run their own without asking under Auto-approve. Grants end when they expire, when you remove them, or when the host stops being shared there.">
+  return <Section title="Host command access" bare info="host_bash runs OUTSIDE the sandbox, on this machine as its user. By default only the owner decides those commands. Grant members of a shared workspace the right to approve them, or to run their own without asking under Auto-approve. The owner may also let them start their own sessions directly on the host, without the sandbox. Grants end when they expire, when you remove them, or when the host stops being shared there.">
     <div className="card">
       {!grants.length && <Row title="Only the owner" hint="No one else decides host commands on this host" />}
       {grants.map(item => <Row key={`${item.workspaceId}:${item.userId ?? ""}`}
@@ -141,16 +158,22 @@ export function HostCommandGrantsSection({ connector, refresh }: { connector: Co
         hint={grantHint(item)}
         trailing={<>
           <StatusBadge tone={item.level === "auto" ? "warning" : "neutral"}>{item.level === "auto" ? "Auto-approve" : "Approve"}</StatusBadge>
+          {item.hostSessions && <StatusBadge tone="danger">Sessions on host</StatusBadge>}
           <Button variant="outline" size="sm" disabled={action.busy} onClick={() => revoke(item)}>Remove</Button>
         </>} />)}
       {!connector.revokedAt && (shared.length ? <Row title="Grant access" hint={members.loading ? "Loading members..." : levelLabels[level].hint} trailing={<>
         {shared.length > 1 && <Combobox label="Workspace" value={target?.id ?? ""} options={shared.map(workspace => ({ value: workspace.id, label: workspace.name }))} onChange={value => { setWorkspaceId(value); setGrantee(EVERYONE); }} disabled={action.busy} />}
         <Combobox label="Member" value={member ? member.userId : EVERYONE} options={[{ value: EVERYONE, label: "All members" }, ...eligible.map(item => ({ value: item.userId, label: usernameWithId(memberPerson(item)) }))]} onChange={setGrantee} disabled={action.busy} />
         <Combobox<HostCommandLevel> label="Access" value={level} options={(["approve", "auto"] as const).map(value => ({ value, label: levelLabels[value].label }))} onChange={setLevel} disabled={action.busy} />
+        {owner && !connector.capabilities.unsandboxed && <label className="check-row small" title={accepting ? "Their own sessions may run directly on this machine, without the sandbox, as its user" : "Turn on Sessions on the host under Configuration for this to apply"}>
+          <input type="checkbox" className="checkbox" checked={sessions} disabled={action.busy} onChange={event => setSessions(event.target.checked)} /><span>Sessions on the host</span>
+        </label>}
         <Combobox<Expiry> label="Expires" value={expiry} options={expiries.map(item => ({ value: item.value, label: item.label }))} onChange={setExpiry} disabled={action.busy} />
         <Button variant="outline" size="sm" disabled={action.busy || !target} onClick={grant}>Grant</Button>
       </>} /> : <Row title="Grant access" hint="Share the host with a workspace first" />)}
     </div>
+    {owner && grants.some(item => item.hostSessions) && !accepting && <Row title="Sessions on the host are off" hint="Grants that include sessions on the host apply only while Configuration → Sessions on the host is on." />}
+    {owner && grants.some(item => item.hostSessions) && connector.capabilities.hostGrants && !connector.capabilities.hostSessionGrants && <Row title="Update the host's connector" hint="This host's connector runs only your own sessions on the host: until it is updated (npx pistead@latest connect), members you granted that get the sandbox." />}
     {!connector.capabilities.hostGrants && <Row title="Update the host's connector" hint="This host's connector predates grants: until it is updated (npx pistead@latest connect), only the owner decides its host commands." />}
     <Feedback error={action.error} notice={action.notice} />
   </Section>;

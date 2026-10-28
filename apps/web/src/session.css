@@ -15,6 +15,22 @@
   .chat-column { width: 100%; max-width: var(--chat-width); margin: 0 auto; padding: 0 var(--space-4); }
 
   .session-transcript { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  /* Holds the transcript and, while the reader has scrolled up, a button back down floating over its bottom edge. */
+  .session-transcript-frame { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
+  .jump-to-latest.btn {
+    position: absolute;
+    bottom: var(--space-3);
+    left: 50%;
+    z-index: 2;
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--surface1);
+    box-shadow: var(--shadow);
+    transform: translateX(-50%);
+  }
+  .jump-to-latest.btn:hover:not(:disabled) { background: var(--surface2); }
   .session-transcript > .chat-column { display: grid; gap: var(--space-4); align-content: start; padding-top: var(--space-6); padding-bottom: var(--space-6); }
   .session-transcript .empty-state { margin-top: var(--space-12); }
 
@@ -78,10 +94,15 @@
   .entry-tool > summary > .icon:last-child { transition: transform 120ms ease; }
   .entry-tool[open] > summary > .icon:last-child { transform: rotate(90deg); }
   .entry-tool > pre { max-height: 420px; margin-top: var(--space-2); }
+  .entry-tool > .entry-brief { margin-top: var(--space-1); }
+  /* A paged transcript's way back: scrolling near it loads the next page too. */
+  .transcript-earlier { display: flex; justify-content: center; }
   .approval-marks { display: inline-flex; flex: 0 0 auto; align-items: center; gap: var(--space-1); }
 
   /* Bottom stack: pinned approvals, queue line, composer. */
-  .session-bottom { flex: 0 0 auto; max-height: 70%; overflow-y: auto; padding: var(--space-2) 0 var(--space-4); }
+  .session-bottom { display: grid; flex: 0 0 auto; gap: var(--space-3); padding: var(--space-2) 0 var(--space-4); }
+  /* Pinned cards and the queue line: at most this much of the screen, scrolling within it, so the chat box below never leaves it. */
+  .session-pinned { max-height: 45vh; max-height: calc(var(--viewport-height, 100dvh) * 0.45); overflow-y: auto; overscroll-behavior: contain; }
   .approval-card { display: grid; gap: var(--space-2); padding: var(--space-3); }
   .approval-card > pre { max-height: 200px; }
   .approval-head { display: flex; align-items: center; gap: var(--space-2); }
@@ -124,6 +145,8 @@
     width: 100%;
     min-height: 24px;
     max-height: 40vh;
+    /* Of the visible height (touch.ts), so a tall draft can't push the chat box out from above an open keyboard. */
+    max-height: calc(var(--viewport-height, 100dvh) * 0.4);
     padding: 0 var(--space-1);
     overflow-y: auto;
     border: 0;
@@ -137,15 +160,25 @@
   .composer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); min-width: 0; }
   .composer-toolbar .menu-anchor { min-width: 0; max-width: 100%; }
   .composer-toolbar .menu-anchor > .btn { max-width: 100%; }
+  /* The attach button and pickers: part of the toolbar's own wrapping row here, one sideways-scrolling strip on phones. */
+  .composer-tools { display: contents; }
+  .composer-attach.btn.icon-only.sm { color: var(--foreground-muted); }
   /* The hint takes what is left of the row; below ~160px it wraps to its own line rather than truncating. */
   .composer-hint { flex: 1 1 160px; min-width: 0; color: var(--foreground-muted); font-size: var(--font-xs); overflow-wrap: anywhere; }
   /* Stop and send stay together at the end of the row. */
   .composer-actions { display: flex; flex: 0 0 auto; gap: var(--space-1); margin-left: auto; }
   .composer-send.btn, .composer-stop.btn { width: var(--control-sm); padding: 0; border-radius: var(--radius-full); }
 
+  @media (pointer: coarse) {
+    /* Send and stop are the chat box's most-used targets: a full fingertip each. */
+    .composer-send.btn, .composer-stop.btn { width: var(--control-md); height: var(--control-md); }
+  }
+
   /* Right panel: pinned column on wide screens, overlay below. */
   .session-panel {
     display: grid;
+    /* Its tabs scroll rather than widen it past its column. */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
@@ -154,6 +187,10 @@
     background: var(--background);
   }
   .session-panel-header { display: flex; align-items: center; gap: var(--space-2); min-height: 48px; padding: 0 var(--space-3); border-bottom: 1px solid var(--border); }
+  /* Five tabs don't fit a phone's width: they scroll sideways rather than push the close button off screen. */
+  .session-panel-header > .segmented { flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .session-panel-header > .segmented::-webkit-scrollbar { display: none; }
+  .session-panel-header > .segmented > button { flex: 0 0 auto; }
   .session-panel-body { min-height: 0; padding: var(--space-4) var(--space-4) var(--space-8); overflow-y: auto; }
   .session-panel .card > .alert { margin: var(--space-3); }
   .backup-detail { padding: 0 var(--space-4) var(--space-4); }
@@ -317,9 +354,64 @@
     .repository-progress:indeterminate { animation: none; }
   }
 
-  @media (max-width: 600px) {
+  /* Phones, held either way, and any screen an open keyboard leaves short. */
+  @media (max-width: 600px), (max-height: 500px) {
     .session-badges > .badge:not(:first-child) { display: none; }
-    .session-pull-link > .icon:last-child { display: none; }
+    /* The live status keeps its dot; its word stays for screen readers, clipped as .visually-hidden is. */
+    .session-badges > .badge:first-child:has(> .dot) { gap: 0; padding: 0 7px; }
+    .session-badges > .badge:first-child:has(> .dot) > .badge-label {
+      position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+    }
+    .session-badges { margin-right: 0; }
+    .session-pull-link > .icon:last-child, .session-pull-prefix, .session-pull-state { display: none; }
+    .session-screen .screen-subtitle { display: none; }
     .chat-column { padding: 0 var(--space-3); }
+    .session-transcript > .chat-column { padding-top: var(--space-4); padding-bottom: var(--space-4); }
+    .entry-bubble { max-width: 90%; }
+    .session-alerts { padding: var(--space-2) var(--space-3) 0; }
+    .session-bottom { padding: var(--space-2) 0; }
+    .composer { padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3); }
+    .composer > textarea { max-height: 30vh; max-height: calc(var(--viewport-height, 100dvh) * 0.3); }
+    .approval-card > pre { max-height: 7.5em; }
+    /* One toolbar row: the tools scroll sideways in what send and stop leave of it. */
+    .composer-tools {
+      display: flex;
+      flex: 1 1 0;
+      align-items: center;
+      gap: var(--space-1);
+      min-width: 0;
+      margin-left: calc(-1 * var(--space-1));
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .composer-tools::-webkit-scrollbar { display: none; }
+    /* Its end fades out: there is more to scroll to. */
+    .composer-tools { padding-right: var(--space-4); mask-image: linear-gradient(to right, #000 calc(100% - var(--space-4)), transparent); }
+    .composer-tools > * { flex: 0 0 auto; }
+    .composer-tools .menu-anchor { max-width: 55vw; }
+    /* "Runs as" can wait for a wider screen; why the box is read-only, or who sees a side ask, can't. */
+    .composer-hint:not(.required) { display: none; }
+    .composer-hint.required { flex-basis: 100%; order: 3; }
+    /* The panel covers the whole conversation rather than leave a sliver of it beside. */
+    .session-panel, .session-screen.panel-wide .session-panel { width: 100%; border-left: 0; }
+    .session-panel-body { padding: var(--space-3) var(--space-3) var(--space-8); }
   }
+  /*
+   * Short of height, the conversation and the chat box come first: the cards get a third of it, scrolling; while typing,
+   * the draft and the cards share what's left, so some conversation stays in view. The same rules twice: by the media
+   * query, and by .short-viewport, which touch.ts sets from the visible height that an iOS keyboard leaves.
+   */
+  @media (max-height: 500px) {
+    .session-pinned { max-height: 33vh; max-height: calc(var(--viewport-height, 100dvh) * 0.33); }
+    .composer > textarea { max-height: calc(var(--viewport-height, 100dvh) * 0.25); }
+    .session-bottom:has(.composer:focus-within) .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.2); }
+    .session-transcript > .chat-column { padding-top: var(--space-2); padding-bottom: var(--space-2); }
+  }
+  .short-viewport .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.33); }
+  .short-viewport .composer > textarea { max-height: calc(var(--viewport-height, 100dvh) * 0.25); }
+  .short-viewport .session-bottom:has(.composer:focus-within) .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.2); }
+  .short-viewport .session-transcript > .chat-column { padding-top: var(--space-2); padding-bottom: var(--space-2); }
 }
+
+/* Scheduled prompts (session-schedules.tsx). */
+.schedule-card pre.schedule-content { margin: 0 0 8px; max-height: 8.5em; overflow: auto; white-space: pre-wrap; word-break: break-word; }

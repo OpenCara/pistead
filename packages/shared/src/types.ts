@@ -19,7 +19,7 @@ export type AssignableWorkspaceRole = (typeof assignableWorkspaceRoles)[number];
 /** The four tiers of access to one session given to one member, least first; sessionRolePermissions (policy.ts) defines them. */
 export const sessionRoles = ["viewer", "member", "collaborator", "admin"] as const;
 export type SessionRole = (typeof sessionRoles)[number];
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue", "schedule", "sessions"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**
  * Tools of sessions that pinned their repositories, which are read-only now: still valid in stored agents and
@@ -95,6 +95,11 @@ export interface AgentVersion {
  */
 export const sessionActivities = ["idle", "working", "waiting", "done", "failed"] as const;
 export type SessionActivity = (typeof sessionActivities)[number];
+/**
+ * A branch a session on a host has checked out in its clone of one of the workspace's github.com repositories (owner/name),
+ * as its host reports it so that the control plane finds the branch's pull request.
+ */
+export interface SessionBranch { repository: string; branch: string }
 export interface SessionRecord {
   id: string;
   workspaceId: string;
@@ -127,17 +132,30 @@ export interface SessionRecord {
   cloneUnavailable?: string;
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
+  /** The session whose agent started this one with the sessions tool, as the same person; absent for every other session. */
+  parentSessionId?: string;
+  /**
+   * "brief": everyone viewing the session (share links included) sees each tool result as its first line and long tool
+   * calls cut short, to keep transcripts small. Absent: full tool output. It starts as its workspace sets for new sessions; only the owner changes it.
+   */
+  toolOutput?: "brief";
   // Present only on single-session reads: the pinned host explicitly runs without isolation, or this session runs on it
   // directly (hostEnvironment).
   hostUnsandboxed?: boolean;
   /**
-   * The session runs directly on its host's own environment, without the sandbox: chosen when its owner, the host's
-   * owner, started it on a host whose configuration accepts that (HostConfig.hostSessions), and fixed for its life.
-   * Its commands run as the host's OS user; deciding them needs host command authority, as host commands do.
+   * The session runs directly on its host's own environment, without the sandbox: chosen when its owner started it on
+   * a host whose configuration accepts that (HostConfig.hostSessions), as the host's owner or a member they granted
+   * sessions on the host (HostCommandGrant.hostSessions), and fixed for its life. Its commands run as the host's OS
+   * user; deciding them needs host command authority, as host commands do.
    */
   hostEnvironment?: true;
   /** What its agent is doing, as its host last reported it; absent until a connector that reports activity opens it. */
   activity?: SessionActivity;
+  /**
+   * When the next of its scheduled prompts sends its agent a message (SessionSchedule); absent when none is enabled.
+   * Display state, like activity.
+   */
+  nextScheduledAt?: string;
   /**
    * The pull request its newest git_push with a pull request opened, or found already open; absent until one does.
    * Display state, like activity: what the push recorded, and the state the control plane last read for it.
@@ -155,6 +173,31 @@ export interface SessionPullRequest {
   number?: number;
   /** Absent until it has been read (github.com pull requests only, so far). */
   state?: PullRequestState;
+}
+/**
+ * A scheduled prompt: a message the server sends the session's agent on a cron schedule (packages/shared/src/cron.ts),
+ * as the session's owner, who alone manages them. A run that comes while the agent is busy or waits for an approval is
+ * skipped, not queued.
+ */
+export interface SessionSchedule {
+  id: string;
+  sessionId: string;
+  name: string;
+  cron: string;
+  /** IANA time zone the cron expression is read in. */
+  timeZone: string;
+  content: string;
+  access: AccessMode;
+  enabled: boolean;
+  /** Null while paused, or when the expression never comes round. */
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastSubmissionId: string | null;
+  /** Why its last run sent nothing: an API error code, or `session_busy`. */
+  lastError: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
 }
 export interface SessionGrant {
   userId: string;
@@ -213,6 +256,11 @@ export interface AuthorizationRequest {
   ownerId: string;
   /** Also report the actor's authority over host commands on the session's host (`hostCommands`). */
   host?: boolean;
+  /**
+   * With `host`, also report whether the actor may run their own sessions directly on the session's host
+   * (`hostSessions`). Asked only by connectors that honor such grants, so older ones never receive the field.
+   */
+  hostSessions?: boolean;
 }
 /**
  * What a member may do with host_bash on a host: `approve` decides each host command; `auto` also runs the host
@@ -227,6 +275,11 @@ export interface AuthorizationResult {
   ownerId: string;
   /** Present only when requested (`host`) and the actor holds some authority over the session's host commands. */
   hostCommands?: HostCommandLevel;
+  /**
+   * Present only when requested (`hostSessions`) and the actor may run their own sessions directly on the session's
+   * host: they own it, or hold a grant there that includes sessions on the host (HostCommandGrant.hostSessions).
+   */
+  hostSessions?: true;
 }
 /** A pull request the control plane opens as the session owner after a successful push. `base` defaults to the default branch. */
 export interface PullRequestRequest {
@@ -254,8 +307,12 @@ export interface GitPushOperation {
   commit: string;
   pullRequest?: PullRequestRequest;
 }
-/** What a tool call lacks: a tool the agent doesn't include, changes in a Read-only message, or a shell without resource limits. */
-export const permissionNeeds = ["tool", "write", "unbounded-shell"] as const;
+/**
+ * What a tool call lacks: a tool the agent doesn't include, changes in a Read-only message, a shell without resource
+ * limits, or (`audience`) showing this session's readers another session's transcript that only a narrower audience
+ * can read now (the sessions tool; see packages/shared/src/cross-session.ts).
+ */
+export const permissionNeeds = ["tool", "write", "unbounded-shell", "audience"] as const;
 export type PermissionNeed = (typeof permissionNeeds)[number];
 /**
  * A tool call that needs more than the session allows. The call waits while the session owner allows it once or for the
@@ -360,6 +417,31 @@ export interface GitHubReadRequest {
   repository: string;
   issue: number;
 }
+/** What the schedule tool does with the session's scheduled prompts. */
+export const scheduleToolActions = ["list", "create", "update", "delete"] as const;
+export type ScheduleToolAction = (typeof scheduleToolActions)[number];
+/**
+ * Runner -> control plane: list, create, change or delete the session's scheduled prompts (SessionSchedule) for a
+ * tool call of the session owner's write message, as the Schedules tab does for them.
+ */
+export interface ScheduleToolRequest {
+  sessionId: string;
+  /** The session owner, who sent the message whose tool call this is; `admissionId` is that message's write admission. */
+  actorId: string;
+  admissionId: string;
+  /** The tool call, so a one-call permission for schedule covers it. */
+  callId: string;
+  action: ScheduleToolAction;
+  /** The schedule an update or delete changes. */
+  scheduleId?: string;
+  name?: string;
+  cron?: string;
+  timeZone?: string;
+  content?: string;
+  access?: AccessMode;
+  enabled?: boolean;
+}
+export type ScheduleToolResult = { schedules: SessionSchedule[] } | { schedule: SessionSchedule } | { deleted: string };
 /** Runner -> control plane: perform one merge, human-approved or under the owner's Auto-approve. */
 export type GitHubMergeRequest = GitHubEffectAuthority & {
   sessionId: string;
@@ -579,6 +661,12 @@ export interface AutoApprovedCall {
   /** It ran without resource limits, on the owner's own host. */
   unbounded?: true;
 }
+/**
+ * Why Pi could not compact a conversation's context before answering, from Pi's own fixed messages: its summary hit the
+ * summarizer's token limit, the summarizer called a tool, wrote no text, or compaction was aborted. Never provider text.
+ */
+export type CompactionFailure = "token_limit" | "tool_call" | "no_text" | "aborted";
+export const COMPACTION_FAILURES: readonly CompactionFailure[] = ["token_limit", "tool_call", "no_text", "aborted"];
 export interface EntryView {
   id: string;
   kind: string;
@@ -586,12 +674,21 @@ export interface EntryView {
   text: string;
   actorId?: string;
   conversationId?: string;
-  /** The model request behind this entry failed. Only the provider/model and HTTP status cross the boundary, never provider text. */
-  error?: { provider?: string; modelId?: string; status?: number };
+  /**
+   * The model request behind this entry failed. Only the provider/model, HTTP status and, when Pi could not compact the
+   * context first, which fixed compaction failure it was cross the boundary, never provider text.
+   */
+  error?: { provider?: string; modelId?: string; status?: number; compaction?: CompactionFailure };
   /** How long the model took to write this reply, or the tool to run; absent for entries recorded before Pi 1.1.0. */
   durationMs?: number;
   /** This entry's tool calls whose commands ran under auto-approve, in call order; absent from older runners. */
   autoApproved?: AutoApprovedCall[];
+  /**
+   * The session shows brief tool output (`SessionRecord.toolOutput`) and `text` is shortened: a tool result's first
+   * line, or tool calls cut to their first characters. The whole text's lines and characters (code points); the host
+   * keeps it.
+   */
+  trimmed?: { lines: number; chars: number };
 }
 /**
  * Phases of preparing one pinned repository on a host with a repository cache (connect --repo-cache): its turn, the
@@ -619,6 +716,18 @@ export interface RepositoryPreparationView {
   /** Why it failed, in fixed and credential-free words. Restarting the session tries again. */
   error?: string;
 }
+export interface ConversationView {
+  id: string;
+  mode: "write" | "ask";
+  actorId?: string;
+  /**
+   * In a workspace that loads transcripts latest first, how many of this conversation's entries come before the ones
+   * `entries` holds; `GET /api/sessions/:id/entries` reads them. Absent when `entries` holds them all.
+   */
+  olderEntries?: number;
+  /** With `olderEntries`: the entry just before this conversation's first one in `entries`. */
+  previousEntryId?: string;
+}
 export interface SessionView {
   sessionId: string;
   owner: Pick<UserProfile, "id" | "displayName" | "gitName" | "gitEmail" | "githubLogin">;
@@ -630,7 +739,7 @@ export interface SessionView {
   approvals: ApprovalRecord[];
   /** How many older settled approvals `approvals` leaves out; the host keeps them. */
   olderApprovals?: number;
-  conversations: { id: string; mode: "write" | "ask"; actorId?: string }[];
+  conversations: ConversationView[];
   busy: boolean;
   /**
    * Every message, in order. `stopping` and `stopped` mark one someone stopped (see `stoppable`): stopping while the host

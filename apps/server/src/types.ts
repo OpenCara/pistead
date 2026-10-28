@@ -28,10 +28,19 @@ export interface Env {
   GITHUB_APP_ID?: string;
   GITHUB_APP_SLUG?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /**
+   * Direct Git transfers (network.ts gitDirect): `on` (default), `own-hosts` (credentials only to session owners' own hosts;
+   * public repositories are still read directly everywhere) or `off` (every Git request is relayed through the server).
+   */
+  GIT_DIRECT?: string;
   /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */
   ADMIN_USER_IDS?: string;
+  /** `true` on a local server (http.ts localMode): loopback only, and only the GitHub account that claimed it signs in. */
+  LOCAL_MODE?: string;
+  /** The local server's claim secret (base64url, 32 bytes): a sign-in carrying it may claim an unclaimed local server. */
+  LOCAL_CLAIM_SECRET?: string;
 }
 export interface AuthIdentity {
   userId: string;
@@ -82,10 +91,20 @@ export interface SessionRow {
   archived_status?: 'provisioning' | 'ready' | 'error' | null;
   /** What its agent is doing, as its host last reported it; display state only, never part of the runner binding. */
   activity?: SessionActivity | null;
+  /** When its next scheduled prompt runs (scheduled-prompts.ts); display state only, never part of the runner binding. */
+  next_scheduled_at?: string | null;
+  /** The session whose agent started this one with the sessions tool (cross-session.ts); null otherwise. Immutable. */
+  parent_session_id?: string | null;
+  /** How its transcript shows tool output to viewers (transcript-display.ts); display only. Absent on older rows: full. */
+  tool_output?: 'full' | 'brief';
   /** Only on rows read through session access: the newest pull request a push from this session opened or found. */
   pull_request_url?: string | null;
   /** Only on rows read through session access: that pull request's state as last read (pull-request-states.ts). */
   pull_request_state?: string | null;
+  /** Only on rows read through session access: the pull request found last for a branch its host reported (session-branches.ts). */
+  branch_pull_request_url?: string | null;
+  /** Only on rows read through session access: that pull request's state as last read. */
+  branch_pull_request_state?: string | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;

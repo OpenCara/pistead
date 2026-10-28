@@ -1,4 +1,4 @@
-import { mkdir, readFile, open, link, unlink, chmod, realpath, lstat } from "node:fs/promises";
+import { mkdir, readFile, open, link, unlink, chmod, realpath, lstat, readdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -9,7 +9,7 @@ import type { RunnerAction, RunnerBinding, RunnerTicket, SubmitInput, Operation 
 import type { RestoreDescriptor, RestoreInput } from "../../../packages/shared/src/connector.js";
 import { ViewRevisions } from "../../../packages/shared/src/view-patch.js";
 import { assertId, permissionFor, RunnerError, stableJson, validateBinding, verifyRunnerTicket } from "./protocol.js";
-import { RunnerSession, type RunnerConfig } from "./session.js";
+import { RunnerSession, WORK_MARKER, type RunnerConfig } from "./session.js";
 import { restoreSession } from "./restore.js";
 
 function immutable<T>(value: T): T {
@@ -75,6 +75,23 @@ export class RunnerService {
     })();
     this.sessions.set(id, opening);
     try { return await opening; } catch (error) { this.sessions.delete(id); throw error; }
+  }
+
+  /**
+   * Opens every session that had work in progress when its runner last stopped (WORK_MARKER), one at a time, so that
+   * work goes on rather than waiting until someone opens the session. Opening resumes it as any open does; a session
+   * that can't open is left for its next request.
+   */
+  async resume(): Promise<void> {
+    let names: string[];
+    try { names = await readdir(join(this.dataDir, "sessions")); }
+    catch { return; }
+    for (const name of names.sort()) {
+      if (this.closed) return;
+      try { assertId(name); } catch { continue; }
+      const marked = await lstat(join(this.dataDir, "sessions", name, WORK_MARKER)).then(stat => stat.isFile(), () => false);
+      if (marked) await this.get(name).catch(() => {});
+    }
   }
 
   async provision(input: unknown, ticket: RunnerTicket): Promise<RunnerSession> {
@@ -209,7 +226,9 @@ export function createRunnerApp(service: RunnerService): Hono {
     }
     const session = await service.get(id);
     if (ticket.ownerId !== session.binding.owner.id) throw new RunnerError(403, "Ticket owner mismatch");
-    await session.authorize(ticket.actorId, permissionFor(action), ticket.policyVersion);
+    // A decision needs approve permission, but the host's owner decides a host command with any access to the session:
+    // decide() checks which one the card's operation needs.
+    await session.authorize(ticket.actorId, action === "approve" ? "read" : permissionFor(action), ticket.policyVersion);
     if (action === "operations" || action === "restart" || action === "backup") await session.consumeTicket(ticket);
     if (action === "view") {
       let views = revisions.get(session);

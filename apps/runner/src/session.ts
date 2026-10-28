@@ -1,13 +1,18 @@
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
 import { randomBytes, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
 import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
 import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, SessionActivity, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
-import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, thinkingLevels } from "../../../packages/shared/src/types.js";
+import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionBranch, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
+import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, repositoryPreparationPhases, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
+import { scheduleToolTarget } from "../../../packages/shared/src/cron.js";
+import { crossSessionLimits, sessionsToolActions, sessionsToolTarget, sessionsWriteActions, type SessionsToolRequest, type SessionsToolResult } from "../../../packages/shared/src/cross-session.js";
+import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
 import { sha256 } from "../../../packages/shared/src/crypto.js";
@@ -20,24 +25,27 @@ import type { SandboxBackendConfig } from "./sandbox-backend.js";
 import { HelperWorkspace } from "./helper-workspace.js";
 import { SeatbeltBackend } from "./seatbelt.js";
 import { WindowsBackend } from "./windows-sandbox.js";
+import { reportedBranches } from "./clone-branches.js";
 import {
   hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
 } from "./sandbox.js";
 import { IMAGE_BUSY, IMAGE_ERROR, imageType, prepareImage } from "./images.js";
 import { performClonePush, PushError, pushSummary, type PushResult } from "./push.js";
-import { HostCredentialError } from "./git-credentials.js";
+import { HostCredentialError, hostGitAuthorization } from "./git-credentials.js";
 import { GitRemote, GitRemoteError } from "./git-remote.js";
 import { mirrorPath, type MirrorRepository, type RepositoryCache } from "./repo-cache.js";
 import type { RepositoryPreparationItem, RepositoryPreparationView } from "../../../packages/shared/src/types.js";
 import type { ResourceConfig } from "./resources.js";
 import type { RestoreManifest } from "./restore.js";
 import { applyEdits } from "./edits.js";
+import { compactionFailure, configuredCompaction, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
-import { EgressProxy, egressEnvironment, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type RelayRequest } from "./egress.js";
-import { egressReadServices, type EgressGrant, type EgressRepository } from "../../../packages/shared/src/network.js";
+import { EgressProxy, egressEnvironment, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type MirrorProgress, type RelayRequest } from "./egress.js";
+import { DirectGit } from "./git-direct.js";
+import { egressReadServices, type EgressGrant, type EgressRepository, type GitDirectRequest } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
-import { defaultHostConfig, type HostConfig } from "../../../packages/shared/src/host-config.js";
+import { defaultHostConfig, type HostCompaction, type HostConfig } from "../../../packages/shared/src/host-config.js";
 import { commandLimits, type CommandLimits } from "./host-config.js";
 
 type Run = {
@@ -59,15 +67,18 @@ type Run = {
   /** Its images were gone or unreadable on the host when it was to run, so it ended without reaching Pi (see endLostInputs). */
   inputsLost?: true;
   /** Pi ended the run without an answer or any entry: its model was unavailable, or its context could not be compacted. */
-  failure?: { reason: "model_error" | "no_model"; provider?: string; modelId?: string };
+  failure?: { reason: "model_error" | "no_model" | "compaction_failed"; provider?: string; modelId?: string; compaction?: CompactionFailure };
   /** Who stopped it (see stop); `pending` until its conversation's work has ended, which holds the queue. */
   stopped?: { by: string; pending?: true };
   /** Pi parked its work after host crashes cut it off again and again, so it ended (see endParkedRuns). */
   crashed?: true;
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
-/** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
-type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
+/**
+ * What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access.
+ * `audience`: the sessions tool exchanges content with sessions whose readers aren't this session's.
+ */
+type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean; audience?: boolean };
 /** A session's backup (format pi-runner-backup-v1), as restore.ts reads it back. */
 interface RunnerBackup {
   format: "pi-runner-backup-v1";
@@ -93,6 +104,19 @@ type InputImage = { mimeType: string; data: string };
 const MAX_QUEUED_IMAGE_BYTES = 16 * 1024 * 1024;
 /** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files"];
+/** How often a sessions tool wait reads its message's outcome. */
+const WAIT_POLL_MS = 3000;
+const SESSIONS_TOOL_DESCRIPTION = "Work with this workspace's other Pistead sessions, as the person whose message you are working on, with exactly their permissions in each session. "
+  + "action list: the sessions they can see (id, title, status, activity, their permissions, parent) and the models create can use. "
+  + "read {session, limit?, message_id?}: a session's latest shared-conversation entries and pending approvals; with message_id, also the outcome of a message this session sent it (status, done, reply). "
+  + "ask {session, message, notify?}: a read-only side question to that session's agent. "
+  + "send {session, message, access?, notify?}: a message to that session's agent, as if typed in its chat (access approval, the default: its commands wait for people there; read: inspect only; auto: only in a message the session owner sent with auto-approve, to a session they own); refused while it is busy. "
+  + "wait {session, message_id, timeout_seconds?}: block until a message this session sent finishes (default 300 seconds), then return its outcome and reply. "
+  + "create {message?, title?, model?, visibility?, access?, notify?}: start a new session for a sub-task, as the same person, on this session's model unless model names one list returns, and send it message. "
+  + "stop {session}: stop that session's current work. archive {session}: archive a session they own. "
+  + "With notify, Pistead sends this session the outcome as a new message once the other session finishes. Delivered messages start with a line naming this session and the sender; "
+  + "chains of messages stop after 3 hops and never loop back to a session they came from; approvals in another session are decided only by people there. "
+  + "Involve other sessions only when the user asked for it or clearly expects it.";
 /**
  * How long after a message is sent its tool calls can wait on a card: the owner's permission or an operation's approval.
  * Deciding needs the message's write admission, which lasts an hour from sending, so a card older than that can't be
@@ -124,6 +148,10 @@ export type RunnerConfig = {
   githubMerge?: (request: GitHubMergeRequest) => Promise<GitHubMergeResult>;
   /** Opens one issue, as githubComment; a refusal GitHub stated throws a RunnerError with status 422 and its reason. */
   githubIssue?: (request: GitHubIssueRequest) => Promise<GitHubIssueResult>;
+  /** Lists, creates, changes or deletes the session's scheduled prompts, as the schedule tool asks; the control plane's refusal throws a RunnerError with its reason. */
+  schedules?: (request: ScheduleToolRequest) => Promise<ScheduleToolResult>;
+  /** One sessions tool call (any action but wait, which is reads), through the control plane; its refusal throws a RunnerError with its reason. */
+  crossSessions?: (request: SessionsToolRequest) => Promise<SessionsToolResult>;
   /** Issues the credential for one approved push; a token is held only in this process's memory. */
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
@@ -136,15 +164,22 @@ export type RunnerConfig = {
   /** The host's models; `thinkingLevel` is the level its Pi starts the model at. */
   resolveModels?: (model: ModelDefinition) => Promise<{ models: Models; provider: string; modelId: string; thinkingLevel?: ThinkingLevel }>;
   readBackup?: (restore: RestoreDescriptor, targetSessionId: string) => Promise<Uint8Array>;
-  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them. */
+  /** The host's Pi compaction settings, overall and per model; Pi's defaults without them, but for reasoning models' room (see hostCompaction). */
   compaction?: CompactionSettings;
   /** How the host's Pi identifies its requests to providers; pi-durable's default (attributed to pi) without it. */
   identity?: ClientIdentity;
   /**
    * This host's repository cache, when its configuration keeps one (HostConfig.repositoryCache): a mirror per repository,
-   * filled through the control plane's relay, that clones borrow objects from. Fixed for a connection.
+   * filled straight from its provider with this host's own Git credentials (see cacheRemote), that clones borrow objects
+   * from once the control plane's relay confirms their owner may read it. Fixed for a connection.
    */
   repositoryCache?: RepositoryCache;
+  /**
+   * How the repository cache reads a workspace repository: by default directly from its provider, with the credential Git
+   * on this host would use (its credential helpers), or anonymously where it has none for the provider. Never through the
+   * relay. Tests stand in their own remote.
+   */
+  cacheRemote?: (repository: EgressRepository) => Promise<GitRemote>;
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
@@ -154,9 +189,19 @@ export type RunnerConfig = {
   openStorage?: (path: string) => Promise<Storage>;
   /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
   reportActivity?: (sessionId: string, activity: SessionActivity) => Promise<void>;
+  /**
+   * Tells the control plane which branches a session on the host has checked out in its clones of the workspace's
+   * github.com repositories, so that it finds their pull requests (clone-branches.ts); connected runners only.
+   */
+  reportBranches?: (sessionId: string, branches: SessionBranch[]) => Promise<void>;
   /** A session's network grant and its Git relay, through the connector; without them, the control plane's internal routes. */
   egressGrant?: (sessionId: string) => Promise<EgressGrant>;
   gitRelay?: (sessionId: string, request: RelayRequest) => Promise<Response>;
+  /**
+   * A direct grant for one of a session's Git requests (GitDirectGrant), through the connector; without it, the control
+   * plane's internal route. The host then makes the request at the forge itself, so it doesn't cross the control plane.
+   */
+  gitDirect?: (sessionId: string, request: Omit<GitDirectRequest, "sessionId">) => Promise<unknown>;
   /**
    * How the host runs its sessions, as its owner and admins set it in Pistead (the connector caches it briefly). Read for
    * each shell command: its time limit and GPU. Without it, the defaults.
@@ -166,6 +211,12 @@ export type RunnerConfig = {
 
 /** How long the relay's word that a session's owner may read a repository lets the session borrow from its mirror. */
 const MIRROR_CONFIRM_MS = 10 * 60 * 1000;
+/** How long a clone waits for the refresh of a mirror filled before; then it borrows the mirror as it is (see mirror). */
+const MIRROR_REFRESH_WAIT_MS = 10_000;
+/** Pauses before the relay is asked again for a repository's refs, after a quick failure another attempt may get past. */
+const OWNER_REFS_RETRY_MS = [500, 2_000];
+/** How long one listing of a repository's refs through the relay may take. */
+const OWNER_REFS_TIMEOUT_MS = 30_000;
 
 /**
  * A definite refusal from the control plane or the provider: a 4xx other than a timeout or rate limit, as a RunnerError
@@ -182,6 +233,20 @@ function mirrorRepository(repository: EgressRepository): MirrorRepository & { bi
   return { bindingId: repository.bindingId, provider: repository.provider, host: repository.host, repositoryId: repository.repositoryId, fullName: repository.fullName };
 }
 
+/**
+ * Why the host couldn't fill its mirror of `repository`, as the clone waiting for it is told (see GIT_SHIM): 503 for a
+ * failure another attempt may get past, after the cache's own attempts, so the clone asks again or stops to be run again
+ * rather than downloading the repository without the cache; any other status lets it go ahead without the cache.
+ */
+function cacheFailure(error: unknown, repository: EgressRepository): RunnerError {
+  if (error instanceof RunnerError) return error;
+  if (error instanceof GitRemoteError && error.status !== undefined && [401, 403, 404].includes(error.status)) {
+    return new RunnerError(502, `This host's Git credentials can't read ${repository.fullName}; its owner can set one up for ${repository.host} on it, for example with gh auth setup-git`);
+  }
+  const reason = error instanceof Error && /^[\x20-\x7e]{1,300}$/.test(error.message) ? error.message : "The repository could not be cached";
+  return new RunnerError(error instanceof GitRemoteError && error.retryable ? 503 : 502, reason);
+}
+
 function preparationFailure(reason: string): string {
   return `${reason.replace(/\.$/, "")}. Restart the session to try again.`;
 }
@@ -193,6 +258,12 @@ type ProgressUpdate = (path: string, change: Partial<Omit<RepositoryPreparationI
 
 /** What the transcript says after a run that the host's crashes ended (see endParkedRuns). */
 const CRASHED_TEXT = "Stopped: the host crashed repeatedly while working on this message. Send it again to retry.";
+
+/**
+ * Beside a session's storage while its agent is working or waiting on a decision, and gone once it isn't: a runner that
+ * starts again opens just these sessions, so their work goes on without someone opening them (RunnerService.resume).
+ */
+export const WORK_MARKER = "working";
 
 /** Whether the model request behind a transcript entry failed, which the session view shows as a failed model turn. */
 function modelFailed(entry: EntryRecord): boolean {
@@ -244,6 +315,8 @@ export class RunnerSession {
   readonly #activity: ActivityReporter | undefined;
   /** The sandbox's only way out (see EgressProxy); listening while the session is open. Host mode has no sandbox to confine. */
   readonly #egress: EgressProxy | undefined;
+  /** Git requests this host makes at the forge itself, where the control plane grants it (see DirectGit). */
+  readonly #direct: DirectGit | undefined;
   /** A clone session: no pins; the agent clones the workspace's repositories with plain Git through the egress proxy. */
   readonly #clone: boolean;
   /**
@@ -253,23 +326,36 @@ export class RunnerSession {
   readonly #frozen: boolean;
   /**
    * The session runs directly on the host's own environment, with no sandbox: every session of an unsandboxed host, or
-   * one its owner started that way on a host that accepts it (`#hostSession`).
+   * one started that way on a host that accepts it (`#hostSession`).
    */
   readonly #onHost: boolean;
   /**
-   * A session its host's owner started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise
-   * sandboxes its sessions: it runs commands only while the host's configuration still accepts that
-   * (HostConfig.hostSessions), and deciding them needs host command authority, as host commands do.
+   * A session started directly on the host (SessionRecord.hostEnvironment), on a host that otherwise sandboxes its
+   * sessions, by its owner or by a member they granted that: it runs commands only while the host's configuration still
+   * accepts that (HostConfig.hostSessions) and, for a member's, while their grant still includes it; deciding them
+   * needs host command authority, as host commands do.
    */
   readonly #hostSession: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
   /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
   #lfsRepositories: string[] = [];
+  /** A clone session on the host: the workspace's repositories, whose checked-out branches it reports (reportBranches). */
+  #branchRepositories: EgressRepository[] = [];
+  /** The branches last reported, as JSON, and whether a report runs or another is wanted after it. */
+  #branchesSent: string | undefined;
+  #branchesReporting = false;
+  #branchesWanted = false;
   /** Clones a restore left to clone again that this open couldn't restore, for the agent's instructions. */
   #cloneFailures: { path: string; reason: string }[] = [];
   /** Restored from a conversation-only backup (Metadata.conversationOnlyRestore), for the agent's instructions. */
   #conversationOnlyRestore = false;
+  /**
+   * The compaction token counts of the host's configuration as last read (HostConfig.compaction), which the harness's
+   * settings put over the host's Pi settings at each use: a change applies from the first message after the connector's
+   * configuration refresh (HostConfigSource, 30 seconds).
+   */
+  #configuredCompaction: HostCompaction | undefined;
   /**
    * The host cache's mirrors this clone session may borrow from, by sandbox path, and when the relay last let its owner
    * read each (0: not yet in this open). Mounted only while confirmed in the last MIRROR_CONFIRM_MS (see mirrorMounts).
@@ -285,11 +371,18 @@ export class RunnerSession {
     this.#frozen = !this.#clone && (binding.session.repositories ?? []).length > 0;
     this.#hostSession = binding.session.hostEnvironment === true && config.unsandboxed !== true;
     this.#onHost = config.unsandboxed === true || this.#hostSession;
-    // Only the host's owner's own sessions ever run on the host itself; the control plane admits no other, and neither
-    // does the host.
-    if (this.#hostSession && (!binding.session.connectorOwnerId || binding.session.connectorOwnerId !== binding.owner.id)) {
-      throw new RunnerError(403, "Only the host's owner's sessions run directly on the host");
+    // Only sessions of the host's owner, or of a member they granted that, run on the host itself: the control plane
+    // admits no other, and the host checks a member's grant again before each of their commands
+    // (requireHostEnvironment).
+    if (this.#hostSession && !binding.session.connectorOwnerId) {
+      throw new RunnerError(403, "Only sessions of the host's owner, or of members they granted that, run directly on the host");
     }
+    // Grants come the way relayed requests go: through the connector, or the control plane's internal route. A runner
+    // given a relay of its own and no way to ask for grants relays everything.
+    const directGrant = config.gitDirect ? (request: Omit<GitDirectRequest, "sessionId">) => config.gitDirect!(binding.session.id, request)
+      : config.gitRelay ? undefined
+      : (request: Omit<GitDirectRequest, "sessionId">) => this.controlPlane("/api/internal/git/direct", { sessionId: binding.session.id, ...request });
+    this.#direct = directGrant && new DirectGit({ grant: directGrant, onFallback: (request, reason) => this.#egress?.noteFallback(request.bindingId, reason) });
     if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
     else if (config.sandboxBackend) {
       // macOS and native Windows sandboxes share the host's network: the proxy listens on a loopback port that wants
@@ -310,7 +403,22 @@ export class RunnerSession {
         ...(this.#clone && cache ? { mirrors: () => this.mirrorMounts() } : {}) });
     }
     const report = config.reportActivity;
-    this.#activity = report && new ActivityReporter(() => this.activity(), activity => report(binding.session.id, activity));
+    // Once the agent stops working, its clones are as it left them: a session on the host reports their branches then.
+    this.#activity = report && new ActivityReporter(() => this.activity(), async activity => {
+      // Marked first: a report that fails (the host is reconnecting) is retried, and the mark must not wait for it. The mark
+      // only saves someone opening the session after a restart, so failing to write it never holds the report up.
+      await this.markWork(activity).catch(() => {});
+      await report(binding.session.id, activity);
+      if (activity !== "working") this.reportBranches();
+    });
+  }
+
+  /** Keeps WORK_MARKER in step with `activity`. Only the host writes the session's directory, never its sandbox. */
+  private async markWork(activity: SessionActivity): Promise<void> {
+    const marker = join(this.directory, WORK_MARKER);
+    if (activity !== "working" && activity !== "waiting") return rm(marker, { force: true });
+    const file = await open(marker, constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    await file.close();
   }
 
   /** The session's network grant from the control plane: its workspace's repositories and network policy. */
@@ -325,18 +433,21 @@ export class RunnerSession {
       ...(token ? { tcp: { token } } : {}),
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
-      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository) => this.mirror(repository) } : {}),
+      ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository, onProgress: (progress: MirrorProgress) => void) => this.mirror(repository, onProgress) } : {}),
       ...(this.#clone ? { sessionBranch: sessionBranch(this.binding.session) } : {}),
     });
   }
 
   /**
-   * One Git request through the control plane's relay: a read with the session owner's access, or a push of the session
-   * branch. A refused read also stops this session borrowing from the host's mirror of that repository.
+   * One Git request: a read with the session owner's access, or a push of the session branch. It goes to the forge from
+   * this host when the control plane grants a credential for it (DirectGit), else through the control plane's relay. A
+   * refused read also stops this session borrowing from the host's mirror of that repository.
    */
   private async relay(request: RelayRequest): Promise<Response> {
     const sessionId = this.binding.session.id;
     try {
+      const direct = await this.#direct?.forward(request);
+      if (direct) return direct;
       return await (this.config.gitRelay ? this.config.gitRelay(sessionId, request)
         : relayGitRequest(this.config.fetch ?? fetch, `${this.config.controlPlaneUrl}${relayPath("/api/internal", sessionId, request)}`,
           { authorization: `Bearer ${this.config.sharedSecret}` }, request, AbortSignal.timeout(60 * 60 * 1000)));
@@ -347,16 +458,71 @@ export class RunnerSession {
     }
   }
 
-  /** A workspace repository read through the relay, for the host cache: the relay itself adds the owner's credential. */
+  /**
+   * A workspace repository read through the relay, where the relay itself adds the owner's credential: how this session
+   * confirms that its owner may read a repository before it borrows the host's mirror of it. Mirrors are never filled so.
+   */
   private relayRemote(repository: EgressRepository, signal?: AbortSignal): GitRemote {
     return new GitRemote({ url: bindingRemote(repository), authorization: "Bearer relay", fetch: relayFetch(repository.bindingId, request => this.relay(request)), signal });
   }
 
-  /** Refreshes the host's mirror of `repository` for this session and lets its shell commands borrow from it. */
-  private async mirror(value: EgressRepository): Promise<string> {
+  /**
+   * Makes the host's mirror of `repository` ready and lets this session's shell commands borrow from it. The relay first
+   * lists the repository's branches and tags with the session owner's own account, which confirms they may read it; then
+   * the mirror fetches those tips straight from the provider with this host's own Git credentials (cacheRemote), never
+   * through the relay. A mirror no fill has completed yet is waited for, however long its first fill takes; a filled one
+   * for at most MIRROR_REFRESH_WAIT_MS, then it is borrowed as it is while its refresh goes on.
+   */
+  private async mirror(value: EgressRepository, onProgress?: (progress: MirrorProgress) => void): Promise<string> {
     const repository = mirrorRepository(value);
-    await this.config.repositoryCache!.refresh({ repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: this.relayRemote(value) });
-    return this.allowMirror(repository, Date.now());
+    const refs = await this.ownerRefs(value);
+    const confirmedAt = Date.now();
+    try {
+      const target = { repository, ownerId: this.binding.owner.id, sessionId: this.binding.session.id, remote: await this.cacheRemote(value), refs };
+      await this.config.repositoryCache!.ready(target, { ...(onProgress ? { onProgress } : {}), wait: MIRROR_REFRESH_WAIT_MS });
+    } catch (error) {
+      throw cacheFailure(error, value);
+    }
+    return this.allowMirror(repository, confirmedAt);
+  }
+
+  /**
+   * `repository`'s branches and tags as the session owner's own account lists them, through the relay (which checks the
+   * repository's identity too): what confirms that the session may borrow its mirror, and what the mirror mirrors.
+   * - A refusal is final (403).
+   * - A failure another attempt may get past (the relay busy or failing, its connection failing or breaking off, or the
+   *   listing running out of its time) ends in 503, which the clone asks again: a quick one only once the relay was asked
+   *   again (OWNER_REFS_RETRY_MS), one that ran out of its time at once.
+   * - Anything else will fail again just the same: 502, so the clone goes ahead without the cache, through the relay,
+   *   where Git says what is wrong.
+   */
+  private async ownerRefs(value: EgressRepository): Promise<Map<string, string>> {
+    for (let failures = 0; ; failures++) {
+      const timeout = AbortSignal.timeout(OWNER_REFS_TIMEOUT_MS);
+      try { return await this.relayRemote(value, timeout).listRefs(); }
+      catch (error) {
+        // A refused read already ended borrowing for this open (see relay).
+        if (refused(error)) throw new RunnerError(403, `Pistead did not confirm that this session's owner can read ${value.fullName}`);
+        // GitRemote calls a request its caller's signal aborted final; here that signal is the listing's own time limit.
+        if (!timeout.aborted && !(error instanceof GitRemoteError && error.retryable)) {
+          throw new RunnerError(502, `Pistead could not list ${value.fullName} for this session's owner`);
+        }
+        const pause = timeout.aborted ? undefined : OWNER_REFS_RETRY_MS[failures];
+        if (pause === undefined) throw new RunnerError(503, `Pistead could not confirm right now that this session's owner can read ${value.fullName}`);
+        await sleep(pause);
+      }
+    }
+  }
+
+  /** How the host's repository cache reads `repository` (see RunnerConfig.cacheRemote). */
+  private async cacheRemote(repository: EgressRepository): Promise<GitRemote> {
+    if (this.config.cacheRemote) return this.config.cacheRemote(repository);
+    const url = bindingRemote(repository);
+    let authorization: string | undefined;
+    // A host with no credential for the provider still fills public repositories.
+    try { authorization = await hostGitAuthorization(url); }
+    catch (error) { if (!(error instanceof HostCredentialError)) throw error; }
+    return new GitRemote({ url, ...(authorization ? { authorization } : {}) });
   }
 
   private allowMirror(repository: MirrorRepository & { bindingId: string }, confirmedAt: number): string {
@@ -396,8 +562,10 @@ export class RunnerSession {
   }
 
   /**
-   * After a reopen, clones made earlier still borrow from mirrors that exist on this host. Each is listed again, but
-   * mounted only once the relay confirms the owner can still read its repository (see mirrorMounts).
+   * Lists the mirror of every workspace repository for this open, creating the ones this host doesn't have yet, empty:
+   * each is mounted only once the relay confirms the owner can read its repository (see mirrorMounts). Created before any
+   * command runs, so the command that first clones a repository already mounts the mirror its clone waits to fill (see
+   * GIT_SHIM), and clones made earlier still borrow from theirs after a reopen.
    */
   private async restoreMirrors(repositories: readonly EgressRepository[]): Promise<void> {
     const cache = this.config.repositoryCache;
@@ -406,7 +574,8 @@ export class RunnerSession {
     for (const value of repositories) {
       if (value.repositoryId === undefined) continue;
       const repository = mirrorRepository(value);
-      try { await lstat(join(cache.mirrorDirectory(repository, this.binding.owner.id), "HEAD")); }
+      // A cache root that isn't private can't be used; the clone hears why when it asks for the mirror.
+      try { await cache.prepare(repository, this.binding.owner.id); }
       catch { continue; }
       this.allowMirror(repository, 0);
     }
@@ -417,9 +586,13 @@ export class RunnerSession {
       throw new RunnerError(403, "Ticket session, owner, or connector mismatch");
   }
 
-  /** `host`: also ask for the actor's authority over host commands on this host (`hostCommands`). */
-  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false): Promise<AuthorizationResult> {
-    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission, ...(host ? { host: true } : {}) };
+  /**
+   * `host`: also ask for the actor's authority over host commands on this host (`hostCommands`); `hostSessions`, also
+   * whether they may run their own sessions directly on it.
+   */
+  async authorize(actorId: string, permission: Permission, expectedPolicyVersion?: number, host = false, hostSessions = false): Promise<AuthorizationResult> {
+    const body: AuthorizationRequest = { sessionId: this.binding.session.id, ownerId: this.binding.owner.id, actorId, permission,
+      ...(host ? { host: true } : {}), ...(host && hostSessions ? { hostSessions: true } : {}) };
     let result: AuthorizationResult;
     try {
       if (this.config.authorize) result = await this.config.authorize(body);
@@ -562,7 +735,10 @@ export class RunnerSession {
           if (!repository) throw new RunnerError(409, "its origin is not one of this workspace's repositories");
           let reference: string | null = null;
           if (this.config.repositoryCache && repository.repositoryId !== undefined) {
-            try { reference = await this.mirror(repository); } catch { /* cloned without borrowing */ }
+            const progress = ({ phase, percent, done, total, bytes }: MirrorProgress) => {
+              if (repositoryPreparationPhases.includes(phase as RepositoryPreparationItem["phase"])) update(entry.path, { phase: phase as RepositoryPreparationItem["phase"], percent, done, total, bytes });
+            };
+            try { reference = await this.mirror(repository, progress); } catch { /* cloned without borrowing */ }
           }
           update(entry.path, { phase: "receiving" });
           await isolatedWorkspace(this.sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
@@ -657,7 +833,8 @@ export class RunnerSession {
   private async openHarness(): Promise<void> {
     await this.initializeRepositories();
     if (this.#clone && !this.#egress) {
-      this.#cloneRepositories = await this.requestGrant().then(grant => grant.repositories.map(repository => bindingRemote(repository)), () => []);
+      this.#branchRepositories = await this.requestGrant().then(grant => grant.repositories, () => []);
+      this.#cloneRepositories = this.#branchRepositories.map(repository => bindingRemote(repository));
     } else if (this.#clone) {
       const repositories = await this.#egress!.grant().then(grant => grant.repositories, () => []);
       this.#cloneRepositories = repositories.map(repository => bindingRemote(repository));
@@ -681,10 +858,22 @@ export class RunnerSession {
     this.modelRef = { provider: resolved.provider, modelId: resolved.modelId };
     this.models = resolved.models;
     const models = this.models;
+    // Reasoning models keep more room for their compaction summary than Pi's default, unless the host's Pi or its
+    // configuration in Pistead says otherwise. The configuration is read now and with each message, and the harness reads
+    // the settings at each use.
+    await this.hostConfig();
+    const catalog = models.getModels();
+    let current: { from: HostCompaction | undefined; settings: { compaction: CompactionSettings } | undefined } | undefined;
+    const settings = () => {
+      if (!current || current.from !== this.#configuredCompaction) {
+        const compaction = hostCompaction(configuredCompaction(this.config.compaction, this.#configuredCompaction), catalog);
+        current = { from: this.#configuredCompaction, settings: compaction ? { compaction } : undefined };
+      }
+      return current.settings;
+    };
     const storage = await this.openStorage();
     try {
-      this.harness = await Harness.open(storage, { models, registry,
-        ...(this.config.compaction ? { settings: { compaction: this.config.compaction } } : {}),
+      this.harness = await Harness.open(storage, { models, registry, settings,
         ...(this.config.identity ? { identity: this.config.identity } : {}) }, context);
     }
     catch (error) { await storage.close(context); throw error; }
@@ -919,6 +1108,39 @@ export class RunnerSession {
     return { ...approval, result };
   }
 
+  /**
+   * Reports the branches a clone session on the host has checked out in its clones of the workspace's github.com
+   * repositories, when they changed since the last report. A session on the host pushes and opens pull requests with
+   * the host's own Git, so this is how the control plane learns which pull requests are its. A report that fails is
+   * sent again the next time the agent stops.
+   */
+  private reportBranches(): void {
+    const send = this.config.reportBranches;
+    if (!send || !this.#onHost || !this.#clone || this.closing) return;
+    if (this.#branchesReporting) { this.#branchesWanted = true; return; }
+    this.#branchesReporting = true;
+    void (async () => {
+      try {
+        do {
+          this.#branchesWanted = false;
+          // A grant that failed when the session opened is asked for again, rather than leaving the session unreported.
+          if (!this.#branchRepositories.length) this.#branchRepositories = (await this.requestGrant()).repositories;
+          if (!this.#branchRepositories.length) break;
+          const clones = await (this.sandbox as HostWorkspace).cloneBranches(async () => {});
+          const branches = reportedBranches(clones, this.#branchRepositories);
+          const json = JSON.stringify(branches);
+          if (json === this.#branchesSent) continue;
+          await send(this.binding.session.id, branches);
+          this.#branchesSent = json;
+        } while (this.#branchesWanted && !this.closing);
+      } catch (error) {
+        // Sent again the next time the agent stops.
+        console.warn(`Session ${this.binding.session.id}: could not report its clones' branches: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      finally { this.#branchesReporting = false; }
+    })();
+  }
+
   /** What the agent is doing now (see SessionActivity). */
   private async activity(): Promise<SessionActivity> {
     const preparation = this.#repositories.status;
@@ -955,8 +1177,9 @@ export class RunnerSession {
       const state = await this.metadata();
       const conversation = await harness.conversation(state.runs[key]!.conversationId as ConversationId, context);
       await conversation?.waitForIdle(context);
+      const compaction = settled.status === "unanswered" && settled.reason === "model_error" ? compactionFailure(settled.detail) : undefined;
       const failure: Run["failure"] = settled.status === "unanswered" && (settled.reason === "model_error" || settled.reason === "no_model")
-        ? { reason: settled.reason, ...(await conversation?.agent(context))?.model } : undefined;
+        ? { reason: compaction ? "compaction_failed" : settled.reason, ...(await conversation?.agent(context))?.model, ...(compaction ? { compaction } : {}) } : undefined;
       await this.exclusive(async () => {
         if (generation !== this.generation || this.closing) return;
         await this.mutate(meta => {
@@ -1212,6 +1435,8 @@ export class RunnerSession {
       const preparation = this.#repositories;
       if (preparation.status === "failed") throw new RunnerError(502, preparationFailure(preparation.reason));
       await this.authorize(ticket.actorId, mode === "ask" ? "ask" : "write", ticket.policyVersion);
+      // The message compacts its conversation, if it must, by the host's configuration as it is now.
+      await this.hostConfig();
       const options = await this.chatOptions(input.options, mode, ticket.actorId);
       if (prepared.length) await this.requireImageModel(options);
       const key = await requestKey(ticket.actorId, mode, input.requestId);
@@ -1283,7 +1508,7 @@ export class RunnerSession {
         const keys = new Set(runs.map(run => run.key));
         for (const [taskId, actor] of Object.entries(meta.toolActors)) {
           if (!keys.has(actor.runKey)) continue;
-          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`]]) {
+          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`], meta.approvals[`permission-${taskId}_audience`]]) {
             if (card?.status === "pending") Object.assign(card, { status: "interrupted", result: "The tool call stopped before a decision." });
           }
         }
@@ -1339,19 +1564,33 @@ export class RunnerSession {
   }
 
   /**
-   * A session its owner started directly on the host runs commands only while the host's configuration still accepts
-   * that: its owner turning it off stops the session's next command (within the configuration's 30-second refresh).
+   * A session started directly on the host runs commands only while the host's configuration still accepts that: its
+   * owner turning it off stops the session's next command (within the configuration's 30-second refresh). A member's
+   * session also needs their grant to still include sessions on the host, and a command that runs without anyone
+   * approving it (`automatic`), automatic host commands too: a grant that ends or shrinks stops their next command.
    */
-  private async requireHostEnvironment(): Promise<void> {
-    if (this.#hostSession && !(await this.hostConfig()).hostSessions) {
+  private async requireHostEnvironment(automatic = false): Promise<void> {
+    if (!this.#hostSession) return;
+    if (!(await this.hostConfig()).hostSessions) {
       throw new RunnerError(403, "This host no longer runs sessions directly on it: its owner turned that off in Pistead (Settings → Hosts → the host → Configuration). "
         + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+    if (this.binding.session.connectorOwnerId === this.binding.owner.id) return;
+    const result = await this.authorize(this.binding.owner.id, "write", undefined, true, true);
+    if (result.hostSessions !== true) {
+      throw new RunnerError(403, "The session's owner may no longer run sessions directly on this host: the grant that let them has ended. "
+        + "Nothing ran. Start a new session to work in the sandbox.");
+    }
+    if (automatic && result.hostCommands !== "auto") {
+      throw new RunnerError(403, "This session runs directly on its host, and its owner no longer holds automatic host commands there: commands need approval. Nothing ran.");
     }
   }
 
   /** The host's configuration, as Pistead reports it to the connector; the defaults on a runner without one. */
   private async hostConfig(): Promise<HostConfig> {
-    return this.config.hostConfig ? await this.config.hostConfig() : { ...defaultHostConfig };
+    const config = this.config.hostConfig ? await this.config.hostConfig() : { ...defaultHostConfig };
+    this.#configuredCompaction = config.compaction;
+    return config;
   }
 
   /** How the next shell command runs, as the host's owner and admins configured it: its time limit and its GPU. */
@@ -1373,15 +1612,21 @@ export class RunnerSession {
    * the owner's card, which allows it once or for the rest of the session, or denies it. `unbounded`: the command runs
    * without limits, which only the host's owner can allow, and only in their own session.
    */
-  private async permit(api: ToolExecutionApi, waiting: Context, tool: ToolName, target: string, effect: { write?: boolean; shell?: boolean } = {}): Promise<{ unbounded: boolean }> {
+  private async permit(api: ToolExecutionApi, waiting: Context, tool: ToolName, target: string, effect: { write?: boolean; shell?: boolean; audience?: boolean } = {}): Promise<{ unbounded: boolean }> {
     const state = await this.metadata();
     const actor = state.toolActors[String(api.taskId)];
     const run = actor && state.runs[actor.runKey];
     if (!run) throw new RunnerError(403, "Tool has no authorized writable submission");
     const grants = state.grants;
     const needs: PermissionNeed[] = [];
-    if (!this.binding.agent.tools.includes(tool) && !(tool !== "host_bash" && grants?.tools.includes(tool))) needs.push("tool");
-    if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
+    // The sessions tool's second card, once the control plane said what a call it let through would share: the call
+    // already has its tool, so that card asks only for this, under an id of its own.
+    if (effect.audience) {
+      if (!grants?.audience) needs.push("audience");
+    } else {
+      if (!this.binding.agent.tools.includes(tool) && !(tool !== "host_bash" && grants?.tools.includes(tool))) needs.push("tool");
+      if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
+    }
     const unbounded = effect.shell === true && !this.shellAllowed();
     if (unbounded) {
       if (this.binding.session.connectorOwnerId !== this.binding.owner.id) this.requireShellCapability({ kind: "bash", command: target });
@@ -1394,7 +1639,7 @@ export class RunnerSession {
     if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
     const deadline = (run.submittedAt ?? Date.now()) + DECISION_WAIT_MS;
     if (deadline <= Date.now()) throw new Error("This message is over an hour old, so the session owner can no longer allow this call. Ask them to send a new message.");
-    const id = `permission-${api.taskId}`;
+    const id = `permission-${api.taskId}${effect.audience ? "_audience" : ""}`;
     // The target only shows the owner what the call touches; keep it within what the control plane accepts.
     const shown = target.replaceAll("\0", "");
     const operation = validateOperation({ kind: "permission", tool, target: shown.length > 8192 ? `${shown.slice(0, 8191)}…` : shown, needs });
@@ -1410,7 +1655,7 @@ export class RunnerSession {
   /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
   private coveredBy(request: PermissionRequest, grants: Grants): boolean {
     return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || (request.tool !== "host_bash" && grants.tools.includes(request.tool))
-      : need === "write" ? grants.write : grants.unboundedShell);
+      : need === "write" ? grants.write : need === "audience" ? grants.audience === true : grants.unboundedShell);
   }
 
   private buildTools(): ToolRegistration[] {
@@ -1534,6 +1779,82 @@ export class RunnerSession {
         await this.permit(api, call, "github_issue", `${repository}: ${args.title}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.issue", repository, title: args.title, body: args.body }, String(api.taskId), { permitted: true }), call));
       } }),
+      defineTool({ name: "schedule", description: "Manage this session's scheduled prompts: messages Pistead sends this session's agent on a cron schedule, as the session owner, so the session wakes up and works on its own (a nightly check, a weekly report). Use it when the user asks to do something every hour, day or week, or at a later time. action list takes nothing; create takes message (what the agent is told each time) and cron (five fields: minute hour day-of-month month day-of-week, such as '0 9 * * 1-5'; runs at least 5 minutes apart), and optionally name, time_zone (IANA, such as Europe/Berlin; UTC otherwise, so ask the user for theirs when the time of day matters), access (approval, the default: commands wait for a human; read; auto, only in a message the owner sent with auto-approve) and enabled; update takes id and only the fields to change (an auto-approved schedule is changed, other than paused or lowered in access, only in a message the owner sent with auto-approve); delete takes id. Only the session owner's messages can use it. A run due while the agent is busy is skipped. The owner sees and edits them in the session panel's Schedules tab.", parameters: Type.Object({
+        action: StringEnum(scheduleToolActions), id: Type.Optional(Type.String()), message: Type.Optional(Type.String()), cron: Type.Optional(Type.String()),
+        time_zone: Type.Optional(Type.String()), name: Type.Optional(Type.String()), access: Type.Optional(StringEnum(accessModes)), enabled: Type.Optional(Type.Boolean()),
+      }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        const fields = Object.fromEntries(Object.entries({ scheduleId: args.id, name: args.name, cron: args.cron, timeZone: args.time_zone, content: args.message,
+          access: args.access, enabled: args.enabled }).filter(([, value]) => value !== undefined)) as Omit<ScheduleToolRequest, "sessionId" | "actorId" | "admissionId" | "callId" | "action">;
+        if (Object.values(fields).some(value => typeof value === "string" && value.includes("\0"))) throw new RunnerError(400, "Schedule fields must not contain NUL characters");
+        const state = await this.metadata();
+        const run = state.runs[state.toolActors[String(api.taskId)]!.runKey]!;
+        // A schedule runs as the session owner, with nobody watching: only the owner's own messages make one, and only a
+        // message with their Auto-approve an auto-approved one (the control plane checks both, and changes to one).
+        if (run.initiatedBy !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner's messages schedule prompts. Ask the owner to send this request, or to add it in the Schedules tab.");
+        if (args.access === "auto" && run.options?.access !== "auto") {
+          throw new RunnerError(403, "Only a message the session owner sent with auto-approve schedules an auto-approved prompt. Use access approval, or ask the owner to set it in the Schedules tab.");
+        }
+        if (!run.admissionId) throw new RunnerError(403, "Scheduling needs a write message");
+        await this.permit(api, call, "schedule", scheduleToolTarget({ action: args.action, ...fields }), { write: args.action !== "list" });
+        await this.authorize(run.initiatedBy, "write");
+        const request: ScheduleToolRequest = { sessionId: this.binding.session.id, actorId: run.initiatedBy, admissionId: run.admissionId, callId: String(api.taskId),
+          action: args.action, ...fields };
+        const result = this.config.schedules ? await this.config.schedules(request) : await this.internalBroker("schedules", request) as ScheduleToolResult;
+        return text({ ...attribution, ...result });
+      } }),
+      defineTool({ name: "sessions", description: SESSIONS_TOOL_DESCRIPTION,
+        // One call at a time: each counts against its message's sends and its session's new sessions.
+        executionMode: "sequential", parameters: Type.Object({
+        action: StringEnum(sessionsToolActions), session: Type.Optional(Type.String()), message: Type.Optional(Type.String()),
+        access: Type.Optional(StringEnum(accessModes)), notify: Type.Optional(Type.Boolean()), title: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
+        visibility: Type.Optional(StringEnum(["private", "workspace"] as const)), message_id: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: crossSessionLimits.readEntries })),
+        timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: crossSessionLimits.waitSeconds })),
+      }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        const fields = Object.fromEntries(Object.entries({ targetSessionId: args.session, message: args.message, access: args.access, notify: args.notify, title: args.title,
+          modelId: args.model, visibility: args.visibility, messageId: args.message_id, limit: args.limit }).filter(([, value]) => value !== undefined)) as
+          Omit<SessionsToolRequest, "sessionId" | "actorId" | "admissionId" | "callId" | "action">;
+        if (Object.values(fields).some(value => typeof value === "string" && value.includes("\0"))) throw new RunnerError(400, "Sessions tool fields must not contain NUL characters");
+        const wait = args.action === "wait";
+        if (wait && (fields.targetSessionId === undefined || fields.messageId === undefined)) throw new RunnerError(400, "wait takes session and message_id, as ask, send or create returned them");
+        if (!wait && args.timeout_seconds !== undefined) throw new RunnerError(400, "Only wait takes timeout_seconds");
+        const state = await this.metadata();
+        const run = state.runs[state.toolActors[String(api.taskId)]!.runKey]!;
+        if (!run.admissionId) throw new RunnerError(403, "The sessions tool needs a write message");
+        // What it sends elsewhere never has more access than this message (the control plane checks this too).
+        if (args.access === "auto" && (run.options?.access !== "auto" || run.initiatedBy !== this.binding.owner.id)) {
+          throw new RunnerError(403, "Only a message the session owner sent with auto-approve sends an auto-approved message. Use access approval, which leaves the other session's commands to its people.");
+        }
+        // A wait is a series of reads of one message, and its card shows it as that read.
+        const request = { action: wait ? "read" as const : args.action as Exclude<typeof args.action, "wait">, ...(wait ? { targetSessionId: fields.targetSessionId, messageId: fields.messageId, limit: 1 } : fields) };
+        await this.permit(api, call, "sessions", sessionsToolTarget(request), { write: sessionsWriteActions.includes(args.action) });
+        await this.authorize(run.initiatedBy, "write");
+        const base = { sessionId: this.binding.session.id, actorId: run.initiatedBy, admissionId: run.admissionId, callId: String(api.taskId) };
+        const broker = async (): Promise<SessionsToolResult> => {
+          const result = this.config.crossSessions ? await this.config.crossSessions({ ...base, ...request }) : await this.internalBroker("sessions", { ...base, ...request }) as SessionsToolResult;
+          if (!("consent" in result)) return result;
+          // The other session's readers aren't this one's: the owner decides, on a card naming that session, and the
+          // control plane then sees their decision for this call.
+          await this.permit(api, call, "sessions", result.target, { audience: true });
+          await this.authorize(run.initiatedBy, "write");
+          const retried = this.config.crossSessions ? await this.config.crossSessions({ ...base, ...request }) : await this.internalBroker("sessions", { ...base, ...request }) as SessionsToolResult;
+          if ("consent" in retried) throw new RunnerError(409, "The control plane did not see the session owner's decision yet; call again.");
+          return retried;
+        };
+        if (!wait) return text({ ...attribution, ...await broker() });
+        const deadline = Date.now() + (args.timeout_seconds ?? crossSessionLimits.defaultWaitSeconds) * 1000;
+        for (;;) {
+          const result = await broker();
+          const done = "outcome" in result && result.outcome?.done === true;
+          if (done || Date.now() + WAIT_POLL_MS > deadline) {
+            const { entries: _entries, ...shown } = result as Extract<SessionsToolResult, { entries: unknown }>;
+            return text({ ...attribution, ...shown, ...(done ? {} : { timedOut: true }) });
+          }
+          await sleep(WAIT_POLL_MS, undefined, { signal: call.abortSignal });
+        }
+      } }),
       defineTool({ name: "host_bash", executionMode: "sequential",
         description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact approval by the host owner or a member they granted host commands; auto-approve skips it only in the session of the host owner or of a member granted automatic host commands. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
         parameters: Type.Object({ command: Type.String(), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600 })) }),
@@ -1642,7 +1963,12 @@ export class RunnerSession {
 
   /** The control plane's GitHub broker for runners without a connector, with the shared secret; refusals keep their status and reason. */
   private async internalGitHub(action: "comment" | "read" | "merge" | "issue", request: object): Promise<unknown> {
-    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/github/${action}`, {
+    return this.internalBroker(`github/${action}`, request);
+  }
+
+  /** One of the control plane's internal broker routes, as internalGitHub. */
+  private async internalBroker(path: "schedules" | "sessions" | `github/${string}`, request: object): Promise<unknown> {
+    const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/${path}`, {
       method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
       body: JSON.stringify(request), signal: AbortSignal.timeout(30_000), redirect: "error",
     });
@@ -1703,7 +2029,10 @@ export class RunnerSession {
       automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id
         && (!github || (admissionId !== undefined && (operation.kind !== "github.merge" || run.options?.autoMerge === true)))
         && (operation.kind !== "git.push" || admissionId !== undefined)
-        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
+        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto")
+        // A command of a session on its host runs there as a host command does: without approval only for an owner who
+        // holds automatic host commands on it.
+        && (operation.kind !== "bash" || !this.#hostSession || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -1764,7 +2093,7 @@ export class RunnerSession {
     try {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation, approval.unbounded === true);
-        await this.requireHostEnvironment();
+        await this.requireHostEnvironment(true);
         await this.authorize(actorId, "write");
       }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true,
         ...await this.commandOptions(), signal });
@@ -1778,6 +2107,16 @@ export class RunnerSession {
     return (await this.metadata()).approvals[id]!;
   }
 
+  /**
+   * The permission `actorId` needs on the session to decide an approval of `operation`: approve, except that the host's
+   * owner decides its host commands (host_bash), which run as the host's OS user, with any access to the session.
+   * Whether they may decide host commands at all is checked with the card (see hostCommandLevel).
+   */
+  private decisionPermission(actorId: string, operation: Pick<Operation, "kind"> | undefined): Permission {
+    const hostOwner = this.binding.session.connectorOwnerId;
+    return operation?.kind === "host.bash" && !!hostOwner && actorId === hostOwner ? "read" : "approve";
+  }
+
   /** `scope` applies to permission requests: allow the one call (default), or the same need for the rest of the session. */
   async decide(ticket: RunnerTicket, id: string, input: { decision: "approve" | "deny"; operation: Operation; brokerCapability?: string; scope?: "call" | "session" }): Promise<ApprovalRecord> {
     this.requireUnfrozen();
@@ -1785,7 +2124,9 @@ export class RunnerSession {
     if (input.decision !== "approve" && input.decision !== "deny") throw new RunnerError(400, "Invalid approval decision");
     if (input.scope !== undefined && input.scope !== "call" && input.scope !== "session") throw new RunnerError(400, "Invalid approval scope");
     return this.exclusive(async () => {
-      await this.authorize(ticket.actorId, "approve", ticket.policyVersion);
+      // The operation the caller names must be the card's (checked below), so it says what deciding it needs.
+      const permission = this.decisionPermission(ticket.actorId, input.operation);
+      await this.authorize(ticket.actorId, permission, ticket.policyVersion);
       const state = await this.metadata();
       const approval = state.approvals[id];
       if (!approval) throw new RunnerError(404, "Approval not found");
@@ -1825,6 +2166,7 @@ export class RunnerSession {
           if (request.needs.includes("tool") && !grants.tools.includes(request.tool)) grants.tools.push(request.tool);
           if (request.needs.includes("write")) grants.write = true;
           if (request.needs.includes("unbounded-shell")) grants.unboundedShell = true;
+          if (request.needs.includes("audience")) grants.audience = true;
           // Parallel calls of the same round that wait on what the session now allows go ahead too.
           for (const other of Object.values(meta.approvals)) {
             if (other.id === id || other.status !== "pending" || other.operation.kind !== "permission" || !this.coveredBy(other.operation, grants)) continue;
@@ -1851,7 +2193,7 @@ export class RunnerSession {
         // Long host builds must not hold the connector's 30-second RPC queue.
         void this.startHostOperation(id, approval.operation, { actorId: ticket.actorId, capability: input.brokerCapability }, async () => {
           await this.authorize(approval.requestedBy, "write");
-          await this.authorize(ticket.actorId, "approve");
+          await this.authorize(ticket.actorId, permission);
         });
         return (await this.metadata()).approvals[id]!;
       }
@@ -2008,11 +2350,14 @@ export class RunnerSession {
     return undefined;
   }
 
-  /** A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, never Pi's detail. */
+  /**
+   * A run Pi settled without an answer, shown as a failed model turn after its entries: provider and model, and which
+   * fixed compaction failure it was, never Pi's detail.
+   */
   private failureView(run: Run, branch: number): SessionView["entries"][number] {
-    const { provider, modelId } = run.failure!;
+    const { provider, modelId, compaction } = run.failure!;
     return { id: `${branch}:failure:${run.key}`, kind: "workspace.run-failure", role: "assistant", text: "", actorId: run.initiatedBy, conversationId: String(branch),
-      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}) } };
+      error: { ...(provider ? { provider } : {}), ...(modelId ? { modelId } : {}), ...(compaction ? { compaction } : {}) } };
   }
 
   async restart(): Promise<void> {

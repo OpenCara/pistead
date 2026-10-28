@@ -15,6 +15,7 @@ import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { browseDirectory, browseFile, checkedBrowse, type BrowseResult } from "./file-browser.js";
 import type { SessionWorkspace } from "./workspace.js";
 import { bashPath, CREATE_FILE, killTree, OPEN_DIRECTORY, OPEN_FILE, privateEntry, windows, windowsSystemEnvironment } from "./platform.js";
+import { readCloneBranches, type CloneBranch } from "./clone-branches.js";
 
 const MAX_ENTRIES = 10_000;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
@@ -216,6 +217,11 @@ export class HostWorkspace implements SessionWorkspace {
       await visit(join(this.worktree, ".git"), "git", ["pistead-push"]);
       return files;
     });
+  }
+
+  /** The branches the worktree's clones have checked out (clone-branches.ts), in turn with the session's other work. */
+  cloneBranches(authorize: SandboxAuthorize): Promise<CloneBranch[]> {
+    return this.#operation(authorize, () => readCloneBranches(this.worktree));
   }
 
   /** Explicit host-owner-approved execution, serialized with sandbox file/Git operations; never a fallback. */

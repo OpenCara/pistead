@@ -1,19 +1,36 @@
+import type { SessionRepository } from '../../../../packages/shared/src/repositories.js';
 import { gitProviderNames } from '../../../../packages/shared/src/repositories.js';
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, PushRequestError, readPushCommands, sessionBranch, sessionBranchRefusal, type PushCommand } from '../../../../packages/shared/src/git-push.js';
+import { fetchGit, gitServiceTypes, gitUpstreamHeaders } from '../../../../packages/shared/src/git-transfer.js';
 import type { AppContext, RepositoryRow, SessionRow } from '../types.js';
 import { auditStatement } from '../db.js';
-import { fail } from '../http.js';
+import { fail, failTransfer } from '../http.js';
 import { cloneSessionRepository, recheckAccess, type RepositoryAccess } from '../repositories.js';
 import { requireBinding, requireNoRestore } from './broker.js';
 import { mintPushToken, revokePushToken } from './mint.js';
-import { pushTarget } from './targets.js';
+import { pushTarget, type PushTarget } from './targets.js';
 
-/** The upstream answer starts within this; a large pack may stream for as long as the session's command runs. */
-const relayTimeout = 60 * 60 * 1000;
-const pushTypes = {
-  'receive-refs': 'application/x-git-receive-pack-advertisement',
-  'receive-pack': 'application/x-git-receive-pack-result',
-} as const;
+const pushTypes = { 'receive-refs': gitServiceTypes['receive-refs'], 'receive-pack': gitServiceTypes['receive-pack'] } as const;
+
+/**
+ * What a push of a clone session's own branch needs before any credential: no restore or move pending, the binding
+ * still configured, the owner able to push the repository themselves (whichever identity pushes for them), and the
+ * binding's default-branch policy. Shared by the relay and the direct grant.
+ */
+export async function sessionBranchTarget(c: AppContext, session: SessionRow, binding: RepositoryRow, access: RepositoryAccess)
+  : Promise<{ branch: string; pin: SessionRepository; target: PushTarget }> {
+  const branch = sessionBranch(session);
+  await requireNoRestore(c, session.id);
+  const pin = await cloneSessionRepository(c.env, session, row => row.id === binding.id);
+  if (!pin) fail(404, 'repository_not_bound', 'This repository is not bound to the session\'s workspace.');
+  const policy = await requireBinding(c, session.workspace_id, pin);
+  const target = await pushTarget(access, pin, branch);
+  if (!target.canPush) fail(403, 'push_permission_required', 'The session owner cannot push to this repository.');
+  if (policy.forbid_default_branch === 1 && branch === target.defaultBranch) {
+    fail(403, 'default_branch_push_forbidden', 'This workspace forbids pushes to the repository default branch.');
+  }
+  return { branch, pin, target };
+}
 
 /** `body`, calling `done` once when it ends, fails, or its reader goes away. */
 function settled(body: ReadableStream<Uint8Array>, done: () => void): ReadableStream<Uint8Array> {
@@ -47,18 +64,8 @@ export async function sessionBranchPush(c: AppContext, input: {
   authorize: () => Promise<unknown>;
 }): Promise<Response> {
   const { session, binding, access, service, authorize } = input;
-  const branch = sessionBranch(session);
   const provider = gitProviderNames[binding.provider];
-  await requireNoRestore(c, session.id);
-  const pin = await cloneSessionRepository(c.env, session, row => row.id === binding.id);
-  if (!pin) fail(404, 'repository_not_bound', 'This repository is not bound to the session\'s workspace.');
-  const policy = await requireBinding(c, session.workspace_id, pin);
-  // The owner must be able to push the repository themselves, whichever identity pushes for them.
-  const target = await pushTarget(access, pin, branch);
-  if (!target.canPush) fail(403, 'push_permission_required', 'The session owner cannot push to this repository.');
-  if (policy.forbid_default_branch === 1 && branch === target.defaultBranch) {
-    fail(403, 'default_branch_push_forbidden', 'This workspace forbids pushes to the repository default branch.');
-  }
+  const { branch, pin, target } = await sessionBranchTarget(c, session, binding, access);
   let body: ReadableStream<Uint8Array> | undefined;
   let command: PushCommand | undefined;
   if (service === 'receive-pack') {
@@ -99,7 +106,7 @@ export async function sessionBranchPush(c: AppContext, input: {
     revoked = true;
     void revokePushToken(c.env, minted.revocation);
   };
-  let upstream: Response;
+  let upstream: { body: ReadableStream<Uint8Array> };
   try {
     if (minted.authorization === null) fail(409, 'host_git_credentials_relay', 'The host\'s Git credentials can\'t push through the egress proxy.');
     if (command) {
@@ -107,31 +114,11 @@ export async function sessionBranchPush(c: AppContext, input: {
         bindingId: binding.id, branch, old: command.old, new: command.new, kind: minted.kind, ...(minted.identityId ? { identityId: minted.identityId } : {}),
       }).run();
     }
-    const agent = c.req.header('user-agent');
-    const headers: Record<string, string> = {
-      Authorization: minted.authorization,
-      'User-Agent': agent && /^git\/[\x21-\x7e]{1,120}$/.test(agent) ? agent : 'git/2 (pistead)',
-      ...(body ? { 'Content-Type': 'application/x-git-receive-pack-request', Accept: pushTypes['receive-pack'] } : {}),
-    };
-    try {
-      upstream = await fetch(service === 'receive-refs' ? `${target.remote}/info/refs?service=git-receive-pack` : `${target.remote}/git-receive-pack`, {
-        method: body ? 'POST' : 'GET', headers, body, duplex: 'half', redirect: 'manual', signal: AbortSignal.timeout(relayTimeout),
-      } as RequestInit);
-    } catch {
-      return fail(502, 'git_unavailable', `${provider} could not be reached.`);
-    }
+    const headers = gitUpstreamHeaders(service, { userAgent: c.req.header('user-agent'), contentType: body ? 'application/x-git-receive-pack-request' : undefined });
+    upstream = await fetchGit({ remote: target.remote, service, authorization: minted.authorization, headers, body, provider, fullName: binding.full_name, identity: 'push' });
   } catch (error) {
     revoke();
-    throw error;
-  }
-  const type = upstream.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
-  if (upstream.status !== 200 || type !== pushTypes[service] || !upstream.body) {
-    await upstream.body?.cancel().catch(() => {});
-    revoke();
-    const denied = [401, 403, 404].includes(upstream.status);
-    return fail(denied ? 403 : 502, denied ? 'push_identity_denied' : 'git_unavailable', denied
-      ? `${provider} did not let the workspace's push identity push to ${binding.full_name}.`
-      : `${provider} could not complete the push.`);
+    failTransfer(error);
   }
   return new Response(settled(upstream.body, revoke), { headers: { 'Content-Type': pushTypes[service], 'Cache-Control': 'private, no-store' } });
 }

@@ -15,7 +15,7 @@
     "connect": "node --import tsx packages/cli/src/pistead.ts connect",
     "build": "vite build --config apps/web/vite.config.ts",
     "build:server": "esbuild apps/server/src/main.ts --bundle --platform=node --format=esm --target=node24 --packages=external --outfile=dist/server/main.js && rm -rf dist/server/migrations && cp -R apps/server/migrations dist/server/migrations",
-    "build:cli": "pnpm --filter pistead run build",
+    "build:cli": "pnpm run build && pnpm --filter pistead run build",
     "typecheck": "tsc --noEmit && pnpm --filter @pistead/mobile --filter @pistead/desktop run typecheck",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:integration": "node --import tsx tests/integration.ts",

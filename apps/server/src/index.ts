@@ -1,15 +1,17 @@
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { WorkerEnv } from './types.js';
-import { authenticate, csrfGuard, registerAuth } from './auth.js';
+import { authenticate, csrfGuard, localOwner, registerAuth } from './auth.js';
 import { registerCatalog } from './catalog.js';
 import { registerSessions } from './sessions.js';
+import { registerScheduledPrompts } from './scheduled-prompts.js';
+import { registerCrossSession } from './cross-session.js';
 import { registerSessionLinks, registerSharedSessions } from './session-links.js';
 import { registerBackups } from './backups.js';
 import { registerSessionFiles } from './session-files.js';
 import { registerInternal } from './internal.js';
 import { assertVaultConfigured } from './vault.js';
-import { fail, testMode } from './http.js';
+import { fail, localMode, testMode } from './http.js';
 import { registerConnectorCredentials, registerConnectors } from './connectors.js';
 import { registerHostAccess } from './host-access.js';
 import { registerHostConfig } from './host-config.js';
@@ -23,6 +25,7 @@ import { registerPushIdentities } from './push/identities.js';
 import { registerWorkspaceDatabases } from './workspace-databases/routes.js';
 import { registerDataExports } from './data-export.js';
 import { registerNetworkPolicies } from './network.js';
+import { registerTranscriptSettings } from './transcript-settings.js';
 import { registerAdmin } from './admin.js';
 import { registerWorkspaceInvites } from './workspace-invites.js';
 import { compression } from './compression.js';
@@ -58,6 +61,8 @@ app.get('/api/health', async c => {
     backupsConfigured: !!c.env.BUCKET, storageProvider: c.env.BUCKET?.provider ?? null,
     workspaceDatabasesConfigured: !!c.env.WORKSPACE_DATABASES,
     connectorsConfigured: !!c.env.CONNECTOR_HUB, testMode: testMode(c.env),
+    // A local server says whether someone has claimed it, so the sign-in page can point to the launcher's link.
+    ...(localMode(c.env) ? { localServer: { claimed: !!await localOwner(c.env) } } : {}),
   });
 });
 registerAuth(app);
@@ -80,11 +85,14 @@ registerSessions(app);
 registerSessionLinks(app);
 registerBackups(app);
 registerSessionFiles(app);
+registerScheduledPrompts(app);
+registerCrossSession(app);
 registerRestoreRoutes(app);
 registerHostMigrations(app);
 registerWorkspaceDatabases(app);
 registerDataExports(app);
 registerNetworkPolicies(app);
+registerTranscriptSettings(app);
 registerAdmin(app);
 app.all('/api/*', () => fail(404, 'not_found', 'API route not found.'));
 

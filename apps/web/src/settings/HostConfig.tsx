@@ -18,7 +18,8 @@ function duration(seconds: number): string {
   return `${seconds} seconds`;
 }
 
-const settings = Object.keys(defaultHostConfig) as (keyof HostConfig)[];
+/** The settings this form changes; compaction has its own section (HostCompaction). */
+const settings = (Object.keys(defaultHostConfig) as (keyof HostConfig)[]).filter(key => key !== "compaction");
 
 const cacheLabels: Record<RepositoryCacheMode, string> = { off: "Off", host: "Shared", owner: "Per owner" };
 const cacheHints: Record<RepositoryCacheMode, string> = {
@@ -63,7 +64,7 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
       })) return;
       if (config.repositoryCache !== "off" && saved.repositoryCache === "off" && !await confirmDialog({
         title: "Keep a repository cache on this host?",
-        message: `${connector.name} will keep a full mirror of each repository its sessions clone, in its state directory, and their clones will borrow objects from it. Clone sessions fill it through Pistead with their owner's own access; sessions that pinned their repositories fetch with this machine's Git credentials.`,
+        message: `${connector.name} will keep a full mirror of each repository its sessions clone, in its state directory, and their clones will borrow objects from it. It fills the mirrors straight from the repositories' hosts with the credentials Git on that machine would use (its credential helpers), and a session borrows from one only once Pistead confirms that the session's owner can read the repository with their own account.`,
         confirmLabel: "Keep a cache",
       })) return;
       if (config.hostSessions && !saved.hostSessions && !await confirmDialog({
@@ -107,12 +108,12 @@ export function HostConfigSection({ connector, refresh }: { connector: Connector
             options={(["off", "host", "owner"] as const).map(value => ({ value, label: cacheLabels[value], hint: cacheHints[value] }))} />
           : <StatusBadge tone={saved.repositoryCache === "off" ? "neutral" : "success"}>{cacheLabels[saved.repositoryCache]}</StatusBadge>} />
       <Row title="Sessions on the host" hint={unsandboxed ? "This host runs every session without the sandbox"
-        : owner ? "You may start sessions that run directly on this machine, without the sandbox, as its user. Turning it off stops their commands within half a minute" : "Only the host's owner changes this"}
+        : owner ? "You, and members you grant it under Host command access, may start sessions that run directly on this machine, without the sandbox, as its user. Turning it off stops their commands within half a minute" : "Only the host's owner changes this"}
         trailing={unsandboxed ? <StatusBadge tone="danger">Every session</StatusBadge>
           : owner
           ? <label className="check-row small"><input type="checkbox" className="checkbox" checked={config.hostSessions} disabled={!editable}
-            onChange={event => setConfig({ ...config, hostSessions: event.target.checked })} /><span>Allow my sessions</span></label>
-          : <StatusBadge tone={saved.hostSessions ? "danger" : "neutral"}>{saved.hostSessions ? "Owner's sessions" : "Off"}</StatusBadge>} />
+            onChange={event => setConfig({ ...config, hostSessions: event.target.checked })} /><span>Allow sessions on the host</span></label>
+          : <StatusBadge tone={saved.hostSessions ? "danger" : "neutral"}>{saved.hostSessions ? "On" : "Off"}</StatusBadge>} />
       {!connector.capabilities.hostConfig && <Row title="Update the host's connector" hint="This host's connector predates configuration in Pistead and keeps its connect options until it is updated (npx pistead@latest connect). What you save here applies then." />}
       {(changed || action.error || action.notice) && <CardBody>
         <div className="stack">

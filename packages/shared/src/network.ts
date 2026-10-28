@@ -93,6 +93,45 @@ export function egressLfsService(service: EgressGitService): service is "lfs-bat
 }
 
 /**
+ * Direct Git transfers: instead of relaying a Git request through the control plane, a host's egress proxy may ask it
+ * for a credential for one repository and make the request at the forge itself, so packs and LFS objects never cross
+ * the control plane. The control plane checks the session's authority exactly as for a relayed request and decides:
+ * - public repositories are read without any credential, on every host;
+ * - private ones with a token limited to that repository and to reading (a GitHub App installation token), on every
+ *   host, or with the session owner's own credential only on the owner's own hosts;
+ * - pushes of the session branch, with the workspace's push identity, only on the owner's own hosts (and the control
+ *   plane's own runner): such a token can't be limited to one branch, so a shared host keeps relaying them.
+ * Anything else is relayed as before (`direct: false`).
+ */
+export type GitDirectAccess = "read" | "lfs" | "push";
+export function gitDirectAccess(service: EgressGitService): GitDirectAccess {
+  return egressPushService(service) ? "push" : egressLfsService(service) ? "lfs" : "read";
+}
+export interface GitDirectRequest {
+  sessionId: string; bindingId: string; access: GitDirectAccess;
+  /** A push's one command, as the proxy read it from the request; absent for the advertisement. */
+  command?: { old: string; new: string; ref: string };
+}
+export type GitDirectGrant =
+  | { direct: false; reason: string; cacheSeconds: number }
+  | {
+    direct: true;
+    /** The repository's Git remote (https), where the proxy makes the request. */
+    remote: string;
+    /** The full Authorization header for the forge, or null for a public repository. */
+    authorization: string | null;
+    /** What the credential is, for the proxy's log: none, a repository token, the owner's account, the push identity. */
+    kind: "public" | "repository-token" | "owner-account" | "push-identity";
+    expiresAt: string;
+    /** How long the proxy may reuse the grant for further requests of the same access; 0 for pushes, which each ask. */
+    cacheSeconds: number;
+    /** A token the proxy revokes once its request is done (a push's installation token): DELETE url with authorization. */
+    revoke?: { url: string; authorization: string };
+  };
+/** Longest a proxy reuses a grant: a revoked session or repository stops direct transfers within this. */
+export const GIT_DIRECT_CACHE_SECONDS = 60;
+
+/**
  * Git LFS through the relay. The proxy turns git-lfs's batch API into these requests, and the control plane answers
  * them with the session owner's own credential; the provider's download URLs and their headers never reach the host.
  */

@@ -1,9 +1,10 @@
 import type { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
-import type { EntryView, SessionView } from '../../../packages/shared/src/types.js';
+import { COMPACTION_FAILURES, type EntryView, type SessionView } from '../../../packages/shared/src/types.js';
 import type { SessionLink, SharedSession, SharedSessionView } from '../../../packages/shared/src/sharing.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { redactSecrets } from '../../../packages/shared/src/redaction.js';
+import { briefEntry, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import { auditStatement, getUser, requireSession, sessionAccess } from './db.js';
 import { appOrigin, fail, identifier, now, randomToken } from './http.js';
@@ -77,6 +78,8 @@ function sharedEntry(entry: EntryView): EntryView {
       ...(error.provider !== undefined ? { provider: error.provider } : {}),
       ...(error.modelId !== undefined ? { modelId: error.modelId } : {}),
       ...(error.status !== undefined ? { status: error.status } : {}),
+      // Only a known fixed code: a newer or misbehaving runner can't put text here.
+      ...(error.compaction !== undefined && COMPACTION_FAILURES.includes(error.compaction) ? { compaction: error.compaction } : {}),
     } } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}) };
 }
@@ -86,15 +89,17 @@ function sharedEntry(entry: EntryView): EntryView {
  * each message, none of the owner's identity beyond their display name, and secrets redacted as in every view. Entries
  * keep only the fields a transcript shows, so nothing a newer runner adds reaches a link without a decision here.
  * It fails closed: an entry shows only when it names a conversation the view lists as the shared one, so a view that
- * drops or mislabels its conversations shows less, never a side ask.
+ * drops or mislabels its conversations shows less, never a side ask. A session showing brief tool output shows it here too.
  */
-export function sharedView(view: SessionView): SharedSessionView {
+export function sharedView(view: SessionView, toolOutput: ToolOutput = 'full'): SharedSessionView {
   const conversations = Array.isArray(view.conversations) ? view.conversations : [];
   const shared = new Set(conversations.filter(conversation => !!conversation && typeof conversation === 'object' && conversation.mode === 'write')
     .map(conversation => conversation.id));
   const entries = (Array.isArray(view.entries) ? view.entries : [])
     .filter(entry => !!entry && typeof entry === 'object' && typeof entry.conversationId === 'string' && shared.has(entry.conversationId))
-    .map(sharedEntry);
+    .map(sharedEntry)
+    // After redaction, as in the session's own views.
+    .map(entry => toolOutput === 'brief' ? briefEntry(entry) : entry);
   return { entries, busy: view.busy === true };
 }
 
@@ -117,7 +122,7 @@ export function registerSharedSessions(app: Hono<WorkerEnv>): void {
     const fresh = await linkedSession(c.env, token);
     if (!fresh || fresh.id !== row.id) fail(404, 'not_found', INVALID_LINK);
     if (fresh.connector_id) await requireConnectorSession(c.env, fresh.connector_id, fresh);
-    return c.json({ view: sharedView(result.view) });
+    return c.json({ view: sharedView(result.view, fresh.tool_output === 'brief' ? 'brief' : 'full') });
   });
 }
 

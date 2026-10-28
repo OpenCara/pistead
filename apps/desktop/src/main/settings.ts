@@ -13,6 +13,11 @@ export interface Settings {
    * hosting when it opens, with the unsandboxed consent they gave in the dialog at that start.
    */
   resumeHost?: { unsandboxedConsent: boolean };
+  /**
+   * Present while the owner wants Pistead running on this computer (local-server.ts): the Pistead window then shows it
+   * instead of `server`, and it starts again at launch with the unsandboxed consent given at its start.
+   */
+  localServer?: { unsandboxedConsent: boolean };
 }
 
 const isBounds = (value: unknown): value is Bounds => isRecord(value)
@@ -30,6 +35,8 @@ export function parseSettings(value: unknown): Settings {
   if (isBounds(source.windowBounds)) settings.windowBounds = source.windowBounds;
   const resume = source.resumeHost;
   if (isRecord(resume) && typeof resume.unsandboxedConsent === "boolean") settings.resumeHost = { unsandboxedConsent: resume.unsandboxedConsent };
+  const local = source.localServer;
+  if (isRecord(local) && typeof local.unsandboxedConsent === "boolean") settings.localServer = { unsandboxedConsent: local.unsandboxedConsent };
   return settings;
 }
 
