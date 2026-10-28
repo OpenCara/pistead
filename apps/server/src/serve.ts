@@ -12,6 +12,7 @@ import { settlePushCredentials } from './push/broker.js';
 import { refreshPullRequestStates } from './pull-request-states.js';
 import { runAutomaticBackups } from './automatic-backups.js';
 import { runScheduledPrompts } from './scheduled-prompts.js';
+import { runCrossSessionNotifications } from './cross-session.js';
 
 /** The `code` of a Node or pg error, looking one `cause` deep (pg wraps socket errors). */
 function errorCode(error: unknown): string | undefined {
@@ -81,6 +82,8 @@ export async function startServer(config: ServerConfig): Promise<RunningServer> 
     sweep('automatic backups', 60_000, async () => { if (env.WORKSPACE_DATABASES) await runAutomaticBackups(env); }),
     // Scheduled prompts (scheduled-prompts.ts).
     sweep('scheduled prompts', 30_000, () => runScheduledPrompts(env)),
+    // Notifications of cross-session messages their targets finished (cross-session.ts).
+    sweep('cross-session notifications', 15_000, () => runCrossSessionNotifications(env)),
   ];
 
   const serveStatic = createStaticHandler(staticDir);

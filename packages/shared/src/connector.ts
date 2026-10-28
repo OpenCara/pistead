@@ -41,6 +41,11 @@ export interface ConnectorCapabilities {
   /** The connector's agents manage their session's scheduled prompts through the control plane (schedule). Absent on older connectors. */
   schedules?: boolean;
   /**
+   * The connector's agents list, read, message, start, stop and archive the workspace's other sessions through the
+   * control plane, as the person whose message they work on (sessions; see cross-session.ts). Absent on older connectors.
+   */
+  crossSessions?: boolean;
+  /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
    * docs/design/repository-cache.md). Absent on older connectors and on hosts whose cache is off, for this connection.
    */

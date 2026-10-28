@@ -9,6 +9,7 @@ import { fail, identifier, jsonObject, userIdentifier } from './http.js';
 import { requireCallbackScope } from './connectors.js';
 import { githubComment, githubIssue, githubMerge, githubRead } from './github-broker.js';
 import { agentSchedules } from './scheduled-prompts.js';
+import { agentSessions } from './cross-session.js';
 import { legacyRestoreDownload } from './restore-routes.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { egressGrant, gitDirect, gitRelay } from './network.js';
@@ -32,6 +33,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/github/merge', c => githubMerge(c, null));
   app.post('/api/internal/github/issue', c => githubIssue(c, null));
   app.post('/api/internal/schedules', c => agentSchedules(c, null));
+  app.post('/api/internal/sessions', c => agentSessions(c, null));
   app.post('/api/internal/git/push/credential', c => pushCredential(c, null));
   app.post('/api/internal/git/push/complete', c => pushComplete(c, null));
   app.post('/api/internal/restores/:restoreId/download', legacyRestoreDownload);

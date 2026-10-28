@@ -76,14 +76,15 @@ export function sessionRecord(row: SessionRow, grants?: Permission[]): SessionRe
     ...(row.activity ? { activity: row.activity } : {}),
     ...(row.next_scheduled_at ? { nextScheduledAt: row.next_scheduled_at } : {}),
     ...(row.tool_output === 'brief' ? { toolOutput: 'brief' as const } : {}),
+    ...(row.parent_session_id ? { parentSessionId: row.parent_session_id } : {}),
     ...(pullRequest ? { pullRequest } : {}) };
 }
-export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest' | 'toolOutput' | 'nextScheduledAt'> {
+export function runnerSessionRecord(row: SessionRow): Omit<SessionRecord, 'visibility' | 'permissions' | 'activity' | 'frozen' | 'pullRequest' | 'toolOutput' | 'nextScheduledAt' | 'parentSessionId'> {
   // Visibility is live control-plane policy, activity and the pull request are what the host and pushes report, tool
-  // output is how the control plane shows the transcript, and the next scheduled prompt is the owner's schedule, so none
-  // of them is part of the immutable runner binding.
+  // output is how the control plane shows the transcript, the next scheduled prompt is the owner's schedule, and the
+  // parent session is how the control plane links sessions, so none of them is part of the immutable runner binding.
   const { visibility: _visibility, permissions: _permissions, activity: _activity, frozen: _frozen, pullRequest: _pullRequest,
-    toolOutput: _toolOutput, nextScheduledAt: _nextScheduledAt, ...record } = sessionRecord(row);
+    toolOutput: _toolOutput, nextScheduledAt: _nextScheduledAt, parentSessionId: _parentSessionId, ...record } = sessionRecord(row);
   return record;
 }
 export async function requireMember(env: Env, workspaceId: string, userId: string, roles?: readonly WorkspaceRole[]): Promise<MemberRow> {
@@ -146,6 +147,25 @@ export async function sessionAccess(env: Env, sessionId: string, actorId: string
   const snapshot = await env.DB.query<SessionPolicyRow>(`${SESSION_ACCESS_SQL} AND s.id = ?`)
     .bind(actorId, testMode(env) ? 1 : 0, sessionId).first();
   return accessFromSnapshot(snapshot, actorId);
+}
+
+// The same policy snapshot as SESSION_ACCESS_SQL, for every member of the session's workspace at once.
+const actorJoin = 'INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id AND actor.user_id = ?';
+if (!SESSION_ACCESS_SQL.includes(actorJoin)) throw new Error('Session access SQL changed: update SESSION_READERS_SQL.');
+const SESSION_READERS_SQL = SESSION_ACCESS_SQL.replace(actorJoin, 'INNER JOIN workspace_members actor ON actor.workspace_id = s.workspace_id')
+  .replace('SELECT s.*,', 'SELECT s.*, actor.user_id AS reader_id,');
+
+/**
+ * Everyone who can read the session now, by the rules `sessionAccess` applies to each of them (its owner, its
+ * workspace's members where it is shared with the workspace, explicit grants; suspended accounts never). Share links
+ * aren't people: callers that care ask `isLinkShared` too.
+ */
+export async function sessionReaders(env: Env, sessionId: string): Promise<Set<string>> {
+  const snapshots = await env.DB.query<SessionPolicyRow & { reader_id: string }>(`${SESSION_READERS_SQL} AND s.id = ?`)
+    .bind(testMode(env) ? 1 : 0, sessionId).all();
+  const readers = new Set<string>();
+  for (const { reader_id, ...snapshot } of snapshots) if (accessFromSnapshot(snapshot, reader_id)) readers.add(reader_id);
+  return readers;
 }
 
 export async function listSessionAccess(env: Env, actorId: string): Promise<SessionAccess[]> {

@@ -26,6 +26,14 @@ export function permissionCall(approvalId: string): string | undefined {
   return /^permission-([A-Za-z0-9_-]+)$/.exec(approvalId)?.[1];
 }
 /**
+ * The sessions tool call a permission request waits in: `permission-<call>` for its tool and write needs, and
+ * `permission-<call>_audience` for the second card a call may raise, once the control plane said what it would share
+ * (cross-session.ts).
+ */
+export function crossSessionCall(approvalId: string): string | undefined {
+  return permissionCall(approvalId)?.replace(/_audience$/, '');
+}
+/**
  * Whether `admission` is a message the session owner sent with Auto-approve access. Its tool calls use any tool without
  * a permission card, as the runner lets them; what those calls do still follows its own rules (a merge waits for a
  * human unless the admission is marked `auto_merge`, a command without limits runs only on the owner's host).
@@ -74,6 +82,26 @@ export async function requireToolCall(env: Env, row: SessionRow, tool: ToolName,
     || review.requested_by !== call.requestedBy || review.admission_id !== call.admission.id) {
     fail(403, 'tool_not_allowed', 'The pinned agent does not include this tool and the session owner has not allowed this call.');
   }
+}
+/**
+ * Whether the session owner let a sessions tool call do what its message alone can't (`need`): change another session in
+ * a Read-only message (`write`), or exchange transcript content with a session whose readers differ (`audience`). The
+ * owner's own Auto-approve message may; otherwise a permission they allowed for the session, or for this one call, as its
+ * card showed it (`call.target`), for the same requester and message, as `requireToolCall` checks a tool.
+ */
+export async function sessionsNeedGranted(env: Env, row: SessionRow, need: 'write' | 'audience',
+  call: { id: string; requestedBy: string; admission: AdmissionRow; target: string }): Promise<boolean> {
+  if (ownerAuto(row, call.admission)) return true;
+  const grants = await env.DB.query<{ call_id: string; approval_id: string }>(`SELECT call_id, approval_id FROM session_tool_grants
+    WHERE session_id = ? AND tool = ? AND (call_id = '' OR call_id = ?)`).bind(row.id, `sessions:${need}`, call.id).all();
+  if (grants.some(grant => grant.call_id === '')) return true;
+  for (const grant of grants) {
+    const review = await env.DB.query<ReviewRow>('SELECT * FROM approval_reviews WHERE session_id = ? AND approval_id = ?').bind(row.id, grant.approval_id).first();
+    const request = review ? parseOperation(JSON.parse(review.operation_json)) : undefined;
+    if (review && request?.kind === 'permission' && request.tool === 'sessions' && request.needs.includes(need) && request.target === call.target
+      && review.requested_by === call.requestedBy && review.admission_id === call.admission.id) return true;
+  }
+  return false;
 }
 export async function reviewCommitment(sessionId: string, approvalId: string, requestedBy: string, operation: Operation): Promise<string> {
   return sha256(JSON.stringify({ sessionId, approvalId, requestedBy, operation }));
