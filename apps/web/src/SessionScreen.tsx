@@ -533,7 +533,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
       {scrolledUp && <Button variant="secondary" size="sm" icon="arrow-down" className="jump-to-latest" aria-label="Jump to the latest message" title="Jump to the latest message" onClick={jumpToLatest} />}
     </div>
     <div className="session-bottom">
-      <div className="chat-column stack">
+      {/* Cards and the queue line scroll on their own above the chat box, which always stays on screen. */}
+      <div className="session-pinned"><div className="chat-column stack">
         {pinned}
         <details className="queue-line">
           <summary role="status" aria-live="polite">{queueLabel}<Icon name="chevron-down" size={14} /></summary>
@@ -552,6 +553,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
             <div className="inline"><Button variant="outline" size="sm" icon="refresh" onClick={refresh}>Refresh queue</Button></div>
           </div>
         </details>
+      </div></div>
+      <div className="chat-column stack">
         <ComposerInput
           value={content}
           onChange={setContent}

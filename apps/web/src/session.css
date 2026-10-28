@@ -100,7 +100,9 @@
   .approval-marks { display: inline-flex; flex: 0 0 auto; align-items: center; gap: var(--space-1); }
 
   /* Bottom stack: pinned approvals, queue line, composer. */
-  .session-bottom { flex: 0 0 auto; max-height: 70%; overflow-y: auto; padding: var(--space-2) 0 var(--space-4); }
+  .session-bottom { display: grid; flex: 0 0 auto; gap: var(--space-3); padding: var(--space-2) 0 var(--space-4); }
+  /* Pinned cards and the queue line: at most this much of the screen, scrolling within it, so the chat box below never leaves it. */
+  .session-pinned { max-height: 45vh; max-height: calc(var(--viewport-height, 100dvh) * 0.45); overflow-y: auto; overscroll-behavior: contain; }
   .approval-card { display: grid; gap: var(--space-2); padding: var(--space-3); }
   .approval-card > pre { max-height: 200px; }
   .approval-head { display: flex; align-items: center; gap: var(--space-2); }
@@ -173,6 +175,8 @@
   /* Right panel: pinned column on wide screens, overlay below. */
   .session-panel {
     display: grid;
+    /* Its tabs scroll rather than widen it past its column. */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
@@ -348,12 +352,13 @@
     .repository-progress:indeterminate { animation: none; }
   }
 
-  @media (max-width: 600px) {
+  /* Phones, held either way, and any screen an open keyboard leaves short. */
+  @media (max-width: 600px), (max-height: 500px) {
     .session-badges > .badge:not(:first-child) { display: none; }
     /* The live status keeps its dot; its word stays for screen readers. */
     .session-badges > .badge:first-child:has(> .dot) { gap: 0; padding: 0 7px; font-size: 0; }
     .session-badges { margin-right: 0; }
-    .session-pull-link > .icon:last-child { display: none; }
+    .session-pull-link > .icon:last-child, .session-pull-prefix, .session-pull-state { display: none; }
     .session-screen .screen-subtitle { display: none; }
     .chat-column { padding: 0 var(--space-3); }
     .session-transcript > .chat-column { padding-top: var(--space-4); padding-bottom: var(--space-4); }
@@ -362,6 +367,7 @@
     .session-bottom { padding: var(--space-2) 0; }
     .composer { padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3); }
     .composer > textarea { max-height: 30vh; max-height: 30dvh; }
+    .approval-card > pre { max-height: 7.5em; }
     /* One toolbar row: the tools scroll sideways in what send and stop leave of it. */
     .composer-tools {
       display: flex;
@@ -374,6 +380,8 @@
       scrollbar-width: none;
     }
     .composer-tools::-webkit-scrollbar { display: none; }
+    /* Its end fades out: there is more to scroll to. */
+    .composer-tools { padding-right: var(--space-4); mask-image: linear-gradient(to right, #000 calc(100% - var(--space-4)), transparent); }
     .composer-tools > * { flex: 0 0 auto; }
     .composer-tools .menu-anchor { max-width: 55vw; }
     /* "Runs as" can wait for a wider screen; why the box is read-only, or who sees a side ask, can't. */
@@ -382,6 +390,11 @@
     /* The panel covers the whole conversation rather than leave a sliver of it beside. */
     .session-panel, .session-screen.panel-wide .session-panel { width: 100%; border-left: 0; }
     .session-panel-body { padding: var(--space-3) var(--space-3) var(--space-8); }
+  }
+  @media (max-height: 500px) {
+    /* Short of height, the conversation and the chat box come first: the cards get a third of it, scrolling. */
+    .session-pinned { max-height: 33vh; max-height: calc(var(--viewport-height, 100dvh) * 0.33); }
+    .session-transcript > .chat-column { padding-top: var(--space-2); padding-bottom: var(--space-2); }
   }
 }
 
