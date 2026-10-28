@@ -175,7 +175,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   }
 
   // On a phone Enter adds a line, and the send button starts the session (touch.ts).
-  const [sendsOnEnter] = useState(enterSends);
+  const [sendsOnEnter] = useState(() => enterSends());
   // Nor does a phone open its keyboard over the screen before the task is even read.
   const [focusOnOpen] = useState(() => !isPhone());
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {

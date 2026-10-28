@@ -368,6 +368,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
   const stick = useRef(true);
   // Shown while the reader has scrolled up from the latest entry: a button back down to it.
   const [scrolledUp, setScrolledUp] = useState(false);
+  // Set while the button's smooth scroll runs: its frames are on the way down, not the reader scrolling up.
+  const jumping = useRef(false);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
@@ -428,8 +430,11 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     const element = transcript.current;
     if (!element) return;
     stick.current = true;
+    jumping.current = true;
     setScrolledUp(false);
     element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    // A reader who stops the scroll halfway (a touch, the wheel) leaves it short of the bottom: their scrolling counts again soon.
+    window.setTimeout(() => { jumping.current = false; }, 1000);
   }
   useLayoutEffect(() => {
     stick.current = true;
@@ -513,6 +518,11 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
       <div className="session-transcript" ref={transcript} onScroll={event => {
         const element = event.currentTarget;
         const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+        if (jumping.current) {
+          // Following and the hidden button stand until the scroll lands; entries that arrive meanwhile are followed.
+          if (distance < 80) jumping.current = false;
+          else return;
+        }
         stick.current = distance < 80;
         // A little further up than following stops, so the button doesn't flicker in and out at the bottom.
         const up = distance > 240;
@@ -597,7 +607,7 @@ function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stoppin
   value: string; onChange: (value: string) => void; onSubmit: () => void; attachments?: Attachments; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
   label: string; placeholder: string; sendLabel: string; hint: ReactNode; hintRequired?: boolean; tools?: ReactNode;
 }) {
-  const [sendsOnEnter] = useState(enterSends);
+  const [sendsOnEnter] = useState(() => enterSends());
   const sendable = Boolean(value.trim() || attachments?.images.length);
   const input = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {

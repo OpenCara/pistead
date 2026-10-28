@@ -145,6 +145,8 @@
     width: 100%;
     min-height: 24px;
     max-height: 40vh;
+    /* Of the visible height (touch.ts), so a tall draft can't push the chat box out from above an open keyboard. */
+    max-height: calc(var(--viewport-height, 100dvh) * 0.4);
     padding: 0 var(--space-1);
     overflow-y: auto;
     border: 0;
@@ -355,8 +357,11 @@
   /* Phones, held either way, and any screen an open keyboard leaves short. */
   @media (max-width: 600px), (max-height: 500px) {
     .session-badges > .badge:not(:first-child) { display: none; }
-    /* The live status keeps its dot; its word stays for screen readers. */
-    .session-badges > .badge:first-child:has(> .dot) { gap: 0; padding: 0 7px; font-size: 0; }
+    /* The live status keeps its dot; its word stays for screen readers, clipped as .visually-hidden is. */
+    .session-badges > .badge:first-child:has(> .dot) { gap: 0; padding: 0 7px; }
+    .session-badges > .badge:first-child:has(> .dot) > .badge-label {
+      position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+    }
     .session-badges { margin-right: 0; }
     .session-pull-link > .icon:last-child, .session-pull-prefix, .session-pull-state { display: none; }
     .session-screen .screen-subtitle { display: none; }
@@ -366,7 +371,7 @@
     .session-alerts { padding: var(--space-2) var(--space-3) 0; }
     .session-bottom { padding: var(--space-2) 0; }
     .composer { padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3); }
-    .composer > textarea { max-height: 30vh; max-height: 30dvh; }
+    .composer > textarea { max-height: 30vh; max-height: calc(var(--viewport-height, 100dvh) * 0.3); }
     .approval-card > pre { max-height: 7.5em; }
     /* One toolbar row: the tools scroll sideways in what send and stop leave of it. */
     .composer-tools {
@@ -394,6 +399,9 @@
   @media (max-height: 500px) {
     /* Short of height, the conversation and the chat box come first: the cards get a third of it, scrolling. */
     .session-pinned { max-height: 33vh; max-height: calc(var(--viewport-height, 100dvh) * 0.33); }
+    /* While typing there, the draft and the cards share what's left, so some conversation stays in view. */
+    .composer > textarea { max-height: calc(var(--viewport-height, 100dvh) * 0.25); }
+    .session-bottom:has(.composer:focus-within) .session-pinned { max-height: calc(var(--viewport-height, 100dvh) * 0.2); }
     .session-transcript > .chat-column { padding-top: var(--space-2); padding-bottom: var(--space-2); }
   }
 }

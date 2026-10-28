@@ -84,7 +84,8 @@ export function LinkButton({ href, variant = "secondary", size = "md", icon, chi
 export type Tone = "success" | "warning" | "danger" | "info" | "neutral" | "running";
 
 export function StatusBadge({ tone = "neutral", dot, children }: { tone?: Tone; dot?: boolean; children: ReactNode }) {
-  return <span className={`badge ${tone === "running" ? "info" : tone}`}>{dot && <StatusDot tone={tone} />}{children}</span>;
+  // The label has its own element, so a compact badge can show only its dot and keep the label for screen readers.
+  return <span className={`badge ${tone === "running" ? "info" : tone}`}>{dot && <StatusDot tone={tone} />}<span className="badge-label">{children}</span></span>;
 }
 
 export function StatusDot({ tone = "neutral", label, icon }: { tone?: Tone; label?: string; icon?: "clock" }) {
