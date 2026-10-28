@@ -4,7 +4,7 @@ export type IconName =
   | "plus" | "settings" | "more" | "chevron-right" | "chevron-down" | "chevron-up" | "chevron-left" | "x" | "check" | "copy"
   | "folder" | "file" | "message" | "terminal" | "tool" | "send" | "panel-right" | "menu" | "info" | "alert" | "shield"
   | "server" | "users" | "user" | "palette" | "sun" | "moon" | "monitor" | "logout" | "archive"
-  | "git-branch" | "git-pull-request" | "github" | "lock" | "globe" | "refresh" | "search" | "eye" | "trash" | "external" | "history" | "pencil" | "link" | "stop" | "clock";
+  | "git-branch" | "git-pull-request" | "github" | "lock" | "globe" | "refresh" | "search" | "eye" | "trash" | "external" | "history" | "pencil" | "link" | "stop" | "clock" | "image" | "arrow-down";
 
 const paths: Record<Exclude<IconName, "github">, ReactNode> = {
   plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
@@ -50,6 +50,8 @@ const paths: Record<Exclude<IconName, "github">, ReactNode> = {
   external: <><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></>,
   history: <><path d="M3 12a9 9 0 1 0 9-9 9.8 9.8 0 0 0-6.7 2.7L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l4 2" /></>,
   clock: <><circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" /></>,
+  image: <><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21" /></>,
+  "arrow-down": <><path d="M12 5v14" /><path d="m19 12-7 7-7-7" /></>,
   link: <><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" /><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" /></>,
 };
 

@@ -3,7 +3,7 @@ import type { ModelDefinition, SessionRecord, Workspace } from "../../../package
 import { canCreateSessions } from "../../../packages/shared/src/policy";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
+import { AttachButton, AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
 import {
   autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, mustConfirmAutoApprove, preferredSelection, readChatPreference, rememberChat, type ChatSelection,
 } from "./chat-options";
@@ -13,6 +13,7 @@ import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
 import { RepositoryClonePolicy, useWorkspaceRepositories } from "./repositories";
 import { href, navigate } from "./router";
+import { enterSends, isPhone } from "./touch";
 import { Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, IdentityBadge, InfoTip, LinkButton, Loading, PageLoading, useAction, useResource } from "./ui";
 import { usernameWithId } from "../../../packages/client/src/usernames";
 import "./new-session.css";
@@ -173,8 +174,12 @@ function Composer({ workspace }: { workspace: Workspace }) {
     });
   }
 
+  // On a phone Enter adds a line, and the send button starts the session (touch.ts).
+  const [sendsOnEnter] = useState(() => enterSends());
+  // Nor does a phone open its keyboard over the screen before the task is even read.
+  const [focusOnOpen] = useState(() => !isPhone());
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (sendsOnEnter && event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       void start();
     }
@@ -223,9 +228,11 @@ function Composer({ workspace }: { workspace: Workspace }) {
     <form className="composer-card" onSubmit={start} aria-busy={action.busy}>
       <fieldset disabled={action.busy}>
         <AttachmentStrip attachments={attachments} disabled={action.busy} />
-        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message" autoFocus />
+        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message"
+          enterKeyHint={sendsOnEnter ? "send" : "enter"} autoFocus={focusOnOpen} />
         {attachments.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
         <div className="composer-toolbar">
+          <AttachButton attachments={attachments} disabled={action.busy} />
           <Combobox label="Host" placeholder={models.loading || connections.loading ? "Loading..." : "Choose a host"} disabled={!hosts.length} value={hostKey}
             options={hosts.map(item => ({ value: item.id, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` }))}
             onChange={setChoice} />
