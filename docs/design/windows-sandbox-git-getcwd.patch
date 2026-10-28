@@ -1,0 +1,79 @@
+diff --git a/compat/mingw.c b/compat/mingw.c
+index 303ffaa..92f9f29 100644
+--- a/compat/mingw.c
++++ b/compat/mingw.c
+@@ -1415,6 +1415,51 @@ struct tm *localtime_r(const time_t *timep, struct tm *result)
+ }
+ #endif
+ 
++/*
++ * GetFinalPathNameByHandleW() with VOLUME_NAME_DOS, for a handle opened from
++ * `hint` (a path to the same file, relative or absolute).
++ *
++ * Turning the volume into a drive letter asks the mount manager, which a
++ * process in an OS process container (e.g. Windows' BaseContainer) may not do,
++ * so the call fails with ERROR_ACCESS_DENIED even though the file is open. The
++ * path within the volume is still known: put it under the drive `hint` names,
++ * and accept that only if it opens the very same file.
++ */
++static DWORD final_path_dos(HANDLE h, const wchar_t *hint, wchar_t *buf, DWORD size)
++{
++	wchar_t full[MAX_LONG_PATH], nt1[MAX_LONG_PATH], nt2[MAX_LONG_PATH];
++	DWORD ret = GetFinalPathNameByHandleW(h, buf, size, 0), len, n1, n2;
++	HANDLE h2;
++
++	if (ret || GetLastError() != ERROR_ACCESS_DENIED)
++		return ret;
++
++	len = GetFullPathNameW(hint, ARRAY_SIZE(full), full, NULL);
++	if (!len || len >= ARRAY_SIZE(full) || !iswalpha(full[0]) ||
++	    full[1] != L':' || size < 3)
++		goto denied;
++	buf[0] = full[0];
++	buf[1] = L':';
++	ret = GetFinalPathNameByHandleW(h, buf + 2, size - 2, VOLUME_NAME_NONE);
++	if (!ret || ret >= size - 2)
++		goto denied;
++
++	h2 = CreateFileW(buf, 0,
++			 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++			 NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
++	if (h2 == INVALID_HANDLE_VALUE)
++		goto denied;
++	n1 = GetFinalPathNameByHandleW(h, nt1, ARRAY_SIZE(nt1), VOLUME_NAME_NT);
++	n2 = GetFinalPathNameByHandleW(h2, nt2, ARRAY_SIZE(nt2), VOLUME_NAME_NT);
++	CloseHandle(h2);
++	if (n1 && n1 < ARRAY_SIZE(nt1) && n1 == n2 && !wcscmp(nt1, nt2))
++		return ret + 2;
++
++denied:
++	SetLastError(ERROR_ACCESS_DENIED);
++	return 0;
++}
++
+ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
+ {
+ 	wchar_t wpath[MAX_PATH];
+@@ -1468,7 +1513,12 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
+ 		return NULL;
+ 	}
+ 
+-	ret = GetFinalPathNameByHandleW(h, wpath, ARRAY_SIZE(wpath), 0);
++	{
++		wchar_t hint[MAX_PATH];
++
++		wcscpy(hint, wpath);
++		ret = final_path_dos(h, hint, wpath, ARRAY_SIZE(wpath));
++	}
+ 	CloseHandle(h);
+ 	if (!ret || ret >= ARRAY_SIZE(wpath))
+ 		goto realpath_failed;
+@@ -1505,7 +1555,7 @@ char *mingw_getcwd(char *pointer, int len)
+ 			  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+ 			  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+ 	if (hnd != INVALID_HANDLE_VALUE) {
+-		ret = GetFinalPathNameByHandleW(hnd, wpointer, ARRAY_SIZE(wpointer), 0);
++		ret = final_path_dos(hnd, cwd, wpointer, ARRAY_SIZE(wpointer));
+ 		CloseHandle(hnd);
+ 		if (!ret || ret >= ARRAY_SIZE(wpointer)) {
+ 			ret = GetLongPathNameW(cwd, wpointer, ARRAY_SIZE(wpointer));

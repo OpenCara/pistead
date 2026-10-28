@@ -257,6 +257,25 @@ test("the Windows runner reads only its configuration, passes everything after i
   assert.equal(refused.stdout, "");
 });
 
+test("the Node helper gives commands the session's own proxy URL back, after MXC replaced it with one without the token", { skip: !posix }, async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "node-helper-proxy-")));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, "helper.mjs"), NODE_HELPER);
+  const own = "http://pistead:session-token@127.0.0.1:41234";
+  const run = (extra: Record<string, string>) => spawnSync(process.execPath, [join(directory, "helper.mjs")], {
+    input: JSON.stringify({ kind: "bash", command: "echo \"$HTTPS_PROXY $https_proxy $HTTP_PROXY $http_proxy ${SANDBOX_EGRESS_PROXY:-unset} [$NO_PROXY] [$no_proxy] ${SANDBOX_EGRESS_NO_PROXY:-unset}\"" }) + "\n",
+    encoding: "utf8", cwd: directory,
+    env: { PATH: process.env.PATH, HOME: directory, SANDBOX_WORKTREE: directory, SANDBOX_BASH: bash,
+      HTTPS_PROXY: "http://127.0.0.1:41234", https_proxy: "http://127.0.0.1:41234", HTTP_PROXY: "http://127.0.0.1:41234", http_proxy: "http://127.0.0.1:41234",
+      NO_PROXY: "", no_proxy: "", ...extra },
+  });
+  const restored = run({ SANDBOX_EGRESS_PROXY: own, SANDBOX_EGRESS_NO_PROXY: "localhost,127.0.0.1,::1" });
+  assert.equal(restored.status, 0, restored.stderr);
+  assert.equal(restored.stdout, `${own} ${own} ${own} ${own} unset [localhost,127.0.0.1,::1] [localhost,127.0.0.1,::1] unset\n`);
+  // A step without the network has no proxy of its own to restore.
+  assert.equal(run({}).stdout, "http://127.0.0.1:41234 http://127.0.0.1:41234 http://127.0.0.1:41234 http://127.0.0.1:41234 unset [] [] unset\n");
+});
+
 test("the Windows runner and helper are valid modules, and job limits are checked", async t => {
   const directory = await mkdtemp(join(tmpdir(), "windows-scripts-"));
   t.after(() => rm(directory, { recursive: true, force: true }));

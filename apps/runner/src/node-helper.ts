@@ -6,13 +6,13 @@
  *
  * It takes one JSON request line on stdin, like the Linux helper, and answers the same way: JSON on stdout, or
  * `sandbox: <reason>` on stderr with exit status 1. It reads its places from the environment: SANDBOX_WORKTREE, HOME,
- * SANDBOX_GITDIR, SANDBOX_OWNER_CONFIG, SANDBOX_GIT, SANDBOX_BASH.
+ * SANDBOX_GITDIR, SANDBOX_OWNER_CONFIG, SANDBOX_GIT, SANDBOX_BASH, and SANDBOX_EGRESS_PROXY when the step has network.
  *
  * Not yet here: clone backups and restores (backups and moves of clone sessions), which the workspace refuses.
  */
 export const NODE_HELPER = String.raw`
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -22,6 +22,18 @@ const GITDIR = process.env.SANDBOX_GITDIR;
 const OWNER_CONFIG = process.env.SANDBOX_OWNER_CONFIG;
 const GIT_BINARY = process.env.SANDBOX_GIT || "git";
 const BASH = process.env.SANDBOX_BASH || "bash";
+// busybox-w32 (as in Git for Windows' MinGit-busybox) starts in Windows' process container, where MSYS2's bash can't. Its
+// shell is ash with bash's common extensions, run as its "bash" applet, and takes none of bash's start-up options.
+const SHELL_ARGS = /^busybox(64)?(\.exe)?$/i.test(basename(BASH)) ? ["bash", "-c"] : ["--noprofile", "--norc", "-c"];
+// MXC's proxy-only egress overwrites the proxy variables with a URL that lacks the session's token, so the proxy would
+// refuse every request (407), and empties NO_PROXY, so even loopback servers the step starts are sent to the proxy. The
+// backend passes the session's own values beside them; everything the helper starts gets them.
+if (process.env.SANDBOX_EGRESS_PROXY) {
+  for (const name of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) process.env[name] = process.env.SANDBOX_EGRESS_PROXY;
+  if (process.env.SANDBOX_EGRESS_NO_PROXY) for (const name of ["NO_PROXY", "no_proxy"]) process.env[name] = process.env.SANDBOX_EGRESS_NO_PROXY;
+}
+delete process.env.SANDBOX_EGRESS_PROXY;
+delete process.env.SANDBOX_EGRESS_NO_PROXY;
 const MAX_FILE = 1024 * 1024;
 const MAX_IMAGE = 16 * 1024 * 1024;
 const MAX_SNAPSHOT = 32 * 1024 * 1024;
@@ -74,16 +86,10 @@ function partsFor(value, writing = false) {
   if (lexical.some(part => part === "" || part === "." || part === "..")) refuse("path traversal is not allowed");
   if (!lexical.every(windowsName)) refuse("invalid Windows file name");
   if (writing && lexical.some(part => part.toLowerCase() === ".git")) refuse("Git metadata is protected");
-  const work = realpathSync(WORK);
-  let current = work;
-  for (const [index, part] of lexical.entries()) {
-    try { current = realpathSync(join(current, part)); }
-    catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      current = join(current, ...lexical.slice(index));
-      break;
-    }
-  }
+  const work = worktreeRoot();
+  let current;
+  try { current = resolveReal(work, lexical); }
+  catch (error) { if (!denied(error)) throw error; current = resolveBelow(work, lexical); }
   const inside = relative(work, current);
   if (inside.startsWith("..") || isAbsolute(inside)) refuse("path escapes the worktree");
   const parts = inside ? inside.split(sep) : [];
@@ -91,8 +97,58 @@ function partsFor(value, writing = false) {
   return parts;
 }
 
+function resolveReal(work, lexical) {
+  let current = work;
+  for (const [index, part] of lexical.entries()) {
+    try { current = realpathSync(join(current, part)); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      return join(current, ...lexical.slice(index));
+    }
+  }
+  return current;
+}
+
+// Node's realpath lstats every folder from the drive root, and its native form asks Windows for the volume's drive letter;
+// Windows' process container allows neither (EPERM). There, links are resolved from the worktree down: the worktree
+// itself is the runner's, and a link may lead only to somewhere else inside it.
+const denied = error => !!error && (error.code === "EPERM" || error.code === "EACCES");
+
+function worktreeRoot() {
+  try { return realpathSync(WORK); } catch (error) { if (denied(error)) return WORK; throw error; }
+}
+
+function resolveBelow(work, lexical) {
+  const parts = [...lexical];
+  let current = work;
+  let links = 0;
+  while (parts.length) {
+    const part = parts.shift();
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (current === work) refuse("path escapes the worktree");
+      current = dirname(current);
+      continue;
+    }
+    const next = join(current, part);
+    let info;
+    try { info = lstatSync(next); } catch (error) { if (error.code === "ENOENT") return join(next, ...parts); throw error; }
+    if (!info.isSymbolicLink()) { current = next; continue; }
+    if (++links > 32) refuse("too many links");
+    // Symbolic links and junctions both; a junction's target may carry the \\?\ prefix.
+    const target = readlinkSync(next).replace(/^\\\\\?\\/, "");
+    if (isAbsolute(target)) {
+      const inside = relative(work, target);
+      if (inside.startsWith("..") || isAbsolute(inside)) refuse("path escapes the worktree");
+      current = work;
+      parts.unshift(...inside.split(sep));
+    } else parts.unshift(...target.split(/[\\/]/));
+  }
+  return current;
+}
+
 function directoryAt(parts, create = false) {
-  let current = realpathSync(WORK);
+  let current = worktreeRoot();
   for (const part of parts) {
     current = join(current, part);
     if (create) { try { mkdirSync(current); } catch (error) { if (error.code !== "EEXIST") throw error; } }
@@ -259,9 +315,13 @@ function cloneDirectory(request) {
   return directory;
 }
 
+// A clone's steps read only its objects and config. Git is given its Git directory rather than told to change into the
+// clone: Windows' process container lets a step change only into folders it may write, and these steps are read-only.
+const cloneGitDir = directory => ["-c", "safe.directory=" + directory, "--git-dir=" + join(directory, ".git")];
+
 function cloneGit(directory, args, input = "") {
-  const result = spawnSync(GIT_BINARY, [...GIT_HARDENED, "--literal-pathspecs", "-c", "safe.directory=" + directory, "-C", directory, ...args], {
-    cwd: directory, input, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+  const result = spawnSync(GIT_BINARY, [...GIT_HARDENED, "--literal-pathspecs", ...cloneGitDir(directory), ...args], {
+    input, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
     stdio: ["pipe", "pipe", "ignore"], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
   });
   return { code: result.error ? 127 : result.status, output: result.stdout ?? Buffer.alloc(0) };
@@ -302,9 +362,9 @@ async function clonePushPack(request) {
   const { commit, exclude } = request;
   if (typeof commit !== "string" || !OID.test(commit) || !Array.isArray(exclude) || exclude.length > 1024 || !exclude.every(oid => typeof oid === "string" && OID.test(oid))) refuse("invalid push request");
   // The pack streams straight to the runner on stdout.
-  const child = spawn(GIT_BINARY, [...GIT_HARDENED, "--literal-pathspecs", "-c", "safe.directory=" + directory, "-C", directory,
+  const child = spawn(GIT_BINARY, [...GIT_HARDENED, "--literal-pathspecs", ...cloneGitDir(directory),
     "-c", "core.bigFileThreshold=64m", "pack-objects", "--stdout", "--revs", "--delta-base-offset", "-q"], {
-    cwd: directory, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, stdio: ["pipe", "inherit", "ignore"], windowsHide: true,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, stdio: ["pipe", "inherit", "ignore"], windowsHide: true,
   });
   child.stdin.end(commit + "\n" + exclude.map(oid => "^" + oid + "\n").join(""));
   const code = await new Promise(resolve => { child.on("error", () => resolve(127)); child.on("close", resolve); });
@@ -338,7 +398,7 @@ async function main() {
     return;
   }
   if (kind === "bash") {
-    const child = spawn(BASH, ["--noprofile", "--norc", "-c", request.command], { cwd: WORK, stdio: ["ignore", "inherit", "inherit"], windowsHide: true });
+    const child = spawn(BASH, [...SHELL_ARGS, request.command], { cwd: WORK, stdio: ["ignore", "inherit", "inherit"], windowsHide: true });
     const code = await new Promise(resolve => { child.on("error", () => resolve(127)); child.on("close", (status, signal) => resolve(status ?? (signal ? 128 : 1))); });
     process.exit(code);
   }
@@ -358,7 +418,7 @@ async function main() {
     return print({ text: data.toString("utf8") });
   }
   if (kind === "browse") {
-    if (!parts.length) return print(browseDirectory(realpathSync(WORK)));
+    if (!parts.length) return print(browseDirectory(worktreeRoot()));
     const path = join(directoryAt(parts.slice(0, -1)), parts.at(-1));
     const info = lstatSync(path);
     return print(info.isDirectory() && !info.isSymbolicLink() ? browseDirectory(path) : browseFile(path));

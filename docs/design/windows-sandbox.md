@@ -86,6 +86,51 @@ First run on Windows 11 25H2 build 26200.9445 (MXC 1.0.1 reports `base-container
   - unsandboxed: stopping a command leaves the background processes MSYS2 bash started (`taskkill /T` can't follow
     them), so a time limit or cancel waits for them to finish.
 
+Second run, on build 26200.9457 (MXC 1.0.1, `base-container`); every helper step and shell command then works:
+
+- Fixed:
+  - the token: MXC rewrites `HTTPS_PROXY`, `HTTP_PROXY` and their lowercase forms but leaves other variables alone, so
+    the backend passes the session's URL as `SANDBOX_EGRESS_PROXY` and the helper puts it back before it starts anything;
+  - the helper's paths: Node's `realpathSync` lstats every folder from the drive root and `realpathSync.native` asks
+    for the drive letter, both denied (`EPERM`); there the helper resolves links from the worktree down instead;
+  - read-only steps: a read-only grant doesn't allow changing into the folder (`SetCurrentDirectory` is denied, though
+    reads work), so `git -C <clone>` failed; clone steps now pass `--git-dir` and don't change directory.
+- Git's working directory, more exactly: `GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS` and `VOLUME_NAME_GUID`
+  (both ask the mount manager), `QueryDosDeviceW` and `GetLongPathNameW` (it lists every parent) are all denied;
+  `VOLUME_NAME_NT` and `VOLUME_NAME_NONE` work. Git falls back from the first to the last, then gives up; its realpath
+  then lstats every parent and fails too. A Git for Windows patch (`compat/mingw.c`) that puts the `VOLUME_NAME_NONE`
+  path under the drive the path names, and keeps it only if reopening it gives the same `VOLUME_NAME_NT` path, fixes
+  `getcwd` and realpath: `git init`, `commit`, `rev-parse` and `pack-objects` then run in the container
+  (`windows-sandbox-git-getcwd.patch`). Windows fixed the cause itself in a later build (third run, below).
+- MSYS2 is unchanged with the newest runtime (Codex's MinGit 2.53 `dash.exe` fails the same way). busybox-w32, as
+  `SANDBOX_BASH` (MinGit-busybox's `mingw64\bin\busybox.exe`), runs as the shell: the helper calls its `bash` applet
+  (ash with `[[ ]]`, `local`, `${s/x/y}`, no arrays), and Git for Windows' native `curl.exe` reaches the proxy.
+  Native programs don't know `/dev/null` (use `NUL`). Supported shells are still to decide: busybox, PowerShell, or an
+  MSYS2 runtime that makes its object directory in the container's namespace.
+- Still open: an MXC request for read-only grants that allow traversal; loopback servers in the container (.9550).
+
+Third run, after the October 2026 update moved the host to build 26300.9711 (MXC 1.0.1 now also reports
+`enumeratePaths`, loopback ingress and `isolation_session`):
+
+- Fixed by Windows: `VOLUME_NAME_DOS` works in the container (microsoft/mxc#1464), so the **stock** Git for Windows
+  2.45.1 runs every step (the patched Git is needed only on older builds), and Node's `realpathSync.native` works.
+  Loopback servers inside the container can be reached.
+- Unchanged: MSYS2 (microsoft/mxc#1061; busybox stays the shell); changing into a read-only folder
+  (microsoft/mxc#1467; `enumeratePaths` doesn't allow it either; clone steps keep `--git-dir`); the proxy variables.
+- Fixed here: MXC also empties `NO_PROXY`/`no_proxy`, which sent loopback requests to the proxy; the helper restores
+  them from `SANDBOX_EGRESS_NO_PROXY`.
+- `node script.js` failed (`EPERM, lstat 'C:\'`): Node's module loader uses the JavaScript `realpathSync`, which
+  lstats every folder from the drive root. Steps now get `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`,
+  so scripts and `require` work; tools that call `fs.realpathSync` themselves still fail. Not chosen:
+  `enumeratePaths` on the worktree's ancestors also fixes it, but the grant covers each whole subtree, so every file
+  *name* on the drive becomes listable (contents stay denied; `deniedPaths` carves folders out). With denies for
+  each ancestor's other entries it would expose only the path to the session, if the session root moved to a
+  shallow folder of its own (the deny list is built for every step, at about 1 ms a path, microsoft/mxc#1468).
+- Open: with proxy-only egress a step can't connect to a loopback server it started itself (`EACCES`): the
+  per-container filter allows only the proxy's port, and MXC refuses any other egress rule beside `networkProxy`.
+  MXC's networking doc lists it as an unresolved ingress limitation; the same server works in a step without the proxy.
+- The Git patch for builds before the fix is `windows-sandbox-git-getcwd.patch`, beside this note.
+
 ## What the Linux sandbox guarantees today
 
 These come from `apps/runner/src/sandbox.ts` (bubblewrap), `resources.ts` (cgroup v2) and `egress.ts`. A Windows

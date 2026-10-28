@@ -142,6 +142,13 @@ export class WindowsBackend implements HelperBackend {
       LOCALAPPDATA: join(layout.home, "AppData", "Local"), APPDATA: join(layout.home, "AppData", "Roaming"),
       // Git for Windows' bash starts in HOME and keeps its /tmp in TEMP.
       MSYSTEM: "MINGW64", CHERE_INVOKING: "1",
+      // Node's module loader resolves every script and module with the JavaScript realpath, which lstats each folder
+      // from the drive root; the container may not see those, so `node script.js` would fail (EPERM, lstat 'C:\').
+      // Tools that call fs.realpathSync themselves still can (see docs/design/windows-sandbox.md, third run).
+      NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main",
+      // MXC replaces the proxy variables with its own URL, without the session's token, and empties NO_PROXY (so even
+      // loopback goes to the proxy); the helper puts the session's back.
+      ...(port !== undefined ? { SANDBOX_EGRESS_PROXY: context.environment.HTTPS_PROXY!, SANDBOX_EGRESS_NO_PROXY: context.environment.NO_PROXY ?? "" } : {}),
     };
     const readonly = [system, dirname(process.execPath), this.#gitRoot, layout.bin, layout.ownerConfig, layout.caBundle, join(layout.worktree, ".git"),
       ...(context.gitWritable ? [] : [layout.git])];
