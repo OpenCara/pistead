@@ -14,6 +14,7 @@ import { settlePushCredentials } from './push/broker.js';
 import { refreshPullRequestStates } from './pull-request-states.js';
 import { runAutomaticBackups } from './automatic-backups.js';
 import { runScheduledPrompts } from './scheduled-prompts.js';
+import { runCrossSessionNotifications } from './cross-session.js';
 import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
 import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
 import { WorkspaceDatabaseError } from './workspace-databases/types.js';
@@ -218,6 +219,17 @@ const scheduledPrompts = setInterval(() => {
     .finally(() => { scheduling = false; });
 }, 30_000);
 scheduledPrompts.unref();
+
+// Notifications of cross-session messages their targets finished (cross-session.ts); one sweep at a time.
+let notifying = false;
+const crossSessionNotifications = setInterval(() => {
+  if (notifying) return;
+  notifying = true;
+  void runCrossSessionNotifications(env)
+    .catch(error => { console.error('pistead: cross-session notifications failed:', error instanceof Error ? error.message : error); })
+    .finally(() => { notifying = false; });
+}, 15_000);
+crossSessionNotifications.unref();
 
 const serveStatic = createStaticHandler(staticDir);
 app.notFound(async c => {

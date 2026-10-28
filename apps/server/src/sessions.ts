@@ -17,7 +17,7 @@ import { connectorUtf8Bytes } from './connector-transport.js';
 import { parseOperation } from './operations.js';
 import { hostSessionsSupported, requireConnectorSession } from './connectors.js';
 import { connectorHostConfig } from './host-config.js';
-import { permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
+import { crossSessionCall, permissionCall, presentApprovals, requireOperationTool, reviewedApproval } from './approval-reviews.js';
 import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
@@ -134,6 +134,162 @@ export async function submitMessage(c: AppContext, row: SessionRow, mode: 'submi
   await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}),
     ...(images ? { images: images.length } : {}), ...audit }).run();
   return result;
+}
+
+/**
+ * Starts a session as the request's user: the route of the apps' New session, and the sessions tool's create
+ * (cross-session.ts), whose sessions record the session that started them (`parentSessionId`). Every check is the same.
+ */
+export async function createSession(c: AppContext, input: Record<string, unknown>, link: { parentSessionId?: string } = {}): Promise<{ row: SessionRow; notice?: string }> {
+  if (['ownerId', 'permissions', 'githubId', 'repositories', 'repositories_json', 'pins'].some(key => key in input)) fail(400, 'server_owned_identity', 'Session identity, repository pins, and permissions are assigned by the server.');
+  const workspaceId = identifier(input.workspaceId, 'workspaceId');
+  // A session starts from a model, with a chat agent of its own.
+  if (input.agentVersionId !== undefined) fail(400, 'invalid_input', 'Sessions start from a model; agents were removed.');
+  const title = text(input.title ?? 'Untitled session', 'title', 200);
+  const visibility = sessionVisibility(input.visibility === undefined ? 'workspace' : input.visibility);
+  const ownerId = c.get('auth').userId;
+  await requireSessionCreator(c.env, workspaceId, ownerId);
+  // A live check: a model of the owner's own host here, or of a host shared here.
+  const model = await requireModel(c.env, identifier(input.modelId, 'modelId'), ownerId);
+  if (model.workspace_id !== workspaceId) fail(404, 'not_found', 'Model not found.');
+  if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are disabled.');
+  const syntheticLegacy = model.provider === 'faux' && await legacyRepositoryFixture(c.env, ownerId);
+  if (!model.connector_id && !syntheticLegacy) fail(400, 'connector_required', 'New sessions require a connected model.');
+  if (model.connector_id && model.connector_owner_id !== ownerId && input.trustedConnectorId !== model.connector_id) {
+    fail(400, 'connector_trust_required', 'Explicitly acknowledge that this host can access this session before continuing.');
+  }
+  const session = { id: id(), workspace_id: workspaceId, owner_id: ownerId, title, visibility, policy_version: 1, status: 'provisioning' as const,
+    created_at: now(), connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
+  const host = session.connector_id
+    ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(session.connector_id).first()
+    : null;
+  const capabilities = JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities;
+  // Every session clones its repositories with plain Git; a connector from before that can't run one.
+  if (session.connector_id && capabilities.plainGit !== true) {
+    fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
+  }
+  // A session may run directly on its host, without the sandbox: only the host's owner, or a member they granted that
+  // in this workspace, starts one, only where the host's configuration accepts that, and only on a connector that runs
+  // it there. Anything else is refused, never quietly sandboxed, so nobody believes a session is somewhere it isn't.
+  if (input.hostEnvironment !== undefined && typeof input.hostEnvironment !== 'boolean') fail(400, 'invalid_input', 'hostEnvironment must be true or false.');
+  const onHost = input.hostEnvironment === true;
+  if (onHost) {
+    const granted = session.connector_owner_id !== ownerId;
+    if (!session.connector_id || (granted && (await hostAuthority(c.env, session, ownerId))?.sessions !== true)) {
+      fail(403, 'host_owner_required', 'Only a host\'s owner, or a member they granted sessions on the host, starts sessions that run directly on it.');
+    }
+    if (capabilities.unsandboxed === true) fail(400, 'host_unsandboxed', 'This host runs every session without the sandbox already.');
+    if (!hostSessionsSupported(capabilities, granted)) {
+      fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to run sessions directly on it.');
+    }
+    if (!(await connectorHostConfig(c.env, session.connector_id)).hostSessions) {
+      fail(409, 'host_sessions_off', 'This host doesn\'t accept sessions that run directly on it. Turn that on under Settings → Hosts → the host → Configuration.');
+    }
+  }
+  // Every session starts empty, pinning nothing: its agent clones the workspace's repositories with plain Git, through
+  // the host's egress proxy on a sandboxed host or with the host's own Git where its owner runs it unsandboxed. An
+  // agent that can't run shell commands there can't clone, and works in an empty worktree (cloneUnavailable says why).
+  const resolved = await cloneRepositories(c.env, workspaceId, ownerId);
+  // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind. It offers only
+  // the tools this host can carry, so an older connector never gets one it can't run.
+  const agent = await chatAgentVersion(c.env, ownerId, model, capabilities);
+  // Its own branch is named for its work, on a connector that pushes the name its binding carries.
+  const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone',
+    branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0,
+    // It starts with the tool output its workspace's owners and admins chose for new sessions; its owner can change it.
+    tool_output: await newSessionToolOutput(c.env.DB, workspaceId) };
+  const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
+  const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
+  await requireSessionCreator(c.env, workspaceId, ownerId);
+  if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
+  // Admit the session only while its workspace's repositories, membership and host are as they were checked.
+  const inserted = await c.env.DB.query(`INSERT INTO sessions
+    (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch,
+      host_environment, tool_output)
+    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    WHERE ${sessionCreatorSQL('?')}
+    AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
+    AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
+      AND ((? = 1 AND session_owner.auth_kind = 'github') OR (? = 1 AND session_owner.auth_kind = 'test'))
+      AND (? IS NULL OR (session_owner.auth_kind = 'github' AND session_owner.github_id = ?
+        AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))))
+    AND (SELECT COUNT(*) FROM json_each(?) used JOIN git_credentials credential
+      ON credential.id = json_extract(used.value, '$.id') AND credential.ciphertext = json_extract(used.value, '$.ciphertext')
+      AND credential.user_id = ?) = ?
+    AND (? IS NULL OR EXISTS (
+      SELECT 1 FROM connectors host JOIN connector_workspaces association ON association.connector_id = host.id
+      JOIN workspace_members member ON member.workspace_id = association.workspace_id AND member.user_id = host.owner_id
+      JOIN users host_user ON host_user.id = host.owner_id
+      JOIN models m ON m.id = ?
+      WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND host_user.suspended_at IS NULL AND association.workspace_id = ?
+        AND (host.owner_id = ? OR EXISTS (SELECT 1 FROM connector_shares share
+          WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
+        AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id AND ${modelEnabledSQL('host.id', 'm')}
+        AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
+        AND (? = 0 OR json_type(host.capabilities_json, '$.gitPush') = 'true')
+        AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
+          WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
+    ))
+    AND (? = 0 OR EXISTS (SELECT 1 FROM connector_configs accepted WHERE accepted.connector_id = ? AND accepted.host_sessions = 1))
+    RETURNING id`)
+    .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
+      row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null, row.branch ?? null,
+      row.host_environment ?? 0, row.tool_output ?? 'full',
+      workspaceId, ownerId, workspaceId, resolved.bindingIds,
+      // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
+      ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
+      resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
+      JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
+      row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
+      testMode(c.env) ? 1 : 0, gitPush,
+      // Its host still accepts sessions on its own environment as the write lands.
+      onHost ? 1 : 0, row.connector_id ?? null).first();
+  if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
+  // Started by another session's agent: linked to it before anything runs, so it never shows unlinked.
+  if (link.parentSessionId) {
+    await c.env.DB.query('UPDATE sessions SET parent_session_id = ? WHERE id = ?').bind(link.parentSessionId, row.id).run();
+    row.parent_session_id = link.parentSessionId;
+  }
+  await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: agent.id, ...(onHost ? { hostEnvironment: true } : {}),
+    ...(link.parentSessionId ? { parentSessionId: link.parentSessionId } : {}) }).run();
+  try {
+    const binding = await bindingForSession(c, row);
+    const response = await runnerRequest(c, row, 'create', '', binding);
+    await response.body?.cancel();
+    await c.env.DB.query('UPDATE sessions SET status = ? WHERE id = ?').bind('ready', row.id).run();
+    row.status = 'ready';
+  } catch (error) {
+    await c.env.DB.query('UPDATE sessions SET status = ? WHERE id = ?').bind('error', row.id).run();
+    await auditStatement(c.env, ownerId, 'session.provision_failed', workspaceId, row.id).run();
+    throw error;
+  }
+  return { row, ...(notice ? { notice } : {}) };
+}
+
+/**
+ * Archives a session for its owner, the request's user: the session menu's Archive, and the sessions tool's archive
+ * (cross-session.ts), whose audit entry names its call in `audit`.
+ */
+export async function archiveSession(c: AppContext, sessionId: string, audit: Record<string, unknown> = {}): Promise<SessionRow> {
+  const { row } = await requireSession(c, sessionId, 'manage');
+  const ownerId = c.get('auth').userId;
+  if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can archive it.');
+  // A policy version bump invalidates runner tickets and broker capabilities issued before archiving.
+  const archived = await c.env.DB.query<SessionRow>(`UPDATE sessions SET archived_status = status, status = 'archived', policy_version = policy_version + 1
+    WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived'
+    RETURNING *`).bind(row.id, ownerId, row.policy_version).first();
+  if (!archived) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
+  await auditStatement(c.env, ownerId, 'session.archived', row.workspace_id, row.id, { previousStatus: row.status, ...audit }).run();
+  return archived;
+}
+
+/** Stops the session's work as the request's user, who may write to it; the sessions tool's audit entry names its call in `audit`. */
+export async function stopSession(c: AppContext, row: SessionRow, audit: Record<string, unknown> = {}): Promise<number> {
+  const result = await runnerJSON<{ stopped: number }>(await runnerRequest(c, row, 'stop', '', {}));
+  invalidateSessionView(c, row.id);
+  if (!Number.isSafeInteger(result?.stopped) || result.stopped < 0) fail(502, 'invalid_runner_response', 'The runner returned an invalid stop result.');
+  await auditStatement(c.env, c.get('auth').userId, 'session.stopped', row.workspace_id, row.id, { stopped: result.stopped, ...audit }).run();
+  return result.stopped;
 }
 
 export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
@@ -257,123 +413,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   });
 
   app.post('/api/sessions', async c => {
-    const input = await jsonObject(c);
-    if (['ownerId', 'permissions', 'githubId', 'repositories', 'repositories_json', 'pins'].some(key => key in input)) fail(400, 'server_owned_identity', 'Session identity, repository pins, and permissions are assigned by the server.');
-    const workspaceId = identifier(input.workspaceId, 'workspaceId');
-    // A session starts from a model, with a chat agent of its own.
-    if (input.agentVersionId !== undefined) fail(400, 'invalid_input', 'Sessions start from a model; agents were removed.');
-    const title = text(input.title ?? 'Untitled session', 'title', 200);
-    const visibility = sessionVisibility(input.visibility === undefined ? 'workspace' : input.visibility);
-    const ownerId = c.get('auth').userId;
-    await requireSessionCreator(c.env, workspaceId, ownerId);
-    // A live check: a model of the owner's own host here, or of a host shared here.
-    const model = await requireModel(c.env, identifier(input.modelId, 'modelId'), ownerId);
-    if (model.workspace_id !== workspaceId) fail(404, 'not_found', 'Model not found.');
-    if (model.provider === 'faux' && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Faux models are disabled.');
-    const syntheticLegacy = model.provider === 'faux' && await legacyRepositoryFixture(c.env, ownerId);
-    if (!model.connector_id && !syntheticLegacy) fail(400, 'connector_required', 'New sessions require a connected model.');
-    if (model.connector_id && model.connector_owner_id !== ownerId && input.trustedConnectorId !== model.connector_id) {
-      fail(400, 'connector_trust_required', 'Explicitly acknowledge that this host can access this session before continuing.');
-    }
-    const session = { id: id(), workspace_id: workspaceId, owner_id: ownerId, title, visibility, policy_version: 1, status: 'provisioning' as const,
-      created_at: now(), connector_id: model.connector_id ?? null, connector_owner_id: model.connector_owner_id ?? null };
-    const host = session.connector_id
-      ? await c.env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(session.connector_id).first()
-      : null;
-    const capabilities = JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities;
-    // Every session clones its repositories with plain Git; a connector from before that can't run one.
-    if (session.connector_id && capabilities.plainGit !== true) {
-      fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect): sessions now clone their repositories with plain Git.');
-    }
-    // A session may run directly on its host, without the sandbox: only the host's owner, or a member they granted that
-    // in this workspace, starts one, only where the host's configuration accepts that, and only on a connector that runs
-    // it there. Anything else is refused, never quietly sandboxed, so nobody believes a session is somewhere it isn't.
-    if (input.hostEnvironment !== undefined && typeof input.hostEnvironment !== 'boolean') fail(400, 'invalid_input', 'hostEnvironment must be true or false.');
-    const onHost = input.hostEnvironment === true;
-    if (onHost) {
-      const granted = session.connector_owner_id !== ownerId;
-      if (!session.connector_id || (granted && (await hostAuthority(c.env, session, ownerId))?.sessions !== true)) {
-        fail(403, 'host_owner_required', 'Only a host\'s owner, or a member they granted sessions on the host, starts sessions that run directly on it.');
-      }
-      if (capabilities.unsandboxed === true) fail(400, 'host_unsandboxed', 'This host runs every session without the sandbox already.');
-      if (!hostSessionsSupported(capabilities, granted)) {
-        fail(409, 'connector_update_required', 'Update the host\'s connector (npx pistead@latest connect) to run sessions directly on it.');
-      }
-      if (!(await connectorHostConfig(c.env, session.connector_id)).hostSessions) {
-        fail(409, 'host_sessions_off', 'This host doesn\'t accept sessions that run directly on it. Turn that on under Settings → Hosts → the host → Configuration.');
-      }
-    }
-    // Every session starts empty, pinning nothing: its agent clones the workspace's repositories with plain Git, through
-    // the host's egress proxy on a sandboxed host or with the host's own Git where its owner runs it unsandboxed. An
-    // agent that can't run shell commands there can't clone, and works in an empty worktree (cloneUnavailable says why).
-    const resolved = await cloneRepositories(c.env, workspaceId, ownerId);
-    // Created only once the start is otherwise admissible, so a refused start leaves no chat agent behind. It offers only
-    // the tools this host can carry, so an older connector never gets one it can't run.
-    const agent = await chatAgentVersion(c.env, ownerId, model, capabilities);
-    // Its own branch is named for its work, on a connector that pushes the name its binding carries.
-    const row: SessionRow & { repositories_json: string } = { ...session, agent_version_id: agent.id, repositories_json: '[]', repository_mode: 'clone',
-      branch: capabilities.sessionBranches === true ? sessionBranchName(title, session.id) : null, host_environment: onHost ? 1 : 0,
-      // It starts with the tool output its workspace's owners and admins chose for new sessions; its owner can change it.
-      tool_output: await newSessionToolOutput(c.env.DB, workspaceId) };
-    const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
-    const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
-    await requireSessionCreator(c.env, workspaceId, ownerId);
-    if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
-    // Admit the session only while its workspace's repositories, membership and host are as they were checked.
-    const inserted = await c.env.DB.query(`INSERT INTO sessions
-      (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch,
-        host_environment, tool_output)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
-      WHERE ${sessionCreatorSQL('?')}
-      AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
-      AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
-        AND ((? = 1 AND session_owner.auth_kind = 'github') OR (? = 1 AND session_owner.auth_kind = 'test'))
-        AND (? IS NULL OR (session_owner.auth_kind = 'github' AND session_owner.github_id = ?
-          AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))))
-      AND (SELECT COUNT(*) FROM json_each(?) used JOIN git_credentials credential
-        ON credential.id = json_extract(used.value, '$.id') AND credential.ciphertext = json_extract(used.value, '$.ciphertext')
-        AND credential.user_id = ?) = ?
-      AND (? IS NULL OR EXISTS (
-        SELECT 1 FROM connectors host JOIN connector_workspaces association ON association.connector_id = host.id
-        JOIN workspace_members member ON member.workspace_id = association.workspace_id AND member.user_id = host.owner_id
-        JOIN users host_user ON host_user.id = host.owner_id
-        JOIN models m ON m.id = ?
-        WHERE host.id = ? AND host.owner_id = ? AND host.revoked_at IS NULL AND host_user.suspended_at IS NULL AND association.workspace_id = ?
-          AND (host.owner_id = ? OR EXISTS (SELECT 1 FROM connector_shares share
-            WHERE share.connector_id = host.id AND share.workspace_id = association.workspace_id))
-          AND m.available = 1 AND m.connector_id = host.id AND m.connector_owner_id = host.owner_id AND ${modelEnabledSQL('host.id', 'm')}
-          AND (? = 1 OR (host_user.auth_kind <> 'test' AND m.provider <> 'faux'))
-          AND (? = 0 OR json_type(host.capabilities_json, '$.gitPush') = 'true')
-          AND EXISTS (SELECT 1 FROM json_each(host.models_json) local
-            WHERE json_extract(local.value, '$.provider') = m.provider AND json_extract(local.value, '$.modelId') = m.model_id)
-      ))
-      AND (? = 0 OR EXISTS (SELECT 1 FROM connector_configs accepted WHERE accepted.connector_id = ? AND accepted.host_sessions = 1))
-      RETURNING id`)
-      .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
-        row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null, row.branch ?? null,
-        row.host_environment ?? 0, row.tool_output ?? 'full',
-        workspaceId, ownerId, workspaceId, resolved.bindingIds,
-        // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
-        ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
-        resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
-        JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
-        row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,
-        testMode(c.env) ? 1 : 0, gitPush,
-        // Its host still accepts sessions on its own environment as the write lands.
-        onHost ? 1 : 0, row.connector_id ?? null).first();
-    if (!inserted) fail(409, 'session_configuration_changed', 'Workspace repositories, Git account access, membership, or connector authority changed. Try again.');
-    await auditStatement(c.env, ownerId, 'session.created', workspaceId, row.id, { agentVersionId: agent.id, ...(onHost ? { hostEnvironment: true } : {}) }).run();
-    try {
-      const binding = await bindingForSession(c, row);
-      const response = await runnerRequest(c, row, 'create', '', binding);
-      await response.body?.cancel();
-      await c.env.DB.query('UPDATE sessions SET status = ? WHERE id = ?').bind('ready', row.id).run();
-      row.status = 'ready';
-    } catch (error) {
-      await c.env.DB.query('UPDATE sessions SET status = ? WHERE id = ?').bind('error', row.id).run();
-      await auditStatement(c.env, ownerId, 'session.provision_failed', workspaceId, row.id).run();
-      throw error;
-    }
+    const { row, notice } = await createSession(c, await jsonObject(c));
     return c.json({ session: { ...sessionRecord(row, [...permissions]), ...(notice ? { cloneUnavailable: notice } : {}) } }, 201);
   });
 
@@ -446,15 +486,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   // Archiving makes a session read-only for everyone (see requireSession and runnerRequest) and hides it from default
   // lists. It never contacts the host or deletes anything, so the owner can unarchive it to its exact previous status.
   app.post('/api/sessions/:id/archive', async c => {
-    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
-    const ownerId = c.get('auth').userId;
-    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can archive it.');
-    // A policy version bump invalidates runner tickets and broker capabilities issued before archiving.
-    const archived = await c.env.DB.query<SessionRow>(`UPDATE sessions SET archived_status = status, status = 'archived', policy_version = policy_version + 1
-      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived'
-      RETURNING *`).bind(row.id, ownerId, row.policy_version).first();
-    if (!archived) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
-    await auditStatement(c.env, ownerId, 'session.archived', row.workspace_id, row.id, { previousStatus: row.status }).run();
+    const archived = await archiveSession(c, identifier(c.req.param('id')));
     return c.json({ session: sessionRecord(archived, [...permissions]) });
   });
   app.post('/api/sessions/:id/unarchive', async c => {
@@ -592,6 +624,16 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, tool, call_id) DO NOTHING`)
           .bind(row.id, operation.tool, scope === 'session' ? '' : permissionCall(approvalId)!, approvalId, c.get('auth').userId, now()).run();
       }
+      // The sessions tool changes other sessions, so the control plane checks itself that the owner let a Read-only
+      // message do that, or let this session's readers see a session they can't open (cross-session.ts).
+      if (operation.kind === 'permission' && operation.tool === 'sessions') {
+        for (const need of ['write', 'audience'] as const) {
+          if (!operation.needs.includes(need)) continue;
+          await c.env.DB.query(`INSERT INTO session_tool_grants (session_id, tool, call_id, approval_id, granted_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, tool, call_id) DO NOTHING`)
+            .bind(row.id, `sessions:${need}`, scope === 'session' ? '' : crossSessionCall(approvalId)!, approvalId, c.get('auth').userId, now()).run();
+        }
+      }
     }
     const decided = await runnerJSON<{ approval: ApprovalRecord }>(await runnerRequest(c, row, 'approve', approvalId, {
       approvalId, decision: input.decision, operation, ...(brokerCapability ? { brokerCapability } : {}), ...(scope ? { scope } : {}),
@@ -673,11 +715,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   // Anyone who can write to the session can stop its work, as they can add to it.
   app.post('/api/sessions/:id/stop', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
-    const result = await runnerJSON<{ stopped: number }>(await runnerRequest(c, row, 'stop', '', {}));
-    invalidateSessionView(c, row.id);
-    if (!Number.isSafeInteger(result?.stopped) || result.stopped < 0) fail(502, 'invalid_runner_response', 'The runner returned an invalid stop result.');
-    await auditStatement(c.env, c.get('auth').userId, 'session.stopped', row.workspace_id, row.id, { stopped: result.stopped }).run();
-    return c.json({ stopped: result.stopped });
+    return c.json({ stopped: await stopSession(c, row) });
   });
 
   app.post('/api/sessions/:id/restart', async c => {

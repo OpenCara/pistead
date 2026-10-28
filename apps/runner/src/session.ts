@@ -11,6 +11,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionBranch, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, repositoryPreparationPhases, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
 import { scheduleToolTarget } from "../../../packages/shared/src/cron.js";
+import { crossSessionLimits, sessionsToolActions, sessionsToolTarget, sessionsWriteActions, type SessionsToolRequest, type SessionsToolResult } from "../../../packages/shared/src/cross-session.js";
 import type { CompactionFailure } from "../../../packages/shared/src/types.js";
 import type { RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { bindingRemote, repositoryPath, validCloneDirectory, validPushTag } from "../../../packages/shared/src/repositories.js";
@@ -68,8 +69,11 @@ type Run = {
   crashed?: true;
 };
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
-/** What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access. */
-type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean };
+/**
+ * What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access.
+ * `audience`: the sessions tool exchanges content with sessions whose readers aren't this session's.
+ */
+type Grants = { tools: ToolName[]; write: boolean; unboundedShell: boolean; audience?: boolean };
 /** A session's backup (format pi-runner-backup-v1), as restore.ts reads it back. */
 interface RunnerBackup {
   format: "pi-runner-backup-v1";
@@ -95,6 +99,19 @@ type InputImage = { mimeType: string; data: string };
 const MAX_QUEUED_IMAGE_BYTES = 16 * 1024 * 1024;
 /** Tools that never change files or run commands: the whole toolset of side asks. */
 const readOnlyTools = ["identity", "read_file", "list_files"];
+/** How often a sessions tool wait reads its message's outcome. */
+const WAIT_POLL_MS = 3000;
+const SESSIONS_TOOL_DESCRIPTION = "Work with this workspace's other Pistead sessions, as the person whose message you are working on, with exactly their permissions in each session. "
+  + "action list: the sessions they can see (id, title, status, activity, their permissions, parent) and the models create can use. "
+  + "read {session, limit?, message_id?}: a session's latest shared-conversation entries and pending approvals; with message_id, also the outcome of a message this session sent it (status, done, reply). "
+  + "ask {session, message, notify?}: a read-only side question to that session's agent. "
+  + "send {session, message, access?, notify?}: a message to that session's agent, as if typed in its chat (access approval, the default: its commands wait for people there; read: inspect only; auto: only in a message the session owner sent with auto-approve, to a session they own); refused while it is busy. "
+  + "wait {session, message_id, timeout_seconds?}: block until a message this session sent finishes (default 300 seconds), then return its outcome and reply. "
+  + "create {message?, title?, model?, visibility?, access?, notify?}: start a new session for a sub-task, as the same person, on this session's model unless model names one list returns, and send it message. "
+  + "stop {session}: stop that session's current work. archive {session}: archive a session they own. "
+  + "With notify, Pistead sends this session the outcome as a new message once the other session finishes. Delivered messages start with a line naming this session and the sender; "
+  + "chains of messages stop after 3 hops and never loop back to a session they came from; approvals in another session are decided only by people there. "
+  + "Involve other sessions only when the user asked for it or clearly expects it.";
 /**
  * How long after a message is sent its tool calls can wait on a card: the owner's permission or an operation's approval.
  * Deciding needs the message's write admission, which lasts an hour from sending, so a card older than that can't be
@@ -128,6 +145,8 @@ export type RunnerConfig = {
   githubIssue?: (request: GitHubIssueRequest) => Promise<GitHubIssueResult>;
   /** Lists, creates, changes or deletes the session's scheduled prompts, as the schedule tool asks; the control plane's refusal throws a RunnerError with its reason. */
   schedules?: (request: ScheduleToolRequest) => Promise<ScheduleToolResult>;
+  /** One sessions tool call (any action but wait, which is reads), through the control plane; its refusal throws a RunnerError with its reason. */
+  crossSessions?: (request: SessionsToolRequest) => Promise<SessionsToolResult>;
   /** Issues the credential for one approved push; a token is held only in this process's memory. */
   pushCredential?: (request: PushCredentialRequest) => Promise<PushCredential | HostPushCredential>;
   /** Reports a finished push so its credential is revoked and any requested pull request is opened. */
@@ -1469,7 +1488,7 @@ export class RunnerSession {
         const keys = new Set(runs.map(run => run.key));
         for (const [taskId, actor] of Object.entries(meta.toolActors)) {
           if (!keys.has(actor.runKey)) continue;
-          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`]]) {
+          for (const card of [meta.approvals[`tool-${taskId}`], meta.approvals[`permission-${taskId}`], meta.approvals[`permission-${taskId}_audience`]]) {
             if (card?.status === "pending") Object.assign(card, { status: "interrupted", result: "The tool call stopped before a decision." });
           }
         }
@@ -1572,15 +1591,21 @@ export class RunnerSession {
    * the owner's card, which allows it once or for the rest of the session, or denies it. `unbounded`: the command runs
    * without limits, which only the host's owner can allow, and only in their own session.
    */
-  private async permit(api: ToolExecutionApi, waiting: Context, tool: ToolName, target: string, effect: { write?: boolean; shell?: boolean } = {}): Promise<{ unbounded: boolean }> {
+  private async permit(api: ToolExecutionApi, waiting: Context, tool: ToolName, target: string, effect: { write?: boolean; shell?: boolean; audience?: boolean } = {}): Promise<{ unbounded: boolean }> {
     const state = await this.metadata();
     const actor = state.toolActors[String(api.taskId)];
     const run = actor && state.runs[actor.runKey];
     if (!run) throw new RunnerError(403, "Tool has no authorized writable submission");
     const grants = state.grants;
     const needs: PermissionNeed[] = [];
-    if (!this.binding.agent.tools.includes(tool) && !(tool !== "host_bash" && grants?.tools.includes(tool))) needs.push("tool");
-    if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
+    // The sessions tool's second card, once the control plane said what a call it let through would share: the call
+    // already has its tool, so that card asks only for this, under an id of its own.
+    if (effect.audience) {
+      if (!grants?.audience) needs.push("audience");
+    } else {
+      if (!this.binding.agent.tools.includes(tool) && !(tool !== "host_bash" && grants?.tools.includes(tool))) needs.push("tool");
+      if (effect.write && run.options?.access === "read" && !grants?.write) needs.push("write");
+    }
     const unbounded = effect.shell === true && !this.shellAllowed();
     if (unbounded) {
       if (this.binding.session.connectorOwnerId !== this.binding.owner.id) this.requireShellCapability({ kind: "bash", command: target });
@@ -1593,7 +1618,7 @@ export class RunnerSession {
     if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
     const deadline = (run.submittedAt ?? Date.now()) + DECISION_WAIT_MS;
     if (deadline <= Date.now()) throw new Error("This message is over an hour old, so the session owner can no longer allow this call. Ask them to send a new message.");
-    const id = `permission-${api.taskId}`;
+    const id = `permission-${api.taskId}${effect.audience ? "_audience" : ""}`;
     // The target only shows the owner what the call touches; keep it within what the control plane accepts.
     const shown = target.replaceAll("\0", "");
     const operation = validateOperation({ kind: "permission", tool, target: shown.length > 8192 ? `${shown.slice(0, 8191)}…` : shown, needs });
@@ -1609,7 +1634,7 @@ export class RunnerSession {
   /** Whether what the owner allowed for the rest of the session covers every need of `request`. */
   private coveredBy(request: PermissionRequest, grants: Grants): boolean {
     return request.needs.every(need => need === "tool" ? this.binding.agent.tools.includes(request.tool) || (request.tool !== "host_bash" && grants.tools.includes(request.tool))
-      : need === "write" ? grants.write : grants.unboundedShell);
+      : need === "write" ? grants.write : need === "audience" ? grants.audience === true : grants.unboundedShell);
   }
 
   private buildTools(): ToolRegistration[] {
@@ -1757,6 +1782,56 @@ export class RunnerSession {
         const result = this.config.schedules ? await this.config.schedules(request) : await this.internalBroker("schedules", request) as ScheduleToolResult;
         return text({ ...attribution, ...result });
       } }),
+      defineTool({ name: "sessions", description: SESSIONS_TOOL_DESCRIPTION, parameters: Type.Object({
+        action: StringEnum(sessionsToolActions), session: Type.Optional(Type.String()), message: Type.Optional(Type.String()),
+        access: Type.Optional(StringEnum(accessModes)), notify: Type.Optional(Type.Boolean()), title: Type.Optional(Type.String()), model: Type.Optional(Type.String()),
+        visibility: Type.Optional(StringEnum(["private", "workspace"] as const)), message_id: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: crossSessionLimits.readEntries })),
+        timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: crossSessionLimits.waitSeconds })),
+      }), execute: async (args, api, call) => {
+        const attribution = await this.toolActor(api, true);
+        const fields = Object.fromEntries(Object.entries({ targetSessionId: args.session, message: args.message, access: args.access, notify: args.notify, title: args.title,
+          modelId: args.model, visibility: args.visibility, messageId: args.message_id, limit: args.limit }).filter(([, value]) => value !== undefined)) as
+          Omit<SessionsToolRequest, "sessionId" | "actorId" | "admissionId" | "callId" | "action">;
+        if (Object.values(fields).some(value => typeof value === "string" && value.includes("\0"))) throw new RunnerError(400, "Sessions tool fields must not contain NUL characters");
+        const wait = args.action === "wait";
+        if (wait && (fields.targetSessionId === undefined || fields.messageId === undefined)) throw new RunnerError(400, "wait takes session and message_id, as ask, send or create returned them");
+        if (!wait && args.timeout_seconds !== undefined) throw new RunnerError(400, "Only wait takes timeout_seconds");
+        const state = await this.metadata();
+        const run = state.runs[state.toolActors[String(api.taskId)]!.runKey]!;
+        if (!run.admissionId) throw new RunnerError(403, "The sessions tool needs a write message");
+        // What it sends elsewhere never has more access than this message (the control plane checks this too).
+        if (args.access === "auto" && (run.options?.access !== "auto" || run.initiatedBy !== this.binding.owner.id)) {
+          throw new RunnerError(403, "Only a message the session owner sent with auto-approve sends an auto-approved message. Use access approval, which leaves the other session's commands to its people.");
+        }
+        // A wait is a series of reads of one message, and its card shows it as that read.
+        const request = { action: wait ? "read" as const : args.action as Exclude<typeof args.action, "wait">, ...(wait ? { targetSessionId: fields.targetSessionId, messageId: fields.messageId, limit: 1 } : fields) };
+        await this.permit(api, call, "sessions", sessionsToolTarget(request), { write: sessionsWriteActions.includes(args.action) });
+        await this.authorize(run.initiatedBy, "write");
+        const base = { sessionId: this.binding.session.id, actorId: run.initiatedBy, admissionId: run.admissionId, callId: String(api.taskId) };
+        const broker = async (): Promise<SessionsToolResult> => {
+          const result = this.config.crossSessions ? await this.config.crossSessions({ ...base, ...request }) : await this.internalBroker("sessions", { ...base, ...request }) as SessionsToolResult;
+          if (!("consent" in result)) return result;
+          // The other session's readers aren't this one's: the owner decides, on a card naming that session, and the
+          // control plane then sees their decision for this call.
+          await this.permit(api, call, "sessions", result.target, { audience: true });
+          await this.authorize(run.initiatedBy, "write");
+          const retried = this.config.crossSessions ? await this.config.crossSessions({ ...base, ...request }) : await this.internalBroker("sessions", { ...base, ...request }) as SessionsToolResult;
+          if ("consent" in retried) throw new RunnerError(409, "The control plane did not see the session owner's decision yet; call again.");
+          return retried;
+        };
+        if (!wait) return text({ ...attribution, ...await broker() });
+        const deadline = Date.now() + (args.timeout_seconds ?? crossSessionLimits.defaultWaitSeconds) * 1000;
+        for (;;) {
+          const result = await broker();
+          const done = "outcome" in result && result.outcome?.done === true;
+          if (done || Date.now() + WAIT_POLL_MS > deadline) {
+            const { entries: _entries, ...shown } = result as Extract<SessionsToolResult, { entries: unknown }>;
+            return text({ ...attribution, ...shown, ...(done ? {} : { timedOut: true }) });
+          }
+          await sleep(WAIT_POLL_MS, undefined, { signal: call.abortSignal });
+        }
+      } }),
       defineTool({ name: "host_bash", executionMode: "sequential",
         description: "Run any command OUTSIDE the sandbox on the host, with its tools, files, credentials and network. Uses the session worktree as cwd and the host home/PATH. Requires exact approval by the host owner or a member they granted host commands; auto-approve skips it only in the session of the host owner or of a member granted automatic host commands. No CPU/memory/disk quotas. Default 300 seconds, maximum 3600. Never use as an implicit fallback.",
         parameters: Type.Object({ command: Type.String(), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600 })) }),
@@ -1869,7 +1944,7 @@ export class RunnerSession {
   }
 
   /** One of the control plane's internal broker routes, as internalGitHub. */
-  private async internalBroker(path: "schedules" | `github/${string}`, request: object): Promise<unknown> {
+  private async internalBroker(path: "schedules" | "sessions" | `github/${string}`, request: object): Promise<unknown> {
     const response = await (this.config.fetch ?? fetch)(`${this.config.controlPlaneUrl}/api/internal/${path}`, {
       method: "POST", headers: { authorization: `Bearer ${this.config.sharedSecret}`, "content-type": "application/json" },
       body: JSON.stringify(request), signal: AbortSignal.timeout(30_000), redirect: "error",
@@ -2068,6 +2143,7 @@ export class RunnerSession {
           if (request.needs.includes("tool") && !grants.tools.includes(request.tool)) grants.tools.push(request.tool);
           if (request.needs.includes("write")) grants.write = true;
           if (request.needs.includes("unbounded-shell")) grants.unboundedShell = true;
+          if (request.needs.includes("audience")) grants.audience = true;
           // Parallel calls of the same round that wait on what the session now allows go ahead too.
           for (const other of Object.values(meta.approvals)) {
             if (other.id === id || other.status !== "pending" || other.operation.kind !== "permission" || !this.coveredBy(other.operation, grants)) continue;

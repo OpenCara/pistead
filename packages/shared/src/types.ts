@@ -19,7 +19,7 @@ export type AssignableWorkspaceRole = (typeof assignableWorkspaceRoles)[number];
 /** The four tiers of access to one session given to one member, least first; sessionRolePermissions (policy.ts) defines them. */
 export const sessionRoles = ["viewer", "member", "collaborator", "admin"] as const;
 export type SessionRole = (typeof sessionRoles)[number];
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue", "schedule"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue", "schedule", "sessions"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**
  * Tools of sessions that pinned their repositories, which are read-only now: still valid in stored agents and
@@ -132,6 +132,8 @@ export interface SessionRecord {
   cloneUnavailable?: string;
   // Control-plane viewing policy; absent on legacy records means private.
   visibility?: "private" | "workspace";
+  /** The session whose agent started this one with the sessions tool, as the same person; absent for every other session. */
+  parentSessionId?: string;
   /**
    * "brief": everyone viewing the session (share links included) sees each tool result as its first line and long tool
    * calls cut short, to keep transcripts small. Absent: full tool output. It starts as its workspace sets for new sessions; only the owner changes it.
@@ -305,8 +307,12 @@ export interface GitPushOperation {
   commit: string;
   pullRequest?: PullRequestRequest;
 }
-/** What a tool call lacks: a tool the agent doesn't include, changes in a Read-only message, or a shell without resource limits. */
-export const permissionNeeds = ["tool", "write", "unbounded-shell"] as const;
+/**
+ * What a tool call lacks: a tool the agent doesn't include, changes in a Read-only message, a shell without resource
+ * limits, or (`audience`) showing this session's readers another session's transcript that only a narrower audience
+ * can read now (the sessions tool; see packages/shared/src/cross-session.ts).
+ */
+export const permissionNeeds = ["tool", "write", "unbounded-shell", "audience"] as const;
 export type PermissionNeed = (typeof permissionNeeds)[number];
 /**
  * A tool call that needs more than the session allows. The call waits while the session owner allows it once or for the

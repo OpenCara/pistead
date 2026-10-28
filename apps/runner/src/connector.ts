@@ -10,6 +10,7 @@ import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, 
 import { connectorLimits, connectorRequestTimeoutMs } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
 import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity, SessionBranch } from "../../../packages/shared/src/types.js";
+import type { SessionsToolResult } from "../../../packages/shared/src/cross-session.js";
 import { MAX_CLONE_BRANCHES } from "./clone-branches.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
@@ -37,6 +38,8 @@ const GITHUB_READ_LIMIT = 128 * 1024;
 const HOST_CONFIG_LIMIT = 128 * 1024;
 /** A schedule tool result: up to every schedule of the session, each with its message (MAX_SCHEDULES_PER_SESSION, server). */
 const SCHEDULES_LIMIT = 4 * 1024 * 1024;
+/** A sessions tool result: a list of up to 200 sessions, or a read of up to 50 entries of 2000 characters and a reply. */
+const SESSIONS_LIMIT = 2 * 1024 * 1024;
 /** The budget of a broker callback, whose upstream work can take several calls: as long as a relayed request may take. */
 const RPC_TIMEOUT = 30_000;
 /** How long a reply may wait for socket output to drain enough to fit; an uplink that can't is a broken connection. */
@@ -198,9 +201,9 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // owner runs it unsandboxed.
   const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, schedules: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache };
+    github: true, githubIssues: true, schedules: true, crossSessions: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, schedules: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache,
+    github: true, githubIssues: true, schedules: true, crossSessions: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache,
     ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
@@ -647,6 +650,15 @@ export class LocalConnector {
         z.union([z.looseObject({ schedules: z.array(z.looseObject({ id: z.string() })) }), z.looseObject({ schedule: z.looseObject({ id: z.string() }) }),
           z.object({ deleted: z.string() }).strict()]).parse(result);
         return result as ScheduleToolResult;
+      },
+      // Like schedules, the control plane's refusal (no access there, a loop, the hop limit) comes back with its reason.
+      crossSessions: async request => {
+        const result = await this.brokerCallback(await this.connection(), "/api/connectors/self/sessions", request, SESSIONS_LIMIT);
+        z.union([z.looseObject({ sessions: z.array(z.looseObject({ id: z.string() })), models: z.array(z.unknown()) }),
+          z.looseObject({ session: z.looseObject({ id: z.string() }) }), z.looseObject({ message: z.looseObject({ id: z.string() }) }),
+          z.object({ stopped: z.number().int().nonnegative() }).strict(), z.object({ archived: z.string() }).strict(),
+          z.object({ consent: z.literal("audience"), target: z.string().max(8192), reason: z.string().max(1024) }).strict()]).parse(result);
+        return result as SessionsToolResult;
       },
       // Minting can take several upstream calls, so push callbacks get the full RPC budget.
       pushCredential: async request => {
