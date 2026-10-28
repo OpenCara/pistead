@@ -20,9 +20,8 @@ Linux and Windows targets are declared for later.
   same consent otherwise; native Windows gets the CLI's WSL2 instructions.
 - Pistead on this computer runs the local server (`dist/host/desktop-server.mjs`, bundled from
   `apps/server/src/local/desktop.ts`) in a second utility process, with `pistead serve`'s state
-  (`~/.local/share/pistead/server`), so the two share their data; a kernel lease on that directory (flock/lockf, as the connector's) lets only one run
-  time. The
-  GitHub OAuth app's secret travels only over the IPC channel into that state. While it runs, the Pistead window shows
+  (`~/.local/share/pistead/server`), so the two share their data; a kernel lease on that directory (flock or lockf, as
+  the connector's) lets only one of them run at a time. The GitHub OAuth app's secret travels only over the IPC channel into that state. While it runs, the Pistead window shows
   it instead of the configured server, opening its sign-in link while nobody has claimed it; this computer becomes its
   host once the owner has signed in, after the same unsandboxed consent where there is no sandbox. It starts again at
   launch while it is on, and stopping it in Settings returns the window to the configured server.
