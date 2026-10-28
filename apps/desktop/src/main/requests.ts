@@ -1,5 +1,5 @@
 import { pairingCodePattern, pairingIdPattern } from "../../../runner/src/desktop-protocol.js";
-import type { StartInput } from "../shared/bridge.js";
+import type { LocalStartInput, StartInput } from "../shared/bridge.js";
 
 // Validation of every payload a local page sends the main process; pure, so tests run it without Electron.
 
@@ -35,6 +35,22 @@ export function parseStartInput(value: unknown): Parsed<StartInput> {
   if (!code) return { ok: false, error: "Enter the single-use pairing code shown in Pistead." };
   if (!pairingCodePattern.test(code)) return { ok: false, error: "That pairing code is not valid. Copy the single-use code shown in Pistead." };
   return { ok: true, value: { pairing: { id, code }, replacePairing: value.replacePairing } };
+}
+
+/** Settings' start of Pistead on this computer, with a GitHub OAuth app when the owner entered one. */
+export function parseLocalStartInput(value: unknown): Parsed<LocalStartInput> {
+  if (!isRecord(value) || !onlyKeys(value, ["github"])) return { ok: false, error: "Invalid request." };
+  if (value.github === undefined) return { ok: true, value: {} };
+  const github = value.github;
+  if (!isRecord(github) || !onlyKeys(github, ["clientId", "clientSecret"]) || typeof github.clientId !== "string" || typeof github.clientSecret !== "string") {
+    return { ok: false, error: "Invalid request." };
+  }
+  const clientId = github.clientId.trim();
+  const clientSecret = github.clientSecret.trim();
+  if (!clientId && !clientSecret) return { ok: true, value: {} };
+  if (!/^[A-Za-z0-9._-]{1,100}$/.test(clientId)) return { ok: false, error: "Enter the client ID GitHub shows for your OAuth app." };
+  if (!/^[A-Za-z0-9._-]{1,200}$/.test(clientSecret)) return { ok: false, error: "Enter a client secret you generated for your OAuth app." };
+  return { ok: true, value: { github: { clientId, clientSecret } } };
 }
 
 export function parseBoolean(value: unknown): Parsed<boolean> {

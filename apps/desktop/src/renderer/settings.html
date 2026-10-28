@@ -21,6 +21,39 @@
           <button id="default" type="button">Use Default</button>
         </div>
       </form>
+
+      <section aria-labelledby="local-heading">
+        <header class="title">
+          <h2 id="local-heading">Pistead on this computer</h2>
+          <span id="local-status" class="pill" role="status">Off</span>
+        </header>
+        <p class="muted">Run Pistead here, for yourself, without a server: the Pistead window shows it instead of the server above, and this computer runs your sessions. Only this computer can reach it, and only your GitHub account can sign in. It's the same as <code>pistead serve</code> in a terminal, and shares its data.</p>
+        <dl class="facts" id="local-facts" hidden>
+          <dt>Address</dt><dd id="local-origin"></dd>
+          <dt>Sessions</dt><dd id="local-host"></dd>
+          <dt>Data</dt><dd id="local-state-dir"></dd>
+        </dl>
+        <form id="local-form" autocomplete="off" novalidate>
+          <div id="github-fields">
+            <p class="muted">Pistead signs you in with GitHub through an OAuth app of your own. Register one once at
+              <code>https://github.com/settings/applications/new</code> with the homepage <code>http://127.0.0.1</code> and the
+              authorization callback URL <code>http://127.0.0.1/api/auth/github/callback</code>, generate a client secret, and enter both here.</p>
+            <p id="github-saved" class="muted" hidden></p>
+            <label>Client ID
+              <input id="client-id" name="client-id" spellcheck="false" autocapitalize="off" />
+            </label>
+            <label>Client secret
+              <input id="client-secret" name="client-secret" type="password" spellcheck="false" autocapitalize="off" />
+            </label>
+          </div>
+          <p id="local-message" role="status" hidden></p>
+          <div class="actions">
+            <button id="local-start" class="primary" type="submit">Run on This Computer</button>
+            <button id="local-stop" type="button" hidden>Stop</button>
+          </div>
+        </form>
+        <ol id="local-logs" class="logs" hidden></ol>
+      </section>
     </main>
   </body>
 </html>

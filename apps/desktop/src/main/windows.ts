@@ -100,8 +100,8 @@ function editContextMenu(window: BrowserWindow): void {
   });
 }
 
-export function createMainWindow(settings: SettingsStore, icon: string | undefined): BrowserWindow {
-  const server = () => settings.get().server;
+/** `server` is the origin the window shows: the configured server, or Pistead on this computer while it runs. */
+export function createMainWindow(settings: SettingsStore, icon: string | undefined, server: () => string, start = server()): BrowserWindow {
   const window = new BrowserWindow({
     width: 1280, height: 860, minWidth: 420, minHeight: 480, title: "Pistead", show: false,
     ...(icon ? { icon } : {}),
@@ -126,7 +126,7 @@ export function createMainWindow(settings: SettingsStore, icon: string | undefin
     if (!isMainFrame || code === -3 || URL.parse(url)?.origin !== server()) return;
     void window.loadURL(offlinePage(server())).catch(() => {});
   });
-  void window.loadURL(server()).catch(() => {});
+  void window.loadURL(start).catch(() => {});
   return window;
 }
 

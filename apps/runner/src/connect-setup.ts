@@ -69,6 +69,15 @@ export async function loadConnectorModels(choice: ModelChoice): Promise<LocalMod
 }
 
 /** The control-plane origin this state directory is paired with, if any. */
+/** Sandboxed only on Linux with every sandbox prerequisite; anything else runs unsandboxed after explicit consent. */
+export async function hostIsolation(): Promise<{ mode: "sandboxed" | "unsandboxed"; sandboxPrerequisites?: Prerequisite[]; prerequisites: Prerequisite[] }> {
+  if (process.platform !== "linux") return { mode: "unsandboxed", prerequisites: await checkPrerequisites(true) };
+  const sandboxPrerequisites = await checkPrerequisites(false);
+  return sandboxPrerequisites.every(item => item.ok)
+    ? { mode: "sandboxed", sandboxPrerequisites, prerequisites: sandboxPrerequisites }
+    : { mode: "unsandboxed", sandboxPrerequisites, prerequisites: await checkPrerequisites(true) };
+}
+
 export async function savedPairing(dataDir: string, allowInsecureLoopback = false): Promise<string | undefined> {
   return (await readConnectorState(dataDir, undefined, allowInsecureLoopback))?.controlPlaneUrl;
 }

@@ -3,7 +3,6 @@ import { sessionExportFormat, workspaceExportFormat } from '../data-export.js';
 import { auditStatement } from '../db.js';
 import type { Database } from '../db/types.js';
 import type { Env, WorkspaceRow } from '../types.js';
-import { PostgresWorkspaceDatabases } from './postgres.js';
 import { workspaceDatabaseTarget, type WorkspaceDatabaseRow } from './store.js';
 import type { ImportedAuditEntry, ImportedSession, WorkspaceDatabaseProvider, WorkspaceImport } from './types.js';
 
@@ -213,6 +212,8 @@ export async function importDumpFromCommandLine(db: Database, processEnv: NodeJS
   let connection = provider;
   if (!connection) {
     if (processEnv.WORKSPACE_DATABASES !== 'true') invalid('Workspace databases are turned off on this server (WORKSPACE_DATABASES).');
+    // Loaded only here: the routes import this module, and a server without workspace databases needs no Postgres driver.
+    const { PostgresWorkspaceDatabases } = await import('./postgres.js');
     connection = new PostgresWorkspaceDatabases({ privateHosts: processEnv.WORKSPACE_DATABASE_PRIVATE_HOSTS === 'true' });
   }
   const env: Env = { DB: db, APP_ORIGIN: '', VAULT_KEY: processEnv.VAULT_KEY };

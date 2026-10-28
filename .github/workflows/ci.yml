@@ -44,6 +44,9 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      # The published CLI, with the web app and migrations `pistead serve` ships, and its server chunk loading.
+      - run: pnpm --filter pistead run build
+      - run: node packages/cli/dist/pistead.js serve --help
       # The desktop app's main process, pages and connector host bundle (packaging needs macOS and is not run here).
       - run: pnpm --filter @pistead/desktop build
       - run: pnpm test:connected

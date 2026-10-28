@@ -64,7 +64,12 @@ Catalogs over 200 models need enabledModels in Pi's settings or --model. Restart
 `;
 
 export function promptPairingCode(): Promise<string> {
-  if (!process.stdin.isTTY || !process.stderr.isTTY || !process.stdin.setRawMode) throw new Error("Pairing requires a private interactive terminal; codes are never accepted on argv or stdin pipes");
+  return promptHidden("Pairing code (hidden): ", "Pairing", "pairing code");
+}
+
+/** A secret typed at a hidden prompt on the terminal: never argv, never a pipe. `noun` names it in errors. */
+export function promptHidden(label: string, action: string, noun: string): Promise<string> {
+  if (!process.stdin.isTTY || !process.stderr.isTTY || !process.stdin.setRawMode) throw new Error(`${action} requires a private interactive terminal; ${noun}s are never accepted on argv or stdin pipes`);
   const wasRaw = process.stdin.isRaw;
   const wasPaused = process.stdin.isPaused();
   const completion = Promise.withResolvers<string>();
@@ -87,16 +92,16 @@ export function promptPairingCode(): Promise<string> {
   const onData = (chunk: Buffer | string) => {
     for (const char of (typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))) {
       if (char === "\r" || char === "\n") { finish(); return; }
-      if (char === "\u0003" || char === "\u0004") { finish(new Error("Pairing cancelled")); return; }
+      if (char === "\u0003" || char === "\u0004") { finish(new Error(`${action} cancelled`)); return; }
       if (char === "\u007f" || char === "\b") { code = code.slice(0, -1); continue; }
-      if (!/^[A-Za-z0-9_-]$/.test(char) || code.length >= 256) { finish(new Error("Invalid pairing code")); return; }
+      if (!/^[A-Za-z0-9_-]$/.test(char) || code.length >= 256) { finish(new Error(`Invalid ${noun}`)); return; }
       code += char;
     }
   };
-  const onEnd = () => finish(new Error("Pairing terminal closed"));
-  const onError = () => finish(new Error("Pairing terminal unavailable"));
-  const onTerminate = () => finish(new Error("Pairing cancelled"));
-  process.stderr.write("Pairing code (hidden): ");
+  const onEnd = () => finish(new Error(`${action} terminal closed`));
+  const onError = () => finish(new Error(`${action} terminal unavailable`));
+  const onTerminate = () => finish(new Error(`${action} cancelled`));
+  process.stderr.write(label);
   process.stdin.setRawMode(true);
   process.stdin.on("data", onData);
   process.stdin.once("end", onEnd);
@@ -107,7 +112,7 @@ export function promptPairingCode(): Promise<string> {
   return completion.promise;
 }
 
-async function resourceConfig(path: string): Promise<ResourceConfig> {
+export async function resourceConfig(path: string): Promise<ResourceConfig> {
   const raw: unknown = JSON.parse(await readFile(resolve(path), "utf8"));
   if (!raw || typeof raw !== "object") throw new Error("Invalid resource configuration");
   const value = raw as Record<string, unknown>;
@@ -124,7 +129,7 @@ async function resourceConfig(path: string): Promise<ResourceConfig> {
   };
 }
 
-async function confirmUnsandboxed(): Promise<void> {
+export async function confirmUnsandboxed(): Promise<void> {
   process.stderr.write(unsandboxedWarning());
   if (!process.stdin.isTTY || !process.stderr.isTTY) {
     process.stderr.write("Non-interactive terminal: --unsafe-no-sandbox is taken as your consent.\n");

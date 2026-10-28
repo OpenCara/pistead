@@ -7,7 +7,7 @@ import type { NativeSignIn, SignedInDevice } from '../../../packages/shared/src/
 import { isInstanceAdmin } from './admin.js';
 import { getUser, userProfile } from './db.js';
 import type { Query, SqlValue } from './db/types.js';
-import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
+import { appOrigin, fail, id, identifier, jsonObject, localMode, now, randomToken, requireOrigin, testMode, text } from './http.js';
 import type { AppContext, AuthIdentity, Env, UserRow, WorkerEnv } from './types.js';
 import { assertVaultConfigured, encryptToken } from './vault.js';
 
@@ -32,11 +32,13 @@ function cookies(env: Env) {
   return {
     auth: secure ? '__Host-auth' : 'test-auth',
     state: secure ? '__Host-oauth-state' : 'test-oauth-state',
+    /** A local server's claim, from its launcher's sign-in link to GitHub's callback (localOwner). */
+    claim: secure ? '__Host-local-claim' : 'local-claim',
     options: { secure, httpOnly: true, sameSite: 'Lax' as const, path: '/' },
   };
 }
 
-function expireCookie(c: AppContext, kind: 'auth' | 'state'): void {
+function expireCookie(c: AppContext, kind: 'auth' | 'state' | 'claim'): void {
   const config = cookies(c.env);
   setCookie(c, config[kind], '', { ...config.options, maxAge: 0, expires: new Date(0) });
 }
@@ -331,6 +333,7 @@ async function githubUser(c: AppContext, config: GitHubConfig, code: string, ver
   const displayName = typeof identity.name === 'string' && identity.name.trim() && identity.name.length <= 200 &&
     !/[\u0000-\u001f\u007f]/.test(identity.name) ? identity.name : identity.login;
   const githubId = String(identity.id);
+  if (localMode(c.env)) await admitLocalOwner(c, githubId);
   // Identity comes exclusively from GitHub, never the current cookie (especially test cookies).
   const user = await dbResult(c.env.DB.query<UserRow>(`INSERT INTO users
     (id, github_id, github_login, display_name, git_name, git_email, env_json, auth_kind, created_at)
@@ -341,12 +344,64 @@ async function githubUser(c: AppContext, config: GitHubConfig, code: string, ver
   if (!user || user.auth_kind !== 'github' || user.id.startsWith('test:')) {
     fail(409, 'identity_conflict', 'GitHub identity cannot be used for this account.');
   }
+  if (localMode(c.env)) await settleLocalClaim(c.env, user.id);
   // Refused before the new token is stored, so a suspended account keeps none it didn't already have.
   if (user.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   const ciphertext = await encryptToken(c.env, user.id, exchange.access_token);
   return { user, tokenStatement: c.env.DB.query(`INSERT INTO github_tokens (user_id, ciphertext, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`)
     .bind(user.id, ciphertext, now()) };
+}
+
+/** The GitHub account that claimed this local server, or null while nobody has: its first GitHub user. */
+export async function localOwner(env: Env): Promise<{ id: string; github_id: string } | null> {
+  return await dbResult(env.DB.query<{ id: string; github_id: string }>(
+    `SELECT id, github_id FROM users WHERE auth_kind = 'github' AND github_id IS NOT NULL ORDER BY created_at, id LIMIT 1`).first()) ?? null;
+}
+
+/**
+ * A local server admits one GitHub account. Its owner signs in as on any server; before anyone has, only a sign-in started
+ * from the launcher's link (localClaim), which carries the claim secret, may claim it. Checked before GitHub's token is
+ * stored, so nobody else's token is ever kept.
+ */
+async function admitLocalOwner(c: AppContext, githubId: string): Promise<void> {
+  const owner = await localOwner(c.env);
+  if (owner) {
+    if (owner.github_id !== githubId) fail(403, 'local_server_owner_only', 'This Pistead runs on its owner\'s computer, and only the GitHub account that set it up can sign in.');
+    return;
+  }
+  const claim = getCookie(c, cookies(c.env).claim);
+  if (!claim || !OPAQUE_TOKEN.test(claim) || !constantTimeEqual(claim, c.env.LOCAL_CLAIM_SECRET!)) {
+    fail(403, 'local_server_unclaimed', 'Nobody has set up this Pistead yet. Sign in with the link it printed when it started (or from the Pistead app), which makes your GitHub account its owner.');
+  }
+}
+
+/**
+ * Two claims at once (both holding the claim secret) could each pass admitLocalOwner before either user exists: once
+ * this sign-in's user is written, only the server's owner, its first GitHub user, goes on. A later one is removed again,
+ * before any token of its own is stored.
+ */
+async function settleLocalClaim(env: Env, userId: string): Promise<void> {
+  const owner = await localOwner(env);
+  if (owner?.id === userId) return;
+  await dbResult(env.DB.query(`DELETE FROM users WHERE id = ? AND auth_kind = 'github'
+    AND NOT EXISTS (SELECT 1 FROM github_tokens WHERE user_id = ?) AND NOT EXISTS (SELECT 1 FROM auth_sessions WHERE user_id = ?)`)
+    .bind(userId, userId, userId).run());
+  fail(403, 'local_server_owner_only', 'This Pistead runs on its owner\'s computer, and only the GitHub account that set it up can sign in.');
+}
+
+/**
+ * The launcher's sign-in link on a local server: `?token=` is its claim secret. It goes to GitHub like "Continue with
+ * GitHub", carrying the claim in a cookie to the callback, where an unclaimed server takes the account as its owner.
+ */
+async function localClaim(c: AppContext) {
+  if (!localMode(c.env)) fail(404, 'not_found', 'Not found.');
+  const tokens = c.req.queries('token');
+  const token = tokens?.length === 1 ? tokens[0] : undefined;
+  if (!token || !OPAQUE_TOKEN.test(token) || !constantTimeEqual(token, c.env.LOCAL_CLAIM_SECRET!)) fail(403, 'invalid_claim', 'This sign-in link is not valid for this Pistead.');
+  const config = cookies(c.env);
+  setCookie(c, config.claim, token, { ...config.options, maxAge: STATE_TTL / 1000, expires: new Date(Date.now() + STATE_TTL) });
+  return githubStart(c);
 }
 
 async function githubCallback(c: AppContext) {
@@ -381,6 +436,7 @@ async function githubCallback(c: AppContext) {
     return nativeFailure(c, error, native.state);
   }
   const { user, tokenStatement } = signedIn;
+  if (localMode(c.env)) expireCookie(c, 'claim');
   if (native) {
     const code = randomToken();
     try {
@@ -483,6 +539,7 @@ async function testLogin(c: AppContext) {
 export function registerAuth(app: Hono<WorkerEnv>): void {
   app.get('/api/auth/github', privateResponse, c => githubStart(c));
   app.get(CALLBACK_PATH, privateResponse, githubCallback);
+  app.get('/api/auth/local/claim', privateResponse, localClaim);
   app.get('/api/auth/native/start', privateResponse, nativeStart);
   app.post('/api/auth/native/token', privateResponse, nativeToken);
   app.post('/api/auth/test', privateResponse, csrfGuard, testLogin);

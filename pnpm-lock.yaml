@@ -199,6 +199,9 @@ importers:
       '@earendil-works/pi-durable':
         specifier: 1.4.0
         version: 1.4.0(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.3.6)
+      '@hono/node-server':
+        specifier: 1.19.11
+        version: 1.19.11(hono@4.12.8)
       hono:
         specifier: 4.12.8
         version: 4.12.8
@@ -6616,9 +6619,7 @@ snapshots:
       metro-runtime: 0.87.1
     transitivePeerDependencies:
       - '@babel/core'
-      - bufferutil
       - supports-color
-      - utf-8-validate
 
   '@react-native/normalize-colors@0.88.0': {}
 
