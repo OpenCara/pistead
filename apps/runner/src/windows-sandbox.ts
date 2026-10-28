@@ -2,7 +2,7 @@ import { chmod, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { egressPort, type HelperBackend, type HelperContext, type HelperLaunch, type HelperLayout } from "./helper-workspace.js";
 import { NODE_HELPER, NODE_HELPER_KINDS } from "./node-helper.js";
-import { bashPath, gitForWindowsRoot } from "./platform.js";
+import { gitForWindowsRoot, SANDBOX_SHELL_HINT, sandboxShellPath } from "./platform.js";
 import { mxcEntry, mxcInstallHint, validWindowsLimits, type WindowsJobLimits } from "./sandbox-backend.js";
 import type { SandboxRequest } from "./sandbox.js";
 import { WindowsJob } from "./windows-job.js";
@@ -102,8 +102,9 @@ export class WindowsBackend implements HelperBackend {
     const sdk = mxcEntry(options.runtime);
     if (!sdk) throw new Error(`The Windows sandbox needs Microsoft's MXC SDK. Install it with: ${mxcInstallHint(options.runtime)}`);
     const gitRoot = gitForWindowsRoot();
-    const bash = bashPath();
-    if (!gitRoot || !bash) throw new Error("The Windows sandbox needs Git for Windows (git and bash.exe): install it from https://git-scm.com/download/win");
+    if (!gitRoot) throw new Error("The Windows sandbox needs Git for Windows: install it from https://git-scm.com/download/win");
+    const bash = sandboxShellPath();
+    if (!bash) throw new Error(`The Windows sandbox needs busybox-w32 as its shell (Git for Windows' bash can't start in the process container): ${SANDBOX_SHELL_HINT}`);
     this.#runtime = options.runtime;
     this.#sdk = sdk;
     this.#limits = validWindowsLimits(options.limits);
@@ -150,7 +151,8 @@ export class WindowsBackend implements HelperBackend {
       // loopback goes to the proxy); the helper puts the session's back.
       ...(port !== undefined ? { SANDBOX_EGRESS_PROXY: context.environment.HTTPS_PROXY!, SANDBOX_EGRESS_NO_PROXY: context.environment.NO_PROXY ?? "" } : {}),
     };
-    const readonly = [system, dirname(process.execPath), this.#gitRoot, layout.bin, layout.ownerConfig, layout.caBundle, join(layout.worktree, ".git"),
+    // The shell is granted alone: it may sit in a folder with other things, such as the user's own programs.
+    const readonly = [system, dirname(process.execPath), this.#gitRoot, this.#bash, layout.bin, layout.ownerConfig, layout.caBundle, join(layout.worktree, ".git"),
       ...(context.gitWritable ? [] : [layout.git])];
     const readwrite = context.readOnly ? [] : [layout.home, layout.worktree, ...(context.gitWritable ? [layout.git] : [])];
     if (context.readOnly) readonly.push(layout.home, layout.worktree);

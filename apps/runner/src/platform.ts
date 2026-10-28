@@ -56,6 +56,25 @@ export function bashPath(): string | undefined {
   ]);
 }
 
+/**
+ * The shell for the Windows sandbox's commands. MSYS2 programs, Git for Windows' bash among them, can't start in Windows'
+ * process container (their runtime is denied its global named objects), so it is busybox-w32: from PISTEAD_BASH, the
+ * per-user install at %LOCALAPPDATA%\Programs\busybox, or Git for Windows' MinGit-busybox flavor. Only that one file is
+ * granted to the container, so it must be the executable itself (not a launcher such as a Scoop shim).
+ */
+export function sandboxShellPath(): string | undefined {
+  if (!windows) return undefined;
+  if (process.env.PISTEAD_BASH) return firstExecutable([process.env.PISTEAD_BASH]);
+  const root = gitForWindowsRoot();
+  return firstExecutable([
+    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs", "busybox", "busybox.exe"),
+    root && join(root, "mingw64", "bin", "busybox.exe"),
+  ]);
+}
+
+/** Where to get the sandbox's shell. */
+export const SANDBOX_SHELL_HINT = "download busybox64.exe from https://frippery.org/busybox/ and save it as %LOCALAPPDATA%\\Programs\\busybox\\busybox.exe";
+
 let gitRoot: string | null | undefined;
 /** Git for Windows' install root (the directory holding bin\bash.exe and usr\bin), from `git --exec-path`. */
 export function gitForWindowsRoot(): string | undefined {

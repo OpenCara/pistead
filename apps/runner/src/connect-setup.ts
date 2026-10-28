@@ -6,7 +6,7 @@ import { readConnectorState } from "./connector.js";
 import { createFauxLocalModels, loadLocalPiModels, readPiSettings, type LocalModels } from "./local-pi.js";
 import type { Prerequisite } from "./desktop-protocol.js";
 import { ConnectorSetupError } from "./protocol.js";
-import { bashPath, gitForWindowsRoot } from "./platform.js";
+import { bashPath, gitForWindowsRoot, SANDBOX_SHELL_HINT, sandboxShellPath } from "./platform.js";
 import { MXC_SDK_VERSION, mxcEntry, mxcInstallHint, windowsRuntimeDirectory } from "./sandbox-backend.js";
 import { SANDBOX_EXEC, seatbeltTools } from "./seatbelt.js";
 
@@ -40,7 +40,8 @@ export async function checkPrerequisites(unsandboxed: boolean, experimental?: { 
     if (unsandboxed || !experimental) return windowsGit();
     const runtime = windowsRuntimeDirectory(experimental.stateDir);
     const build = Number(release().split(".")[2] ?? 0);
-    return [...windowsGit(),
+    return [{ name: "Git for Windows (git on PATH)", ok: gitForWindowsRoot() !== undefined },
+      { name: `busybox-w32, the sandbox's shell (${SANDBOX_SHELL_HINT}; or set PISTEAD_BASH)`, ok: sandboxShellPath() !== undefined },
       { name: `Windows 11 24H2 or later (build 26100+, found ${build || "unknown"}; the sandbox checks the update level itself)`, ok: build >= 26100 },
       { name: `Microsoft MXC SDK ${MXC_SDK_VERSION} in ${runtime} (install: ${mxcInstallHint(runtime)})`, ok: mxcEntry(runtime) !== undefined }];
   }
@@ -67,7 +68,7 @@ export function assertPrerequisites(prerequisites: readonly Prerequisite[], unsa
   const missing = prerequisites.filter(item => !item.ok).map(item => item.name);
   if (!missing.length) return;
   const hint = process.platform === "darwin" ? " Install Git, e.g. xcode-select --install or brew install git."
-    : process.platform === "win32" ? " Install Git for Windows from https://git-scm.com/download/win."
+    : process.platform === "win32" ? (missing.some(name => name.startsWith("Git for Windows")) ? " Install Git for Windows from https://git-scm.com/download/win." : "")
     : unsandboxed ? "" : sandboxHint;
   throw new ConnectorSetupError(`Missing prerequisites: ${missing.join(", ")}.${hint}`);
 }
