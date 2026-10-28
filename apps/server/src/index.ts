@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { WorkerEnv } from './types.js';
-import { authenticate, csrfGuard, registerAuth } from './auth.js';
+import { authenticate, csrfGuard, localOwner, registerAuth } from './auth.js';
 import { registerCatalog } from './catalog.js';
 import { registerSessions } from './sessions.js';
 import { registerScheduledPrompts } from './scheduled-prompts.js';
@@ -10,7 +10,7 @@ import { registerBackups } from './backups.js';
 import { registerSessionFiles } from './session-files.js';
 import { registerInternal } from './internal.js';
 import { assertVaultConfigured } from './vault.js';
-import { fail, testMode } from './http.js';
+import { fail, localMode, testMode } from './http.js';
 import { registerConnectorCredentials, registerConnectors } from './connectors.js';
 import { registerHostAccess } from './host-access.js';
 import { registerHostConfig } from './host-config.js';
@@ -60,6 +60,8 @@ app.get('/api/health', async c => {
     backupsConfigured: !!c.env.BUCKET, storageProvider: c.env.BUCKET?.provider ?? null,
     workspaceDatabasesConfigured: !!c.env.WORKSPACE_DATABASES,
     connectorsConfigured: !!c.env.CONNECTOR_HUB, testMode: testMode(c.env),
+    // A local server says whether someone has claimed it, so the sign-in page can point to the launcher's link.
+    ...(localMode(c.env) ? { localServer: { claimed: !!await localOwner(c.env) } } : {}),
   });
 });
 registerAuth(app);

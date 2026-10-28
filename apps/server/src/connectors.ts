@@ -1,14 +1,14 @@
 import { egressGrant, gitDirect, gitRelay } from './network.js';
 import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
-import type { ConnectorCapabilities, ConnectorInfo, LocalModelSummary } from '../../../packages/shared/src/connector.js';
+import type { ConnectorCapabilities, ConnectorInfo, ConnectorPairing, LocalModelSummary } from '../../../packages/shared/src/connector.js';
 import { gpuKinds, type GpuKind } from '../../../packages/shared/src/host-config.js';
 import { sessionActivities, thinkingLevels, type SessionActivity, type ThinkingLevel } from '../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../packages/shared/src/crypto.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import type { Query } from './db/types.js';
 import { auditStatement, requireMember } from './db.js';
-import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
+import { appOrigin, fail, id, identifier, jsonObject, loopbackHttp, now, randomToken, requireOrigin, testMode, text } from './http.js';
 import { authorizeSession } from './internal.js';
 import { markSessionChanged } from './session-changes.js';
 import { githubComment, githubIssue, githubMerge, githubRead } from './github-broker.js';
@@ -85,7 +85,7 @@ export function parseManifest(input: Record<string, unknown>, env: Env): { model
 }
 
 function requireConnectorTLS(env: Env, url: URL): void {
-  if (url.protocol !== 'https:' && !(testMode(env) && url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) {
+  if (url.protocol !== 'https:' && !loopbackHttp(env, url)) {
     fail(400, 'secure_transport_required', 'Connector credentials require HTTPS.');
   }
 }
@@ -394,27 +394,31 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/git/direct', async c => gitDirect(c, await authenticateConnector(c)));
 }
 
+/** A one-use pairing code for a new host of `ownerId`, valid ten minutes; also how a local server pairs its own machine. */
+export async function createPairing(env: Env, ownerId: string, name: string): Promise<ConnectorPairing> {
+  const pairingId = id(); const code = randomToken(); const expires = Math.floor(Date.now() / 1000) + 600;
+  await env.DB.query('DELETE FROM connector_pairings WHERE owner_id = ? AND expires_at <= ?').bind(ownerId, Math.floor(Date.now() / 1000)).run();
+  const created = await env.DB.query(`INSERT INTO connector_pairings (id,owner_id,name,code_hash,expires_at,created_at,workspace_id)
+    SELECT ?,?,?,?,?,?,NULL WHERE (SELECT COUNT(*) FROM connector_pairings WHERE owner_id = ?) < 5
+    AND (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20
+    AND EXISTS (SELECT 1 FROM users WHERE id = ? AND (? = 1 OR auth_kind <> 'test')) RETURNING id`)
+    .bind(pairingId, ownerId, name, await sha256(code), expires, now(), ownerId, ownerId, ownerId, testMode(env) ? 1 : 0).first();
+  if (!created) {
+    // The write refuses a test user once test mode is off: a refusal, not a limit, so tell them apart.
+    const testUser = await env.DB.query('SELECT 1 FROM users WHERE id = ? AND auth_kind = \'test\'').bind(ownerId).first();
+    if (testUser && !testMode(env)) fail(403, 'test_mode_disabled', 'Test users can pair hosts only while test mode is on.');
+    fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
+  }
+  return { id: pairingId, code, expiresAt: new Date(expires * 1000).toISOString() };
+}
+
 export function registerConnectors(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/pairings', async c => {
     const input = await jsonObject(c, 4096);
     // `workspaceId` is accepted, and ignored, from pages that predate it: a host is no longer paired into a workspace.
     onlyFields(input, ['name', 'workspaceId']);
     const name = text(input.name, 'name', 120);
-    const ownerId = c.get('auth').userId;
-    const pairingId = id(); const code = randomToken(); const expires = Math.floor(Date.now() / 1000) + 600;
-    await c.env.DB.query('DELETE FROM connector_pairings WHERE owner_id = ? AND expires_at <= ?').bind(ownerId, Math.floor(Date.now() / 1000)).run();
-    const created = await c.env.DB.query(`INSERT INTO connector_pairings (id,owner_id,name,code_hash,expires_at,created_at,workspace_id)
-      SELECT ?,?,?,?,?,?,NULL WHERE (SELECT COUNT(*) FROM connector_pairings WHERE owner_id = ?) < 5
-      AND (SELECT COUNT(*) FROM connectors WHERE owner_id = ? AND revoked_at IS NULL) < 20
-      AND EXISTS (SELECT 1 FROM users WHERE id = ? AND (? = 1 OR auth_kind <> 'test')) RETURNING id`)
-      .bind(pairingId, ownerId, name, await sha256(code), expires, now(), ownerId, ownerId, ownerId, testMode(c.env) ? 1 : 0).first();
-    if (!created) {
-      // The write refuses a test user once test mode is off: a refusal, not a limit, so tell them apart.
-      const testUser = await c.env.DB.query('SELECT 1 FROM users WHERE id = ? AND auth_kind = \'test\'').bind(ownerId).first();
-      if (testUser && !testMode(c.env)) fail(403, 'test_mode_disabled', 'Test users can pair hosts only while test mode is on.');
-      fail(429, 'pairing_limit', 'Too many active pairings or connectors.');
-    }
-    return c.json({ pairing: { id: pairingId, code, expiresAt: new Date(expires * 1000).toISOString() } }, 201);
+    return c.json({ pairing: await createPairing(c.env, c.get('auth').userId, name) }, 201);
   });
   app.get('/api/connectors', async c => {
     const rows = await c.env.DB.query<ConnectorInfoRow>(`SELECT c.*, u.display_name AS owner_name,
