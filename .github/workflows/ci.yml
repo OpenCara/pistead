@@ -49,6 +49,14 @@ jobs:
       - run: node packages/cli/dist/pistead.js serve --help
       # The desktop app's main process, pages and connector host bundle (packaging needs macOS and is not run here).
       - run: pnpm --filter @pistead/desktop build
+      # The iOS app's JavaScript bundle, as the release archive's Xcode phase builds it with Metro, which resolves imports
+      # differently from tsc and Vite (the shared sources' "./types.js" imports broke ios-v0.1.0). The native build needs
+      # macOS and runs only in release-ios.yml.
+      - name: Mobile app bundles for iOS
+        working-directory: apps/mobile
+        run: >-
+          pnpm exec expo export:embed --entry-file node_modules/expo-router/entry.js --platform ios --dev false
+          --minify false --bundle-output "$RUNNER_TEMP/mobile/main.jsbundle" --assets-dest "$RUNNER_TEMP/mobile/assets"
       - run: pnpm test:connected
       # TRUST_PROXY with forwarded requests, on the image's own Node: its health check sends no forwarded headers, so it
       # stayed healthy while every request through a TLS proxy was a 500 (#71).
