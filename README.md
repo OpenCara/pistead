@@ -87,7 +87,7 @@ To bring in teammates, share the workspace's invite link (**Settings → Workspa
 
 ### Signing in and your profile
 
-Pistead signs people in with GitHub, and asks GitHub for the `read:user user:email repo workflow` scopes. That token is kept encrypted on the server and used to read your repositories, open your pull requests and act on GitHub for your sessions; it reaches a host only when a push uses your own account. A browser sign-in lasts 7 days, an app sign-in 30 days. Where the operator allows it, people can also sign in with a [username and password](#username-and-password).
+Pistead signs people in with GitHub, and asks GitHub for the `read:user user:email repo workflow` scopes. That token is kept encrypted on the server and used to read your repositories, open your pull requests and act on GitHub for your sessions; it reaches a host only when a push uses your own account. A browser sign-in (the Mac app's too) lasts 7 days, an iPhone or iPad app sign-in 30 days. Where the operator allows it, people can also sign in with a [username and password](#username-and-password).
 
 #### Who can create an account
 
@@ -107,7 +107,7 @@ Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a use
 - Passwords are at least 12 characters, other than the username. The server keeps only a salted scrypt hash. After five wrong passwords in a row the account refuses sign-ins for 30 seconds, doubling with each further miss up to 15 minutes; a correct sign-in resets the count.
 - **Settings → Profile → Password** changes it, which signs out every other browser signed in as you. There is no reset by email: someone who forgets theirs asks the server's operator for a new one (`--reset-password`, see [Administration](#administration)).
 - A password account holds no GitHub token, so it can't bind or clone **github.com** repositories (not even ones a teammate bound: a session reads repositories with its owner's own access), push with its own GitHub account, or use the GitHub tools. It works with every other Git provider, GitHub Enterprise Server included, through personal access tokens under **Git accounts**. Its Git author email starts as `<username>@users.pistead.invalid`; set your own under **Identity**.
-- The iPhone, iPad and Mac apps still sign in with GitHub only.
+- The iPhone and iPad app still signs in with GitHub only; the Mac app shows the server's sign-in page, password included.
 - Turning `PASSWORD_AUTH` off signs every password account out at once and refuses their sign-ins; turning it on again lets them back in.
 
 **Settings → Profile** holds:
@@ -115,7 +115,7 @@ Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a use
 - **Identity**: **Display name**, **Git author name** and **Git author email**. Commits in sessions you own use this identity; new sessions pick up saved changes.
 - **Environment**: up to 32 non-secret `APP_` variables (for example `APP_PROJECT=web`) sent to the host of every session you own. Values are at most 2,048 characters, and names containing `TOKEN`, `SECRET`, `PASSWORD`, `PRIVATE_KEY` or `API_KEY` are refused: credentials belong in Git accounts or in Pi on the host.
 - **Git accounts**: your GitHub sign-in plus personal access tokens for other Git providers (see [Repositories and Git accounts](#repositories-and-git-accounts)).
-- **Signed-in apps**: the iPhone, iPad and Mac apps signed in as you, each of which you can sign out.
+- **Signed-in apps**: the iPhone and iPad apps signed in as you, each of which you can sign out. The Mac app signs in as a browser does, so it isn't listed here; **Sign out** in it ends its sign-in.
 - **Account**: your **User ID** (owners add you to workspaces with it) and **Sign out**.
 
 **Settings → Appearance** switches between the Light, Dark and System themes.
@@ -666,7 +666,7 @@ While both hosts are connected, a session's owner can move it to a model on anot
 - **iPhone and iPad** ([`apps/mobile`](apps/mobile/README.md), Expo): your sessions grouped by workspace with their status; a session opens live with its transcript, queue, pending approvals to decide, and the chat box for shared messages and side asks; new sessions start from the app. It isn't on the App Store or TestFlight yet: build it from source as a development build.
 - **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal. Pair it with a pairing ID and code from **Settings → Hosts**. It shares the command-line connector's state, so a Mac paired with `pistead connect` is adopted as is, and only one of the two can run at a time. macOS has no sandbox, so starting the host asks for the same consent as `--unsafe-no-sandbox`. **Settings → Pistead on this computer** runs Pistead itself on the Mac instead of using a server (see [Running Pistead on your own computer](#running-pistead-on-your-own-computer)).
 
-The apps sign in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. They don't offer username and password sign-in yet, and they can't open invite links: where `SIGNUP=invite`, a new person creates their account through the link in a browser first, then signs in on the app. Each app sign-in lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out.
+The iPhone and iPad app signs in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. It doesn't offer username and password sign-in yet. Each of its sign-ins lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out. The Mac app shows the server's own sign-in page, so it signs in as a browser does: with GitHub or, where the server allows it, a username and password, for 7 days. Neither app opens invite links (the Mac app sends links to your default browser): where `SIGNUP=invite`, a new person creates their account through the link in a browser, then signs in on the app.
 
 ## Running Pistead on your own computer
 
