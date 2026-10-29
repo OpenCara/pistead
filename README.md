@@ -69,8 +69,8 @@ And around them:
 
 Just for yourself, on one computer? `npx pistead@latest serve` runs all of it there, with no server to deploy: see [Running Pistead on your own computer](#running-pistead-on-your-own-computer). For a team:
 
-1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
-2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
+1. **Run the server** with Docker and a GitHub OAuth app, or with [username and password](#username-and-password) accounts (`PASSWORD_AUTH=true`) and an administrator created with `--create-admin`: see [Running the server](#running-the-server).
+2. **Sign in** with **Continue with GitHub** or your username and password, then choose **New workspace** and name it.
 3. **Bind a repository**: **Settings → Workspaces →** your workspace **→ Repositories → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**.
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
@@ -81,7 +81,7 @@ Just for yourself, on one computer? `npx pistead@latest serve` runs all of it th
 5. **Start a session**: select the workspace in the sidebar, choose your host in **Host**, describe the task and press Enter.
 6. **Approve** commands and commits as their cards appear above the transcript.
 
-To bring in teammates, they sign in once and send you their **User ID** from **Settings → Profile**; add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
+To bring in teammates, share the workspace's invite link (**Settings → Workspaces → Members → Invite link**) and accept them under **Pending members** once they've signed in from it; where the server takes new accounts only through invitations (`SIGNUP=invite`, see [Who can create an account](#who-can-create-an-account)), that is how they get one. Or they sign in once and send you their **User ID** from **Settings → Profile**, and you add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
 
 ## Using Pistead
 
@@ -666,7 +666,7 @@ While both hosts are connected, a session's owner can move it to a model on anot
 - **iPhone and iPad** ([`apps/mobile`](apps/mobile/README.md), Expo): your sessions grouped by workspace with their status; a session opens live with its transcript, queue, pending approvals to decide, and the chat box for shared messages and side asks; new sessions start from the app. It isn't on the App Store or TestFlight yet: build it from source as a development build.
 - **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal. Pair it with a pairing ID and code from **Settings → Hosts**. It shares the command-line connector's state, so a Mac paired with `pistead connect` is adopted as is, and only one of the two can run at a time. macOS has no sandbox, so starting the host asks for the same consent as `--unsafe-no-sandbox`. **Settings → Pistead on this computer** runs Pistead itself on the Mac instead of using a server (see [Running Pistead on your own computer](#running-pistead-on-your-own-computer)).
 
-The apps sign in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. Each app sign-in lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out.
+The apps sign in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. They don't offer username and password sign-in yet, and they can't open invite links: where `SIGNUP=invite`, a new person creates their account through the link in a browser first, then signs in on the app. Each app sign-in lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out.
 
 ## Running Pistead on your own computer
 
@@ -699,13 +699,17 @@ docker compose up -d
 
 The image builds the web app and the bundled server and runs them as a non-root user. The server listens on port 8787 and keeps its SQLite database in the `pistead-data` volume; it stores no session backups unless you set `STORAGE_URL` (see [Database and backup storage](#database-and-backup-storage)). The image sets `WORKSPACE_DATABASES=true`, so workspace owners can keep their sessions' backups in a Postgres database of their own (see [Workspace session databases](#workspace-session-databases)); set `WORKSPACE_DATABASES=false` in `.env` to turn that off. `GET /api/health` reports which providers are configured, and the image's health check uses it. Migrations run automatically at start-up: to upgrade, update the source and run `docker compose up -d --build`.
 
+> **Upgrading to server 0.16.0:** its first start rebuilds the `users` table of a SQLite database (to allow password accounts), keeping every row and checking every reference to it before committing; back up the `pistead-data` volume first, as before any upgrade. Postgres changes the table in place. Nothing else changes until you set `PASSWORD_AUTH` or `SIGNUP`: unset, sign-in and GitHub sign-up work as before.
+
 Each server release (`server-v*` tag) is published as `ghcr.io/opencara/pistead` (`latest`, `X.Y` and `X.Y.Z`, for linux/amd64 and linux/arm64); to use it instead of building, set `image: ghcr.io/opencara/pistead:latest` and drop `build: .` in `docker-compose.yml`.
 
 Put a reverse proxy with TLS in front of it (Caddy, nginx, Traefik, a cloud load balancer); the app serves plain HTTP. If the proxy sets `X-Forwarded-Proto`/`X-Forwarded-Host`, set `TRUST_PROXY=true`. The proxy must pass WebSocket upgrades on `/api/connectors/socket`, accept request bodies of 32 MiB for dump imports, and route `/.well-known/` to Pistead if you use `OIDC_SIGNING_KEY`. The server gzips its responses and session event streams itself, and compresses the connector WebSocket for connectors that offer it, so the proxy needs no compression of its own.
 
-### GitHub sign-in and apps
+### Sign-in and GitHub apps
 
-- **Sign-in** needs a GitHub OAuth app whose callback URL is `<APP_ORIGIN>/api/auth/github/callback`; put its id and secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. Without it, the sign-in page says GitHub sign-in isn't configured. The same app resets session owners' GitHub tokens after pushes that used them.
+- **GitHub sign-in** needs a GitHub OAuth app whose callback URL is `<APP_ORIGIN>/api/auth/github/callback`; put its id and secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The same app resets session owners' GitHub tokens after pushes that used them. github.com repositories need it: only accounts that sign in with GitHub can read them.
+- **Username and password sign-in** is on with `PASSWORD_AUTH=true` (see [Username and password](#username-and-password)), next to GitHub or instead of it. Create the first administrator with `--create-admin` (see [Administration](#administration)). With neither, the sign-in page says GitHub sign-in isn't configured.
+- **Who can create an account** is `SIGNUP`'s choice (see [Who can create an account](#who-can-create-an-account)). Unset, anyone with a GitHub account can sign up, as before; on a server the internet can reach, `SIGNUP=invite` limits new accounts to people holding a workspace's invite link.
 - **github.com pushes** can use an operator GitHub App with Repository contents read & write: set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_PRIVATE_KEY`. Without it, each workspace adds its own GitHub App under **Push access**. Either app also gives hosts read-only tokens for single repositories, so that sessions' clones of private repositories don't go through the server.
 - **Azure DevOps and Forgejo push identities** trust Pistead as an OIDC issuer at `APP_ORIGIN` (`/.well-known/openid-configuration`, `/.well-known/jwks.json`): set `OIDC_SIGNING_KEY` to an RSA key (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072`).
 
@@ -855,7 +859,7 @@ await fetch("/api/auth/test", { method: "POST", headers: { Authorization: "Beare
 
 ## Layout
 
-- `apps/server`: the control plane (Hono on Node); `src/local` runs it on one person's own computer (`pistead serve` and the desktop app). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/connector-hub.ts` the WebSocket relay to connected hosts.
+- `apps/server`: the control plane (Hono on Node); `src/local` runs it on one person's own computer (`pistead serve` and the desktop app). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/auth.ts` GitHub and session sign-in and `src/password-auth.ts` password accounts, with `src/password-accounts-cli.ts` for `--create-admin` and `--reset-password`; `src/connector-hub.ts` the WebSocket relay to connected hosts.
 - `apps/web`: the React UI.
 - `apps/mobile`: the iPhone and iPad app (Expo; Android later). `apps/desktop`: the macOS app (Electron; Linux and Windows later).
 - `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` (with the server, for `pistead serve`) and bundled into the desktop app.

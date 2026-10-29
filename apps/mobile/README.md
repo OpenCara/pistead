@@ -13,7 +13,9 @@ usernames and session status. The web app (`apps/web`) is the reference for beha
 - Sign-in uses the native flow (`/api/auth/native/start`, PKCE): the server sends the browser to GitHub through its
   existing GitHub OAuth app, then redirects to `pistead://auth`, and the app exchanges the code for a bearer token
   kept in the iOS Keychain (expo-secure-store). It needs no extra GitHub configuration. Signed-in apps are listed, and
-  can be revoked, under Settings › Profile on the web.
+  can be revoked, under Settings › Profile on the web. Password accounts can't sign in on the app yet, and where the
+  server's `SIGNUP=invite` a new GitHub account is refused (`invite_required`; the app says to create it through the
+  invite link in a browser first).
 - Every request carries that token; no cookies. A 401 signs the app out.
 
 ## Develop
