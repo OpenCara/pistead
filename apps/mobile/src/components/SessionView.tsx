@@ -1,6 +1,6 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommand, hostCommandWaiting, initialSelection, isHostCommand, modelUnavailable,
-  mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
+  accessUnavailable, activeStatuses, chatOptionsBody, decidedAsHostCommand, decidesHostCommand, hostCommandWaiting, initialSelection, isHostCommand,
+  modelUnavailable, mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
@@ -77,12 +77,13 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
 
   /**
    * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
-   * command, as every command of a session that runs on its host is, needs host command authority (see decidesHostCommand:
+   * command, as every command of a session that runs on its host is, needs host command authority, and so does a command
+   * without the host's missing resource limits in a member's session (see decidedAsHostCommand and decidesHostCommand:
    * the host's owner decides host_bash without approve permission here); everything else, approve permission.
    */
   function decides(approval: ApprovalRecord): boolean {
     if (readOnly) return false;
-    if (isHostCommand(approval.operation, session ?? {})) return decidesHostCommand(approval.operation, session ?? {}, host, user.id, permissions.includes("approve"));
+    if (decidedAsHostCommand(approval.operation, session ?? {}, approval.unbounded)) return decidesHostCommand(approval.operation, session ?? {}, host, user.id, permissions.includes("approve"));
     const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
     return canApprove && (!ownerOnly || isOwner);
   }
@@ -129,6 +130,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   const pendingApprovalCard = (approval: ApprovalRecord) => {
     const permission = approval.operation.kind === "permission";
     const hostCommand = isHostCommand(approval.operation, session ?? {});
+    const hostDecided = decidedAsHostCommand(approval.operation, session ?? {}, approval.unbounded);
     const ownerOnly = permission || approval.operation.kind === "git.repin";
     const disabled = approvalAction.busy || !approval.reviewHash;
     return <ApprovalCard approval={approval} key={approval.id}>
@@ -151,7 +153,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
           </Text>
         </>}
       </> : <Text style={[ui.small, { color: palette.muted }]}>
-        {hostCommand ? hostCommandWaiting(approval.operation, host) : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
+        {hostDecided ? hostCommandWaiting(approval.operation, host) : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
       </Text>}
     </ApprovalCard>;
   };

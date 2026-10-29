@@ -75,6 +75,19 @@ export async function hostCommandAuthority(env: Env, row: Pick<SessionRow, 'conn
   return (await hostAuthority(env, row, userId))?.level;
 }
 
+/**
+ * Whether the sessions `ownerId` owns run shell commands on the host of `row` (its connector and owner, in the session's
+ * workspace): a host with resource limits (`productionShell`), or one that runs without the sandbox, runs everyone's; one
+ * without limits runs its owner's, and those of members its owner or one of its admins granted host commands there,
+ * without the limits it lacks, on a connector that honors that (`unboundedShellGrants`).
+ */
+export async function runsShellCommands(env: Env, capabilities: ConnectorCapabilities,
+  row: Pick<SessionRow, 'connector_id' | 'connector_owner_id' | 'workspace_id'>, ownerId: string): Promise<boolean> {
+  if (capabilities.productionShell === true || capabilities.unsandboxed === true) return true;
+  if (row.connector_owner_id && row.connector_owner_id === ownerId) return true;
+  return capabilities.unboundedShellGrants === true && await hostAuthority(env, row, ownerId) !== undefined;
+}
+
 /** Whether `userId` may decide host commands in `row` (the owner, or a grant of either level). */
 export async function mayDecideHostCommands(env: Env, row: SessionRow, userId: string): Promise<boolean> {
   return (await hostCommandAuthority(env, row, userId)) !== undefined;

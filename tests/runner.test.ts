@@ -507,7 +507,7 @@ test("connected writes durably bind Worker admission to every model approval wit
   await recoveredService.close();
 });
 
-test("only the host's owner lets a command run without the resource limits the host lacks", { skip: process.platform !== "linux" }, async t => {
+test("the host's owner lets their own commands run without the resource limits the host lacks; nobody lifts them for a member without a host command grant", { skip: process.platform !== "linux" }, async t => {
   const { service } = await fixture(t);
   const connectorId = "limitless-connector";
   // Neither provisioned limits nor the test shell: a command runs within limits, or with the host owner's consent.
@@ -523,12 +523,13 @@ test("only the host's owner lets a command run without the resource limits the h
     await session.submit({ ...await ticket(id, "submit"), connectorId }, { content: `TEST_BASH ${command}`, requestId: id, admissionId }, "write");
     return session;
   }
-  // On someone else's host the call fails without a card: nobody in the session may lift the host's limits.
+  // On someone else's host, without a host command grant there, the call fails without a card: nobody in the session
+  // may lift the host's limits, and the agent learns who may run commands there.
   const shared = await start("limitless-shared", "test:host", "echo shared");
   await idle(shared);
   const sharedView = await shared.view();
   assert.deepEqual(sharedView.approvals, []);
-  assert.ok(sharedView.entries.some(entry => entry.role === "toolResult" && entry.text.includes("quota-backed")));
+  assert.ok(sharedView.entries.some(entry => entry.role === "toolResult" && entry.text.includes("only in sessions of its owner and of members they granted host commands")));
 
   const own = await start("limitless-own", "test:alice", "echo unlimited-marker");
   const request = await permissionRequest(own);
@@ -555,6 +556,95 @@ test("only the host's owner lets a command run without the resource limits the h
   assert.equal(autoView.approvals.filter(approval => approval.operation.kind === "permission").length, 1, "only the default-access message asked");
   assert.deepEqual(autoApproved(autoView), [{ tool: "bash", status: "executed", unbounded: true }]);
   assert.ok(toolOutput(autoView, /auto-unlimited-marker/));
+});
+
+test("a member granted host commands runs commands in the sandbox without the limits the host lacks, decided as host commands are, while the grant lasts", { skip: process.platform !== "linux" }, async t => {
+  const { service, grants } = await fixture(t);
+  // May approve the session's work, but holds no host command authority.
+  grants["test:carol"] = ["read", "ask", "write", "approve"];
+  // The host's owner, with approve access to the session.
+  grants["test:host"] = ["read", "approve"];
+  const connectorId = "granted-shell-connector";
+  // What the control plane reports of alice's grant on test:host's host.
+  const grant: { hostCommands?: "approve" | "auto" } = { hostCommands: "approve" };
+  const asked: AuthorizationRequest[] = [];
+  const authorize = async (input: AuthorizationRequest) => {
+    asked.push(input);
+    const allowed = grants[input.actorId]?.includes(input.permission) ?? false;
+    return { allowed, ownerId: input.ownerId, policyVersion: 1,
+      ...(allowed && input.host && input.actorId === "test:alice" && grant.hostCommands ? { hostCommands: grant.hostCommands } : {}) };
+  };
+  // Neither provisioned limits nor the test shell.
+  const runner = new RunnerService({ ...service.config, connectorId, allowTestShell: false, authorize });
+  await runner.initialize();
+  t.after(() => runner.close());
+  const admissionId = await sha256("granted shell write admission");
+  const value = binding("granted-shell");
+  value.session.connectorId = value.model.connectorId = connectorId;
+  value.session.connectorOwnerId = value.model.connectorOwnerId = "test:host";
+  const session = await runner.provision(value, { ...await ticket("granted-shell", "create"), connectorId });
+  assert.ok(!(session.sandbox instanceof HostWorkspace), "it runs in the sandbox");
+  const submit = async (requestId: string, command: string, access?: "auto") => session.submit({ ...await ticket("granted-shell", "submit"), connectorId },
+    { content: `TEST_BASH ${command}`, requestId, admissionId, ...(access ? { options: { access } } : {}) }, "write");
+  const decide = async (approval: ApprovalRecord, actorId = "test:alice", decision: "approve" | "deny" = "approve") =>
+    session.decide({ ...await ticket("granted-shell", "approve", actorId), connectorId }, approval.id, { decision, operation: approval.operation });
+
+  // With approve access to host commands, they allow running without limits as the host's owner would in theirs...
+  await submit("approved", "echo granted-approved");
+  const request = await permissionRequest(session);
+  assert.deepEqual(request.operation, { kind: "permission", tool: "bash", target: "echo granted-approved", needs: ["unbounded-shell"] });
+  assert.ok(asked.some(input => input.actorId === "test:alice" && input.host), "the host checks their grant before the card asks");
+  await decide(request);
+  // ...and the command waits for someone with host command authority: approve permission on the session isn't enough.
+  const [command] = await operationRequests(session);
+  assert.equal(command!.operation.kind, "bash");
+  assert.equal(command!.unbounded, true);
+  await assert.rejects(decide(command!, "test:carol"), rejectedWith(403, /on the strength of a host command grant/));
+  await decide(command!);
+  const ran = await settledCard(session, command!.id);
+  assert.equal(ran.status, "executed", ran.result);
+  assert.match(ran.result ?? "", /granted-approved/);
+  await idle(session);
+
+  // Their Auto-approve still asks for each command: they decide it themselves, or the host's owner does.
+  await submit("approve-level-auto", "echo approve-level-auto", "auto");
+  const [asking] = await operationRequests(session);
+  assert.equal(asking!.unbounded, true);
+  await decide(asking!, "test:host", "deny");
+  assert.equal((await settledCard(session, asking!.id)).status, "denied");
+  await idle(session);
+
+  // With automatic host commands, it runs at once, without either card.
+  grant.hostCommands = "auto";
+  await submit("automatic", "echo granted-automatic", "auto");
+  await idle(session);
+  const automatic = await session.view();
+  assert.deepEqual(autoApproved(automatic), [{ tool: "bash", status: "executed", unbounded: true }]);
+  assert.ok(toolOutput(automatic, /granted-automatic/));
+
+  // A card left waiting when the grant ends no longer runs, even approved by the host's owner.
+  grant.hostCommands = "approve";
+  await submit("waiting", "echo left-waiting");
+  const unlimited = await permissionRequest(session);
+  await decide(unlimited);
+  const [waiting] = await operationRequests(session);
+  delete grant.hostCommands;
+  await assert.rejects(decide(waiting!), rejectedWith(403, /on the strength of a host command grant/));
+  await decide(waiting!, "test:host");
+  const stopped = await settledCard(session, waiting!.id);
+  assert.equal(stopped.status, "failed");
+  assert.match(stopped.result ?? "", /members they granted host commands/);
+  await idle(session);
+
+  // Once the grant has ended, the next command stops before any card asks anyone, and the agent learns why.
+  const refusals = (view: SessionView) => view.entries.filter(entry => entry.role === "toolResult"
+    && entry.text.includes("only in sessions of its owner and of members they granted host commands")).length;
+  const before = await session.view();
+  await submit("ended", "echo after-the-grant", "auto");
+  await idle(session);
+  const view = await session.view();
+  assert.equal(view.approvals.length, before.approvals.length, "no card asks anyone");
+  assert.equal(refusals(view), refusals(before) + 1);
 });
 
 test("a session its host's owner started on the host runs there while the host accepts that, and only host command authority decides it", { skip: process.platform !== "linux" }, async t => {

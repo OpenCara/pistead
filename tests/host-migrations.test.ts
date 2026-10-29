@@ -18,7 +18,8 @@ const sourceConnection = 'c'.repeat(43);
 const targetConnection = 'k'.repeat(43);
 const migratePath = '/api/sessions/source/migrate';
 
-async function fixture(t: TestContext, options: { targetCapabilities?: Record<string, unknown> } = {}) {
+async function fixture(t: TestContext, options: { targetCapabilities?: Record<string, unknown>; targetOwner?: string } = {}) {
+  const targetOwner = options.targetOwner ?? 'test:owner';
   const { db, sqlite } = await testDatabase();
   t.after(() => db.close());
   let rpc: (connectorId: string, input: { action: string; body: string }) => Promise<Response> = async () => Response.json({}, { status: 503 });
@@ -38,15 +39,15 @@ async function fixture(t: TestContext, options: { targetCapabilities?: Record<st
     VALUES ('old-host','test:host','Old host',?,?,?,'{"platform":"linux","sandbox":true,"productionShell":false}','2026-01-01')`)
     .run(await sha256(sourceBearer), await sha256(sourceConnection), models);
   sqlite.prepare(`INSERT INTO connectors (id,owner_id,name,credential_hash,connection_hash,models_json,capabilities_json,created_at)
-    VALUES ('new-host','test:owner','New host',?,?,?,?,'2026-01-01')`)
-    .run(await sha256(targetBearer), await sha256(targetConnection), models,
+    VALUES ('new-host',?,'New host',?,?,?,?,'2026-01-01')`)
+    .run(targetOwner, await sha256(targetBearer), await sha256(targetConnection), models,
       JSON.stringify(options.targetCapabilities ?? { platform: 'linux', sandbox: true, productionShell: false, hostMigration: true }));
   sqlite.exec(`
     INSERT INTO connector_workspaces VALUES ('old-host','workspace','2026-01-01'),('new-host','workspace','2026-01-01');
     INSERT INTO connector_shares VALUES ('old-host','workspace','2026-01-01');
     INSERT INTO models (id,workspace_id,name,provider,model_id,connector_id,connector_owner_id,created_at) VALUES
       ('old-model','workspace','Old model','faux','faux-v1','old-host','test:host','2026-01-01'),
-      ('new-model','workspace','New model','faux','faux-v1','new-host','test:owner','2026-01-01');
+      ('new-model','workspace','New model','faux','faux-v1','new-host','${targetOwner}','2026-01-01');
     INSERT INTO agents (id, author_id, created_at) VALUES ('agent','test:owner','2026-01-01');
     INSERT INTO agent_versions VALUES ('version','agent','test:owner','workspace',1,'Agent','Description','Instructions','["read_file","git_push"]','old-model','2026-01-01');
     INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,policy_version,status,created_at,connector_id,connector_owner_id,repositories_json,visibility)
@@ -161,6 +162,26 @@ test('a clone session moves only to a host that restores its clones', async t =>
   const moved = await current.request(migratePath, { requestId: 'current', modelId: 'new-model' });
   assert.equal(moved.status, 201);
   assert.equal((await moved.json() as { session: { repositoryMode?: string } }).session.repositoryMode, 'clone');
+});
+
+test('a clone session moves to another member\'s host without resource limits only with a host command grant there', async t => {
+  const f = await fixture(t, { targetOwner: 'test:host', targetCapabilities: { platform: 'linux', sandbox: false, productionShell: false, hostMigration: true,
+    plainGit: true, cloneBackups: true, hostCommands: true, hostGrants: true, unboundedShellGrants: true } });
+  // The session clones, and the host it moves to is test:host's, shared with the workspace.
+  f.sqlite.exec("PRAGMA defer_foreign_keys = ON; BEGIN; DROP TRIGGER sessions_repository_mode_immutable;"
+    + " UPDATE sessions SET repository_mode = 'clone' WHERE id = 'source'; COMMIT;"
+    + " INSERT INTO connector_shares VALUES ('new-host','workspace','2026-01-01');");
+  f.hosts();
+  const move = (requestId: string) => f.request(migratePath, { requestId, modelId: 'new-model', trustedConnectorId: 'new-host' });
+  // Its owner's commands would be refused there: the host has no resource limits, and they hold no grant on it.
+  const refused = await move('ungranted');
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json() as { code: string }).code, 'clone_host_required');
+  f.sqlite.prepare(`INSERT INTO connector_host_grants (connector_id, workspace_id, user_id, level, host_sessions, expires_at, created_by, created_at)
+    VALUES ('new-host', 'workspace', 'test:owner', 'approve', 0, NULL, 'test:host', '2026-01-01')`).run();
+  const moved = await move('granted');
+  assert.equal(moved.status, 201);
+  assert.equal((await moved.json() as { session: { connectorId: string } }).session.connectorId, 'new-host');
 });
 
 test('a move that fails on the target locks the source until it is retried or cancelled', async t => {

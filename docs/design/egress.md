@@ -107,7 +107,8 @@ it for a minute, and keeps a stale one for up to five minutes if the control pla
 
 A session is created as a **clone session** (`sessions.repository_mode = 'clone'`, `SessionRecord.repositoryMode`) when
 its host's connector advertises `plainGit` (sandboxed connectors of this version) and can run the session owner's shell
-commands: the host has resource limits (`productionShell`), or the owner is the host's owner. The session's agent must
+commands: the host has resource limits (`productionShell`), or the owner is the host's owner (or, since, holds a host
+command grant there, on a connector advertising `unboundedShellGrants`). The session's agent must
 also have `bash` (a session started from a model always does). Shell access is what cloning needs, so elsewhere
 sessions keep pinning as before, and an agent with only file and Git tools keeps its pinned snapshots; phase 5
 revisits that. The mode is immutable like the pins
@@ -349,8 +350,10 @@ audited as `repository.lfs.updated`; the setting is in `WorkspaceRepository.lfs`
   sessions from before don't (their owner config is immutable). `git_push` is not offered there. Backups keep the
   worktree as files, so a session with a clone in its worktree can't be backed up: a clone's history has no bound.
 - **Sessions that can't clone.** An agent without `bash`, or another member's session on a host without resource limits
-  (whose shell commands are refused), works in an empty worktree. The session is created anyway, and its record says why
-  (`cloneUnavailable`, on creation and on single-session reads).
+  where they hold no host command grant (whose shell commands are refused), works in an empty worktree. The session is
+  created anyway, and its record says why (`cloneUnavailable`, on creation and on single-session reads, so a grant given
+  or ended later shows). A member holding a grant there runs commands without the limits the host lacks, as its owner
+  does in their own sessions, decided like host commands (`unboundedShellGrants`).
 - **Pinned sessions are read-only** (`frozenSession`: not a clone session, with pins). Every runner request but `view`,
   `events`, `create`, `restart` and `stop` (which open it to show its history, and end work) is refused
   (`session_frozen`), and so are push credentials, GitHub comments and merges, restores of their backups and moves.

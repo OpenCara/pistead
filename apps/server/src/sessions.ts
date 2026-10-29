@@ -8,7 +8,7 @@ import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import { hasPermission, normalizePermissions, roleSessionCeiling, sessionRoleOf, sessionRolePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import { redactApproval } from '../../../packages/shared/src/redaction.js';
-import type { AgentRow, AppContext, ModelRow, SessionRow, WorkerEnv } from './types.js';
+import type { AgentRow, AppContext, Env, ModelRow, SessionRow, WorkerEnv } from './types.js';
 import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireActiveSession, requireMember, requireSession, requireSessionCreator, sessionCreatorSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { sessionBranchName } from '../../../packages/shared/src/git-push.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
@@ -22,7 +22,7 @@ import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
-import { hostAuthority, hostOwnerDecides, mayDecideHostCommands } from './host-access.js';
+import { hostAuthority, hostOwnerDecides, mayDecideHostCommands, runsShellCommands } from './host-access.js';
 import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
 import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
@@ -199,7 +199,7 @@ export async function createSession(c: AppContext, input: Record<string, unknown
     // It starts with the tool output its workspace's owners and admins chose for new sessions; its owner can change it.
     tool_output: await newSessionToolOutput(c.env.DB, workspaceId) };
   const gitPush = row.connector_id && (JSON.parse(agent.tools_json) as unknown[]).includes('git_push') ? 1 : 0;
-  const notice = row.connector_id ? cloneUnavailable(capabilities, row.connector_owner_id ?? null, ownerId, JSON.parse(agent.tools_json) as string[]) : undefined;
+  const notice = row.connector_id ? await cloneUnavailable(c.env, capabilities, row, JSON.parse(agent.tools_json) as string[]) : undefined;
   await requireSessionCreator(c.env, workspaceId, ownerId);
   if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
   // Admit the session only while its workspace's repositories, membership and host are as they were checked.
@@ -393,13 +393,15 @@ function pollingEvents(c: AppContext, row: SessionRow): Response {
 }
 
 /**
- * Why a session's agent can't run shell commands on its host, and so can't clone the workspace's repositories; undefined
- * when it can. Such a session works in an empty worktree.
+ * Why the agent of session `row` (with `tools`) can't run shell commands on its host, and so can't clone the workspace's
+ * repositories; undefined when it can (see runsShellCommands). Such a session works in an empty worktree.
  */
-export function cloneUnavailable(capabilities: ConnectorCapabilities, hostOwnerId: string | null, ownerId: string, tools: readonly string[]): string | undefined {
+export async function cloneUnavailable(env: Env, capabilities: ConnectorCapabilities,
+  row: Pick<SessionRow, 'connector_id' | 'connector_owner_id' | 'workspace_id' | 'owner_id'>, tools: readonly string[]): Promise<string | undefined> {
   if (!tools.includes('bash')) return 'This session\'s agent doesn\'t have the bash tool, so it can\'t clone the workspace\'s repositories and works in an empty worktree.';
-  if (capabilities.productionShell !== true && hostOwnerId !== ownerId) {
-    return 'This session\'s host runs shell commands only for its owner, as it has no resource limits, so the agent can\'t clone the workspace\'s repositories and works in an empty worktree.';
+  if (!await runsShellCommands(env, capabilities, row, row.owner_id)) {
+    return 'This session\'s host has no resource limits, so it runs shell commands only for its owner and for members they granted host commands: '
+      + 'the agent can\'t clone the workspace\'s repositories and works in an empty worktree.';
   }
   return undefined;
 }
@@ -430,7 +432,7 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     // A clone session whose agent can't run shell commands on its host learns why it can't clone.
     const agent = access.row.repository_mode === 'clone' && access.row.connector_id && capabilities
       ? await c.env.DB.query<{ tools_json: string }>('SELECT tools_json FROM agent_versions WHERE id = ?').bind(access.row.agent_version_id).first() : null;
-    const notice = agent ? cloneUnavailable(capabilities as ConnectorCapabilities, access.row.connector_owner_id ?? null, access.row.owner_id, JSON.parse(agent.tools_json) as string[]) : undefined;
+    const notice = agent ? await cloneUnavailable(c.env, capabilities as ConnectorCapabilities, access.row, JSON.parse(agent.tools_json) as string[]) : undefined;
     // Everyone who can view the session learns that its shared conversation is also visible to anyone with its link.
     const linkShared = await isLinkShared(c.env, access.row.id);
     return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}), ...(linkShared ? { linkShared } : {}),
@@ -591,11 +593,19 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (operation.kind === 'bash' && Number(row.host_environment ?? 0) === 1 && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
       fail(403, 'host_owner_required', 'This session runs directly on its host: only the host owner, or a member granted host commands on this host, decides its commands.');
     }
+    // So is a command without the resource limits its host lacks in a session whose owner isn't the host's owner: it
+    // runs on the strength of that owner's host command grant.
+    if (operation.kind === 'bash' && approval.unbounded === true && row.connector_owner_id !== row.owner_id
+      && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
+      fail(403, 'host_owner_required', 'This command runs without the resource limits its host lacks: only the host owner, or a member granted host commands on this host, decides it.');
+    }
     // A permission request lets a tool call do more than the session allows, so only its owner decides it.
     if (operation.kind === 'permission') {
       if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can allow more than the session allows.');
-      if (operation.needs.includes('unbounded-shell') && row.connector_owner_id !== row.owner_id) {
-        fail(403, 'host_owner_required', 'Only the host\'s owner can allow a shell without resource limits.');
+      // Without the limits a host lacks, a member's commands run only on the strength of their host command grant there.
+      if (operation.needs.includes('unbounded-shell') && row.connector_owner_id !== row.owner_id
+        && (!row.connector_id || !await mayDecideHostCommands(c.env, row, row.owner_id))) {
+        fail(403, 'host_owner_required', 'Only the host\'s owner, or a member granted host commands on this host, can allow a shell without resource limits.');
       }
       // Each host command runs outside the sandbox, so its permission covers that one call only.
       if (input.scope === 'session' && operation.tool === 'host_bash') fail(400, 'invalid_decision', 'Host commands can only be allowed once.');

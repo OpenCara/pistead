@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "../packages/client/src/host-commands.js";
+import { decidedAsHostCommand, decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "../packages/client/src/host-commands.js";
 
 test("a host command is host_bash, or any command of a session that runs on its host", () => {
   const sandboxed = {};
@@ -11,6 +11,25 @@ test("a host command is host_bash, or any command of a session that runs on its 
   assert.equal(isHostCommand({ kind: "bash" }, sandboxed), false);
   // Only commands: a session on its host still pushes, comments and asks for permissions as any other does.
   for (const kind of ["git.push", "github.comment", "permission"] as const) assert.equal(isHostCommand({ kind }, onHost), false, kind);
+});
+
+test("a command without the host's missing limits in a member's session is decided as a host command, though it runs in the sandbox", () => {
+  type Session = { ownerId: string; connectorOwnerId?: string; hostEnvironment?: true };
+  const member: Session = { ownerId: "github:2", connectorOwnerId: "github:1" };
+  const own: Session = { ownerId: "github:1", connectorOwnerId: "github:1" };
+  const bash = { kind: "bash" } as const;
+  assert.equal(decidedAsHostCommand(bash, member, true), true);
+  assert.equal(isHostCommand(bash, member), false, "it still runs in the sandbox, as the session's owner");
+  // Within the host's limits, or in the host owner's own session, approve permission decides it as before.
+  assert.equal(decidedAsHostCommand(bash, member, false), false);
+  assert.equal(decidedAsHostCommand(bash, member), false);
+  assert.equal(decidedAsHostCommand(bash, own, true), false);
+  // A session with no host recorded has no owner to compare.
+  assert.equal(decidedAsHostCommand(bash, { ownerId: "github:2" }, true), false);
+  // Every host command is decided as one.
+  assert.equal(decidedAsHostCommand({ kind: "host.bash" }, own), true);
+  assert.equal(decidedAsHostCommand(bash, { ...own, hostEnvironment: true }), true);
+  for (const kind of ["git.push", "github.comment", "permission"] as const) assert.equal(decidedAsHostCommand({ kind }, member, true), false, kind);
 });
 
 test("the host's owner and members granted host commands decide them, as the control plane checks; approve access alone doesn't", () => {
