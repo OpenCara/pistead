@@ -1,4 +1,6 @@
-import { chmod, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { egressPort, type HelperBackend, type HelperContext, type HelperLaunch, type HelperLayout } from "./helper-workspace.js";
 import { NODE_HELPER, NODE_HELPER_KINDS } from "./node-helper.js";
@@ -24,7 +26,8 @@ import { WindowsJob } from "./windows-job.js";
  * proxy on a loopback port (MXC's proxy-only egress: everything else is blocked by a per-container WFP filter), which
  * also wants the session's token.
  *
- * Needs Windows 11 24H2/25H2 builds 26100/26200.9550 or later. Untested: see docs/design/windows-sandbox.md, Spikes.
+ * Needs Windows 11 24H2 or later with the October 2026 update, which `--experimental-sandbox` checks by asking Windows
+ * (WINDOWS_SUPPORT_CHECK). See docs/design/windows-sandbox.md for the runs on Windows.
  */
 export const WINDOWS_RUNNER = String.raw`
 import { pathToFileURL } from "node:url";
@@ -60,7 +63,7 @@ let probe;
 try { probe = sdk.probe(config.request); } catch (error) { fail("this Windows can't run the process container: " + (error && error.message || "probe failed")); }
 if (probe.error || probe.tier !== "base-container" || (probe.warnings && probe.warnings.length)) {
   fail("this Windows can't run the OS process container (MXC chose " + (probe.tier || "nothing") + (probe.error ? ": " + probe.error : "")
-    + "); Pistead never uses MXC's AppContainer fallbacks. Windows 11 24H2/25H2 build .9550 or later is required, or run the connector in WSL2");
+    + "); Pistead never uses MXC's AppContainer fallbacks. it needs Windows 11 24H2 or later with the latest update, or run the connector in WSL2");
 }
 let child;
 try { child = await sdk.spawn(config.request); } catch (error) { fail("the process container could not start: " + (error && error.message || "unknown error")); }
@@ -79,6 +82,93 @@ const result = await child.wait();
 await Promise.all(copies);
 process.exitCode = result.timedOut ? 124 : result.exitCode;
 `;
+
+/**
+ * What `--experimental-sandbox` checks before it pairs, run by node in a process of its own (MXC's native code never loads
+ * in the connector). It asks MXC for a session's network policy (proxy-only egress, identity-less loopback proxy) on
+ * the OS container, then starts one container and resolves its working directory to a drive-letter path. Git (its
+ * working directory) and Node (realpath) need that, and Windows only allows it in a container from its October 2026
+ * update: build 26200.9457 refused it, 26300.9711 allows it. The build number alone doesn't tell, so this asks Windows.
+ * Arguments: the SDK's entry, a scratch directory, the system directory. Prints one JSON line.
+ */
+export const WINDOWS_SUPPORT_CHECK = String.raw`
+import { pathToFileURL } from "node:url";
+import { dirname } from "node:path";
+const [sdkPath, directory, system] = process.argv.slice(1);
+const done = value => { process.stdout.write(JSON.stringify(value) + "\n"); process.exit(0); };
+let sdk;
+try { sdk = await import(pathToFileURL(sdkPath).href); } catch { done({ error: "the MXC SDK could not be loaded from " + sdkPath }); }
+const resolve = "process.stdout.write(JSON.stringify(require('fs').realpathSync.native('.')))";
+const request = {
+  command: '"' + process.execPath + '" -e "' + resolve + '"',
+  containment: { type: "processcontainer" },
+  filesystem: { readwritePaths: [directory], readonlyPaths: [system, dirname(process.execPath)], deniedPaths: [] },
+  network: { egress: { default: "deny" }, ingress: { default: "allow", hostLoopback: "allow" }, runtimeConfig: { networkProxy: "http://127.0.0.1:9" } },
+  ui: { disable: false }, workingDirectory: directory, inheritDefaultEnvironment: false, timeoutMs: 30000,
+  environment: { SystemRoot: system, windir: system, PATH: system + "\\System32", LOCALAPPDATA: directory, TEMP: directory, TMP: directory },
+};
+let probe;
+try { probe = sdk.probe(request); } catch (error) { done({ error: "MXC's probe failed: " + (error && error.message || "unknown error") }); }
+const result = { tier: probe.tier || null, warnings: probe.warnings || [], probeError: probe.error || null,
+  identitylessProxy: !!(probe.probes && probe.probes.baseContainerSupportsIdentitylessLoopbackProxy) };
+if (result.tier !== "base-container" || result.warnings.length || result.probeError || !result.identitylessProxy) done(result);
+try {
+  const child = await sdk.spawn(request);
+  let stdout = "", stderr = "";
+  child.standardInput && child.standardInput.end();
+  const copies = [[child.standardOutput, chunk => stdout += chunk], [child.standardError, chunk => stderr += chunk]].filter(([from]) => from)
+    .map(([from, add]) => new Promise(resolve => { from.on("data", add); from.on("end", resolve); from.on("error", resolve); }));
+  const exit = await child.wait();
+  await Promise.all(copies);
+  let resolved = null;
+  try { resolved = JSON.parse(stdout); } catch {}
+  done({ ...result, resolved, exitCode: exit.exitCode, stderr: stderr.slice(0, 500) });
+} catch (error) { done({ ...result, error: "the process container could not start: " + (error && error.message || "unknown error") }); }
+`;
+
+/** The Windows build with its update level (UBR), e.g. "26300.9711", from the registry. */
+export function windowsBuild(): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  const result = spawnSync("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "/v", "CurrentBuild"], { encoding: "utf8", windowsHide: true });
+  const ubr = spawnSync("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "/v", "UBR"], { encoding: "utf8", windowsHide: true });
+  const build = /CurrentBuild\s+REG_SZ\s+(\d+)/.exec(result.stdout ?? "")?.[1];
+  const update = /UBR\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(ubr.stdout ?? "")?.[1];
+  return build ? `${build}${update ? `.${Number.parseInt(update, 16)}` : ""}` : undefined;
+}
+
+export interface WindowsSandboxSupport {
+  /** MXC would run sessions in the OS container (base-container) with proxy-only egress to an unpackaged proxy. */
+  container: boolean;
+  /** A process in the container can resolve its working directory to a drive-letter path (Git, Node). */
+  paths: boolean;
+  /** Why not, for the setup message. */
+  detail?: string;
+}
+
+/** Runs WINDOWS_SUPPORT_CHECK with the SDK at `sdk` (its entry point). */
+export async function windowsSandboxSupport(sdk: string, node = process.execPath): Promise<WindowsSandboxSupport> {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pistead-sandbox-check-")));
+  try {
+    const system = process.env.SystemRoot ?? "C:\\Windows";
+    const run = spawnSync(node, ["--input-type=module", "-e", WINDOWS_SUPPORT_CHECK, sdk, directory, system], {
+      encoding: "utf8", windowsHide: true, timeout: 60_000, cwd: directory,
+      // As the runner's: only what Node and MXC need to start (MXC runs `whoami`, which must be Windows' own).
+      env: { SystemRoot: system, windir: system, PATH: [join(system, "System32"), system].join(";"), TEMP: directory, TMP: directory,
+        ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}), ...(process.env.SystemDrive ? { SystemDrive: process.env.SystemDrive } : {}) },
+    });
+    let result: { error?: string; tier?: string | null; warnings?: string[]; probeError?: string | null; identitylessProxy?: boolean; resolved?: unknown; exitCode?: number; stderr?: string };
+    try { result = JSON.parse(run.stdout.trim().split("\n").at(-1) ?? ""); }
+    catch { return { container: false, paths: false, detail: `the check could not run${run.error ? ` (${run.error.message})` : ""}` }; }
+    const container = !result.error && result.tier === "base-container" && !result.warnings?.length && !result.probeError && result.identitylessProxy === true;
+    if (!container) {
+      return { container: false, paths: false, detail: result.error ?? `MXC chose ${result.tier ?? "nothing"}${result.probeError ? `: ${result.probeError}` : ""}${result.warnings?.length ? ` (${result.warnings.join("; ")})` : ""}${result.identitylessProxy === false ? ", without proxy-only egress for the connector's proxy" : ""}` };
+    }
+    const paths = typeof result.resolved === "string" && result.resolved.toLowerCase() === directory.toLowerCase();
+    return paths ? { container, paths } : { container, paths, detail: result.error ?? `resolving a path in the container failed${result.stderr ? `: ${result.stderr.trim().split("\n").find(line => /Error|EPERM|denied/i.test(line)) ?? result.stderr.trim().split("\n")[0]}` : ""}` };
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
 
 export interface WindowsBackendOptions {
   /** Where MXC is installed (see windowsRuntimeDirectory). */

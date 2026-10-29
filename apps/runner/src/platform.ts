@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { dirname, join } from "node:path";
+import { WindowsJob } from "./windows-job.js";
 
 /**
  * What differs between the hosts the connector runs on: Linux (and WSL2), macOS and native Windows. Everything that
@@ -104,11 +105,48 @@ export function windowsSystemEnvironment(): Record<string, string> {
 export const NULL_DEVICE = windows ? "NUL" : "/dev/null";
 
 /**
+ * Unsandboxed bash on Windows starts its command only once it is in its job (startHostBash): until then it waits for the
+ * command on stdin, so nothing it starts can be outside the job. Its stdin is then empty, as with `stdio: "ignore"`. The
+ * variable is cleared inside the evaluated text, so the command never sees it.
+ */
+const WINDOWS_HOST_BASH = "IFS= read -r -d '' __pistead_command || exit 125; exec 0</dev/null; eval \"unset __pistead_command; $__pistead_command\"";
+
+/** Arguments for bash running an unsandboxed command; spawn it with a piped stdin and call startHostBash. */
+export function hostBashArgs(command: string): string[] {
+  return ["--noprofile", "--norc", "-c", windows ? WINDOWS_HOST_BASH : command];
+}
+
+const hostJobs = new WeakMap<ChildProcess, WindowsJob>();
+
+/**
+ * Starts bash spawned with hostBashArgs. On Windows it goes into a job first, so a time limit or cancel (killTree) ends
+ * everything it started, background processes included, which `taskkill /T` misses once their parent has exited. Without
+ * koffi there is no job, and killTree falls back to `taskkill /T`. Elsewhere bash already has its command.
+ */
+export function startHostBash(child: ChildProcess, command: string): void {
+  if (!windows) { child.stdin?.end(); return; }
+  if (child.pid) {
+    const job = WindowsJob.hostJob();
+    if (job) {
+      try {
+        job.assign(child.pid);
+        hostJobs.set(child, job);
+        child.once("close", () => job.release());
+      } catch { job.release(); }
+    }
+  }
+  child.stdin?.end(`${command}\0`);
+}
+
+/**
  * Stops a command and everything it started. POSIX commands run in their own process group (spawned `detached`), which
- * one signal ends. Windows has no process groups: `taskkill /T` ends the tree the process started.
+ * one signal ends. Windows has no process groups: unsandboxed bash's job (startHostBash) ends all of it; otherwise
+ * `taskkill /T` ends the tree the process started.
  */
 export function killTree(child: ChildProcess): void {
   if (!child.pid) return;
+  const job = hostJobs.get(child);
+  if (job) { job.terminate(); return; }
   if (windows) {
     const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
     killer.on("error", () => child.kill());

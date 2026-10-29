@@ -24,6 +24,10 @@ test("a clone's branch, origin and default branch are read from its Git files", 
   assert.equal(originUrl('[remote "origin"]\n\turl = git@github.com:owner/repo.git\n\turl = https://second.example/repo\n'), "git@github.com:owner/repo.git");
   assert.equal(originUrl('[remote "upstream"]\n\turl = https://github.com/a/b\n'), undefined);
   assert.equal(originUrl('[Remote "origin"] \n  URL = "https://github.com/owner/repo"\n'), "https://github.com/owner/repo");
+  // Values as Git writes and reads them: Git for Windows writes a local path's backslashes escaped; comments end a value.
+  assert.equal(originUrl('[remote "origin"]\n\turl = C:\\\\Users\\\\me\\\\upstream\n'), "C:\\Users\\me\\upstream");
+  assert.equal(originUrl('[remote "origin"]\n\turl = "https://x.example/a b" ; a comment\n'), "https://x.example/a b");
+  assert.equal(originUrl('[remote "origin"]\n\turl = git@github.com:owner/repo.git # a comment\n'), "git@github.com:owner/repo.git");
 });
 
 test("the worktree's clones report their checked-out branches of the workspace's github.com repositories", async t => {

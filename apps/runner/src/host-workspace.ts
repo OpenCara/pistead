@@ -14,7 +14,7 @@ import {
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { browseDirectory, browseFile, checkedBrowse, type BrowseResult } from "./file-browser.js";
 import type { SessionWorkspace } from "./workspace.js";
-import { bashPath, CREATE_FILE, killTree, OPEN_DIRECTORY, OPEN_FILE, privateEntry, windows, windowsSystemEnvironment } from "./platform.js";
+import { bashPath, CREATE_FILE, hostBashArgs, killTree, OPEN_DIRECTORY, OPEN_FILE, privateEntry, startHostBash, windows, windowsSystemEnvironment } from "./platform.js";
 import { readCloneBranches, type CloneBranch } from "./clone-branches.js";
 
 const MAX_ENTRIES = 10_000;
@@ -24,7 +24,8 @@ const DIRECTORY_FLAGS = OPEN_DIRECTORY;
 const queues = new Map<string, Promise<void>>();
 
 type Captured = { code: number | null; stdout: string; stderr: string };
-type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal };
+/** `hostCommand`: the process is bash spawned with hostBashArgs, started with startHostBash rather than given `input`. */
+type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal; hostCommand?: string };
 
 /**
  * Owner-consented host mode for macOS or Linux without bubblewrap. It runs as the
@@ -169,8 +170,8 @@ export class HostWorkspace implements SessionWorkspace {
           if (options.signal?.aborted) throw new SandboxProcessError("Command stopped before it started", null, null, "", "");
           const bash = bashPath();
           if (!bash) throw hostError(windows ? "bash commands need Git for Windows' bash.exe" : "bash commands need /bin/bash");
-          return output(checked(await this.#spawn(bash, ["--noprofile", "--norc", "-c", command], undefined,
-            { timeoutMs: (options.limits?.seconds ?? TIMEOUT_MS / 1000) * 1000, signal: options.signal })));
+          return output(checked(await this.#spawn(bash, hostBashArgs(command), undefined,
+            { timeoutMs: (options.limits?.seconds ?? TIMEOUT_MS / 1000) * 1000, signal: options.signal, hostCommand: command })));
         });
       }
       case "github.comment":
@@ -366,7 +367,10 @@ export class HostWorkspace implements SessionWorkspace {
       if (failure || signal) reject(new SandboxProcessError(`${failure ?? `Command killed by ${signal}`}${err ? `: ${err.slice(0, 4096).trim()}` : ""}`, code, signal, out, err));
       else resolveResult({ code, stdout: out, stderr: err });
     });
-    child.stdin.end(input ?? "");
+    // A command cancelled before it starts never gets to bash, which then ends at once.
+    if (options.hostCommand === undefined) child.stdin.end(input ?? "");
+    else if (failure) child.stdin.end();
+    else startHostBash(child, options.hostCommand);
     return promise;
   }
 }

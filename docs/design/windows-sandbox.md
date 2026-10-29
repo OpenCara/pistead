@@ -134,6 +134,23 @@ Third run, after the October 2026 update moved the host to build 26300.9711 (MXC
   MXC's networking doc lists it as an unresolved ingress limitation; the same server works in a step without the proxy.
 - The Git patch for builds before the fix is `windows-sandbox-git-getcwd.patch`, beside this note.
 
+The first run's open items, after the third run:
+
+- A (shell) and B (Git's working directory): busybox-w32 is the sandbox's shell; Windows' October 2026 update fixed B.
+- C (the token): the helper restores the proxy variables and `NO_PROXY` (second and third runs).
+- D (loopback servers): fixed by the same update, except behind the proxy (third run).
+- E (the build check): the build number can't tell, because the update that matters has a different number on each
+  release (25H2 is 26200.x, 26H2 26300.x), and .9550 isn't where Git started working. `--experimental-sandbox` now
+  asks Windows (`WINDOWS_SUPPORT_CHECK`): in a node process of its own, MXC probes a session's network policy (the
+  OS container, proxy-only egress to an unpackaged proxy), then one container resolves its working directory to a
+  drive-letter path, as Git and Node do. About a second; the setup message names the build with its update level.
+- F (unsandboxed commands outliving a time limit or cancel): each unsandboxed bash command runs in a job object
+  (koffi, an optional dependency), and a time limit or cancel ends the job. Bash waits for its command on stdin until
+  it is in the job, so nothing it starts can be outside it. The job doesn't allow breaking away: MSYS2's runtime asks
+  to (CREATE_BREAKAWAY_FROM_JOB) for every process it starts, which is how `cmd &` left the job while it allowed it,
+  and starts it in the job otherwise. The job isn't killed when its handle closes, so what a command leaves running
+  when it finishes keeps running, as on Linux. Without koffi it falls back to `taskkill /T`.
+
 ## What the Linux sandbox guarantees today
 
 These come from `apps/runner/src/sandbox.ts` (bubblewrap), `resources.ts` (cgroup v2) and `egress.ts`. A Windows

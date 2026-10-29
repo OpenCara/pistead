@@ -61,9 +61,32 @@ export function originUrl(config: string): string | undefined {
     if (!inOrigin) continue;
     const entry = /^url\s*=\s*(.*)$/i.exec(line);
     // A later url of the same remote is another push or fetch URL; the first is the one Git fetches from.
-    if (entry && url === undefined) url = entry[1]!.replace(/^"(.*)"$/, "$1").trim();
+    if (entry && url === undefined) url = configValue(entry[1]!);
   }
   return url || undefined;
+}
+
+/**
+ * A Git config value as Git reads it: quotes kept together, `\\`, `\"`, `\n`, `\t` and `\b` unescaped, and a `#` or `;`
+ * outside quotes starting a comment. Git for Windows writes a local path's backslashes as `\\`.
+ */
+function configValue(raw: string): string {
+  let value = "";
+  let quoted = false;
+  let pending = "";
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index]!;
+    if (char === "\\") {
+      const next = raw[++index];
+      value += pending + (next === "n" ? "\n" : next === "t" ? "\t" : next === "b" ? "\b" : next ?? "");
+      pending = "";
+    } else if (char === '"') quoted = !quoted;
+    else if (!quoted && (char === "#" || char === ";")) break;
+    // Whitespace outside quotes counts only between other characters.
+    else if (!quoted && /\s/.test(char)) pending += char;
+    else { value += pending + char; pending = ""; }
+  }
+  return value.trim();
 }
 
 /**

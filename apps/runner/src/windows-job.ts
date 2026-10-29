@@ -8,7 +8,11 @@ import type { WindowsJobLimits } from "./sandbox-backend.js";
  * and kills them all when the runner closes it. MXC puts the container in a kill-on-close job of its own, inside
  * this one (jobs nest since Windows 8).
  *
- * The Win32 calls go through koffi, which MXC's SDK already depends on, loaded from where the SDK is installed.
+ * Unsandboxed commands on Windows run in a job too (hostJob), without limits, so a time limit or cancel ends what they
+ * started in the background: `taskkill /T` can't find those once the process that started them has exited.
+ *
+ * The Win32 calls go through koffi: Pistead's own (an optional dependency, installed on Windows), else the copy MXC's SDK
+ * depends on, loaded from where the SDK is installed.
  */
 const JobObjectExtendedLimitInformation = 9;
 const JobObjectCpuRateControlInformation = 15;
@@ -36,12 +40,19 @@ interface Kernel32 {
   cpuSize: number;
 }
 
+function loadKoffi(runtime?: string): Koffi {
+  try { return createRequire(import.meta.url)("koffi") as Koffi; }
+  catch (error) {
+    if (!runtime) throw error;
+    return createRequire(join(runtime, "node_modules", "@microsoft", "mxc-sdk", "package.json"))("koffi") as Koffi;
+  }
+}
+
 let kernel32: Kernel32 | undefined;
-function load(runtime: string): Kernel32 {
+function load(runtime?: string): Kernel32 {
   if (kernel32) return kernel32;
   if (process.platform !== "win32") throw new Error("Job objects exist only on Windows");
-  const require = createRequire(join(runtime, "node_modules", "@microsoft", "mxc-sdk", "package.json"));
-  const koffi = require("koffi") as Koffi;
+  const koffi = loadKoffi(runtime);
   const library = koffi.load("kernel32.dll");
   const IO_COUNTERS = koffi.struct("PISTEAD_IO_COUNTERS", {
     ReadOperationCount: "uint64", WriteOperationCount: "uint64", OtherOperationCount: "uint64",
@@ -85,28 +96,49 @@ export class WindowsJob {
 
   static create(runtime: string, limits: Readonly<WindowsJobLimits>): WindowsJob {
     const api = load(runtime);
-    const handle = api.CreateJobObjectW(null, null);
-    if (!handle) throw new Error(`CreateJobObject failed (${api.GetLastError()})`);
-    const job = new WindowsJob(api, handle);
+    const job = WindowsJob.#open(api, JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+      limits.processes, limits.memoryBytes);
     try {
-      const extended = {
-        BasicLimitInformation: {
-          PerProcessUserTimeLimit: 0, PerJobUserTimeLimit: 0, MinimumWorkingSetSize: 0, MaximumWorkingSetSize: 0, Affinity: 0, PriorityClass: 0, SchedulingClass: 0,
-          LimitFlags: JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-          ActiveProcessLimit: limits.processes,
-        },
-        IoInfo: { ReadOperationCount: 0, WriteOperationCount: 0, OtherOperationCount: 0, ReadTransferCount: 0, WriteTransferCount: 0, OtherTransferCount: 0 },
-        ProcessMemoryLimit: 0, JobMemoryLimit: limits.memoryBytes, PeakProcessMemoryUsed: 0, PeakJobMemoryUsed: 0,
-      };
-      if (!api.SetExtendedLimits(handle, JobObjectExtendedLimitInformation, extended, api.extendedSize)) throw new Error(`Job limits could not be set (${api.GetLastError()})`);
       // In hundredths of a percent of the whole machine.
       const cpu = { ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, CpuRate: limits.cpuPercent * 100 };
-      if (!api.SetCpuRate(handle, JobObjectCpuRateControlInformation, cpu, api.cpuSize)) throw new Error(`Job CPU limit could not be set (${api.GetLastError()})`);
+      if (!api.SetCpuRate(job.#handle, JobObjectCpuRateControlInformation, cpu, api.cpuSize)) throw new Error(`Job CPU limit could not be set (${api.GetLastError()})`);
       return job;
     } catch (error) {
       job.close();
       throw error;
     }
+  }
+
+  /**
+   * A job for an unsandboxed command: no limits, and not killed when its handle closes, so what a command leaves running
+   * when it exits normally keeps running, as on Linux. It doesn't allow breaking away: MSYS2's runtime asks to break away
+   * (CREATE_BREAKAWAY_FROM_JOB) for the processes it starts, and starts them in the job when that isn't allowed, which is
+   * what keeps `cmd &` in it. Undefined when koffi isn't installed.
+   */
+  static hostJob(): WindowsJob | undefined {
+    let api: Kernel32;
+    try { api = load(); } catch { return undefined; }
+    return WindowsJob.#open(api, 0, 0, 0);
+  }
+
+  static #open(api: Kernel32, flags: number, processes: number, memoryBytes: number): WindowsJob {
+    const handle = api.CreateJobObjectW(null, null);
+    if (!handle) throw new Error(`CreateJobObject failed (${api.GetLastError()})`);
+    const job = new WindowsJob(api, handle);
+    const extended = {
+      BasicLimitInformation: {
+        PerProcessUserTimeLimit: 0, PerJobUserTimeLimit: 0, MinimumWorkingSetSize: 0, MaximumWorkingSetSize: 0, Affinity: 0, PriorityClass: 0, SchedulingClass: 0,
+        LimitFlags: flags, ActiveProcessLimit: processes,
+      },
+      IoInfo: { ReadOperationCount: 0, WriteOperationCount: 0, OtherOperationCount: 0, ReadTransferCount: 0, WriteTransferCount: 0, OtherTransferCount: 0 },
+      ProcessMemoryLimit: 0, JobMemoryLimit: memoryBytes, PeakProcessMemoryUsed: 0, PeakJobMemoryUsed: 0,
+    };
+    if (!api.SetExtendedLimits(handle, JobObjectExtendedLimitInformation, extended, api.extendedSize)) {
+      const code = api.GetLastError();
+      job.close();
+      throw new Error(`Job limits could not be set (${code})`);
+    }
+    return job;
   }
 
   /** Puts a process in the job; it and everything it starts from then on are bound by it. */
@@ -117,6 +149,19 @@ export class WindowsJob {
     try {
       if (!this.#api.AssignProcessToJobObject(this.#handle, process)) throw new Error(`The sandbox runner could not be put in its job (${this.#api.GetLastError()})`);
     } finally { this.#api.CloseHandle(process); }
+  }
+
+  /** Ends every process in the job; the job stays open. */
+  terminate(): void {
+    if (this.#handle) this.#api.TerminateJobObject(this.#handle, 1);
+  }
+
+  /** Releases the job without ending its processes (a host job's leave running what a command started on purpose). */
+  release(): void {
+    const handle = this.#handle;
+    if (!handle) return;
+    this.#handle = undefined;
+    this.#api.CloseHandle(handle);
   }
 
   /** Ends every process in the job, then releases it. */

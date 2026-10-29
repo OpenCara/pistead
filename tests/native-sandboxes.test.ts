@@ -13,7 +13,7 @@ import { NODE_HELPER, NODE_HELPER_KINDS } from "../apps/runner/src/node-helper.j
 import { HELPER, type SandboxRequest } from "../apps/runner/src/sandbox.js";
 import { validWindowsLimits } from "../apps/runner/src/sandbox-backend.js";
 import { SeatbeltBackend, seatbeltProfile } from "../apps/runner/src/seatbelt.js";
-import { WINDOWS_RUNNER, WindowsBackend } from "../apps/runner/src/windows-sandbox.js";
+import { WINDOWS_RUNNER, WINDOWS_SUPPORT_CHECK, WindowsBackend, windowsSandboxSupport } from "../apps/runner/src/windows-sandbox.js";
 import type { EgressGrant } from "../packages/shared/src/network.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 
@@ -278,10 +278,44 @@ test("the Node helper gives commands the session's own proxy URL back, after MXC
   assert.equal(run({}).stdout, "http://127.0.0.1:41234 http://127.0.0.1:41234 http://127.0.0.1:41234 http://127.0.0.1:41234 unset [] [] unset\n");
 });
 
+/**
+ * A stand-in for MXC's SDK in the setup check: `probe` reports `tier` (and the identity-less proxy flag), and `spawn` runs
+ * the check's own command in a shell, or, with `denied`, fails as Windows did before its October 2026 update.
+ */
+const FAKE_CHECK_SDK = (tier: string, options: { identityless?: boolean; denied?: boolean } = {}) => `
+import { spawn as start } from "node:child_process";
+export function probe() { return { tier: ${JSON.stringify(tier)}, warnings: [], probes: { baseContainerSupportsIdentitylessLoopbackProxy: ${options.identityless ?? true} } }; }
+export async function spawn(request) {
+  const child = ${options.denied
+    ? `start(process.execPath, ["-e", "process.stderr.write(\\"Error: EPERM: operation not permitted, realpath 'C:\\\\\\\\work'\\\\n\\");process.exit(1)"], { stdio: ["pipe", "pipe", "pipe"] })`
+    : `start(request.command, { shell: true, cwd: request.workingDirectory, stdio: ["pipe", "pipe", "pipe"] })`};
+  return { standardInput: child.stdin, standardOutput: child.stdout, standardError: child.stderr,
+    wait: () => new Promise(resolve => child.on("close", code => resolve({ exitCode: code, timedOut: false }))) };
+}
+`;
+
+test("the Windows setup check runs a session's container and resolves a path in it, so builds where Git can't work are refused", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "windows-check-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const check = async (name: string, source: string) => {
+    await writeFile(join(directory, `${name}.mjs`), source);
+    return windowsSandboxSupport(join(directory, `${name}.mjs`));
+  };
+  assert.deepEqual(await check("works", FAKE_CHECK_SDK("base-container")), { container: true, paths: true });
+  const denied = await check("denied", FAKE_CHECK_SDK("base-container", { denied: true }));
+  assert.deepEqual([denied.container, denied.paths], [true, false]);
+  assert.match(denied.detail!, /EPERM: operation not permitted, realpath/);
+  const fallback = await check("fallback", FAKE_CHECK_SDK("appcontainer-dacl"));
+  assert.deepEqual([fallback.container, fallback.paths], [false, false]);
+  assert.match(fallback.detail!, /MXC chose appcontainer-dacl/);
+  assert.match((await check("no-proxy", FAKE_CHECK_SDK("base-container", { identityless: false }))).detail!, /without proxy-only egress/);
+  assert.match((await windowsSandboxSupport(join(directory, "missing.mjs"))).detail!, /could not be loaded/);
+});
+
 test("the Windows runner and helper are valid modules, and job limits are checked", async t => {
   const directory = await mkdtemp(join(tmpdir(), "windows-scripts-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  for (const [name, source] of [["runner.mjs", WINDOWS_RUNNER], ["helper.mjs", NODE_HELPER]] as const) {
+  for (const [name, source] of [["runner.mjs", WINDOWS_RUNNER], ["helper.mjs", NODE_HELPER], ["check.mjs", WINDOWS_SUPPORT_CHECK]] as const) {
     await writeFile(join(directory, name), source);
     const check = spawnSync(process.execPath, ["--check", join(directory, name)], { encoding: "utf8" });
     assert.equal(check.status, 0, `${name}: ${check.stderr}`);

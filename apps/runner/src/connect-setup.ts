@@ -9,6 +9,7 @@ import { ConnectorSetupError } from "./protocol.js";
 import { bashPath, gitForWindowsRoot, SANDBOX_SHELL_HINT, sandboxShellPath } from "./platform.js";
 import { MXC_SDK_VERSION, mxcEntry, mxcInstallHint, windowsRuntimeDirectory } from "./sandbox-backend.js";
 import { SANDBOX_EXEC, seatbeltTools } from "./seatbelt.js";
+import { windowsBuild, windowsSandboxSupport } from "./windows-sandbox.js";
 
 // Front-end-neutral connector preflight shared by `pistead connect` and the desktop host. Messages that name CLI flags
 // stay in their front end; everything here reads the same in a terminal and in an app.
@@ -23,7 +24,7 @@ export const defaultStateDir = (): string => join(homedir(), ".local", "share", 
 export function assertConnectorPlatform(mode: { unsandboxed?: boolean; experimentalSandbox?: boolean } = {}): void {
   if (Number(process.versions.node.split(".")[0]) < 24) throw new ConnectorSetupError(`Node.js 24 or newer is required (found ${process.versions.node}).`);
   if (process.platform === "win32" && !mode.unsandboxed && !mode.experimentalSandbox) {
-    throw new ConnectorSetupError("Native Windows has no sandbox by default. The isolated sandbox runs in WSL2: install it (in PowerShell: wsl --install), open the Ubuntu terminal, install Node.js 24, Pi, bubblewrap, Python 3, Git and util-linux there, then run this same command inside WSL2. On Windows 11 24H2/25H2 (build .9550 or later) you can try the native sandbox with --experimental-sandbox, or run without one with --unsafe-no-sandbox.");
+    throw new ConnectorSetupError("Native Windows has no sandbox by default. The isolated sandbox runs in WSL2: install it (in PowerShell: wsl --install), open the Ubuntu terminal, install Node.js 24, Pi, bubblewrap, Python 3, Git and util-linux there, then run this same command inside WSL2. On Windows 11 24H2 or later with the October 2026 update you can try the native sandbox with --experimental-sandbox, or run without one with --unsafe-no-sandbox.");
   }
   if (process.platform !== "linux" && process.platform !== "darwin" && process.platform !== "win32") throw new ConnectorSetupError(`Unsupported platform "${process.platform}": use Linux, WSL2, macOS or Windows.`);
   if (process.platform === "linux" && mode.experimentalSandbox) throw new ConnectorSetupError("--experimental-sandbox is for macOS and native Windows; Linux runs the bubblewrap sandbox.");
@@ -39,11 +40,22 @@ export async function checkPrerequisites(unsandboxed: boolean, experimental?: { 
   if (process.platform === "win32") {
     if (unsandboxed || !experimental) return windowsGit();
     const runtime = windowsRuntimeDirectory(experimental.stateDir);
-    const build = Number(release().split(".")[2] ?? 0);
-    return [{ name: "Git for Windows (git on PATH)", ok: gitForWindowsRoot() !== undefined },
+    const found = windowsBuild() ?? release().split(".")[2] ?? "unknown";
+    const build = Number(found.split(".")[0]);
+    const sdk = mxcEntry(runtime);
+    const result: Prerequisite[] = [{ name: "Git for Windows (git on PATH)", ok: gitForWindowsRoot() !== undefined },
       { name: `busybox-w32, the sandbox's shell (${SANDBOX_SHELL_HINT}; or set PISTEAD_SANDBOX_SHELL)`, ok: sandboxShellPath() !== undefined },
-      { name: `Windows 11 24H2 or later (build 26100+, found ${build || "unknown"}; the sandbox checks the update level itself)`, ok: build >= 26100 },
-      { name: `Microsoft MXC SDK ${MXC_SDK_VERSION} in ${runtime} (install: ${mxcInstallHint(runtime)})`, ok: mxcEntry(runtime) !== undefined }];
+      { name: `Windows 11 24H2 or later (build 26100+, found ${found})`, ok: build >= 26100 },
+      { name: `Microsoft MXC SDK ${MXC_SDK_VERSION} in ${runtime} (install: ${mxcInstallHint(runtime)})`, ok: sdk !== undefined }];
+    // The update level decides whether sessions can work, and its number differs between releases (25H2 is 26200.x,
+    // 26H2 26300.x), so Windows is asked: one container with a session's network policy, resolving a path in it.
+    if (sdk && build >= 26100) {
+      const support = await windowsSandboxSupport(sdk);
+      result.push(
+        { name: `Windows' process container for sessions, with proxy-only egress (MXC's base-container tier)${support.container ? "" : `: ${support.detail}`}`, ok: support.container },
+        { name: `Paths that Git and Node resolve inside the container (Windows' October 2026 update or later: install the latest Windows update)${support.container && !support.paths ? `: ${support.detail}` : ""}`, ok: support.paths });
+    }
+    return result;
   }
   const required: Record<string, string> = unsandboxed
     ? process.platform === "linux" ? { "/usr/bin/flock": "flock (util-linux)" } : { "/usr/bin/lockf": "lockf" }

@@ -56,8 +56,8 @@ Development:
 
 Linux or WSL2 with working bubblewrap, Python 3, Git and flock is required for the
 isolated sandbox. On native Windows run this command inside WSL2, or try
---experimental-sandbox (Windows 11 24H2/25H2 build .9550+, Git for Windows, and
-Microsoft's MXC SDK, which it tells you how to install). On macOS,
+--experimental-sandbox (Windows 11 24H2 or later with the October 2026 update, Git
+for Windows, busybox-w32 and Microsoft's MXC SDK; it checks each and says what to do). On macOS,
 --experimental-sandbox needs the developer tools (xcode-select --install); its shell
 commands have no hard memory limits, so only you can let them run, in your own sessions.
 --unsafe-no-sandbox needs only Git on PATH, but approved commands then run as your
