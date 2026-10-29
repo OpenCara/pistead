@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { WorkerEnv } from './types.js';
 import { authenticate, csrfGuard, localOwner, registerAuth } from './auth.js';
-import { registerPasswordAuth } from './password-auth.js';
+import { registerPasswordAuth, signupMode } from './password-auth.js';
 import { registerCatalog } from './catalog.js';
 import { registerSessions } from './sessions.js';
 import { registerScheduledPrompts } from './scheduled-prompts.js';
@@ -64,6 +64,7 @@ app.get('/api/health', async c => {
     connectorsConfigured: !!c.env.CONNECTOR_HUB, testMode: testMode(c.env),
     // The sign-in page offers a username and password next to GitHub.
     passwordAuth: passwordAuthEnabled(c.env),
+    ...(passwordAuthEnabled(c.env) ? { passwordSignup: signupMode(c.env) } : {}),
     // A local server says whether someone has claimed it, so the sign-in page can point to the launcher's link.
     ...(localMode(c.env) ? { localServer: { claimed: !!await localOwner(c.env) } } : {}),
   });

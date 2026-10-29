@@ -43,6 +43,8 @@ export interface Env {
   LOCAL_CLAIM_SECRET?: string;
   /** `true` lets people sign up and sign in with a username and password (password-auth.ts), next to GitHub. */
   PASSWORD_AUTH?: string;
+  /** Who may sign up with a password (password-auth.ts signupMode): `invite` (default), `open` or `off`. */
+  PASSWORD_SIGNUP?: string;
 }
 export interface AuthIdentity {
   userId: string;

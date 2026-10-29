@@ -38,8 +38,9 @@ function title(route: Route): string {
   }
 }
 
-function SignIn({ error, retry, invited }: { error: string; retry: () => void; invited?: boolean }) {
-  const health = useResource<{ githubConfigured?: boolean; passwordAuth?: boolean; localServer?: { claimed: boolean } }>("/api/health");
+function SignIn({ error, retry, inviteToken }: { error: string; retry: () => void; inviteToken?: string }) {
+  const invited = inviteToken !== undefined;
+  const health = useResource<{ githubConfigured?: boolean; passwordAuth?: boolean; passwordSignup?: "open" | "invite" | "off"; localServer?: { claimed: boolean } }>("/api/health");
   const callbackError = new URLSearchParams(window.location.search).get("error");
   const problem = error || health.error || (callbackError ? `GitHub sign-in did not complete: ${callbackError.slice(0, 300)}` : "");
   const githubUnconfigured = health.data?.githubConfigured === false;
@@ -59,7 +60,7 @@ function SignIn({ error, retry, invited }: { error: string; retry: () => void; i
         : <Alert variant="warning" title="GitHub sign-in is not configured">The operator needs to configure the GitHub OAuth app, its callback URL and the server's GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and VAULT_KEY settings.</Alert>)}
       {!unconfigured && local && !local.claimed && <Alert variant="info" title="Set up this Pistead" role="status">This Pistead runs on this computer and has no owner yet. Sign in with the link <code>pistead serve</code> printed when it started, or from the Pistead app, which opens it for you: your GitHub account becomes its owner, and the only one that can sign in.</Alert>}
       <div className="actions">
-        {password && <PasswordSignIn signedIn={retry} />}
+        {password && <PasswordSignIn signedIn={retry} signup={health.data?.passwordSignup ?? "off"} inviteToken={inviteToken} />}
         {password && !githubUnconfigured && <div className="sign-in-divider" role="separator">or</div>}
         {!githubUnconfigured && <a className="btn default lg" href="/api/auth/github"><GitHubMark />Continue with GitHub</a>}
         {(problem || unconfigured) && <Button onClick={() => { retry(); health.refresh(); }}>Try again</Button>}
@@ -145,7 +146,7 @@ function App() {
   // GitHub's callback drops the fragment, so an invite link opened while signed out is remembered for after sign-in.
   useEffect(() => { if (!loading && !user && route.name === "join") rememberInvite(route.token); }, [loading, user, route]);
   if (loading) return <PageLoading />;
-  if (!user) return <SignIn error={error} retry={() => setRevision(value => value + 1)} invited={route.name === "join"} />;
+  if (!user) return <SignIn error={error} retry={() => setRevision(value => value + 1)} inviteToken={route.name === "join" ? route.token : undefined} />;
   return <AppProvider key={user.id} user={user} setUser={setUser} signOut={() => void signOut()}><Shell /></AppProvider>;
 }
 

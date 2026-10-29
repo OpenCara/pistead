@@ -6,6 +6,7 @@ import { maxPendingMembers, type OwnJoinRequest, type WorkspaceInvite, type Work
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { auditAfterChange, auditStatement, requireMember } from './db.js';
 import { appOrigin, fail, identifier, id, jsonObject, now, randomToken, userIdentifier } from './http.js';
+import type { Database } from './db/types.js';
 import type { Env, WorkerEnv } from './types.js';
 import { decryptToken, encryptToken } from './vault.js';
 import { ownerHostStatements } from './connectors.js';
@@ -50,7 +51,7 @@ async function presentLink(env: Env, workspaceId: string, link: LinkRow): Promis
 }
 
 /** The workspace an invite token opens right now, or one answer for every missing, malformed, unknown or turned-off link. */
-async function requireInvitedWorkspace(env: Env, token: unknown): Promise<{ id: string; name: string }> {
+export async function requireInvitedWorkspace(env: Env, token: unknown): Promise<{ id: string; name: string }> {
   if (typeof token !== 'string' || !INVITE_TOKEN.test(token)) fail(404, 'not_found', INVALID_LINK);
   const workspace = await env.DB.query<{ id: string; name: string }>(`SELECT w.id, w.name FROM workspace_invite_links l
     JOIN workspaces w ON w.id = l.workspace_id WHERE l.token_hash = ?`).bind(await sha256(token)).first();
@@ -76,6 +77,20 @@ function joinRequests(env: Env, workspaceId: string) {
 
 const requireManager = (env: Env, workspaceId: string, actorId: string) => requireMember(env, workspaceId, actorId, workspaceManagerRoles);
 
+/**
+ * Files `userId`'s request to join through the link whose token hashes to `tokenHash`: admitted only while that same link
+ * is still on, the person isn't a member and the queue has room. It changes one row when it files the request.
+ */
+export function joinRequestStatement(db: Pick<Database, 'query'>, workspaceId: string, tokenHash: string, userId: string) {
+  return db.query(`INSERT INTO workspace_join_requests (workspace_id, user_id, created_at)
+    SELECT l.workspace_id, ?, ? FROM workspace_invite_links l
+    WHERE l.workspace_id = ? AND l.token_hash = ?
+      AND NOT EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = l.workspace_id AND m.user_id = ?)
+      AND (SELECT COUNT(*) FROM workspace_join_requests r WHERE r.workspace_id = l.workspace_id) < ?
+    ON CONFLICT (workspace_id, user_id) DO NOTHING`)
+    .bind(userId, now(), workspaceId, tokenHash, userId, maxPendingMembers);
+}
+
 /** Signed-in routes: register after the cookie authentication and CSRF guard. */
 export function registerWorkspaceInvites(app: Hono<WorkerEnv>): void {
   // What the link opens, for the person holding it. The token comes in a header so it stays out of URLs and logs.
@@ -93,15 +108,8 @@ export function registerWorkspaceInvites(app: Hono<WorkerEnv>): void {
     const before = await inviteFor(c.env, workspace, userId);
     if (before.status !== 'none') return c.json({ invite: before });
     const tokenHash = await sha256(body.token as string);
-    // Admitted only while this same link is still on, the person isn't a member and the queue has room.
     const result = await c.env.DB.batch([
-      c.env.DB.query(`INSERT INTO workspace_join_requests (workspace_id, user_id, created_at)
-        SELECT l.workspace_id, ?, ? FROM workspace_invite_links l
-        WHERE l.workspace_id = ? AND l.token_hash = ?
-          AND NOT EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = l.workspace_id AND m.user_id = ?)
-          AND (SELECT COUNT(*) FROM workspace_join_requests r WHERE r.workspace_id = l.workspace_id) < ?
-        ON CONFLICT (workspace_id, user_id) DO NOTHING`)
-        .bind(userId, now(), workspace.id, tokenHash, userId, maxPendingMembers),
+      joinRequestStatement(c.env.DB, workspace.id, tokenHash, userId),
       auditAfterChange(c.env, userId, 'workspace.join.request', workspace.id, { userId }),
     ]);
     if (result[0].changes !== 1) {

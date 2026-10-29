@@ -2,16 +2,21 @@ import { randomBytes, scrypt as scryptCallback, timingSafeEqual, type ScryptOpti
 import type { Hono } from 'hono';
 import { isInstanceAdmin } from './admin.js';
 import { authenticate, csrfGuard, dbResult, newSession, ownProfile, privateResponse, safeText, sessionCookie, SUSPENDED } from './auth.js';
+import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { auditStatement, getUser } from './db.js';
-import { ConstraintError } from './db/types.js';
-import { fail, jsonObject, now, PASSWORD_USERNAME, passwordAuthEnabled, requireOrigin } from './http.js';
+import { ConstraintError, type Database } from './db/types.js';
+import { fail, id, jsonObject, now, PASSWORD_USERNAME, passwordAuthEnabled, requireOrigin } from './http.js';
+import { joinRequestStatement, requireInvitedWorkspace } from './workspace-invites.js';
 import type { AppContext, Env, UserRow, WorkerEnv } from './types.js';
 
 /**
- * Username and password accounts, for servers whose operator sets PASSWORD_AUTH=true: anyone who can reach the server
- * signs up as `password:<username>` and signs in with that username. They are full accounts that sign in with a cookie
- * like GitHub's, but hold no GitHub token: github.com repositories need a GitHub sign-in, and other providers work
- * through personal access tokens under Settings → Profile → Git accounts. Native apps still sign in with GitHub only.
+ * Username and password accounts, for servers whose operator sets PASSWORD_AUTH=true: people sign up as
+ * `password:<username>` and sign in with that username. Who may sign up is PASSWORD_SIGNUP's choice (signupMode): by
+ * default only someone holding a workspace's invite link, whose request to join that workspace is filed with the account.
+ * The operator creates accounts from the command line as well (password-accounts-cli.ts). They are full accounts that
+ * sign in with a cookie like GitHub's, but hold no GitHub token: github.com repositories need a GitHub sign-in, and other
+ * providers work through personal access tokens under Settings → Profile → Git accounts. Native apps still sign in with
+ * GitHub only.
  */
 
 const PASSWORD_MIN = 12;
@@ -26,7 +31,17 @@ const MAX_LOCK_MS = 15 * 60_000;
 /** Hashes running at once, and waiting: a flood of sign-ins gets 429s instead of starving the server's thread pool. */
 const HASH_CONCURRENCY = 4;
 const HASH_QUEUE = 64;
-const FIELDS = ['username', 'password', 'displayName'] as const;
+const FIELDS = ['username', 'password', 'displayName', 'inviteToken'] as const;
+
+/**
+ * Who may sign up: `invite` (the default) only with a workspace's current invite link, `open` anyone who reaches the
+ * server, `off` nobody (the operator still creates accounts from the command line).
+ */
+export type SignupMode = 'open' | 'invite' | 'off';
+export const signupModes: readonly SignupMode[] = ['open', 'invite', 'off'];
+export function signupMode(env: Env): SignupMode {
+  return signupModes.includes(env.PASSWORD_SIGNUP as SignupMode) ? env.PASSWORD_SIGNUP as SignupMode : 'invite';
+}
 const INCORRECT = 'The username or password is incorrect.';
 
 function scrypt(password: string, salt: Buffer, keyLength: number, options: ScryptOptions): Promise<Buffer> {
@@ -93,7 +108,7 @@ function input(body: Record<string, unknown>, fields: readonly string[]): void {
 }
 
 /** A typed username: case and surrounding spaces don't matter. */
-function username(value: unknown): string {
+export function passwordUsername(value: unknown): string {
   if (typeof value !== 'string') fail(400, 'invalid_username', 'Enter a username.');
   const result = value.trim().toLowerCase();
   if (!PASSWORD_USERNAME.test(result)) {
@@ -103,7 +118,7 @@ function username(value: unknown): string {
 }
 
 /** A new password: long enough, and not the username. Any characters are allowed, spaces too. */
-function newPassword(value: unknown, name: string): string {
+export function newPassword(value: unknown, name: string): string {
   if (typeof value !== 'string') fail(400, 'invalid_password', 'Enter a password.');
   const length = [...value].length;
   if (length < PASSWORD_MIN) fail(400, 'weak_password', `Use a password of at least ${PASSWORD_MIN} characters.`);
@@ -140,34 +155,65 @@ async function recordFailure(env: Env, userId: string): Promise<void> {
   await dbResult(env.DB.query('UPDATE password_credentials SET locked_until = ? WHERE user_id = ?').bind(Date.now() + pause, userId).run());
 }
 
+/**
+ * The statements that create a password account, in order: its user (with a placeholder Git email that can't be
+ * delivered to; its owner sets their own under Profile) and its credential. A taken username fails with ConstraintError.
+ */
+export function passwordAccountStatements(db: Pick<Database, 'query'>, name: string, displayName: string, hash: string) {
+  const userId = `password:${name}`;
+  const created = now();
+  return [
+    db.query(`INSERT INTO users (id, github_id, github_login, display_name, git_name, git_email, env_json, auth_kind, created_at)
+      VALUES (?, NULL, NULL, ?, ?, ?, '{}', 'password', ?)`).bind(userId, displayName, displayName, `${name}@users.pistead.invalid`, created),
+    db.query('INSERT INTO password_credentials (user_id, password_hash, failed_attempts, locked_until, created_at, updated_at) VALUES (?, ?, 0, NULL, ?, ?)')
+      .bind(userId, hash, created, created),
+  ];
+}
+
+class SignupRefused extends Error {}
+
 async function signUp(c: AppContext) {
   requireEnabled(c.env);
   requireOrigin(c);
+  const mode = signupMode(c.env);
+  if (mode === 'off') fail(403, 'signup_closed', 'This server doesn\'t take new accounts. Ask its operator for one.');
   const body = await jsonObject(c, 4096);
   input(body, FIELDS);
-  const name = username(body.username);
+  // Signing up through an invite link files a request to join its workspace with the account, in any mode.
+  if (mode === 'invite' && (body.inviteToken === undefined || body.inviteToken === null)) {
+    fail(403, 'invite_required', 'New accounts need an invite link. Ask a workspace owner or admin for theirs, and open it to sign up.');
+  }
+  const invited = body.inviteToken === undefined || body.inviteToken === null ? null
+    : { workspace: await requireInvitedWorkspace(c.env, body.inviteToken), tokenHash: await sha256(body.inviteToken as string) };
+  const name = passwordUsername(body.username);
   const userId = `password:${name}`;
   const password = newPassword(body.password, name);
   const displayName = body.displayName === undefined || body.displayName === '' ? name : safeText(body.displayName, 'displayName', 200);
   // An operator may list an account in ADMIN_USER_IDS before it exists: only they can create it then (see adminUserId).
   if (isInstanceAdmin(c.env, userId)) {
-    fail(409, 'username_reserved', 'This username is reserved by the server\'s configuration. Its operator signs it up after taking it out of ADMIN_USER_IDS, then lists it again.');
+    fail(409, 'username_reserved', 'This username is reserved for an administrator of this server, whose operator creates it.');
   }
   const hash = await hashPassword(password);
-  const created = now();
   const session = await newSession(c.env, userId, 'password');
   try {
-    await c.env.DB.batch([
-      // A placeholder Git email that can't be delivered to; the account owner sets their own under Profile.
-      c.env.DB.query(`INSERT INTO users (id, github_id, github_login, display_name, git_name, git_email, env_json, auth_kind, created_at)
-        VALUES (?, NULL, NULL, ?, ?, ?, '{}', 'password', ?)`).bind(userId, displayName, displayName, `${name}@users.pistead.invalid`, created),
-      c.env.DB.query('INSERT INTO password_credentials (user_id, password_hash, failed_attempts, locked_until, created_at, updated_at) VALUES (?, ?, 0, NULL, ?, ?)')
-        .bind(userId, hash, created, created),
-      auditStatement(c.env, userId, 'account.password.signed_up'),
-      session.statement,
-    ]);
+    await c.env.DB.transaction(async tx => {
+      for (const statement of passwordAccountStatements(tx, name, displayName, hash)) await statement.run();
+      if (invited) {
+        // The account exists only with its request: a full queue or a link turned off meanwhile creates neither.
+        const filed = await joinRequestStatement(tx, invited.workspace.id, invited.tokenHash, userId).run();
+        if (filed.changes !== 1) throw new SignupRefused();
+        await tx.query('INSERT INTO audit (id, workspace_id, session_id, actor_id, action, detail_json, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?)')
+          .bind(id(), invited.workspace.id, userId, 'workspace.join.request', JSON.stringify({ userId }), now()).run();
+      }
+      await tx.query('INSERT INTO audit (id, workspace_id, session_id, actor_id, action, detail_json, created_at) VALUES (?, NULL, NULL, ?, ?, ?, ?)')
+        .bind(id(), userId, 'account.password.signed_up', JSON.stringify(invited ? { workspaceId: invited.workspace.id } : {}), now()).run();
+      await tx.query(session.sql).bind(...session.values).run();
+    });
   } catch (error) {
     if (error instanceof ConstraintError) fail(409, 'username_taken', 'That username is taken. Choose another.');
+    if (error instanceof SignupRefused) {
+      fail(409, 'too_many_pending', 'This workspace has too many people waiting to join, or its invite link was just turned off. Ask an owner or admin.');
+    }
     fail(503, 'auth_unavailable', 'Authentication storage is temporarily unavailable.');
   }
   sessionCookie(c, session);

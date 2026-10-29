@@ -91,11 +91,17 @@ Pistead signs people in with GitHub, and asks GitHub for the `read:user user:ema
 
 #### Username and password
 
-Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a username and password, and anyone who can reach the server can create an account with **New here? Create an account**:
+Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a username and password. Who can create an account there is `PASSWORD_SIGNUP`'s choice:
+
+- `invite` (the default): only someone who opens a workspace's [invite link](#invite-links-and-pending-members). **New here? Create an account** appears on the link's sign-in page, and the new account asks to join that workspace in the same step, so an owner or admin still accepts them before they see anything. A link turned off or replaced admits nobody new, and while 200 people wait to join a workspace its link creates no more accounts either.
+- `open`: anyone who can reach the server. Someone signing up through an invite link still asks to join its workspace.
+- `off`: nobody; the operator creates accounts from the command line (see [Administration](#administration)).
+
+Existing accounts sign in in every mode, and GitHub sign-in isn't affected. Then:
 
 - The username (3 to 39 letters, digits, `-` and `_`, not case-sensitive) makes your user ID, `password:<username>`, so teammates can add you to a workspace by it before you ever sign in. It can't be changed later.
 - Passwords are at least 12 characters, other than the username. The server keeps only a salted scrypt hash. After five wrong passwords in a row the account refuses sign-ins for 30 seconds, doubling with each further miss up to 15 minutes; a correct sign-in resets the count.
-- **Settings → Profile → Password** changes it, which signs out every other browser signed in as you. There is no password reset yet, by email or by an administrator: someone who forgets theirs signs up a new account.
+- **Settings → Profile → Password** changes it, which signs out every other browser signed in as you. There is no reset by email: someone who forgets theirs asks the server's operator for a new one (`--reset-password`, see [Administration](#administration)).
 - A password account holds no GitHub token, so it can't bind or clone **github.com** repositories (not even ones a teammate bound: a session reads repositories with its owner's own access), push with its own GitHub account, or use the GitHub tools. It works with every other Git provider, GitHub Enterprise Server included, through personal access tokens under **Git accounts**. Its Git author email starts as `<username>@users.pistead.invalid`; set your own under **Identity**.
 - The iPhone, iPad and Mac apps still sign in with GitHub only.
 - Turning `PASSWORD_AUTH` off signs every password account out at once and refuses their sign-ins; turning it on again lets them back in.
@@ -723,12 +729,21 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |
-| `PASSWORD_AUTH` | off | `true` lets anyone who reaches the server sign up and sign in with a username and password (see [Username and password](#username-and-password)); not with `LOCAL_MODE` |
+| `PASSWORD_AUTH` | off | `true` offers sign-in with a username and password (see [Username and password](#username-and-password)); not with `LOCAL_MODE` |
+| `PASSWORD_SIGNUP` | `invite` | Who can create a password account: `invite` (through a workspace's invite link), `open` (anyone who reaches the server) or `off` (only the operator, with `--create-admin`) |
 | `LOCAL_MODE`, `LOCAL_CLAIM_SECRET` | off | A server for one person on their own computer, as `pistead serve` runs it: plain HTTP on loopback only, and only the GitHub account that signs in through `/api/auth/local/claim?token=LOCAL_CLAIM_SECRET` first (a base64url 32-byte value) can sign in |
 
 ### Administration
 
-The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890,password:alice`); each person finds theirs under **Settings → Profile**. A GitHub user ID is `github:` and the numeric ID GitHub gives the account, which `https://api.github.com/users/<login>` shows as `id` before anyone signs in. A password account's is `password:` and its username: nobody can sign up as one that `ADMIN_USER_IDS` lists, so create the account first and list it afterwards (listing it beforehand only reserves the name). The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
+The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890,password:alice`); each person finds theirs under **Settings → Profile**. A GitHub user ID is `github:` and the numeric ID GitHub gives the account, which `https://api.github.com/users/<login>` shows as `id` before anyone signs in. A password account's is `password:` and its username. Nobody can sign up in the app as an account `ADMIN_USER_IDS` lists, so listing one reserves the name; the operator creates it from the server's command line instead, with the password typed at a hidden prompt (or piped in on the first line of standard input, never as an argument):
+
+```sh
+# ADMIN_USER_IDS=password:admin and PASSWORD_AUTH=true, in the server's environment
+node dist/server/main.js --create-admin admin
+docker compose exec pistead node dist/server/main.js --create-admin admin   # under Docker
+```
+
+That needs no sign-in first and no restart afterwards, and a fresh server with `PASSWORD_SIGNUP=invite` starts this way: the administrator signs in, creates a workspace and shares its invite link. `--reset-password USERNAME` sets a new password for any password account the same way, clears its failed sign-ins and signs it out everywhere. Both are recorded in the audit table, with no actor. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
 
 - **Overview** counts accounts, workspaces, hosts (and how many are online) and sessions.
 - **Accounts**, **Workspaces** and **Hosts** list each one with its owner and how many members, repositories, hosts and sessions it has. They never show session titles, prompts, repository names, models, environment values or credentials.

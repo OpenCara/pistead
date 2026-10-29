@@ -162,12 +162,12 @@ export async function newSession(env: Env, userId: string, kind: 'github' | 'tes
   const token = randomToken();
   const csrfToken = randomToken();
   const tokenHash = await sha256(token);
-  return {
-    token, expiresAt,
-    statement: env.DB.query(`INSERT INTO auth_sessions (token_hash, user_id, csrf_token, expires_at, created_at, client, device_id, device_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(tokenHash, userId, csrfToken, expiresAt, new Date(issuedAt).toISOString(),
-      native ? 'native' : 'browser', native ? id() : null, native?.deviceName ?? null),
-  };
+  const sql = `INSERT INTO auth_sessions (token_hash, user_id, csrf_token, expires_at, created_at, client, device_id, device_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+  const values: SqlValue[] = [tokenHash, userId, csrfToken, expiresAt, new Date(issuedAt).toISOString(),
+    native ? 'native' : 'browser', native ? id() : null, native?.deviceName ?? null];
+  // `sql` and `values` let a caller insert it inside its own transaction.
+  return { token, expiresAt, sql, values, statement: env.DB.query(sql).bind(...values) };
 }
 
 export function sessionCookie(c: AppContext, session: { token: string; expiresAt: number }): void {

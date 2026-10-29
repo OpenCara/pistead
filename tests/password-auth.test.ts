@@ -15,7 +15,7 @@ async function fixture(t: TestContext, overrides: Partial<Env> = {}) {
   // Test mode only allows plain HTTP on localhost; password accounts work without it.
   const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: "true", TEST_AUTH_SECRET: "password-auth-test-secret-not-for-deployment",
     TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(), RUNNER_SHARED_SECRET: "r".repeat(43),
-    VAULT_KEY: Buffer.alloc(32, 7).toString("base64url"), PASSWORD_AUTH: "true", ...overrides };
+    VAULT_KEY: Buffer.alloc(32, 7).toString("base64url"), PASSWORD_AUTH: "true", PASSWORD_SIGNUP: "open", ...overrides };
   const request = (method: string, path: string, init: { headers?: Record<string, string>; body?: unknown } = {}) =>
     app.request(path, { method, headers: { ...(init.body === undefined ? {} : { "Content-Type": "application/json" }), ...init.headers },
       body: init.body === undefined ? undefined : JSON.stringify(init.body) }, env);
@@ -31,7 +31,17 @@ async function fixture(t: TestContext, overrides: Partial<Env> = {}) {
     const csrf = await (await request("GET", "/api/auth/csrf", { headers: { Cookie: cookie } })).json() as { csrfToken: string };
     return { Cookie: cookie, Origin: origin, "X-CSRF-Token": csrf.csrfToken };
   }
-  return { env, sqlite, request, cookieOf, signUp, signIn, browser };
+  /** A test-mode owner's workspace with its invite link turned on: its id and the link's token. */
+  async function invitingWorkspace() {
+    const login = await request("POST", "/api/auth/test", { headers: { Authorization: `Bearer ${env.TEST_AUTH_SECRET}`, Origin: origin }, body: { id: "inviter" } });
+    const owner = cookieOf(login);
+    const created = await request("POST", "/api/workspaces", { headers: await browser(owner), body: { name: "Team" } });
+    const { workspace: { id } } = await created.json() as { workspace: { id: string } };
+    const link = await request("PUT", `/api/workspaces/${id}/invite-link`, { headers: await browser(owner) });
+    const { link: { url } } = await link.json() as { link: { url: string } };
+    return { id, owner, token: url.split("#/join/")[1]! };
+  }
+  return { env, sqlite, request, cookieOf, signUp, signIn, browser, invitingWorkspace };
 }
 
 async function errorCode(response: Response): Promise<string> {
@@ -230,4 +240,69 @@ test("workspace owners add a password account as a member by its user ID", async
   const { workspace: { id } } = await workspace.json() as { workspace: { id: string } };
   const added = await f.request("POST", `/api/workspaces/${id}/members`, { headers: await f.browser(owner), body: { userId: "password:judy", role: "member" } });
   assert.ok(added.status === 200 || added.status === 201, String(added.status));
+});
+
+test("by default sign-up needs a workspace's invite link, and files the request to join with the account", async t => {
+  const f = await fixture(t, { PASSWORD_SIGNUP: undefined });
+  const health = await (await f.request("GET", "/api/health")).json() as { passwordSignup: string };
+  assert.equal(health.passwordSignup, "invite");
+  const uninvited = await f.signUp({ username: "kim", password });
+  assert.equal(uninvited.status, 403);
+  assert.equal(await errorCode(uninvited), "invite_required");
+  const forged = await f.signUp({ username: "kim", password, inviteToken: "x".repeat(43) });
+  assert.equal(forged.status, 404);
+
+  const { id, owner, token } = await f.invitingWorkspace();
+  const invited = await f.signUp({ username: "kim", password, inviteToken: token });
+  assert.equal(invited.status, 201);
+  assert.deepEqual(f.sqlite.prepare("SELECT workspace_id, user_id FROM workspace_join_requests").all().map(row => ({ ...row })),
+    [{ workspace_id: id, user_id: "password:kim" }]);
+  const requests = await f.request("GET", `/api/workspaces/${id}/join-requests`, { headers: { Cookie: owner } });
+  assert.deepEqual((await requests.json() as { requests: { userId: string }[] }).requests.map(request => request.userId), ["password:kim"]);
+  // The new account sees its request, and nothing of the workspace yet.
+  const own = await f.request("GET", "/api/join-requests", { headers: { Cookie: f.cookieOf(invited) } });
+  assert.equal((await own.json() as { requests: unknown[] }).requests.length, 1);
+  assert.equal((await f.request("GET", `/api/workspaces/${id}/members`, { headers: { Cookie: f.cookieOf(invited) } })).status, 404);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.join.request' AND actor_id = 'password:kim'").get()!.n, 1);
+
+  // A link turned off admits nobody new; signing in still works.
+  await f.request("DELETE", `/api/workspaces/${id}/invite-link`, { headers: await f.browser(owner) });
+  assert.equal((await f.signUp({ username: "lee", password, inviteToken: token })).status, 404);
+  assert.equal((await f.signIn("kim", password)).status, 200);
+});
+
+test("an invite link whose workspace has a full queue creates no account", async t => {
+  const f = await fixture(t, { PASSWORD_SIGNUP: "invite" });
+  const { id, token } = await f.invitingWorkspace();
+  const insertUser = f.sqlite.prepare("INSERT INTO users (id, display_name, git_name, git_email, auth_kind, created_at) VALUES (?, 'W', 'W', 'w@example.test', 'test', '2026-01-01')");
+  const insertRequest = f.sqlite.prepare("INSERT INTO workspace_join_requests (workspace_id, user_id, created_at) VALUES (?, ?, '2026-01-01')");
+  for (let index = 0; index < 200; index++) { insertUser.run(`test:waiting-${index}`); insertRequest.run(id, `test:waiting-${index}`); }
+  const refused = await f.signUp({ username: "mia", password, inviteToken: token });
+  assert.equal(refused.status, 409);
+  assert.equal(await errorCode(refused), "too_many_pending");
+  assert.equal(refused.headers.get("set-cookie"), null);
+  for (const table of ["password_credentials", "auth_sessions"]) {
+    assert.equal(f.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE user_id = 'password:mia'`).get()!.n, 0, table);
+  }
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM users WHERE id = 'password:mia'").get()!.n, 0);
+});
+
+test("with PASSWORD_SIGNUP=off nobody signs up, invited or not, and existing accounts still sign in", async t => {
+  const f = await fixture(t);
+  assert.equal((await f.signUp({ username: "nina", password })).status, 201);
+  const { token } = await f.invitingWorkspace();
+  f.env.PASSWORD_SIGNUP = "off";
+  for (const body of [{ username: "omar", password }, { username: "omar", password, inviteToken: token }]) {
+    const response = await f.signUp(body);
+    assert.equal(response.status, 403);
+    assert.equal(await errorCode(response), "signup_closed");
+  }
+  assert.equal((await f.signIn("nina", password)).status, 200);
+});
+
+test("open sign-up through an invite link also asks to join its workspace", async t => {
+  const f = await fixture(t);
+  const { id, token } = await f.invitingWorkspace();
+  assert.equal((await f.signUp({ username: "pat", password, inviteToken: token })).status, 201);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM workspace_join_requests WHERE workspace_id = ? AND user_id = 'password:pat'").get(id)!.n, 1);
 });

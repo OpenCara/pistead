@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs';
 import { ConfigurationError, defaultDatabaseUrl, loadConfig } from './config.js';
 import { exportSession, exportWorkspace } from './data-export.js';
 import { openDatabase } from './db/index.js';
+import { passwordCommand, PasswordCommandError, readNewPassword, runPasswordCommand, type PasswordCommand } from './password-accounts-cli.js';
 import { migrateWhenReachable, startServer } from './serve.js';
 import { DumpImportError, importDumpFromCommandLine } from './workspace-databases/import.js';
 import { workspaceDatabaseExplanation } from './workspace-databases/store.js';
@@ -71,9 +72,38 @@ function writeOut(text: string): Promise<void> {
 const commandLine = process.argv.slice(2);
 const dump = dumpRequest(commandLine);
 const importFile = importRequest(commandLine);
-if (dump && importFile) {
-  console.error('pistead: dump or import, one at a time');
+let accountCommand: PasswordCommand | null = null;
+try { accountCommand = passwordCommand(commandLine); } catch (error) {
+  if (!(error instanceof PasswordCommandError)) throw error;
+  console.error(`pistead: ${error.message}`);
   process.exit(2);
+}
+if ([dump, importFile, accountCommand].filter(Boolean).length > 1) {
+  console.error('pistead: dump, import or manage an account, one at a time');
+  process.exit(2);
+}
+
+// The operator creates an administrator's password account, or sets a new password, in the server's database
+// (password-accounts-cli.ts). Migrations are applied first, as at start-up.
+if (accountCommand) {
+  const db = await openDatabase(process.env.DATABASE_URL || defaultDatabaseUrl);
+  let failure: string | null = null;
+  let outcome = '';
+  try {
+    await migrateWhenReachable(db);
+    outcome = `${await runPasswordCommand(db, process.env, accountCommand, readNewPassword)}\n`;
+  } catch (error) {
+    if (!(error instanceof PasswordCommandError)) throw error;
+    failure = error.message;
+  } finally {
+    await db.close();
+  }
+  if (failure !== null) {
+    console.error(`pistead: ${failure}`);
+    process.exit(1);
+  }
+  await writeOut(outcome);
+  process.exit(0);
 }
 
 // The operator's dump of one session or workspace from the database, as JSON on stdout: every session in full, without

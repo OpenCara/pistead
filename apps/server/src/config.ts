@@ -31,7 +31,7 @@ const stringVars = [
   'APP_ORIGIN', 'RUNNER_URL', 'RUNNER_EVENT_TRANSPORT', 'RUNNER_SHARED_SECRET', 'SESSION_SECRET', 'VAULT_KEY',
   'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'TEST_AUTH_ENABLED', 'TEST_AUTH_SECRET', 'TEST_AUTH_EXPIRES_AT',
   'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS', 'GIT_DIRECT',
-  'LOCAL_MODE', 'LOCAL_CLAIM_SECRET', 'PASSWORD_AUTH',
+  'LOCAL_MODE', 'LOCAL_CLAIM_SECRET', 'PASSWORD_AUTH', 'PASSWORD_SIGNUP',
 ] as const;
 const LOOPBACK = ['127.0.0.1', '::1', 'localhost'];
 
@@ -63,6 +63,9 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   if (env.PASSWORD_AUTH !== undefined) {
     if (!['true', 'false'].includes(env.PASSWORD_AUTH)) throw new ConfigurationError('PASSWORD_AUTH must be "true" or "false".');
     if (env.PASSWORD_AUTH === 'true' && env.LOCAL_MODE === 'true') throw new ConfigurationError('PASSWORD_AUTH is for shared servers: a LOCAL_MODE server admits only the GitHub account that claimed it.');
+  }
+  if (env.PASSWORD_SIGNUP !== undefined && !['open', 'invite', 'off'].includes(env.PASSWORD_SIGNUP)) {
+    throw new ConfigurationError('PASSWORD_SIGNUP must be "invite" (the default), "open" or "off".');
   }
   const listenHost = processEnv.HOST || (env.LOCAL_MODE === 'true' ? '127.0.0.1' : '0.0.0.0');
   // A local server is reachable from this machine only, and admits only the GitHub account that claimed it.

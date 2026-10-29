@@ -15,7 +15,12 @@ async function passwordRequest(path: string, body: Record<string, string>): Prom
   throw new Error(typeof answer?.error === "string" ? answer.error : `Sign-in failed (HTTP ${response.status}). Try again.`);
 }
 
-export function PasswordSignIn({ signedIn }: { signedIn: () => void }) {
+/**
+ * `signup` is the server's PASSWORD_SIGNUP: with `invite`, only someone who opened a workspace's invite link
+ * (`inviteToken`) can create an account, which asks to join that workspace as well.
+ */
+export function PasswordSignIn({ signedIn, signup, inviteToken }: { signedIn: () => void; signup: "open" | "invite" | "off"; inviteToken?: string }) {
+  const canSignUp = signup === "open" || (signup === "invite" && inviteToken !== undefined);
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -28,7 +33,9 @@ export function PasswordSignIn({ signedIn }: { signedIn: () => void }) {
     if (signingUp && password !== confirm) { setError("The passwords don't match."); return; }
     setBusy(true);
     setError("");
-    passwordRequest(signingUp ? "/api/auth/password/signup" : "/api/auth/password/login", { username, password })
+    const body: Record<string, string> = { username, password };
+    if (signingUp && inviteToken !== undefined) body.inviteToken = inviteToken;
+    passwordRequest(signingUp ? "/api/auth/password/signup" : "/api/auth/password/login", body)
       .then(signedIn, reason => { setError(reason instanceof Error ? reason.message : "Sign-in failed. Try again."); setBusy(false); });
   }
   function switchMode() {
@@ -52,8 +59,10 @@ export function PasswordSignIn({ signedIn }: { signedIn: () => void }) {
     <Button type="submit" variant="default" size="lg" block disabled={busy}>
       {busy ? (signingUp ? "Creating account..." : "Signing in...") : (signingUp ? "Create account" : "Sign in")}
     </Button>
-    <Button variant="ghost" size="sm" onClick={switchMode} disabled={busy}>
+    {canSignUp && <Button variant="ghost" size="sm" onClick={switchMode} disabled={busy}>
       {signingUp ? "Have an account? Sign in" : "New here? Create an account"}
-    </Button>
+    </Button>}
+    {signingUp && inviteToken !== undefined && <p className="field-hint">Creating an account asks to join the workspace that invited you. An owner or admin accepts you before you can see anything in it.</p>}
+    {!canSignUp && signup === "invite" && <p className="field-hint">New here? Open the invite link a workspace owner or admin shared with you to create an account.</p>}
   </form>;
 }
