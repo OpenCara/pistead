@@ -11,16 +11,11 @@ export function isHostCommand(operation: Pick<Operation, "kind">, session: Pick<
 }
 
 /**
- * Whether an operation is decided as a host command is: every host command (see `isHostCommand`), and a command without
- * the resource limits the host lacks (`unbounded`, see ApprovalRecord.unbounded) in a session whose owner isn't the
- * host's owner. That one still runs in the sandbox, as the session's owner, but on the strength of their host command
- * grant, so only someone with host command authority decides it (see `decidesHostCommands`).
+ * Whether deciding an operation takes host command authority: every host command (see `isHostCommand`), and a command
+ * without the resource limits the host lacks (`unbounded`, see ApprovalRecord.unbounded) in a session whose owner isn't
+ * the host's owner, which still runs in the sandbox, as that owner. The rule the control plane and the host decide by.
  */
-export function decidedAsHostCommand(operation: Pick<Operation, "kind">,
-  session: Partial<Pick<SessionRecord, "hostEnvironment" | "ownerId" | "connectorOwnerId">>, unbounded = false): boolean {
-  return isHostCommand(operation, session) || (operation.kind === "bash" && unbounded
-    && session.connectorOwnerId !== undefined && session.connectorOwnerId !== session.ownerId);
-}
+export { decidedAsHostCommand } from "../../shared/src/host-operations";
 
 /**
  * Whether `userId` holds host command authority in the session, as the control plane checks it before a host command is

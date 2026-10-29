@@ -22,7 +22,8 @@ import { issueRunAdmission } from './run-admissions.js';
 import { cloneRepositories, legacyRepositoryFixture } from './repositories.js';
 import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
-import { hostAuthority, hostOwnerDecides, mayDecideHostCommands, runsShellCommands } from './host-access.js';
+import { hostAuthority, hostCommandSession, hostOwnerDecides, mayDecideHostCommands, runsShellCommands } from './host-access.js';
+import { decidedAsHostCommand, grantedShell } from '../../../packages/shared/src/host-operations.js';
 import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
 import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
@@ -585,25 +586,19 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     if (approval.status !== 'pending') fail(409, 'approval_already_decided', 'This approval request is no longer pending.');
     const operation = review.operation;
     // The host's owner decides host commands, as does a member they (or a host admin) granted host commands to who has
-    // approve permission here.
-    if (operation.kind === 'host.bash' && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
-      fail(403, 'host_owner_required', 'Only the host owner, or a member granted host commands on this host, can decide host commands.');
-    }
-    // A session that runs directly on its host runs its commands there, as host commands: they are decided the same way.
-    if (operation.kind === 'bash' && Number(row.host_environment ?? 0) === 1 && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
-      fail(403, 'host_owner_required', 'This session runs directly on its host: only the host owner, or a member granted host commands on this host, decides its commands.');
-    }
-    // So is a command without the resource limits its host lacks in a session whose owner isn't the host's owner: it
-    // runs on the strength of that owner's host command grant.
-    if (operation.kind === 'bash' && approval.unbounded === true && row.connector_owner_id !== row.owner_id
-      && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
-      fail(403, 'host_owner_required', 'This command runs without the resource limits its host lacks: only the host owner, or a member granted host commands on this host, decides it.');
+    // approve permission here; so are the commands of a session that runs directly on its host, and those that run without
+    // the resource limits its host lacks on the strength of the session owner's grant, by the rule the host applies too.
+    const hostSession = hostCommandSession(row);
+    if (decidedAsHostCommand(operation, hostSession, approval.unbounded === true) && (!row.connector_id || !await mayDecideHostCommands(c.env, row, c.get('auth').userId))) {
+      fail(403, 'host_owner_required', operation.kind === 'host.bash' ? 'Only the host owner, or a member granted host commands on this host, can decide host commands.'
+        : hostSession.hostEnvironment ? 'This session runs directly on its host: only the host owner, or a member granted host commands on this host, decides its commands.'
+        : 'This command runs without the resource limits its host lacks: only the host owner, or a member granted host commands on this host, decides it.');
     }
     // A permission request lets a tool call do more than the session allows, so only its owner decides it.
     if (operation.kind === 'permission') {
       if (c.get('auth').userId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can allow more than the session allows.');
       // Without the limits a host lacks, a member's commands run only on the strength of their host command grant there.
-      if (operation.needs.includes('unbounded-shell') && row.connector_owner_id !== row.owner_id
+      if (operation.needs.includes('unbounded-shell') && grantedShell(hostSession)
         && (!row.connector_id || !await mayDecideHostCommands(c.env, row, row.owner_id))) {
         fail(403, 'host_owner_required', 'Only the host\'s owner, or a member granted host commands on this host, can allow a shell without resource limits.');
       }

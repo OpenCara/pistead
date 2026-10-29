@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
 import type { ConnectorAdmin, ConnectorCapabilities, HostCommandGrant } from '../../../packages/shared/src/connector.js';
 import { hasPermission, readOnlyRoles } from '../../../packages/shared/src/policy.js';
+import { grantedShell, type HostCommandSession } from '../../../packages/shared/src/host-operations.js';
 import { hostCommandLevels, type HostCommandLevel, type Permission, type RunnerAction } from '../../../packages/shared/src/types.js';
 import type { AppContext, Env, SessionAccess, SessionRow, WorkerEnv } from './types.js';
 import type { ConnectorRow } from './connectors.js';
@@ -84,8 +85,13 @@ export async function hostCommandAuthority(env: Env, row: Pick<SessionRow, 'conn
 export async function runsShellCommands(env: Env, capabilities: ConnectorCapabilities,
   row: Pick<SessionRow, 'connector_id' | 'connector_owner_id' | 'workspace_id'>, ownerId: string): Promise<boolean> {
   if (capabilities.productionShell === true || capabilities.unsandboxed === true) return true;
-  if (row.connector_owner_id && row.connector_owner_id === ownerId) return true;
+  if (!grantedShell({ ownerId, connectorOwnerId: row.connector_owner_id })) return true;
   return capabilities.unboundedShellGrants === true && await hostAuthority(env, row, ownerId) !== undefined;
+}
+
+/** Session `row` as deciding its operations sees it, by the rule the host and the apps apply too (see decidedAsHostCommand). */
+export function hostCommandSession(row: Pick<SessionRow, 'owner_id' | 'connector_owner_id' | 'host_environment'>): HostCommandSession {
+  return { ownerId: row.owner_id, connectorOwnerId: row.connector_owner_id, hostEnvironment: Number(row.host_environment ?? 0) === 1 };
 }
 
 /** Whether `userId` may decide host commands in `row` (the owner, or a grant of either level). */
