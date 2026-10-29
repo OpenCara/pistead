@@ -618,6 +618,12 @@
   .welcome-inner p { color: var(--foreground-muted); }
   .welcome-inner .actions { display: grid; gap: var(--space-2); width: 100%; }
   .welcome-footnote { color: var(--foreground-muted); font-size: var(--font-sm); }
+  /* Username and password sign-in (PasswordSignIn.tsx), above "or" and the GitHub button. */
+  .password-sign-in { display: grid; gap: var(--space-3); width: 100%; text-align: left; }
+  .password-sign-in > .btn.ghost { justify-self: center; }
+  .password-sign-in > .field-hint { color: var(--foreground-muted); font-size: var(--font-sm); text-align: center; }
+  .sign-in-divider { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--font-sm); }
+  .sign-in-divider::before, .sign-in-divider::after { content: ""; border-top: 1px solid var(--border); }
 
   .skip-link { position: fixed; top: var(--space-2); left: var(--space-2); z-index: 200; transform: translateY(-200%); }
   .skip-link:focus { transform: none; }

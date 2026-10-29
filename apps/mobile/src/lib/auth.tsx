@@ -8,6 +8,13 @@ import type { UserProfile } from "../../../../packages/shared/src/types";
 import { createPkce } from "./pkce";
 import { DEFAULT_ORIGIN } from "./server";
 
+/** Why the server refused a new account (its SIGNUP setting), by the code it returns to the app's callback. */
+const signInRefusals: Record<string, string> = {
+  invite_required: "This server takes new accounts only through a workspace's invite link. Open the link in a browser to create your account, then sign in here.",
+  signup_closed: "This server doesn't take new accounts. Ask its operator to add you.",
+  too_many_pending: "The workspace that invited you has too many people waiting to join. Ask an owner or admin.",
+};
+
 const TOKEN_KEY = "pistead.token";
 const EXPIRES_KEY = "pistead.tokenExpires";
 /** The server is a preference, not a credential: it stays after sign-out so signing in again goes to the same place. */
@@ -140,7 +147,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // A callback for another attempt (or forged by another app) must never complete this one.
     if (firstParam(params.state) !== state) throw new Error("The sign-in response did not match this attempt. Try again.");
     const error = firstParam(params.error);
-    if (error) throw new Error(`GitHub sign-in did not complete: ${error.slice(0, 300)}`);
+    if (error) throw new Error(signInRefusals[error] ?? `GitHub sign-in did not complete: ${error.slice(0, 300)}`);
     const code = firstParam(params.code);
     if (!code) throw new Error("The server did not return a sign-in code. Try again.");
     const deviceName = Device.deviceName ?? Device.modelName ?? undefined;

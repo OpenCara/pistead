@@ -52,10 +52,30 @@ export function identifier(value: unknown, field = 'id'): string {
 }
 export function userIdentifier(value: unknown, field = 'userId'): string {
   const result = text(value, field, 133);
-  if (!/^github:[1-9][0-9]*$/.test(result) && !/^test:[A-Za-z0-9_-]{1,128}$/.test(result)) {
+  if (!/^github:[1-9][0-9]*$/.test(result) && !/^test:[A-Za-z0-9_-]{1,128}$/.test(result) && !PASSWORD_USER_ID.test(result)) {
     fail(400, 'invalid_input', `Invalid ${field}.`);
   }
   return result;
+}
+/** A password account's username: lowercase, 3-39 letters, digits, `-` and `_`, starting with a letter or digit. */
+export const PASSWORD_USERNAME = /^[a-z0-9][a-z0-9_-]{2,38}$/;
+/** A password account's user ID, `password:<username>`. */
+export const PASSWORD_USER_ID = /^password:[a-z0-9][a-z0-9_-]{2,38}$/;
+/** Username and password sign-in and sign-up (password-auth.ts); never on a local server, which admits only its owner. */
+export function passwordAuthEnabled(env: Env): boolean {
+  return env.PASSWORD_AUTH === 'true' && !localMode(env);
+}
+/**
+ * Who may create an account with a sign-in method (SIGNUP): `open` anyone who reaches the server, `invite` only someone
+ * holding a workspace's current invite link, whose request to join it is filed with the account, `off` nobody (the
+ * operator still creates password accounts with --create-admin, and ADMIN_USER_IDS's GitHub accounts always sign up).
+ * Unset, GitHub stays open as it always was, and passwords take invitations.
+ */
+export type SignupMode = 'open' | 'invite' | 'off';
+export const signupModes: readonly SignupMode[] = ['open', 'invite', 'off'];
+export function signupMode(env: Env, method: 'github' | 'password'): SignupMode {
+  if (signupModes.includes(env.SIGNUP as SignupMode)) return env.SIGNUP as SignupMode;
+  return method === 'github' ? 'open' : 'invite';
 }
 export function now(): string { return new Date().toISOString(); }
 export function id(): string { return crypto.randomUUID(); }

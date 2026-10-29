@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { app } from '../apps/server/src/index.js';
@@ -11,6 +11,7 @@ import { sha256 } from '../packages/shared/src/crypto.js';
 import type { SessionView } from '../packages/shared/src/types.js';
 import { applyViewPatch, diffView, type SessionViewPatch } from '../packages/shared/src/view-patch.js';
 import { seedAgentVersion, testDatabase } from './helpers/control-plane.js';
+import { applySqliteMigrations } from './helpers/sqlite-migrations.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'control-plane-test-secret-not-for-deployment';
@@ -20,16 +21,7 @@ const migrationFiles = readdirSync(migrationsDirectory).filter(name => name.ends
 
 function migrate(sqlite: DatabaseSync, files = migrationFiles) {
   sqlite.exec('PRAGMA foreign_keys = ON');
-  for (const file of files) {
-    sqlite.exec('BEGIN');
-    try {
-      sqlite.exec(readFileSync(new URL(file, migrationsDirectory), 'utf8'));
-      sqlite.exec('COMMIT');
-    } catch (error) {
-      sqlite.exec('ROLLBACK');
-      throw error;
-    }
-  }
+  applySqliteMigrations(sqlite, migrationsDirectory, files);
 }
 
 async function fixture(t: TestContext) {

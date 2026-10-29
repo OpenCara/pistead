@@ -31,7 +31,7 @@ const stringVars = [
   'APP_ORIGIN', 'RUNNER_URL', 'RUNNER_EVENT_TRANSPORT', 'RUNNER_SHARED_SECRET', 'SESSION_SECRET', 'VAULT_KEY',
   'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'TEST_AUTH_ENABLED', 'TEST_AUTH_SECRET', 'TEST_AUTH_EXPIRES_AT',
   'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS', 'GIT_DIRECT',
-  'LOCAL_MODE', 'LOCAL_CLAIM_SECRET',
+  'LOCAL_MODE', 'LOCAL_CLAIM_SECRET', 'PASSWORD_AUTH', 'SIGNUP',
 ] as const;
 const LOOPBACK = ['127.0.0.1', '::1', 'localhost'];
 
@@ -58,7 +58,14 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   if (!env.VAULT_KEY) throw new ConfigurationError('VAULT_KEY is required: set it to a base64url-encoded random 32-byte key.');
   if (!/^(?:[A-Za-z0-9+/]{43}=?|[A-Za-z0-9_-]{43}=?)$/.test(env.VAULT_KEY)) throw new ConfigurationError('VAULT_KEY must be a base64url-encoded 32-byte key.');
   if (env.ADMIN_USER_IDS && env.ADMIN_USER_IDS.split(',').some(item => !adminUserId(env, item.trim()))) {
-    throw new ConfigurationError('ADMIN_USER_IDS must list user IDs such as github:12345, separated by commas.');
+    throw new ConfigurationError('ADMIN_USER_IDS must list user IDs such as github:12345 or password:alice, separated by commas.');
+  }
+  if (env.PASSWORD_AUTH !== undefined) {
+    if (!['true', 'false'].includes(env.PASSWORD_AUTH)) throw new ConfigurationError('PASSWORD_AUTH must be "true" or "false".');
+    if (env.PASSWORD_AUTH === 'true' && env.LOCAL_MODE === 'true') throw new ConfigurationError('PASSWORD_AUTH is for shared servers: a LOCAL_MODE server admits only the GitHub account that claimed it.');
+  }
+  if (env.SIGNUP !== undefined && !['open', 'invite', 'off'].includes(env.SIGNUP)) {
+    throw new ConfigurationError('SIGNUP must be "open", "invite" or "off" (unset: GitHub sign-ups are open and password sign-ups need an invite).');
   }
   const listenHost = processEnv.HOST || (env.LOCAL_MODE === 'true' ? '127.0.0.1' : '0.0.0.0');
   // A local server is reachable from this machine only, and admits only the GitHub account that claimed it.

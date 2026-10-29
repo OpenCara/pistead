@@ -1,6 +1,6 @@
 // First import: the stylesheet declares the cascade layer order before any screen CSS registers a layer.
 import "./styles.css";
-import { StrictMode, useEffect, useState } from "react";
+import { StrictMode, useEffect, useState, type MouseEvent } from "react";
 import { createRoot } from "react-dom/client";
 import type { UserProfile } from "../../../packages/shared/src/types";
 import { api, ApiError, errorMessage } from "./api";
@@ -8,6 +8,7 @@ import { AppProvider, useApp } from "./app-context";
 import { GitHubMark, Icon, Logo } from "./icons";
 import { JoinWorkspaceScreen, OwnJoinRequests, rememberInvite, takeRememberedInvite } from "./JoinWorkspaceScreen";
 import { NewSession } from "./NewSession";
+import { PasswordSignIn, type SignupMode } from "./PasswordSignIn";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { navigate, useRoute, type Route } from "./router";
 import { SessionScreen } from "./SessionScreen";
@@ -37,12 +38,40 @@ function title(route: Route): string {
   }
 }
 
-function SignIn({ error, retry, invited }: { error: string; retry: () => void; invited?: boolean }) {
-  const health = useResource<{ githubConfigured?: boolean; localServer?: { claimed: boolean } }>("/api/health");
+function SignIn({ error, retry, inviteToken }: { error: string; retry: () => void; inviteToken?: string }) {
+  const invited = inviteToken !== undefined;
+  const health = useResource<{ githubConfigured?: boolean; githubSignup?: SignupMode; passwordAuth?: boolean; passwordSignup?: SignupMode; localServer?: { claimed: boolean } }>("/api/health");
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState("");
   const callbackError = new URLSearchParams(window.location.search).get("error");
-  const problem = error || health.error || (callbackError ? `GitHub sign-in did not complete: ${callbackError.slice(0, 300)}` : "");
-  const unconfigured = health.data?.githubConfigured === false;
+  const problem = error || health.error || startError || (callbackError ? `GitHub sign-in did not complete: ${callbackError.slice(0, 300)}` : "");
+  const githubUnconfigured = health.data?.githubConfigured === false;
+  const password = health.data?.passwordAuth === true;
+  // Without GitHub, a server that offers passwords still signs people in.
+  const unconfigured = githubUnconfigured && !password;
   const local = health.data?.localServer;
+  // New accounts: where neither offered method takes them from anyone, say how to get one.
+  const methods = [...(!githubUnconfigured && !local ? [health.data?.githubSignup ?? "open"] : []), ...(password ? [health.data?.passwordSignup ?? "off"] : [])];
+  const signupHint = invited || !health.data || methods.includes("open") ? ""
+    : methods.includes("invite") ? "New here? Open the invite link a workspace owner or admin shared with you to create an account."
+    : "This Pistead doesn't take new accounts. If you have one, sign in.";
+  /** GitHub's sign-in from an invite link carries the link's token in a request body, never in a URL. */
+  async function continueWithGitHub(event: MouseEvent) {
+    if (inviteToken === undefined) return;
+    event.preventDefault();
+    setStarting(true);
+    setStartError("");
+    try {
+      const response = await fetch("/api/auth/github/start", { method: "POST", credentials: "same-origin",
+        headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ inviteToken }) });
+      const body = await response.json().catch(() => null) as { url?: unknown; error?: unknown } | null;
+      if (!response.ok || typeof body?.url !== "string") throw new Error(typeof body?.error === "string" ? body.error : `GitHub sign-in could not start (HTTP ${response.status}).`);
+      window.location.assign(body.url);
+    } catch (reason) {
+      setStartError(reason instanceof Error ? reason.message : "GitHub sign-in could not start.");
+      setStarting(false);
+    }
+  }
   return <div className="welcome">{skipLink}
     <main id="main-content" className="welcome-inner" tabIndex={-1}>
       <Logo size={40} />
@@ -55,10 +84,14 @@ function SignIn({ error, retry, invited }: { error: string; retry: () => void; i
         : <Alert variant="warning" title="GitHub sign-in is not configured">The operator needs to configure the GitHub OAuth app, its callback URL and the server's GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and VAULT_KEY settings.</Alert>)}
       {!unconfigured && local && !local.claimed && <Alert variant="info" title="Set up this Pistead" role="status">This Pistead runs on this computer and has no owner yet. Sign in with the link <code>pistead serve</code> printed when it started, or from the Pistead app, which opens it for you: your GitHub account becomes its owner, and the only one that can sign in.</Alert>}
       <div className="actions">
-        {!unconfigured && <a className="btn default lg" href="/api/auth/github"><GitHubMark />Continue with GitHub</a>}
+        {password && <PasswordSignIn signedIn={retry} signup={health.data?.passwordSignup ?? "off"} inviteToken={inviteToken} />}
+        {password && !githubUnconfigured && <div className="sign-in-divider" role="separator">or</div>}
+        {!githubUnconfigured && <a className="btn default lg" href="/api/auth/github" aria-disabled={starting} onClick={event => void continueWithGitHub(event)}><GitHubMark />Continue with GitHub</a>}
+        {signupHint && <p className="welcome-footnote">{signupHint}</p>}
         {(problem || unconfigured) && <Button onClick={() => { retry(); health.refresh(); }}>Try again</Button>}
       </div>
-      <p className="welcome-footnote">Model credentials stay on your host. GitHub tokens stay on the server, or go only to your own hosts when you push with your account.</p>
+      <p className="welcome-footnote">Model credentials stay on your host. GitHub tokens stay on the server, or go only to your own hosts when you push with your account.
+        {password && !githubUnconfigured && " Repositories on github.com need the GitHub sign-in; a password account reaches other Git providers with their tokens."}</p>
     </main>
   </div>;
 }
@@ -138,7 +171,7 @@ function App() {
   // GitHub's callback drops the fragment, so an invite link opened while signed out is remembered for after sign-in.
   useEffect(() => { if (!loading && !user && route.name === "join") rememberInvite(route.token); }, [loading, user, route]);
   if (loading) return <PageLoading />;
-  if (!user) return <SignIn error={error} retry={() => setRevision(value => value + 1)} invited={route.name === "join"} />;
+  if (!user) return <SignIn error={error} retry={() => setRevision(value => value + 1)} inviteToken={route.name === "join" ? route.token : undefined} />;
   return <AppProvider key={user.id} user={user} setUser={setUser} signOut={() => void signOut()}><Shell /></AppProvider>;
 }
 

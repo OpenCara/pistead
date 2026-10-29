@@ -211,7 +211,7 @@ export async function createSession(c: AppContext, input: Record<string, unknown
     WHERE ${sessionCreatorSQL('?')}
     AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
     AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
-      AND ((? = 1 AND session_owner.auth_kind = 'github') OR (? = 1 AND session_owner.auth_kind = 'test'))
+      AND ((? = 1 AND session_owner.auth_kind IN ('github', 'password')) OR (? = 1 AND session_owner.auth_kind = 'test'))
       AND (? IS NULL OR (session_owner.auth_kind = 'github' AND session_owner.github_id = ?
         AND EXISTS (SELECT 1 FROM github_tokens WHERE user_id = session_owner.id AND ciphertext = ?))))
     AND (SELECT COUNT(*) FROM json_each(?) used JOIN git_credentials credential

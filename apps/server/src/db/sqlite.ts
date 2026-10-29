@@ -26,6 +26,9 @@ function mapError(error: unknown): unknown {
 
 const noop = (): void => {};
 
+/** A migration's first line asks for SQLite's table-rebuild procedure, with foreign keys off while it runs. */
+const REBUILDS_REFERENCED_TABLE = /^-- pistead: foreign-keys-off\r?\n/;
+
 export class SqliteDatabase implements Database {
   readonly provider = 'sqlite' as const;
   readonly handle: DatabaseSync;
@@ -88,7 +91,25 @@ export class SqliteDatabase implements Database {
     });
     const applied = new Set(this.handle.prepare('SELECT name FROM schema_migrations').all().map(row => String(row.name)));
     for (const file of files) {
-      if (!applied.has(file.name)) await this.transaction(async () => this.apply(file));
+      if (applied.has(file.name)) continue;
+      if (!REBUILDS_REFERENCED_TABLE.test(file.sql)) {
+        await this.transaction(async () => this.apply(file));
+        continue;
+      }
+      // SQLite's procedure for rebuilding a table others reference (https://sqlite.org/lang_altertable.html#otheralter):
+      // with foreign keys on, dropping the old table would run its ON DELETE actions on every referencing row. The
+      // pragma is a no-op inside a transaction, so it is switched around it, and every reference is checked before commit.
+      this.handle.exec('PRAGMA foreign_keys = OFF');
+      try {
+        await this.transaction(async () => {
+          this.apply(file);
+          if (this.handle.prepare('PRAGMA foreign_key_check').all().length) {
+            throw new Error(`Migration ${file.name} left rows whose references don't hold.`);
+          }
+        });
+      } finally {
+        this.handle.exec('PRAGMA foreign_keys = ON');
+      }
     }
   }
 

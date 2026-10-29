@@ -1,7 +1,7 @@
 import type { Hono } from 'hono';
 import { adminListLimit, type AdminHost, type AdminList, type AdminOverview, type AdminUser, type AdminWorkspace } from '../../../packages/shared/src/admin.js';
 import { auditAfterChange } from './db.js';
-import { fail, now, testMode, userIdentifier } from './http.js';
+import { fail, now, PASSWORD_USER_ID, testMode, userIdentifier } from './http.js';
 import type { Env, WorkerEnv } from './types.js';
 
 /**
@@ -10,9 +10,14 @@ import type { Env, WorkerEnv } from './types.js';
  * grants nothing inside workspaces or sessions: no session titles, prompts, repositories or credentials are shown here.
  */
 
-/** Whether ADMIN_USER_IDS may list `value`: a GitHub user, or a test identity while test mode lasts, where it can sign in at all. */
+/**
+ * Whether ADMIN_USER_IDS may list `value`: a GitHub user, a password account (`password:<username>`), or a test identity
+ * while test mode lasts, where it can sign in at all. Nobody can sign up as a password account it lists (password-auth.ts),
+ * so listing one before it exists reserves the name rather than handing the role to whoever registers it first; the
+ * operator creates it with `--create-admin` (password-accounts-cli.ts).
+ */
 export function adminUserId(env: Env, value: string): boolean {
-  return /^github:[1-9][0-9]*$/.test(value) || (testMode(env) && /^test:[A-Za-z0-9_-]{1,128}$/.test(value));
+  return /^github:[1-9][0-9]*$/.test(value) || PASSWORD_USER_ID.test(value) || (testMode(env) && /^test:[A-Za-z0-9_-]{1,128}$/.test(value));
 }
 
 /** The configured administrators. */

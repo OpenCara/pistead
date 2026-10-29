@@ -41,6 +41,10 @@ export interface Env {
   LOCAL_MODE?: string;
   /** The local server's claim secret (base64url, 32 bytes): a sign-in carrying it may claim an unclaimed local server. */
   LOCAL_CLAIM_SECRET?: string;
+  /** `true` lets people sign up and sign in with a username and password (password-auth.ts), next to GitHub. */
+  PASSWORD_AUTH?: string;
+  /** Who may create an account (http.ts signupMode): `open`, `invite` or `off`; unset, GitHub is open and passwords invite. */
+  SIGNUP?: string;
 }
 export interface AuthIdentity {
   userId: string;
@@ -59,7 +63,7 @@ export interface UserRow {
   git_name: string;
   git_email: string;
   env_json: string;
-  auth_kind: 'github' | 'test';
+  auth_kind: 'github' | 'test' | 'password';
   created_at: string;
   /** Set while an instance administrator has the account suspended. */
   suspended_at?: string | null;
