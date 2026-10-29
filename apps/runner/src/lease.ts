@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { createServer } from "node:net";
+import { join, resolve } from "node:path";
 import { ConnectorSetupError } from "./protocol.js";
 
 // The guardian reports LOCKED, then holds the kernel lock until its stdin reaches EOF.
@@ -10,9 +12,33 @@ export class RunnerLeaseBusyError extends ConnectorSetupError {
   override name = "RunnerLeaseBusyError";
 }
 
+/**
+ * Windows has neither flock nor lockf. A named pipe serves instead: only one process can listen on a name, Windows
+ * frees it when that process ends however it ends, and the name comes from the state directory, so two connectors
+ * on one directory never both run.
+ */
+async function acquireWindowsLease(directory: string, onLost: () => void): Promise<() => Promise<void>> {
+  const name = `\\\\.\\pipe\\pistead-lease-${createHash("sha256").update(resolve(directory).toLowerCase()).digest("hex").slice(0, 32)}`;
+  const server = createServer(socket => socket.destroy());
+  let releasing = false;
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", (error: NodeJS.ErrnoException) => reject(error.code === "EADDRINUSE"
+      ? new RunnerLeaseBusyError("Another connector or runner is already using this state directory")
+      : new Error("Cannot take the runner lease")));
+    server.listen(name, () => resolveListen());
+  });
+  server.on("error", () => { if (!releasing) onLost(); });
+  server.on("close", () => { if (!releasing) onLost(); });
+  return async () => {
+    releasing = true;
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  };
+}
+
 /** Kernel flock survives stale lock files; pipe EOF releases it even after Node is SIGKILLed. */
 export async function acquireRunnerLease(directory: string, onLost: () => void): Promise<() => Promise<void>> {
-  if (process.platform !== "linux" && process.platform !== "darwin") throw new Error("Runner lease requires Linux flock or macOS lockf; no PID-file fallback");
+  if (process.platform === "win32") return acquireWindowsLease(directory, onLost);
+  if (process.platform !== "linux" && process.platform !== "darwin") throw new Error("Runner lease requires Linux flock, macOS lockf or a Windows named pipe; no PID-file fallback");
   const ready = Promise.withResolvers<void>();
   const exited = Promise.withResolvers<void>();
   let acquired = false;

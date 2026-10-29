@@ -1,5 +1,5 @@
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -20,6 +20,11 @@ import { messageHash, parseChatImages, type ChatImage } from "../../../packages/
 import { requestKey, RunnerError, stableJson, validateOperation } from "./protocol.js";
 import { runnerModels } from "./provider.js";
 import { HostWorkspace } from "./host-workspace.js";
+import { isolatedWorkspace, type SessionWorkspace } from "./workspace.js";
+import type { SandboxBackendConfig } from "./sandbox-backend.js";
+import { HelperWorkspace } from "./helper-workspace.js";
+import { SeatbeltBackend } from "./seatbelt.js";
+import { WindowsBackend } from "./windows-sandbox.js";
 import { reportedBranches } from "./clone-branches.js";
 import {
   hostGitLfs, MIRROR_ROOT, Sandbox, SandboxProcessError, type CloneBackup, type MirrorMount, type SandboxAuthorize, type SnapshotFile,
@@ -36,7 +41,7 @@ import { applyEdits } from "./edits.js";
 import { compactionFailure, configuredCompaction, hostCompaction } from "./compaction.js";
 import { ActivityReporter, sessionActivity, type ActivityEntry } from "./activity.js";
 import { autoApprovedCalls, settled, viewApprovals, type StoredApproval } from "./approval-view.js";
-import { EgressProxy, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type MirrorProgress, type RelayRequest } from "./egress.js";
+import { EgressProxy, egressEnvironment, egressSocketPath, parseEgressGrant, relayFetch, relayGitRequest, relayPath, repositoryForRemote, type MirrorProgress, type RelayRequest } from "./egress.js";
 import { DirectGit } from "./git-direct.js";
 import { egressReadServices, type EgressGrant, type EgressRepository, type GitDirectRequest } from "../../../packages/shared/src/network.js";
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
@@ -178,6 +183,8 @@ export type RunnerConfig = {
   resources?: ResourceConfig;
   /** Owner-consented host mode: no isolation, so bash needs only per-command approval. */
   unsandboxed?: boolean;
+  /** The sandbox of a macOS or native Windows host (see sandbox-backend.ts); Linux hosts use bubblewrap without it. */
+  sandboxBackend?: SandboxBackendConfig;
   /** Opens a session's Pi storage; defaults to the SQLite file in its directory. */
   openStorage?: (path: string) => Promise<Storage>;
   /** Tells the control plane what a session's agent is doing (see SessionActivity) as it changes; connected runners only. */
@@ -269,7 +276,7 @@ function activityEntry(entry: EntryRecord | undefined): ActivityEntry | undefine
 }
 
 export class RunnerSession {
-  readonly sandbox: Sandbox | HostWorkspace;
+  readonly sandbox: SessionWorkspace;
   readonly sqlitePath: string;
   private harness!: Harness;
   private root!: Conversation;
@@ -377,7 +384,19 @@ export class RunnerSession {
       : (request: Omit<GitDirectRequest, "sessionId">) => this.controlPlane("/api/internal/git/direct", { sessionId: binding.session.id, ...request });
     this.#direct = directGrant && new DirectGit({ grant: directGrant, onFallback: (request, reason) => this.#egress?.noteFallback(request.bindingId, reason) });
     if (this.#onHost) this.sandbox = new HostWorkspace(binding, join(directory, "sandbox"));
-    else {
+    else if (config.sandboxBackend) {
+      // macOS and native Windows sandboxes share the host's network: the proxy listens on a loopback port that wants
+      // this session's token. They keep no host repository cache.
+      const egress = this.egressProxy(egressSocketPath(binding.session.id, directory), randomBytes(24).toString("base64url"));
+      this.#egress = egress;
+      const backend = config.sandboxBackend.kind === "seatbelt" ? new SeatbeltBackend()
+        : new WindowsBackend({ runtime: config.sandboxBackend.runtime, limits: config.sandboxBackend.limits });
+      const branch = this.#clone ? sessionBranch(binding.session) : undefined;
+      const workspace: HelperWorkspace = new HelperWorkspace(binding, join(directory, "sandbox"), backend, {
+        egressEnvironment: () => { const endpoint = egress.endpoint; return endpoint && egressEnvironment(branch, endpoint, workspace.layout.caBundle); },
+      });
+      this.sandbox = workspace;
+    } else {
       this.#egress = this.egressProxy(egressSocketPath(binding.session.id, directory));
       this.sandbox = new Sandbox(binding, join(directory, "sandbox"), config.resources, { egressSocket: this.#egress.socketPath,
         ...(this.#clone ? { sessionBranch: sessionBranch(binding.session) } : {}),
@@ -408,9 +427,10 @@ export class RunnerSession {
     return parseEgressGrant(this.config.egressGrant ? await this.config.egressGrant(sessionId) : await this.controlPlane("/api/internal/network", { sessionId }));
   }
 
-  private egressProxy(socketPath: string): EgressProxy {
+  private egressProxy(socketPath: string, token?: string): EgressProxy {
     return new EgressProxy({
       socketPath,
+      ...(token ? { tcp: { token } } : {}),
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
       ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository, onProgress: (progress: MirrorProgress) => void) => this.mirror(repository, onProgress) } : {}),
@@ -721,7 +741,7 @@ export class RunnerSession {
             try { reference = await this.mirror(repository, progress); } catch { /* cloned without borrowing */ }
           }
           update(entry.path, { phase: "receiving" });
-          await (this.sandbox as Sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
+          await isolatedWorkspace(this.sandbox).cloneRestore(entry.path, bindingRemote(repository), reference, authorize);
         } catch (error) {
           if (controller.signal.aborted) throw error;
           const reason = error instanceof RunnerError ? error.message
@@ -825,7 +845,7 @@ export class RunnerSession {
       // Only a restore writes the list (in the worktree's .git, which shell commands can't change), so a session that
       // has none needs no sandbox to tell.
       if (await lstat(join(this.directory, "sandbox", "git", "pistead-clones", "manifest.json")).then(() => true, () => false)) {
-        const pending = await (this.sandbox as Sandbox).clonePending(async () => {});
+        const pending = await isolatedWorkspace(this.sandbox).clonePending(async () => {});
         if (pending.length) this.prepareClones(pending);
       }
     }
@@ -1535,11 +1555,12 @@ export class RunnerSession {
   }
 
   /**
-   * Whether shell commands may run here: within provisioned limits, on the host itself (an owner-consented unsandboxed
-   * host, or the owner's session on a host that accepts it), or as a faux test shell.
+   * Whether shell commands may run here: within provisioned limits (Linux --resources, or the Windows sandbox's job
+   * objects; macOS has none), on the host itself (an owner-consented unsandboxed host, or the owner's session on a host
+   * that accepts it), or as a faux test shell.
    */
   private shellAllowed(): boolean {
-    return !!this.config.resources || this.#onHost || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
+    return (!!this.config.resources && !this.config.sandboxBackend) || (!this.#onHost && this.config.sandboxBackend?.kind === "windows") || this.#onHost || (this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true);
   }
 
   /**
@@ -1655,7 +1676,7 @@ export class RunnerSession {
       if (!validCloneDirectory(args.directory)) throw new RunnerError(400, "directory must be a clone's path in the worktree, such as app or src/app");
       if (args.tag !== undefined && !validPushTag(args.tag)) throw new RunnerError(400, "tag must be a plain tag name, such as v1.2.3, not refs/tags/v1.2.3");
       if (args.tag !== undefined && args.pull_request) throw new RunnerError(400, "a tag push opens no pull request");
-      const head = await (this.sandbox as Sandbox).cloneHead(args.directory, () => this.recheckTool(attribution));
+      const head = await isolatedWorkspace(this.sandbox).cloneHead(args.directory, () => this.recheckTool(attribution));
       if (!head.origin) throw new RunnerError(400, `${args.directory} has no origin remote; push only clones of this workspace's repositories`);
       const repository = repositoryForRemote((await this.#egress!.grant()).repositories, head.origin);
       if (!repository) throw new RunnerError(403, `${args.directory} was cloned from ${head.origin.slice(0, 200)}, which is not one of this workspace's repositories`);
@@ -2368,8 +2389,8 @@ export class RunnerSession {
         // again from their origin.
         // On an unsandboxed host the worktree is kept as files, and a session with a clone in it can't be backed up.
         const sandboxed = this.#clone && this.#egress;
-        const { clones, found } = sandboxed ? await (this.sandbox as Sandbox).cloneBackup(authorize) : { clones: [], found: [] };
-        const files = sandboxed ? await (this.sandbox as Sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
+        const { clones, found } = sandboxed ? await isolatedWorkspace(this.sandbox).cloneBackup(authorize) : { clones: [], found: [] };
+        const files = sandboxed ? await isolatedWorkspace(this.sandbox).snapshot(authorize, found) : await this.sandbox.snapshot(authorize);
         return { format: "pi-runner-backup-v1", binding: this.binding, manifest: state, sqlite, files, ...(clones.length ? { clones } : {}),
           createdAt: new Date().toISOString() };
       } finally { await this.open(); }
@@ -2447,7 +2468,7 @@ export class RunnerSession {
     let failure: { status: "failed" | "interrupted"; result: string } | undefined;
     try {
       const authorization = "hostCredentials" in credential ? await this.hostAuthorization(credential.remote, signal) : credential.authorization;
-      pushed = await performClonePush({ workspace: this.sandbox as Sandbox, operation, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
+      pushed = await performClonePush({ workspace: isolatedWorkspace(this.sandbox), operation, credential: { remote: credential.remote, authorization }, authorize: recheck, signal });
     } catch (error) {
       failure = error instanceof PushError && !signal?.aborted
         ? { status: "failed", result: `Push failed: ${error.message}. Nothing was pushed.` }

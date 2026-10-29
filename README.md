@@ -170,7 +170,7 @@ Sessions started before this change pinned their repositories to exact commits. 
 
 A host is a machine where you run the `pistead` connector next to [Pi](https://github.com/earendil-works/pi). Sessions on it use the models and credentials configured in Pi there (by default in `~/.pi/agent`); provider credentials, Pi history and personal extensions are never uploaded.
 
-**Requirements:** Linux or WSL2 with Node.js 24 or newer, Pi configured with the providers and models to offer, and `bubblewrap`, Python 3, Git and `flock` (util-linux) for the sandbox. macOS, or Linux without bubblewrap, can run [without the sandbox](#running-without-the-sandbox). Native Windows is unsupported: run the connector inside WSL2.
+**Requirements:** Linux or WSL2 with Node.js 24 or newer, Pi configured with the providers and models to offer, and `bubblewrap`, Python 3, Git and `flock` (util-linux) for the sandbox. On Windows, run the connector inside WSL2 for that sandbox. macOS and native Windows can also try their own [experimental sandboxes](#experimental-sandboxes-on-macos-and-windows), and macOS, native Windows or Linux without bubblewrap can run [without the sandbox](#running-without-the-sandbox).
 
 #### Pairing
 
@@ -277,7 +277,7 @@ Shell commands (`bash`) also need resource limits. A connector started with `--r
 
 #### Network access
 
-A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080`); file tools, commits and every other sandboxed step have no network at all.
+A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080` in the Linux sandbox; in the [experimental macOS and Windows sandboxes](#experimental-sandboxes-on-macos-and-windows), the session's own loopback port and credentials); file tools, commits and every other sandboxed step have no network at all.
 
 - **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. For each request the proxy asks Pistead, which checks the session and the **session owner's own access** to the repository; the sandbox never holds a credential. On a host with a [repository cache](#repository-cache-preview), clones borrow the host's copy, so only what it lacks is fetched.
 - **In a session that clones on demand, pushes of the session's own branch work too:** `git push origin HEAD:$PISTEAD_SESSION_BRANCH` (the branch, such as `pistead/add-dark-mode-1a2b3c4d5e6f`, is in `$PISTEAD_SESSION_BRANCH`). They are pushed with the workspace's [push identity](#push-access). A push of any other branch is rejected, as a Git host rejects one, and goes through `git_push` instead (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). Pinned sessions push only with `git_push`.
@@ -304,9 +304,22 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
 
 `curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the workspace's repositories and its recent decisions, with `(direct …)` on the Git requests the host made itself. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
 
+#### Experimental sandboxes on macOS and Windows
+
+macOS and native Windows can run sessions in their own operating system's sandbox instead of bubblewrap. Both are **experimental and not yet verified on real machines**: report what breaks. The design and what still has to be checked are in [docs/design/windows-sandbox.md](docs/design/windows-sandbox.md).
+
+```sh
+npx pistead@latest connect --experimental-sandbox
+```
+
+- **macOS** (Seatbelt, macOS 15 or later, with the developer tools: `xcode-select --install`): every step runs under `sandbox-exec` with a profile that denies everything by default. A session sees its own files, the system's read-only runtime, the developer tools and Homebrew, and nothing of your home folder or other sessions. Its only network is its egress proxy, on a loopback port that wants the session's credentials, so tests that start a local server can't reach it, and Go and Swift programs can't verify HTTPS (they check certificates only through a macOS service that would fetch on the host's own network, outside the proxy; curl, Git, Node and Python work). macOS has no hard memory or process limits for a group of processes, so, as on a Linux host without `--resources`, shell commands run only in the host owner's own sessions, once they allow it.
+- **Windows** (Windows 11 24H2 or later with the October 2026 update, which the connector checks by running one container, [Git for Windows](https://git-scm.com/download/win), and Microsoft's [MXC SDK](https://github.com/microsoft/mxc), which the connector tells you how to install: `npm install --prefix <state dir>\mxc @microsoft/mxc-sdk@1.0.1`): every step runs in an OS process container that may write only the session's files and reach only its egress proxy, inside a job object that limits its memory, processes and CPU (`--memory-limit`, `--process-limit`, `--cpu-limit`). Commands run in [busybox-w32](https://frippery.org/busybox/)'s shell, because Git for Windows' bash can't start in the container: save `busybox64.exe` as `%LOCALAPPDATA%\Programs\busybox\busybox.exe`, or name it in `PISTEAD_SANDBOX_SHELL`. Pistead refuses to run where MXC would fall back to its AppContainer modes, which change the permissions of your folders. Backups and moves of clone sessions don't work here yet.
+
+Neither keeps a [repository cache](#repository-cache-preview) or lends the GPU yet.
+
 #### Running without the sandbox
 
-On macOS, or Linux without bubblewrap, you can opt out of isolation. This needs only Git (on macOS, `xcode-select --install` or `brew install git`):
+On macOS, native Windows, or Linux without bubblewrap, you can opt out of isolation. This needs only Git (on macOS, `xcode-select --install` or `brew install git`; on Windows, [Git for Windows](https://git-scm.com/download/win), whose bash runs the commands):
 
 ```sh
 npx pistead@latest connect --unsafe-no-sandbox

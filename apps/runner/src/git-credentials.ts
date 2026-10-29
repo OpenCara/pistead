@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import { homedir } from "node:os";
+import { killTree, windows } from "./platform.js";
 import { spawn } from "node:child_process";
 
 /** A definite failure to read the host's Git credential. Messages are fixed and never carry the credential. */
@@ -42,14 +44,13 @@ function fill(input: string, env: NodeJS.ProcessEnv, host: string, signal?: Abor
   if (signal?.aborted) return Promise.reject(new HostCredentialError("Reading the host's Git credentials was interrupted"));
   const { promise, resolve, reject } = Promise.withResolvers<string>();
   // Its own process group, so a credential helper that hangs is killed with Git. "/" keeps repository config out.
-  const child = spawn("git", ["credential", "fill"], { cwd: "/", env, detached: true, stdio: ["pipe", "pipe", "ignore"] });
+  const child = spawn("git", ["credential", "fill"], { cwd: windows ? homedir() : "/", env, detached: !windows, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
   const chunks: Buffer[] = [];
   let size = 0;
   let failure: HostCredentialError | undefined;
   const stop = (reason: HostCredentialError) => {
     failure ??= reason;
-    if (!child.pid) return;
-    try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+    killTree(child);
   };
   const timer = setTimeout(() => stop(new HostCredentialError("Reading the host's Git credentials timed out")), TIMEOUT_MS);
   const abort = () => stop(new HostCredentialError("Reading the host's Git credentials was interrupted"));

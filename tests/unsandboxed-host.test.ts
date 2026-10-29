@@ -5,12 +5,16 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostWorkspace } from "../apps/runner/src/host-workspace.js";
+import { runHostShell } from "../apps/runner/src/host-shell.js";
 import { Sandbox, type SandboxAuthorize } from "../apps/runner/src/sandbox.js";
+import { isolatedWorkspace } from "../apps/runner/src/workspace.js";
 import type { SessionRepository } from "../packages/shared/src/repositories.js";
 import type { RunnerBinding } from "../packages/shared/src/types.js";
 
-// Host mode needs only Git on PATH, so it runs on macOS and Linux alike.
-const hostMode = { skip: !["linux", "darwin"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
+// Host mode needs only Git on PATH (and on Windows Git for Windows' bash), so it runs on macOS, Linux and Windows alike.
+const hostMode = { skip: !["linux", "darwin", "win32"].includes(process.platform) || spawnSync("git", ["--version"]).status !== 0 };
+// Git for Windows' bash prints the working directory as /c/...; cygpath gives the Windows path the worktree has.
+const printWorkingDirectory = process.platform === "win32" ? 'cygpath -w "$PWD"' : "pwd";
 const authorize: SandboxAuthorize = async () => {};
 
 function binding(id: string, repositories: SessionRepository[] = []): RunnerBinding {
@@ -34,6 +38,12 @@ test("the Linux sandbox never falls back to host execution on other platforms", 
   assert.throws(() => new Sandbox(binding("implicit"), join(tmpdir(), "pistead-implicit")), /requires Linux/);
 });
 
+test("a host workspace is not isolated, so the sandbox's clone steps are refused rather than run on the host", hostMode, async t => {
+  const { workspace } = await hostWorkspace(t);
+  assert.equal(workspace.isolated, false);
+  assert.throws(() => isolatedWorkspace(workspace), /needs the sandbox/);
+});
+
 test("unsandboxed file tools stay inside the session worktree", hostMode, async t => {
   const { workspace, outside } = await hostWorkspace(t);
   await workspace.writeFile("notes/plan.md", "inside", authorize);
@@ -53,7 +63,7 @@ test("approved unsandboxed commands run in the worktree without the connector en
   const { workspace } = await hostWorkspace(t);
   process.env.PISTEAD_CONNECTOR_SECRET = "must-not-leak";
   t.after(() => { delete process.env.PISTEAD_CONNECTOR_SECRET; });
-  const output = await workspace.execute({ kind: "bash", command: 'pwd; echo "${PISTEAD_CONNECTOR_SECRET:-unset} $APP_TEAM"' }, false, authorize);
+  const output = await workspace.execute({ kind: "bash", command: `${printWorkingDirectory}; echo "\${PISTEAD_CONNECTOR_SECRET:-unset} $APP_TEAM"` }, false, authorize);
   assert.equal(output, `${workspace.worktree}\nunset core\n`);
   await assert.rejects(workspace.execute({ kind: "bash", command: "true" }, true, authorize), /read-only/);
   await assert.rejects(workspace.execute({ kind: "bash", command: "exit 3" }, false, authorize), /exit 3/);
@@ -104,8 +114,58 @@ test("a host clone session reads the branches its clones have checked out, as Gi
   const upstream = join(directory, "upstream");
   await mkdir(upstream);
   const run = (command: string) => workspace.execute({ kind: "bash", command }, false, authorize);
-  await run(`git init -q -b main ${upstream} && git -C ${upstream} commit -q --allow-empty -m initial`);
-  await run(`git clone -q ${upstream} app && git clone -q ${upstream} other && git -C app switch -q -c fix/parser`);
+  await run(`git init -q -b main '${upstream}' && git -C '${upstream}' commit -q --allow-empty -m initial`);
+  await run(`git clone -q '${upstream}' app && git clone -q '${upstream}' other && git -C app switch -q -c fix/parser`);
   assert.deepEqual(await workspace.cloneBranches(authorize), [{ directory: "app", origin: upstream, branch: "fix/parser" }],
     "a clone on its origin's default branch has no pull request of its own");
+});
+
+/** Whether a background loop that appends to `file` every 0.2 s is still running. */
+async function stillBeating(file: string): Promise<boolean> {
+  const before = await readFile(file, "utf8").catch(() => "");
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  return (await readFile(file, "utf8").catch(() => "")) !== before;
+}
+
+// Programs bash starts straight into the background (`sh -c ...`, `sleep 600`), as `cmd &` does: on Windows the bash process
+// that started each one has exited, so `taskkill /T` can't find them. With `wait` the command never finishes on its own.
+const beat = "sh -c 'while :; do echo . >> beat.txt; sleep 0.2; done' & sleep 600 & wait";
+
+test("a time limit ends what an unsandboxed command started in the background, not only bash", hostMode, async t => {
+  const { workspace } = await hostWorkspace(t);
+  const started = Date.now();
+  await assert.rejects(workspace.execute({ kind: "bash", command: beat }, false, authorize,
+    { limits: { seconds: 2, cpuSeconds: 25, fileBytes: 64 * 1024 ** 2, openFiles: 256 } }), /time limit/);
+  assert.ok(Date.now() - started < 20_000, `the time limit took ${Date.now() - started} ms to end the command`);
+  assert.equal(await stillBeating(join(workspace.worktree, "beat.txt")), false, "the background loop outlived the time limit");
+});
+
+test("a cancelled or timed-out host command ends what it started in the background", hostMode, async t => {
+  const { workspace } = await hostWorkspace(t);
+  const options = { worktree: workspace.worktree, git: join(workspace.worktree, ".git"), gitConfig: join(workspace.worktree, "..", "owner.gitconfig"),
+    gitName: "Alice Owner", gitEmail: "alice@example.test" };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 1500);
+  let started = Date.now();
+  await assert.rejects(runHostShell({ kind: "host.bash", command: beat, timeoutSeconds: 600 }, { ...options, signal: controller.signal }), /cancelled/);
+  assert.ok(Date.now() - started < 20_000, `cancelling took ${Date.now() - started} ms`);
+  assert.equal(await stillBeating(join(workspace.worktree, "beat.txt")), false, "the background loop outlived the cancel");
+  started = Date.now();
+  await assert.rejects(runHostShell({ kind: "host.bash", command: beat.replace("beat.txt", "beat2.txt"), timeoutSeconds: 2 }, { ...options, signal: new AbortController().signal }), /time limit/);
+  assert.ok(Date.now() - started < 20_000, `the time limit took ${Date.now() - started} ms to end the command`);
+  assert.equal(await stillBeating(join(workspace.worktree, "beat2.txt")), false, "the background loop outlived the time limit");
+});
+
+test("an unsandboxed command runs as written: quoting, lines, an empty stdin and its exit status", hostMode, async t => {
+  const { workspace } = await hostWorkspace(t);
+  const command = "x='a  \"b\" \\c'\nprintf '%s|' \"$x\" \"${__pistead_command-unset}\"\nif read -r line; then echo \"stdin: $line\"; else echo 'stdin: empty'; fi";
+  assert.equal(await workspace.execute({ kind: "bash", command }, false, authorize), "a  \"b\" \\c|unset|stdin: empty\n");
+  await assert.rejects(workspace.execute({ kind: "bash", command: "echo partial; exit 7" }, false, authorize), /exit 7/);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(runHostShell({ kind: "host.bash", command: "echo should-not-run > ran.txt", timeoutSeconds: 10 },
+    { worktree: workspace.worktree, git: join(workspace.worktree, ".git"), gitConfig: join(workspace.worktree, "..", "owner.gitconfig"),
+      gitName: "Alice Owner", gitEmail: "alice@example.test", signal: controller.signal }));
+  await new Promise(resolve => setTimeout(resolve, 500));
+  await assert.rejects(readFile(join(workspace.worktree, "ran.txt")), "a command cancelled before it started never ran");
 });

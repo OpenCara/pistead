@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { constants } from "node:fs";
 import { mkdir, realpath, lstat, open, link, rename, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -14,6 +13,8 @@ import type { SessionsToolResult } from "../../../packages/shared/src/cross-sess
 import { MAX_CLONE_BRANCHES } from "./clone-branches.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
+import type { SandboxBackendConfig } from "./sandbox-backend.js";
+import { CREATE_FILE, exactMode, OPEN_DIRECTORY, OPEN_FILE, windows } from "./platform.js";
 import type { LocalModels } from "./local-pi.js";
 import { modelSummary } from "./local-pi.js";
 import { assertId, ConnectorSetupError, RunnerError, verifyRunnerTicket } from "./protocol.js";
@@ -91,8 +92,7 @@ async function privateDirectory(directory: string): Promise<string> {
   const path = resolve(directory);
   await mkdir(path, { recursive: true, mode: 0o700 });
   const stat = await lstat(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700
-    || (process.getuid && stat.uid !== process.getuid()) || await realpath(path) !== path) {
+  if (!stat.isDirectory() || stat.isSymbolicLink() || !exactMode(stat, 0o700) || await realpath(path) !== path) {
     throw new ConnectorSetupError("Connector state directory must be an owned, non-symlink mode0700 directory");
   }
   return path;
@@ -101,12 +101,11 @@ async function privateDirectory(directory: string): Promise<string> {
 export async function readConnectorState(directory: string, origin?: string, allowInsecureLoopback = false): Promise<ConnectorCredentials | undefined> {
   const path = join(await privateDirectory(directory), STATE_FILE);
   let file;
-  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  try { file = await open(path, OPEN_FILE); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw new Error("Cannot safely open connector state"); }
   try {
     const stat = await file.stat();
-    if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.size > 4096
-      || (process.getuid && stat.uid !== process.getuid())) throw new Error("Connector state must be an owned mode0600 regular file");
+    if (!stat.isFile() || stat.nlink !== 1 || !exactMode(stat, 0o600) || stat.size > 4096) throw new Error("Connector state must be an owned mode0600 regular file");
     const state = JSON.parse(await file.readFile("utf8"));
     if (state.version !== 1) throw new Error("Unsupported connector state version");
     return credentials(state.credentials, origin, allowInsecureLoopback);
@@ -117,7 +116,7 @@ export async function writeConnectorState(directory: string, value: ConnectorCre
   const path = await privateDirectory(directory);
   const saved = credentials(value, undefined, allowInsecureLoopback);
   const temporary = join(path, `.connector-${randomUUID()}.tmp`);
-  const file = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  const file = await open(temporary, CREATE_FILE, 0o600);
   try {
     await file.writeFile(JSON.stringify({ version: 1, credentials: saved }));
     await file.sync();
@@ -132,7 +131,9 @@ export async function writeConnectorState(directory: string, value: ConnectorCre
       await link(temporary, join(path, STATE_FILE));
     } finally { await unlink(temporary); }
   }
-  const directoryHandle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  // Windows can't open a directory to flush it; NTFS journals the rename itself.
+  if (windows) return;
+  const directoryHandle = await open(path, OPEN_DIRECTORY);
   try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
 }
 
@@ -292,6 +293,8 @@ export interface ConnectorOptions {
   resources?: RunnerConfig["resources"];
   /** Run session work directly on the host without isolation; requires explicit owner consent. */
   unsandboxed?: boolean;
+  /** The sandbox of a macOS or native Windows host (see sandbox-backend.ts); Linux uses bubblewrap. */
+  sandboxBackend?: SandboxBackendConfig;
   /**
    * The GPU device this host can lend sandboxed commands, where its configuration turns that on; detected on the host
    * unless given (null for none). Everything else the host's owner and admins configure in Pistead (HostConfig): the
@@ -400,7 +403,11 @@ export class LocalConnector {
   }
 
   private async initialize(): Promise<void> {
-    if (process.platform !== "linux" && !this.options.runtimeFactory && !(this.options.unsandboxed && process.platform === "darwin")) throw new Error("Connected runner requires a Linux sandbox and kernel lease; no host-shell fallback");
+    // Linux runs the bubblewrap sandbox; macOS and Windows run theirs (see sandbox-backend.ts) or, with the owner's
+    // consent, none. There is never a silent fallback to the host.
+    if (!this.options.runtimeFactory && !["linux", "darwin", "win32"].includes(process.platform)) throw new Error("Connected runner requires Linux, macOS or Windows; no host-shell fallback");
+    if (!this.options.runtimeFactory && process.platform !== "linux" && !this.options.unsandboxed && !this.options.sandboxBackend)
+      throw new Error("This platform has no sandbox unless one is chosen (sandboxBackend); no host-shell fallback");
     this.directory = await privateDirectory(this.options.dataDir);
     this.releaseLease = await (this.options.acquireLease ?? acquireRunnerLease)(this.directory, () => {
       this.lifetime.abort();
@@ -550,7 +557,8 @@ export class LocalConnector {
     try {
       if (replacing) await this.retireRuntime();
       if (!this.runtime) {
-        const cache = repositoryCache === "off" ? undefined : this.repositoryCacheFor(repositoryCache);
+        // The macOS and Windows sandboxes keep no host repository cache (their sessions can't mount its mirrors).
+        const cache = repositoryCache === "off" || this.options.sandboxBackend ? undefined : this.repositoryCacheFor(repositoryCache);
         this.runtime = { value: await (this.options.runtimeFactory ?? defaultRuntime)(this.runnerConfig(cache)), repositoryCache, resumed: false };
       }
       return this.runtime;
@@ -601,6 +609,7 @@ export class LocalConnector {
       sharedSecret: this.secret, connectorId: state.connectorId,
       allowFaux: this.options.allowFaux === true, allowTestShell: this.options.allowTestShell === true,
       resources: this.options.resources, unsandboxed: this.options.unsandboxed === true,
+      ...(this.options.sandboxBackend && !this.options.unsandboxed ? { sandboxBackend: this.options.sandboxBackend } : {}),
       resolveModels: model => {
         if (this.lifetime.signal.aborted) throw new Error("Connector has stopped");
         return this.options.localModels.resolve(model);

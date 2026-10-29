@@ -35,7 +35,7 @@ The saved token is replaced only once the new code is accepted. The old host sta
 
 Connector 0.8.0 moved the default state directory from `~/.local/share/opencara/connector` to `~/.local/share/pistead/connector` without moving anything: to keep a pairing made by an older connector, run `npx pistead@latest connect --state-dir ~/.local/share/opencara/connector`, or pair the machine again.
 
-Run `npx pistead connect --help` for all options. The connector takes only what pairing and this machine's own setup need (`--state-dir`, `--pi-agent-dir`, `--model`, `--resources`, `--unsafe-no-sandbox`).
+Run `npx pistead connect --help` for all options. The connector takes only what pairing and this machine's own setup need (`--state-dir`, `--pi-agent-dir`, `--model`, `--resources`, `--unsafe-no-sandbox`, `--experimental-sandbox`).
 
 ## Host configuration
 
@@ -64,9 +64,9 @@ Commands run in the session's worktree, whose files and Git configuration the ag
 
 Each exact command and timeout needs the approval of the **host owner**, or of a member they (or one of the host's admins) granted host commands, in the session. On a shared host, the approver must also have approve access to the session. The session owner's **Auto-approve** skips this decision only when they own the host too, or hold an automatic host command grant on it; without one it never authorizes commands on someone else's host. Commands default to a five-minute timeout (`timeout_seconds`, 1-3600); timeout, cancellation and output limits terminate the process group, but cannot contain an unrestricted command that deliberately detaches processes.
 
-## macOS and hosts without bubblewrap
+## macOS, Windows and hosts without bubblewrap
 
-The isolated sandbox needs Linux. On macOS, or Linux without bubblewrap, you can opt out of isolation:
+The isolated sandbox needs Linux (or WSL2 on Windows). macOS and native Windows can try their own experimental sandboxes with `--experimental-sandbox` (see the main README, "Experimental sandboxes on macOS and Windows"). On macOS, native Windows, or Linux without bubblewrap, you can also opt out of isolation:
 
 ```sh
 npx pistead@latest connect --unsafe-no-sandbox

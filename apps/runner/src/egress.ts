@@ -5,7 +5,7 @@ import { BlockList, connect as tcpConnect, isIP, type Socket } from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
 import { egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize, type EgressGitService, type EgressGrant,
@@ -57,6 +57,12 @@ export interface EgressEntry { at: string; kind: "git" | "connect" | "http"; tar
 export interface MirrorProgress { phase: string; percent: number | null; done: number | null; total: number | null; bytes: number }
 export interface EgressOptions {
   socketPath: string;
+  /**
+   * Also listen on a loopback TCP port, for sandboxes that share the host's network instead of having their own (macOS
+   * Seatbelt, native Windows): every request there must carry `token` (see EgressEndpoint), so neither another
+   * session nor another program on the host can use this session's proxy.
+   */
+  tcp?: { token: string };
   /** The session's current grant from the control plane. */
   grant: () => Promise<EgressGrant>;
   /**
@@ -85,10 +91,11 @@ export interface EgressOptions {
  * SSH remotes of the common hosts) go to its Git endpoint, which relays the workspace's repositories with the owner's
  * credential. None of this is a boundary: the sandbox has no other network, so bypassing it only fails.
  */
-export function egressEnvironment(sessionBranch?: string): Record<string, string> {
-  const proxy = `http://127.0.0.1:${EGRESS_PORT}`;
-  const rewrites: [string, string][] = [["https://", EGRESS_GIT_BASE],
-    ...SSH_HOSTS.flatMap((host): [string, string][] => [[`git@${host}:`, `${EGRESS_GIT_BASE}${host}/`], [`ssh://git@${host}/`, `${EGRESS_GIT_BASE}${host}/`]])];
+export function egressEnvironment(sessionBranch?: string, endpoint?: EgressEndpoint, caBundle = CA_BUNDLE): Record<string, string> {
+  const proxy = endpoint ? endpointUrl(endpoint) : `http://127.0.0.1:${EGRESS_PORT}`;
+  const base = `${proxy}/git/`;
+  const rewrites: [string, string][] = [["https://", base],
+    ...SSH_HOSTS.flatMap((host): [string, string][] => [[`git@${host}:`, `${base}${host}/`], [`ssh://git@${host}/`, `${base}${host}/`]])];
   const config: Record<string, string> = { GIT_CONFIG_COUNT: String(rewrites.length) };
   rewrites.forEach(([from, to], index) => {
     config[`GIT_CONFIG_KEY_${index}`] = `url.${to}.insteadOf`;
@@ -99,11 +106,31 @@ export function egressEnvironment(sessionBranch?: string): Record<string, string
     NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1",
     NODE_USE_ENV_PROXY: "1",
     // The host's trusted certificates, mounted read-only at CA_BUNDLE, for HTTPS through the proxy's tunnels.
-    ...Object.fromEntries(CA_BUNDLE_VARIABLES.map(name => [name, CA_BUNDLE])),
+    ...Object.fromEntries(CA_BUNDLE_VARIABLES.map(name => [name, caBundle])),
     PISTEAD_EGRESS_STATUS: `${proxy}/__pistead/status`,
     ...(sessionBranch ? { PISTEAD_SESSION_BRANCH: sessionBranch } : {}),
     ...config,
   };
+}
+
+/**
+ * Where a sandbox that shares the host's network reaches its session's proxy: a loopback port and the session's token,
+ * which clients send as Basic credentials (`pistead:<token>`), named in the proxy URL so curl, Git, Node and Python
+ * send them as they are.
+ */
+export interface EgressEndpoint { port: number; token: string }
+export const EGRESS_USER = "pistead";
+export function endpointUrl(endpoint: EgressEndpoint): string {
+  return `http://${EGRESS_USER}:${endpoint.token}@127.0.0.1:${endpoint.port}`;
+}
+
+/** Whether `header` (Authorization or Proxy-Authorization) carries this session's token. */
+export function egressAuthorized(header: string | undefined, token: string): boolean {
+  const match = /^Basic\s+([A-Za-z0-9+/=]{1,512})$/i.exec(header ?? "");
+  if (!match) return false;
+  const given = Buffer.from(Buffer.from(match[1]!, "base64").toString("utf8"));
+  const expected = Buffer.from(`${EGRESS_USER}:${token}`);
+  return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
 let directory: string | undefined;
@@ -252,6 +279,8 @@ export class EgressProxy {
   readonly #sockets = new Set<Socket | Duplex>();
   readonly #pushes = new Set<Promise<void>>();
   #server: Server | undefined;
+  #tcpServer: Server | undefined;
+  #port: number | undefined;
   #grant: { value: EgressGrant; at: number } | undefined;
   #refresh: Promise<EgressGrant> | undefined;
 
@@ -261,32 +290,83 @@ export class EgressProxy {
   }
 
   async start(): Promise<void> {
-    if (this.#server) return;
-    await rm(this.socketPath, { force: true });
-    const server = createServer((request, response) => { void this.#request(request, response); });
-    server.on("connect", (request: IncomingMessage, socket: Duplex, head: Buffer) => { void this.#tunnel(request, socket, head); });
-    server.on("clientError", (_error, socket) => socket.destroy());
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(this.socketPath, () => { server.off("error", reject); resolve(); });
+    if (this.#server || this.#tcpServer) return;
+    const tcp = this.#options.tcp;
+    // A sandbox with its own network reaches the proxy through its socket; one sharing the host's, only through its port.
+    if (!tcp) {
+      await rm(this.socketPath, { force: true });
+      const server = this.#createServer(undefined);
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(this.socketPath, () => { server.off("error", reject); resolve(); });
+      });
+      this.#server = server;
+    } else {
+      const listener = this.#createServer(tcp.token);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          listener.once("error", reject);
+          // An ephemeral port on loopback only; the sandbox is told which (endpoint).
+          listener.listen({ host: "127.0.0.1", port: 0 }, () => { listener.off("error", reject); resolve(); });
+        });
+      } catch (error) {
+        await this.close();
+        throw error;
+      }
+      this.#port = (listener.address() as { port: number }).port;
+      this.#tcpServer = listener;
+    }
+  }
+
+  /** The loopback endpoint of a proxy started with `tcp`, once it listens. */
+  get endpoint(): EgressEndpoint | undefined {
+    return this.#port !== undefined && this.#options.tcp ? { port: this.#port, token: this.#options.tcp.token } : undefined;
+  }
+
+  /** A server for the session's socket (`token` undefined: only its sandbox can reach it) or its loopback port. */
+  #createServer(token: string | undefined): Server {
+    const server = createServer((request, response) => {
+      if (token !== undefined && !egressAuthorized(request.headers.authorization ?? request.headers["proxy-authorization"], token)) {
+        // Absolute-form (proxy) requests ask for proxy credentials; Git asks for the /git/ endpoint's like a forge's.
+        const proxied = /^[a-z]+:/i.test(request.url ?? "");
+        response.writeHead(proxied ? 407 : 401, { [proxied ? "Proxy-Authenticate" : "WWW-Authenticate"]: 'Basic realm="Pistead egress"',
+          "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", Connection: "close" });
+        response.end("This session's egress proxy needs its credentials, which are in HTTPS_PROXY\n");
+        return;
+      }
+      void this.#request(request, response);
     });
+    server.on("connect", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+      if (token !== undefined && !egressAuthorized(request.headers["proxy-authorization"], token)) {
+        socket.on("error", () => socket.destroy());
+        socket.end("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Pistead egress\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+      }
+      void this.#tunnel(request, socket, head);
+    });
+    server.on("clientError", (_error, socket) => socket.destroy());
     // A push's request is its whole pack, which may take longer to send than Node's default allows.
     server.requestTimeout = 60 * 60 * 1000;
     // Open connections keep the process alive while they last; an idle proxy never does.
     server.unref();
-    this.#server = server;
+    return server;
   }
 
   async close(): Promise<void> {
     const server = this.#server;
     this.#server = undefined;
+    const tcp = this.#tcpServer;
+    this.#tcpServer = undefined;
+    this.#port = undefined;
+    const tcpClosed = tcp && new Promise<void>(resolve => tcp.close(() => resolve()));
     // No new requests; a push under way finishes before its connection goes, as the forge may take it and Git must hear
     // how it went. The relay's own time limit bounds the wait.
     const closed = server && new Promise<void>(resolve => server.close(() => resolve()));
     await Promise.allSettled([...this.#pushes]);
     for (const socket of this.#sockets) socket.destroy();
     if (server) { server.closeAllConnections(); await closed; }
-    await rm(this.socketPath, { force: true });
+    if (tcp) { tcp.closeAllConnections(); await tcpClosed; }
+    if (!this.#options.tcp) await rm(this.socketPath, { force: true });
   }
 
   /** The session's current grant, as the proxy enforces it. */
@@ -407,7 +487,8 @@ export class EgressProxy {
       try { url = new URL(request.url ?? "/", "http://127.0.0.1"); }
       catch { return refuse(response, 400, "Invalid request"); }
       // Absolute-form requests are plain-HTTP proxying, except to the proxy's own address (a client that ignored NO_PROXY).
-      if (/^[a-z]+:/i.test(request.url ?? "") && url.host !== `127.0.0.1:${EGRESS_PORT}` && url.host !== `localhost:${EGRESS_PORT}`) {
+      const port = this.#port ?? EGRESS_PORT;
+      if (/^[a-z]+:/i.test(request.url ?? "") && url.host !== `127.0.0.1:${port}` && url.host !== `localhost:${port}`) {
         this.#record({ kind: "http", target: `${url.protocol}//${url.host}`.slice(0, 300), outcome: "refused", reason: "plain HTTP" });
         return refuse(response, 403, "Plain HTTP is not allowed through the Pistead egress proxy; use HTTPS");
       }
@@ -432,7 +513,7 @@ export class EgressProxy {
       ...(error ? { error } : {}),
       repositories: grant?.repositories.map(repository => bindingRemote(repository)) ?? [],
       lfs: grant?.repositories.filter(repository => repository.lfs).map(repository => bindingRemote(repository)) ?? [],
-      gitRemotes: `https:// remotes go through ${EGRESS_GIT_BASE}<host>/<path>; the workspace's repositories are read with the session owner's access`
+      gitRemotes: `https:// remotes go through ${this.#port === undefined ? EGRESS_GIT_BASE : `http://127.0.0.1:${this.#port}/git/`}<host>/<path>; the workspace's repositories are read with the session owner's access`
         + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : "")
         + ". The host fetches them from the forge itself when Pistead grants it a credential (\"direct\" in recent), else Pistead relays them",
       sessionBranch: this.#options.sessionBranch ?? null,
