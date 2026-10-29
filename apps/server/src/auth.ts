@@ -163,12 +163,18 @@ export async function newSession(env: Env, userId: string, kind: 'github' | 'tes
   const token = randomToken();
   const csrfToken = randomToken();
   const tokenHash = await sha256(token);
-  const sql = `INSERT INTO auth_sessions (token_hash, user_id, csrf_token, expires_at, created_at, client, device_id, device_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+  const columns = '(token_hash, user_id, csrf_token, expires_at, created_at, client, device_id, device_name)';
+  const sql = `INSERT INTO auth_sessions ${columns} VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
   const values: SqlValue[] = [tokenHash, userId, csrfToken, expiresAt, new Date(issuedAt).toISOString(),
     native ? 'native' : 'browser', native ? id() : null, native?.deviceName ?? null];
-  // `sql` and `values` let a caller insert it inside its own transaction.
-  return { token, expiresAt, sql, values, statement: env.DB.query(sql).bind(...values) };
+  return {
+    token, expiresAt,
+    // `sql` and `values` let a caller insert it inside its own transaction.
+    sql, values, statement: env.DB.query(sql).bind(...values),
+    /** The insert, made only while `condition` (SQL, with `conditionValues`) holds as it runs. */
+    statementWhere: (condition: string, ...conditionValues: SqlValue[]) =>
+      env.DB.query(`INSERT INTO auth_sessions ${columns} SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${condition}`).bind(...values, ...conditionValues),
+  };
 }
 
 export function sessionCookie(c: AppContext, session: { token: string; expiresAt: number }): void {

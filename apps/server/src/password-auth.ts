@@ -3,7 +3,7 @@ import type { Hono } from 'hono';
 import { isInstanceAdmin } from './admin.js';
 import { authenticate, csrfGuard, dbResult, newSession, ownProfile, privateResponse, safeText, sessionCookie, SUSPENDED } from './auth.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
-import { auditStatement, getUser } from './db.js';
+import { auditAfterChange, getUser } from './db.js';
 import { ConstraintError, type Database } from './db/types.js';
 import { fail, id, jsonObject, now, PASSWORD_USERNAME, passwordAuthEnabled, requireOrigin, signupMode } from './http.js';
 import { joinRequestStatement, requireInvitedWorkspace } from './workspace-invites.js';
@@ -21,6 +21,8 @@ import type { AppContext, Env, UserRow, WorkerEnv } from './types.js';
 
 const PASSWORD_MIN = 12;
 const PASSWORD_MAX = 256;
+/** The longest password accepted as typed (UTF-16 code units), before NFKC: room for composing characters. */
+const RAW_PASSWORD_MAX = PASSWORD_MAX * 4;
 /** scrypt with 32 MiB per hash (N=2^15, r=8): about 50-100 ms of one CPU, and too costly to try offline at scale. */
 const SCRYPT = { N: 32768, r: 8, p: 1, keyLength: 32, saltLength: 16 } as const;
 const SCRYPT_MAXMEM = 64 * 1024 * 1024;
@@ -83,11 +85,16 @@ export async function verifyPassword(password: string, stored: string): Promise<
   return timingSafeEqual(key, expected);
 }
 
+/** `make`'s result, made once it succeeds: a failure (a busy server, say) is forgotten, so the next call makes it again. */
+export function onceSucceeded<T>(make: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | undefined;
+  return () => pending ??= make().catch(error => { pending = undefined; throw error; });
+}
+
 /** Spends a hash's time on a sign-in with no account, so its answer doesn't say the username is free. */
-let decoy: Promise<string> | undefined;
+const decoyHash = onceSucceeded(() => hashPassword(randomBytes(32).toString('base64url')));
 async function decoyVerify(password: string): Promise<void> {
-  decoy ??= hashPassword(randomBytes(32).toString('base64url'));
-  await verifyPassword(password, await decoy);
+  await verifyPassword(password, await decoyHash());
 }
 
 function requireEnabled(env: Env): void {
@@ -108,19 +115,25 @@ export function passwordUsername(value: unknown): string {
   return result;
 }
 
-/** A new password: long enough, and not the username. Any characters are allowed, spaces too. */
+/**
+ * A new password: long enough, and not the username, both judged as it is hashed (NFKC), so a fullwidth copy of the
+ * username or combining characters that compose into fewer don't pass. Any characters are allowed, spaces too.
+ */
 export function newPassword(value: unknown, name: string): string {
   if (typeof value !== 'string') fail(400, 'invalid_password', 'Enter a password.');
-  const length = [...value].length;
+  // Bounded before normalizing, which can lengthen text.
+  if (value.length > RAW_PASSWORD_MAX) fail(400, 'invalid_password', `Use a password of at most ${PASSWORD_MAX} characters.`);
+  const password = normalized(value);
+  const length = [...password].length;
   if (length < PASSWORD_MIN) fail(400, 'weak_password', `Use a password of at least ${PASSWORD_MIN} characters.`);
   if (length > PASSWORD_MAX) fail(400, 'invalid_password', `Use a password of at most ${PASSWORD_MAX} characters.`);
-  if (value.trim().toLowerCase() === name) fail(400, 'weak_password', 'Use a password other than your username.');
-  return value;
+  if (password.trim().toLowerCase() === name) fail(400, 'weak_password', 'Use a password other than your username.');
+  return password;
 }
 
 /** A password typed to sign in, bounded before it is hashed. */
 function typedPassword(value: unknown): string {
-  if (typeof value !== 'string' || !value || [...value].length > PASSWORD_MAX) fail(401, 'invalid_credentials', INCORRECT);
+  if (typeof value !== 'string' || !value || value.length > RAW_PASSWORD_MAX) fail(401, 'invalid_credentials', INCORRECT);
   return value;
 }
 
@@ -236,10 +249,14 @@ async function signIn(c: AppContext) {
   // Only a correct password says the account is suspended.
   if (row.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   const session = await newSession(c.env, row.user_id, 'password');
-  await dbResult(c.env.DB.batch([
-    c.env.DB.query('UPDATE password_credentials SET failed_attempts = 0, locked_until = NULL WHERE user_id = ?').bind(row.user_id),
-    session.statement,
+  // Only while the password checked above is still the account's: a reset or change that landed while it was being
+  // hashed signs the account out everywhere, and this sign-in must not outlive it.
+  const [cleared, created] = await dbResult(c.env.DB.batch([
+    c.env.DB.query('UPDATE password_credentials SET failed_attempts = 0, locked_until = NULL WHERE user_id = ? AND password_hash = ?')
+      .bind(row.user_id, row.password_hash),
+    session.statementWhere('EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ? AND password_hash = ?)', row.user_id, row.password_hash),
   ]));
+  if (cleared!.changes !== 1 || created!.changes !== 1) fail(401, 'invalid_credentials', INCORRECT);
   sessionCookie(c, session);
   const user = await dbResult(getUser(c.env, row.user_id));
   if (!user) fail(401, 'unauthorized', 'Authentication is required.');
@@ -258,18 +275,24 @@ async function changePassword(c: AppContext) {
   const locked = lockedFor(row);
   if (locked) failLocked(locked);
   const password = newPassword(body.newPassword, auth.userId.slice('password:'.length));
-  if (typeof body.currentPassword !== 'string' || [...body.currentPassword].length > PASSWORD_MAX || !await verifyPassword(body.currentPassword, row.password_hash)) {
+  if (typeof body.currentPassword !== 'string' || body.currentPassword.length > RAW_PASSWORD_MAX || !await verifyPassword(body.currentPassword, row.password_hash)) {
     // A stolen browser session can't guess its way to the password either.
     await recordFailure(c.env, auth.userId);
     fail(403, 'invalid_credentials', 'The current password is incorrect.');
   }
   const hash = await hashPassword(password);
-  await dbResult(c.env.DB.batch([
-    c.env.DB.query('UPDATE password_credentials SET password_hash = ?, failed_attempts = 0, locked_until = NULL, updated_at = ? WHERE user_id = ?')
-      .bind(hash, now(), auth.userId),
-    c.env.DB.query('DELETE FROM auth_sessions WHERE user_id = ? AND token_hash <> ?').bind(auth.userId, auth.tokenHash),
-    auditStatement(c.env, auth.userId, 'account.password.changed'),
+  // Only from the password checked above, and while this browser is still signed in: a reset, another change or a
+  // sign-out that landed while hashing wins, rather than being overwritten.
+  const [changed] = await dbResult(c.env.DB.batch([
+    c.env.DB.query(`UPDATE password_credentials SET password_hash = ?, failed_attempts = 0, locked_until = NULL, updated_at = ?
+      WHERE user_id = ? AND password_hash = ? AND EXISTS (SELECT 1 FROM auth_sessions WHERE token_hash = ? AND user_id = ?)`)
+      .bind(hash, now(), auth.userId, row.password_hash, auth.tokenHash, auth.userId),
+    auditAfterChange(c.env, auth.userId, 'account.password.changed', null, {}),
+    // The new hash is salted, so it is there only if this change landed.
+    c.env.DB.query(`DELETE FROM auth_sessions WHERE user_id = ? AND token_hash <> ?
+      AND EXISTS (SELECT 1 FROM password_credentials WHERE user_id = ? AND password_hash = ?)`).bind(auth.userId, auth.tokenHash, auth.userId, hash),
   ]));
+  if (changed!.changes !== 1) fail(409, 'password_changed', 'Your password was changed or reset meanwhile, or this browser was signed out. Sign in again.');
   return c.json({ ok: true });
 }
 

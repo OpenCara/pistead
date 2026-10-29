@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { app } from "../apps/server/src/index.js";
-import { hashPassword, verifyPassword } from "../apps/server/src/password-auth.js";
+import { hashPassword, onceSucceeded, verifyPassword } from "../apps/server/src/password-auth.js";
 import type { Env } from "../apps/server/src/types.js";
 import type { UserProfile } from "../packages/shared/src/types.js";
 import { testDatabase } from "./helpers/control-plane.js";
@@ -10,7 +10,7 @@ const origin = "http://localhost:8787";
 const password = "correct horse battery";
 
 async function fixture(t: TestContext, overrides: Partial<Env> = {}) {
-  const { db, sqlite } = await testDatabase();
+  const { db, sqlite, setBeforeQuery } = await testDatabase();
   t.after(() => db.close());
   // Test mode only allows plain HTTP on localhost; password accounts work without it.
   const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: "true", TEST_AUTH_SECRET: "password-auth-test-secret-not-for-deployment",
@@ -41,7 +41,7 @@ async function fixture(t: TestContext, overrides: Partial<Env> = {}) {
     const { link: { url } } = await link.json() as { link: { url: string } };
     return { id, owner, token: url.split("#/join/")[1]! };
   }
-  return { env, sqlite, request, cookieOf, signUp, signIn, browser, invitingWorkspace };
+  return { env, sqlite, request, cookieOf, signUp, signIn, browser, invitingWorkspace, setBeforeQuery };
 }
 
 async function errorCode(response: Response): Promise<string> {
@@ -305,4 +305,93 @@ test("open sign-up through an invite link also asks to join its workspace", asyn
   const { id, token } = await f.invitingWorkspace();
   assert.equal((await f.signUp({ username: "pat", password, inviteToken: token })).status, 201);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM workspace_join_requests WHERE workspace_id = ? AND user_id = 'password:pat'").get(id)!.n, 1);
+});
+
+/**
+ * Runs `reset` (synchronously, as the operator's --reset-password lands) once, just before a statement starting with
+ * `prefix` is built: after the request checked the password, before its final write.
+ */
+function resetBefore(f: { setBeforeQuery(hook?: (sql: string) => void): void }, prefix: string, reset: () => void) {
+  let done = false;
+  f.setBeforeQuery(sql => {
+    if (done || !sql.trimStart().startsWith(prefix)) return;
+    done = true;
+    reset();
+  });
+}
+
+test("a sign-in whose password was reset while it was being checked creates no session", async t => {
+  const f = await fixture(t);
+  await f.signUp({ username: "quinn", password });
+  const replacement = await hashPassword("the operator's new passphrase");
+  resetBefore(f, "UPDATE password_credentials SET failed_attempts = 0", () => {
+    f.sqlite.prepare("UPDATE password_credentials SET password_hash = ? WHERE user_id = 'password:quinn'").run(replacement);
+    f.sqlite.prepare("DELETE FROM auth_sessions WHERE user_id = 'password:quinn'").run();
+  });
+  const late = await f.signIn("quinn", password);
+  assert.equal(late.status, 401);
+  assert.equal(late.headers.get("set-cookie"), null);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM auth_sessions WHERE user_id = 'password:quinn'").get()!.n, 0);
+  f.setBeforeQuery();
+  assert.equal((await f.signIn("quinn", "the operator's new passphrase")).status, 200);
+});
+
+test("a password change doesn't overwrite a reset that landed while it was hashing, nor outlive its own sign-out", async t => {
+  const f = await fixture(t);
+  const cookie = f.cookieOf(await f.signUp({ username: "riley", password }));
+  const replacement = await hashPassword("the operator's new passphrase");
+  const headers = await f.browser(cookie);
+  resetBefore(f, "UPDATE password_credentials SET password_hash", () => {
+    f.sqlite.prepare("UPDATE password_credentials SET password_hash = ? WHERE user_id = 'password:riley'").run(replacement);
+  });
+  const raced = await f.request("POST", "/api/me/password", { headers, body: { currentPassword: password, newPassword: "the user's own new passphrase" } });
+  assert.equal(raced.status, 409);
+  assert.equal(await errorCode(raced), "password_changed");
+  f.setBeforeQuery();
+  assert.equal((await f.signIn("riley", "the user's own new passphrase")).status, 401);
+  assert.equal((await f.signIn("riley", "the operator's new passphrase")).status, 200);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'account.password.changed'").get()!.n, 0);
+
+  // Signed out (this browser's session removed) while hashing: the change doesn't land either.
+  const fresh = f.cookieOf(await f.signIn("riley", "the operator's new passphrase"));
+  const freshHeaders = await f.browser(fresh);
+  resetBefore(f, "UPDATE password_credentials SET password_hash", () => {
+    f.sqlite.prepare("DELETE FROM auth_sessions WHERE user_id = 'password:riley'").run();
+  });
+  const signedOut = await f.request("POST", "/api/me/password", { headers: freshHeaders, body: { currentPassword: "the operator's new passphrase", newPassword: "the user's own new passphrase" } });
+  assert.equal(signedOut.status, 409);
+  f.setBeforeQuery();
+  assert.equal((await f.signIn("riley", "the operator's new passphrase")).status, 200);
+});
+
+test("password rules judge the password as it is hashed: a fullwidth username or composing characters don't slip through", async t => {
+  const f = await fixture(t);
+  // NFKC turns fullwidth letters into ASCII, so this is the username.
+  const fullwidth = await f.signUp({ username: "samuelson", password: "\uff53\uff41\uff4d\uff55\uff45\uff4c\uff53\uff4f\uff4e" });
+  assert.equal(await errorCode(fullwidth), "weak_password");
+  // Fourteen code points that compose into seven characters.
+  const composed = await f.signUp({ username: "samuelson", password: "e\u0301".repeat(7) });
+  assert.equal(await errorCode(composed), "weak_password");
+  // Twelve composed characters typed as 24 code points pass, and sign in typed either way.
+  const accented = "e\u0301".repeat(12);
+  assert.equal((await f.signUp({ username: "samuelson", password: accented })).status, 201);
+  assert.equal((await f.signIn("samuelson", accented)).status, 200);
+  assert.equal((await f.signIn("samuelson", "\u00e9".repeat(12))).status, 200);
+  // A password of 256 characters typed as 512 code points still signs in.
+  const longest = "e\u0301".repeat(256);
+  assert.equal((await f.signUp({ username: "longest", password: longest })).status, 201);
+  assert.equal((await f.signIn("longest", longest)).status, 200);
+});
+
+test("a cached value that failed to be made is made again next time", async () => {
+  let attempts = 0;
+  const value = onceSucceeded(async () => {
+    attempts++;
+    if (attempts === 1) throw new Error("busy");
+    return "made";
+  });
+  await assert.rejects(value(), /busy/);
+  assert.equal(await value(), "made");
+  assert.equal(await value(), "made");
+  assert.equal(attempts, 2);
 });
