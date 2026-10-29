@@ -10,3 +10,5 @@ CREATE TABLE password_credentials (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+ALTER TABLE oauth_states ADD COLUMN invite_token_hash TEXT;

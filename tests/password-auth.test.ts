@@ -15,7 +15,7 @@ async function fixture(t: TestContext, overrides: Partial<Env> = {}) {
   // Test mode only allows plain HTTP on localhost; password accounts work without it.
   const env: Env = { DB: db, APP_ORIGIN: origin, TEST_AUTH_ENABLED: "true", TEST_AUTH_SECRET: "password-auth-test-secret-not-for-deployment",
     TEST_AUTH_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(), RUNNER_SHARED_SECRET: "r".repeat(43),
-    VAULT_KEY: Buffer.alloc(32, 7).toString("base64url"), PASSWORD_AUTH: "true", PASSWORD_SIGNUP: "open", ...overrides };
+    VAULT_KEY: Buffer.alloc(32, 7).toString("base64url"), PASSWORD_AUTH: "true", SIGNUP: "open", ...overrides };
   const request = (method: string, path: string, init: { headers?: Record<string, string>; body?: unknown } = {}) =>
     app.request(path, { method, headers: { ...(init.body === undefined ? {} : { "Content-Type": "application/json" }), ...init.headers },
       body: init.body === undefined ? undefined : JSON.stringify(init.body) }, env);
@@ -243,7 +243,7 @@ test("workspace owners add a password account as a member by its user ID", async
 });
 
 test("by default sign-up needs a workspace's invite link, and files the request to join with the account", async t => {
-  const f = await fixture(t, { PASSWORD_SIGNUP: undefined });
+  const f = await fixture(t, { SIGNUP: undefined });
   const health = await (await f.request("GET", "/api/health")).json() as { passwordSignup: string };
   assert.equal(health.passwordSignup, "invite");
   const uninvited = await f.signUp({ username: "kim", password });
@@ -272,7 +272,7 @@ test("by default sign-up needs a workspace's invite link, and files the request 
 });
 
 test("an invite link whose workspace has a full queue creates no account", async t => {
-  const f = await fixture(t, { PASSWORD_SIGNUP: "invite" });
+  const f = await fixture(t, { SIGNUP: "invite" });
   const { id, token } = await f.invitingWorkspace();
   const insertUser = f.sqlite.prepare("INSERT INTO users (id, display_name, git_name, git_email, auth_kind, created_at) VALUES (?, 'W', 'W', 'w@example.test', 'test', '2026-01-01')");
   const insertRequest = f.sqlite.prepare("INSERT INTO workspace_join_requests (workspace_id, user_id, created_at) VALUES (?, ?, '2026-01-01')");
@@ -287,11 +287,11 @@ test("an invite link whose workspace has a full queue creates no account", async
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM users WHERE id = 'password:mia'").get()!.n, 0);
 });
 
-test("with PASSWORD_SIGNUP=off nobody signs up, invited or not, and existing accounts still sign in", async t => {
+test("with SIGNUP=off nobody signs up, invited or not, and existing accounts still sign in", async t => {
   const f = await fixture(t);
   assert.equal((await f.signUp({ username: "nina", password })).status, 201);
   const { token } = await f.invitingWorkspace();
-  f.env.PASSWORD_SIGNUP = "off";
+  f.env.SIGNUP = "off";
   for (const body of [{ username: "omar", password }, { username: "omar", password, inviteToken: token }]) {
     const response = await f.signUp(body);
     assert.equal(response.status, 403);

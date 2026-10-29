@@ -16,10 +16,13 @@ async function passwordRequest(path: string, body: Record<string, string>): Prom
 }
 
 /**
- * `signup` is the server's PASSWORD_SIGNUP: with `invite`, only someone who opened a workspace's invite link
+ * `signup` is what the server's SIGNUP means for passwords: with `invite`, only someone who opened a workspace's invite link
  * (`inviteToken`) can create an account, which asks to join that workspace as well.
  */
-export function PasswordSignIn({ signedIn, signup, inviteToken }: { signedIn: () => void; signup: "open" | "invite" | "off"; inviteToken?: string }) {
+/** Who may create an account with a method, as /api/health reports it (the server's SIGNUP). */
+export type SignupMode = "open" | "invite" | "off";
+
+export function PasswordSignIn({ signedIn, signup, inviteToken }: { signedIn: () => void; signup: SignupMode; inviteToken?: string }) {
   const canSignUp = signup === "open" || (signup === "invite" && inviteToken !== undefined);
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [username, setUsername] = useState("");
@@ -63,6 +66,5 @@ export function PasswordSignIn({ signedIn, signup, inviteToken }: { signedIn: ()
       {signingUp ? "Have an account? Sign in" : "New here? Create an account"}
     </Button>}
     {signingUp && inviteToken !== undefined && <p className="field-hint">Creating an account asks to join the workspace that invited you. An owner or admin accepts you before you can see anything in it.</p>}
-    {!canSignUp && signup === "invite" && <p className="field-hint">New here? Open the invite link a workspace owner or admin shared with you to create an account.</p>}
   </form>;
 }

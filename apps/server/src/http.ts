@@ -65,6 +65,18 @@ export const PASSWORD_USER_ID = /^password:[a-z0-9][a-z0-9_-]{2,38}$/;
 export function passwordAuthEnabled(env: Env): boolean {
   return env.PASSWORD_AUTH === 'true' && !localMode(env);
 }
+/**
+ * Who may create an account with a sign-in method (SIGNUP): `open` anyone who reaches the server, `invite` only someone
+ * holding a workspace's current invite link, whose request to join it is filed with the account, `off` nobody (the
+ * operator still creates password accounts with --create-admin, and ADMIN_USER_IDS's GitHub accounts always sign up).
+ * Unset, GitHub stays open as it always was, and passwords take invitations.
+ */
+export type SignupMode = 'open' | 'invite' | 'off';
+export const signupModes: readonly SignupMode[] = ['open', 'invite', 'off'];
+export function signupMode(env: Env, method: 'github' | 'password'): SignupMode {
+  if (signupModes.includes(env.SIGNUP as SignupMode)) return env.SIGNUP as SignupMode;
+  return method === 'github' ? 'open' : 'invite';
+}
 export function now(): string { return new Date().toISOString(); }
 export function id(): string { return crypto.randomUUID(); }
 export function testMode(env: Env): boolean {

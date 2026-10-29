@@ -30,3 +30,7 @@ CREATE TABLE password_credentials (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- A GitHub sign-in started from a workspace's invite link (SIGNUP=invite): the link token's SHA-256, so a new account
+-- is created only while that link is on, and asks to join its workspace.
+ALTER TABLE oauth_states ADD COLUMN invite_token_hash TEXT;

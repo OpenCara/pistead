@@ -5,13 +5,13 @@ import { authenticate, csrfGuard, dbResult, newSession, ownProfile, privateRespo
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { auditStatement, getUser } from './db.js';
 import { ConstraintError, type Database } from './db/types.js';
-import { fail, id, jsonObject, now, PASSWORD_USERNAME, passwordAuthEnabled, requireOrigin } from './http.js';
+import { fail, id, jsonObject, now, PASSWORD_USERNAME, passwordAuthEnabled, requireOrigin, signupMode } from './http.js';
 import { joinRequestStatement, requireInvitedWorkspace } from './workspace-invites.js';
 import type { AppContext, Env, UserRow, WorkerEnv } from './types.js';
 
 /**
  * Username and password accounts, for servers whose operator sets PASSWORD_AUTH=true: people sign up as
- * `password:<username>` and sign in with that username. Who may sign up is PASSWORD_SIGNUP's choice (signupMode): by
+ * `password:<username>` and sign in with that username. Who may sign up is SIGNUP's choice (http.ts signupMode): by
  * default only someone holding a workspace's invite link, whose request to join that workspace is filed with the account.
  * The operator creates accounts from the command line as well (password-accounts-cli.ts). They are full accounts that
  * sign in with a cookie like GitHub's, but hold no GitHub token: github.com repositories need a GitHub sign-in, and other
@@ -33,15 +33,6 @@ const HASH_CONCURRENCY = 4;
 const HASH_QUEUE = 64;
 const FIELDS = ['username', 'password', 'displayName', 'inviteToken'] as const;
 
-/**
- * Who may sign up: `invite` (the default) only with a workspace's current invite link, `open` anyone who reaches the
- * server, `off` nobody (the operator still creates accounts from the command line).
- */
-export type SignupMode = 'open' | 'invite' | 'off';
-export const signupModes: readonly SignupMode[] = ['open', 'invite', 'off'];
-export function signupMode(env: Env): SignupMode {
-  return signupModes.includes(env.PASSWORD_SIGNUP as SignupMode) ? env.PASSWORD_SIGNUP as SignupMode : 'invite';
-}
 const INCORRECT = 'The username or password is incorrect.';
 
 function scrypt(password: string, salt: Buffer, keyLength: number, options: ScryptOptions): Promise<Buffer> {
@@ -175,7 +166,7 @@ class SignupRefused extends Error {}
 async function signUp(c: AppContext) {
   requireEnabled(c.env);
   requireOrigin(c);
-  const mode = signupMode(c.env);
+  const mode = signupMode(c.env, 'password');
   if (mode === 'off') fail(403, 'signup_closed', 'This server doesn\'t take new accounts. Ask its operator for one.');
   const body = await jsonObject(c, 4096);
   input(body, FIELDS);
