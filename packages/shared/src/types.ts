@@ -37,6 +37,8 @@ export interface UserProfile {
   githubConnected: boolean;
   /** Present on the signed-in user's own profile when the server lists them in ADMIN_USER_IDS. */
   instanceAdmin?: true;
+  /** Present on the signed-in user's own profile when they sign in with a username and password instead of GitHub. */
+  passwordSignIn?: true;
 }
 /** A native app (iOS, iPadOS, macOS) signed in as the user, listed so the user can revoke it from the web app. */
 export interface SignedInDevice {

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
+import { applySqliteMigrations } from './helpers/sqlite-migrations.js';
 
 const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const providerMigration = '0007_git_providers.sql';
@@ -10,11 +11,7 @@ const pins = JSON.stringify([{ bindingId: 'binding-1', repositoryId: 123, fullNa
   ref: 'main', commit: 'a'.repeat(40), path: 'Owner/Project' }]);
 
 function migrate(sqlite: DatabaseSync, files: string[]) {
-  for (const file of files) {
-    sqlite.exec('BEGIN');
-    try { sqlite.exec(readFileSync(new URL(file, directory), 'utf8')); sqlite.exec('COMMIT'); }
-    catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  }
+  applySqliteMigrations(sqlite, directory, files);
 }
 
 function fixture(t: TestContext) {

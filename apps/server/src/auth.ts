@@ -7,7 +7,7 @@ import type { NativeSignIn, SignedInDevice } from '../../../packages/shared/src/
 import { isInstanceAdmin } from './admin.js';
 import { getUser, userProfile } from './db.js';
 import type { Query, SqlValue } from './db/types.js';
-import { appOrigin, fail, id, identifier, jsonObject, localMode, now, randomToken, requireOrigin, testMode, text } from './http.js';
+import { appOrigin, fail, id, identifier, jsonObject, localMode, now, passwordAuthEnabled, randomToken, requireOrigin, testMode, text } from './http.js';
 import type { AppContext, AuthIdentity, Env, UserRow, WorkerEnv } from './types.js';
 import { assertVaultConfigured, encryptToken } from './vault.js';
 
@@ -25,7 +25,7 @@ const NATIVE_CALLBACK = 'pistead://auth';
 const VERIFIER = /^[A-Za-z0-9_-]{43,128}$/;
 const APP_STATE = /^[A-Za-z0-9_-]{16,128}$/;
 const PROFILE_FIELDS: Record<string, true> = { displayName: true, gitName: true, gitEmail: true, env: true };
-const SUSPENDED = 'This account is suspended. Ask the administrator of this Pistead server to restore it.';
+export const SUSPENDED = 'This account is suspended. Ask the administrator of this Pistead server to restore it.';
 
 function cookies(env: Env) {
   const secure = new URL(appOrigin(env)).protocol === 'https:';
@@ -43,7 +43,7 @@ function expireCookie(c: AppContext, kind: 'auth' | 'state' | 'claim'): void {
   setCookie(c, config[kind], '', { ...config.options, maxAge: 0, expires: new Date(0) });
 }
 
-async function dbResult<T>(operation: Promise<T>): Promise<T> {
+export async function dbResult<T>(operation: Promise<T>): Promise<T> {
   try { return await operation; }
   catch { fail(503, 'auth_unavailable', 'Authentication storage is temporarily unavailable.'); }
 }
@@ -63,9 +63,12 @@ export const authenticate: MiddlewareHandler<WorkerEnv> = async (c, next) => {
     .bind(tokenHash).first());
   if (!session || session.client !== client || session.expires_at <= Date.now() || !Number.isSafeInteger(session.expires_at) ||
       !OPAQUE_TOKEN.test(session.csrf_token) ||
-      (session.auth_kind !== 'github' && session.auth_kind !== 'test') ||
+      (session.auth_kind !== 'github' && session.auth_kind !== 'test' && session.auth_kind !== 'password') ||
       (session.auth_kind === 'test' && (!testMode(c.env) || !session.user_id.startsWith('test:'))) ||
-      (session.auth_kind === 'github' && session.user_id.startsWith('test:'))) {
+      (session.auth_kind === 'github' && session.user_id.startsWith('test:')) ||
+      (session.auth_kind !== 'password' && session.user_id.startsWith('password:')) ||
+      // Turning PASSWORD_AUTH off ends password sign-ins at once, not when they expire.
+      (session.auth_kind === 'password' && (!passwordAuthEnabled(c.env) || !session.user_id.startsWith('password:')))) {
     if (client === 'browser') expireCookie(c, 'auth');
     fail(401, 'unauthorized', 'Authentication is required.');
   }
@@ -103,14 +106,14 @@ export const csrfGuard: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   await next();
 };
 
-const privateResponse: MiddlewareHandler<WorkerEnv> = async (c, next) => {
+export const privateResponse: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   c.header('Cache-Control', 'no-store');
   c.header('Pragma', 'no-cache');
   c.header('Referrer-Policy', 'no-referrer');
   await next();
 };
 
-function safeText(value: unknown, field: string, max: number): string {
+export function safeText(value: unknown, field: string, max: number): string {
   const result = text(value, field, max);
   if (!result.trim() || /[\u0000-\u001f\u007f]/.test(result)) fail(400, 'invalid_input', `Invalid ${field}.`);
   return result;
@@ -143,12 +146,13 @@ async function currentUser(c: AppContext): Promise<UserRow> {
 }
 
 /** The signed-in user's own profile, which also says whether they administer this server. */
-function ownProfile(env: Env, user: UserRow) {
-  return { ...userProfile(user), ...(isInstanceAdmin(env, user.id) ? { instanceAdmin: true as const } : {}) };
+export function ownProfile(env: Env, user: UserRow) {
+  return { ...userProfile(user), ...(isInstanceAdmin(env, user.id) ? { instanceAdmin: true as const } : {}),
+    ...(user.auth_kind === 'password' ? { passwordSignIn: true as const } : {}) };
 }
 
 /** A new sign-in. Native sessions are bearer tokens listed as devices under the app's `deviceName`. */
-async function newSession(env: Env, userId: string, kind: 'github' | 'test', native?: { deviceName: string | null }) {
+export async function newSession(env: Env, userId: string, kind: 'github' | 'test' | 'password', native?: { deviceName: string | null }) {
   const issuedAt = Date.now();
   let expiresAt = issuedAt + (native ? NATIVE_SESSION_TTL : SESSION_TTL);
   if (kind === 'test') {
@@ -166,7 +170,7 @@ async function newSession(env: Env, userId: string, kind: 'github' | 'test', nat
   };
 }
 
-function sessionCookie(c: AppContext, session: { token: string; expiresAt: number }): void {
+export function sessionCookie(c: AppContext, session: { token: string; expiresAt: number }): void {
   const config = cookies(c.env);
   setCookie(c, config.auth, session.token, {
     ...config.options, expires: new Date(session.expiresAt),

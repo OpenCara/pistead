@@ -52,10 +52,18 @@ export function identifier(value: unknown, field = 'id'): string {
 }
 export function userIdentifier(value: unknown, field = 'userId'): string {
   const result = text(value, field, 133);
-  if (!/^github:[1-9][0-9]*$/.test(result) && !/^test:[A-Za-z0-9_-]{1,128}$/.test(result)) {
+  if (!/^github:[1-9][0-9]*$/.test(result) && !/^test:[A-Za-z0-9_-]{1,128}$/.test(result) && !PASSWORD_USER_ID.test(result)) {
     fail(400, 'invalid_input', `Invalid ${field}.`);
   }
   return result;
+}
+/** A password account's username: lowercase, 3-39 letters, digits, `-` and `_`, starting with a letter or digit. */
+export const PASSWORD_USERNAME = /^[a-z0-9][a-z0-9_-]{2,38}$/;
+/** A password account's user ID, `password:<username>`. */
+export const PASSWORD_USER_ID = /^password:[a-z0-9][a-z0-9_-]{2,38}$/;
+/** Username and password sign-in and sign-up (password-auth.ts); never on a local server, which admits only its owner. */
+export function passwordAuthEnabled(env: Env): boolean {
+  return env.PASSWORD_AUTH === 'true' && !localMode(env);
 }
 export function now(): string { return new Date().toISOString(); }
 export function id(): string { return crypto.randomUUID(); }

@@ -8,6 +8,7 @@ import { AppProvider, useApp } from "./app-context";
 import { GitHubMark, Icon, Logo } from "./icons";
 import { JoinWorkspaceScreen, OwnJoinRequests, rememberInvite, takeRememberedInvite } from "./JoinWorkspaceScreen";
 import { NewSession } from "./NewSession";
+import { PasswordSignIn } from "./PasswordSignIn";
 import { NewWorkspaceSheet } from "./NewWorkspaceSheet";
 import { navigate, useRoute, type Route } from "./router";
 import { SessionScreen } from "./SessionScreen";
@@ -38,10 +39,13 @@ function title(route: Route): string {
 }
 
 function SignIn({ error, retry, invited }: { error: string; retry: () => void; invited?: boolean }) {
-  const health = useResource<{ githubConfigured?: boolean; localServer?: { claimed: boolean } }>("/api/health");
+  const health = useResource<{ githubConfigured?: boolean; passwordAuth?: boolean; localServer?: { claimed: boolean } }>("/api/health");
   const callbackError = new URLSearchParams(window.location.search).get("error");
   const problem = error || health.error || (callbackError ? `GitHub sign-in did not complete: ${callbackError.slice(0, 300)}` : "");
-  const unconfigured = health.data?.githubConfigured === false;
+  const githubUnconfigured = health.data?.githubConfigured === false;
+  const password = health.data?.passwordAuth === true;
+  // Without GitHub, a server that offers passwords still signs people in.
+  const unconfigured = githubUnconfigured && !password;
   const local = health.data?.localServer;
   return <div className="welcome">{skipLink}
     <main id="main-content" className="welcome-inner" tabIndex={-1}>
@@ -55,10 +59,13 @@ function SignIn({ error, retry, invited }: { error: string; retry: () => void; i
         : <Alert variant="warning" title="GitHub sign-in is not configured">The operator needs to configure the GitHub OAuth app, its callback URL and the server's GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET and VAULT_KEY settings.</Alert>)}
       {!unconfigured && local && !local.claimed && <Alert variant="info" title="Set up this Pistead" role="status">This Pistead runs on this computer and has no owner yet. Sign in with the link <code>pistead serve</code> printed when it started, or from the Pistead app, which opens it for you: your GitHub account becomes its owner, and the only one that can sign in.</Alert>}
       <div className="actions">
-        {!unconfigured && <a className="btn default lg" href="/api/auth/github"><GitHubMark />Continue with GitHub</a>}
+        {password && <PasswordSignIn signedIn={retry} />}
+        {password && !githubUnconfigured && <div className="sign-in-divider" role="separator">or</div>}
+        {!githubUnconfigured && <a className="btn default lg" href="/api/auth/github"><GitHubMark />Continue with GitHub</a>}
         {(problem || unconfigured) && <Button onClick={() => { retry(); health.refresh(); }}>Try again</Button>}
       </div>
-      <p className="welcome-footnote">Model credentials stay on your host. GitHub tokens stay on the server, or go only to your own hosts when you push with your account.</p>
+      <p className="welcome-footnote">Model credentials stay on your host. GitHub tokens stay on the server, or go only to your own hosts when you push with your account.
+        {password && !githubUnconfigured && " Repositories on github.com need the GitHub sign-in; a password account reaches other Git providers with their tokens."}</p>
     </main>
   </div>;
 }

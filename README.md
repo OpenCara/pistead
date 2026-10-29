@@ -87,7 +87,18 @@ To bring in teammates, they sign in once and send you their **User ID** from **S
 
 ### Signing in and your profile
 
-Pistead signs people in with GitHub only, and asks GitHub for the `read:user user:email repo workflow` scopes. That token is kept encrypted on the server and used to read your repositories, open your pull requests and act on GitHub for your sessions; it reaches a host only when a push uses your own account. A browser sign-in lasts 7 days, an app sign-in 30 days.
+Pistead signs people in with GitHub, and asks GitHub for the `read:user user:email repo workflow` scopes. That token is kept encrypted on the server and used to read your repositories, open your pull requests and act on GitHub for your sessions; it reaches a host only when a push uses your own account. A browser sign-in lasts 7 days, an app sign-in 30 days.
+
+#### Username and password
+
+Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a username and password, and anyone who can reach the server can create an account with **New here? Create an account**:
+
+- The username (3 to 39 letters, digits, `-` and `_`, not case-sensitive) makes your user ID, `password:<username>`, so teammates can add you to a workspace by it before you ever sign in. It can't be changed later.
+- Passwords are at least 12 characters, other than the username. The server keeps only a salted scrypt hash. After five wrong passwords in a row the account refuses sign-ins for 30 seconds, doubling with each further miss up to 15 minutes; a correct sign-in resets the count.
+- **Settings → Profile → Password** changes it, which signs out every other browser signed in as you. There is no password reset yet, by email or by an administrator: someone who forgets theirs signs up a new account.
+- A password account holds no GitHub token, so it can't bind or clone **github.com** repositories (not even ones a teammate bound: a session reads repositories with its owner's own access), push with its own GitHub account, or use the GitHub tools. It works with every other Git provider, GitHub Enterprise Server included, through personal access tokens under **Git accounts**. Its Git author email starts as `<username>@users.pistead.invalid`; set your own under **Identity**.
+- The iPhone, iPad and Mac apps still sign in with GitHub only.
+- Turning `PASSWORD_AUTH` off signs every password account out at once and refuses their sign-ins; turning it on again lets them back in.
 
 **Settings → Profile** holds:
 
@@ -712,11 +723,12 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |
+| `PASSWORD_AUTH` | off | `true` lets anyone who reaches the server sign up and sign in with a username and password (see [Username and password](#username-and-password)); not with `LOCAL_MODE` |
 | `LOCAL_MODE`, `LOCAL_CLAIM_SECRET` | off | A server for one person on their own computer, as `pistead serve` runs it: plain HTTP on loopback only, and only the GitHub account that signs in through `/api/auth/local/claim?token=LOCAL_CLAIM_SECRET` first (a base64url 32-byte value) can sign in |
 
 ### Administration
 
-The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890`); each person finds theirs under **Settings → Profile**. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
+The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890,password:alice`); each person finds theirs under **Settings → Profile**. A GitHub user ID is `github:` and the numeric ID GitHub gives the account, which `https://api.github.com/users/<login>` shows as `id` before anyone signs in. A password account's is `password:` and its username: nobody can sign up as one that `ADMIN_USER_IDS` lists, so create the account first and list it afterwards (listing it beforehand only reserves the name). The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
 
 - **Overview** counts accounts, workspaces, hosts (and how many are online) and sessions.
 - **Accounts**, **Workspaces** and **Hosts** list each one with its owner and how many members, repositories, hosts and sessions it has. They never show session titles, prompts, repository names, models, environment values or credentials.

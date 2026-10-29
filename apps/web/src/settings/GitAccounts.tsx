@@ -39,11 +39,16 @@ export function GitAccountsSection() {
   return <Section title="Git accounts"
     info="Repositories you bind or pin are read with these accounts, and the pull requests your agents ask for are opened with them. Tokens are encrypted on the server and never sent to other people's hosts. Where a workspace's push access uses the session owner's account, your own host receives yours in memory for each push in your sessions; Pistead resets your GitHub token when the push ends, so that copy stops working. Your sign-in stays GitHub; viewing a session, sharing a host or publishing an agent never grants access to your accounts."
     action={<Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add account</Button>}>
-    <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`} hint={user.githubLogin ? `@${user.githubLogin}` : undefined}
-      trailing={<>
-        <StatusBadge tone={user.githubConnected ? "success" : "warning"}>{user.githubConnected ? "Connected" : "Not connected"}</StatusBadge>
-        {!user.githubConnected && <LinkButton variant="outline" size="sm" href="/api/auth/github">Connect GitHub</LinkButton>}
-      </>} />
+    {/* Continuing with GitHub would sign in as a separate GitHub account, so a password account isn't offered it here. */}
+    {user.passwordSignIn
+      ? <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`}
+          hint="Repositories on github.com need an account that signs in with GitHub. This account signs in with a password; add accounts for other Git providers below."
+          trailing={<StatusBadge tone="warning">Not available</StatusBadge>} />
+      : <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`} hint={user.githubLogin ? `@${user.githubLogin}` : undefined}
+          trailing={<>
+            <StatusBadge tone={user.githubConnected ? "success" : "warning"}>{user.githubConnected ? "Connected" : "Not connected"}</StatusBadge>
+            {!user.githubConnected && <LinkButton variant="outline" size="sm" href="/api/auth/github">Connect GitHub</LinkButton>}
+          </>} />}
     <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
       {accounts?.filter(account => account.provider !== "github").map(account => <Row key={account.id} leading={<Icon name="git-branch" size={16} />}
         title={gitAccountLabel(account)} hint={account.login}
