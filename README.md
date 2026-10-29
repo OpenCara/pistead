@@ -225,7 +225,7 @@ A host offers the models matched by `enabledModels` in Pi's `settings.json` (the
 The host's owner and its [admins](#host-admins-and-host-command-grants) can also turn models off without touching the machine: under **Settings → Hosts →** the host **→ Models**, clear a model's **Enabled** box. Disabling a model applies to everyone who uses the host, the owner included, in every workspace, and takes effect at once:
 
 - It leaves every model picker, and no session starts from it or moves onto it. Only the host's **Models** section still lists it, to its owner and admins.
-- No message switches to it. Sessions already on it keep their history and continue on another model; while the host has a disabled model, each message names the model it runs on, as the apps always do, so a conversation still on a disabled model asks you to choose another.
+- No message switches to it. Sessions already on it keep their history and continue on another model; while the host has a disabled model, each message names the model it runs on, as the apps always do (scheduled prompts and messages between sessions name the conversation's current model), so a conversation still on a disabled model asks you to choose another.
 - A message already running on it when it is disabled runs to its end.
 
 The setting stays with the host until someone enables the model again, even if Pi on the host stops offering the model for a while. Disabling a model doesn't change Pi's own configuration on the host.
