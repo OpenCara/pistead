@@ -470,6 +470,8 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'non-boolean host configuration', value: { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: 'true' } }, code: 'invalid_manifest' },
     { name: 'unknown GPU device', value: { ...manifest, capabilities: { ...manifest.capabilities, gpu: 'cuda' } }, code: 'invalid_manifest' },
     { name: 'GPU lent by an unsandboxed host', value: { ...manifest, capabilities: { platform: 'darwin', sandbox: false, productionShell: false, unsandboxed: true, gpu: 'render' } }, code: 'invalid_manifest' },
+    { name: 'unbounded shell grants without host grants', value: { ...manifest, capabilities: { ...manifest.capabilities, hostCommands: true, unboundedShellGrants: true } }, code: 'invalid_manifest' },
+    { name: 'non-boolean unbounded shell grants', value: { ...manifest, capabilities: { ...manifest.capabilities, hostCommands: true, hostGrants: true, unboundedShellGrants: 'yes' } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -1229,7 +1231,8 @@ test('only the session owner answers a permission request, for one call or the s
     client.request('POST', `${path}/approvals/${id}`, { decision: 'approve', reviewHash: presented.get(id)!.reviewHash, ...body });
   await denied(await decide(s.admin, once.id, { scope: 'call' }), 403, 'owner_required');
   await denied(await decide(s.creator, once.id, { scope: 'forever' }), 400, 'invalid_decision');
-  // The creator's session runs on the host's machine, and only the host's owner can lift the limits it lacks.
+  // The creator's session runs on the host's machine, and only the host's owner, or a member they granted host commands,
+  // can lift the limits it lacks.
   await denied(await decide(s.creator, unlimited.id, {}), 403, 'host_owner_required');
   // A host command runs outside the sandbox, so each one is allowed for its own call only.
   await denied(await decide(s.creator, hostCommand.id, { scope: 'session' }), 400, 'invalid_decision');
@@ -1250,6 +1253,59 @@ test('only the session owner answers a permission request, for one call or the s
   // Only permission requests take a scope, and nobody can request a permission directly.
   await denied(await decide(s.admin, command.id, { scope: 'session' }), 400, 'invalid_decision');
   await denied(await s.creator.request('POST', `${path}/operations`, { kind: 'permission', tool: 'bash', target: '', needs: ['tool'] }), 400, 'invalid_operation');
+});
+
+test('a member granted host commands lets their commands run without the limits the host lacks, and only host command authority decides them', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'bash']);
+  // The workspace's owner may approve the creator's work here, but holds no host command grant.
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'approve'] }));
+  const path = `/api/sessions/${s.session.id}`;
+  const pending = (id: string, operation: Operation, extra: Partial<ApprovalRecord> = {}): ApprovalRecord => ({
+    id, sessionId: s.session.id, requestedBy: s.creator.user.id, operation, status: 'pending', createdAt: new Date().toISOString(), ...extra,
+  });
+  const unlimited = pending('permission-call-1', { kind: 'permission', tool: 'bash', target: 'make', needs: ['unbounded-shell'] });
+  const command = pending('tool-call-1', { kind: 'bash', command: 'make' }, { unbounded: true });
+  // A command within the host's limits is decided as before, by anyone with approve permission.
+  const bounded = pending('tool-call-2', { kind: 'bash', command: 'make check' });
+  let approvals = [unlimited, command, bounded];
+  const decisions: { approvalId: string; actorId: string }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const { admissionId } = JSON.parse(envelope.request.body) as { admissionId: string };
+      approvals = approvals.map(approval => ({ ...approval, admissionId }));
+      return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: true,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string };
+    decisions.push({ approvalId: input.approvalId, actorId: envelope.request.ticket.actorId });
+    const decided: ApprovalRecord = { ...approvals.find(approval => approval.id === input.approvalId)!, status: 'approved', decidedBy: envelope.request.ticket.actorId };
+    approvals = approvals.map(approval => approval.id === decided.id ? decided : approval);
+    return Response.json({ approval: decided });
+  });
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Build it', requestId: 'granted-shell' }), 202);
+  const presented = new Map((await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
+  assert.equal(presented.get(command.id)!.unbounded, true);
+  const decide = (client: typeof s.creator, approval: ApprovalRecord) =>
+    client.request('POST', `${path}/approvals/${approval.id}`, { decision: 'approve', reviewHash: presented.get(approval.id)!.reviewHash });
+
+  // Without a grant, the creator can neither lift the host's limits nor run a command without them.
+  await denied(await decide(s.creator, unlimited), 403, 'host_owner_required');
+  await denied(await decide(s.creator, command), 403, 'host_owner_required');
+  assert.deepEqual(decisions, []);
+  // With one, they can; approve permission on the session alone still can't decide a command without limits.
+  await json(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/host-grants/${s.team.id}`, { level: 'approve', userId: s.creator.user.id }));
+  await json(await decide(s.creator, unlimited));
+  await denied(await decide(s.admin, command), 403, 'host_owner_required');
+  await json(await decide(s.creator, command));
+  await json(await decide(s.admin, bounded));
+  assert.deepEqual(decisions, [{ approvalId: unlimited.id, actorId: s.creator.user.id }, { approvalId: command.id, actorId: s.creator.user.id },
+    { approvalId: bounded.id, actorId: s.admin.user.id }]);
 });
 
 test('the host\'s owner decides host commands in a session on it they can read, once its connector lets them; nothing else and nobody else without approve', async t => {

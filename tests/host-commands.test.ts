@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "../packages/client/src/host-commands.js";
+import { decidedAsHostCommand, decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "../packages/client/src/host-commands.js";
+import { decidedAsHostCommand as sharedRule, grantedShell, type HostCommandSession } from "../packages/shared/src/host-operations.js";
+import { hostCommandSession } from "../apps/server/src/host-access.js";
 
 test("a host command is host_bash, or any command of a session that runs on its host", () => {
   const sandboxed = {};
@@ -11,6 +13,60 @@ test("a host command is host_bash, or any command of a session that runs on its 
   assert.equal(isHostCommand({ kind: "bash" }, sandboxed), false);
   // Only commands: a session on its host still pushes, comments and asks for permissions as any other does.
   for (const kind of ["git.push", "github.comment", "permission"] as const) assert.equal(isHostCommand({ kind }, onHost), false, kind);
+});
+
+test("a command without the host's missing limits in a member's session is decided as a host command, though it runs in the sandbox", () => {
+  type Session = { ownerId: string; connectorOwnerId?: string; hostEnvironment?: true };
+  const member: Session = { ownerId: "github:2", connectorOwnerId: "github:1" };
+  const own: Session = { ownerId: "github:1", connectorOwnerId: "github:1" };
+  const bash = { kind: "bash" } as const;
+  assert.equal(decidedAsHostCommand(bash, member, true), true);
+  assert.equal(isHostCommand(bash, member), false, "it still runs in the sandbox, as the session's owner");
+  // Within the host's limits, or in the host owner's own session, approve permission decides it as before.
+  assert.equal(decidedAsHostCommand(bash, member, false), false);
+  assert.equal(decidedAsHostCommand(bash, member), false);
+  assert.equal(decidedAsHostCommand(bash, own, true), false);
+  // A session with no host recorded: nobody holds host command authority there, so nobody decides it.
+  assert.equal(decidedAsHostCommand(bash, { ownerId: "github:2" }, true), true);
+  assert.equal(decidesHostCommand(bash, { connectorOwnerId: undefined }, undefined, "github:2", true), false);
+  // Every host command is decided as one.
+  assert.equal(decidedAsHostCommand({ kind: "host.bash" }, own), true);
+  assert.equal(decidedAsHostCommand(bash, { ...own, hostEnvironment: true }), true);
+  for (const kind of ["git.push", "github.comment", "permission"] as const) assert.equal(decidedAsHostCommand({ kind }, member, true), false, kind);
+});
+
+test("the control plane, the host and the apps decide by one rule which operations take host command authority", () => {
+  // The apps use the shared rule itself, as the host (RunnerSession.requireHostDecider) and the control plane do.
+  assert.equal(decidedAsHostCommand, sharedRule);
+  const owner = "github:1"; const member = "github:2";
+  const own: HostCommandSession = { ownerId: owner, connectorOwnerId: owner };
+  const members: HostCommandSession = { ownerId: member, connectorOwnerId: owner };
+  const cases: [kind: string, session: HostCommandSession, unbounded: boolean, decided: boolean][] = [
+    ["host.bash", own, false, true],
+    ["host.bash", members, false, true],
+    // Every command of a session that runs directly on its host.
+    ["bash", { ...own, hostEnvironment: true }, false, true],
+    ["bash", { ...members, hostEnvironment: true }, false, true],
+    // A command without the host's missing limits: the host's owner allowed their own; a member's runs on their grant.
+    ["bash", own, true, false],
+    ["bash", members, true, true],
+    // Within limits, approve permission decides as before.
+    ["bash", own, false, false],
+    ["bash", members, false, false],
+    // Nothing but commands.
+    ["git.push", { ...members, hostEnvironment: true }, true, false],
+    ["permission", members, true, false],
+  ];
+  for (const [kind, session, unbounded, decided] of cases) {
+    const label = JSON.stringify({ kind, session, unbounded });
+    assert.equal(sharedRule({ kind }, session, unbounded), decided, label);
+    // The control plane reads the same session from its row.
+    const row = { owner_id: session.ownerId!, connector_owner_id: session.connectorOwnerId ?? null, host_environment: session.hostEnvironment ? 1 : 0 };
+    assert.equal(sharedRule({ kind }, hostCommandSession(row), unbounded), decided, `row ${label}`);
+  }
+  // Only a member's commands run on a grant: the host's owner lets their own run without limits with a permission request.
+  assert.equal(grantedShell(own), false);
+  assert.equal(grantedShell(members), true);
 });
 
 test("the host's owner and members granted host commands decide them, as the control plane checks; approve access alone doesn't", () => {

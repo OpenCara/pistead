@@ -11,6 +11,13 @@ export function isHostCommand(operation: Pick<Operation, "kind">, session: Pick<
 }
 
 /**
+ * Whether deciding an operation takes host command authority: every host command (see `isHostCommand`), and a command
+ * without the resource limits the host lacks (`unbounded`, see ApprovalRecord.unbounded) in a session whose owner isn't
+ * the host's owner, which still runs in the sandbox, as that owner. The rule the control plane and the host decide by.
+ */
+export { decidedAsHostCommand } from "../../shared/src/host-operations";
+
+/**
  * Whether `userId` holds host command authority in the session, as the control plane checks it before a host command is
  * decided: they own the session's host, or its owner or one of its admins granted them host commands in the session's
  * workspace. `host` is the session's host as that workspace's host listing reports it to them (its `hostCommandAccess`);
@@ -35,10 +42,10 @@ function hostOwnerDecides(operation: Pick<Operation, "kind">, host: ListedHost |
 }
 
 /**
- * Whether `userId` decides host command `operation` (see `isHostCommand`) in a session they can see, as the control plane
- * lets them: with approve permission on it (`canApprove`) and host command authority there (see `decidesHostCommands`);
- * or, as the owner of its host, a host_bash card without approve permission where the host lets them (see
- * `hostOwnerDecides`). The caller still leaves out archived and read-only sessions.
+ * Whether `userId` decides `operation`, one decided as a host command is (see `decidedAsHostCommand`), in a session they
+ * can see, as the control plane lets them: with approve permission on it (`canApprove`) and host command authority there
+ * (see `decidesHostCommands`); or, as the owner of its host, a host_bash card without approve permission where the host
+ * lets them (see `hostOwnerDecides`). The caller still leaves out archived and read-only sessions.
  */
 export function decidesHostCommand(operation: Pick<Operation, "kind">, session: Pick<SessionRecord, "connectorOwnerId">,
   host: ListedHost | undefined, userId: string, canApprove: boolean): boolean {

@@ -102,6 +102,13 @@ export interface ConnectorCapabilities {
    */
   hostSessionGrants?: boolean;
   /**
+   * On a host without resource limits (no `productionShell`), the connector runs the sandboxed shell commands of members
+   * its owner granted host commands (HostCommandGrant), without those limits, as it runs its owner's: decided only by
+   * someone with host command authority, and without approval only for a member holding automatic host commands. Absent
+   * on older connectors, which refuse every command of another member's session there.
+   */
+  unboundedShellGrants?: boolean;
+  /**
    * The connector lists the session worktree's directories and previews its files, read-only, for the session panel's
    * file browser (the `files` runner action). Absent on older connectors, which refuse that request.
    */

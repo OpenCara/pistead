@@ -643,7 +643,10 @@ export interface ApprovalRecord {
   reviewHash?: string;
   /** A permission request the owner allowed: for that one call, or for the rest of the session. */
   scope?: "call" | "session";
-  /** A shell command the host's owner allowed to run without resource limits, which this host lacks. */
+  /**
+   * A shell command that may run without the resource limits this host lacks: the host's owner allowed that in their own
+   * session, or the session's owner holds host command authority on the host (ConnectorCapabilities.unboundedShellGrants).
+   */
   unbounded?: boolean;
   /**
    * The permission someone gave this operation's tool call first. Its own card is folded into this one in a view, as
@@ -658,7 +661,7 @@ export interface ApprovalRecord {
 export interface AutoApprovedCall {
   tool: string;
   status: ApprovalRecord["status"];
-  /** It ran without resource limits, on the owner's own host. */
+  /** It ran without resource limits, on the owner's own host or with their host command grant there. */
   unbounded?: true;
 }
 /**

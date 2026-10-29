@@ -1120,14 +1120,18 @@ test('every session clones: older connectors are refused, and a session whose ag
   assert.deepEqual(own.repositories, []);
   assert.equal(own.cloneUnavailable, undefined);
   assert.deepEqual(remote.calls, [], 'nothing is resolved with the owner\'s account at creation');
-  // Another member's session needs the host's resource limits to run shell commands; without them it starts empty, and says so.
+  // Another member's session needs the host's resource limits to run shell commands, or a host command grant there;
+  // without either it starts empty, and says so.
   const unlimited = await host({}, true);
   const { session: empty } = await json<{ session: SessionRecord }>(await start(member_, unlimited), 201);
   assert.equal(empty.repositoryMode, 'clone');
-  assert.match(empty.cloneUnavailable ?? '', /runs shell commands only for its owner/);
+  assert.match(empty.cloneUnavailable ?? '', /runs shell commands only for its owner and for members they granted host commands/);
   assert.match((await json<{ session: SessionRecord }>(await member_.request('GET', `/api/sessions/${empty.id}`))).session.cloneUnavailable ?? '', /only for its owner/);
   const { session: limited } = await json<{ session: SessionRecord }>(await start(member_, await host({ productionShell: true }, true)), 201);
   assert.equal(limited.cloneUnavailable, undefined);
+  // A host without the sandbox runs everyone's commands, as its owner accepted.
+  const { session: unsandboxed } = await json<{ session: SessionRecord }>(await start(member_, await host({ sandbox: false, unsandboxed: true }, true)), 201);
+  assert.equal(unsandboxed.cloneUnavailable, undefined);
   // A connector from before sessions cloned can't run one.
   await denied(await start(admin, await host({ plainGit: undefined }, false)), 409, 'connector_update_required');
   // A session started from a saved agent without bash, before agents were removed, works in an empty worktree too.
@@ -1138,6 +1142,38 @@ test('every session clones: older connectors are refused, and a session whose ag
   assert.equal(filesOnly.repositoryMode, 'clone');
   assert.match(filesOnly.cloneUnavailable ?? '', /doesn't have the bash tool/);
   assert.throws(() => f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = ?").run(own.id), /immutable/);
+});
+
+test('a member granted host commands clones on a host without resource limits, once its connector honors that, while the grant lasts', async t => {
+  const f = await fixture(t); github(t);
+  const admin = await f.client('admin'); const member_ = await f.client('member');
+  const team = await workspace(admin);
+  await member(admin, team.id, member_);
+  await bindRepository(admin, team.id);
+  provisionHub(f);
+  const host = async (capabilities: Record<string, unknown>) => {
+    const connector = await connect(f, admin, { models: manifest.models, capabilities: { ...manifest.capabilities, hostCommands: true, hostGrants: true, ...capabilities } });
+    await json(await admin.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
+    await json(await admin.request('PUT', `/api/connectors/${connector.connectorId}/host-grants/${team.id}`, { level: 'approve', userId: member_.user.id }));
+    return connector;
+  };
+  const start = async (connector: { connectorId: string }) => {
+    const { models } = await json<{ models: ModelDefinition[] }>(await member_.request('GET', `/api/workspaces/${team.id}/models`));
+    const model = models.find(item => item.connectorId === connector.connectorId)!;
+    const { session } = await json<{ session: SessionRecord }>(await member_.request('POST', '/api/sessions', {
+      workspaceId: team.id, modelId: model.id, title: 'Clone', trustedConnectorId: connector.connectorId,
+    }), 201);
+    return session;
+  };
+  // Neither host has resource limits; the member holds a host command grant on both.
+  const current = await host({ unboundedShellGrants: true });
+  const older = await host({});
+  const session = await start(current);
+  assert.equal(session.cloneUnavailable, undefined);
+  assert.match((await start(older)).cloneUnavailable ?? '', /only for its owner and for members they granted host commands/);
+  // The grant is checked on each read: once it ends, the session says why it can't clone.
+  assert.equal((await admin.request('DELETE', `/api/connectors/${current.connectorId}/host-grants/${team.id}?userId=${member_.user.id}`)).status, 204);
+  assert.match((await json<{ session: SessionRecord }>(await member_.request('GET', `/api/sessions/${session.id}`))).session.cloneUnavailable ?? '', /only for its owner/);
 });
 
 test('a session that pinned its repositories is read-only: it shows, and nothing runs or is approved in it', async t => {

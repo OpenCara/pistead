@@ -47,6 +47,7 @@ import { egressReadServices, type EgressGrant, type EgressRepository, type GitDi
 import { sessionBranch } from "../../../packages/shared/src/git-push.js";
 import { defaultHostConfig, type HostCompaction, type HostConfig } from "../../../packages/shared/src/host-config.js";
 import { commandLimits, type CommandLimits } from "./host-config.js";
+import { decidedAsHostCommand, grantedShell, type HostCommandSession } from "../../../packages/shared/src/host-operations.js";
 
 type Run = {
   key: string; initiatedBy: string; ownerId: string; mode: "write" | "ask";
@@ -123,6 +124,9 @@ const SESSIONS_TOOL_DESCRIPTION = "Work with this workspace's other Pistead sess
  * decided: the call fails instead of holding the session.
  */
 const DECISION_WAIT_MS = 60 * 60 * 1000;
+/** Why a command without the host's missing limits in a member's session waits for someone else (see grantedShell). */
+const GRANTED_SHELL_DECIDERS = "This command runs without the resource limits its host lacks, on the strength of a host command grant: "
+  + "only the host owner, or a member granted host commands on this host, can decide it";
 /** Whether `run` keeps the session busy: it is queued or at work, or a stop of it is still ending its work. */
 function holdsQueue(run: Run): boolean {
   return ["queued", "running", "admitting"].includes(run.status) || run.stopped?.pending === true;
@@ -1599,7 +1603,10 @@ export class RunnerSession {
     return { limits: commandLimits(config.commandTimeoutSeconds), gpu: config.gpu };
   }
 
-  /** `unbounded`: the host's owner allowed this command to run without the limits this host lacks. */
+  /**
+   * `unbounded`: the command may run without the limits this host lacks, as the host's owner allowed for their own
+   * session, or a member they granted host commands for theirs (see grantedShell and requireShellGrant).
+   */
   private requireShellCapability(operation: Operation, unbounded = false): void {
     if (operation.kind === "bash" && !unbounded && !this.shellAllowed()) {
       throw new RunnerError(403, "Production shell requires a quota-backed runner; bash needs verified resources or explicitly enabled faux test sessions");
@@ -1607,10 +1614,49 @@ export class RunnerSession {
   }
 
   /**
+   * The session as deciding its operations sees it, by the rule the control plane and the apps apply too (see
+   * decidedAsHostCommand and grantedShell).
+   */
+  private hostCommandSession(): HostCommandSession {
+    return { ownerId: this.binding.owner.id, connectorOwnerId: this.binding.session.connectorOwnerId, hostEnvironment: this.#hostSession };
+  }
+
+  /**
+   * Refuses `actorId`'s decision of `approval` where deciding it takes host command authority on this host (see
+   * decidedAsHostCommand) and they don't hold it now.
+   */
+  private async requireHostDecider(actorId: string, approval: Pick<StoredApproval, "operation" | "unbounded">): Promise<void> {
+    if (!decidedAsHostCommand(approval.operation, this.hostCommandSession(), approval.unbounded === true)) return;
+    if (await this.hostCommandLevel(actorId, "approve")) return;
+    throw new RunnerError(403, approval.operation.kind === "host.bash" ? "Only the host owner, or a member granted host commands on this host, can decide a host command"
+      : this.#hostSession ? "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands"
+      : GRANTED_SHELL_DECIDERS);
+  }
+
+  /**
+   * Refuses a command without the limits this host lacks, in a session whose owner isn't the host's owner (see
+   * grantedShell), unless that owner holds host command authority on this host now: either level for a command someone
+   * decides, automatic host commands for one that runs without approval (`automatic`). A grant that ends or shrinks
+   * stops their next command.
+   */
+  private async requireShellGrant(automatic = false): Promise<void> {
+    const level = this.binding.session.connectorOwnerId ? await this.hostCommandLevel(this.binding.owner.id, "write") : undefined;
+    if (!level) {
+      throw new RunnerError(403, "This host has no resource limits for commands, so it runs them only in sessions of its owner and of members they granted "
+        + "host commands (Settings → Hosts → the host → Host command access). Nothing ran.");
+    }
+    if (automatic && level !== "auto") {
+      throw new RunnerError(403, "This host has no resource limits for commands, and the session's owner no longer holds automatic host commands there: "
+        + "commands need approval. Nothing ran.");
+    }
+  }
+
+  /**
    * Lets a tool call go ahead, first asking the session owner when the session doesn't allow it yet: a tool outside the
    * agent's, a change in a Read-only message, or a shell command on a host without resource limits. The call waits on
    * the owner's card, which allows it once or for the rest of the session, or denies it. `unbounded`: the command runs
-   * without limits, which only the host's owner can allow, and only in their own session.
+   * without limits, which the host's owner can allow in their own session, and a member they granted host commands in
+   * theirs (see grantedShell).
    */
   private async permit(api: ToolExecutionApi, waiting: Context, tool: ToolName, target: string, effect: { write?: boolean; shell?: boolean; audience?: boolean } = {}): Promise<{ unbounded: boolean }> {
     const state = await this.metadata();
@@ -1629,12 +1675,14 @@ export class RunnerSession {
     }
     const unbounded = effect.shell === true && !this.shellAllowed();
     if (unbounded) {
-      if (this.binding.session.connectorOwnerId !== this.binding.owner.id) this.requireShellCapability({ kind: "bash", command: target });
+      // In another member's session, only while they hold host command authority here, checked before any card asks.
+      if (grantedShell(this.hostCommandSession())) await this.requireShellGrant();
       if (!grants?.unboundedShell) needs.push("unbounded-shell");
     }
     if (!needs.length) return { unbounded };
     // The owner's auto-approve access answers these cards for them: they chose to let the agent act without asking.
-    // Only the owner can pick it, and a command without limits got this far only on their own host (checked above).
+    // Only the owner can pick it, and a command without limits got this far only on their own host, or with a host
+    // command grant there (checked above), which still decides whether it then runs without approval (createApproval).
     if (run.options?.access === "auto" && run.mode === "write" && run.initiatedBy === this.binding.owner.id) return { unbounded };
     if (this.config.connectorId && !run.admissionId) throw new RunnerError(403, "Approval lacks Worker write admission");
     const deadline = (run.submittedAt ?? Date.now()) + DECISION_WAIT_MS;
@@ -1981,8 +2029,9 @@ export class RunnerSession {
   }
 
   /**
-   * `consent.permitted`: a tool call `permit` already let through. `consent.unbounded`: the host's owner allowed this
-   * command to run without the resource limits this host lacks.
+   * `consent.permitted`: a tool call `permit` already let through. `consent.unbounded`: this command may run without the
+   * resource limits this host lacks, as the host's owner allowed in their own session, or on the strength of a host
+   * command grant in a member's (see grantedShell).
    */
   async createApproval(actorId: string, input: Operation, toolTaskId?: string, consent: { permitted?: boolean; unbounded?: boolean } = {}, signal?: AbortSignal): Promise<ApprovalRecord> {
     this.requireUnfrozen();
@@ -2029,10 +2078,11 @@ export class RunnerSession {
       automatic = (run.options?.access === "auto" || sessionGranted) && run.initiatedBy === this.binding.owner.id
         && (!github || (admissionId !== undefined && (operation.kind !== "github.merge" || run.options?.autoMerge === true)))
         && (operation.kind !== "git.push" || admissionId !== undefined)
-        && (operation.kind !== "host.bash" || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto")
-        // A command of a session on its host runs there as a host command does: without approval only for an owner who
-        // holds automatic host commands on it.
-        && (operation.kind !== "bash" || !this.#hostSession || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
+        // An operation decided as a host command is (host_bash, a command of a session on its host, or one without the
+        // host's missing limits in a member's session) runs without approval only for an owner who holds automatic host
+        // commands on this host.
+        && (!decidedAsHostCommand(operation, this.hostCommandSession(), consent.unbounded === true)
+          || await this.hostCommandLevel(this.binding.owner.id, "write") === "auto");
     }
     const id = toolTaskId ? `tool-${toolTaskId}` : randomUUID();
     const approval: StoredApproval = { id, sessionId: this.binding.session.id, requestedBy: actorId, operation: JSON.parse(JSON.stringify(operation)), createdAt: new Date().toISOString(),
@@ -2094,6 +2144,7 @@ export class RunnerSession {
       result = await this.sandbox.execute(operation, false, async () => {
         this.requireShellCapability(operation, approval.unbounded === true);
         await this.requireHostEnvironment(true);
+        if (approval.unbounded === true && grantedShell(this.hostCommandSession())) await this.requireShellGrant(true);
         await this.authorize(actorId, "write");
       }, { allowTestShell: this.binding.model.provider === "faux" && this.config.allowFaux && this.config.allowTestShell === true, unbounded: approval.unbounded === true,
         ...await this.commandOptions(), signal });
@@ -2139,13 +2190,10 @@ export class RunnerSession {
         if (card.status !== "pending") throw decided();
         Object.assign(card, decision);
       };
-      if (approval.operation.kind === "host.bash" && !await this.hostCommandLevel(ticket.actorId, "approve")) {
-        throw new RunnerError(403, "Only the host owner, or a member granted host commands on this host, can decide a host command");
-      }
-      // A command of a session that runs directly on the host runs there, as a host command does: so is it decided.
-      if (approval.operation.kind === "bash" && this.#hostSession && !await this.hostCommandLevel(ticket.actorId, "approve")) {
-        throw new RunnerError(403, "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands");
-      }
+      // Host commands, the commands of a session that runs directly on the host, and those that run without the host's
+      // missing limits in a member's session, on the strength of their grant, take host command authority to decide.
+      await this.requireHostDecider(ticket.actorId, approval);
+      const granted = approval.operation.kind === "bash" && approval.unbounded === true && grantedShell(this.hostCommandSession());
       if (approval.operation.kind === "git.repin" && ticket.actorId !== this.binding.owner.id) {
         throw new RunnerError(403, "Only the session owner can decide a repin");
       }
@@ -2153,8 +2201,9 @@ export class RunnerSession {
       if (approval.operation.kind === "permission") {
         const request = approval.operation;
         if (ticket.actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session owner can allow more than the session allows");
-        if (request.needs.includes("unbounded-shell") && this.binding.session.connectorOwnerId !== this.binding.owner.id) {
-          throw new RunnerError(403, "Only the host's owner can allow a shell without resource limits");
+        // On someone else's host, only with host command authority there (see grantedShell).
+        if (request.needs.includes("unbounded-shell") && grantedShell(this.hostCommandSession()) && !await this.hostCommandLevel(ticket.actorId, "approve")) {
+          throw new RunnerError(403, "Only the host's owner, or a member granted host commands on this host, can allow a shell without resource limits");
         }
         const scope = input.scope ?? "call";
         // Each host command runs outside the sandbox, so its permission covers that one call only.
@@ -2206,10 +2255,10 @@ export class RunnerSession {
           await this.requireHostEnvironment();
           await this.authorize(approval.requestedBy, "write");
           await this.authorize(ticket.actorId, "approve");
-          // Its decider's host command authority, as it stands when the command starts.
-          if (this.#hostSession && !await this.hostCommandLevel(ticket.actorId, "approve")) {
-            throw new RunnerError(403, "This session runs directly on its host: only the host owner, or a member granted host commands on this host, can decide its commands");
-          }
+          // Its decider's host command authority where deciding it takes that, as it stands when the command starts, and,
+          // without the host's missing limits in a member's session, their grant too.
+          await this.requireHostDecider(ticket.actorId, approval);
+          if (granted) await this.requireShellGrant();
         });
         return (await this.metadata()).approvals[id]!;
       }
