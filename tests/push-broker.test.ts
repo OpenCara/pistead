@@ -1258,3 +1258,32 @@ test('sandboxed GitHub API reads: the owner\'s own host gets the token under own
   assert.equal((await (await f.post('/api/internal/network', { sessionId: 'pinned' })).json() as Record<string, unknown>).apis, undefined);
   assert.equal((await apiCredential(f, { sessionId: 'pinned' })).body.reason, 'Only sessions that clone their repositories read the GitHub API through Pistead');
 });
+
+test('sandboxed GitHub API reads: a repository the app wasn\'t installed on is covered within a minute of installing it', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t, { host: { owner: approver } });
+  // The fixture's workspace is at its repository limit: an Azure DevOps one makes room.
+  f.sqlite.prepare("DELETE FROM workspace_repositories WHERE id = 'binding-az'").run();
+  f.sqlite.prepare('INSERT INTO workspace_repositories (id,workspace_id,provider,host,repository_id,full_name,ref,private,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run('binding-gh2', 'workspace', 'github', 'github.com', '102', 'owner/other', 'main', 1, new Date().toISOString());
+  let installed = false;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/repos/owner/other') return Response.json({ id: 102, full_name: 'owner/other', default_branch: 'main', private: true, permissions: { push: true } });
+    if (url.pathname === '/repos/owner/other/installation') {
+      return installed ? Response.json({ id: 55, account: { login: 'owner' }, permissions: { contents: 'read' } }) : Response.json({ message: 'Not Found' }, { status: 404 });
+    }
+    return previousFetch(input, init);
+  };
+  const realNow = Date.now;
+  t.after(() => { globalThis.fetch = previousFetch; Date.now = realNow; });
+  const repositories = async () => (await apiCredential(f)).body.credentials.flatMap((item: { repositories: string[] }) => item.repositories);
+  assert.deepEqual(await repositories(), ['owner/repo']);
+  installed = true;
+  // Reused briefly, as a complete answer is...
+  assert.deepEqual(await repositories(), ['owner/repo']);
+  // ...but asked again a minute later, now with both.
+  Date.now = () => realNow() + 61_000;
+  assert.deepEqual((await repositories()).sort(), ['owner/other', 'owner/repo']);
+});

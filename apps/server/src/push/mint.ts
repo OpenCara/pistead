@@ -412,7 +412,9 @@ async function readApp(env: Env, workspaceId: string, provider: GitProvider, hos
  */
 const apiReadPermissions = ['actions', 'checks', 'contents', 'deployments', 'discussions', 'issues', 'metadata', 'pages', 'pull_requests', 'statuses'];
 export interface ApiReadToken { account: string; token: string; expiresAt: number; repositories: string[] }
-const apiTokens = new Map<string, ApiReadToken[]>();
+/** A result some of whose repositories the app couldn't reach is asked again this soon, so installing it there shows. */
+const incompleteReuseSeconds = 60;
+const apiTokens = new Map<string, { tokens: ApiReadToken[]; notInstalled: string[]; until: number }>();
 
 /**
  * Tokens for sandboxed reads of the GitHub API (see `credentialedApiHosts`): one per installation of the workspace's
@@ -430,9 +432,8 @@ export async function mintGitHubApiReadTokens(env: Env, target: { workspaceId: s
   const key = `${app.appId}\0${ids.join(',')}`;
   const time = Math.floor(Date.now() / 1000);
   const cached = apiTokens.get(key);
-  if (cached && cached.every(token => token.expiresAt - time > readReuseSeconds)) {
-    const covered = new Set(cached.flatMap(token => token.repositories));
-    return { tokens: cached, notInstalled: target.repositories.map(item => item.fullName).filter(name => !covered.has(name)) };
+  if (cached && cached.until > time && cached.tokens.every(token => token.expiresAt - time > readReuseSeconds)) {
+    return { tokens: cached.tokens, notInstalled: cached.notInstalled };
   }
   apiTokens.delete(key);
   const api = githubApiBase('github', 'github.com');
@@ -470,7 +471,7 @@ export async function mintGitHubApiReadTokens(env: Env, target: { workspaceId: s
   }
   if (tokens.length) {
     if (apiTokens.size >= 1000) apiTokens.clear();
-    apiTokens.set(key, tokens);
+    apiTokens.set(key, { tokens, notInstalled, until: notInstalled.length ? time + incompleteReuseSeconds : Infinity });
   }
   return { tokens, notInstalled };
 }

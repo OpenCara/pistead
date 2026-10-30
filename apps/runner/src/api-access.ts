@@ -280,15 +280,18 @@ export class ApiAccess {
     try {
       upstream = await this.#upstream({ url: new URL(`https://${host}${path}`), method, headers, ...(payload ? { body: payload } : {}) });
       // Downloads GitHub points elsewhere are fetched here, without the credential.
+      // Each hop's Location is relative to the URL that answered it.
+      let current = new URL(`https://${host}${path}`);
       for (let hop = 0; method === "GET" && hop < REDIRECTS && [301, 302, 303, 307, 308].includes(upstream.status); hop++) {
         let location: URL;
-        try { location = new URL(String(upstream.headers.location ?? ""), `https://${host}${path}`); } catch { break; }
+        try { location = new URL(String(upstream.headers.location ?? ""), current); } catch { break; }
         if (location.protocol !== "https:" || location.username || location.password || !GITHUB_DOWNLOAD_HOSTS.some(pattern => pattern.test(location.hostname))) break;
         upstream.body.resume();
         const follow: Record<string, string> = {};
         for (const name of ["accept", "user-agent", "range"]) if (headers[name]) follow[name] = headers[name]!;
         upstream = await this.#upstream({ url: location, method: "GET", headers: { ...follow, host: location.host } });
         reason += `, then ${location.hostname.slice(0, 100)}`;
+        current = location;
       }
     } catch (error) {
       return refuse(502, error instanceof RunnerError ? error.message : `${host} could not be reached`);

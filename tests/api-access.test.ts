@@ -198,6 +198,9 @@ test("downloads GitHub redirects to its storage are fetched by the proxy without
   const { socketPath, upstream } = await proxy(t, { answer: (request): Answer => {
     if (request.url.pathname.endsWith("/logs")) return { status: 302, headers: { location: "https://results-receiver.actions.githubusercontent.com/logs/1?sig=abc" } };
     if (request.url.pathname.endsWith("/elsewhere")) return { status: 302, headers: { location: "https://evil.example/collect" } };
+    if (request.url.pathname.endsWith("/artifacts/7/zip")) return { status: 302, headers: { location: "https://pipelines.actions.githubusercontent.com/a/start" } };
+    // A storage host's own relative redirect is relative to it, not to api.github.com.
+    if (request.url.pathname === "/a/start") return { status: 302, headers: { location: "/a/blob?sig=1" } };
     if (request.url.hostname !== "api.github.com") return { status: 200, headers: { "content-type": "text/plain" }, body: "2026-10-29T11:09:42Z Unable to resolve \"./types.js\"" };
     return { status: 200 };
   } });
@@ -210,6 +213,12 @@ test("downloads GitHub redirects to its storage are fetched by the proxy without
   assert.equal(elsewhere.status, 302);
   assert.equal(elsewhere.headers.location, "https://evil.example/collect");
   assert.equal(upstream.length, 3);
+
+  const artifact = await call(socketPath, "/repos/acme/app/actions/artifacts/7/zip");
+  assert.equal(artifact.status, 200);
+  assert.deepEqual(upstream.slice(3).map(request => request.url.href), ["https://api.github.com/repos/acme/app/actions/artifacts/7/zip",
+    "https://pipelines.actions.githubusercontent.com/a/start", "https://pipelines.actions.githubusercontent.com/a/blob?sig=1"]);
+  assert.equal(upstream[5]!.headers.authorization, undefined);
 });
 
 test("without the API in its grant (a pinned session, an older control plane), the placeholder never reaches GitHub", async t => {
