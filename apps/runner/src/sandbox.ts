@@ -11,7 +11,7 @@ import type { HostCommandOperation, Operation, RunnerBinding } from "../../../pa
 import type { ClonePushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
-import { CA_BUNDLE, trustedCertificates } from "./trust-store.js";
+import { CA_BUNDLE, sandboxCertificates } from "./trust-store.js";
 import { runHostShell } from "./host-shell.js";
 import { checkedBrowse, type BrowseResult } from "./file-browser.js";
 import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
@@ -1547,7 +1547,7 @@ export class Sandbox implements IsolatedWorkspace {
           const bundle = join(this.#root, CA_BUNDLE_FILE);
           const staged = `${bundle}.new`;
           await rm(staged, { force: true });
-          await writeFile(staged, trustedCertificates(), { mode: 0o400 });
+          await writeFile(staged, sandboxCertificates(), { mode: 0o400 });
           await chmod(staged, 0o400);
           await rename(staged, bundle);
         }

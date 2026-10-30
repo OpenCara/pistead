@@ -8,11 +8,13 @@ import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
-import { egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize, type EgressGitService, type EgressGrant,
-  type EgressRepository, type LfsBatchResult } from "../../../packages/shared/src/network.js";
+import { API_TOKEN_PLACEHOLDER, credentialedApiHosts, egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize,
+  type EgressApi, type EgressGitService, type EgressGrant, type EgressRepository, type LfsBatchResult } from "../../../packages/shared/src/network.js";
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal, type PushCommand } from "../../../packages/shared/src/git-push.js";
 import { RunnerError } from "./protocol.js";
 import { CA_BUNDLE, CA_BUNDLE_VARIABLES } from "./trust-store.js";
+import { ApiAccess, type ApiUpstream } from "./api-access.js";
+import type { InterceptionAuthority } from "./interception-ca.js";
 
 /** Where sandboxed commands reach the proxy: a loopback port the sandbox helper relays to this session's socket. */
 export const EGRESS_PORT = 41080;
@@ -52,7 +54,7 @@ export interface RelayRequest {
 }
 /** How the answer reached the proxy, when the host made the request at the forge itself (git-direct.ts). */
 export const TRANSPORT_HEADER = "x-pistead-transport";
-export interface EgressEntry { at: string; kind: "git" | "connect" | "http"; target: string; outcome: "allowed" | "refused"; reason?: string }
+export interface EgressEntry { at: string; kind: "git" | "connect" | "http" | "api"; target: string; outcome: "allowed" | "refused"; reason?: string }
 /** How far a mirror's fill is, as a clone waiting for it hears: Git's numbers only (see RepositoryCacheProgress). */
 export interface MirrorProgress { phase: string; percent: number | null; done: number | null; total: number | null; bytes: number }
 export interface EgressOptions {
@@ -84,6 +86,14 @@ export interface EgressOptions {
    * relayed to the control plane, which pushes with the workspace's push identity. Without it, every push is refused.
    */
   sessionBranch?: string;
+  /**
+   * Asks the control plane for the session's credential for a credentialed API host (an ApiCredentialGrant, see
+   * api-access.ts). Without it, the proxy answers for no API itself and tunnels them like any other host.
+   */
+  apiCredential?: (host: string) => Promise<unknown>;
+  /** Overridable for tests: the authority the proxy answers credentialed APIs with, and its requests to them. */
+  apiAuthority?: InterceptionAuthority;
+  apiUpstream?: ApiUpstream;
 }
 
 /**
@@ -108,6 +118,8 @@ export function egressEnvironment(sessionBranch?: string, endpoint?: EgressEndpo
     // The host's trusted certificates, mounted read-only at CA_BUNDLE, for HTTPS through the proxy's tunnels.
     ...Object.fromEntries(CA_BUNDLE_VARIABLES.map(name => [name, caBundle])),
     PISTEAD_EGRESS_STATUS: `${proxy}/__pistead/status`,
+    // gh and GitHub's SDKs send this to api.github.com, where the proxy puts the session's own credential in its place.
+    GH_TOKEN: API_TOKEN_PLACEHOLDER, GITHUB_TOKEN: API_TOKEN_PLACEHOLDER,
     ...(sessionBranch ? { PISTEAD_SESSION_BRANCH: sessionBranch } : {}),
     ...config,
   };
@@ -283,10 +295,24 @@ export class EgressProxy {
   #port: number | undefined;
   #grant: { value: EgressGrant; at: number } | undefined;
   #refresh: Promise<EgressGrant> | undefined;
+  readonly #api: ApiAccess | undefined;
 
   constructor(options: EgressOptions) {
     this.socketPath = options.socketPath;
     this.#options = options;
+    const credential = options.apiCredential;
+    this.#api = credential && new ApiAccess({
+      credential, grant: () => this.#currentGrant(),
+      record: entry => this.#record({ kind: "api", ...entry }),
+      ...(options.apiAuthority ? { authority: options.apiAuthority } : {}),
+      ...(options.apiUpstream ? { upstream: options.apiUpstream } : {}),
+    });
+  }
+
+  /** The credentialed API the grant names for `host`, for which the control plane gives this session a credential. */
+  #credentialedApi(grant: EgressGrant, host: string): EgressApi | undefined {
+    if (!this.#api?.handles(host)) return undefined;
+    return grant.apis?.find(api => api.host === host);
   }
 
   async start(): Promise<void> {
@@ -448,6 +474,16 @@ export class EgressProxy {
       if (!target) return deny(403, "Invalid tunnel target");
       if (target.port !== 443) return deny(403, `Only HTTPS on port 443 is allowed, not port ${target.port}`);
       const grant = await this.#currentGrant();
+      // A credentialed API is answered here, whatever the policy: each request is checked and logged (kind "api"). Also
+      // where the grant gives no credential for it (a pinned session, an older control plane): the sandbox's placeholder
+      // token must never reach the API, and requests go on without one where the policy allows the host.
+      if (this.#api?.handles(target.host)) {
+        if (client.destroyed) return;
+        this.#sockets.add(client);
+        client.once("close", () => this.#sockets.delete(client));
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        return this.#api!.intercept(client, head, target.host);
+      }
       if (!hostAllowed(grant.policy, target.host)) {
         return deny(403, grant.policy.mode === "off"
           ? `${target.host} is not reachable: this workspace's network access is off`
@@ -512,6 +548,10 @@ export class EgressProxy {
       network: grant?.policy ?? null,
       ...(error ? { error } : {}),
       repositories: grant?.repositories.map(repository => bindingRemote(repository)) ?? [],
+      apis: grant && this.#api ? credentialedApiHosts.map(host => ({ host,
+        access: this.#credentialedApi(grant!, host)
+          ? `the proxy answers HTTPS to ${host} itself and reads the workspace's repositories with a read-only token; GH_TOKEN holds only a placeholder`
+          : `the proxy answers HTTPS to ${host} itself, without a credential for this session, where the network policy allows ${host}` })) : [],
       lfs: grant?.repositories.filter(repository => repository.lfs).map(repository => bindingRemote(repository)) ?? [],
       gitRemotes: `https:// remotes go through ${this.#port === undefined ? EGRESS_GIT_BASE : `http://127.0.0.1:${this.#port}/git/`}<host>/<path>; the workspace's repositories are read with the session owner's access`
         + (this.#options.sessionBranch ? `, and this session's branch ${this.#options.sessionBranch} is pushed with the workspace's push identity` : "")
@@ -796,7 +836,15 @@ export function parseEgressGrant(value: unknown): EgressGrant {
     return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
       ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}), ...(repository.lfs ? { lfs: true } : {}) };
   });
-  return { policy, repositories };
+  // Credentialed APIs this connector knows; a newer control plane's others are left out, as it may name hosts this proxy
+  // has no rules for.
+  if (input.apis !== undefined && (!Array.isArray(input.apis) || input.apis.length > 10)) throw new RunnerError(502, "Invalid APIs from the control plane");
+  const apis = ((input.apis ?? []) as unknown[]).flatMap((item): EgressApi[] => {
+    const api = item as Partial<EgressApi> | null;
+    if (!api || typeof api.host !== "string" || typeof api.provider !== "string") throw new RunnerError(502, "Invalid APIs from the control plane");
+    return credentialedApiHosts.includes(api.host) && api.provider === "github" ? [{ host: api.host, provider: api.provider }] : [];
+  });
+  return { policy, repositories, ...(apis.length ? { apis } : {}) };
 }
 
 /**

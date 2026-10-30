@@ -72,8 +72,42 @@ export interface EgressRepository {
    */
   lfs?: boolean;
 }
-/** What the control plane lets one session's egress proxy do; the proxy asks again every minute. */
-export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[] }
+/**
+ * What the control plane lets one session's egress proxy do; the proxy asks again every minute. `apis` lists the
+ * credentialed APIs the proxy answers for itself (see ApiCredentialGrant); absent from older control planes.
+ */
+export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[]; apis?: EgressApi[] }
+
+/**
+ * Credentialed APIs: hosts whose HTTPS the egress proxy terminates itself, with a certificate from the connector's own
+ * authority that only sessions' sandboxes trust, so that it can add a credential outside the sandbox. Sandboxed tools
+ * such as `gh` send a placeholder token (API_TOKEN_PLACEHOLDER) and never hold a real one. Every other host's HTTPS
+ * stays an opaque tunnel.
+ */
+export const credentialedApiHosts: readonly string[] = Object.freeze(["api.github.com"]);
+export type CredentialedApiProvider = "github";
+export interface EgressApi { host: string; provider: CredentialedApiProvider }
+/** What `GH_TOKEN` and `GITHUB_TOKEN` hold in a sandbox: the proxy puts the real credential in its place. */
+export const API_TOKEN_PLACEHOLDER = "pistead-egress-proxy-adds-the-credential";
+/** Longest a proxy reuses an API credential: a revoked session or repository stops using it within this. */
+export const API_CREDENTIAL_CACHE_SECONDS = 60;
+/**
+ * A session's credential for a credentialed API, from the control plane. For api.github.com: one token per GitHub App
+ * installation, limited to reading the workspace's github.com repositories that the session owner can read (the
+ * installation's account is `account`), never the owner's own sign-in token.
+ */
+export type ApiCredentialGrant =
+  | { available: false; reason: string; cacheSeconds: number }
+  | { available: true; credentials: ApiCredential[]; cacheSeconds: number };
+export interface ApiCredential {
+  /** The installation's account (a user or organization login), which owns `repositories`. */
+  account: string;
+  /** The full Authorization header for the API. */
+  authorization: string;
+  /** The repositories (owner/name) the credential can read. */
+  repositories: string[];
+  expiresAt: string;
+}
 /**
  * The Git requests the relay forwards: a fetch's ref advertisement and the fetch itself; in clone sessions a push's
  * (`receive-refs`, `receive-pack`), which may only update the session branch; and, for repositories with Git LFS on,

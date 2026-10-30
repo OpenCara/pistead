@@ -207,6 +207,11 @@ export type RunnerConfig = {
    */
   gitDirect?: (sessionId: string, request: Omit<GitDirectRequest, "sessionId">) => Promise<unknown>;
   /**
+   * A session's credential for a credentialed API host (ApiCredentialGrant, see api-access.ts), through the connector;
+   * without it, the control plane's internal route. The session's egress proxy adds it to the API requests it answers.
+   */
+  apiCredential?: (sessionId: string, host: string) => Promise<unknown>;
+  /**
    * How the host runs its sessions, as its owner and admins set it in Pistead (the connector caches it briefly). Read for
    * each shell command: its time limit and GPU. Without it, the defaults.
    */
@@ -437,6 +442,8 @@ export class RunnerSession {
       ...(token ? { tcp: { token } } : {}),
       grant: () => this.requestGrant(),
       relay: request => this.relay(request),
+      apiCredential: host => this.config.apiCredential ? this.config.apiCredential(this.binding.session.id, host)
+        : this.controlPlane("/api/internal/api/credential", { sessionId: this.binding.session.id, host }),
       ...(this.#clone && this.config.repositoryCache ? { mirror: (repository: EgressRepository, onProgress: (progress: MirrorProgress) => void) => this.mirror(repository, onProgress) } : {}),
       ...(this.#clone ? { sessionBranch: sessionBranch(this.binding.session) } : {}),
     });

@@ -311,6 +311,13 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
   | Push the session branch | Relayed: a push token can't be limited to one branch | Direct, with the workspace's push identity, except the owner's GitHub sign-in account and the host's Git credentials, which stay relayed |
 
   Pistead checks the session's authority for each grant, as for a relayed request, and a host reuses a read grant for a minute at most. A host that can't reach the Git host itself falls back to the relay. The server's operator chooses with `GIT_DIRECT` (see [Configuration](#configuration)): `own-hosts` gives tokens only to session owners' own hosts, and `off` relays everything.
+- **In a session that clones on demand, `gh` and other GitHub API clients read the workspace's github.com repositories**, whatever the workspace's network access: `gh run view --log-failed`, `gh pr view`, `gh api repos/acme/app/actions/runs`. The sandbox holds no GitHub credential: `GH_TOKEN` and `GITHUB_TOKEN` hold a placeholder, and the session's proxy answers HTTPS to `api.github.com` itself and adds the credential there. That is a token of a GitHub App (the workspace's under **Push access**, or the server's on github.com), which needs to be installed on the repositories. It can only read the workspace's github.com repositories that the session owner can read, and only what `gh` reads: code, issues, pull requests, Actions runs and logs, checks, statuses, deployments, discussions and Pages. It is never the owner's own sign-in token. Pistead checks the session for each token, as for Git, and the proxy reuses one for a minute at most.
+  - **Only reads.** The proxy refuses every other method and GraphQL mutations; comments, issues, merges and pushes go through `github_comment`, `github_issue`, `github_merge` and `git_push`, with their approvals. The token couldn't make them anyway.
+  - **Other repositories** are read without a credential, and only where the workspace's network access allows `api.github.com`. So is a request that carries a token of its own instead of the placeholder.
+  - **Downloads** that GitHub redirects to its storage (Actions logs and artifacts, release assets, archives) are fetched by the proxy, without the credential.
+  - **How the proxy can see these requests:** the connector makes a certificate authority in memory when it starts, and adds it to each session's certificates. It can vouch only for `api.github.com`, by a name constraint that OpenSSL, Go, Node.js and Python check; HTTPS to every other host stays a tunnel the proxy never looks inside. In the [experimental macOS and Windows sandboxes](#experimental-sandboxes-on-macos-and-windows), Go programs such as `gh` check certificates only against the system's own store, so they can't verify it there yet; curl, Node.js and Python can.
+
+  The server's operator chooses with `SANDBOX_GITHUB_API`: `own-hosts` gives these tokens only to session owners' own hosts, and `off` gives none, so sessions reach `api.github.com` only as the network access allows, without a credential. Pinned sessions get none.
 - **Everything else follows the workspace's network access**, under **Settings → Workspaces →** the workspace **→ Network access** (owners and admins):
 
   | Access | HTTPS reaches |
@@ -323,7 +330,7 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
 
   Shell commands verify these hosts against the certificates the **host** trusts (its system store, or Node.js's bundled one where it has none, plus the connector's `NODE_EXTRA_CA_CERTS`): the connector copies them into the session when it opens, and the sandbox sees them read-only at `/etc/ssl/certs/ca-certificates.crt`, which `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` name. Nothing else of the host's `/etc` is visible. A certificate added on the host reaches a session the next time it opens.
 
-`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the workspace's repositories and its recent decisions, with `(direct …)` on the Git requests the host made itself. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
+`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the workspace's repositories, the APIs its proxy answers itself and its recent decisions, with `(direct …)` on the Git requests the host made itself and each GitHub API request with the credential it was made with. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
 
 #### Experimental sandboxes on macOS and Windows
 
@@ -735,6 +742,7 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | none | Operator GitHub App for github.com pushes (PEM as one line with `\n` escapes) |
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
 | `GIT_DIRECT` | `on` | Where sessions' Git data goes (see [Network access](#network-access)): `on` lets hosts fetch from Git hosts themselves with credentials limited to a repository, `own-hosts` gives credentials only to session owners' own hosts, `off` relays every Git request through the server |
+| `SANDBOX_GITHUB_API` | `on` | Whether sessions' `gh` and other GitHub API clients read the workspace's github.com repositories (see [Network access](#network-access)): `on` gives every host running a session a read-only GitHub App token for them, which its egress proxy adds, `own-hosts` only session owners' own hosts, `off` none |
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |

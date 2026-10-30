@@ -110,7 +110,9 @@ async function fixture(t: test.TestContext, options: { canPush?: boolean; bitbuc
       if (method === 'GET' && url.pathname === '/repos/owner/repo') {
         return Response.json({ id: 101, full_name: 'owner/repo', default_branch: 'main', private: state.githubPrivate, permissions: { push: state.canPush } });
       }
-      if (method === 'GET' && url.pathname === '/repos/owner/repo/installation') return Response.json({ id: 55 });
+      if (method === 'GET' && url.pathname === '/repos/owner/repo/installation') {
+        return Response.json({ id: 55, account: { login: 'owner' }, permissions: { contents: 'write', metadata: 'read', issues: 'write', actions: 'read', administration: 'write', secrets: 'write' } });
+      }
       if (method === 'POST' && url.pathname === '/app/installations/55/access_tokens') {
         return Response.json({ token: 'ghs_installation_token', expires_at: new Date(Date.now() + 3600000).toISOString() }, { status: 201 });
       }
@@ -1178,4 +1180,81 @@ test('direct Git grants: the control plane\'s own runner reads with the owner\'s
   const gitlab = await direct(f, { bindingId: 'binding-gl', access: 'read' });
   assert.deepEqual([gitlab.body.direct, gitlab.body.kind, gitlab.body.authorization],
     [true, 'owner-account', 'Basic ' + Buffer.from('oauth2:owner-gitlab-token').toString('base64')]);
+});
+
+/** The credential a session's egress proxy adds to the GitHub API requests it answers, with its JSON answer. */
+async function apiCredential(f: Awaited<ReturnType<typeof fixture>>, body: Record<string, unknown> = {}): Promise<{ status: number; body: Record<string, any> }> {
+  const response = await f.post('/api/internal/api/credential', { sessionId: 'session', host: 'api.github.com', ...body });
+  return { status: response.status, body: await response.json() as Record<string, any> };
+}
+async function networkGrant(f: Awaited<ReturnType<typeof fixture>>): Promise<Record<string, any>> {
+  return await (await f.post('/api/internal/network', { sessionId: 'session' })).json() as Record<string, any>;
+}
+
+test('sandboxed GitHub API reads: a read-only installation token for the workspace\'s repositories the owner can read, never the owner\'s own', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t, { host: { owner: approver } });
+  // The session's grant names the API its proxy answers itself.
+  assert.deepEqual((await networkGrant(f)).apis, [{ host: 'api.github.com', provider: 'github' }]);
+
+  const answer = await apiCredential(f);
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(answer.body.available, true);
+  assert.equal(answer.body.cacheSeconds, 60);
+  assert.equal(answer.body.credentials.length, 1);
+  const [credential] = answer.body.credentials;
+  assert.deepEqual([credential.account, credential.authorization, credential.repositories], ['owner', 'Bearer ghs_installation_token', ['owner/repo']]);
+  assert.ok(Date.parse(credential.expiresAt) > Date.now());
+  // Limited to the repository, and to reading what the installation may: never administration or secrets, never writes.
+  const mints = f.calls.filter(call => call.url === 'https://api.github.com/app/installations/55/access_tokens');
+  assert.deepEqual(mints.map(call => call.body), [{ repository_ids: [101], permissions: { actions: 'read', contents: 'read', issues: 'read', metadata: 'read' } }]);
+  // The owner's own account confirms the repository on every request; their token is never the one handed out.
+  assert.equal(f.calls.filter(call => call.url === 'https://api.github.com/repos/owner/repo' && call.authorization === 'Bearer owner-oauth-token').length, 1);
+  assert.doesNotMatch(JSON.stringify(answer.body), /owner-oauth-token/);
+  // Shared while it lasts, as read tokens are.
+  assert.equal((await apiCredential(f)).body.credentials[0].authorization, 'Bearer ghs_installation_token');
+  assert.equal(f.calls.filter(call => call.url === 'https://api.github.com/app/installations/55/access_tokens').length, 1);
+
+  // Only credentialed API hosts, and only the session.
+  assert.equal((await apiCredential(f, { host: 'api.example.com' })).status, 400);
+  assert.equal((await apiCredential(f, { extra: true })).status, 400);
+});
+
+test('sandboxed GitHub API reads follow SANDBOX_GITHUB_API and the session\'s authority', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t, { host: { owner: approver } });
+  f.env.SANDBOX_GITHUB_API = 'own-hosts';
+  // A host shared with the workspace gets no token then; the grant still names the API, so the proxy says why.
+  assert.deepEqual(await apiCredential(f).then(answer => answer.body), { available: false, reason: 'This Pistead server gives GitHub API credentials only to session owners\' own hosts', cacheSeconds: 60 });
+  f.env.SANDBOX_GITHUB_API = 'off';
+  assert.equal((await networkGrant(f)).apis, undefined);
+  assert.equal((await apiCredential(f)).body.reason, 'GitHub API access from sessions is off on this Pistead server');
+  assert.equal(f.calls.filter(call => call.url.includes('/access_tokens')).length, 0);
+  delete f.env.SANDBOX_GITHUB_API;
+
+  // A repository the owner can no longer read is left out; with none left there is no token at all.
+  f.state.canPush = false;
+  const answer = await apiCredential(f);
+  assert.equal(answer.body.available, true, 'reading needs no push permission');
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => new URL(String(input)).pathname === '/repos/owner/repo' ? Response.json({ message: 'Not Found' }, { status: 404 }) : previousFetch(input, init);
+  try {
+    assert.deepEqual((await apiCredential(f)).body, { available: false, reason: 'The session owner can read none of this workspace\'s github.com repositories', cacheSeconds: 60 });
+  } finally { globalThis.fetch = previousFetch; }
+
+  // An archived session has no access at all.
+  f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = 'session'").run();
+  assert.equal((await apiCredential(f)).status, 403);
+});
+
+test('sandboxed GitHub API reads: the owner\'s own host gets the token under own-hosts, and pinned sessions get none', async t => {
+  forgetRepositoryReadTokens();
+  const f = await fixture(t, { host: { owner } });
+  f.env.SANDBOX_GITHUB_API = 'own-hosts';
+  assert.equal((await apiCredential(f)).body.available, true);
+  // A pinned session (no repository mode) on the same host.
+  f.sqlite.prepare(`INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,repositories_json,connector_id,connector_owner_id,repository_mode)
+    SELECT 'pinned',workspace_id,owner_id,agent_version_id,title,status,created_at,repositories_json,connector_id,connector_owner_id,NULL FROM sessions WHERE id = 'session'`).run();
+  assert.equal((await (await f.post('/api/internal/network', { sessionId: 'pinned' })).json() as Record<string, unknown>).apis, undefined);
+  assert.equal((await apiCredential(f, { sessionId: 'pinned' })).body.reason, 'Only sessions that clone their repositories read the GitHub API through Pistead');
 });

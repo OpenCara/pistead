@@ -33,6 +33,12 @@ export interface Env {
    * public repositories are still read directly everywhere) or `off` (every Git request is relayed through the server).
    */
   GIT_DIRECT?: string;
+  /**
+   * Sandboxed GitHub API reads (api-access.ts): `on` (default) gives every host running a clone session a token that
+   * only reads the workspace's github.com repositories, which its egress proxy adds to api.github.com requests;
+   * `own-hosts` only to session owners' own hosts and the server's own runner; `off` to none.
+   */
+  SANDBOX_GITHUB_API?: string;
   /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */

@@ -1,4 +1,5 @@
 import { egressGrant, gitDirect, gitRelay } from './network.js';
+import { apiCredential } from './api-access.js';
 import { withHostToolCapabilities } from './host-capabilities.js';
 import type { Hono } from 'hono';
 import type { ConnectorCapabilities, ConnectorInfo, ConnectorPairing, LocalModelSummary } from '../../../packages/shared/src/connector.js';
@@ -395,6 +396,8 @@ export function registerConnectorCredentials(app: Hono<WorkerEnv>): void {
   app.post('/api/connectors/self/git/relay/:bindingId/:service', async c => gitRelay(c, await authenticateConnector(c)));
   // A credential for the host's egress proxy to make one Git request at the forge itself, or the word to relay it.
   app.post('/api/connectors/self/git/direct', async c => gitDirect(c, await authenticateConnector(c)));
+  // The credential a session's egress proxy adds to the GitHub API requests it answers itself (api-access.ts).
+  app.post('/api/connectors/self/api/credential', async c => apiCredential(c, await authenticateConnector(c)));
 }
 
 /** A one-use pairing code for a new host of `ownerId`, valid ten minutes; also how a local server pairs its own machine. */
