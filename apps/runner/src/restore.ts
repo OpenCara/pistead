@@ -26,7 +26,8 @@ export interface RestoreConfig {
 
 export interface RestoreManifest {
   binding: RunnerBinding;
-  branches: { id: number; mode: "write" | "ask"; actorId?: string }[];
+  /** A shared conversation someone went back from is `superseded` by the fork that replaced it (RunnerSession.revert). */
+  branches: { id: number; mode: "write" | "ask"; actorId?: string; superseded?: true }[];
   runs: Record<string, unknown>;
   approvals: Record<string, unknown>;
   toolActors: Record<string, unknown>;
@@ -126,9 +127,12 @@ function snapshot(bytes: Uint8Array, descriptor: RestoreDescriptor, target: Runn
   for (const branch of manifest.branches) {
     if (!record(branch) || !Number.isSafeInteger(branch.id) || (branch.id as number) < 1
       || !["write", "ask"].includes(branch.mode as string)
-      || (branch.actorId !== undefined && typeof branch.actorId !== "string") || branches.has(branch.id as number)) invalid("Invalid backup branches");
+      || (branch.actorId !== undefined && typeof branch.actorId !== "string") || (branch.superseded !== undefined && branch.superseded !== true)
+      || branches.has(branch.id as number)) invalid("Invalid backup branches");
     branches.add(branch.id as number);
   }
+  // One shared conversation is current; the ones people went back from are kept beside it.
+  if (manifest.branches.filter(branch => branch.mode === "write" && !branch.superseded).length !== 1) invalid("Invalid backup branches");
   for (const [key, run] of Object.entries(manifest.runs)) {
     if (!record(run) || !["settled", "interrupted"].includes(run.status as string)) invalid("Backup requires idle runs");
     // A message with images can be images alone, and its hash binds them too (messageHash). The backup has no images to

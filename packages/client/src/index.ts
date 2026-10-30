@@ -9,6 +9,7 @@ export {
   type StreamStatus,
 } from "./live-session";
 export { COMPACTION_FAILED_TITLE, compactionFailureText } from "./compaction";
+export { copyText, messageCut, resendText, rewindable, type MessageCut } from "./message-actions";
 export type { CompactionFailure } from "../../shared/src/types";
 export { decidedAsHostCommand, decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "./host-commands";
 export { formatBytes, preparingRepositories, repositoryPhaseLabel, repositoryProgressText, repositoryProgressValue } from "./repository-progress";

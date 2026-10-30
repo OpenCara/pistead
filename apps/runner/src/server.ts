@@ -169,6 +169,25 @@ export class RunnerService {
     return binding;
   }
 
+  /**
+   * Starts `target`, a new session of the ticket's owner, from the shared conversation of `sourceSessionId`, another of
+   * their sessions on this host, up to one of its messages. The transcript goes from one to the other here, on the host.
+   */
+  async fork(target: RunnerSession, ticket: RunnerTicket, input: unknown): Promise<{ conversationId: string; entries: number }> {
+    const value = input as { sourceSessionId?: unknown; entryId?: unknown } | null;
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => key !== "sourceSessionId" && key !== "entryId")
+      || typeof value.sourceSessionId !== "string" || typeof value.entryId !== "string" || value.entryId.length > 64) throw new RunnerError(400, "Invalid fork request");
+    const sourceId = assertId(value.sourceSessionId);
+    if (sourceId === target.binding.session.id) throw new RunnerError(400, "A session can't be forked into itself");
+    if (ticket.actorId !== target.binding.owner.id) throw new RunnerError(403, "Only the session's owner can fork into it");
+    const source = await this.get(sourceId);
+    if (source.binding.owner.id !== ticket.actorId || source.binding.session.workspaceId !== target.binding.session.workspaceId) {
+      throw new RunnerError(403, "Only the session's owner can fork it, into the same workspace");
+    }
+    const entries = await source.forkEntries(ticket.actorId, value.entryId);
+    return target.seed(ticket, { sessionId: sourceId, entryId: value.entryId }, entries);
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     for (const pending of this.sessions.values()) {
@@ -211,7 +230,7 @@ export function createRunnerApp(service: RunnerService): Hono {
     const approval = /^approvals\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(route);
     // view/<revision>: what changed since a view this caller already holds.
     const since = /^view\/([0-9a-f]{32})$/.exec(route)?.[1];
-    const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore", stop: "stop", files: "files" };
+    const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore", stop: "stop", files: "files", revert: "revert", fork: "fork" };
     const action = approval ? "approve" : since ? "view" : actions[route];
     if (!action) throw new RunnerError(404, "Unknown runner endpoint");
     if (c.req.method !== (action === "view" || action === "events" ? "GET" : "POST")) throw new RunnerError(405, "Method not allowed");
@@ -263,6 +282,8 @@ export function createRunnerApp(service: RunnerService): Hono {
     if (action === "submit" || action === "ask") return c.json(await session.submit(ticket, input as SubmitInput, action === "ask" ? "ask" : "write"));
     if (action === "operations") return c.json({ approval: await session.createApproval(ticket.actorId, input.operation as Operation) }, 201);
     if (action === "stop") return c.json(await session.stop(ticket));
+    if (action === "revert") return c.json(await session.revert(ticket, input));
+    if (action === "fork") return c.json(await service.fork(session, ticket, input));
     if (action === "files") {
       // One worktree path, relative, as the file browser asks for it; the sandbox checks it again.
       if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => key !== "path")

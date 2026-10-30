@@ -215,7 +215,8 @@ export interface RunnerBinding {
   agent: AgentVersion;
   model: ModelDefinition;
 }
-export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop" | "files";
+export type RunnerAction = "create" | "view" | "events" | "submit" | "ask" | "operations" | "approve" | "backup" | "restart" | "restore" | "stop" | "files"
+  | "revert" | "fork";
 
 /** How far the session file browser reads: entries listed per directory, and bytes of a file previewed. */
 export const fileBrowserLimits = { entries: 1000, textBytes: 256 * 1024, imageBytes: 2 * 1024 * 1024 } as const;
@@ -754,6 +755,11 @@ export interface SessionView {
   queue?: { submissionId: string; actorId: string; mode: "write" | "ask"; status: string }[];
   /** The host can stop the session's work: the message running and those queued behind it. Absent from older runners. */
   stoppable?: boolean;
+  /**
+   * The host can take the shared conversation back to one of its messages, and fork a new session from one
+   * (`POST /api/sessions/:id/revert` and `/fork`). Absent from older runners.
+   */
+  rewindable?: boolean;
   /** The shared conversation's current model and reasoning level. */
   agent?: { provider: string; modelId: string; thinkingLevel: ThinkingLevel };
   /**

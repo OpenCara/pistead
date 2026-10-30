@@ -5,8 +5,8 @@ import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promi
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { awaitWithContext, BACKGROUND_CONTEXT as context, type Context } from "@earendil-works/chord/context";
-import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Models } from "@earendil-works/pi-ai";
-import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryRecord, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
+import { getSupportedThinkingLevels, StringEnum, Type, type ClientIdentity, type Message, type Models } from "@earendil-works/pi-ai";
+import { createRegistry, defineDoc, defineExtension, defineTool, Harness, InboxDoc, type AgentChange, type CompactionSettings, type Cursor, type Conversation, type ConversationId, type EntryId, type EntryRecord, type Extension, type Storage, type SubmissionId, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { ApprovalRecord, AuthorizationRequest, AuthorizationResult, ChatOptions, GitHubCommentRequest, GitHubIssueRequest, GitHubIssueResult, GitHubIssueView, GitHubMergeRequest, GitHubMergeResult, GitHubReadRequest, GitPushOperation, HostPushCredential, ModelDefinition, Operation, PermissionNeed, PermissionRequest, Permission, PushCompleteRequest, PushCompletionResult, PushCredential, PushCredentialRequest, PushOutcome, HostCommandLevel, RunnerBinding, RunnerTicket, ScheduleToolRequest, ScheduleToolResult, SessionActivity, SessionBranch, SessionFiles, SessionView, SubmitInput, SubmitResult, ThinkingLevel, ToolName } from "../../../packages/shared/src/types.js";
 import { GITHUB_ISSUE_BODY_LIMIT, GITHUB_ISSUE_TITLE_LIMIT, accessModes, githubMergeMethods, repositoryPreparationPhases, scheduleToolActions, thinkingLevels } from "../../../packages/shared/src/types.js";
@@ -73,8 +73,28 @@ type Run = {
   stopped?: { by: string; pending?: true };
   /** Pi parked its work after host crashes cut it off again and again, so it ended (see endParkedRuns). */
   crashed?: true;
+  /** Someone went back to before this shared message (see `revert`): it no longer says what the session is doing. */
+  reverted?: true;
 };
-type Branch = { id: number; mode: "write" | "ask"; actorId?: string };
+/**
+ * One of the session's conversations. The shared conversation is the write branch that isn't `superseded`: going back to
+ * an earlier message (`revert`) forks it there and supersedes it, which keeps its entries on the host but out of the view.
+ */
+type Branch = { id: number; mode: "write" | "ask"; actorId?: string; superseded?: true };
+/** An entry of the shared conversation as a session forked from it starts with (see `forkEntries` and `seed`). */
+export type ForkedEntry = { kind: string; model: readonly Message[] };
+/** What a session forked from another starts with: its shared conversation's entries, and the model and reasoning it used. */
+export type ForkedConversation = { entries: ForkedEntry[]; agent: { model?: { provider: string; modelId: string }; thinkingLevel?: ThinkingLevel } };
+/** The kind of the entries a forked session starts with. */
+const FORKED_KIND = "workspace.forked";
+
+/** The view entry a revert names: `{ entryId }`, nothing else. */
+export function messageInput(input: unknown): string {
+  const value = input as { entryId?: unknown } | null;
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => key !== "entryId")
+    || typeof value.entryId !== "string" || value.entryId.length > 64) throw new RunnerError(400, "Invalid message");
+  return value.entryId;
+}
 /**
  * What the session owner allowed for the rest of the session, beyond the agent's tools and each message's access.
  * `audience`: the sessions tool exchanges content with sessions whose readers aren't this session's.
@@ -96,7 +116,9 @@ interface RunnerBackup {
 }
 type Metadata = { binding: RunnerBinding; branches: Branch[]; runs: Record<string, Run>; approvals: Record<string, StoredApproval>; toolActors: Record<string, { initiatedBy: string; ownerId: string; runKey: string; callId?: string }>; usedTickets?: Record<string, number>; nextSequence?: number; grants?: Grants;
   /** The session's latest restore was from a conversation-only backup: files and clones its history mentions weren't kept. */
-  conversationOnlyRestore?: true };
+  conversationOnlyRestore?: true;
+  /** The session started from another session's shared conversation, up to one of its messages (see `seed`). */
+  forkedFrom?: { sessionId: string; entryId: string } };
 /** One JSON string that every change replaces, so each change is stored whole: a delta would be as large and only lengthen replay. */
 const RunnerState = defineDoc<{ json: string }>({ kind: "workspace.runner", version: 1, scope: "session", initial: () => ({ json: "" }), checkpointWhen: () => true });
 /** A message's image as the model gets it: prepared by `prepareImage`, base64. */
@@ -289,6 +311,13 @@ export class RunnerSession {
   readonly sqlitePath: string;
   private harness!: Harness;
   private root!: Conversation;
+  /**
+   * The shared conversation: Pi's root until someone goes back to an earlier message, then the fork that replaced it
+   * (see `revert`). Every shared message runs here, and side asks fork from it. Session documents still commit on the root.
+   */
+  #shared!: Conversation;
+  /** The session's tools as one extension, for a shared conversation started afresh (see `revert`). */
+  #extension!: Extension;
   private tools: ToolRegistration[] = [];
   private lock: Promise<unknown> = Promise.resolve();
   private generation = 0;
@@ -863,6 +892,7 @@ export class RunnerSession {
     const registry = createRegistry();
     this.tools = this.buildTools();
     const extension = defineExtension({ name: "workspace-tools", tools: this.tools });
+    this.#extension = extension;
     registry.install(extension);
     const resolved = this.config.resolveModels ? await this.config.resolveModels(this.binding.model)
       : { models: runnerModels(this.binding.model, this.config.allowFaux), provider: this.binding.model.provider, modelId: this.binding.model.modelId };
@@ -916,6 +946,7 @@ export class RunnerSession {
       }
       doc.json = JSON.stringify(state);
     }, context);
+    this.#shared = await this.sharedConversation();
     this.closing = false;
     this.#opened = true;
     // Recovered and queued work waits for repositories prepared in the background: their preparation resumes it once
@@ -1029,6 +1060,15 @@ export class RunnerSession {
       }
     }).finally(() => { this.#recovery = undefined; });
     return this.#recovery;
+  }
+
+  /** The shared conversation as the metadata names it: its write branch that nothing superseded. */
+  private async sharedConversation(): Promise<Conversation> {
+    const branch = (await this.metadata()).branches.find(item => item.mode === "write" && !item.superseded);
+    if (!branch || branch.id === this.root.id) return this.root;
+    const conversation = await this.harness.conversation(branch.id as ConversationId, context);
+    if (!conversation) throw new Error("Persisted shared conversation is missing");
+    return conversation;
   }
 
   private async metadata(): Promise<Metadata> {
@@ -1158,12 +1198,12 @@ export class RunnerSession {
     // Held work waits for the repositories, and a failed preparation holds it until the session restarts.
     if (preparation !== "ready") return preparation === "preparing" ? "working" : "failed";
     const state = await this.metadata();
-    const runs = Object.values(state.runs);
+    const runs = Object.values(state.runs).filter(run => !run.reverted);
     const approvals = Object.values(state.approvals);
     const activity = sessionActivity(runs, approvals);
     if (activity !== "done") return activity;
     // A message that settled can still have failed in its last entry, when its model request did.
-    const watch = await this.root.watch(context);
+    const watch = await this.#shared.watch(context);
     let last: EntryRecord | undefined;
     try { last = watch.value.entries.at(-1); }
     finally { await watch.stop(); }
@@ -1297,7 +1337,7 @@ export class RunnerSession {
     }
     if (value.thinkingLevel !== undefined) {
       if (!thinkingLevels.includes(value.thinkingLevel as never)) throw invalid();
-      const target = options.model ?? (await this.root.agent(context)).model ?? this.modelRef;
+      const target = options.model ?? (await this.#shared.agent(context)).model ?? this.modelRef;
       const model = this.models.getModel(target.provider, target.modelId);
       if (!model || !getSupportedThinkingLevels(model).includes(value.thinkingLevel as never)) throw invalid("Reasoning level is not supported by the model");
       options.thinkingLevel = value.thinkingLevel as ChatOptions["thinkingLevel"];
@@ -1333,7 +1373,7 @@ export class RunnerSession {
 
   /** Images go only to a model that takes them; one that doesn't would answer the text without ever seeing them. */
   private async requireImageModel(options: ChatOptions | undefined): Promise<void> {
-    const target = options?.model ?? (await this.root.agent(context)).model ?? this.modelRef;
+    const target = options?.model ?? (await this.#shared.agent(context)).model ?? this.modelRef;
     const model = this.models.getModel(target.provider, target.modelId);
     // A model that doesn't say what it takes is left to its provider.
     if (model && Array.isArray(model.input) && !model.input.includes("image")) throw new RunnerError(422, "The model doesn't accept images");
@@ -1474,16 +1514,17 @@ export class RunnerSession {
       // On disk before the run is committed, so a queued run with images always finds them; a run that never commits
       // leaves them for sweepInputs.
       if (prepared.length) await this.writeInputs(key, prepared);
-      let conversation = this.root;
+      const shared = this.#shared;
+      let conversation = shared;
       if (mode === "ask") {
-        const transcript = await this.root.context(context);
+        const transcript = await shared.context(context);
         const head = transcript.entries.at(-1);
         const fork = { ownership: { kind: "ownerless" as const }, agent: {
           // A side ask starts from the shared conversation's current model; its own choices apply when it runs.
-          model: (await this.root.agent(context)).model ?? this.modelRef, instructions: this.agentInstructions("ask"),
+          model: (await shared.agent(context)).model ?? this.modelRef, instructions: this.agentInstructions("ask"),
           tools: this.tools.filter(tool => readOnlyTools.includes(tool.name) && this.binding.agent.tools.includes(tool.name as never)),
         } };
-        conversation = head ? await this.root.fork(head.id, fork, context) : await this.harness.createConversation(fork, context);
+        conversation = head ? await shared.fork(head.id, fork, context) : await this.harness.createConversation(fork, context);
       }
       const transcript = await conversation.context(context);
       const run: Run = { key, initiatedBy: ticket.actorId, ownerId: this.binding.owner.id, mode, conversationId: conversation.id, content: input.content, contentHash: hash, status: "queued", startEntry: transcript.entries.at(-1)?.id ?? 0, sequence: state.nextSequence ?? 0, submittedAt: Date.now() };
@@ -2309,6 +2350,143 @@ export class RunnerSession {
     });
   }
 
+  /**
+   * Where the shared conversation goes back to for its view entry `entryId` (`<conversation>:<entry>`, as the view names
+   * it): just before a user message, so it can be sent again, or just after the agent's final reply of a turn. Nowhere
+   * else: a cut inside a turn would leave tool calls without results. `at` is undefined for a cut before the first message.
+   */
+  private async cutPoint(conversation: Conversation, entryId: string): Promise<{ at: EntryId | undefined; last: boolean }> {
+    const match = /^(\d{1,15}):(\d{1,15})$/.exec(entryId);
+    if (!match) throw new RunnerError(400, "Invalid message");
+    if (Number(match[1]) !== Number(conversation.id)) throw new RunnerError(409, "That message is no longer in the shared conversation; reload it");
+    const watch = await conversation.watch(context);
+    let entries: readonly EntryRecord[];
+    try { entries = watch.value.entries; }
+    finally { await watch.stop(); }
+    const index = entries.findIndex(entry => entry.id === Number(match[2]));
+    if (index < 0) throw new RunnerError(409, "That message is no longer in the shared conversation; reload it");
+    const entry = entries[index]!;
+    const messages = entry.model ?? [];
+    // The active entries start at the context's head marker (a compaction's, which carries `head`), or else at the very
+    // first entry: a user message there goes back to the start of the conversation.
+    if (messages[0]?.role === "user" && entry.head === undefined) return { at: index > 0 ? entries[index - 1]!.id : undefined, last: false };
+    const reply = messages.at(-1);
+    if (reply?.role !== "assistant" || reply.content.some(block => block.type === "toolCall")) {
+      throw new RunnerError(409, "Choose one of your messages or the agent's final reply");
+    }
+    return { at: entry.id, last: index === entries.length - 1 };
+  }
+
+  /** Whether the shared conversation, or the message queue, has work under way that a revert or fork would cut through. */
+  private working(state: Metadata): boolean {
+    return Object.values(state.runs).some(run => ["queued", "admitting", "running"].includes(run.status) || run.stopped?.pending)
+      || Object.values(state.approvals).some(approval => approval.status === "executing");
+  }
+
+  /**
+   * Takes the shared conversation back to one of its messages (see `cutPoint`): it continues from a fork there, and what
+   * came after leaves the view. The old conversation stays on the host, in its backups too. Only the conversation goes
+   * back: the worktree, its clones and anything pushed stay as they are. Refused while work runs or is queued.
+   */
+  async revert(ticket: RunnerTicket, input: unknown): Promise<{ conversationId: string }> {
+    this.assertTicket(ticket);
+    this.requireUnfrozen();
+    const entryId = messageInput(input);
+    return this.exclusive(async () => {
+      if (this.closing) throw new RunnerError(503, "Session is closing");
+      await this.authorize(ticket.actorId, "write", ticket.policyVersion);
+      if (this.working(await this.metadata())) throw new RunnerError(409, "Stop the session's work before going back to an earlier message");
+      const shared = this.#shared;
+      const { at, last } = await this.cutPoint(shared, entryId);
+      // Back to where it is already: nothing to undo.
+      if (last) return { conversationId: String(shared.id) };
+      let next: Conversation;
+      if (at !== undefined) next = await shared.fork(at, { ownership: { kind: "ownerless" } }, context);
+      else {
+        // Before the first message: a conversation as the session's root started, on the model it uses now.
+        const agent = await shared.agent(context);
+        next = await this.harness.createConversation({ ownership: { kind: "ownerless" }, agent: {
+          model: agent.model ?? this.modelRef, thinkingLevel: agent.thinkingLevel, extensions: [this.#extension],
+          tools: this.tools, instructions: this.agentInstructions("write"),
+        } }, context);
+      }
+      await this.mutate(meta => {
+        for (const branch of meta.branches) if (branch.mode === "write") branch.superseded = true;
+        meta.branches.push({ id: next.id, mode: "write" });
+        // Entry ids grow across the session's conversations, so the shared messages cut off are those that started at
+        // the cut or after it; before the first message, all of them.
+        for (const run of Object.values(meta.runs)) if (run.mode === "write" && (at === undefined || run.startEntry >= at)) run.reverted = true;
+      });
+      this.#shared = next;
+      return { conversationId: String(next.id) };
+    });
+  }
+
+  /**
+   * The shared conversation's entries up to one of its messages (see `cutPoint`), as the model sees them, for a session
+   * forked from it (see `seed`). Its owner reads them on this host: they never leave it.
+   */
+  async forkEntries(actorId: string, entryId: string): Promise<ForkedConversation> {
+    return this.exclusive(async () => {
+      if (this.closing) throw new RunnerError(503, "Session is closing");
+      if (actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session's owner can fork it");
+      await this.authorize(actorId, "manage");
+      const shared = this.#shared;
+      const { at, last } = await this.cutPoint(shared, entryId);
+      // The latest reply while the agent still works may be followed at once by more of its turn.
+      if (last && this.working(await this.metadata())) throw new RunnerError(409, "Wait for the agent to finish before forking from its latest reply");
+      // The fork goes on with the model and reasoning the conversation uses now, which messages may have changed.
+      const current = await shared.agent(context);
+      const agent = { ...(current.model ? { model: { provider: current.model.provider, modelId: current.model.modelId } } : {}),
+        ...(current.thinkingLevel ? { thinkingLevel: current.thinkingLevel as ThinkingLevel } : {}) };
+      if (at === undefined) return { entries: [], agent };
+      const transcript = await shared.context(context, { at });
+      // System messages are this session's prompt (its branch, its worktree): the fork's agent renders its own.
+      const entries = transcript.entries.flatMap((_entry, index) => {
+        const model = (transcript.contributions[index] ?? []).filter(message => (message.role as string) !== "system");
+        return model.length ? [{ kind: FORKED_KIND, model }] : [];
+      });
+      return { entries, agent };
+    });
+  }
+
+  /**
+   * Starts this new session's shared conversation with another session's (see `forkEntries`). Only into a session that
+   * hasn't run anything yet; the same fork again is answered as before.
+   */
+  async seed(ticket: RunnerTicket, from: { sessionId: string; entryId: string }, { entries, agent }: ForkedConversation): Promise<{ conversationId: string; entries: number }> {
+    this.assertTicket(ticket);
+    this.requireUnfrozen();
+    if (ticket.actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session's owner can fork into it");
+    return this.exclusive(async () => {
+      if (this.closing) throw new RunnerError(503, "Session is closing");
+      await this.authorize(ticket.actorId, "write", ticket.policyVersion);
+      const shared = this.#shared;
+      const state = await this.metadata();
+      if (state.forkedFrom) {
+        if (state.forkedFrom.sessionId !== from.sessionId || state.forkedFrom.entryId !== from.entryId) throw new RunnerError(409, "This session was already forked from another message");
+        return { conversationId: String(shared.id), entries: entries.length };
+      }
+      if (Object.keys(state.runs).length || state.branches.length !== 1 || (await shared.context(context)).entries.length) {
+        throw new RunnerError(409, "Only a new session can start from another session's conversation");
+      }
+      await shared.commit(async tx => {
+        for (const entry of entries) await tx.appendEntry(shared.id, { kind: FORKED_KIND, model: entry.model });
+        const doc = await tx.doc(RunnerState);
+        const meta = JSON.parse(doc.json) as Metadata;
+        meta.forkedFrom = { sessionId: from.sessionId, entryId: from.entryId };
+        doc.json = JSON.stringify(meta);
+      }, context);
+      // The control plane started this session on the source's current model when it still could (the host offers it
+      // and nobody disabled it), else on the source's own: only on the same model does the reasoning level carry over.
+      // The model itself is the control plane's choice, never set here.
+      const same = agent.model?.provider === this.modelRef.provider && agent.model.modelId === this.modelRef.modelId;
+      if (same && agent.thinkingLevel && thinkingLevels.includes(agent.thinkingLevel)) await shared.configure({ thinkingLevel: agent.thinkingLevel }, context);
+      this.#activity?.changed();
+      return { conversationId: String(shared.id), entries: entries.length };
+    });
+  }
+
   async consumeTicket(ticket: RunnerTicket): Promise<void> {
     this.assertTicket(ticket);
     if (ticket.exp * 1000 <= Date.now()) throw new RunnerError(401, "Ticket expired");
@@ -2325,7 +2503,8 @@ export class RunnerSession {
   async view(): Promise<SessionView> {
     const initial = await this.metadata();
     const snapshots: { branch: Branch; entries: readonly EntryRecord[] }[] = [];
-    for (const branch of initial.branches) {
+    // A shared conversation someone went back from stays on the host, out of the view: its fork shows what was kept.
+    for (const branch of initial.branches.filter(item => !item.superseded)) {
       const conversation = await this.harness.conversation(branch.id as ConversationId, context);
       if (!conversation) continue;
       const watch = await conversation.watch(context);
@@ -2349,7 +2528,7 @@ export class RunnerSession {
       const ending = previous && this.endView(previous, snapshot.branch.id);
       if (ending) entries.push(ending);
     }
-    const agent = await this.root.agent(context);
+    const agent = await this.#shared.agent(context);
     const latestWrite = Object.values(state.runs).filter(run => run.mode === "write").sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))[0];
     // Every shared message ran at some access ("approval" when it named none), so the view says which; only a session
     // without one leaves it out, and the owner's chat box then starts on Auto-approve.
@@ -2358,17 +2537,19 @@ export class RunnerSession {
     const { id, displayName, gitName, gitEmail, githubLogin } = this.binding.owner;
     const { approvals, olderApprovals } = viewApprovals(stored);
     return { sessionId: this.binding.session.id, owner: { id, displayName, gitName, gitEmail, githubLogin }, entries,
-      approvals, ...(olderApprovals ? { olderApprovals } : {}), conversations: state.branches.map(branch => ({ ...branch, id: String(branch.id) })),
+      approvals, ...(olderApprovals ? { olderApprovals } : {}),
+      conversations: state.branches.filter(branch => !branch.superseded).map(({ id, mode, actorId }) => ({ id: String(id), mode, ...(actorId ? { actorId } : {}) })),
       busy: Object.values(state.runs).some(holdsQueue)
         || Object.values(state.approvals).some(approval => approval.status === "executing") || repositories?.status === "preparing",
       queue: Object.values(state.runs).sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
         .map(run => ({ submissionId: run.key, actorId: run.initiatedBy, mode: run.mode, status: run.stopped ? (run.stopped.pending ? "stopping" : "stopped") : run.inputsLost ? "images lost" : run.status })),
       stoppable: true,
+      rewindable: true,
       ...(agent.model ? { agent: { provider: agent.model.provider, modelId: agent.model.modelId, thinkingLevel: agent.thinkingLevel } } : {}),
       ...(access ? { access } : {}),
       ...(repositories ? { repositories } : {}),
       activity: repositories ? (repositories.status === "preparing" ? "working" : "failed")
-        : sessionActivity(Object.values(state.runs), Object.values(state.approvals),
+        : sessionActivity(Object.values(state.runs).filter(run => !run.reverted), Object.values(state.approvals),
           activityEntry(snapshots.find(snapshot => snapshot.branch.mode === "write")?.entries.at(-1))),
     };
   }
