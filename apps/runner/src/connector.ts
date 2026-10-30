@@ -10,7 +10,7 @@ import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, 
 import { connectorLimits } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
 import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, SessionActivity } from "../../../packages/shared/src/types.js";
-import type { NotionReadView } from "../../../packages/shared/src/sources.js";
+import { documentItemTypes, documentKinds, type SourceReadView } from "../../../packages/shared/src/sources.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
 import type { LocalModels } from "./local-pi.js";
@@ -185,9 +185,9 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // for `sandbox`), or with the host's own Git where its owner runs it unsandboxed.
   const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, notion: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
+    github: true, githubIssues: true, sources: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, notion: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
+    github: true, githubIssues: true, sources: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, ...cache,
     ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
@@ -474,10 +474,10 @@ export class LocalConnector {
           z.looseObject({ repository: z.string(), number: z.number().int().positive(), title: z.string(), comments: z.array(z.unknown()) }).parse(view);
           return view as GitHubIssueView;
         },
-        notionRead: async request => {
-          const view = await this.brokerCallback(generation, "/api/connectors/self/notion/read", request, GITHUB_READ_LIMIT);
-          z.looseObject({ source: z.string(), id: z.string(), object: z.enum(["page", "database"]), title: z.string(), truncated: z.boolean() }).parse(view);
-          return view as NotionReadView;
+        sourceRead: async request => {
+          const view = await this.brokerCallback(generation, "/api/connectors/self/sources/read", request, GITHUB_READ_LIMIT);
+          z.looseObject({ source: z.string(), kind: z.enum(documentKinds), id: z.string(), type: z.enum(documentItemTypes), title: z.string(), truncated: z.boolean() }).parse(view);
+          return view as SourceReadView;
         },
         githubMerge: async request => {
           const payload = {

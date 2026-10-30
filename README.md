@@ -68,7 +68,7 @@ And around them:
 
 1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
-3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page works too (see [Notion sources](#notion-sources)).
+3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page, Google Drive folder or Feishu/Lark document works too (see [Document sources](#document-sources)).
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
    ```sh
@@ -112,7 +112,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | View workspace-visible sessions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Start sessions | ✓ | ✓ | ✓ | ✓ | |
 | Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
-| Add and remove sources (repositories, Notion pages), set repositories' push policy and Git LFS | ✓ | ✓ | | | |
+| Add and remove sources (repositories, documents), set repositories' push policy and Git LFS | ✓ | ✓ | | | |
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
 | Add, change or remove collaborators, members and viewers | ✓ | ✓ | | | |
@@ -137,7 +137,7 @@ Workspace admins manage only their workspace; the server's administrators are co
 
 ### Repositories and Git accounts
 
-Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [Notion pages and databases](#notion-sources), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
+Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [documents](#document-sources) (Notion, Google Drive, Feishu/Lark), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
 
 Connect the accounts that can read your repositories under **Settings → Profile → Git accounts** (**Add account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
@@ -163,16 +163,24 @@ Sessions **clone on demand**: every new session starts with an empty worktree an
 
 Sessions started before this change pinned their repositories to exact commits. They stay **read-only**: their conversation, approvals, backups (to download) and exports remain, but they no longer run messages, approvals, backups, restores or moves. Start a new session to continue their work.
 
-#### Notion sources
+#### Document sources
 
-A workspace's sources can also be Notion pages and databases: agents read them, and the pages under them, as context (specs, notes, task lists). They don't write to Notion.
+A workspace's sources can also be documents: Notion pages and databases, Google Drive folders and files, and Feishu/Lark folders, documents and wiki pages. Agents read them, and what is under them, as context (specs, notes, runbooks, task lists). They don't write to them.
 
-- **Connect Notion** under **Settings → Profile → Connected accounts → Notion → Connect**: create an [internal integration](https://www.notion.so/profile/integrations) with the **Read content** capability, paste its secret, and share the pages it may read with it (a page's **•••** menu → **Connections**). Notion lets it read only those pages and the pages under them. Pistead verifies the secret with Notion and keeps it encrypted on the server; it never goes to any host.
-- **Add a page**: owners and admins choose **Settings → Workspaces →** the workspace **→ Sources → Notion → Add Notion page** and paste the page's or database's link (**Share → Copy link**). Pistead checks it with their own Notion connection. A workspace has at most 10 Notion sources.
-- **In a session**, the agent reads them with `notion_read`, with the **session owner's** Notion connection, during a message sent with write access: a page comes back as Markdown with the pages and databases under it, and a database as its rows (the 200 most recently edited). Pages outside the bound page or database are refused, even where the owner's integration can read them, and long content is cut at 96 KiB. A session owner without a Notion connection gets a refusal that says so.
-- Removing a Notion source stops reads of it at once, in running sessions too. Every read is recorded in the audit log (`notion.read`).
+Each member connects their own accounts under **Settings → Profile → Connected accounts**. Pistead verifies what you paste with the provider and keeps it encrypted on the server; it never goes to any host. Each provider lets the connection read only what you share with it:
 
-Notion content is written by other people: the agent is told to treat it as information, not as instructions.
+| Provider | How to connect | Share with it |
+|---|---|---|
+| Notion | An [internal integration](https://www.notion.so/profile/integrations) secret, with **Read content** | Pages and databases: a page's **•••** menu → **Connections** |
+| Google Drive | The JSON key of a Google Cloud service account, with the Drive API enabled (only its email and private key are kept) | Folders and files, shared with the service account's email as **Viewer** |
+| Feishu / Lark | A custom app's **App ID** and **App Secret**, on Feishu (open.feishu.cn) or Lark (open.larksuite.com), with read access to Drive, Docs and Wiki | Folders, documents and wiki spaces the app is added to |
+
+- **Add a source**: owners and admins choose **Settings → Workspaces →** the workspace **→ Sources → Documents → Add document source**, pick the provider and paste the item's link. Pistead checks it with their own connection. A workspace has at most 20 document sources.
+- **In a session**, the agent reads them with `source_read`, with the **session owner's** connection of that kind, during a message sent with write access. A Notion page comes back as Markdown with the pages and databases under it, and a database as its rows (the 200 most recently edited). A Google Doc comes back as Markdown, a Sheet as CSV (its first sheet), Slides and text files as text, and a folder as its files. A Feishu/Lark docx document comes back as plain text, a folder as its files, and a wiki page as its document's text and the pages under it; older docs, sheets and bases are listed but not read.
+- Items outside the bound one are refused, even where the owner's connection can read them, and long content is cut at 96 KiB. A session owner without a connection of that kind gets a refusal that says so.
+- Removing a source stops reads of it at once, in running sessions too. Every read is recorded in the audit log (`source.read`).
+
+Documents are written by other people: the agent is told to treat them as information, not as instructions. Tencent Docs, Dropbox and OneDrive can't be connected yet: they grant access only through each person's own sign-in (OAuth), which Pistead doesn't offer for them yet.
 
 ### Hosts
 
@@ -361,7 +369,7 @@ The tools an agent can use:
 | `github_comment` | Comment on a GitHub issue or pull request | Approval |
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
-| `notion_read` | Read a page or database of one of the workspace's [Notion sources](#notion-sources), with the session owner's Notion connection | Nothing, during a shared message |
+| `source_read` | Read an item of one of the workspace's [document sources](#document-sources) (Notion, Google Drive, Feishu/Lark), with the session owner's connection | Nothing, during a shared message |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments, merges and issues, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.

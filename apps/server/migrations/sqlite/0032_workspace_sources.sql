@@ -9,7 +9,7 @@
 CREATE TABLE workspace_sources (
   id TEXT PRIMARY KEY NOT NULL,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK (kind IN ('git', 'notion')),
+  kind TEXT NOT NULL CHECK (kind IN ('git', 'notion', 'google-drive', 'feishu')),
   repository_binding_id TEXT UNIQUE REFERENCES workspace_repositories(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
   CHECK ((kind = 'git') = (repository_binding_id IS NOT NULL)),
@@ -35,35 +35,37 @@ CREATE TRIGGER workspace_sources_immutable BEFORE UPDATE ON workspace_sources BE
 END;
 
 -- Connected accounts of kinds other than Git (Git accounts are git_credentials and the GitHub sign-in): one per user and
--- provider. The token is vault-encrypted with the user id as AAD, like Git tokens, and never leaves the server: sessions
--- read their owner's sources through the control plane (notion_read).
+-- provider. The secret (a Notion integration secret, a Google service account key, a Feishu/Lark app's id and secret)
+-- is vault-encrypted with the user id as AAD, like Git tokens, and never leaves the server: sessions read their owner's
+-- sources through the control plane (source_read).
 CREATE TABLE source_accounts (
   id TEXT PRIMARY KEY NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  provider TEXT NOT NULL CHECK (provider IN ('notion')),
+  provider TEXT NOT NULL CHECK (provider IN ('notion', 'google-drive', 'feishu')),
   ciphertext TEXT NOT NULL,
-  -- What the provider calls the account (a Notion integration's workspace), as verified when it was connected.
+  -- What the provider calls the account (a Notion workspace, a service account's email, an app id), as verified.
   account_name TEXT NOT NULL CHECK (length(account_name) BETWEEN 1 AND 300),
   created_at TEXT NOT NULL,
   UNIQUE (user_id, provider)
 );
 
--- A Notion page or database bound to a workspace: the detail of a 'notion' source. Sessions read it and the pages under
--- it with their owner's own Notion account. Removing the source removes it.
-CREATE TABLE notion_sources (
+-- The item a document source binds: the detail of every source that isn't a Git repository. Sessions read it and what
+-- is under it with their owner's own account of the same kind. Removing the source removes it.
+CREATE TABLE document_sources (
   source_id TEXT PRIMARY KEY NOT NULL REFERENCES workspace_sources(id) ON DELETE CASCADE,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  notion_id TEXT NOT NULL CHECK (length(notion_id) = 36),
-  object TEXT NOT NULL CHECK (object IN ('page', 'database')),
+  kind TEXT NOT NULL CHECK (kind IN ('notion', 'google-drive', 'feishu')),
+  item_id TEXT NOT NULL CHECK (length(item_id) BETWEEN 1 AND 200),
+  item_type TEXT NOT NULL CHECK (item_type IN ('page', 'database', 'folder', 'document', 'spreadsheet', 'presentation', 'file', 'wiki')),
   title TEXT NOT NULL CHECK (length(title) <= 300),
   url TEXT NOT NULL CHECK (length(url) <= 2048),
   created_by TEXT NOT NULL,
-  UNIQUE (workspace_id, notion_id)
+  UNIQUE (workspace_id, kind, item_id)
 );
-CREATE TRIGGER notion_sources_kind BEFORE INSERT ON notion_sources
-WHEN NOT EXISTS (SELECT 1 FROM workspace_sources WHERE id = NEW.source_id AND workspace_id = NEW.workspace_id AND kind = 'notion') BEGIN
-  SELECT RAISE(ABORT, 'a notion source needs its workspace source');
+CREATE TRIGGER document_sources_kind BEFORE INSERT ON document_sources
+WHEN NOT EXISTS (SELECT 1 FROM workspace_sources WHERE id = NEW.source_id AND workspace_id = NEW.workspace_id AND kind = NEW.kind) BEGIN
+  SELECT RAISE(ABORT, 'a document source needs its workspace source');
 END;
-CREATE TRIGGER notion_sources_immutable BEFORE UPDATE ON notion_sources BEGIN
+CREATE TRIGGER document_sources_immutable BEFORE UPDATE ON document_sources BEGIN
   SELECT RAISE(ABORT, 'workspace sources are immutable');
 END;

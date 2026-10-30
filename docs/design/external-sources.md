@@ -181,8 +181,9 @@ Google Drive, Dropbox, OneDrive, Tencent Docs and the rest are others.
   layer.
 - **Accounts:** one **Connected accounts** page in the profile; storage stays per kind (`git_credentials` and a new
   `source_accounts`).
-- **Tools stay per kind.** Git keeps `git clone` and `git_push`. Document kinds get their own tools (`notion_read`,
-  `docs_pull`, `docs_push`, …), because their approval cards and failure modes differ. No single `source_read`.
+- **Tools by what they do.** Git keeps `git clone` and `git_push`. Every document kind is read with one tool,
+  `source_read`, so a new kind needs no connector update; writes, when they come, get tools per kind, because their
+  approval cards and failure modes differ.
 
 ### Migration
 
@@ -205,28 +206,43 @@ workspace and starting a session now require a source (`workspaceHasSourceSQL`, 
 `repositories.ts`), and the session insert requires the workspace's sources, not its repositories, to be unchanged.
 The error code stays `workspace_repositories_required` for API callers.
 
-**Done: steps 3 and 4.** The web app's workspace section is **Sources**, holding **Git repositories** and **Notion**;
-the setup step is **Add a source**; new-session and host-sharing gates (web and mobile) count every source
-(`WorkspaceRepositoryList.sources`). Notion is the first non-Git kind, read-only:
+**Done: steps 3 and 4, and two more kinds.** The web app's workspace section is **Sources**, holding **Git
+repositories** and **Documents**; the setup step is **Add a source**; new-session and host-sharing gates (web and
+mobile) count every source (`WorkspaceRepositoryList.sources`). Three document kinds, all read-only, share one path:
 
-- `source_accounts` (per user, provider `notion`, an internal integration secret, vault-encrypted with the user id as
-  AAD) under **Settings → Profile → Connected accounts**; `PUT/DELETE /api/source-accounts/notion` verify with
-  `GET /v1/users/me`.
-- `notion_sources` (the detail of a `notion` workspace source: Notion id, page or database, title, URL), at most 10 per
-  workspace; `GET/POST /api/workspaces/:id/sources` and `DELETE …/sources/:sourceId`, owners and admins, audited
-  (`workspace.source.added` / `.removed`). The adding admin's own Notion connection checks the page and names it.
-- The session grant lists them (`EgressGrant.sources`), and the runner names them in the instructions with a warning
-  that their content is other people's.
-- `notion_read {source, page?}`: a tool behind the connector capability `notion`, brokered like `github_read`
-  (`/api/connectors/self/notion/read`, `/api/internal/notion/read`): a write admission of the requester, the tool or
-  the owner's permission for that exact target, the **session owner's** Notion connection, and a target that is the
-  bound page or database or under it (`requireUnder` follows Notion parents, through blocks, at most 16 steps). A page
-  returns as Markdown (`apps/server/src/notion.ts`; at most 1,000 blocks, 3 levels of nested blocks) with its child
-  pages and databases; a database returns its 200 most recently edited rows. Results stay within 96 KiB of JSON, the
-  account is rechecked before the result leaves, and every read is audited (`notion.read`).
+- `source_accounts` (per user and provider, vault-encrypted with the user id as AAD) under **Settings → Profile →
+  Connected accounts**; `PUT/DELETE /api/source-accounts/:provider`. Each kind connects with a secret its owner pastes
+  and scopes by sharing, so no OAuth app is needed: a Notion internal integration secret (verified with
+  `GET /v1/users/me`), a Google service account's JSON key (only `client_email`, `private_key` and `private_key_id` are
+  kept; signed into a `drive.readonly` token at `oauth2.googleapis.com` only), a Feishu/Lark custom app's id and
+  secret (a tenant token from `open.feishu.cn` or `open.larksuite.com`).
+- `document_sources` (the detail of every non-Git workspace source: kind, the provider's item id and type, title,
+  URL), at most 20 per workspace; `GET/POST /api/workspaces/:id/sources` and `DELETE …/sources/:sourceId`, owners and
+  admins, audited (`workspace.source.added` / `.removed`). The adding admin's own connection checks and names the item.
+- The session grant lists them (`EgressGrant.sources`, with kind and type), and the runner names them in the
+  instructions with a warning that their content is other people's.
+- `source_read {source, item?}`: **one** read tool for every document kind, behind the connector capability `sources`,
+  so a new kind needs only the control plane. It is brokered like `github_read` (`/api/connectors/self/sources/read`,
+  `/api/internal/sources/read`): a write admission of the requester, the tool or the owner's permission for that exact
+  target, the **session owner's** connection of the source's kind, and an item that is the bound one or under it.
+  Results stay within 96 KiB of JSON, the account is rechecked before the result leaves, and every read is audited
+  (`source.read`). (Writes, when they come, are per kind: their approval cards differ.)
+- Adapters (`DocumentAdapter` in `document-http.ts`: `connect`, `resolve`, `read`):
+  - `notion.ts`: "under" follows Notion parents (pages, databases, blocks) up, at most 16 steps. A page is Markdown
+    (at most 1,000 blocks, 3 nesting levels) plus its child pages and databases; a database, its 200 newest rows.
+  - `google-drive.ts`: "under" follows Drive parents up. Docs export as `text/markdown` (falling back to
+    `text/plain`), Sheets as CSV (first sheet), Slides as text; text files download as they are (512 KiB); folders list.
+  - `feishu.ts`: Feishu names no parent of a file, so "under" searches down from the bound folder or wiki node (at
+    most 40 listings). Docx documents read as `raw_content` plain text; folders and wiki nodes list; a wiki node holding
+    a docx reads its text too. Older docs, sheets, bases and files are listed, not read.
 
-Not yet: writes to Notion, exports of Notion sources in workspace data exports, OAuth (public integrations) instead
-of internal integration secrets, and the other kinds (Drive, Dropbox, OneDrive, Feishu, Tencent Docs).
+The Google Drive and Feishu/Lark adapters were written from memory of their APIs (this sandbox reaches neither the
+APIs nor their documentation) and are tested against fakes: verify endpoint shapes, error codes and permission scopes
+against the real services before relying on them.
+
+Not yet: writes; document sources in workspace data exports; OAuth sign-in per user, which Tencent Docs, Dropbox and
+OneDrive need (they offer no app-scoped secret to paste) and which would let Google and Notion skip the
+service-account and integration setup.
 
 ## Open questions
 

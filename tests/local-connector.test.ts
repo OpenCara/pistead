@@ -156,7 +156,7 @@ test('pairing posts only to the fixed origin and strips extra model/capability s
   assert.equal(request.redirect, 'error');
   assert.equal(request.credentials, 'omit');
   assert.equal(request.headers.get('authorization'), null);
-  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, notion: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true } });
+  assert.deepEqual(await request.json(), { code: 'fixture_pairing_code', models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, sources: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true } });
   for (const secret of [providerSecret, credentials.token, 'fixture_pairing_code']) assert.equal(request.url.includes(secret), false);
 });
 
@@ -421,7 +421,7 @@ async function connectorFixture(t: TestContext, options: FixtureOptions = {}) {
         return options.authorize?.() ?? Response.json({ allowed: true, policyVersion: 1, ownerId: 'owner' });
       }
       if (request.url === `${origin}/api/connectors/self/git/push/credential` && options.pushCredential) return options.pushCredential(request);
-      if ((request.url.startsWith(`${origin}/api/connectors/self/github/`) || request.url === `${origin}/api/connectors/self/notion/read`) && options.github) return options.github(request);
+      if ((request.url.startsWith(`${origin}/api/connectors/self/github/`) || request.url === `${origin}/api/connectors/self/sources/read`) && options.github) return options.github(request);
       assert.fail(`Unexpected fixture Worker request: ${request.url}`);
     },
     onStatus: status => { statuses.push(status); if (status === 'connected') connected.push(); },
@@ -512,7 +512,7 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   socket.welcome();
   const call = await fixture.workerCalls.next();
   assert.equal(call.request.url, `${origin}/api/connectors/self/manifest`);
-  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, notion: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true } });
+  assert.deepEqual(JSON.parse(call.body), { models: [summary], capabilities: { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, sources: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true } });
   assert.equal(call.request.headers.get('x-connection-token'), connectionToken);
   assert.equal(fixture.runtimes.length, 1);
   assert.equal(ready, false);
@@ -541,7 +541,7 @@ test('fake WebSocket readiness requires welcome and acknowledged manifest; stop 
   assert.deepEqual(fixture.statuses, ['connecting', 'connected', 'stopped']);
 });
 
-const advertisedBase = { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, notion: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true };
+const advertisedBase = { ...publicCapabilities, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true, github: true, githubIssues: true, sources: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostCommands: true, hostGrants: true, automaticGitHub: true, fileBrowser: true, ...hostMigration, hostConfig: true };
 
 test('a host configured in Pistead uses its Git credentials for pushes only while its owner has them on there', { timeout: 10000 }, async t => {
   let issued: unknown;
@@ -634,20 +634,20 @@ test('github reads and merges reach the control plane over the connection, pass 
   answer = () => Response.json({ sha: 'b'.repeat(40), url: 'https://evil.example/acme/alpha/pull/7' });
   await assert.rejects(config.githubMerge!(merge));
 
-  // Notion reads go the same way, with the same bound, and refusals pass on.
-  const notionRead = { sessionId: 'session', actorId: 'owner', admissionId: 'admission', callId: 'call-2', source: 'source-1', page: '0123abcd-0123-4567-89ab-0123456789ab' };
-  const page = { source: 'Specs', id: notionRead.page, object: 'page', title: 'Specs', url: 'https://www.notion.so/x', lastEdited: '', markdown: 'y'.repeat(90 * 1024), children: [], truncated: false };
+  // Source reads go the same way, with the same bound, and refusals pass on.
+  const sourceRead = { sessionId: 'session', actorId: 'owner', admissionId: 'admission', callId: 'call-2', source: 'source-1', item: '0123abcd-0123-4567-89ab-0123456789ab' };
+  const page = { source: 'Specs', kind: 'notion', id: sourceRead.item, type: 'page', title: 'Specs', url: 'https://www.notion.so/x', lastEdited: '', content: 'y'.repeat(90 * 1024), entries: [], truncated: false };
   answer = request => {
-    assert.equal(request.url, `${origin}/api/connectors/self/notion/read`);
+    assert.equal(request.url, `${origin}/api/connectors/self/sources/read`);
     return Response.json(page);
   };
-  assert.deepEqual(await config.notionRead!(notionRead), page);
-  assert.deepEqual(JSON.parse(fixture.allCalls.at(-1)!.body), notionRead);
-  answer = () => Response.json({ error: 'That page is not under this source, the page or database bound to the workspace.', code: 'notion_outside_source' }, { status: 403 });
-  await assert.rejects(config.notionRead!(notionRead), (error: Error & { status?: number }) => error.status === 403 && /not under this source/.test(error.message));
+  assert.deepEqual(await config.sourceRead!(sourceRead), page);
+  assert.deepEqual(JSON.parse(fixture.allCalls.at(-1)!.body), sourceRead);
+  answer = () => Response.json({ error: 'That page is not under this source, the page or database bound to the workspace.', code: 'source_outside' }, { status: 403 });
+  await assert.rejects(config.sourceRead!(sourceRead), (error: Error & { status?: number }) => error.status === 403 && /not under this source/.test(error.message));
   // A view that isn't one is refused.
   answer = () => Response.json({ title: 'no id' });
-  await assert.rejects(config.notionRead!(notionRead));
+  await assert.rejects(config.sourceRead!(sourceRead));
 });
 
 test('malformed welcome never creates a runtime or advertises readiness', { timeout: 10000 }, async t => {

@@ -1,8 +1,8 @@
 import type { Hono } from 'hono';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
 import {
-  notionId, notionReadLimits, sourceLimits, validNotionId,
-  type GrantSource, type NotionObject, type NotionReadView, type SourceAccountList, type WorkspaceNotionSource, type WorkspaceSourceList,
+  documentKind, sourceLimits, validSourceItem,
+  type DocumentItemType, type DocumentKind, type GrantSource, type SourceAccountList, type SourceReadView, type WorkspaceDocumentSource, type WorkspaceSourceList,
 } from '../../../packages/shared/src/sources.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
 import { auditStatement, requireMember, sessionAccess } from './db.js';
@@ -10,88 +10,73 @@ import { fail, id, identifier, jsonObject, now, text, userIdentifier } from './h
 import { decryptToken, encryptToken } from './vault.js';
 import { requireCallbackScope } from './connectors.js';
 import { requireToolCall } from './approval-reviews.js';
-import { notionObject, readNotion, requireUnder, verifyNotion } from './notion.js';
+import { fit, type DocumentAdapter } from './document-http.js';
+import { notionAdapter } from './notion.js';
+import { googleDriveAdapter } from './google-drive.js';
+import { feishuAdapter } from './feishu.js';
 
 /**
- * Workspace sources other than Git repositories (docs/design/external-sources.md): today Notion pages and databases.
- * Owners and admins bind them; every session in the workspace reads them, each with its owner's own Notion account,
- * through the control plane (notion_read). Tokens never reach a host.
+ * Workspace sources other than Git repositories (docs/design/external-sources.md): Notion pages and databases, Google
+ * Drive folders and files, Feishu/Lark folders, documents and wiki pages. Owners and admins bind them; every session in
+ * the workspace reads them, each with its owner's own connected account of that kind, through the control plane
+ * (source_read). Secrets never reach a host.
  */
-interface SourceAccountRow { id: string; user_id: string; provider: 'notion'; ciphertext: string; account_name: string; created_at: string }
-interface NotionSourceRow { source_id: string; workspace_id: string; notion_id: string; object: NotionObject; title: string; url: string; created_by: string; created_at: string }
+export const documentAdapters: Record<DocumentKind, DocumentAdapter> = { notion: notionAdapter, 'google-drive': googleDriveAdapter, feishu: feishuAdapter };
 
-const notionSourceSelect = `SELECT n.*, s.created_at FROM notion_sources n JOIN workspace_sources s ON s.id = n.source_id AND s.kind = 'notion'`;
+interface SourceAccountRow { id: string; user_id: string; provider: DocumentKind; ciphertext: string; account_name: string; created_at: string }
+interface DocumentSourceRow { source_id: string; workspace_id: string; kind: DocumentKind; item_id: string; item_type: DocumentItemType; title: string; url: string; created_by: string; created_at: string }
 
-function publicNotionSource(row: NotionSourceRow): WorkspaceNotionSource {
-  return { id: row.source_id, workspaceId: row.workspace_id, kind: 'notion', notionId: row.notion_id, object: row.object, title: row.title, url: row.url, createdAt: row.created_at };
+const documentSourceSelect = `SELECT d.*, s.created_at FROM document_sources d JOIN workspace_sources s ON s.id = d.source_id AND s.kind = d.kind`;
+
+function publicSource(row: DocumentSourceRow): WorkspaceDocumentSource {
+  return { id: row.source_id, workspaceId: row.workspace_id, kind: row.kind, itemId: row.item_id, itemType: row.item_type, title: row.title, url: row.url, createdAt: row.created_at };
 }
 
-export async function workspaceNotionSources(env: Env, workspaceId: string): Promise<WorkspaceNotionSource[]> {
-  const rows = await env.DB.query<NotionSourceRow>(`${notionSourceSelect} WHERE n.workspace_id = ? ORDER BY s.created_at, n.source_id`).bind(workspaceId).all();
-  return rows.map(publicNotionSource);
+export async function workspaceDocumentSources(env: Env, workspaceId: string): Promise<WorkspaceDocumentSource[]> {
+  const rows = await env.DB.query<DocumentSourceRow>(`${documentSourceSelect} WHERE d.workspace_id = ? ORDER BY s.created_at, d.source_id`).bind(workspaceId).all();
+  return rows.map(publicSource);
 }
 
-/** The workspace's non-Git sources as a session's grant lists them. */
+/** The workspace's document sources as a session's grant lists them. */
 export async function grantSources(env: Env, workspaceId: string): Promise<GrantSource[]> {
-  return (await workspaceNotionSources(env, workspaceId)).map(source => ({ id: source.id, kind: 'notion', object: source.object, title: source.title }));
+  return (await workspaceDocumentSources(env, workspaceId)).map(source => ({ id: source.id, kind: source.kind, type: source.itemType, title: source.title }));
 }
 
-/** How many sources a workspace has, repositories included. */
-export async function workspaceSourceCount(env: Env, workspaceId: string): Promise<number> {
-  return Number(await env.DB.query<{ n: number }>('SELECT COUNT(*) AS n FROM workspace_sources WHERE workspace_id = ?').bind(workspaceId).first('n') ?? 0);
-}
+interface LoadedAccount { secret: string; ciphertext: string; userId: string; provider: DocumentKind }
 
-interface LoadedNotion { token: string; ciphertext: string; userId: string }
-
-async function loadNotion(env: Env, userId: string): Promise<LoadedNotion | null> {
-  const row = await env.DB.query<SourceAccountRow>("SELECT * FROM source_accounts WHERE user_id = ? AND provider = 'notion'").bind(userId).first();
-  return row ? { token: await decryptToken(env, userId, row.ciphertext), ciphertext: row.ciphertext, userId } : null;
+async function loadAccount(env: Env, userId: string, provider: DocumentKind): Promise<LoadedAccount | null> {
+  const row = await env.DB.query<SourceAccountRow>('SELECT * FROM source_accounts WHERE user_id = ? AND provider = ?').bind(userId, provider).first();
+  return row ? { secret: await decryptToken(env, userId, row.ciphertext), ciphertext: row.ciphertext, userId, provider } : null;
 }
 
 /** The account that was used must still be the connected one before its result leaves the control plane. */
-async function recheckNotion(env: Env, account: LoadedNotion): Promise<void> {
-  const current = await env.DB.query<{ ciphertext: string }>("SELECT ciphertext FROM source_accounts WHERE user_id = ? AND provider = 'notion'").bind(account.userId).first('ciphertext');
-  if (current !== account.ciphertext) fail(403, 'notion_access_changed', 'The Notion connection changed; try again with the current one.');
+async function recheckAccount(env: Env, account: LoadedAccount): Promise<void> {
+  const current = await env.DB.query<{ ciphertext: string }>('SELECT ciphertext FROM source_accounts WHERE user_id = ? AND provider = ?')
+    .bind(account.userId, account.provider).first('ciphertext');
+  if (current !== account.ciphertext) fail(403, 'source_access_changed', 'The connected account changed; try again with the current one.');
 }
 
-function notionRequired(): never {
-  return fail(409, 'notion_account_required', 'Connect Notion in Settings → Profile first.');
-}
-
-/** A JSON value cut to fit `notionReadLimits.bytes`: rows and children first, then the page's Markdown. */
-function fit(view: NotionReadView): NotionReadView {
-  const size = () => Buffer.byteLength(JSON.stringify(view));
-  while (size() > notionReadLimits.bytes && (view.rows?.length || view.children?.length)) {
-    if (view.rows?.length) view.rows.pop(); else view.children!.pop();
-    view.truncated = true;
-  }
-  if (size() > notionReadLimits.bytes && view.markdown) {
-    let markdown = view.markdown;
-    while (markdown && Buffer.byteLength(JSON.stringify({ ...view, markdown })) > notionReadLimits.bytes) markdown = markdown.slice(0, Math.floor(markdown.length * 0.9));
-    view.markdown = markdown;
-    view.truncated = true;
-  }
-  return view;
+function providerParam(value: string | undefined): DocumentKind {
+  return documentKind(value) ? value : fail(404, 'not_found', 'No such kind of connected account.');
 }
 
 /**
- * notion_read: a page or database of one of the session's workspace sources, read with the session OWNER's Notion
- * account, within the requester's current write message, like github_read. The target must be the bound page or
- * database or lie under it.
+ * source_read: an item of one of the session's workspace sources, read with the session OWNER's account of that kind,
+ * within the requester's current write message, like github_read. The item must be the bound one or lie under it.
  */
-export async function notionRead(c: AppContext, connectorId: string | null): Promise<Response> {
-  const input = await jsonObject(c, 4096);
-  if (Object.keys(input).some(key => !['sessionId', 'actorId', 'admissionId', 'callId', 'source', 'page'].includes(key))) {
-    fail(400, 'invalid_input', 'Unexpected Notion read field.');
+export async function sourceRead(c: AppContext, connectorId: string | null): Promise<Response> {
+  const input = await jsonObject(c, 8192);
+  if (Object.keys(input).some(key => !['sessionId', 'actorId', 'admissionId', 'callId', 'source', 'item'].includes(key))) {
+    fail(400, 'invalid_input', 'Unexpected source read field.');
   }
   const sessionId = identifier(input.sessionId, 'sessionId');
   const actorId = userIdentifier(input.actorId, 'actorId');
   const admissionId = text(input.admissionId, 'admissionId', 128);
   const callId = identifier(input.callId, 'callId');
   const sourceId = identifier(input.source, 'source');
-  const page = input.page === undefined ? null : notionId(input.page);
-  if (input.page !== undefined && !page) fail(400, 'invalid_input', 'page must be a Notion page or database id or URL.');
-  const authorize = async (): Promise<{ row: SessionRow; source: NotionSourceRow }> => {
+  if (input.item !== undefined && !validSourceItem(input.item)) fail(400, 'invalid_input', 'item must be an id or link of one line.');
+  const item = input.item === undefined ? null : (input.item as string).trim();
+  const authorize = async (): Promise<{ row: SessionRow; source: DocumentSourceRow }> => {
     const access = await sessionAccess(c.env, sessionId, actorId);
     if (!access || access.row.status === 'archived' || !hasPermission(access.permissions, 'write')) {
       fail(403, 'permission_revoked', 'The requester can no longer write to this session.');
@@ -101,22 +86,23 @@ export async function notionRead(c: AppContext, connectorId: string | null): Pro
       'SELECT id, session_id, actor_id, mode, access, expires_at FROM run_admissions WHERE id = ?').bind(admissionId).first();
     if (!admission || admission.session_id !== sessionId || admission.actor_id !== actorId || admission.mode !== 'write'
       || admission.expires_at <= Math.floor(Date.now() / 1000)) {
-      fail(403, 'notion_read_not_admitted', 'Notion reads need a write message from the requester sent within the last hour.');
+      fail(403, 'source_read_not_admitted', 'Source reads need a write message from the requester sent within the last hour.');
     }
-    await requireToolCall(c.env, access.row, 'notion_read', { id: callId, requestedBy: actorId, admission, target: `${sourceId}${page ? `:${page}` : ''}` });
-    const source = await c.env.DB.query<NotionSourceRow>(`${notionSourceSelect} WHERE n.source_id = ? AND n.workspace_id = ?`).bind(sourceId, access.row.workspace_id).first();
-    if (!source) fail(404, 'source_not_found', 'This workspace has no such Notion source.');
+    // The target a one-call permission card showed: the source and the item exactly as the agent passed it.
+    await requireToolCall(c.env, access.row, 'source_read', { id: callId, requestedBy: actorId, admission, target: item === null ? sourceId : `${sourceId}: ${item}` });
+    const source = await c.env.DB.query<DocumentSourceRow>(`${documentSourceSelect} WHERE d.source_id = ? AND d.workspace_id = ?`).bind(sourceId, access.row.workspace_id).first();
+    if (!source) fail(404, 'source_not_found', 'This workspace has no such source, or it is a repository (clone those with Git).');
     return { row: access.row, source };
   };
   const { row, source } = await authorize();
-  const account = await loadNotion(c.env, row.owner_id);
-  if (!account) fail(409, 'notion_account_required', 'The session owner has not connected Notion in Settings → Profile.');
-  const target = await notionObject(account.token, page ?? source.notion_id);
-  await requireUnder(account.token, source.notion_id, target);
-  const view = fit(await readNotion(account.token, source.title, target));
-  await recheckNotion(c.env, account);
+  const adapter = documentAdapters[source.kind];
+  const account = await loadAccount(c.env, row.owner_id, source.kind);
+  if (!account) fail(409, 'source_account_required', `The session owner has not connected ${adapter.name} in Settings → Profile → Connected accounts.`);
+  const read = await adapter.read(account.secret, { id: source.item_id, type: source.item_type, title: source.title, url: source.url }, item);
+  const view = fit<SourceReadView>({ source: source.title, kind: source.kind, ...read });
+  await recheckAccount(c.env, account);
   await authorize();
-  await auditStatement(c.env, actorId, 'notion.read', row.workspace_id, sessionId, { source: source.source_id, page: target.id, object: target.object }).run();
+  await auditStatement(c.env, actorId, 'source.read', row.workspace_id, sessionId, { source: source.source_id, kind: source.kind, item: view.id, type: view.type }).run();
   return c.json(view);
 }
 
@@ -125,28 +111,28 @@ export function registerSources(app: Hono<WorkerEnv>): void {
     const rows = await c.env.DB.query<SourceAccountRow>('SELECT * FROM source_accounts WHERE user_id = ? ORDER BY provider').bind(c.get('auth').userId).all();
     return c.json({ accounts: rows.map(row => ({ provider: row.provider, name: row.account_name, createdAt: row.created_at })) } satisfies SourceAccountList);
   });
-  app.put('/api/source-accounts/notion', async c => {
+  app.put('/api/source-accounts/:provider', async c => {
     const actor = c.get('auth').userId;
-    const input = await jsonObject(c, 8192);
-    if (Object.keys(input).some(key => key !== 'token')) fail(400, 'invalid_input', 'Only the token is accepted.');
-    const token = typeof input.token === 'string' ? input.token.trim() : '';
-    if (!/^[A-Za-z0-9_-]{20,500}$/.test(token)) fail(400, 'invalid_notion_token', 'Paste a Notion internal integration secret (it starts with ntn_ or secret_).');
-    const { name } = await verifyNotion(token);
-    const ciphertext = await encryptToken(c.env, actor, token);
+    const provider = providerParam(c.req.param('provider'));
+    const input = await jsonObject(c, 16384);
+    // The adapter verifies what was pasted with its provider and keeps only what reads need.
+    const { secret, name } = await documentAdapters[provider].connect(input);
+    const ciphertext = await encryptToken(c.env, actor, secret);
     const created = now();
     await c.env.DB.batch([
-      c.env.DB.query(`INSERT INTO source_accounts (id, user_id, provider, ciphertext, account_name, created_at) VALUES (?, ?, 'notion', ?, ?, ?)
+      c.env.DB.query(`INSERT INTO source_accounts (id, user_id, provider, ciphertext, account_name, created_at) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT (user_id, provider) DO UPDATE SET ciphertext = excluded.ciphertext, account_name = excluded.account_name, created_at = excluded.created_at`)
-        .bind(id(), actor, ciphertext, name, created),
-      auditStatement(c.env, actor, 'source_account.connected', null, null, { provider: 'notion', name }),
+        .bind(id(), actor, provider, ciphertext, name.slice(0, sourceLimits.title), created),
+      auditStatement(c.env, actor, 'source_account.connected', null, null, { provider, name }),
     ]);
-    return c.json({ provider: 'notion', name, createdAt: created });
+    return c.json({ provider, name, createdAt: created });
   });
-  app.delete('/api/source-accounts/notion', async c => {
+  app.delete('/api/source-accounts/:provider', async c => {
     const actor = c.get('auth').userId;
+    const provider = providerParam(c.req.param('provider'));
     await c.env.DB.batch([
-      c.env.DB.query("DELETE FROM source_accounts WHERE user_id = ? AND provider = 'notion'").bind(actor),
-      auditStatement(c.env, actor, 'source_account.removed', null, null, { provider: 'notion' }),
+      c.env.DB.query('DELETE FROM source_accounts WHERE user_id = ? AND provider = ?').bind(actor, provider),
+      auditStatement(c.env, actor, 'source_account.removed', null, null, { provider }),
     ]);
     return c.json({ ok: true });
   });
@@ -154,41 +140,40 @@ export function registerSources(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/sources', async c => {
     const workspaceId = identifier(c.req.param('id'));
     await requireMember(c.env, workspaceId, c.get('auth').userId);
-    return c.json({ sources: await workspaceNotionSources(c.env, workspaceId) } satisfies WorkspaceSourceList);
+    return c.json({ sources: await workspaceDocumentSources(c.env, workspaceId) } satisfies WorkspaceSourceList);
   });
   app.post('/api/workspaces/:id/sources', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
     await requireMember(c.env, workspaceId, actor, ['owner', 'admin']);
     const input = await jsonObject(c, 8192);
     if (Object.keys(input).some(key => !['kind', 'target'].includes(key))) fail(400, 'invalid_source', 'Only the kind and target are accepted.');
-    if (input.kind !== 'notion') fail(400, 'invalid_source', 'Add Git repositories under Repositories; other sources are Notion pages and databases.');
-    const notion = notionId(input.target);
-    if (!notion) fail(400, 'invalid_source', 'Paste the link of a Notion page or database, or its id.');
-    // The admin's own Notion account checks that the page exists and names it; sessions read it with their owners' accounts.
-    const account = await loadNotion(c.env, actor) ?? notionRequired();
-    const object = await notionObject(account.token, notion);
-    if (!validNotionId(object.id)) fail(502, 'invalid_notion_response', 'Notion returned an unexpected response.');
-    await recheckNotion(c.env, account);
+    if (!documentKind(input.kind)) fail(400, 'invalid_source', 'Add Git repositories under Repositories; other sources are Notion, Google Drive or Feishu/Lark items.');
+    const kind = input.kind;
+    const adapter = documentAdapters[kind];
+    // The admin's own account checks the item and names it; sessions read it with their owners' accounts.
+    const account = await loadAccount(c.env, actor, kind) ?? fail(409, 'source_account_required', `Connect ${adapter.name} in Settings → Profile → Connected accounts first.`);
+    const item = await adapter.resolve(account.secret, input.target);
+    await recheckAccount(c.env, account);
     const sourceId = id(); const created = now();
     const results = await c.env.DB.batch([
       c.env.DB.query(`INSERT INTO workspace_sources (id, workspace_id, kind, repository_binding_id, created_at)
-        SELECT ?, ?, 'notion', NULL, ? WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))
-        AND (SELECT COUNT(*) FROM notion_sources WHERE workspace_id = ?) < ?
-        AND NOT EXISTS (SELECT 1 FROM notion_sources WHERE workspace_id = ? AND notion_id = ?) RETURNING id`)
-        .bind(sourceId, workspaceId, created, workspaceId, actor, workspaceId, sourceLimits.notion, workspaceId, object.id),
-      c.env.DB.query(`INSERT INTO notion_sources (source_id, workspace_id, notion_id, object, title, url, created_by)
-        SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM workspace_sources WHERE id = ?)`)
-        .bind(sourceId, workspaceId, object.id, object.object, object.title, object.url, actor, sourceId),
+        SELECT ?, ?, ?, NULL, ? WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))
+        AND (SELECT COUNT(*) FROM document_sources WHERE workspace_id = ?) < ?
+        AND NOT EXISTS (SELECT 1 FROM document_sources WHERE workspace_id = ? AND kind = ? AND item_id = ?) RETURNING id`)
+        .bind(sourceId, workspaceId, kind, created, workspaceId, actor, workspaceId, sourceLimits.documents, workspaceId, kind, item.id),
+      c.env.DB.query(`INSERT INTO document_sources (source_id, workspace_id, kind, item_id, item_type, title, url, created_by)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM workspace_sources WHERE id = ?)`)
+        .bind(sourceId, workspaceId, kind, item.id, item.type, item.title, item.url, actor, sourceId),
     ]);
     if (!results[0].results[0]) {
-      const existing = await c.env.DB.query('SELECT 1 FROM notion_sources WHERE workspace_id = ? AND notion_id = ?').bind(workspaceId, object.id).first();
-      if (existing) fail(409, 'source_exists', 'This Notion page or database is already a source of the workspace.');
+      const existing = await c.env.DB.query('SELECT 1 FROM document_sources WHERE workspace_id = ? AND kind = ? AND item_id = ?').bind(workspaceId, kind, item.id).first();
+      if (existing) fail(409, 'source_exists', 'This item is already a source of the workspace.');
       await requireMember(c.env, workspaceId, actor, ['owner', 'admin']);
-      fail(409, 'source_limit', `A workspace has at most ${sourceLimits.notion} Notion sources.`);
+      fail(409, 'source_limit', `A workspace has at most ${sourceLimits.documents} sources besides its repositories.`);
     }
-    await auditStatement(c.env, actor, 'workspace.source.added', workspaceId, null, { source: sourceId, kind: 'notion', object: object.object, notionId: object.id }).run();
-    return c.json({ source: publicNotionSource({ source_id: sourceId, workspace_id: workspaceId, notion_id: object.id, object: object.object,
-      title: object.title, url: object.url, created_by: actor, created_at: created }) }, 201);
+    await auditStatement(c.env, actor, 'workspace.source.added', workspaceId, null, { source: sourceId, kind, type: item.type, item: item.id }).run();
+    return c.json({ source: publicSource({ source_id: sourceId, workspace_id: workspaceId, kind, item_id: item.id, item_type: item.type,
+      title: item.title, url: item.url, created_by: actor, created_at: created }) }, 201);
   });
   app.delete('/api/workspaces/:id/sources/:sourceId', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;

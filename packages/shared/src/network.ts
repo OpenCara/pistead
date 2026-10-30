@@ -78,8 +78,8 @@ export interface EgressGrant {
   policy: NetworkPolicy;
   repositories: EgressRepository[];
   /**
-   * The workspace's sources other than its repositories (Notion pages and databases), which the agent reads through
-   * the control plane (notion_read), never through the proxy. Absent from older control planes.
+   * The workspace's document sources (Notion, Google Drive, Feishu/Lark), which the agent reads through
+   * the control plane (source_read), never through the proxy. Absent from older control planes.
    */
   sources?: GrantSource[];
 }

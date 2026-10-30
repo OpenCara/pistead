@@ -78,13 +78,15 @@ test('sources are immutable, and a git source needs its own repository in its ow
   assert.throws(() => insert.run('other-kind', 'one', 'drive', null), /CHECK/);
   // Other kinds have no repository; their details are in their own table, which needs a source of that kind.
   insert.run('notion', 'one', 'notion', null);
-  const detail = sqlite.prepare(`INSERT INTO notion_sources (source_id, workspace_id, notion_id, object, title, url, created_by) VALUES (?, ?, ?, 'page', 'Specs', 'https://www.notion.so/x', 'owner')`);
+  const detail = sqlite.prepare(`INSERT INTO document_sources (source_id, workspace_id, kind, item_id, item_type, title, url, created_by) VALUES (?, ?, ?, ?, 'page', 'Specs', 'https://www.notion.so/x', 'owner')`);
   const page = '0123abcd-0123-4567-89ab-0123456789ab';
-  assert.throws(() => detail.run('r1', 'one', page), /needs its workspace source/);
-  assert.throws(() => detail.run('notion', 'two', page), /needs its workspace source/);
-  detail.run('notion', 'one', page);
-  assert.throws(() => sqlite.exec("UPDATE notion_sources SET title = 'Other'"), /immutable/);
+  assert.throws(() => detail.run('r1', 'one', 'git', page), /CHECK|needs its workspace source/);
+  assert.throws(() => detail.run('notion', 'two', 'notion', page), /needs its workspace source/);
+  // A source's details are of its own kind.
+  assert.throws(() => detail.run('notion', 'one', 'google-drive', page), /needs its workspace source/);
+  detail.run('notion', 'one', 'notion', page);
+  assert.throws(() => sqlite.exec("UPDATE document_sources SET title = 'Other'"), /immutable/);
   assert.deepEqual(sources(sqlite).map(row => row.id), ['notion', 'r1']);
   sqlite.exec("DELETE FROM workspace_sources WHERE id = 'notion'");
-  assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM notion_sources').get()!.n, 0);
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM document_sources').get()!.n, 0);
 });

@@ -1,103 +1,141 @@
-import { useState, type FormEvent } from "react";
-import { sourceLimits, type SourceAccountList, type WorkspaceNotionSource, type WorkspaceSourceList } from "../../../packages/shared/src/sources";
+import { useState, type FormEvent, type ReactNode } from "react";
+import {
+  documentKindNames, documentKinds, sourceLimits,
+  type DocumentItemType, type DocumentKind, type FeishuDomain, type SourceAccountList, type WorkspaceDocumentSource, type WorkspaceSourceList,
+} from "../../../packages/shared/src/sources";
 import { api, segment } from "./api";
 import { href } from "./router";
 import { Icon } from "./icons";
-import { Alert, Button, CardBody, Feedback, Field, LinkButton, ResourceState, Row, Section, Sheet, StatusBadge, confirmDialog, useAction, useResource } from "./ui";
+import { Alert, Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState, Row, Section, Sheet, StatusBadge, confirmDialog, useAction, useResource } from "./ui";
 
-/** The caller's connected accounts other than Git (today: Notion). */
+/** The caller's connected accounts other than Git (Notion, Google Drive, Feishu/Lark). */
 export function useSourceAccounts(enabled = true) {
   const resource = useResource<SourceAccountList>(enabled ? "/api/source-accounts" : null);
   return { accounts: resource.data?.accounts ?? null, loading: resource.loading, error: resource.error, refresh: resource.refresh };
 }
 
-/** A workspace's sources other than its repositories (today: Notion pages and databases). */
+/** A workspace's sources other than its repositories. */
 export function useWorkspaceSources(workspaceId: string | null) {
   const resource = useResource<WorkspaceSourceList>(workspaceId ? `/api/workspaces/${segment(workspaceId)}/sources` : null);
   return { sources: resource.data?.sources ?? null, loading: resource.loading, error: resource.error, refresh: resource.refresh };
 }
 
-/** Profile section: the Notion account sessions you own read Notion sources with. */
+const setup: Record<DocumentKind, ReactNode> = {
+  notion: <>Create an internal integration at notion.so/profile/integrations with Read content, and share the pages it may read with it (a page's ••• menu → Connections).</>,
+  "google-drive": <>Create a service account in Google Cloud with the Drive API enabled, download its JSON key, and share the folders and files it may read with the service account's email, as Viewer.</>,
+  feishu: <>Create a custom app in the Feishu or Lark developer console with read access to Drive, Docs and Wiki, publish it, and add it to the folders, documents or wiki spaces it may read.</>,
+};
+
+const itemLabels: Record<DocumentItemType, string> = {
+  page: "Page", database: "Database", folder: "Folder", document: "Document", spreadsheet: "Spreadsheet", presentation: "Presentation", file: "File", wiki: "Wiki page",
+};
+
+/** Profile section: the accounts sessions you own read the workspaces' document sources with. */
 export function ConnectedAccountsSection() {
   const { accounts, loading, error, refresh } = useSourceAccounts();
   const action = useAction();
-  const [connecting, setConnecting] = useState(false);
-  const notion = accounts?.find(account => account.provider === "notion") ?? null;
-  async function remove() {
-    if (action.busy || !notion) return;
+  const [connecting, setConnecting] = useState<DocumentKind | null>(null);
+  async function remove(provider: DocumentKind, name: string) {
+    if (action.busy) return;
     const confirmed = await confirmDialog({
-      title: "Disconnect Notion",
-      message: `Disconnect Notion (${notion.name})? Its secret is deleted from the server, and sessions you own can no longer read the workspaces' Notion sources.`,
+      title: `Disconnect ${documentKindNames[provider]}`,
+      message: `Disconnect ${documentKindNames[provider]} (${name})? Its secret is deleted from the server, and sessions you own can no longer read the workspaces' ${documentKindNames[provider]} sources.`,
       confirmLabel: "Disconnect",
       destructive: true,
     });
     if (!confirmed) return;
     void action.run(async () => {
-      await api("/api/source-accounts/notion", { method: "DELETE" });
+      await api(`/api/source-accounts/${provider}`, { method: "DELETE" });
       refresh();
-    }, "Notion disconnected.");
+    }, `${documentKindNames[provider]} disconnected.`);
   }
   return <Section title="Connected accounts"
     info={<div className="stack">
-      <p>Sessions you own read the workspaces' Notion sources with your own Notion connection, through Pistead: the secret is encrypted on the server and never sent to any host, yours included.</p>
-      <p>Create an internal integration at notion.so/profile/integrations with Read content, and share the pages it may read with it (a page's ••• menu → Connections). Notion lets it read only those pages and the pages under them.</p>
+      <p>Sessions you own read the workspaces' Notion, Google Drive and Feishu/Lark sources with your own connections here, through Pistead. Secrets are encrypted on the server and never sent to any host, yours included.</p>
+      <p>Each provider lets its connection read only what you share with it, and sessions read only what lies under the workspace's sources.</p>
     </div>}>
     <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
-      <Row leading={<Icon name="file" size={16} />} title="Notion" hint={notion ? notion.name : "Not connected"}
-        trailing={notion
-          ? <><StatusBadge tone="success">Connected</StatusBadge><Button variant="ghost" size="sm" disabled={action.busy} onClick={() => setConnecting(true)}>Replace</Button><Button variant="ghost" size="sm" disabled={action.busy} aria-label="Disconnect Notion" onClick={() => void remove()}>Disconnect</Button></>
-          : <Button variant="outline" size="sm" disabled={action.busy} onClick={() => setConnecting(true)}>Connect</Button>} />
+      {documentKinds.map(provider => {
+        const account = accounts?.find(item => item.provider === provider);
+        return <Row key={provider} leading={<Icon name="file" size={16} />} title={documentKindNames[provider]} hint={account ? account.name : "Not connected"}
+          trailing={account
+            ? <><StatusBadge tone="success">Connected</StatusBadge><Button variant="ghost" size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>Replace</Button><Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Disconnect ${documentKindNames[provider]}`} onClick={() => void remove(provider, account.name)}>Disconnect</Button></>
+            : <Button variant="outline" size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>Connect</Button>} />;
+      })}
     </ResourceState>
     {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
-    <ConnectNotionSheet open={connecting} close={() => setConnecting(false)} connected={refresh} />
+    <ConnectSheet provider={connecting} close={() => setConnecting(null)} connected={refresh} />
   </Section>;
 }
 
-function ConnectNotionSheet({ open, close, connected }: { open: boolean; close: () => void; connected: () => void }) {
-  const [token, setToken] = useState("");
+function ConnectSheet({ provider, close, connected }: { provider: DocumentKind | null; close: () => void; connected: () => void }) {
+  const [secret, setSecret] = useState("");
+  const [appId, setAppId] = useState("");
+  const [domain, setDomain] = useState<FeishuDomain>("feishu");
   const action = useAction();
+  function reset() { setSecret(""); setAppId(""); setDomain("feishu"); }
   function dismiss() {
     if (action.busy) return;
-    setToken("");
+    reset();
     close();
   }
+  const ready = Boolean(secret.trim() && (provider !== "feishu" || appId.trim()));
   function submit(event: FormEvent) {
     event.preventDefault();
-    if (!token.trim() || action.busy) return;
+    if (!provider || !ready || action.busy) return;
+    const body = provider === "notion" ? { token: secret.trim() } : provider === "google-drive" ? { key: secret } : { appId: appId.trim(), appSecret: secret.trim(), domain };
     void action.run(async () => {
-      try { await api("/api/source-accounts/notion", { method: "PUT", body: { token: token.trim() } }); }
-      finally { setToken(""); }
+      try { await api(`/api/source-accounts/${provider}`, { method: "PUT", body }); }
+      finally { setSecret(""); }
+      reset();
       connected();
       close();
     });
   }
-  return <Sheet open={open} title="Connect Notion" onClose={dismiss} footer={<>
+  const name = provider ? documentKindNames[provider] : "";
+  return <Sheet open={provider !== null} title={`Connect ${name}`} onClose={dismiss} footer={<>
     <Button disabled={action.busy} onClick={dismiss}>Cancel</Button>
-    <Button variant="default" type="submit" form="notion-account-form" disabled={!token.trim() || action.busy}>{action.busy ? "Verifying..." : "Connect"}</Button>
+    <Button variant="default" type="submit" form="source-account-form" disabled={!ready || action.busy}>{action.busy ? "Verifying..." : "Connect"}</Button>
   </>}>
-    <form id="notion-account-form" className="stack" onSubmit={submit}>
-      <Field label="Internal integration secret" hint="From notion.so/profile/integrations, with the Read content capability. Verified with Notion, then encrypted on the server">
-        <input className="input" required type="password" value={token} onChange={event => setToken(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} placeholder="ntn_…" />
-      </Field>
+    <form id="source-account-form" className="stack" onSubmit={submit}>
+      {provider && <p className="muted small">{setup[provider]} Pistead verifies it with {name}, then encrypts it on the server.</p>}
+      {provider === "notion" && <Field label="Internal integration secret">
+        <input className="input" required type="password" value={secret} onChange={event => setSecret(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} placeholder="ntn_…" />
+      </Field>}
+      {provider === "google-drive" && <Field label="Service account JSON key" hint="The whole key file. Only its email and private key are kept">
+        <textarea className="input" required rows={6} value={secret} onChange={event => setSecret(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} placeholder='{"type": "service_account", …}' />
+      </Field>}
+      {provider === "feishu" && <>
+        <div className="field"><span className="field-label">Platform</span>
+          <Combobox<FeishuDomain> label="Platform" value={domain} disabled={action.busy}
+            options={[{ value: "feishu", label: "Feishu", hint: "open.feishu.cn" }, { value: "lark", label: "Lark", hint: "open.larksuite.com" }]} onChange={setDomain} />
+        </div>
+        <Field label="App ID">
+          <input className="input" required value={appId} onChange={event => setAppId(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} placeholder="cli_…" />
+        </Field>
+        <Field label="App Secret">
+          <input className="input" required type="password" value={secret} onChange={event => setSecret(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} />
+        </Field>
+      </>}
       <Feedback error={action.error} />
     </form>
   </Sheet>;
 }
 
-/** The Notion part of a workspace's Sources: its bound pages and databases, which owners and admins add and remove. */
-export function NotionSources({ workspaceId, workspaceName, admin, sources, loading, error, refresh, changed }: {
-  workspaceId: string; workspaceName: string; admin: boolean; sources: WorkspaceNotionSource[] | null; loading: boolean; error: string; refresh: () => void; changed: () => void;
+/** The document part of a workspace's Sources: its Notion, Google Drive and Feishu/Lark items, which owners and admins add and remove. */
+export function DocumentSources({ workspaceId, workspaceName, admin, sources, loading, error, refresh, changed }: {
+  workspaceId: string; workspaceName: string; admin: boolean; sources: WorkspaceDocumentSource[] | null; loading: boolean; error: string; refresh: () => void; changed: () => void;
 }) {
   const action = useAction();
   const accounts = useSourceAccounts(admin);
   const [adding, setAdding] = useState(false);
-  const connected = Boolean(accounts.accounts?.some(account => account.provider === "notion"));
-  const full = (sources?.length ?? 0) >= sourceLimits.notion;
-  async function remove(source: WorkspaceNotionSource) {
+  const connected = documentKinds.filter(kind => accounts.accounts?.some(account => account.provider === kind));
+  const full = (sources?.length ?? 0) >= sourceLimits.documents;
+  async function remove(source: WorkspaceDocumentSource) {
     if (action.busy || !admin) return;
     const confirmed = await confirmDialog({
-      title: "Remove Notion source",
-      message: `Remove ${source.title} from ${workspaceName}? Sessions, running ones too, can no longer read it or the pages under it.`,
+      title: "Remove source",
+      message: `Remove ${source.title} (${documentKindNames[source.kind]}) from ${workspaceName}? Sessions, running ones too, can no longer read it or what is under it.`,
       confirmLabel: "Remove",
       destructive: true,
     });
@@ -105,54 +143,66 @@ export function NotionSources({ workspaceId, workspaceName, admin, sources, load
     void action.run(async () => {
       await api(`/api/workspaces/${segment(workspaceId)}/sources/${segment(source.id)}`, { method: "DELETE" });
       refresh(); changed();
-    }, "Notion source removed.");
+    }, "Source removed.");
   }
   return <div className="stack">
-    <div className="section-header"><h3 className="section-title">Notion</h3><span className="spacer" />
-      {admin && connected && !full && <Button variant="outline" size="sm" icon="plus" disabled={loading || Boolean(error) || action.busy} onClick={() => setAdding(true)}>Add Notion page</Button>}
+    <div className="section-header"><h3 className="section-title">Documents</h3><span className="spacer" />
+      {admin && connected.length > 0 && !full && <Button variant="outline" size="sm" icon="plus" disabled={loading || Boolean(error) || action.busy} onClick={() => setAdding(true)}>Add document source</Button>}
     </div>
     <div className="card">
       <ResourceState loading={loading} error={error} retry={refresh}>
         {!sources?.length
-          ? <CardBody><span className="muted">No Notion pages yet. Sessions read a bound page or database, and the pages under it, with their owner's own Notion connection</span></CardBody>
+          ? <CardBody><span className="muted">No documents yet. Sessions read a bound Notion page, Google Drive folder or Feishu/Lark folder, document or wiki page, and what is under it, with their owner's own connection</span></CardBody>
           : sources.map(source => <Row key={source.id} leading={<Icon name="file" size={16} />} title={source.title}
-            hint={<>{source.object === "database" ? "Database" : "Page"} · <a href={source.url} target="_blank" rel="noreferrer">Open in Notion</a></>}
+            hint={<>{documentKindNames[source.kind]} · {itemLabels[source.itemType]} · <a href={source.url} target="_blank" rel="noreferrer">Open</a></>}
             trailing={admin && <Button variant="outline" size="sm" disabled={action.busy} aria-label={`Remove ${source.title}`} onClick={() => void remove(source)}>Remove</Button>} />)}
         {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
       </ResourceState>
     </div>
-    {admin && accounts.accounts && !connected && <Alert variant="info" title="Connect Notion to add pages" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Pistead checks each page you add with your own Notion connection, in Settings → Profile → Connected accounts.</Alert>}
-    {admin && full && <Alert variant="info" title="Notion source limit reached">A workspace has at most {sourceLimits.notion} Notion sources. Remove one to add another.</Alert>}
-    {admin && connected && <AddNotionSheet open={adding} workspaceId={workspaceId} close={() => setAdding(false)} added={() => { refresh(); changed(); }} />}
+    {admin && accounts.accounts && !connected.length && <Alert variant="info" title="Connect an account to add documents" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Pistead checks each item you add with your own Notion, Google Drive or Feishu/Lark connection, in Settings → Profile → Connected accounts.</Alert>}
+    {admin && full && <Alert variant="info" title="Document source limit reached">A workspace has at most {sourceLimits.documents} document sources. Remove one to add another.</Alert>}
+    {admin && connected.length > 0 && <AddSourceSheet open={adding} kinds={connected} workspaceId={workspaceId} close={() => setAdding(false)} added={() => { refresh(); changed(); }} />}
   </div>;
 }
 
-function AddNotionSheet({ open, workspaceId, close, added }: { open: boolean; workspaceId: string; close: () => void; added: () => void }) {
+const linkHints: Record<DocumentKind, string> = {
+  notion: "A page or database link (Share → Copy link). It must be shared with your Notion integration",
+  "google-drive": "A folder, file, Google Doc, Sheet or Slides link. It must be shared with your service account",
+  feishu: "A folder, docx document or wiki page link. Your app must be added to it",
+};
+
+function AddSourceSheet({ open, kinds, workspaceId, close, added }: { open: boolean; kinds: DocumentKind[]; workspaceId: string; close: () => void; added: () => void }) {
+  const [kind, setKind] = useState<DocumentKind | "">("");
   const [target, setTarget] = useState("");
   const action = useAction();
+  const chosen = kind || (kinds.length === 1 ? kinds[0]! : "");
   function dismiss() {
     if (action.busy) return;
-    setTarget("");
+    setTarget(""); setKind("");
     close();
   }
   function submit(event: FormEvent) {
     event.preventDefault();
-    if (!target.trim() || action.busy) return;
+    if (!chosen || !target.trim() || action.busy) return;
     void action.run(async () => {
-      await api(`/api/workspaces/${segment(workspaceId)}/sources`, { method: "POST", body: { kind: "notion", target: target.trim() } });
-      setTarget("");
+      await api(`/api/workspaces/${segment(workspaceId)}/sources`, { method: "POST", body: { kind: chosen, target: target.trim() } });
+      setTarget(""); setKind("");
       added();
       close();
     });
   }
-  return <Sheet open={open} title="Add Notion page" onClose={dismiss} footer={<>
+  return <Sheet open={open} title="Add document source" onClose={dismiss} footer={<>
     <Button disabled={action.busy} onClick={dismiss}>Cancel</Button>
-    <Button variant="default" type="submit" form="notion-source-form" disabled={!target.trim() || action.busy}>{action.busy ? "Checking..." : "Add page"}</Button>
+    <Button variant="default" type="submit" form="document-source-form" disabled={!chosen || !target.trim() || action.busy}>{action.busy ? "Checking..." : "Add source"}</Button>
   </>}>
-    <form id="notion-source-form" className="stack" onSubmit={submit}>
-      <Field label="Page or database link" hint="Copy it with Share → Copy link in Notion. It must be shared with your Notion integration; each session reads it with its owner's own connection">
-        <input className="input" required value={target} onChange={event => setTarget(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} placeholder="https://www.notion.so/…" />
-      </Field>
+    <form id="document-source-form" className="stack" onSubmit={submit}>
+      <div className="field"><span className="field-label">Provider</span>
+        <Combobox<DocumentKind> label="Provider" placeholder="Choose a provider" value={chosen} disabled={action.busy}
+          options={kinds.map(item => ({ value: item, label: documentKindNames[item] }))} onChange={setKind} />
+      </div>
+      {chosen && <Field label="Link" hint={`${linkHints[chosen]}. Each session reads it with its owner's own connection`}>
+        <input className="input" required value={target} onChange={event => setTarget(event.target.value)} disabled={action.busy} autoComplete="off" spellCheck={false} placeholder="https://…" />
+      </Field>}
       <Feedback error={action.error} />
     </form>
   </Sheet>;

@@ -11,7 +11,7 @@ import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepo
 import { egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize, type EgressGitService, type EgressGrant,
   type EgressRepository, type LfsBatchResult } from "../../../packages/shared/src/network.js";
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal } from "../../../packages/shared/src/git-push.js";
-import { notionObjects, sourceLimits, type GrantSource, type NotionObject } from "../../../packages/shared/src/sources.js";
+import { documentItemTypes, documentKind, sourceLimits, type DocumentItemType, type GrantSource } from "../../../packages/shared/src/sources.js";
 import { RunnerError } from "./protocol.js";
 import { CA_BUNDLE, CA_BUNDLE_VARIABLES } from "./trust-store.js";
 
@@ -667,15 +667,15 @@ export function parseEgressGrant(value: unknown): EgressGrant {
     return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
       ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}), ...(repository.lfs ? { lfs: true } : {}) };
   });
-  // Notion pages and databases the agent reads through the control plane; absent from older control planes.
+  // Document sources (Notion, Google Drive, Feishu/Lark) the agent reads through the control plane; absent from older control planes.
   if (input.sources !== undefined && (!Array.isArray(input.sources) || input.sources.length > 100)) throw new RunnerError(502, "Invalid sources from the control plane");
   const sources = (input.sources as unknown[] | undefined)?.map((item): GrantSource => {
     const source = item as Partial<GrantSource> | null;
-    if (!source || typeof source.id !== "string" || !IDENTIFIER.test(source.id) || source.kind !== "notion"
-      || !notionObjects.includes(source.object as NotionObject) || typeof source.title !== "string" || source.title.length > sourceLimits.title) {
+    if (!source || typeof source.id !== "string" || !IDENTIFIER.test(source.id) || !documentKind(source.kind)
+      || !documentItemTypes.includes(source.type as DocumentItemType) || typeof source.title !== "string" || source.title.length > sourceLimits.title) {
       throw new RunnerError(502, "Invalid sources from the control plane");
     }
-    return { id: source.id, kind: "notion", object: source.object!, title: source.title };
+    return { id: source.id, kind: source.kind, type: source.type!, title: source.title };
   });
   return { policy, repositories, ...(sources ? { sources } : {}) };
 }

@@ -9,7 +9,7 @@ import { Icon } from "../icons";
 import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
 import { gitAccountLabel, gitProviderLabel, RepositoryClonePolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
-import { NotionSources, useWorkspaceSources } from "../sources";
+import { DocumentSources, useWorkspaceSources } from "../sources";
 import { Alert, Button, CardBody, Combobox, CopyField, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, RelativeTime, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
 import type { WorkspaceInviteLink, WorkspaceJoinRequest } from "../../../../packages/shared/src/invites";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
@@ -75,7 +75,7 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
       <Row title="Your role" trailing={<StatusBadge tone={admin ? "success" : "neutral"}>{roleLabel[role]}</StatusBadge>} />
     </Section>
     {canCreateSessions(role) && <Setup user={user} workspace={workspace} admin={admin} sourceCount={repositories.sourceCount} />}
-    <Repositories workspace={workspace} admin={admin} {...repositories} notion={<NotionSources workspaceId={workspace.id} workspaceName={workspace.name} admin={admin} {...sources} changed={repositories.refresh} />} />
+    <Repositories workspace={workspace} admin={admin} {...repositories} documents={<DocumentSources workspaceId={workspace.id} workspaceName={workspace.name} admin={admin} {...sources} changed={repositories.refresh} />} />
     <PushAccess workspace={workspace} admin={admin} />
     <NetworkAccess workspace={workspace} admin={admin} />
     <WorkspaceDatabaseSection workspace={workspace} owner={role === "owner"} />
@@ -110,8 +110,8 @@ function Setup({ user, workspace, admin, sourceCount }: { user: UserProfile; wor
   </Section>;
 }
 
-/** The workspace's sources: its Git repositories, then `notion`, the Notion pages and databases. */
-function Repositories({ workspace, admin, repositories, sourceCount, loading, error, refresh, notion }: { workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; sourceCount: number | null; loading: boolean; error: string; refresh: () => void; notion: ReactNode }) {
+/** The workspace's sources: its Git repositories, then `documents`, its Notion, Google Drive and Feishu/Lark items. */
+function Repositories({ workspace, admin, repositories, sourceCount, loading, error, refresh, documents }: { workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; sourceCount: number | null; loading: boolean; error: string; refresh: () => void; documents: ReactNode }) {
   const action = useAction();
   const accounts = useGitAccounts(admin);
   const [picking, setPicking] = useState(false);
@@ -147,7 +147,7 @@ function Repositories({ workspace, admin, repositories, sourceCount, loading, er
   }
   const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
   return <Section bare title="Sources" info={<div className="stack">
-    <p>What this workspace's sessions work on: Git repositories, which agents clone, and Notion pages and databases, which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts.</p>
+    <p>What this workspace's sessions work on: Git repositories, which agents clone, and documents (Notion, Google Drive, Feishu/Lark), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts.</p>
     {!admin && <p>Only workspace owners and admins can add or remove sources.</p>}
     <p>Changes apply at once, in running sessions too: a removed source can no longer be read, nor a removed repository pushed. To change a ref, remove and re-add the repository.</p>
     <p>Git LFS is off by default, and clones check out LFS pointer files. Turned on, sessions download the repository's LFS files with their owner's own account, where the host has git-lfs installed. Sessions never upload LFS files.</p>
@@ -172,7 +172,7 @@ function Repositories({ workspace, admin, repositories, sourceCount, loading, er
       {admin && accounts.accounts && !accounts.accounts.length && <Alert variant="warning" title="No Git accounts connected" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Connect GitHub or add a Git account in Settings → Profile before choosing repositories.</Alert>}
       {admin && Boolean(accounts.accounts?.length) && full && <Alert variant="info" title="Repository limit reached">The workspace has reached its {repositoryLimits.repositories}-repository limit. Remove a binding to choose another.</Alert>}
     </div>
-    {notion}
+    {documents}
     {canAdd && <RepositoryPicker open={picking} workspace={workspace} accounts={accounts.accounts ?? []} repositories={repositories ?? []} disabled={loading || Boolean(error) || action.busy} refresh={refresh} close={() => setPicking(false)} />}
   </Section>;
 }
