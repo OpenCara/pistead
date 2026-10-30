@@ -40,7 +40,7 @@ const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "p
   "transfer-encoding", "upgrade", "host", "authorization", "cookie", "content-length", "expect"]);
 
 export interface ApiEntry { target: string; outcome: "allowed" | "refused"; reason?: string }
-export interface UpstreamRequest { url: URL; method: string; headers: Record<string, string>; body?: Uint8Array }
+export interface UpstreamRequest { url: URL; method: string; headers: Record<string, string>; body?: Uint8Array; signal?: AbortSignal }
 export interface UpstreamResponse { status: number; headers: IncomingHttpHeaders; body: Readable }
 export type ApiUpstream = (request: UpstreamRequest) => Promise<UpstreamResponse>;
 
@@ -125,7 +125,7 @@ async function body(request: IncomingMessage, limit: number): Promise<Uint8Array
 }
 
 /** A request to `url` at its public addresses only, connected to exactly the addresses checked, without redirects. */
-export const publicUpstream: ApiUpstream = async ({ url, method, headers, body }) => {
+export const publicUpstream: ApiUpstream = async ({ url, method, headers, body, signal }) => {
   const host = url.hostname.replace(/^\[|\]$/g, "");
   let addresses: { address: string; family: number }[];
   try { addresses = isIP(host) ? [{ address: host, family: isIP(host) }] : await dnsLookup(host, { all: true, verbatim: true }); }
@@ -139,7 +139,7 @@ export const publicUpstream: ApiUpstream = async ({ url, method, headers, body }
   return new Promise((resolve, reject) => {
     // Its own agent: never a proxy from the connector's environment, which would resolve the name itself.
     const request = httpsRequest(url, { method, headers: body ? { ...headers, "content-length": String(body.byteLength) } : headers,
-      lookup, agent: new HttpsAgent({ keepAlive: false, lookup }) }, response => {
+      lookup, agent: new HttpsAgent({ keepAlive: false, lookup }), ...(signal ? { signal } : {}) }, response => {
       request.setTimeout(0);
       resolve({ status: response.statusCode ?? 502, headers: response.headers, body: response });
     });

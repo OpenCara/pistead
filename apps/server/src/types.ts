@@ -39,6 +39,14 @@ export interface Env {
    * `own-hosts` only to session owners' own hosts and the server's own runner; `off` to none.
    */
   SANDBOX_GITHUB_API?: string;
+  /**
+   * The agent's web_search tool (web-search.ts): `brave`, `tavily` or `searxng` searches with that provider, in workspaces
+   * whose network access turns web search on; unset or `off`, no search. WEB_SEARCH_API_KEY is Brave's or Tavily's key
+   * (secret; optional for SearXNG), WEB_SEARCH_URL a SearXNG instance's origin.
+   */
+  WEB_SEARCH?: string;
+  WEB_SEARCH_API_KEY?: string;
+  WEB_SEARCH_URL?: string;
   /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */

@@ -54,7 +54,8 @@ export interface RelayRequest {
 }
 /** How the answer reached the proxy, when the host made the request at the forge itself (git-direct.ts). */
 export const TRANSPORT_HEADER = "x-pistead-transport";
-export interface EgressEntry { at: string; kind: "git" | "connect" | "http" | "api"; target: string; outcome: "allowed" | "refused"; reason?: string }
+/** One decision of the proxy, or of the agent's web_fetch tool (`fetch`), which reaches what the proxy's tunnels reach. */
+export interface EgressEntry { at: string; kind: "git" | "connect" | "http" | "api" | "fetch"; target: string; outcome: "allowed" | "refused"; reason?: string }
 /** How far a mirror's fill is, as a clone waiting for it hears: Git's numbers only (see RepositoryCacheProgress). */
 export interface MirrorProgress { phase: string; percent: number | null; done: number | null; total: number | null; bytes: number }
 export interface EgressOptions {
@@ -406,6 +407,11 @@ export class EgressProxy {
     const repository = this.#grant?.value.repositories.find(item => item.bindingId === bindingId);
     const target = repository ? repositoryKey(bindingRemote(repository).replace(/^https:\/\//, "")) : bindingId;
     this.#record({ kind: "git", target: target.slice(0, 300), outcome: "allowed", reason: `relayed: ${reason.replace(/[^\x20-\x7e]/g, " ").slice(0, 300)}` });
+  }
+
+  /** Records a web_fetch request, which the host makes itself under the same policy, with the proxy's own decisions. */
+  recordFetch(entry: Omit<EgressEntry, "at" | "kind">): void {
+    this.#record({ kind: "fetch", ...entry, target: entry.target.slice(0, 300) });
   }
 
   #record(entry: Omit<EgressEntry, "at">): void {

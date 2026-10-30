@@ -170,6 +170,7 @@ function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
   if (tool === 'github_issue') return capabilities.githubIssues === true;
   if (tool === 'schedule') return capabilities.schedules === true;
   if (tool === 'sessions') return capabilities.crossSessions === true;
+  if (tool === 'web_fetch' || tool === 'web_search') return capabilities.web === true;
   return true;
 }
 

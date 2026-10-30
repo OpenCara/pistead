@@ -122,6 +122,15 @@ The sandbox has no network, so `gh` and `curl` inside it can't reach GitHub. Age
 - `github_comment` posts a comment. It waits for a human approval unless the session owner's message chose **Auto-approve**.
 - `github_issue` opens an issue with exactly the approved title and body in one of those repositories, and gives the agent its number and URL (connector newer than 0.9.0). It waits for a human approval unless the session owner's message chose **Auto-approve**. If GitHub refuses (issues turned off, no access), no issue is opened and the agent gets GitHub's reason.
 
+## Web pages and search
+
+Agents read web pages with `web_fetch` and search the web with `web_search` (connector newer than 0.9.0).
+
+- `web_fetch` reads one `https://` page from this host, as far as the workspace's network access lets the session's sandbox reach, and never at an address in this host's own networks. It sends no cookies or credentials and only reads; HTML comes back as text, images as images. It needs no approval, during a shared message. On a host running without the sandbox it still follows the workspace's network access.
+- `web_search` asks Pistead, which searches with the provider its operator configured, where the workspace turned web search on. The provider's key never reaches this host.
+
+What they return is untrusted input, like any repository content.
+
 ## Chat options
 
 In a session's chat box you can pick any model this host's Pi offers that isn't disabled in the web app, its reasoning level, and the access mode for each message: **Read only**, **Ask before acting** (the default) or **Auto-approve** (session owner only). Hosts running a connector older than 0.3.0 keep each session's pinned model; restart the connector with `npx pistead@latest connect` to enable the options.

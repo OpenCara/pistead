@@ -10,6 +10,7 @@ import { connectorLimits, connectorRequestTimeoutMs } from "../../../packages/sh
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
 import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity, SessionBranch } from "../../../packages/shared/src/types.js";
 import type { SessionsToolResult } from "../../../packages/shared/src/cross-session.js";
+import { webLimits, webSearchProviders, type WebSearchResult } from "../../../packages/shared/src/web.js";
 import { MAX_CLONE_BRANCHES } from "./clone-branches.js";
 import { sessionActivities } from "../../../packages/shared/src/types.js";
 import { acquireRunnerLease } from "./lease.js";
@@ -41,6 +42,8 @@ const HOST_CONFIG_LIMIT = 128 * 1024;
 const SCHEDULES_LIMIT = 4 * 1024 * 1024;
 /** A sessions tool result: a list of up to 200 sessions, or a read of up to 50 entries of 2000 characters and a reply. */
 const SESSIONS_LIMIT = 2 * 1024 * 1024;
+/** A web_search result: at most 20 results within their title, URL and snippet limits (webLimits). */
+const WEB_SEARCH_LIMIT = 1024 * 1024;
 /** The budget of a broker callback, whose upstream work can take several calls: as long as a relayed request may take. */
 const RPC_TIMEOUT = 30_000;
 /** How long a reply may wait for socket output to drain enough to fit; an uplink that can't is a broken connection. */
@@ -668,6 +671,15 @@ export class LocalConnector {
           z.object({ stopped: z.number().int().nonnegative() }).strict(), z.object({ archived: z.string() }).strict(),
           z.object({ consent: z.literal("audience"), target: z.string().max(8192), reason: z.string().max(1024) }).strict()]).parse(result);
         return result as SessionsToolResult;
+      },
+      // Like schedules, the control plane's refusal (web search off, no provider, the provider's) comes back with its reason.
+      webSearch: async request => {
+        const result = await this.brokerCallback(await this.connection(), "/api/connectors/self/web/search", request, WEB_SEARCH_LIMIT);
+        z.object({ query: z.string(), provider: z.enum(webSearchProviders), results: z.array(z.object({
+          title: z.string().max(webLimits.titleLength), url: z.string().max(webLimits.urlLength).regex(/^https?:\/\//),
+          snippet: z.string().max(webLimits.snippetLength), published: z.string().max(100).optional(),
+        }).strict()).max(webLimits.maxResults) }).strict().parse(result);
+        return result as WebSearchResult;
       },
       // Minting can take several upstream calls, so push callbacks get the full RPC budget.
       pushCredential: async request => {

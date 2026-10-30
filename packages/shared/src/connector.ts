@@ -114,6 +114,12 @@ export interface ConnectorCapabilities {
    */
   fileBrowser?: boolean;
   /**
+   * The connector carries the agent's web tools: web_fetch, which reads pages on the host as far as the workspace's
+   * network access reaches, and web_search, through the control plane's search provider (see web.ts). Absent on older
+   * connectors.
+   */
+  web?: boolean;
+  /**
    * The connector runs as its owner and admins configure it in Pistead (HostConfig: command time limit, GPU, Git
    * credentials, repository cache), read from the control plane, rather than by connect options. Absent on older
    * connectors, which keep their options.
