@@ -465,6 +465,16 @@ While the agent works, anyone with write permission can press **Stop** (the squa
 
 The host can stop a message too. When the host crashes (rather than stopping its connector) five times in a row while the same message is being worked on, Pi stops resuming that work so the host doesn't keep crashing. The transcript then says the message stopped because the host crashed, the session shows as **Failed**, and the queue moves on. Send the message again to retry it.
 
+#### Copying, going back and forking
+
+Each message has actions beside who sent it: hover over it, or tab to it, in the web and Mac apps (they always show on touch screens); in the iPhone and iPad app, tap **…** under it.
+
+- **Copy message** (the copy icon): a message's text, or a reply's Markdown without its tool calls. Every message offers it, side asks too.
+- **Go back** (the history icon, needs write permission): takes the shared conversation back, for everyone, to just before one of the messages people sent, or to just after one of the agent's final replies. Everything after that point leaves the conversation, and the next message continues from there, with the model seeing only what is left. Going back to before a message puts that message's text in your chat box, if it's empty, so you can edit it and send it again. Only the conversation goes back: the worktree, its clones, commits and anything pushed stay as they are, so ask the agent to undo those if you need to. Stop the session's work first: going back waits until nothing runs or is queued. The host keeps the conversation it went back from, in its backups too, but it no longer shows.
+- **Fork** (the branch icon, the session's owner only): starts a new session of yours from the shared conversation up to the same points, on the same host and model, with the same visibility, titled **Fork: …**, and opens it; a fork from before a message puts that message in the new session's chat box. The session you forked from stays as it is. The host copies the conversation into the new session itself, so it never passes through the server. Like every new session, the fork's worktree starts empty: its agent clones the workspace's repositories again, and only what was pushed is there. If the fork fails, the new session is archived.
+
+There are no such points inside one of the agent's turns, where a tool call would lose its result, so a reply that goes on to call tools offers only **Copy** (tool call and tool result rows show their text when expanded). A host whose connector predates these actions offers only **Copy** too: update it with `npx pistead@latest connect`.
+
 #### Chat options
 
 Beside the composer you can pick, for each message:

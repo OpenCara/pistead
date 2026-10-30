@@ -196,7 +196,8 @@ test('relay accepts exactly the supported action/method/path combinations and lo
   const bodies: Record<Exclude<RunnerAction, 'events'>, string> = {
     create: JSON.stringify(binding()), view: '', submit: '{}', ask: '{}', operations: '{}',
     approve: '{}', backup: '{}', restart: '{}', restore: JSON.stringify({ binding: binding() }), stop: '{}',
-    files: JSON.stringify({ path: 'src' }),
+    files: JSON.stringify({ path: 'src' }), revert: JSON.stringify({ entryId: '1:2' }),
+    fork: JSON.stringify({ sourceSessionId: 'other', entryId: '1:2' }),
   };
   for (const action of Object.keys(bodies) as (keyof typeof bodies)[]) {
     await t.test(action, async () => {

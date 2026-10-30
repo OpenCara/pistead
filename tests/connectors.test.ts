@@ -2388,6 +2388,64 @@ test('writers stop a session\'s work through its host, audited; archived session
   assert.equal(requests.length, 2);
 });
 
+test('writers take the shared conversation back to a message through its host, audited; readers and archived sessions refuse', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  let answer: unknown = { conversationId: '7' };
+  const requests = rpcHub(f, s.connector, () => Response.json(answer));
+  assert.deepEqual(await json(await s.owner.request('POST', `${path}/revert`, { entryId: '1:12' })), { conversationId: '7' });
+  const { request } = requests[0]!;
+  assert.deepEqual([request.method, request.path, request.body, request.ticket.action, request.ticket.actorId],
+    ['POST', `/v1/sessions/${s.session.id}/revert`, JSON.stringify({ entryId: '1:12' }), 'revert', s.owner.user.id]);
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.reverted'").all(s.session.id);
+  assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ entryId: '1:12' }) }]);
+  for (const body of [{}, { entryId: 12 }, { entryId: '12' }, { entryId: '1:12', extra: true }]) {
+    await denied(await s.owner.request('POST', `${path}/revert`, body), 400, 'invalid_input');
+  }
+  await denied(await s.member.request('POST', `${path}/revert`, { entryId: '1:12' }), 403, 'forbidden');
+  answer = {};
+  await denied(await s.owner.request('POST', `${path}/revert`, { entryId: '1:12' }), 502, 'invalid_runner_response');
+  await json(await s.owner.request('POST', `${path}/archive`));
+  await denied(await s.owner.request('POST', `${path}/revert`, { entryId: '1:12' }), 409, 'session_archived');
+  assert.equal(requests.length, 2);
+});
+
+test('its owner forks a session from a message into a new one on the same host and model, which the host fills; a failed fork is archived', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  let forkAnswer: () => Response = () => Response.json({ conversationId: '1', entries: 4 });
+  const requests = rpcHub(f, s.connector, envelope => envelope.request.ticket.action === 'fork' ? forkAnswer() : Response.json({ session: {} }, { status: 201 }));
+  const { session } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 201);
+  assert.notEqual(session.id, s.session.id);
+  assert.deepEqual([session.title, session.visibility, session.status, session.connectorId, session.ownerId],
+    [`Fork: ${s.session.title}`, s.session.visibility, 'ready', s.session.connectorId, s.owner.user.id]);
+  assert.deepEqual(requests.map(({ request }) => [request.path, request.ticket.action, request.ticket.sessionId]), [
+    ['/v1/sessions', 'create', session.id],
+    [`/v1/sessions/${session.id}/fork`, 'fork', session.id],
+  ]);
+  assert.deepEqual(JSON.parse(requests[1]!.request.body), { sourceSessionId: s.session.id, entryId: '1:12' });
+  const model = (id: string) => (f.sqlite.prepare('SELECT a.model_id FROM sessions s JOIN agent_versions a ON a.id = s.agent_version_id WHERE s.id = ?').get(id) as { model_id: string }).model_id;
+  assert.equal(model(session.id), model(s.session.id));
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.forked'").all(session.id);
+  assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ sourceSessionId: s.session.id, entryId: '1:12' }) }]);
+
+  const { session: titled } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12', title: 'Try another way' }), 201);
+  assert.equal(titled.title, 'Try another way');
+  for (const body of [{}, { entryId: '1:12', visibility: 'private' }, { entryId: 'x' }]) await denied(await s.owner.request('POST', `${path}/fork`, body), 400, 'invalid_input');
+  // Only its owner: a reader can't, and nor could someone who could write to it.
+  await denied(await s.member.request('POST', `${path}/fork`, { entryId: '1:12' }), 403, 'forbidden');
+  await json(await s.owner.request('POST', `${path}/grants`, { userId: s.member.user.id, permissions: ['read', 'ask', 'write', 'approve', 'manage'] }));
+  await denied(await s.member.request('POST', `${path}/fork`, { entryId: '1:12' }), 403, 'owner_required');
+
+  // The host refuses: the new session is archived rather than left empty.
+  const before = requests.length;
+  forkAnswer = () => Response.json({ error: 'That message is no longer in the shared conversation; reload it' }, { status: 409 });
+  await denied(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 409, 'runner_error');
+  const failed = requests.at(-1)!.request.ticket.sessionId;
+  assert.equal(requests.length, before + 2);
+  assert.equal((f.sqlite.prepare('SELECT status FROM sessions WHERE id = ?').get(failed) as { status: string }).status, 'archived');
+});
+
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const { session: privateSession } = await json<{ session: SessionRecord }>(await s.owner.request('POST', '/api/sessions', {

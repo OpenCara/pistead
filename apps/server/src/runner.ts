@@ -9,6 +9,7 @@ import { connectorRequest, type ConnectionPin } from './connector-transport.js';
 const actionPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
   operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'write', stop: 'write', files: 'write',
+  revert: 'write', fork: 'write',
 };
 
 export async function runnerRequest(c: AppContext, row: SessionRow, action: RunnerAction, suffix = '', body?: unknown, pin?: ConnectionPin): Promise<Response> {
@@ -33,7 +34,7 @@ export async function requireRunnerAccess(c: AppContext, actorId: string, row: S
   // A session that pinned its repositories stays readable only.
   // A read-only session still opens (create, restart) to show its history and files, and can be stopped; nothing new runs in it.
   if (!['view', 'events', 'create', 'restart', 'stop', 'files'].includes(action)) requireUnfrozen(access.row);
-  if (['create', 'restart', 'restore', 'backup'].includes(action) && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
+  if (['create', 'restart', 'restore', 'backup', 'fork'].includes(action) && actorId !== row.owner_id) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
   if (action !== 'restore' && await c.env.DB.query("SELECT 1 FROM restore_jobs WHERE target_session_id = ? AND status <> 'completed'").bind(row.id).first()) {
     fail(409, 'restore_pending', 'Session restoration is not complete.');
   }
@@ -58,6 +59,7 @@ async function actorRequest(c: AppContext, actorId: string, row: SessionRow, act
     submit: `/v1/sessions/${row.id}/submit`, ask: `/v1/sessions/${row.id}/ask`, operations: `/v1/sessions/${row.id}/operations`,
     approve: `/v1/sessions/${row.id}/approvals/${encodeURIComponent(suffix)}`, backup: `/v1/sessions/${row.id}/backup`, restart: `/v1/sessions/${row.id}/restart`,
     restore: `/v1/sessions/${row.id}/restore`, stop: `/v1/sessions/${row.id}/stop`, files: `/v1/sessions/${row.id}/files`,
+    revert: `/v1/sessions/${row.id}/revert`, fork: `/v1/sessions/${row.id}/fork`,
   };
   const serialized = body === undefined ? '' : JSON.stringify(body);
   const issuedAt = Math.floor(Date.now() / 1000);

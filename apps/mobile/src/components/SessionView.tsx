@@ -1,6 +1,6 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, decidedAsHostCommand, decidesHostCommand, hostCommandWaiting, initialSelection, isHostCommand,
-  modelUnavailable, mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
+  accessUnavailable, activeStatuses, chatOptionsBody, copyText, decidedAsHostCommand, decidesHostCommand, hostCommandWaiting, initialSelection, isHostCommand,
+  messageCut, modelUnavailable, mustConfirmAutoApprove, preparingRepositories, resendText, rewindable, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
@@ -14,10 +14,10 @@ import { managesSession } from "../../../../packages/shared/src/policy";
 import { redactSecrets, REDACTED } from "../../../../packages/shared/src/redaction";
 // Brings in `SessionRecord.linkShared`, which link sharing declares there.
 import type {} from "../../../../packages/shared/src/sharing";
-import type { ApprovalRecord, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
+import type { ApprovalRecord, EntryView, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
-import { forgetSentDraft, saveDraft, useDraft } from "../lib/drafts";
+import { forgetSentDraft, readDraft, saveDraft, useDraft } from "../lib/drafts";
 import { useKeyboardVisible, useOpenSession } from "../lib/layout";
 import { useLiveSession } from "../lib/live-session";
 import { PeopleProvider, useUsername, useWorkspacePeople } from "../lib/people";
@@ -28,7 +28,7 @@ import { ChatOptionsBar, useConfirmAutoApprove } from "./ChatOptionsBar";
 import { Composer } from "./Composer";
 import { RepositoryPreparationCard } from "./RepositoryPreparation";
 import { TranscriptEntry } from "./TranscriptEntry";
-import { Badge, Banner, Button, Chip, EmptyState, Feedback, IconButton, Loading, OptionSheet, styles as ui } from "./ui";
+import { Badge, Banner, Button, Chip, confirm, EmptyState, Feedback, IconButton, Loading, OptionSheet, styles as ui, type Option } from "./ui";
 
 /**
  * One session: live transcript, pending approvals and the chat box. `embedded` renders its own title bar (the wide
@@ -188,6 +188,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
       : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
       : <View style={ui.flex} />)
       : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh} loadOlder={live.loadOlder}
+        openSession={target => { refreshSessions(); openSession(target); }}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
@@ -253,9 +254,9 @@ function ApprovalsSheet({ visible, approvals, olderApprovals, onClose, onOpenSes
   </Modal>;
 }
 
-function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, pinned }: {
+function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, openSession, pinned }: {
   id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void;
-  loadOlder: (conversationId: string) => Promise<void>; pinned: ReactNode;
+  loadOlder: (conversationId: string) => Promise<void>; openSession: (id: string) => void; pinned: ReactNode;
 }) {
   const { api } = useSession();
   const { rememberChat, autoApproveConfirmed } = useAppData();
@@ -373,6 +374,62 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     });
   }
 
+  // A message's actions: copy it; go back to it, for anyone who drives the work; fork a new session from it, for the
+  // owner. Going back and forking take the shared conversation, on a host that offers them (see messageCut).
+  const rewinding = useAction();
+  // The entry stays chosen once its sheet closes: on iOS the choice applies after that (see OptionSheet).
+  const [chosen, setChosen] = useState<EntryView | null>(null);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const showActions = useCallback((entry: EntryView) => { setChosen(entry); setActionsOpen(true); }, []);
+  const working = view.busy || activeQueue.length > 0;
+  const cut = chosen && rewindable(view) && actualMode === "write" && !readOnly ? messageCut(chosen) : undefined;
+  const messageOptions: Option<"copy" | "revert" | "fork">[] = chosen ? [
+    { value: "copy", label: "Copy message" },
+    ...(cut && canWrite ? [{ value: "revert" as const, label: cut.before ? "Go back to before this message" : "Go back to this reply", destructive: true,
+      hint: working ? "Stop the session's work first" : "Later messages leave the conversation; files stay as they are" }] : []),
+    ...(cut && owner ? [{ value: "fork" as const, label: "Fork a new session from here", hint: "A new session with the conversation up to here" }] : []),
+  ] : [];
+
+  function messageAction(choice: "copy" | "revert" | "fork") {
+    const entry = chosen;
+    if (!entry) return;
+    if (choice === "copy") { void rewinding.run(async () => { await Clipboard.setStringAsync(copyText(entry)); }, "Message copied"); return; }
+    const target = messageCut(entry);
+    if (!target || rewinding.busy) return;
+    if (choice === "revert") void revert(entry, target.entryId, target.before);
+    else void fork(entry, target.entryId, target.before);
+  }
+
+  async function revert(entry: EntryView, entryId: string, before: boolean) {
+    if (working) { void rewinding.run(async () => { throw new Error("Stop the session's work to go back to an earlier message."); }); return; }
+    const confirmed = await confirm({
+      title: before ? "Go back to before this message?" : "Go back to this reply?",
+      message: `${before ? "This message and everything after it leave" : "Everything after this reply leaves"} the shared conversation, for everyone, and the agent continues from there.${before ? " The message goes back into your chat box, when it's empty, to edit and send again." : ""} Only the conversation goes back: files, commits and pushes stay as they are.`,
+      confirmLabel: "Go back", destructive: true,
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      await api(`/api/sessions/${segment(id)}/revert`, { method: "POST", body: { entryId } });
+      if (before && !readDraft(id).trim()) setContent(resendText(entry));
+      stick.current = true;
+      refresh();
+    });
+  }
+
+  async function fork(entry: EntryView, entryId: string, before: boolean) {
+    const confirmed = await confirm({
+      title: "Fork a new session from here?",
+      message: `A new session of yours starts on the same host and model with this conversation up to ${before ? "just before this message, which goes into its chat box" : "this reply"}. This session stays as it is. Like every new session, the fork's worktree starts empty: its agent clones the workspace's repositories again.`,
+      confirmLabel: "Fork session",
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      const result = await api<{ session: SessionRecord }>(`/api/sessions/${segment(id)}/fork`, { method: "POST", body: { entryId } });
+      if (before) saveDraft(result.session.id, resendText(entry));
+      openSession(result.session.id);
+    });
+  }
+
   // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
   const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
 
@@ -388,7 +445,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
   return <>
     <FlatList ref={list} style={ui.flex} data={entries} keyExtractor={entry => entry.id}
       contentContainerStyle={[styles.transcript, !entries.length && styles.grow]}
-      renderItem={({ item }) => <TranscriptEntry entry={item} userId={user.id} />}
+      renderItem={({ item }) => <TranscriptEntry entry={item} userId={user.id} onActions={showActions} />}
       ItemSeparatorComponent={Separator}
       ListEmptyComponent={<EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>
         {actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}
@@ -440,8 +497,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
       {draftHasSecret && <Text testID="draft-secret" style={[ui.small, { color: palette.muted }]} accessibilityLiveRegion="polite">
         This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.
       </Text>}
-      <Feedback error={submission.error || stopping.error} />
+      <Feedback error={submission.error || stopping.error || rewinding.error} notice={rewinding.notice} />
     </View>
+    <OptionSheet<"copy" | "revert" | "fork"> visible={actionsOpen} title="Message" options={messageOptions} onClose={() => setActionsOpen(false)} onSelect={messageAction} />
     <OptionSheet<string> visible={pickingConversation} title="Side conversation" value={conversationId} onClose={() => setPickingConversation(false)} onSelect={setConversationId}
       options={[{ value: "", label: "All my side asks" }, ...sideConversations.map((conversation, index) => ({ value: conversation.id, label: `Side ask ${index + 1}`, hint: conversation.id.slice(0, 8) }))]} />
   </>;

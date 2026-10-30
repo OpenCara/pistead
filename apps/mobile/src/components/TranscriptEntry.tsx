@@ -1,5 +1,5 @@
 import Ionicons from "@expo/vector-icons/Ionicons";
-import { COMPACTION_FAILED_TITLE, compactionFailureText, splitToolCalls } from "@pistead/client";
+import { COMPACTION_FAILED_TITLE, compactionFailureText, copyText, splitToolCalls } from "@pistead/client";
 import { memo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { EntryView } from "../../../../packages/shared/src/types";
@@ -36,8 +36,25 @@ function autoApprovedSuffix(calls: EntryView["autoApproved"]): string {
   return ` · Auto-approved${calls.some(call => call.unbounded) ? " · No resource limits" : ""}${notes.map(note => ` · ${note}`).join("")}`;
 }
 
-/** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
-export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
+/** Who sent a message and how long it took, then the button that opens its actions (copy, go back, fork). */
+function Footer({ entry, meta, onActions, end }: { entry: EntryView; meta: string; onActions?: (entry: EntryView) => void; end?: boolean }) {
+  const palette = usePalette();
+  const actions = onActions && copyText(entry) !== "";
+  if (!meta && !actions) return null;
+  return <View style={[styles.footer, end && styles.footerEnd]}>
+    {meta !== "" && <Text style={[styles.meta, { color: palette.muted }]}>{meta}</Text>}
+    {actions && <Pressable accessibilityRole="button" accessibilityLabel="Message actions" hitSlop={10} onPress={() => onActions(entry)}
+      style={({ pressed }) => ({ opacity: pressed ? 0.5 : 1 })}>
+      <Ionicons name="ellipsis-horizontal" size={16} color={palette.muted} />
+    </Pressable>}
+  </View>;
+}
+
+/**
+ * User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one
+ * row. `onActions` opens a message's actions: keep it stable, as entries are memoized.
+ */
+export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId, onActions }: { entry: EntryView; userId: string; onActions?: (entry: EntryView) => void }) {
   const palette = usePalette();
   const name = useUsername();
   const actor = entry.actorId && name(entry.actorId, true);
@@ -73,14 +90,14 @@ export const TranscriptEntry = memo(function TranscriptEntry({ entry, userId }: 
       <View style={[styles.bubble, { backgroundColor: palette.userBubble }]}>
         <Text selectable style={[styles.bubbleText, { color: palette.onUserBubble }]}>{entry.text}</Text>
       </View>
-      {actor && entry.actorId !== userId && <Text style={meta}>by {actor}</Text>}
+      <Footer entry={entry} meta={actor && entry.actorId !== userId ? `by ${actor}` : ""} onActions={onActions} end />
     </View>;
   }
   const took = entry.durationMs !== undefined ? formatDuration(entry.durationMs) : "";
   return <View style={styles.entry}>
     {prose.trim() !== "" && <Markdown text={prose} />}
     {toolLabel && <ToolDetails icon="construct-outline" label={`${toolLabel}${autoApprovedSuffix(entry.autoApproved)}`} text={calls.map(call => call.line).join("\n")} trimmed={entry.trimmed} />}
-    {(actor || took) && <Text style={meta}>{[actor && `by ${actor}`, took].filter(Boolean).join(" · ")}</Text>}
+    <Footer entry={entry} meta={[actor && `by ${actor}`, took].filter(Boolean).join(" · ")} onActions={onActions} />
   </View>;
 });
 
@@ -90,6 +107,8 @@ const styles = StyleSheet.create({
   bubble: { borderRadius: 16, paddingHorizontal: 14, paddingVertical: 9, maxWidth: "88%" },
   bubbleText: { fontSize: 16, lineHeight: 22 },
   meta: { fontSize: 12 },
+  footer: { flexDirection: "row", alignItems: "center", gap: 10 },
+  footerEnd: { justifyContent: "flex-end" },
   stopped: { flexDirection: "row", alignItems: "center", gap: 10 },
   // A longer note wraps between the rules instead of pushing them off the screen.
   stoppedText: { flexShrink: 1, textAlign: "center" },

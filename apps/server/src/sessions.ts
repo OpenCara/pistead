@@ -314,6 +314,43 @@ export async function stopSession(c: AppContext, row: SessionRow, audit: Record<
   return result.stopped;
 }
 
+/** The view entry a revert or fork names, `<conversation>:<entry>` as the session view lists it. */
+function messageEntry(input: Record<string, unknown>): string {
+  if (Object.keys(input).some(key => key !== 'entryId') || typeof input.entryId !== 'string' || !/^\d{1,15}:\d{1,15}$/.test(input.entryId)) {
+    fail(400, 'invalid_input', 'entryId names one message of the shared conversation.');
+  }
+  return input.entryId;
+}
+
+/**
+ * Starts a new session from `source`'s shared conversation up to `entryId`, as its owner: on the same host and model,
+ * with the same visibility, starting empty like any session (its agent clones the workspace's repositories again). The
+ * host copies the conversation from one session to the other itself, so it never crosses the control plane. A fork
+ * that doesn't complete leaves its new session archived.
+ */
+export async function forkSession(c: AppContext, source: SessionRow, entryId: string, title?: string): Promise<{ row: SessionRow }> {
+  const actorId = c.get('auth').userId;
+  if (source.owner_id !== actorId) fail(403, 'owner_required', 'Only the session owner can fork it.');
+  requireUnfrozen(source);
+  if (!source.connector_id) fail(409, 'connector_required', 'Only a session on a connected host can be forked.');
+  const agent = await c.env.DB.query<{ model_id: string }>('SELECT model_id FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
+  if (!agent) fail(409, 'invalid_binding', 'Session binding is incomplete.');
+  const { row } = await createSession(c, {
+    workspaceId: source.workspace_id, title: title ?? `Fork: ${source.title}`.slice(0, 200), visibility: source.visibility ?? 'private',
+    modelId: agent.model_id, trustedConnectorId: source.connector_id, ...(source.host_environment ? { hostEnvironment: true } : {}),
+  });
+  try {
+    const result = await runnerJSON<{ conversationId: string; entries: number }>(
+      await runnerRequest(c, row, 'fork', '', { sourceSessionId: source.id, entryId }), 65536);
+    if (typeof result?.conversationId !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid fork result.');
+  } catch (error) {
+    await archiveSession(c, row.id, { forkFailed: true }).catch(() => {});
+    throw error;
+  }
+  await auditStatement(c.env, actorId, 'session.forked', row.workspace_id, row.id, { sourceSessionId: source.id, entryId }).run();
+  return { row };
+}
+
 export async function bindingForSession(c: AppContext, row: SessionRow): Promise<RunnerBinding> {
   const [owner, agent] = await Promise.all([
     getUser(c.env, row.owner_id),
@@ -746,6 +783,27 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
   app.post('/api/sessions/:id/stop', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
     return c.json({ stopped: await stopSession(c, row) });
+  });
+
+  // Anyone who can write to the session can take its shared conversation back to one of its messages, as they drive it.
+  app.post('/api/sessions/:id/revert', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'write');
+    const entryId = messageEntry(await jsonObject(c, 4096));
+    const result = await runnerJSON<{ conversationId: string }>(await runnerRequest(c, row, 'revert', '', { entryId }), 65536);
+    invalidateSessionView(c, row.id);
+    if (typeof result?.conversationId !== 'string') fail(502, 'invalid_runner_response', 'The runner returned an invalid revert result.');
+    await auditStatement(c.env, c.get('auth').userId, 'session.reverted', row.workspace_id, row.id, { entryId }).run();
+    return c.json({ conversationId: result.conversationId });
+  });
+
+  // Its owner starts a new session from the shared conversation up to one of its messages (forkSession).
+  app.post('/api/sessions/:id/fork', async c => {
+    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    const input = await jsonObject(c, 4096);
+    if (Object.keys(input).some(key => key !== 'entryId' && key !== 'title')) fail(400, 'invalid_input', 'A fork accepts only entryId and title.');
+    const title = input.title === undefined ? undefined : text(input.title, 'title', 200);
+    const { row: forked } = await forkSession(c, row, messageEntry({ entryId: input.entryId }), title);
+    return c.json({ session: sessionRecord(forked, [...permissions]) }, 201);
   });
 
   app.post('/api/sessions/:id/restart', async c => {

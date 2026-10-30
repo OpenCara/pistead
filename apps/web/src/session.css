@@ -48,7 +48,15 @@
   /* min-width 0 keeps wide tables and code scrolling inside the column instead of widening it. */
   .entry-assistant { min-width: 0; font-size: var(--font-content); line-height: 1.6; }
   .entry-actor { color: var(--foreground-muted); font-size: var(--font-xs); }
-  .entry-assistant > .entry-actor { margin-top: var(--space-1); }
+  /* Who sent a message, how long it took and its actions, on one line under it. */
+  .entry-footer { display: flex; align-items: center; gap: var(--space-2); min-height: 24px; }
+  .entry-footer:empty { display: none; }
+  .entry-user > .entry-footer { justify-content: flex-end; }
+  .entry-assistant > .entry-footer { margin-top: var(--space-1); }
+  .entry-actions { display: inline-flex; gap: 2px; opacity: 0; transition: opacity 120ms ease; }
+  :is(.entry-user, .entry-assistant):hover .entry-actions, .entry-actions:focus-within { opacity: 1; }
+  /* Without hover, they would never show. */
+  @media (hover: none) { .entry-actions { opacity: 1; } }
   .entry-assistant > .entry-tool { margin-top: var(--space-2); }
   .entry-error > .entry-actor { margin-top: var(--space-1); }
   .entry-stopped { display: flex; align-items: center; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--font-xs); }

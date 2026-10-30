@@ -11,7 +11,8 @@ import {
   accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, modelUnavailable, mustConfirmAutoApprove, rememberChat,
   type ChatSelection,
 } from "./chat-options";
-import { forgetSentDraft, useDraft, writeDraft } from "./drafts";
+import { forgetSentDraft, readDraft, useDraft, writeDraft } from "./drafts";
+import { copyText, messageCut, resendText, rewindable, type MessageCut } from "../../../packages/client/src/message-actions";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -28,7 +29,7 @@ import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type 
 import { splitToolCalls } from "../../../packages/client/src/transcript";
 import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
 import {
-  Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
+  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
@@ -108,8 +109,41 @@ function briefLine(entry: EntryView): ReactNode {
   return entry.trimmed && entry.role === "toolResult" && entry.text.trim() ? <span className="muted"> · {entry.text}</span> : null;
 }
 
+/**
+ * What a shared-conversation entry's actions do, where the viewer may take them (see messageCut): go back to it, fork a
+ * new session from it. `disabled` says why one can't be taken now. Copying is offered on every message.
+ */
+type MessageActionHandlers = {
+  revert?: { run: (entry: EntryView, cut: MessageCut) => void; disabled?: string };
+  fork?: { run: (entry: EntryView, cut: MessageCut) => void; disabled?: string };
+};
+
+/** A message's actions, shown beside who sent it: on hover or focus with a pointer, always on touch screens. */
+function MessageActions({ entry, actions }: { entry: EntryView; actions?: MessageActionHandlers }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  const text = copyText(entry);
+  const cut = actions && messageCut(entry);
+  const revert = cut && actions?.revert;
+  const fork = cut && actions?.fork;
+  if (!text && !revert && !fork) return null;
+  const revertLabel = cut?.before ? "Go back to before this message" : "Go back to this reply";
+  return <span className="entry-actions" role="toolbar" aria-label="Message actions">
+    {text && <Button variant="ghost" size="xs" icon={copied ? "check" : "copy"} aria-label={copied ? "Copied" : "Copy message"} title={copied ? "Copied" : "Copy message"}
+      onClick={() => void navigator.clipboard.writeText(text).then(() => setCopied(true))} />}
+    {revert && <Button variant="ghost" size="xs" icon="history" aria-label={revertLabel} title={revert.disabled || revertLabel} disabled={Boolean(revert.disabled)}
+      onClick={() => revert.run(entry, cut)} />}
+    {fork && <Button variant="ghost" size="xs" icon="git-branch" aria-label="Fork a new session from here" title={fork.disabled || "Fork a new session from here"}
+      disabled={Boolean(fork.disabled)} onClick={() => fork.run(entry, cut)} />}
+  </span>;
+}
+
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
-function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
+function TranscriptEntry({ entry, userId, actions }: { entry: EntryView; userId: string; actions?: MessageActionHandlers }) {
   const actor = entry.actorId && <Username id={entry.actorId} you />;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
@@ -134,14 +168,20 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
   if (entry.role === "user") {
     return <div className="entry-user" title={entry.kind}>
       <div className="entry-bubble">{entry.text}</div>
-      {actor && entry.actorId !== userId && <div className="entry-actor">by {actor}</div>}
+      <div className="entry-footer">
+        {actor && entry.actorId !== userId && <span className="entry-actor">by {actor}</span>}
+        <MessageActions entry={entry} actions={actions} />
+      </div>
     </div>;
   }
   const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
     {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} trimmed={entry.trimmed} />}
-    {(actor || took) && <div className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</div>}
+    <div className="entry-footer">
+      {(actor || took) && <span className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</span>}
+      <MessageActions entry={entry} actions={actions} />
+    </div>
   </div>;
 }
 
@@ -286,6 +326,7 @@ function SessionPane({ id }: { id: string }) {
         : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
         : <div className="session-transcript" />) : session && <Conversation
         id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh} loadOlder={live.loadOlder}
+        openSession={openSession}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={refreshAll} />}
@@ -348,9 +389,9 @@ function RenameSheet({ open, title, busy, onClose, onSave }: { open: boolean; ti
   </Sheet>;
 }
 
-function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, pinned }: {
+function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, openSession, pinned }: {
   id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void;
-  loadOlder: (conversationId: string) => Promise<void>; pinned: ReactNode;
+  loadOlder: (conversationId: string) => Promise<void>; openSession: (id: string) => void; pinned: ReactNode;
 }) {
   const owner = session.ownerId === user.id;
   // Initialised once per session (SessionPane remounts per id); view refreshes never reset the user's picks.
@@ -533,6 +574,50 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
     });
   }
 
+  // Going back to a message, and forking from one: the shared conversation's, on a host that offers it. Anyone who drives
+  // the work can take it back; only the owner forks it, as the fork is a session of theirs with this one's history.
+  const rewinding = useAction();
+  const working = view.busy || activeQueue.length > 0;
+  const cuts = rewindable(view) && actualMode === "write" && !archived && !frozen;
+  const messageActions: MessageActionHandlers | undefined = cuts && (canWrite || owner) ? {
+    ...(canWrite ? { revert: { run: revert, disabled: rewinding.busy ? "Working..." : working ? "Stop the session's work to go back to an earlier message" : undefined } } : {}),
+    ...(owner ? { fork: { run: fork, disabled: rewinding.busy ? "Working..." : undefined } } : {}),
+  } : undefined;
+
+  async function revert(entry: EntryView, cut: MessageCut) {
+    if (rewinding.busy) return;
+    const confirmed = await confirmDialog({
+      title: cut.before ? "Go back to before this message?" : "Go back to this reply?",
+      message: <>{cut.before ? "This message and everything after it leave" : "Everything after this reply leaves"} the shared conversation, for everyone, and the agent continues from there.
+        {cut.before && " The message goes back into your chat box, when it's empty, to edit and send again."} Only the conversation goes back: files, commits and pushes stay as they are.</>,
+      confirmLabel: "Go back", destructive: true,
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      await api(`/api/sessions/${segment(id)}/revert`, { method: "POST", body: { entryId: cut.entryId } });
+      // Read again: something may have been typed while the dialog was open.
+      if (cut.before && !readDraft(id).trim()) setContent(resendText(entry));
+      stick.current = true;
+      refresh();
+    });
+  }
+
+  async function fork(entry: EntryView, cut: MessageCut) {
+    if (rewinding.busy) return;
+    const confirmed = await confirmDialog({
+      title: "Fork a new session from here?",
+      message: <>A new session of yours starts on the same host and model with this conversation up to {cut.before ? "just before this message, which goes into its chat box" : "this reply"}. This session stays as it is.
+        Like every new session, the fork's worktree starts empty: its agent clones the workspace's repositories again, and only what was pushed is there.</>,
+      confirmLabel: "Fork session",
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      const result = await api<{ session: SessionRecord }>(`/api/sessions/${segment(id)}/fork`, { method: "POST", body: { entryId: cut.entryId } });
+      if (cut.before) writeDraft(result.session.id, resendText(entry));
+      openSession(result.session.id);
+    });
+  }
+
   // The transcript hides secrets from everyone, but the agent and its host receive the message as typed.
   const draftHasSecret = Boolean(content.trim()) && redactSecrets(content) !== content;
 
@@ -564,7 +649,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
               {loadingOlder ? "Loading earlier messages..." : `Show earlier messages (${olderCount})`}
             </Button>
           </div>}
-          {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
+          {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} actions={messageActions} key={entry.id} />)
             : <EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}</EmptyState>}
         </div>
       </div>
@@ -619,7 +704,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, loadOlder
           </>}
         />
         {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
-        <Feedback error={submission.error || stopping.error} />
+        <Feedback error={submission.error || stopping.error || rewinding.error} />
       </div>
     </div>
   </>;
