@@ -68,6 +68,9 @@ jobs:
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/api/health && break; sleep 1; done
           curl -fsS http://127.0.0.1:8787/api/health | grep -q '"databaseProvider":"sqlite"'
           curl -fsS http://127.0.0.1:8787/api/health | grep -q '"workspaceDatabasesConfigured":true'
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"passwordAuth":true'
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"githubSignup":"invite"'
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"passwordSignup":"invite"'
           curl -fsS http://127.0.0.1:8787/ | grep -qi '<!doctype html'
           curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: pistead.example' http://127.0.0.1:8787/api/health | grep -q '"databaseProvider":"sqlite"'
           curl -fsS -H 'X-Forwarded-Proto: https' http://127.0.0.1:8787/ | grep -qi '<!doctype html'
