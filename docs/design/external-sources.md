@@ -162,10 +162,42 @@ write admissions; others become approval cards with their exact arguments.
 - Restores and moves keep materialized files (they are worktree files). The manifest's revisions make a stale push
   after a restore fail safely.
 
+## Decision: workspaces have sources, and a Git repository is one kind of source
+
+Instead of a second system beside repositories, a workspace binds **sources**. A Git repository is one kind; Notion,
+Google Drive, Dropbox, OneDrive, Tencent Docs and the rest are others.
+
+- **Visibility: no restriction per session or member.** Every source of a workspace is in the grant of every session
+  in it, as repositories are today. Each read still uses the session owner's own account, so what a session can
+  actually see is still limited by that owner's access at the provider.
+- **A general layer** that owns what is the same for every kind: `workspace_sources` (`id`, `workspace_id`, `kind`,
+  display name, `writable`, created by and when). Used by the settings UI (**Settings → Workspaces → Sources → Add
+  source**), the setup checklist, the start-session check ("at least one source" replaces "at least one
+  repository"), the session grant and instructions, workspace exports and audit.
+- **Per-kind detail tables.** `workspace_repositories` becomes the detail of `kind = git` and keeps everything that
+  only Git has: push policies and identities, session branches, LFS, the host repository cache, `git_push` and tags,
+  and pull request states. New kinds get their own tables (`notion_sources` with the root page or database id,
+  `drive_sources` with the folder and drive ids, …). Branch, LFS or cache concepts are not pushed into the general
+  layer.
+- **Accounts:** one **Connected accounts** page in the profile; storage stays per kind (`git_credentials` and a new
+  `source_accounts`).
+- **Tools stay per kind.** Git keeps `git clone` and `git_push`. Document kinds get their own tools (`notion_read`,
+  `docs_pull`, `docs_push`, …), because their approval cards and failure modes differ. No single `source_read`.
+
+### Migration
+
+1. Add `workspace_sources` and backfill one `git` row per existing repository, keeping the repository ids so existing
+   references (pushes, ledgers, mirrors, exports) still resolve.
+2. Move the workspace-level reads to sources: the settings UI, setup checklist, start-session check, grant and
+   exports. The repository-specific server code (`push/broker.ts`, `push/identities.ts`, LFS, the relay and the
+   runner's proxy and cache) keeps reading `workspace_repositories`.
+3. Rename **Repositories** to **Sources** in the UI and the README.
+4. Add the first non-Git kind (Notion) on top of the general layer.
+
+Steps 1 and 2 are a refactor with no visible behaviour change, and can land before any integration.
+
 ## Open questions
 
 - Is the main demand reading context (specs, notes) or writing documents back? Reading-only cuts the work roughly
   in half and avoids lossy round-trips.
 - Which providers do actual users have? Notion and Google likely; Tencent Docs or Feishu for China-based teams.
-- Should sources be per-workspace bindings (like repositories), or per-session picks by the owner? Per-workspace
-  matches the current model and admin control.
