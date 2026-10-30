@@ -2143,16 +2143,16 @@ test('workspace read does not grant mutations, connector credentials, personal e
   assert.equal(f.sqlite.prepare('SELECT ciphertext FROM github_tokens WHERE user_id = ?').get(s.owner.user.id)!.ciphertext, ciphertext);
 });
 
-test('root visibility PATCH is CSRF protected, owner-only, versioned and unions rather than replaces explicit grants', async t => {
+test('root visibility PATCH is CSRF protected, for the owner and the workspace\'s owner and admins, versioned and unions rather than replaces explicit grants', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
   assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403);
   // A role change bumps the policy version of the workspace's sessions, so promote before taking the baseline.
-  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'collaborator' }));
   const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { 'X-CSRF-Token': '' })).status, 403);
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { Origin: 'https://hostile.example' })).status, 403);
-  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403, 'Workspace administration is not session ownership');
+  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403, 'Messaging a shared session is not managing it');
   await denied(await s.outsider.request('PATCH', path, { visibility: 'private' }), 404, 'not_found');
   for (const visibility of ['public', '', null, 1]) {
     assert.equal((await s.owner.request('PATCH', path, { visibility })).status, 400);
@@ -2170,13 +2170,13 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   await json(await s.owner.request('POST', `${path}/grants`, { userId: s.member.user.id, permissions: ['ask', 'manage'] }));
   const granted = await json<{ session: SessionRecord }>(await s.member.request('GET', path));
   assert.deepEqual(granted.session.permissions, ['read', 'ask', 'manage']);
-  assert.equal((await s.member.request('PATCH', path, { visibility: 'workspace' })).status, 403, 'Manage is not ownership');
+  await denied(await s.member.request('PATCH', path, { visibility: 'workspace' }), 403, 'owner_required');
   assert.equal(f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id)!.policy_version, granted.session.policyVersion);
   const grantBefore = f.sqlite.prepare('SELECT * FROM session_grants WHERE session_id = ?').all(s.session.id);
   const shared = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'workspace' }));
   assert.equal(shared.session.policyVersion, granted.session.policyVersion + 1);
   assert.equal(shared.session.visibility, 'workspace');
-  // Shared with the workspace, an admin can also send messages; its grant adds manage.
+  // Shared with the workspace, a collaborator can also send messages; its grant adds manage.
   assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'write', 'manage']);
   const privateAgain = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'private' }));
   assert.equal(privateAgain.session.policyVersion, shared.session.policyVersion + 1);
@@ -2188,6 +2188,21 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   await json(await s.owner.request('PATCH', path, { visibility: 'private' }));
   await denied(await s.member.request('GET', path), 404, 'not_found');
   assert.deepEqual(await json(await s.member.request('GET', '/api/sessions')), { sessions: [] });
+
+  // The workspace's owner and admins manage every session there: made an admin, the member opens the private session,
+  // with no grant, and changes its visibility as its owner would, versioned and recorded as their own change.
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  const managed = await json<{ session: SessionRecord }>(await s.member.request('GET', path));
+  assert.deepEqual(managed.session.permissions, ['read', 'ask', 'write', 'manage']);
+  assert.deepEqual((await json<{ sessions: SessionRecord[] }>(await s.member.request('GET', '/api/sessions'))).sessions.map(session => session.id), [s.session.id]);
+  const reshared = await json<{ session: SessionRecord }>(await s.member.request('PATCH', path, { visibility: 'workspace' }));
+  assert.equal(reshared.session.visibility, 'workspace');
+  assert.equal(reshared.session.policyVersion, managed.session.policyVersion + 1);
+  assert.deepEqual(reshared.session.permissions, ['read', 'ask', 'write', 'manage'], 'what the admin holds, not the owner\'s access');
+  assert.equal((await json<{ session: SessionRecord }>(await s.member.request('PATCH', path, { visibility: 'private' }))).session.visibility, 'private');
+  assert.deepEqual(f.sqlite.prepare("SELECT actor_id FROM audit WHERE session_id = ? AND action = 'session.visibility.updated' ORDER BY created_at DESC, rowid DESC LIMIT 2")
+    .all(s.session.id).map(row => row.actor_id), [s.member.user.id, s.member.user.id]);
+  assert.deepEqual(f.sqlite.prepare('SELECT * FROM session_grants WHERE session_id = ?').all(s.session.id), []);
   const stored = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
   for (const key of ['owner_id', 'workspace_id', 'agent_version_id', 'connector_id', 'connector_owner_id', 'repositories_json']) {
     assert.equal(stored[key], rowBefore![key], key);
@@ -2235,6 +2250,78 @@ test('owners rename and archive sessions; archived sessions are read-only and un
   const actions = (f.sqlite.prepare('SELECT action FROM audit WHERE session_id = ? ORDER BY created_at, rowid').all(s.session.id) as { action: string }[]).map(row => row.action);
   for (const action of ['session.renamed', 'session.archived', 'session.unarchived']) assert.ok(actions.includes(action), action);
   assert.equal(s.hub.requests.length, 1, 'Renaming and archiving must not contact the host');
+});
+
+test('the workspace\'s owner and admins manage every session there, private ones included, but nothing that is its owner\'s alone', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  // The creator's private session on the host s.host shares; s.admin owns the workspace.
+  const { session } = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, visibility: 'private', trustedConnectorId: s.connector.connectorId,
+  }), 201);
+  const path = `/api/sessions/${session.id}`;
+  const workspaceAdmin = await f.client('workspace-admin');
+  await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: workspaceAdmin.user.id, role: 'admin' }));
+  const managed = ['read', 'ask', 'write', 'manage'];
+  const held = async (client: Client) => (await json<{ session: SessionRecord }>(await client.request('GET', path))).session.permissions;
+
+  // Another member, the host's owner included, doesn't see it; the workspace's owner and its admins open and list it
+  // with no grant, holding all but approve.
+  await denied(await s.host.request('GET', path), 404, 'not_found');
+  for (const manager of [s.admin, workspaceAdmin]) {
+    assert.deepEqual(await held(manager), managed);
+    const { sessions } = await json<{ sessions: SessionRecord[] }>(await manager.request('GET', '/api/sessions'));
+    assert.deepEqual(sessions.find(item => item.id === session.id)?.permissions, managed);
+  }
+
+  // They rename it and change its tool output and visibility as its owner would; each answer carries what they hold.
+  const renamed = await json<{ session: SessionRecord }>(await workspaceAdmin.request('PATCH', path, { title: '  Tidied up  ' }));
+  assert.equal(renamed.session.title, 'Tidied up');
+  assert.deepEqual(renamed.session.permissions, managed);
+  assert.equal((await json<{ session: SessionRecord }>(await s.admin.request('PATCH', path, { toolOutput: 'brief' }))).session.toolOutput, 'brief');
+  assert.equal((await json<{ session: SessionRecord }>(await workspaceAdmin.request('PATCH', path, { visibility: 'workspace' }))).session.visibility, 'workspace');
+  assert.deepEqual(await held(s.host), ['read']);
+  await json(await workspaceAdmin.request('PATCH', path, { visibility: 'private' }));
+  await denied(await s.host.request('GET', path), 404, 'not_found');
+
+  // They give session roles up to what they hold, so never one that approves, and take any away.
+  await denied(await workspaceAdmin.request('POST', `${path}/grants`, { userId: s.host.user.id, role: 'admin' }), 403, 'grant_escalation');
+  await json(await workspaceAdmin.request('POST', `${path}/grants`, { userId: s.host.user.id, role: 'collaborator' }));
+  assert.deepEqual(await held(s.host), ['read', 'ask', 'write']);
+  // A session admin role, which its owner can give, manages who has access but not the session itself.
+  await json(await s.creator.request('POST', `${path}/grants`, { userId: s.host.user.id, role: 'admin' }));
+  for (const [method, suffix, body] of [['PATCH', '', { title: 'Hijacked' }], ['PATCH', '', { visibility: 'workspace' }], ['PATCH', '', { toolOutput: 'full' }],
+    ['POST', '/archive', undefined]] as const) {
+    await denied(await s.host.request(method, `${path}${suffix}`, body), 403, 'owner_required');
+  }
+  await json(await s.admin.request('DELETE', `${path}/grants/${encodeURIComponent(s.host.user.id)}`));
+  await denied(await s.host.request('GET', path), 404, 'not_found');
+
+  // Approving, and whatever acts as the session's owner or takes their work elsewhere, stay its owner's.
+  await denied(await workspaceAdmin.request('POST', `${path}/approvals/approval`, { decision: 'approve', reviewHash: 'r'.repeat(43) }), 403, 'forbidden');
+  for (const [method, suffix, body] of [['POST', '/backup', {}], ['GET', '/backups', undefined], ['POST', '/restart', {}], ['GET', '/export', undefined],
+    ['GET', '/link', undefined], ['PUT', '/link', undefined], ['POST', '/schedules', { message: 'Nightly', cron: '0 3 * * *' }],
+    ['POST', '/migrate', { requestId: 'manager-move', modelId: s.model.id }]] as const) {
+    await denied(await workspaceAdmin.request(method, `${path}${suffix}`, body), 403, 'owner_required');
+  }
+
+  // They archive it and unarchive it to its exact status; every change is recorded as the one who made it.
+  const archived = await json<{ session: SessionRecord }>(await workspaceAdmin.request('POST', `${path}/archive`));
+  assert.equal(archived.session.status, 'archived');
+  assert.deepEqual(archived.session.permissions, managed);
+  const restored = await json<{ session: SessionRecord }>(await s.admin.request('POST', `${path}/unarchive`));
+  assert.equal(restored.session.status, 'ready');
+  const actors = Object.fromEntries((f.sqlite.prepare(`SELECT action, actor_id FROM audit WHERE session_id = ?
+    AND action IN ('session.renamed', 'session.tool_output.updated', 'session.archived', 'session.unarchived')`).all(session.id) as { action: string; actor_id: string }[])
+    .map(row => [row.action, row.actor_id]));
+  assert.deepEqual(actors, { 'session.renamed': workspaceAdmin.user.id, 'session.tool_output.updated': s.admin.user.id,
+    'session.archived': workspaceAdmin.user.id, 'session.unarchived': s.admin.user.id });
+
+  // An admin no more, they manage nothing and don't see it.
+  await json(await s.admin.request('PATCH', `/api/workspaces/${s.team.id}/members/${encodeURIComponent(workspaceAdmin.user.id)}`, { role: 'collaborator' }));
+  await denied(await workspaceAdmin.request('GET', path), 404, 'not_found');
+  await denied(await workspaceAdmin.request('POST', `${path}/archive`), 404, 'not_found');
+  assert.equal(s.hub.requests.length, 1, 'Managing a session never contacts its host');
+  assert.deepEqual(s.hub.unexpected, []);
 });
 
 test('hosts report what the agent of each session they serve is doing; lists show it and the runner binding never carries it', async t => {

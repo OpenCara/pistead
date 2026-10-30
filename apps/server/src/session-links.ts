@@ -6,7 +6,7 @@ import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { redactSecrets } from '../../../packages/shared/src/redaction.js';
 import { briefEntry, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
-import { auditStatement, getUser, requireSession, sessionAccess } from './db.js';
+import { auditStatement, getUser, requireSession, requireSessionManager, sessionAccess } from './db.js';
 import { appOrigin, fail, identifier, now, randomToken } from './http.js';
 import { ownerViewRequest, runnerJSON } from './runner.js';
 import { requireConnectorSession } from './connectors.js';
@@ -132,7 +132,10 @@ async function requireOwner(c: AppContext, permission: 'read' | 'manage', messag
   return row;
 }
 
-/** Share links expose a session beyond its workspace, so only its owner can see, create or turn off its link. */
+/**
+ * Share links expose a session beyond its workspace, so only its owner can see or create its link. Turning one off only
+ * takes that away, which its workspace's owner and admins, who manage every session there, can do too.
+ */
 export function registerSessionLinks(app: Hono<WorkerEnv>): void {
   app.get('/api/sessions/:id/link', async c => {
     const row = await requireOwner(c, 'read', 'Only the session owner can see its share link.');
@@ -165,9 +168,10 @@ export function registerSessionLinks(app: Hono<WorkerEnv>): void {
   });
   // Turning a link off only takes access away, so it also works on an archived session.
   app.delete('/api/sessions/:id/link', async c => {
-    const row = await requireOwner(c, 'read', 'Only the session owner can turn off its share link.');
+    const { row } = await requireSessionManager(c, identifier(c.req.param('id')), 'read',
+      'Only the session owner, or the workspace\'s owner or an admin, can turn off its share link.');
     const removed = await c.env.DB.query('DELETE FROM session_links WHERE session_id = ? RETURNING session_id').bind(row.id).first();
-    if (removed) await auditStatement(c.env, row.owner_id, 'session.link.revoked', row.workspace_id, row.id).run();
+    if (removed) await auditStatement(c.env, c.get('auth').userId, 'session.link.revoked', row.workspace_id, row.id).run();
     return c.json({ ok: true });
   });
 }

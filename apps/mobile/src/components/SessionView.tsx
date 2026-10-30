@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
+import { managesSession } from "../../../../packages/shared/src/policy";
 import { redactSecrets, REDACTED } from "../../../../packages/shared/src/redaction";
 // Brings in `SessionRecord.linkShared`, which link sharing declares there.
 import type {} from "../../../../packages/shared/src/sharing";
@@ -66,7 +67,10 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   // Everyone a session names (owner, host owner, writers, approvers) is or was a member of its workspace.
   const people = useWorkspacePeople(known?.workspaceId ?? null);
   const title = known?.title ?? "Session";
-  const workspaceName = known && workspaces.find(workspace => workspace.id === known.workspaceId)?.name;
+  const workspace = known && workspaces.find(item => item.id === known.workspaceId);
+  const workspaceName = workspace?.name;
+  // Its owner, and its workspace's owner and admins, unarchive it; the server decides.
+  const manages = Boolean(session && managesSession(user.id, session.ownerId, workspace?.role));
   const approvals = view?.approvals ?? [];
   const pendingCount = approvals.filter(approval => approval.status === "pending").length;
 
@@ -172,8 +176,8 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
       <SessionPeople session={session} host={host} />
     </View>}
     {(archived || (live.error && !startFailed) || action.error || action.notice) && <View style={styles.alerts}>
-      {archived && <Banner title="Archived" actions={isOwner && <Button small label="Unarchive" disabled={action.busy} onPress={unarchive} />}>
-        {`This session is read-only. ${isOwner ? "Unarchive it to continue the work." : "Only its owner can unarchive it."}`}
+      {archived && <Banner title="Archived" actions={manages && <Button small label="Unarchive" disabled={action.busy} onPress={unarchive} />}>
+        {`This session is read-only. ${manages ? "Unarchive it to continue the work." : "Only its owner, or the workspace's owner or an admin, can unarchive it."}`}
       </Banner>}
       {live.error && !startFailed && <Banner tone="danger" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button small label="Reconnect and check access" onPress={live.reconnect} />}>
         {live.error}

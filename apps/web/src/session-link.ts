@@ -3,7 +3,10 @@ import type { SessionRecord, UserProfile } from "../../../packages/shared/src/ty
 import { api, segment } from "./api";
 import { confirmDialog, useResource, type ActionState } from "./ui";
 
-/** A session's share link as its owner manages it; everyone else learns from `session.linkShared` that one exists. */
+/**
+ * A session's share link as its owner manages it; everyone else learns from `session.linkShared` that one exists. The
+ * workspace's owner and admins, who manage every session there, can also turn it off.
+ */
 export interface SessionLinkActions {
   /** Undefined until it has loaded (and for everyone but the owner), null while link sharing is off. */
   link: SessionLink | null | undefined;
@@ -14,8 +17,11 @@ export interface SessionLinkActions {
   unshareLink: () => void;
 }
 
-/** `action` is the session's own action state, so link changes share its busy flag and show their notices with it. */
-export function useSessionLink({ session, user, action, onChange }: { session: SessionRecord; user: UserProfile; action: ActionState; onChange: () => void }): SessionLinkActions {
+/**
+ * `action` is the session's own action state, so link changes share its busy flag and show their notices with it.
+ * `manages`: the user is its owner, or its workspace's owner or an admin (managesSession).
+ */
+export function useSessionLink({ session, user, manages, action, onChange }: { session: SessionRecord; user: UserProfile; manages: boolean; action: ActionState; onChange: () => void }): SessionLinkActions {
   const isOwner = session.ownerId === user.id;
   const resource = useResource<{ link: SessionLink | null }>(isOwner ? `/api/sessions/${segment(session.id)}/link` : null);
   const link = resource.data ? resource.data.link : undefined;
@@ -40,17 +46,19 @@ export function useSessionLink({ session, user, action, onChange }: { session: S
   }
 
   async function unshareLink() {
-    if (!isOwner || action.busy) return;
+    if (!manages || action.busy) return;
     const confirmed = await confirmDialog({
       title: "Turn off the share link?",
-      message: "The link stops working at once, for everyone who has it. Content already viewed or copied can't be recalled. Turning link sharing on again creates a new link.",
+      message: `The link stops working at once, for everyone who has it. Content already viewed or copied can't be recalled. ${isOwner
+        ? "Turning link sharing on again creates a new link." : "Only the session's owner can share it by link again, with a new link."}`,
       confirmLabel: "Turn off link",
       destructive: true,
     });
     if (!confirmed) return;
     await action.run(async () => {
       await api(`/api/sessions/${segment(session.id)}/link`, { method: "DELETE" });
-      resource.setData({ link: null });
+      // Only the owner loads the link itself; for everyone else the refreshed session says it is gone.
+      if (isOwner) resource.setData({ link: null });
       onChange();
     }, "Share link turned off. It no longer opens this session.");
   }

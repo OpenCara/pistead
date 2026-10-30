@@ -331,10 +331,13 @@ await check("the same model starts distinct owner-bound sessions", async () => {
   assert.equal(bv.owner.id, bob.user.id);
   assert.equal(av.owner.gitEmail, "alice@example.invalid");
   assert.equal(bv.owner.gitEmail, "bob@example.invalid");
-  await alice.request("GET", `/api/sessions/${bobSession.id}/view`, undefined, [403, 404]);
   await bob.request("GET", `/api/sessions/${aliceSession.id}/view`, undefined, [403, 404]);
+  const bobVisible: SessionRecord[] = (await bob.request("GET", "/api/sessions")).sessions;
+  assert.ok(!bobVisible.some((session) => session.id === aliceSession.id), "a member doesn't see another member's private session");
+  // Alice owns the workspace, so she manages every session in it, Bob's private one included, short of approving; it still runs as Bob.
+  assert.equal((await alice.view(bobSession.id)).owner.id, bob.user.id);
   const visible: SessionRecord[] = (await alice.request("GET", "/api/sessions")).sessions;
-  assert.ok(!visible.some((session) => session.id === bobSession.id));
+  assert.deepEqual(visible.find((session) => session.id === bobSession.id)?.permissions, ["read", "ask", "write", "manage"]);
 });
 
 if (connectedRuntime) {
@@ -355,7 +358,8 @@ if (connectedRuntime) {
 
 await check("session ownership is assigned by the server, not the session caller", async () => {
   await bob.request("POST", "/api/sessions", { workspaceId: workspace.id, modelId: model.id, title: "Spoofed owner", ownerId: alice.user.id }, [400]);
-  await alice.request("GET", `/api/sessions/${bobSession.id}/view`, undefined, [403, 404]);
+  assert.equal((await bob.request("GET", `/api/sessions/${bobSession.id}`)).session.ownerId, bob.user.id);
+  await bob.request("GET", `/api/sessions/${aliceSession.id}/view`, undefined, [403, 404]);
 });
 
 await check("read-only sharing cannot prompt, ask, approve, manage, or cross workspace boundaries", async () => {

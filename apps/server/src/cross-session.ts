@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
-import { accessModes, type AccessMode, type SessionView, type SubmitResult } from '../../../packages/shared/src/types.js';
-import { hasPermission } from '../../../packages/shared/src/policy.js';
+import { accessModes, type AccessMode, type SessionView, type SubmitResult, type WorkspaceRole } from '../../../packages/shared/src/types.js';
+import { hasPermission, workspaceSessionPermissions } from '../../../packages/shared/src/policy.js';
 import {
   audienceTarget, crossSessionHeader, crossSessionLimits, cut, messageOutcome, sessionsBrokerActions, sessionsToolTarget, sessionsWriteActions,
   type CrossSessionMessage, type CrossSessionOutcome, type CrossSessionSummary, type SessionConnections, type SessionsBrokerAction, type SessionsToolResult,
@@ -355,10 +355,12 @@ async function createChild(call: Call, options: { message?: string; access?: Acc
     fail(403, 'connector_trust_required', 'A session started by the agent runs on your own host or on this session\'s host. Start one on another member\'s host yourself.');
   }
   if (options.message !== undefined && options.notify) {
-    // Its outcome comes back here: everyone who reads this session must be able to read the new one, which only its
-    // owner reads, or, shared with the workspace, every member does.
-    const readers = visibility === 'private' ? new Set([actorId]) : new Set((await c.env.DB.query<{ user_id: string }>(`SELECT member.user_id FROM workspace_members member
-      JOIN users u ON u.id = member.user_id WHERE member.workspace_id = ? AND u.suspended_at IS NULL`).bind(origin.workspace_id).all()).map(row => row.user_id));
+    // Its outcome comes back here: everyone who reads this session must be able to read the new one. Its owner (the
+    // actor) reads it, and so does every member whose workspace role reads it with no grant: the workspace's owner and
+    // admins whatever its visibility, and everyone else once it is shared with the workspace.
+    const members = await c.env.DB.query<{ user_id: string; role: WorkspaceRole }>(`SELECT member.user_id, member.role FROM workspace_members member
+      JOIN users u ON u.id = member.user_id WHERE member.workspace_id = ? AND u.suspended_at IS NULL`).bind(origin.workspace_id).all();
+    const readers = new Set([actorId, ...members.filter(member => workspaceSessionPermissions(member.role, visibility).length > 0).map(member => member.user_id)]);
     const consent = await audienceConsent(call, { id: null, title: options.title ?? 'new session', readers }, ['in']);
     if (consent) return c.json(consent);
   }

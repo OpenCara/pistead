@@ -17,7 +17,7 @@ call as if the person behind it had made it themselves. Shared types, limits and
 | `wait` | The runner reads one message's outcome every 3 seconds until it is done (default 300 s, at most 1800 s) | read | any |
 | `create` | A new session as the actor, linked to this one (`parent_session_id`), with an optional opening message | creating sessions in the workspace | Read only needs the owner's permission |
 | `stop` | Stops the other session's work | write | Read only needs the owner's permission |
-| `archive` | Archives a session the actor owns | owner | Read only needs the owner's permission |
+| `archive` | Archives a session the actor owns or, as the workspace's owner or an admin, any session of the workspace | owner, or the workspace's owner or an admin | Read only needs the owner's permission |
 
 `ask`, `send` and `create` take `notify`: once the target finishes the message, a sweep (every 15 seconds,
 `runCrossSessionNotifications`) sends its outcome back as a new message of the same actor, while the origin is idle.
@@ -62,7 +62,9 @@ and does nothing; the runner raises a second permission card for the same call (
 grant (for the call, or the session), which the control plane checks against the card's own target, requester and
 admission (`sessionsNeedGranted`). The owner's own Auto-approve message raises no card, as for any permission.
 
-A session the agent starts is never more visible than its parent: a private session starts only private ones.
+A session the agent starts is never more visible than its parent: a private session starts only private ones. A new
+private session is read by its owner (the actor) and the workspace's owner and admins, who read every session, so a
+private parent's outcome comes back from it without a card unless the parent has other readers.
 
 ## Provenance, chains and limits
 

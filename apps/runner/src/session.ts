@@ -114,7 +114,7 @@ const SESSIONS_TOOL_DESCRIPTION = "Work with this workspace's other Pistead sess
   + "send {session, message, access?, notify?}: a message to that session's agent, as if typed in its chat (access approval, the default: its commands wait for people there; read: inspect only; auto: only in a message the session owner sent with auto-approve, to a session they own); refused while it is busy. "
   + "wait {session, message_id, timeout_seconds?}: block until a message this session sent finishes (default 300 seconds), then return its outcome and reply. "
   + "create {message?, title?, model?, visibility?, access?, notify?}: start a new session for a sub-task, as the same person, on this session's model unless model names one list returns, and send it message. "
-  + "stop {session}: stop that session's current work. archive {session}: archive a session they own. "
+  + "stop {session}: stop that session's current work. archive {session}: archive a session they own or, as the workspace's owner or an admin, any of its sessions. "
   + "With notify, Pistead sends this session the outcome as a new message once the other session finishes. Delivered messages start with a line naming this session and the sender; "
   + "chains of messages stop after 3 hops and never loop back to a session they came from; approvals in another session are decided only by people there. "
   + "Involve other sessions only when the user asked for it or clearly expects it.";

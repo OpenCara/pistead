@@ -34,17 +34,36 @@ export function isSafeRelativePath(path: string): boolean {
 
 /** Roles that may create (or restore into) a session of their own; viewers only follow other people's. */
 export const sessionCreatorRoles: readonly WorkspaceRole[] = ["owner", "admin", "collaborator", "member"];
-/** Roles that manage the workspace: its members, models, repositories and settings. */
+/**
+ * Roles that manage the workspace: its members, models, repositories and settings, and every session there, private ones
+ * included (see workspaceSessionPermissions and managesSession).
+ */
 export const workspaceManagerRoles: readonly WorkspaceRole[] = ["owner", "admin"];
 /** Roles an admin (not only the owner) may assign, change or remove. */
 export const adminManagedRoles: readonly WorkspaceRole[] = ["collaborator", "member", "viewer"];
 
 /**
- * What a workspace role alone allows on a session shared with the workspace, one it doesn't own: collaborators,
- * admins and the owner send messages (write) and side asks; members and viewers follow it read-only.
+ * What a workspace role alone allows on a session it doesn't own. The workspace's owner and admins manage every session
+ * there, private ones included: they follow it, send side asks and messages, stop its work and manage it (see
+ * managesSession), but decide its approvals only with a session role that allows that, since approved operations run as
+ * the session's owner. On a session shared with the workspace, collaborators also send messages and side asks, and
+ * members and viewers follow it read-only. A private session gives everyone else nothing.
  */
-export function workspaceSessionPermissions(role: WorkspaceRole): Permission[] {
+export function workspaceSessionPermissions(role: WorkspaceRole, visibility: "private" | "workspace"): Permission[] {
+  if (workspaceManagerRoles.includes(role)) return ["read", "ask", "write", "manage"];
+  if (visibility !== "workspace") return [];
   return sharedSessionWriterRoles.includes(role) ? ["read", "ask", "write"] : ["read"];
+}
+
+/**
+ * Whether `userId`, whose role in the session's workspace is `role`, manages the session as a whole as its owner does:
+ * renames, archives and unarchives it, changes its visibility and tool output, and turns off its share link. Its owner
+ * does, and so do its workspace's owner and admins; a session admin role manages only who holds a session role.
+ * What acts as the session's owner or takes their work elsewhere stays theirs alone: Auto-approve, permission requests,
+ * scheduled prompts, restarts, backups, restores, moves, exports and creating a share link.
+ */
+export function managesSession(userId: string, ownerId: string, role: WorkspaceRole | undefined): boolean {
+  return userId === ownerId || (role !== undefined && workspaceManagerRoles.includes(role));
 }
 /** Roles that send messages to any session shared with the workspace (see workspaceSessionPermissions). */
 export const sharedSessionWriterRoles: readonly WorkspaceRole[] = ["owner", "admin", "collaborator"];

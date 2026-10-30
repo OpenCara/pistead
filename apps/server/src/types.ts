@@ -130,5 +130,10 @@ export interface PushCredentialRow {
   pull_request_url: string | null;
   pull_request_state?: string | null; pull_request_checked_at?: string | null;
 }
-export interface SessionAccess { row: SessionRow; permissions: Permission[] }
+export interface SessionAccess {
+  row: SessionRow;
+  permissions: Permission[];
+  /** The actor's role in the session's workspace, from the same policy snapshot as `permissions`. */
+  role: WorkspaceRole;
+}
 export type PublicProfile = UserProfile;
