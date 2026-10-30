@@ -197,7 +197,7 @@ Google Drive, Dropbox, OneDrive, Tencent Docs and the rest are others.
 
 Steps 1 and 2 are a refactor with no visible behaviour change, and can land before any integration.
 
-**Done: steps 1 and 2.** Migration `0032_workspace_sources.sql` (Postgres `0025_workspace_sources.sql`) adds
+**Done: steps 1 and 2.** Migration `0040_workspace_sources.sql` (Postgres `0033_workspace_sources.sql`) adds
 `workspace_sources` and backfills one `git` row per repository, with the repository's id. A `git` source references its
 repository (`repository_binding_id`, `ON DELETE CASCADE`), and an insert trigger on `workspace_repositories` adds it,
 so every path that binds or removes a repository (the API, imports, tests) keeps the two in step. Sources are

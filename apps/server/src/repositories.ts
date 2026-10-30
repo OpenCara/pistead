@@ -95,6 +95,7 @@ function conflictingPaths(paths: string[]): boolean {
 async function githubAccess(env: Env, userId: string): Promise<GitHubAccess> {
   const user = await getUser(env, userId);
   if (user?.auth_kind === 'test') fail(403, 'github_not_connected', 'Synthetic users cannot access GitHub repositories.');
+  if (user?.auth_kind === 'password') fail(409, 'github_not_connected', 'github.com repositories need an account that signs in with GitHub. This account signs in with a password; its Git accounts reach other providers.');
   if (!user || user.auth_kind !== 'github' || !user.github_id) fail(409, 'github_not_connected', 'The acting user must connect GitHub. Workspace sharing does not grant repository access.');
   const vault = await env.DB.query<{ ciphertext: string }>('SELECT ciphertext FROM github_tokens WHERE user_id = ?').bind(userId).first();
   if (!vault) fail(409, 'github_not_connected', 'The acting user must connect GitHub.');
@@ -251,7 +252,7 @@ export function registerRepositories(app: Hono<WorkerEnv>): void {
           WHERE t.user_id = ? AND t.ciphertext = ? AND u.auth_kind = 'github' AND u.github_id = ?)`,
         values: [actor, access.github.ciphertext, access.github.githubId] }
       : { sql: `EXISTS (SELECT 1 FROM git_credentials g JOIN users u ON u.id = g.user_id
-          WHERE g.id = ? AND g.user_id = ? AND g.ciphertext = ? AND (u.auth_kind = 'github' OR (? = 1 AND u.auth_kind = 'test')))`,
+          WHERE g.id = ? AND g.user_id = ? AND g.ciphertext = ? AND (u.auth_kind IN ('github', 'password') OR (? = 1 AND u.auth_kind = 'test')))`,
         values: [access.account.credential.id, actor, access.account.ciphertext, testMode(c.env) ? 1 : 0] };
     const inserted = await c.env.DB.query(`INSERT INTO workspace_repositories (id,workspace_id,provider,host,repository_id,full_name,ref,private,created_at)
       SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))

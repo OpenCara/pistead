@@ -44,6 +44,8 @@ jobs:
         env:
           VERSION: ${{ needs.check.outputs.version }}
         run: node scripts/set-release-version.mjs "$VERSION" cli
+      # The web app, which the CLI ships for `pistead serve`.
+      - run: pnpm build
       # prepublishOnly checks the shrinkwrap and builds dist.
       - name: Publish pistead
         working-directory: packages/cli

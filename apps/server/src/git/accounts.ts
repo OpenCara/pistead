@@ -151,7 +151,7 @@ export function registerGitAccounts(app: Hono<WorkerEnv>): void {
     const row = await c.env.DB.query<Pick<GitCredentialRow, 'id' | 'provider' | 'host' | 'organization' | 'login' | 'created_at'>>(`INSERT INTO git_credentials
       (id, user_id, provider, host, organization, username, login, ciphertext, created_at, updated_at)
       SELECT ?,?,?,?,?,?,?,?,?,?
-      WHERE EXISTS (SELECT 1 FROM users WHERE id = ? AND (auth_kind = 'github' OR (? = 1 AND auth_kind = 'test')))
+      WHERE EXISTS (SELECT 1 FROM users WHERE id = ? AND (auth_kind IN ('github', 'password') OR (? = 1 AND auth_kind = 'test')))
         AND ((SELECT COUNT(*) FROM git_credentials WHERE user_id = ?) < ? OR EXISTS (SELECT 1 FROM git_credentials
           WHERE user_id = ? AND provider = ? AND host = ? AND organization = ?))
       ON CONFLICT (user_id, provider, host, organization) DO UPDATE SET username = excluded.username, login = excluded.login,

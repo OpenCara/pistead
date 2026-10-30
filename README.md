@@ -5,7 +5,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
 Two things set it apart:
 
 - **One subscription, the whole team.** Pair a machine where Pi is signed in to your model provider, share it with a workspace, and every teammate can start their own sessions on its models. They never see its API keys or subscription login: those stay on the host. Each session still runs as the member who started it, with their own Git accounts, so the team shares the models and not each other's identities. See [Sharing a host](#sharing-a-host).
-- **Share a chat session, with exactly the permissions you choose.** Every session is a live conversation teammates can follow. Make it visible to the workspace or keep it private, then give people exactly what they need: `read` to watch, `ask` for side questions that don't touch the work, `write` to drive it, `approve` to decide its commands and pushes, `manage` to share it further. A read-only link can show the conversation to anyone, even without signing in. See [Collaborating on a session](#collaborating-on-a-session).
+- **Share a chat session, with exactly the permissions you choose.** Every session is a live conversation teammates can follow. Make it visible to the workspace or keep it private (the workspace's owner and admins still manage it), then give people exactly what they need: `read` to watch, `ask` for side questions that don't touch the work, `write` to drive it, `approve` to decide its commands and pushes, `manage` to share it further. A read-only link can show the conversation to anyone, even without signing in. See [Collaborating on a session](#collaborating-on-a-session).
 
 <p align="center">
   <img src="docs/images/team-collaboration.svg" alt="Alice shares her host, where Pi is signed in to a model provider, with the workspace. Bob starts a session on it that runs as Bob. Carol can write and approve, Dan sends side asks, Erin reads, and anyone with the share link follows the conversation read-only." width="900">
@@ -16,7 +16,7 @@ And around them:
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
 - **Isolated work.** Each session clones the workspace's repositories into its own sandbox, whose only way out is a proxy that reads them with the session owner's account and follows the workspace's network policy.
 - **People decide.** Shell commands, commits, pushes, GitHub comments, merges and new issues wait for an approval unless the session owner auto-approves a message.
-- **Built for teams.** Workspace roles (viewer, member, collaborator, admin) set what each person can do by default, and session grants add more for one session at a time.
+- **Built for teams.** Workspace roles (viewer, member, collaborator, admin) set what each person can do by default, with the workspace's owner and admins managing every session in it, and session grants add more for one session at a time.
 
 ## Contents
 
@@ -37,6 +37,7 @@ And around them:
   - [Backups, restores and exports](#backups-restores-and-exports)
   - [Moving a session to another host](#moving-a-session-to-another-host)
   - [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)
+- [Running Pistead on your own computer](#running-pistead-on-your-own-computer)
 - [Running the server](#running-the-server)
 - [Development](#development)
 - [Layout](#layout)
@@ -48,7 +49,7 @@ And around them:
                                               (control plane)                        (a member's host)
 ```
 
-- The **server** keeps workspaces, members, session records, permissions and approvals. It relays sessions' Git reads with the session owner's Git account and their session-branch pushes with the workspace's push identity, issues short-lived push credentials, and acts on GitHub for session owners. It never runs an agent itself.
+- The **server** keeps workspaces, members, session records, permissions and approvals. It decides every Git request of a session: the host then makes it at the Git host itself with a credential the server gives it for that repository, or the server relays it (see [Network access](#network-access)). It issues short-lived push credentials and acts on GitHub for session owners. It never runs an agent itself.
 - A **host** runs the agents. Pi's configuration and model credentials, each session's files and its conversation stay there; the server relays every request to it. While a host is offline, its sessions' conversations can't load and no work runs on them.
 - Everyone watching a session shares the server's reads of it, about one a second, and after the first read the host, the server and the apps send each other only what changed in the conversation.
 - The web app is the complete client; the Mac app shows it in its own window, and the iPhone and iPad app covers sessions (see [iPhone, iPad and Mac apps](#iphone-ipad-and-mac-apps)). They all call the same API.
@@ -66,8 +67,10 @@ And around them:
 
 ## Quick start
 
-1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
-2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
+Just for yourself, on one computer? `npx pistead@latest serve` runs all of it there, with no server to deploy: see [Running Pistead on your own computer](#running-pistead-on-your-own-computer). For a team:
+
+1. **Run the server** with Docker and a GitHub OAuth app, or with [username and password](#username-and-password) accounts (`PASSWORD_AUTH=true`) and an administrator created with `--create-admin`: see [Running the server](#running-the-server).
+2. **Sign in** with **Continue with GitHub** or your username and password, then choose **New workspace** and name it.
 3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page or a folder or document in Google Drive, Dropbox, OneDrive, Feishu/Lark or Tencent Docs works too (see [Document sources](#document-sources)).
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
@@ -78,40 +81,63 @@ And around them:
 5. **Start a session**: select the workspace in the sidebar, choose your host in **Host**, describe the task and press Enter.
 6. **Approve** commands and commits as their cards appear above the transcript.
 
-To bring in teammates, they sign in once and send you their **User ID** from **Settings → Profile**; add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Add a source**, **Pair a host**, **Start a session**) until all three are done.
+To bring in teammates, share the workspace's invite link (**Settings → Workspaces → Members → Invite link**) and accept them under **Pending members** once they've signed in from it; where the server takes new accounts only through invitations (`SIGNUP=invite`, see [Who can create an account](#who-can-create-an-account)), that is how they get one. Or they sign in once and send you their **User ID** from **Settings → Profile**, and you add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Add a source**, **Pair a host**, **Start a session**) until all three are done.
 
 ## Using Pistead
 
 ### Signing in and your profile
 
-Pistead signs people in with GitHub only, and asks GitHub for the `read:user user:email repo workflow` scopes. That token is kept encrypted on the server and used to read your repositories, open your pull requests and act on GitHub for your sessions; it reaches a host only when a push uses your own account. A browser sign-in lasts 7 days, an app sign-in 30 days.
+Pistead signs people in with GitHub, and asks GitHub for the `read:user user:email repo workflow` scopes. That token is kept encrypted on the server and used to read your repositories, open your pull requests and act on GitHub for your sessions; it reaches a host only when a push uses your own account. A browser sign-in (the Mac app's too) lasts 7 days, an iPhone or iPad app sign-in 30 days. Where the operator allows it, people can also sign in with a [username and password](#username-and-password).
+
+#### Who can create an account
+
+The first sign-in creates an account, as far as the operator's `SIGNUP` setting allows, for GitHub and password sign-ins alike:
+
+- `open`: anyone who can reach the server. Unset, `SIGNUP` means this for GitHub, as before.
+- `invite`: only someone who opens a workspace's [invite link](#invite-links-and-pending-members) and signs in, or signs up, from it. The new account asks to join that workspace in the same step, so an owner or admin still accepts them before they see anything. A link turned off or replaced admits nobody new, and while 200 people wait to join a workspace its link creates no more accounts. Unset, `SIGNUP` means this for passwords.
+- `off`: nobody new, apart from the operator's own: the GitHub accounts `ADMIN_USER_IDS` lists, and password accounts made with `--create-admin` (see [Administration](#administration)).
+
+Existing accounts sign in whatever `SIGNUP` says; it decides only who may be added. In every mode, `ADMIN_USER_IDS`'s GitHub accounts can sign up, so a server's administrators can always set it up. Someone signing up through an invite link where `SIGNUP=open` asks to join its workspace too. The iPhone, iPad and Mac apps can't open invite links, so where `SIGNUP=invite` a new person creates their account through the link in a browser first, then signs in on the app. A refused sign-in keeps nothing: no account, and not the token GitHub issued.
+
+#### Username and password
+
+Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a username and password, and **New here? Create an account** where `SIGNUP` lets the visitor sign up: by default only on an invite link's sign-in page. Then:
+
+- The username (3 to 39 letters, digits, `-` and `_`, not case-sensitive) makes your user ID, `password:<username>`, so teammates can add you to a workspace by it before you ever sign in. It can't be changed later.
+- Passwords are at least 12 characters, other than the username. The server keeps only a salted scrypt hash. After five wrong passwords in a row the account refuses sign-ins for 30 seconds, doubling with each further miss up to 15 minutes; a correct sign-in resets the count.
+- **Settings → Profile → Password** changes it, which signs out every other browser signed in as you. There is no reset by email: someone who forgets theirs asks the server's operator for a new one (`--reset-password`, see [Administration](#administration)).
+- A password account holds no GitHub token, so it can't bind or clone **github.com** repositories (not even ones a teammate bound: a session reads repositories with its owner's own access), push with its own GitHub account, or use the GitHub tools. It works with every other Git provider, GitHub Enterprise Server included, through personal access tokens under **Git accounts**. Its Git author email starts as `<username>@users.pistead.invalid`; set your own under **Identity**.
+- The iPhone and iPad app still signs in with GitHub only; the Mac app shows the server's sign-in page, password included.
+- Turning `PASSWORD_AUTH` off signs every password account out at once and refuses their sign-ins; turning it on again lets them back in.
 
 **Settings → Profile** holds:
 
 - **Identity**: **Display name**, **Git author name** and **Git author email**. Commits in sessions you own use this identity; new sessions pick up saved changes.
 - **Environment**: up to 32 non-secret `APP_` variables (for example `APP_PROJECT=web`) sent to the host of every session you own. Values are at most 2,048 characters, and names containing `TOKEN`, `SECRET`, `PASSWORD`, `PRIVATE_KEY` or `API_KEY` are refused: credentials belong in Git accounts or in Pi on the host.
 - **Git accounts**: your GitHub sign-in plus personal access tokens for other Git providers (see [Repositories and Git accounts](#repositories-and-git-accounts)).
-- **Signed-in apps**: the iPhone, iPad and Mac apps signed in as you, each of which you can sign out.
+- **Signed-in apps**: the iPhone and iPad apps signed in as you, each of which you can sign out. The Mac app signs in as a browser does, so it isn't listed here; **Sign out** in it ends its sign-in.
 - **Account**: your **User ID** (owners add you to workspaces with it) and **Sign out**.
 
 **Settings → Appearance** switches between the Light, Dark and System themes.
 
 ### Workspaces and members
 
-Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Sources**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
+Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Sources**, **Push access**, **Network access**, **Transcripts**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Or they share an invite link instead (see [Invite links and pending members](#invite-links-and-pending-members)). Below the owner there are four tiers:
 
 - **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session role can't give a viewer more than session viewer (read).
 - **Member**: starts sessions, and follows other people's workspace-visible sessions read-only unless their owner grants more.
 - **Collaborator**: starts sessions, and can send messages and side asks to any workspace-visible session.
-- **Admin**: everything a collaborator can do, plus managing the workspace.
+- **Admin**: everything a collaborator can do, plus managing the workspace and every session in it, private ones included (see [Managing every session](#managing-every-session)).
 
 | | Owner | Admin | Collaborator | Member | Viewer |
 |---|:-:|:-:|:-:|:-:|:-:|
 | View workspace-visible sessions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Start sessions | ✓ | ✓ | ✓ | ✓ | |
 | Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
+| View, message and stop any session, private ones included | ✓ | ✓ | | | |
+| Rename, archive or unarchive any session, change its visibility and tool output, give it session roles, turn off its share link | ✓ | ✓ | | | |
 | Add and remove sources (repositories, documents), set repositories' push policy and Git LFS | ✓ | ✓ | | | |
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
@@ -121,7 +147,18 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | Connect the session database, import dumps | ✓ | | | | |
 | Export the workspace | ✓ | ✓ | | | |
 
-Approving tool calls, and managing or opening someone else's private session, still take an explicit grant from the session's owner, whatever the role.
+Approving tool calls still takes an explicit grant from the session's owner, whatever the role. For collaborators, members and viewers, so does opening or managing someone else's private session.
+
+#### Managing every session
+
+The workspace's owner and admins manage every session in it, private ones included, without a session role. On a session they don't own they hold `read`, `ask`, `write` and `manage`, so they can:
+
+- open it from their session lists, follow it, send side asks and shared messages, stop its work and browse its **Files**;
+- **Rename**, **Archive** and **Unarchive** it, make it private or workspace-visible, and turn its **Full tool output** on or off;
+- give workspace members session roles up to **Collaborator** and remove anyone's, under **Details → People → Session roles**;
+- **Turn off** its share link.
+
+Everything that acts as the session's owner, or takes their work out of the session, stays theirs. Approving its tool calls takes a session role that allows it, since an approved operation runs as the owner with their Git accounts; the owner, or a session admin, gives that. Only the owner uses **Auto-approve**, decides permission requests, schedules prompts, restarts, backs up, restores, exports or moves the session, and creates or copies its share link. Every change a manager makes is recorded in the session's activity under their own name. Demoting an admin, or removing them, takes all of this away at once.
 
 #### Invite links and pending members
 
@@ -133,7 +170,7 @@ Owners and admins can share one link to the workspace with anyone: **Members →
 - A pending member can withdraw their request from the link's page, or under **Settings → Profile → Your requests to join**, which keeps working after the link is turned off or replaced. Adding someone with **Add member** also settles their pending request.
 - At most 200 people wait to join one workspace at a time. Requests count until someone accepts, declines or withdraws them, also after the link changes, so decline the ones you won't accept to make room.
 
-Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
+Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions only to the workspace's owner and admins. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody, the workspace's owner and admins included, can open them while their owner isn't a member.
 
 ### Repositories and Git accounts
 
@@ -150,14 +187,14 @@ Connect the accounts that can read your repositories under **Settings → Profil
 | Azure DevOps | Personal access token and organization | Code (Read); opening pull requests or pushing with your account needs Code (Read & write) |
 | Gitea / Forgejo | Personal access token and host | `read:repository` and `read:user`; opening pull requests or pushing with your account needs `write:repository` |
 
-Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Sources → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's own account, on hosts that have `git-lfs` installed (Pistead uses the host's own). The provider's download links and the tokens that come with them stay on the control plane. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
+Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Sources → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's access, on hosts that have `git-lfs` installed (Pistead uses the host's own). The host downloads them from the provider itself where Pistead gives it a credential for the repository (see [Network access](#network-access)), else Pistead relays them; either way the provider's download links and the tokens that come with them never reach the sandbox. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
 
 Sessions **clone on demand**: every new session starts with an empty worktree and pins nothing.
 
 - On a sandboxed host, the agent clones the repositories it needs with plain Git (`git clone https://github.com/acme/app`), and fetches, switches and creates branches as usual. Git reaches the workspace's repositories through the session's [egress proxy](#network-access), which reads them with the **session owner's own** account; the account never reaches the host.
 - The agent commits with Git and pushes its work to the session's own branch, named for its work (`pistead/<title-slug>-<short id>`, for example `pistead/add-dark-mode-1a2b3c4d5e6f`), with plain `git push`, without approval. Other branches, and pull requests, go through `git_push` (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)).
 - On a host its owner runs [without the sandbox](#running-without-the-sandbox), the agent clones, commits and pushes with the host's own Git, network and credentials (its Git credential helpers, such as `gh auth setup-git`), each command with approval. Such a session can't be backed up once it has a clone in its worktree.
-- Cloning needs shell commands: an agent without `bash` (a session started from a model has it), or another member's session on a host without [resource limits](#the-sandbox), works in an empty worktree, and the session says so.
+- Cloning needs shell commands: an agent without `bash` (a session started from a model has it), or another member's session on a host without [resource limits](#the-sandbox) whose owner hasn't [granted them host commands](#host-admins-and-host-command-grants), works in an empty worktree, and the session says so.
 - Removing a repository from the workspace stops new reads and pushes of it at once, in running sessions too.
 - The host needs connector 0.9.0 or newer: one from before sessions cloned their repositories can't start new sessions.
 
@@ -198,7 +235,7 @@ Documents are written by other people: the agent is told to treat them as inform
 
 A host is a machine where you run the `pistead` connector next to [Pi](https://github.com/earendil-works/pi). Sessions on it use the models and credentials configured in Pi there (by default in `~/.pi/agent`); provider credentials, Pi history and personal extensions are never uploaded.
 
-**Requirements:** Linux or WSL2 with Node.js 24 or newer, Pi configured with the providers and models to offer, and `bubblewrap`, Python 3, Git and `flock` (util-linux) for the sandbox. macOS, or Linux without bubblewrap, can run [without the sandbox](#running-without-the-sandbox). Native Windows is unsupported: run the connector inside WSL2.
+**Requirements:** Linux or WSL2 with Node.js 24 or newer, Pi configured with the providers and models to offer, and `bubblewrap`, Python 3, Git and `flock` (util-linux) for the sandbox. On Windows, run the connector inside WSL2 for that sandbox. macOS and native Windows can also try their own [experimental sandboxes](#experimental-sandboxes-on-macos-and-windows), and macOS, native Windows or Linux without bubblewrap can run [without the sandbox](#running-without-the-sandbox).
 
 #### Pairing
 
@@ -217,7 +254,7 @@ Each person can hold at most five unexpired pairing codes and 20 active hosts. T
 npx pistead@latest connect
 ```
 
-Keep it running, for example in `tmux` or under your service manager: it reconnects by itself after network failures, and sessions on the host work only while it runs. Restart it after changing Pi's configuration, and run it with `@latest` to update it; newer features need a newer connector, and the web app says when a host's is too old.
+Keep it running, for example in `tmux` or under your service manager: it reconnects by itself after network failures, without interrupting the sessions at work on the host, and sessions on the host work only while it runs. When it starts again, sessions that were at work when it stopped carry on without waiting for someone to open them. Restart it after changing Pi's configuration, and run it with `@latest` to update it; newer features need a newer connector, and the web app says when a host's is too old.
 
 To pair a machine again (after revoking its host, or to move it to another server), create a new code and add `--force` to its command. The saved token is replaced only once the new code is accepted; the old host stays in **Settings → Hosts**, offline, until you revoke it, and its sessions don't move. Use a separate `--state-dir` to run a second connection on the same machine.
 
@@ -232,14 +269,16 @@ A host offers the models matched by `enabledModels` in Pi's `settings.json` (the
 The host's owner and its [admins](#host-admins-and-host-command-grants) can also turn models off without touching the machine: under **Settings → Hosts →** the host **→ Models**, clear a model's **Enabled** box. Disabling a model applies to everyone who uses the host, the owner included, in every workspace, and takes effect at once:
 
 - It leaves every model picker, and no session starts from it or moves onto it. Only the host's **Models** section still lists it, to its owner and admins.
-- No message switches to it. Sessions already on it keep their history and continue on another model; while the host has a disabled model, each message names the model it runs on, as the apps always do, so a conversation still on a disabled model asks you to choose another.
+- No message switches to it. Sessions already on it keep their history and continue on another model; while the host has a disabled model, each message names the model it runs on, as the apps always do (scheduled prompts and messages between sessions name the conversation's current model), so a conversation still on a disabled model asks you to choose another.
 - A message already running on it when it is disabled runs to its end.
 
 The setting stays with the host until someone enables the model again, even if Pi on the host stops offering the model for a while. Disabling a model doesn't change Pi's own configuration on the host.
 
 Sessions on a host also follow two more of its Pi settings:
 
-- **Compaction**: `compaction` (`enabled`, `reserveTokens`, `keepRecentTokens`) decides when a long conversation is summarized, and `compaction.modelOverrides` sets the token values per exact `provider/modelId`, so a session that switches between a small-window and a large-window model compacts in time for each. Pi's defaults apply where these are unset.
+- **Compaction**: `compaction` (`enabled`, `reserveTokens`, `keepRecentTokens`) decides when a long conversation is summarized, and `compaction.modelOverrides` sets the token values per exact `provider/modelId`, so a session that switches between a small-window and a large-window model compacts in time for each. Pi's defaults apply where these are unset, with one exception: a reasoning model keeps a tenth of its context window, between 16K and 64K tokens, as `reserveTokens` instead of Pi's 16K. Pi summarizes at the conversation's reasoning level within 80% of `reserveTokens`, so at 16K a model thinking at a high level can spend the whole budget thinking, and once the context is past the threshold every message fails the same compaction. Set `reserveTokens` (overall or for the model) to use another value.
+
+  The host's owner and its admins can also set these token counts in Pistead, without touching the machine: under **Settings → Hosts →** the host **→ Compaction**, enter **Reserve** and **Keep recent** tokens for all models, or for single models under **Per model**. Each count set there replaces the one in the host's `settings.json`; an empty one keeps it. Sessions pick up a change within a minute, from their next message, without restarting the connector. This needs a connector from this release or later.
 - **Provider attribution**: with Pi's `enableInstallTelemetry` set to `false` (or `PI_TELEMETRY=0`), sessions' model requests carry no attribution headers to pi, as Pi's own don't.
 
 The connector reads these when it starts; restart it after changing them.
@@ -261,9 +300,9 @@ The host's page shows its **Status** (online or offline, owner, capabilities), *
 By default only a host's owner manages its sharing and models and decides its `host_bash` commands, which run outside the sandbox on their machine. The owner can hand some of that out on the host's page:
 
 - **Admins**: **Add admin** makes another member of a workspace the host is connected to an admin. Admins share and unshare the host, in workspaces they and the owner both belong to, give or remove host command grants, and [enable or disable its models](#models) for everyone who uses it, but hold no host command access themselves unless a grant gives it to them. Only the owner adds or removes admins, reconnects, revokes or removes the host; an admin can **Step down**.
-- **Host command access**: in a workspace the host is shared with, grant one member or **All members** either **Approve host commands** (they decide each host command in sessions they can approve) or **Auto-approve host commands** (their own **Auto-approve** messages also run host commands without asking). A grant can expire after a day, a week or a month, or never. It ends when it expires, when an owner or admin removes it, or when the host stops being shared there. Viewers can't hold one.
+- **Host command access**: in a workspace the host is shared with, grant one member or **All members** either **Approve host commands** (they decide each host command in sessions they can approve) or **Auto-approve host commands** (their own **Auto-approve** messages also run host commands without asking). On a host without [resource limits](#the-sandbox), either level also lets the member's own sandboxed sessions run shell commands there, decided like host commands. The owner (not an admin) can also tick **Sessions on the host**, so the member may start their own [sessions directly on the host](#sessions-on-the-host); an admin can take that away, and changing a grant's level keeps it. A grant can expire after a day, a week or a month, or never. It ends when it expires, when an owner or admin removes it, or when the host stops being shared there. Viewers can't hold one.
 
-The host asks the control plane who holds which grant each time a host command is created, decided or run, so a grant that ends stops working at the next command. Grants need a connector advertising `hostGrants`; until it is updated, only the owner decides host commands. Every admin, grant and model change is recorded in the audit log.
+The host asks the control plane who holds which grant each time a host command is created, decided or run, so a grant that ends stops working at the next command. Grants need a connector advertising `hostGrants`; until it is updated, only the owner decides host commands. Sessions on the host for members need one advertising `hostSessionGrants`; until then, only the owner's run there. Members' sandboxed commands on a host without resource limits need one advertising `unboundedShellGrants`; until then, they are refused. Every admin, grant and model change is recorded in the audit log.
 
 #### Host configuration
 
@@ -274,8 +313,8 @@ How a host runs its sessions is set on its page, under **Configuration**, rather
 | **Command time limit** | How long a shell command may run before it is stopped, from 30 seconds (the default) to an hour. A longer limit also lifts the per-process limits of short commands (25 seconds of CPU, 64 MiB per file, 256 open files) so builds fit: each process may use every CPU for the whole limit, write files of up to 16 GiB and open 8192 files | Owner and admins |
 | **GPU** | Sandboxed commands get the host's GPU render device for rendering and compute: `/dev/dxg` on WSL2, or Linux DRM render nodes with their sysfs entries. Never the screen, windows, input or display (`card`) nodes, so the agent renders offscreen, for example to image files it reads back. Offered only where the connector found such a device. On WSL2, Mesa's `vulkan-dzn` on the host gives Vulkan over the Windows driver | Owner and admins |
 | **Git credentials** | Pushes in the owner's own sessions may use the credentials Git on the host would use (see [push access](#push-access)) | Owner |
-| **Repository cache** | Off, or a full mirror of each repository on the host for every session (**Shared**) or one per session owner (**Per owner**); see [Repository cache](#repository-cache-preview) | Owner |
-| **Sessions on the host** | The owner may start sessions that run directly on the host, without the sandbox; see [Sessions on the host](#sessions-on-the-host) | Owner |
+| **Repository cache** | Off, or a full mirror of each repository on the host for every session (**Shared**) or one per session owner (**Per owner**), filled with the host's own Git credentials; see [Repository cache](#repository-cache-preview) | Owner |
+| **Sessions on the host** | The owner, and members they [grant](#host-admins-and-host-command-grants) it, may start sessions that run directly on the host, without the sandbox; see [Sessions on the host](#sessions-on-the-host) | Owner |
 
 Running sessions pick up a change within a minute, and the agent finds the time limit and GPU in `identity` (`commands`); a repository cache change applies when the connector next connects. Saving changes only the settings you changed, so it never undoes one someone else saved meanwhile. Turning on Git credentials, the cache or the GPU asks first, and every change is recorded in the audit log (`host.config.updated`).
 
@@ -285,27 +324,44 @@ Running sessions pick up a change within a minute, and the agent finds the time 
 
 #### Sessions on the host
 
-A sandboxed host can also run some of its owner's sessions directly on the machine, for work the sandbox doesn't allow: an app or game that opens windows or uses the GPU and the machine's drivers as installed, or tools and SDKs the sandbox can't see. Turn on **Sessions on the host** in the host's [configuration](#host-configuration) (owner only; it asks first), then choose **Where it runs → On this host** when you start a session on it. Each session keeps the choice it started with; restored and moved copies start in the sandbox.
+A sandboxed host can also run some sessions directly on the machine, for work the sandbox doesn't allow: an app or game that opens windows or uses the GPU and the machine's drivers as installed, or tools and SDKs the sandbox can't see. Turn on **Sessions on the host** in the host's [configuration](#host-configuration) (owner only; it asks first), then choose **Where it runs → On this host** when you start a session on it. To let another member do the same, include **Sessions on the host** in their [host command grant](#host-admins-and-host-command-grants). Each session keeps the choice it started with; restored and moved copies start in the sandbox.
 
-Such a session runs like one on an [unsandboxed host](#running-without-the-sandbox): commands run as the connector's OS user, in the session's own folder, with your files, credentials and network and no resource limits, and the workspace's network access doesn't apply. They start with the connector's `PATH`, the session's own `HOME` and no display: set `DISPLAY` to open windows (for example `DISPLAY=:0` under WSLg). The host's command time limit still applies. Clones use the host's own Git and credentials, so push with `git` itself rather than `git_push`. In addition:
+Such a session runs like one on an [unsandboxed host](#running-without-the-sandbox): commands run as the connector's OS user, in the session's own folder, with the host owner's files, credentials and network and no resource limits, and the workspace's network access doesn't apply. They start with the connector's `PATH`, the session's own `HOME` and no display: set `DISPLAY` to open windows (for example `DISPLAY=:0` under WSLg). The host's command time limit still applies. Clones use the host's own Git and credentials, so push with `git` itself rather than `git_push`. In addition:
 
-- Only the host's owner starts one, and only on their own host; members it is shared with always get the sandbox.
-- Its commands are decided like [host commands](#host-commands): only by the host's owner, or a member they granted host commands. Approve permission on the session isn't enough.
-- Turning **Sessions on the host** off stops the next command of every such session (within half a minute) before it runs; nothing else of theirs changes.
+- Only the host's owner starts one, or a member whose grant in the session's workspace includes **Sessions on the host**; other members always get the sandbox. The session owner is still whoever started it.
+- Its commands are decided like [host commands](#host-commands): only by the host's owner, or a member they granted host commands (a member running their own session there holds a grant, so they can decide its commands). Approve permission on the session isn't enough. Under **Auto-approve**, its commands run without asking only for the host's owner or a member holding **Auto-approve host commands**; otherwise each one asks.
+- Turning **Sessions on the host** off stops the next command of every such session (within half a minute) before it runs; nothing else of theirs changes. So does a member's grant ending or no longer including sessions on the host, for their sessions.
+- Pushes with the [host's Git credentials](#push-access) stay the owner's alone; a member's clones still use Git on the host, with whatever credential helpers it has set up.
 - Everyone who can see the session is warned that it runs without a sandbox (**Runs on the host**).
 
 #### The sandbox
 
 With bubblewrap, every session runs in its own sandbox: no direct network (see [Network access](#network-access)), read-only system directories, and only the session's own worktree writable. Commands in it stop after the host's [command time limit](#host-configuration), 30 seconds unless its owner or an admin sets a longer one. Git there runs without hooks, stored credentials or SSH: an approved push gets a credential for that push alone (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)), and GitHub actions go through Pistead.
 
-Shell commands (`bash`) also need resource limits. A connector started with `--resources PATH` (an operator-provisioned cgroup v2 configuration: CPU, memory, process and disk limits, described in [`apps/runner/src/resources.ts`](apps/runner/src/resources.ts)) runs them in every session. Without it, only the host's owner can let commands run without limits, and only in their own sessions, through a [permission request](#permission-requests); in other members' sessions on that host, `bash` is refused.
+Shell commands (`bash`) also need resource limits. A connector started with `--resources PATH` (an operator-provisioned cgroup v2 configuration: CPU, memory, process and disk limits, described in [`apps/runner/src/resources.ts`](apps/runner/src/resources.ts)) runs them in every session. Without it, the host's owner can let commands run without limits in their own sessions, through a [permission request](#permission-requests). So can a member they [granted host commands](#host-admins-and-host-command-grants) there, in their own sessions, since that grant already lets them run any command on the host itself. Their commands still run in the sandbox, as the session's owner, but are decided like host commands: only by the host's owner or a member granted host commands, either with approve permission on the session. Under the session owner's **Auto-approve** they run without asking only with **Auto-approve host commands**, and once the grant ends, the next command is refused. In every other member's session on that host, `bash` is refused.
 
 #### Network access
 
-A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080`); file tools, commits and every other sandboxed step have no network at all.
+A sandbox's only way out is its session's **egress proxy**, which the connector runs on the host. Shell commands find it through `HTTPS_PROXY` (`http://127.0.0.1:41080` in the Linux sandbox; in the [experimental macOS and Windows sandboxes](#experimental-sandboxes-on-macos-and-windows), the session's own loopback port and credentials); file tools, commits and every other sandboxed step have no network at all.
 
-- **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. The proxy relays them to Pistead, which reads the repository with the **session owner's own account**; the credential never reaches the host. Pistead re-checks the session and the owner's access on every request.
-- **In a session that clones on demand, pushes of the session's own branch work too:** `git push origin HEAD:$PISTEAD_SESSION_BRANCH` (the branch, such as `pistead/add-dark-mode-1a2b3c4d5e6f`, is in `$PISTEAD_SESSION_BRANCH`). The proxy relays them to Pistead, which pushes with the workspace's [push identity](#push-access); its credential never leaves Pistead. A push of any other branch is rejected, as a Git host rejects one, and goes through `git_push` instead (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). Pinned sessions push only with `git_push`.
+- **Git reads of the workspace's repositories always work.** Git in the sandbox sends `https://` remotes, and SSH remotes of github.com, gitlab.com and bitbucket.org, to the proxy, so `git clone https://github.com/acme/app` or `git fetch` work as usual. For each request the proxy asks Pistead, which checks the session and the **session owner's own access** to the repository; the sandbox never holds a credential. On a host with a [repository cache](#repository-cache-preview), clones borrow the host's copy, so only what it lacks is fetched.
+- **In a session that clones on demand, pushes of the session's own branch work too:** `git push origin HEAD:$PISTEAD_SESSION_BRANCH` (the branch, such as `pistead/add-dark-mode-1a2b3c4d5e6f`, is in `$PISTEAD_SESSION_BRANCH`). They are pushed with the workspace's [push identity](#push-access). A push of any other branch is rejected, as a Git host rejects one, and goes through `git_push` instead (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). Pinned sessions push only with `git_push`.
+- **Where Git's data goes.** So that clones, fetches and pushes don't all go through the server, the host's proxy fetches from the Git host itself when Pistead gives it a credential for that repository; otherwise Pistead relays the request with a credential that never leaves the server:
+
+  | Request | Any host | The session owner's own host |
+  |---|---|---|
+  | Read a public repository, or download its Git LFS files | Direct, without a credential | Direct, without a credential |
+  | Read a private repository, or download its LFS files | Direct, with a token that can only read that repository, where a GitHub App serves it (the workspace's under **Push access**, or the server's for github.com); relayed otherwise | Direct, with that token or else the owner's own account (also on the server's own runner) |
+  | Push the session branch | Relayed: a push token can't be limited to one branch | Direct, with the workspace's push identity, except the owner's GitHub sign-in account and the host's Git credentials, which stay relayed |
+
+  Pistead checks the session's authority for each grant, as for a relayed request, and a host reuses a read grant for a minute at most. A host that can't reach the Git host itself falls back to the relay. The server's operator chooses with `GIT_DIRECT` (see [Configuration](#configuration)): `own-hosts` gives tokens only to session owners' own hosts, and `off` relays everything.
+- **In a session that clones on demand, `gh` and other GitHub API clients read the workspace's github.com repositories**, whatever the workspace's network access: `gh run view --log-failed`, `gh pr view`, `gh api repos/acme/app/actions/runs`. The sandbox holds no GitHub credential: `GH_TOKEN` and `GITHUB_TOKEN` hold a placeholder, and the session's proxy answers HTTPS to `api.github.com` itself and adds the credential there. That is a token of a GitHub App (the workspace's under **Push access**, or the server's on github.com), which needs to be installed on the repositories. It can only read the workspace's github.com repositories that the session owner can read, and only what `gh` reads: code, issues, pull requests, Actions runs and logs, checks, statuses, deployments, discussions and Pages. It is never the owner's own sign-in token. Pistead checks the session for each token, as for Git, and the proxy reuses one for a minute at most.
+  - **Only reads.** The proxy refuses every other method and GraphQL mutations; comments, issues, merges and pushes go through `github_comment`, `github_issue`, `github_merge` and `git_push`, with their approvals. The token couldn't make them anyway.
+  - **Other repositories** are read without a credential, and only where the workspace's network access allows `api.github.com`. So is a request that carries a token of its own instead of the placeholder.
+  - **Downloads** that GitHub redirects to its storage (Actions logs and artifacts, release assets, archives) are fetched by the proxy, without the credential.
+  - **How the proxy can see these requests:** the connector makes a certificate authority in memory when it starts, and adds it to each session's certificates. It can vouch only for `api.github.com`, by a name constraint that OpenSSL, Go, Node.js and Python check; HTTPS to every other host stays a tunnel the proxy never looks inside. In the [experimental macOS and Windows sandboxes](#experimental-sandboxes-on-macos-and-windows), Go programs such as `gh` check certificates only against the system's own store, so they can't verify it there yet; curl, Node.js and Python can.
+
+  The server's operator chooses with `SANDBOX_GITHUB_API`: `own-hosts` gives these tokens only to session owners' own hosts, and `off` gives none, so sessions reach `api.github.com` only as the network access allows, without a credential. Pinned sessions get none.
 - **Everything else follows the workspace's network access**, under **Settings → Workspaces →** the workspace **→ Network access** (owners and admins):
 
   | Access | HTTPS reaches |
@@ -318,11 +374,30 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
 
   Shell commands verify these hosts against the certificates the **host** trusts (its system store, or Node.js's bundled one where it has none, plus the connector's `NODE_EXTRA_CA_CERTS`): the connector copies them into the session when it opens, and the sandbox sees them read-only at `/etc/ssl/certs/ca-certificates.crt`, which `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` name. Nothing else of the host's `/etc` is visible. A certificate added on the host reaches a session the next time it opens.
 
-`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the repositories the proxy relays and its recent decisions. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
+- **The agent's web tools** (connector newer than 0.9.0):
+  - `web_fetch` reads one web page for the agent: the host makes the request itself, as far as this network access lets the session's sandbox reach (with **Off**, nowhere), and only over HTTPS on port 443 (an `http://` URL is read as `https://`). It never reaches addresses in the host's own networks, checks each redirect like the first request, sends no cookies or credentials, and only reads (GET). HTML comes back as text with its headings, lists, code blocks and links; JSON and other text as they are; PNG, JPEG, GIF and WebP images as images; other files are refused unread, for `curl` in `bash`. It downloads at most 5 MiB of a page, and the agent reads long pages in parts. It needs no approval, during a shared message (not a side ask), and its requests show in the session's egress status as `fetch`. It follows the workspace's network access on every host, unsandboxed ones too.
+  - `web_search` searches the web with the search provider the server's operator configured (`WEB_SEARCH`, see [Configuration](#configuration): Brave Search, Tavily or a SearXNG instance), whose key stays on the server. It works only where the workspace's owners and admins turn on **Web search** under **Network access**, off by default, because each query goes to that provider; it needs no approval, during a shared message (until an hour after it was sent), and each search is recorded in the workspace's audit log with its query.
+
+  Whatever the agent puts in a URL or a query reaches that host or the provider, so a workspace whose network access is **Open** lets a misled agent send what it read elsewhere without asking anyone, as approved or auto-approved shell commands already could. What the tools return is untrusted input, and the agent is told so with each result.
+
+`curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the workspace's repositories, the APIs its proxy answers itself and its recent decisions, with `(direct …)` on the Git requests the host made itself and each GitHub API request with the credential it was made with. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
+
+#### Experimental sandboxes on macOS and Windows
+
+macOS and native Windows can run sessions in their own operating system's sandbox instead of bubblewrap. Both are **experimental and not yet verified on real machines**: report what breaks. The design and what still has to be checked are in [docs/design/windows-sandbox.md](docs/design/windows-sandbox.md).
+
+```sh
+npx pistead@latest connect --experimental-sandbox
+```
+
+- **macOS** (Seatbelt, macOS 15 or later, with the developer tools: `xcode-select --install`): every step runs under `sandbox-exec` with a profile that denies everything by default. A session sees its own files, the system's read-only runtime, the developer tools and Homebrew, and nothing of your home folder or other sessions. Its only network is its egress proxy, on a loopback port that wants the session's credentials, so tests that start a local server can't reach it, and Go and Swift programs can't verify HTTPS (they check certificates only through a macOS service that would fetch on the host's own network, outside the proxy; curl, Git, Node and Python work). macOS has no hard memory or process limits for a group of processes, so, as on a Linux host without `--resources`, shell commands run only in the host owner's own sessions, once they allow it.
+- **Windows** (Windows 11 24H2 or later with the October 2026 update, which the connector checks by running one container, [Git for Windows](https://git-scm.com/download/win), and Microsoft's [MXC SDK](https://github.com/microsoft/mxc), which the connector tells you how to install: `npm install --prefix <state dir>\mxc @microsoft/mxc-sdk@1.0.1`): every step runs in an OS process container that may write only the session's files and reach only its egress proxy, inside a job object that limits its memory, processes and CPU (`--memory-limit`, `--process-limit`, `--cpu-limit`). Commands run in [busybox-w32](https://frippery.org/busybox/)'s shell, because Git for Windows' bash can't start in the container: save `busybox64.exe` as `%LOCALAPPDATA%\Programs\busybox\busybox.exe`, or name it in `PISTEAD_SANDBOX_SHELL`. Pistead refuses to run where MXC would fall back to its AppContainer modes, which change the permissions of your folders. Backups and moves of clone sessions don't work here yet.
+
+Neither keeps a [repository cache](#repository-cache-preview) or lends the GPU yet.
 
 #### Running without the sandbox
 
-On macOS, or Linux without bubblewrap, you can opt out of isolation. This needs only Git (on macOS, `xcode-select --install` or `brew install git`):
+On macOS, native Windows, or Linux without bubblewrap, you can opt out of isolation. This needs only Git (on macOS, `xcode-select --install` or `brew install git`; on Windows, [Git for Windows](https://git-scm.com/download/win), whose bash runs the commands):
 
 ```sh
 npx pistead@latest connect --unsafe-no-sandbox
@@ -341,7 +416,10 @@ Pistead labels such a host **Unsandboxed** to everyone who can see it.
 
 By default each session downloads its clones itself. With **Repository cache** set to **Shared** (one cache for every session on the host) or **Per owner** (a separate cache for each session owner) in the host's [configuration](#host-configuration), the connector keeps a full clone of each repository on the host and lets sessions' clones borrow from it. Only the host's owner changes it, and it applies when the connector next connects. (Connectors 0.9.0 and older take `--repo-cache` and `--repo-cache-scope owner` instead.)
 
-- `git clone` of a workspace repository first brings the host's copy up to date through Pistead, with the session owner's own account like every other read, then borrows its objects (`--reference-if-able`) instead of downloading and storing them again. A clone that doesn't come within 20 seconds goes ahead on its own; clones with `--reference`, `--shared` or `--dissociate` are left alone. A session sees a copy, read-only, only once Pistead has let its owner read the repository, again each time the session is reopened. A copy the session's first command created is visible from its next command on.
+- The host fills its copies itself, straight from GitHub (or the repository's Git host), with the credentials Git on the host would use: its credential helpers, such as `gh auth setup-git`. Without one for the Git host it reads anonymously, which only public repositories allow. Nothing is downloaded through Pistead for the cache, so it is as fast as the host's own network.
+- A session borrows from a copy only once Pistead confirms, with the session owner's own account, that they can read the repository, again every 10 minutes and each time the session is reopened. The host downloads only the branches and tags that account lists, and only after that. A session's copies are there from its first command on, empty until a clone fills them.
+- `git clone` of a workspace repository asks for the host's copy and borrows its objects (`--reference-if-able`) instead of downloading and storing them again; only what the copy lacks comes through Pistead. The first clone of a repository waits while the host downloads it, however long that takes, and says so; the download goes on if the command stops, so a clone stopped by the command time limit can just be run again. A copy filled before is brought up to date first, but a clone waits at most 10 seconds for that, then borrows it as it is. If the host can't fill a copy at all (no credential that can read the repository, say, or a listing of it that fails the same way every time), the clone says why and goes ahead without it. A copy that isn't available just now (Pistead can't confirm access, or the host's download keeps breaking off) is asked for again, and then the clone stops, to be run again, rather than downloading the repository without it. Clones with `--reference`, `--shared` or `--dissociate` are left alone.
+- Fetches into the cache that break off are tried again; what a broken-off fetch left behind is removed.
 - Inside the sandbox the cache is read-only.
 - `npx pistead@latest cache list` shows each cached repository, its size and how many sessions keep objects in it. `npx pistead@latest cache prune --older-than 30` forgets sessions idle for longer than that many days and collects what nothing reaches any more; a clone in such a session loses the objects it borrowed. Both take `--state-dir`.
 
@@ -382,6 +460,10 @@ The tools an agent can use:
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
 | `source_read` | Read an item of one of the workspace's [document sources](#document-sources), with the session owner's connection | Nothing, during a shared message |
+| `web_fetch` | Read a web page, as far as the workspace's [network access](#network-access) reaches | Nothing, during a shared message |
+| `web_search` | Search the web with the server's search provider | **Web search** on in the workspace's network access; nothing else, during a shared message |
+| `schedule` | List, create, change or delete the session's [scheduled prompts](#scheduled-prompts) | A message from the session owner; Auto-approve for auto-approved schedules |
+| `sessions` | List, read, message, start, stop and archive the workspace's other sessions, as the message's sender (see [Working across sessions](#working-across-sessions)) | A shared message; permission in **Read only** messages for changes, and to pass content between sessions whose readers differ |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments, merges and issues, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.
@@ -396,11 +478,11 @@ Select a workspace in the sidebar (or open **New session** in it):
 
 - **Describe the task**: the first message. Its first line becomes the session's title.
 - **Host**: one of your hosts, or a host shared with the workspace.
-- **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only). See [Collaborating on a session](#collaborating-on-a-session).
-- **Where it runs** (on your own host, once its [configuration](#host-configuration) allows **Sessions on the host**): **Sandbox** (the default) or **On this host**, without the sandbox. See [Sessions on the host](#sessions-on-the-host).
+- **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only, apart from the workspace's owner and admins, who [manage every session](#managing-every-session)). See [Collaborating on a session](#collaborating-on-a-session).
+- **Where it runs** (on your own host, or one whose owner granted you **Sessions on the host**, once its [configuration](#host-configuration) allows **Sessions on the host**): **Sandbox** (the default) or **On this host**, without the sandbox. See [Sessions on the host](#sessions-on-the-host).
 - The model, reasoning level and access for the first message (see [Chat options](#chat-options)). The info tips show the host, the model and the repositories the session will pin.
 
-Press Enter to start (Shift+Enter adds a line). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares it, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).
+Press Enter to start (Shift+Enter adds a line; on a phone, Enter adds a line and the send button starts it). On someone else's host, first confirm that you trust it: its operator can read the session's prompts and repository files. The session shows **Starting** while the host prepares it, then runs your message. If it fails to start (**Not started**), its owner sends a message to start it again on the same host (**Restart and send**).
 
 #### Shared messages and side asks
 
@@ -413,7 +495,7 @@ Shared messages and side asks share one queue: up to 64 waiting or running, with
 
 #### Images
 
-Paste images, such as screenshots, into the composer: into a new session's first message, a shared message or a side ask. They show as thumbnails above the text; **×** removes one. A message carries up to 4 images, and can be images alone. The browser scales each image to at most 1568 pixels on its longest edge and compresses it until the message fits what the host takes in one request; the host decodes and prepares each image again, and the model gets them after the message's text. The images stay on the host: the transcript notes each one as `[image image/png]`.
+Paste images, such as screenshots, into the composer, or pick them with its image button (on a phone, from the photo library or camera): into a new session's first message, a shared message or a side ask. They show as thumbnails above the text; **×** removes one. A message carries up to 4 images, and can be images alone. The browser scales each image to at most 1568 pixels on its longest edge and compresses it until the message fits what the host takes in one request; the host decodes and prepares each image again, and the model gets them after the message's text. The images stay on the host: the transcript notes each one as `[image image/png]`.
 
 Images need a connector that supports them on the session's host (update it with `npx pistead@latest connect`) and a model that accepts images; otherwise the composer or the send says why.
 
@@ -422,6 +504,16 @@ Images need a connector that supports them on the session's host (update it with
 While the agent works, anyone with write permission can press **Stop** (the square beside send) to stop the message running now and every message queued behind it, side asks included (connector 0.9.0 or newer). They show as stopped in the queue at once, and the transcript marks where the work stopped and who stopped it. A tool call waiting on a card ends and its card is marked interrupted; a command or push already running finishes, and its card shows the outcome. The queue line reads **Stopping...** until the host has ended the work; messages sent meanwhile wait and then run as usual. A queued message that was stopped never reaches the agent: send it again to run it. A session whose last shared message was stopped shows as **Idle**.
 
 The host can stop a message too. When the host crashes (rather than stopping its connector) five times in a row while the same message is being worked on, Pi stops resuming that work so the host doesn't keep crashing. The transcript then says the message stopped because the host crashed, the session shows as **Failed**, and the queue moves on. Send the message again to retry it.
+
+#### Copying, going back and forking
+
+Each message has actions beside who sent it: hover over it, or tab to it, in the web and Mac apps (they always show on touch screens); in the iPhone and iPad app, tap **…** under it.
+
+- **Copy message** (the copy icon): a message's text, or a reply's Markdown without its tool calls. Every message offers it, side asks too.
+- **Go back** (the history icon, needs write permission): takes the shared conversation back, for everyone, to just before one of the messages people sent, or to just after one of the agent's final replies. Everything after that point leaves the conversation, and the next message continues from there, with the model seeing only what is left. Going back to before a message puts that message's text in your chat box, if it's empty, so you can edit it and send it again. Only the conversation goes back: the worktree, its clones, commits and anything pushed stay as they are, so ask the agent to undo those if you need to. Stop the session's work first: going back waits until nothing runs or is queued. The host keeps the conversation it went back from, in its backups too, but it no longer shows.
+- **Fork** (the branch icon, the session's owner only): starts a new session of yours from the shared conversation up to the same points, on the same host, with the model and reasoning level the conversation uses now (or the model the session started on, once the host no longer offers that one or it's disabled) and the same visibility, titled **Fork: …**, and opens it; a fork from before a message puts that message in the new session's chat box. The session you forked from stays as it is. The host copies the conversation into the new session itself, so it never passes through the server. Like every new session, the fork's worktree starts empty: its agent clones the workspace's repositories again, and only what was pushed is there. If the fork fails, the new session is archived.
+
+There are no such points inside one of the agent's turns, where a tool call would lose its result, so a reply that goes on to call tools offers only **Copy** (tool call and tool result rows show their text when expanded). A host whose connector predates these actions offers only **Copy** too: update it with `npx pistead@latest connect`.
 
 #### Chat options
 
@@ -435,7 +527,7 @@ Beside the composer you can pick, for each message:
 |---|---|
 | **Read only** | Inspect files; edits, commands and commits ask the session owner first |
 | **Ask before acting** (default for everyone but the session owner) | Edits are automatic; commands, commits, pushes, GitHub comments, merges and issues need approval |
-| **Auto-approve** (session owner only; their default) | Commands, commits, pushes, GitHub comments, merges and new issues run at once as the owner, as do tools outside the agent and commands without resource limits. `host_bash` runs without asking only on the owner's own host, or one whose owner granted them automatic host commands. |
+| **Auto-approve** (session owner only; their default) | Commands, commits, pushes, GitHub comments, merges and new issues run at once as the owner, as do tools outside the agent and commands without resource limits (on someone else's host, only with automatic host commands there). `host_bash` runs without asking only on the owner's own host, or one whose owner granted them automatic host commands. |
 
 Before a session's first shared message, the owner's chat box starts on **Auto-approve** and everyone else's on **Ask before acting**; after it, each starts on the last shared message's access (Auto-approve only for the owner). Switching to **Auto-approve** asks for confirmation each time, and warns more strongly on an unsandboxed host. Under it the agent can merge any pull request of the workspace's github.com repositories that GitHub lets the owner merge, without asking; GitHub's branch protection and required checks still apply. The owner's chat box starts on **Auto-approve** without that confirmation, so their first message that would merge without asking asks for it instead, once in each browser or app (confirming it when switching counts too). Apps from before Auto-approve covered merges keep their **Auto-merge** option, and merge without asking only with it on. Automatic comments, issues and merges need a connector advertising `automaticGitHub`; older ones still ask for each. Hosts running a connector older than 0.3.0 keep each session's model and offer none of these options.
 
@@ -443,16 +535,40 @@ The **Approvals** list keeps to what people decide. Shell and host commands that
 
 #### Status, menu and panel
 
-Session lists show what each session's agent is doing: **Starting**, **Not started**, **In progress**, **Needs approval**, **Done**, **Failed**, **Idle** or **Archived**. The **Sessions** page groups sessions by workspace, with a search box, **Show archived** and **Open by ID** (for a session ID someone gave you).
+Session lists show what each session's agent is doing: **Starting**, **Not started**, **In progress**, **Needs approval**, **Done**, **Failed**, **Idle** or **Archived**. A session at rest with a [scheduled prompt](#scheduled-prompts) shows **Scheduled**, with a clock in place of its status dot. The **Sessions** page groups sessions by workspace, with a search box, **Show archived** and **Open by ID** (for a session ID someone gave you).
 
-The session's menu offers **Copy session ID** and **Open in workspace settings**, and to its owner **Rename**, **Make private** or **Make workspace-visible**, **Create backup** and **Archive** (or **Unarchive**). Archiving makes a session read-only for everyone and hides it from lists; unarchiving brings it back as it was.
+The session's menu offers **Copy session ID** and **Open in workspace settings**; to its owner and the workspace's owner and admins **Rename**, **Make private** or **Make workspace-visible** and **Archive** (or **Unarchive**); and to its owner **Create backup** too. Archiving makes a session read-only for everyone and hides it from lists; unarchiving brings it back as it was.
 
-The session panel has four tabs:
+The session panel has five tabs:
 
-- **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Backups**, **Operation request**, **Export** and **Access**.
+- **Details**: **Host**, **Repositories** (cloned on demand; a pinned session's ref, commit and folder), **People**, **Transcript** (see [Transcript size](#transcript-size)), **Connected sessions** (see [Working across sessions](#working-across-sessions)), **Backups**, **Operation request**, **Export** and **Access**.
 - **Approvals**: every approval and permission request, pending ones first.
 - **Files**: the session's worktree on its host, read-only. Open directories and preview files: text up to 256 KB, with line numbers and syntax highlighting chosen by file name (up to 128 KB), and PNG, JPEG, GIF and WebP images up to 2 MB, over a checkerboard that shows transparency; click an image to switch between fitting the panel and its actual size. SVG files show as an image, drawn without running scripts or loading anything, with their source a click away. Each path is read from the host as you open it (**Refresh** reads it again), inside the session's sandbox and confined to its worktree like the agent's file tools; symlinks that lead out of it don't open, and values that look like secrets are hidden as in the transcript. It takes the session collaborator role (`write`), since collaborators can already have the agent read any file; viewers and share links don't get it. It isn't offered on archived sessions, and needs a host whose connector is new enough to advertise it.
+- **Schedules**: the session's [scheduled prompts](#scheduled-prompts).
 - **Activity**: the session's audit log, newest 200 entries.
+
+#### Scheduled prompts
+
+A scheduled prompt wakes the session's agent on a schedule: the server sends it a message, as the session's owner, as if they typed it in the chat box. Use it for recurring work such as a nightly test run or a weekly dependency report. The session owner manages them in the panel's **Schedules** tab (**New**, **Pause**/**Resume**, **Run now**, **Edit**, **Delete**), or asks the agent in the chat ("every weekday at 9, check the nightly build"), and everyone who can view the session sees them.
+
+- **When**: a five-field cron expression (minute, hour, day of month, month, day of week, as in crontab, with ranges, steps, lists and names such as `*/30 8-18 * * mon-fri`, or `@hourly`, `@daily`, `@weekly`, `@monthly`), read in an IANA time zone (the browser's by default). Runs are at least 5 minutes apart. The form shows the next three runs as you type.
+- **Access**: **Ask for approval** (the default, as in the chat box), **Read-only** or the owner's **Auto-approve**, which runs commands without anyone watching. Read-only and auto-approve need a host whose connector takes chat options.
+- **Busy sessions**: a run that comes while the agent is working or waiting for an approval is skipped, not queued, and the schedule shows why. Runs missed while the server or host was offline, or the session archived, aren't caught up: the next check sends one and moves on. The session's host must be online for its message to run.
+- **From the chat**: the agent's `schedule` tool lists, creates, changes and deletes the session's schedules (connector newer than 0.9.0; in sessions started before it, the agent asks the owner's permission the first time). Only the session owner's messages can use it, since every run is the owner's message; a collaborator's are refused. A schedule with **Auto-approve** access is created, or changed and left so, only from a message the owner sent with Auto-approve, so a message never leaves behind a schedule with more access than it had itself; any of the owner's messages may pause one, lower its access or delete it.
+- Each run is audited as the owner's `session.submit` with the schedule's ID; creating, changing and deleting schedules are audited too, marked with the tool call when the agent did it. A session keeps at most 20 schedules, and the server checks for due ones every 30 seconds.
+
+#### Working across sessions
+
+A session's agent can work with the workspace's other sessions through its `sessions` tool: ask you which sessions exist and what they are doing, read another session's latest transcript and pending approvals, ask it a side question, send its agent a message, start a new session for a sub-task, wait for or be notified of the outcome, and stop or archive sessions. Use it to split work between sessions ("start a session to update the docs while you fix the tests, and tell me when both are done") or to consult a session that already knows a part of the code.
+
+- **As the sender, never more**: every action runs as the person whose message the agent is working on, with exactly their permissions in the other session, as if they had acted themselves. A collaborator's message reaches only the sessions the collaborator can, and a session the agent starts is the sender's own, on their own host or this session's host when it is theirs. Sessions of other workspaces aren't reachable.
+- **Access is capped by the message**: a **Read only** message lists, reads and asks, and changes another session (send, start, stop, archive) only once the session owner allows it on a [permission request](#permission-requests). A message sent elsewhere asks for approval by default, or is read-only; only a message the session owner sent with **Auto-approve** sends an auto-approved one, and only to a session they own.
+- **Approvals stay where they are**: commands that a message runs in another session wait for that session's own approval cards, decided by people there; the agent can see that cards are waiting but never decide them.
+- **Who can see what**: content passes between two sessions only when the same people can read both (a share link counts as everyone). Reading a session, or being notified of its reply, that someone reading this session can't open, or sending this session's content where people who can't read this session would see it, first asks the session owner with a permission request (**Allow once** or **Allow for this session**). A session started by the agent is never more visible than the one that started it: a private session starts only private ones.
+- **Messages say where they come from**: each message an agent sends starts with a line naming the session it comes from, its sender and its hop, and the server records it. The **Connected sessions** section of the panel shows the session that started this one, the sessions it started, and the latest messages either way, with their senders (only sessions you can open are named). Lists show sessions started by another session indented under it.
+- **Busy sessions and notifications**: a message to a session that is working or waiting for an approval is refused, not queued (side asks still go). With `notify`, the server sends the outcome back as a new message once the other session finished, as the same sender, when this session is idle; it gives up after 24 hours. The agent can also `wait` for an outcome, for up to 30 minutes.
+- **Limits**: a message that came from another session is one hop further down a chain; at 3 hops an agent reads and lists but sends nothing further, and no message goes back to a session it came through (the notification answers it instead). One message sends at most 10 messages to other sessions, and a session starts at most 20 sessions.
+- Every action is audited in both sessions: `session.cross_session.sent`, `.created`, `.stopped` and `.archived` in the sending session, and the usual `session.submit`, `session.stopped` or `session.archived` in the other, marked with the message. The tool needs a connector new enough to advertise it; in sessions started before it, the agent asks the owner's permission the first time. See [docs/design/cross-session.md](docs/design/cross-session.md).
 
 ### Approvals and permission requests
 
@@ -463,13 +579,14 @@ Commands, pushes, GitHub comments, merges and issues, and host commands each nee
 | Operation | Who can decide |
 |---|---|
 | Commands, commits, pushes, GitHub comments, merges | Anyone with approve permission on the session (the owner always has it) |
-| Host commands | Only the host's owner, who also needs approve permission on the session |
+| Commands without [resource limits](#the-sandbox) in a session on someone else's host | The host's owner, or a member they [granted host commands](#host-admins-and-host-command-grants), either with approve permission on the session |
+| Host commands | The host's owner, in any session on their host they can see (connector newer than 0.9.0; with an older one they also need approve permission on the session), or a member they [granted host commands](#host-admins-and-host-command-grants) who has approve permission on the session |
 
 The agent's tool call waits for the decision, and its message waits with it (connector 0.9.0 or newer). **Approve** runs the operation at once: its output appears on the card and goes back to the agent, which carries on. Commands, pushes and host commands run in the background (connector newer than 0.9.0 for commands), so the card shows them running until they end. After **Deny**, the agent learns the operation was denied. The card can be decided until an hour after its message was sent; a card whose call stops first (the message is stopped, the session restarts, or the hour passes) is marked interrupted and can no longer run. An operation you request yourself, outside a message, can be approved once the session's queue is idle. Approving also checks that whoever requested it still has write permission. You can request an operation yourself under **Details → Operation request** (**Bash command** or **GitHub comment**), with write permission; it needs approval like the agent's.
 
 #### Permission requests
 
-When a tool call needs more than the session allows (a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a host without resource limits), the agent asks instead of failing, and the session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. Only the session owner decides these, and only a host's owner can let commands run without resource limits, in their own sessions.
+When a tool call needs more than the session allows (a tool its agent doesn't include, a change in a **Read only** message, a shell command on a host without resource limits, or passing content between this session and another one [whose readers differ](#working-across-sessions)), the agent asks instead of failing, and the session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. Only the session owner decides these, and only a host's owner, or a member they granted host commands there, can let commands run without resource limits, in their own sessions.
 
 The call can wait for the answer until an hour after its message was sent, and the session's queue waits with it. **Allow once** lets that call use the tool, but what it does still needs its own approval; the permission then shows on that operation's card instead of a card of its own. **Allow for this session** also approves what the tool does in the session owner's later messages, as **Auto-approve** would: its commands and pushes run without asking, while GitHub comments, merges and issues still wait for a decision (they run automatically only under **Auto-approve** itself), and other people's messages still ask for approval. Host commands (`host_bash`) can only be allowed once, so each one asks again. Messages the session owner sends with **Auto-approve** raise no permission requests. A session restored from a backup asks again.
 
@@ -505,23 +622,32 @@ sequenceDiagram
 
 #### Visibility and session roles
 
-- **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. Collaborators and admins can also send them messages. **Private** sessions only by the owner and people with a grant. Only the owner changes visibility; making a session private keeps explicit grants but can't recall what was already seen.
-- Session roles (**Details → People → Session roles**) give a workspace member one of four tiers of access to one session, named after the workspace roles. Each tier includes everything in the tiers below it. You can only give a tier whose permissions you hold, and the owner's own access can't be changed. A workspace viewer can only be a session viewer. Removing someone's session role doesn't take away what their workspace role gives them on a workspace-visible session (viewing, and for collaborators and admins messaging); making the session private does.
+- **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. Collaborators and admins can also send them messages. **Private** sessions only by the owner, the workspace's owner and admins, and people with a grant. The owner, and the workspace's owner and admins, change visibility; making a session private keeps explicit grants but can't recall what was already seen.
+- Session roles (**Details → People → Session roles**) give a workspace member one of four tiers of access to one session, named after the workspace roles. Each tier includes everything in the tiers below it. You can only give a tier whose permissions you hold, and the owner's own access can't be changed. A workspace viewer can only be a session viewer. Removing someone's session role doesn't take away what their workspace role gives them on a workspace-visible session (viewing, and for collaborators and admins messaging); making the session private does, except for the workspace's owner and admins, who manage every session.
 
 | Session role | Permissions | Allows |
 |---|---|---|
 | **Viewer** | `read` | Viewing the session, its side asks, approvals and activity |
 | **Member** | `read`, `ask` | Also sending side asks |
 | **Collaborator** | `read`, `ask`, `write` | Also sending shared messages, stopping work and requesting operations |
-| **Admin** | `read`, `ask`, `write`, `approve`, `manage` | Also deciding approvals (host commands need the host's owner; permission requests, the session owner) and managing who has a session role |
+| **Admin** | `read`, `ask`, `write`, `approve`, `manage` | Also deciding approvals (host commands also need a host command grant, and the host's owner decides them without this role; permission requests need the session owner) and managing who has a session role |
 
 The API takes a tier (`POST /api/sessions/:id/grants` with `{ userId, role }`) or, as before, an explicit permission list (`{ userId, permissions }`). A grant that matches no tier, such as one made before tiers existed, shows as **Custom** until someone chooses a tier for it.
 
-Only the session's owner can rename, archive or restart it, change its visibility or share link, back it up, restore or export it, use **Auto-approve**, and decide permission requests.
+Only the session's owner can restart it, create its share link, back it up, restore, move or export it, use **Auto-approve**, schedule prompts, and decide permission requests. Its owner and the workspace's owner and admins rename, archive and unarchive it, change its visibility and tool output, and turn off its share link (see [Managing every session](#managing-every-session)).
 
 #### Share links
 
-The owner can share a session by link (**Details → People → Create link**). Anyone who has the link can follow the shared conversation read-only, without signing in, with the session's title and the owner's display name. They see nothing else: no side asks, approvals, senders, host, workspace or repositories. **Turn off** stops the link at once, and turning sharing on again issues a new one; archived sessions can't get a new link. The token is carried only in the URL fragment (`#/shared/…`) and an `X-Share-Token` header, never in a request path, and the link pages read only `GET /api/shared` and `GET /api/shared/view`.
+The owner can share a session by link (**Details → People → Create link**). Anyone who has the link can follow the shared conversation read-only, without signing in, with the session's title and the owner's display name. They see nothing else: no side asks, approvals, senders, host, workspace or repositories. **Turn off** (the owner, or the workspace's owner or an admin) stops the link at once, and turning sharing on again issues a new one; archived sessions can't get a new link. The token is carried only in the URL fragment (`#/shared/…`) and an `X-Share-Token` header, never in a request path, and the link pages read only `GET /api/shared` and `GET /api/shared/view`.
+
+#### Transcript size
+
+A session's transcript comes from its host, which always sends Pistead the whole conversation, compressed. Two settings make what reaches each viewer smaller. Both change only what Pistead shows, so they work with every connector version:
+
+- **Full tool output** (**Details → Transcript**, the session's owner, or the workspace's owner or an admin; `PATCH /api/sessions/:id` with `{"toolOutput": "brief"}` or `"full"`) is on by default. A workspace's owners and admins choose what new sessions there start with (**Settings → Workspaces →** the workspace **→ Transcripts → Full tool output**; `PUT /api/workspaces/:id/transcripts` with `{"toolOutput": "brief"}` or `"full"`); changing it leaves existing sessions as they are, and a session moved to another host or restored from a backup keeps its source's. Turned off, each tool result shows only its first line (up to 200 characters), on its row in the transcript. Long tool calls, such as a file the agent writes, are cut to their first 200 characters. Tool output is most of a typical transcript, so long sessions then load roughly half as much. It applies to everyone viewing the session, its share link included. A shortened row says how many lines and characters the full output has; the host keeps all of it, and the agent still sees all of it. Secrets are hidden before anything is shortened.
+- **Latest messages first** (**Settings → Workspaces →** the workspace **→ Transcripts**, owners and admins; `PUT /api/workspaces/:id/transcripts` with `{"paging": true}`; either setting may be sent alone, and one left out keeps its value) is off by default. Turned on, a session opens with only the newest 50 entries of each conversation. Earlier ones load 50 at a time as you scroll up, or with **Show earlier messages** at the top (`GET /api/sessions/:id/entries?conversation=…&before=…&limit=…`, up to 200). Entries you've already seen stay in place while new ones arrive. Your browser's find on the page only searches what has loaded. Share links aren't paged: they show the whole shared conversation.
+
+Open sessions pick up either change within a few seconds.
 
 #### Hidden secrets
 
@@ -536,6 +662,7 @@ Agents commit with Git itself, as the session owner's Git identity, and push com
 - The approval shows the repository, the clone's directory if any, the branch, the tag if any and the exact commit.
 - Pushes are fast-forward only and never forced; a branch that moved elsewhere is refused.
 - The agent can also ask for a pull request, which Pistead opens as the session owner with their connected account. Session lists and the session header then show the session's newest pull request with its state: **Draft**, **Open**, **CI failed** (a check run or commit status of its head failed), **Changes requested** (a reviewer's latest review asks for changes), **Merged** or **Closed**. Pistead reads the state in the background with the session owner's GitHub account, about every two minutes (every 30 minutes for archived sessions), and stops once the pull request is merged or closed. Only github.com pull requests show a state so far.
+- Sessions that run directly on a host push and open pull requests with the host's own Git and credentials (`gh pr create`, say), so Pistead doesn't see those pull requests open. Instead, once the agent stops, the host reports which branches the session's clones of the workspace's github.com repositories have checked out (not their default branch). Pistead then looks up each branch's newest pull request opened since the session started, in the repository itself rather than a fork, with the session owner's GitHub account, and shows it and its state in the same way. A pull request found this way stays with the session after its clone switches away from the branch.
 - Before each push, Pistead checks with the session owner's own account that they may push to the repository and, where the Git host reports it, to that branch; GitHub protected branches are refused. For a tag, it checks that they may push to the repository (on Azure DevOps, that they may create that tag); tag rules on the Git host (GitHub rulesets, GitLab and Gitea protected tags) apply to the push identity's push, and its bypass list too. Owners and admins can forbid pushes to a repository's default branch by clearing **Allow agent pushes to the default branch**.
 - The connector holds the push credential in memory only and talks to the Git host directly; the sandbox never sees it.
 
@@ -575,7 +702,7 @@ Comments, issues and merges wait for a human decision, unless the session owner 
 
 ### Host commands
 
-Host commands need connector 0.8.0 or newer. When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the approval of the **host owner**, or of a member they [granted host commands](#host-admins-and-host-command-grants); on a shared host, the approver also needs approve permission on the session. The session owner's **Auto-approve** skips this only on their own host, or where they hold an automatic host command grant.
+Host commands need connector 0.8.0 or newer. When a task needs an SDK installed on the host or network access, ask the agent to use `host_bash`, for example for `dotnet --info`; ordinary `bash` stays in the sandbox, with only the workspace's [network access](#network-access). Each exact command and timeout (five minutes by default, `timeout_seconds` up to 3600) needs the approval of the **host owner**, or of a member they [granted host commands](#host-admins-and-host-command-grants) who also has approve permission on the session. The command runs as the host's OS user, so the host owner decides it in any session on their host they can see, without a session role (connector newer than 0.9.0; an older one also asks them for approve permission on the session). The session owner's **Auto-approve** skips this only on their own host, or where they hold an automatic host command grant.
 
 Host commands run **outside the sandbox, as the connector's OS user**, in the session's worktree: they can read and change host files and credentials, use the network, and run without CPU, memory, process or disk limits. The agent can change the worktree's files and Git configuration, so builds, package scripts and Git hooks there can run its code on the host, even for a command as harmless-looking as `git status`. Approve a host command only if you would run it yourself in that directory. Commands get the host's `PATH` and `HOME`, not the connector's whole environment, and Bash starts without shell profiles.
 
@@ -592,7 +719,7 @@ A session's conversation and files live on its host. A backup copies them to the
 Exports are JSON records without secrets; a session's conversation is in its backups:
 
 - Session owners export a session (details, people, approvals, pushes, backup list and activity) under **Details → Export**.
-- Workspace owners and admins export a workspace (settings, members, models, published agents, repositories, push access, its session database connection and activity, with their own sessions in full and the records of the other sessions they can view) under **Settings → Workspaces → Data export**. Other members' private sessions are left out; their owners can export them.
+- Workspace owners and admins export a workspace (settings, members, models, published agents, repositories, push access, its session database connection and activity, with their own sessions in full and the records of every other session there, which they manage) under **Settings → Workspaces → Data export**. The rest of another member's session (its people, approvals, pushes and activity) is in its owner's export of it.
 
 ### Moving a session to another host
 
@@ -607,9 +734,27 @@ While both hosts are connected, a session's owner can move it to a model on anot
 ### iPhone, iPad and Mac apps
 
 - **iPhone and iPad** ([`apps/mobile`](apps/mobile/README.md), Expo): your sessions grouped by workspace with their status; a session opens live with its transcript, queue, pending approvals to decide, and the chat box for shared messages and side asks; new sessions start from the app. It isn't on the App Store or TestFlight yet: build it from source as a development build.
-- **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal. Pair it with a pairing ID and code from **Settings → Hosts**. It shares the command-line connector's state, so a Mac paired with `pistead connect` is adopted as is, and only one of the two can run at a time. macOS has no sandbox, so starting the host asks for the same consent as `--unsafe-no-sandbox`.
+- **macOS** ([`apps/desktop`](apps/desktop/README.md), Electron): Pistead in its own window, plus **This Mac**, which runs the `pistead` connector on the Mac without a terminal. Pair it with a pairing ID and code from **Settings → Hosts**. It shares the command-line connector's state, so a Mac paired with `pistead connect` is adopted as is, and only one of the two can run at a time. macOS has no sandbox, so starting the host asks for the same consent as `--unsafe-no-sandbox`. **Settings → Pistead on this computer** runs Pistead itself on the Mac instead of using a server (see [Running Pistead on your own computer](#running-pistead-on-your-own-computer)).
 
-The apps sign in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. Each app sign-in lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out.
+The iPhone and iPad app signs in with GitHub through the server's GitHub OAuth app; nothing else needs configuring. It doesn't offer username and password sign-in yet. Each of its sign-ins lasts 30 days and appears under **Settings → Profile → Signed-in apps**, where you can sign it out. The Mac app shows the server's own sign-in page, so it signs in as a browser does: with GitHub or, where the server allows it, a username and password, for 7 days. Neither app opens invite links (the Mac app sends links to your default browser): where `SIGNUP=invite`, a new person creates their account through the link in a browser, then signs in on the app.
+
+## Running Pistead on your own computer
+
+For one person, Pistead can run entirely on their own computer: the server, the web app and the computer itself as the host that runs the sessions. Nothing is deployed and no account at a Pistead service is needed; it is the same server, so everything in [Using Pistead](#using-pistead) works, for its one user.
+
+```sh
+npx pistead@latest serve
+```
+
+Or, in the Mac app, **Settings → Pistead on this computer → Run on This Computer**: the app runs the same server with the same data, and its Pistead window shows it while it runs.
+
+- **Sign-in** is with GitHub, through a GitHub OAuth app of your own, registered once at <https://github.com/settings/applications/new> with the homepage `http://127.0.0.1` and the callback URL `http://127.0.0.1/api/auth/github/callback` (GitHub accepts it on any port of 127.0.0.1). The first `pistead serve` asks for its client ID and, at a hidden prompt, its secret (or takes `--github-client-id` with the secret in `PISTEAD_GITHUB_CLIENT_SECRET`); the app has fields for them.
+- **One owner.** The first run prints a sign-in link (the app opens it in its window). The GitHub account that signs in through it becomes the owner, and from then on the only account that can sign in: any other is refused before its GitHub token is stored. Keep the link private until you have used it.
+- **This computer only.** It listens on `http://127.0.0.1:7878` (`--port` changes it), so nothing else on the network reaches it.
+- **This computer is the host.** Once the owner has signed in, the computer pairs itself with the server, with no code to copy, and appears under **Settings → Hosts**. It runs sessions as `pistead connect` would: in the bubblewrap sandbox on Linux with its prerequisites, otherwise only with `--unsafe-no-sandbox` (the app asks for the same consent). `--no-host` serves without it.
+- **Its data** (the SQLite database, session backups, the secrets it was set up with, and this computer's pairing) is in `~/.local/share/pistead/server` (`--state-dir` chooses another), private to your user. It is separate from `pistead connect`'s, so a computer connected to a team's server stays connected. One Pistead at a time runs from it: `pistead serve` and the Mac app share it, and whichever starts second says the other is running.
+
+Run `npx pistead serve --help` for every option. The server is the one [Running the server](#running-the-server) describes, started with `LOCAL_MODE` (see [Configuration](#configuration)).
 
 ## Running the server
 
@@ -624,14 +769,18 @@ docker compose up -d
 
 The image builds the web app and the bundled server and runs them as a non-root user. The server listens on port 8787 and keeps its SQLite database in the `pistead-data` volume; it stores no session backups unless you set `STORAGE_URL` (see [Database and backup storage](#database-and-backup-storage)). The image sets `WORKSPACE_DATABASES=true`, so workspace owners can keep their sessions' backups in a Postgres database of their own (see [Workspace session databases](#workspace-session-databases)); set `WORKSPACE_DATABASES=false` in `.env` to turn that off. `GET /api/health` reports which providers are configured, and the image's health check uses it. Migrations run automatically at start-up: to upgrade, update the source and run `docker compose up -d --build`.
 
+> **Upgrading to server 0.16.0:** its first start rebuilds the `users` table of a SQLite database (to allow password accounts), keeping every row and checking every reference to it before committing; back up the `pistead-data` volume first, as before any upgrade. Postgres changes the table in place. Nothing else changes until you set `PASSWORD_AUTH` or `SIGNUP`: unset, sign-in and GitHub sign-up work as before.
+
 Each server release (`server-v*` tag) is published as `ghcr.io/opencara/pistead` (`latest`, `X.Y` and `X.Y.Z`, for linux/amd64 and linux/arm64); to use it instead of building, set `image: ghcr.io/opencara/pistead:latest` and drop `build: .` in `docker-compose.yml`.
 
 Put a reverse proxy with TLS in front of it (Caddy, nginx, Traefik, a cloud load balancer); the app serves plain HTTP. If the proxy sets `X-Forwarded-Proto`/`X-Forwarded-Host`, set `TRUST_PROXY=true`. The proxy must pass WebSocket upgrades on `/api/connectors/socket`, accept request bodies of 32 MiB for dump imports, and route `/.well-known/` to Pistead if you use `OIDC_SIGNING_KEY`. The server gzips its responses and session event streams itself, and compresses the connector WebSocket for connectors that offer it, so the proxy needs no compression of its own.
 
-### GitHub sign-in and apps
+### Sign-in and GitHub apps
 
-- **Sign-in** needs a GitHub OAuth app whose callback URL is `<APP_ORIGIN>/api/auth/github/callback`; put its id and secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. Without it, the sign-in page says GitHub sign-in isn't configured. The same app resets session owners' GitHub tokens after pushes that used them.
-- **github.com pushes** can use an operator GitHub App with Repository contents read & write: set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_PRIVATE_KEY`. Without it, each workspace adds its own GitHub App under **Push access**.
+- **GitHub sign-in** needs a GitHub OAuth app whose callback URL is `<APP_ORIGIN>/api/auth/github/callback`; put its id and secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The same app resets session owners' GitHub tokens after pushes that used them. github.com repositories need it: only accounts that sign in with GitHub can read them.
+- **Username and password sign-in** is on with `PASSWORD_AUTH=true` (see [Username and password](#username-and-password)), next to GitHub or instead of it. Create the first administrator with `--create-admin` (see [Administration](#administration)). With neither, the sign-in page says GitHub sign-in isn't configured.
+- **Who can create an account** is `SIGNUP`'s choice (see [Who can create an account](#who-can-create-an-account)). Unset, anyone with a GitHub account can sign up, as before; on a server the internet can reach, `SIGNUP=invite` limits new accounts to people holding a workspace's invite link.
+- **github.com pushes** can use an operator GitHub App with Repository contents read & write: set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_PRIVATE_KEY`. Without it, each workspace adds its own GitHub App under **Push access**. Either app also gives hosts read-only tokens for single repositories, so that sessions' clones of private repositories don't go through the server.
 - **Azure DevOps and Forgejo push identities** trust Pistead as an OIDC issuer at `APP_ORIGIN` (`/.well-known/openid-configuration`, `/.well-known/jwks.json`): set `OIDC_SIGNING_KEY` to an RSA key (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072`).
 
 ### Configuration
@@ -640,10 +789,10 @@ Settings are environment variables, read once at start-up; secrets are never log
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `APP_ORIGIN` | required | Public origin of the server (scheme and host, no path); HTTPS outside local test mode |
+| `APP_ORIGIN` | required | Public origin of the server (scheme and host, no path); HTTPS outside local test mode and `LOCAL_MODE` |
 | `SESSION_SECRET` | required | Random string of at least 32 characters |
 | `VAULT_KEY` | required | Base64url 32-byte key that encrypts stored tokens and secrets; keep it stable, since secrets stored with one key can't be read with another |
-| `HOST`, `PORT` | `0.0.0.0`, `8787` | Listening address |
+| `HOST`, `PORT` | `0.0.0.0` (`127.0.0.1` with `LOCAL_MODE`), `8787` | Listening address |
 | `TRUST_PROXY` | `false` | Honor `X-Forwarded-Proto`/`X-Forwarded-Host` from a trusted proxy |
 | `STATIC_DIR` | `dist/web` | Built web app |
 | `DATABASE_URL` | `sqlite:///data/pistead.sqlite` | Control-plane database |
@@ -656,13 +805,28 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `GOOGLE_CLIENT_ID`/`_SECRET`, `NOTION_CLIENT_ID`/`_SECRET`, `DROPBOX_CLIENT_ID`/`_SECRET`, `MICROSOFT_CLIENT_ID`/`_SECRET` (and `MICROSOFT_TENANT`), `TENCENT_DOCS_CLIENT_ID`/`_SECRET` | none | OAuth apps that let members connect [document sources](#document-sources) by signing in |
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | none | Operator GitHub App for github.com pushes (PEM as one line with `\n` escapes) |
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
+| `GIT_DIRECT` | `on` | Where sessions' Git data goes (see [Network access](#network-access)): `on` lets hosts fetch from Git hosts themselves with credentials limited to a repository, `own-hosts` gives credentials only to session owners' own hosts, `off` relays every Git request through the server |
+| `SANDBOX_GITHUB_API` | `on` | Whether sessions' `gh` and other GitHub API clients read the workspace's github.com repositories (see [Network access](#network-access)): `on` gives every host running a session a read-only GitHub App token for them, which its egress proxy adds, `own-hosts` only session owners' own hosts, `off` none |
+| `WEB_SEARCH` | `off` | The search provider of the agent's `web_search` tool (see [Network access](#network-access)): `brave` ([Brave Search API](https://brave.com/search/api/)), `tavily` ([Tavily](https://tavily.com)) or `searxng` (a [SearXNG](https://docs.searxng.org) instance with its JSON output turned on); `off` offers no search. Workspaces still turn web search on themselves |
+| `WEB_SEARCH_API_KEY`, `WEB_SEARCH_URL` | none | The provider's API key (Brave, Tavily; for SearXNG, an optional bearer token); the SearXNG instance's origin, such as `https://search.example.com` |
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |
+| `PASSWORD_AUTH` | off | `true` offers sign-in with a username and password (see [Username and password](#username-and-password)); not with `LOCAL_MODE` |
+| `SIGNUP` | GitHub `open`, passwords `invite` | Who can create an account, with GitHub and with a password: `open` (anyone who reaches the server), `invite` (only through a workspace's invite link) or `off` (only the operator's: `ADMIN_USER_IDS` and `--create-admin`); see [Who can create an account](#who-can-create-an-account). Not for `LOCAL_MODE`, which admits only its owner |
+| `LOCAL_MODE`, `LOCAL_CLAIM_SECRET` | off | A server for one person on their own computer, as `pistead serve` runs it: plain HTTP on loopback only, and only the GitHub account that signs in through `/api/auth/local/claim?token=LOCAL_CLAIM_SECRET` first (a base64url 32-byte value) can sign in |
 
 ### Administration
 
-The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890`); each person finds theirs under **Settings → Profile**. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
+The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890,password:alice`); each person finds theirs under **Settings → Profile**. A GitHub user ID is `github:` and the numeric ID GitHub gives the account, which `https://api.github.com/users/<login>` shows as `id` before anyone signs in. A password account's is `password:` and its username. Nobody can sign up in the app as an account `ADMIN_USER_IDS` lists, so listing one reserves the name; the operator creates it from the server's command line instead, with the password typed at a hidden prompt (or piped in on the first line of standard input, never as an argument):
+
+```sh
+# ADMIN_USER_IDS=password:admin and PASSWORD_AUTH=true, in the server's environment
+node dist/server/main.js --create-admin admin
+docker compose exec pistead node dist/server/main.js --create-admin admin   # under Docker
+```
+
+That needs no sign-in first and no restart afterwards, and a fresh server with `SIGNUP=invite` or `off` starts this way (or with a GitHub administrator, who can always sign up): the administrator signs in, creates a workspace and shares its invite link. `--reset-password USERNAME` sets a new password for any password account the same way, clears its failed sign-ins and signs it out everywhere. Both are recorded in the audit table, with no actor. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
 
 - **Overview** counts accounts, workspaces, hosts (and how many are online) and sessions.
 - **Accounts**, **Workspaces** and **Hosts** list each one with its owner and how many members, repositories, hosts and sessions it has. They never show session titles, prompts, repository names, models, environment values or credentials.
@@ -769,9 +933,9 @@ await fetch("/api/auth/test", { method: "POST", headers: { Authorization: "Beare
 
 ## Layout
 
-- `apps/server`: the control plane (Hono on Node). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/connector-hub.ts` the WebSocket relay to connected hosts.
+- `apps/server`: the control plane (Hono on Node); `src/local` runs it on one person's own computer (`pistead serve` and the desktop app). `src/db` holds the database providers and the SQLite→Postgres dialect translation; `src/storage` the backup storage providers; `src/workspace-databases` the owner-connected session databases; `src/git` the Git providers and accounts; `src/push` push identities and credentials; `src/data-export.ts` the session and workspace exports; `src/admin.ts` the server administration API; `src/auth.ts` GitHub and session sign-in and `src/password-auth.ts` password accounts, with `src/password-accounts-cli.ts` for `--create-admin` and `--reset-password`; `src/connector-hub.ts` the WebSocket relay to connected hosts.
 - `apps/web`: the React UI.
 - `apps/mobile`: the iPhone and iPad app (Expo; Android later). `apps/desktop`: the macOS app (Electron; Linux and Windows later).
-- `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` and bundled into the desktop app.
+- `apps/runner`: the connector runtime that runs on each host, published as the `pistead` CLI from `packages/cli` (with the server, for `pistead serve`) and bundled into the desktop app.
 - `packages/shared`: types and policy shared by all of the above. `packages/client`: the API client, live session updates and chat-option rules shared by the web and the apps.
 - `docs/design`: design notes, such as the [repository cache](docs/design/repository-cache.md).

@@ -13,6 +13,26 @@ export type RepositoryCacheMode = (typeof repositoryCacheModes)[number];
 export const gpuKinds = ["dxg", "render"] as const;
 export type GpuKind = (typeof gpuKinds)[number];
 
+/** A model's compaction token counts, or the whole host's; each one left out keeps the host's Pi setting. */
+export interface CompactionTokens {
+  /**
+   * The context left free for compaction: a conversation is summarized once it is within this many tokens of the model's
+   * context window, and Pi gives the summary up to 80% of it.
+   */
+  reserveTokens?: number;
+  /** The most recent context kept word for word, unsummarized, in tokens. */
+  keepRecentTokens?: number;
+}
+
+/**
+ * When a long conversation is summarized, as the host's owner and admins set it in Pistead: for every model, and for
+ * models by exact `provider/modelId`. Each count it sets replaces the one in Pi's settings.json on the host; the counts
+ * it leaves out keep that file's, or the defaults (see the runner's hostCompaction).
+ */
+export interface HostCompaction extends CompactionTokens {
+  modelOverrides?: Record<string, CompactionTokens>;
+}
+
 export interface HostConfig {
   /**
    * The longest a shell command in this host's sessions runs, in seconds. Commands longer than the default also get
@@ -32,18 +52,65 @@ export interface HostConfig {
    */
   repositoryCache: RepositoryCacheMode;
   /**
-   * The host's owner may start sessions that run directly on the host's own environment, without the sandbox
-   * (SessionRecord.hostEnvironment): their commands run as the connector's OS user, with its files, credentials,
+   * The host's owner, and members they granted that (HostCommandGrant.hostSessions), may start sessions that run
+   * directly on the host's own environment, without the sandbox (SessionRecord.hostEnvironment): their commands run as the connector's OS user, with its files, credentials,
    * network and GPU. Turning it off stops those sessions' commands at once.
    */
   hostSessions: boolean;
+  /** Compaction token counts over the host's Pi settings; empty keeps those. Sessions pick a change up within a minute (the connector's refresh), with their next message. */
+  compaction: HostCompaction;
 }
 
-export const hostConfigLimits = Object.freeze({ commandTimeoutSeconds: Object.freeze({ min: 30, max: 3600 }) });
+export const hostConfigLimits = Object.freeze({
+  commandTimeoutSeconds: Object.freeze({ min: 30, max: 3600 }),
+  /** Each compaction token count, and the number of models with their own (a host offers at most 200). */
+  compactionTokens: Object.freeze({ min: 0, max: 10_000_000 }),
+  compactionModels: 200,
+});
 
 export const defaultHostConfig: Readonly<HostConfig> = Object.freeze({
-  commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false,
+  commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: "off", hostSessions: false, compaction: Object.freeze({}),
 });
+
+const compactionTokenKeys = ["reserveTokens", "keepRecentTokens"] as const;
+/** A model as Pi's compaction overrides name it: `provider/modelId`, as the host advertises them (80 and 200 characters at most). */
+const COMPACTION_MODEL = /^[^/\s]{1,80}\/\S{1,200}$/;
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value)
+  && Object.getPrototypeOf(value) === Object.prototype;
+
+function compactionTokens(value: unknown): CompactionTokens {
+  if (!isPlainObject(value) || Object.keys(value).some(key => !(compactionTokenKeys as readonly string[]).includes(key))) {
+    throw new Error("Invalid compaction setting");
+  }
+  const { min, max } = hostConfigLimits.compactionTokens;
+  const tokens: CompactionTokens = {};
+  // In a fixed order, so equal settings are equal JSON.
+  for (const key of compactionTokenKeys) {
+    const count = value[key];
+    if (count === undefined) continue;
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count < min || count > max) {
+      throw new Error(`Compaction token counts are whole numbers from ${min} to ${max.toLocaleString("en-US")}`);
+    }
+    tokens[key] = count;
+  }
+  return tokens;
+}
+
+/** A compaction setting: token counts for every model and per model, each a whole number in bounds; a model with none is left out. */
+export function parseHostCompaction(value: unknown): HostCompaction {
+  if (!isPlainObject(value)) throw new Error("Invalid compaction setting");
+  const { modelOverrides, ...overall } = value;
+  const compaction: HostCompaction = compactionTokens(overall);
+  if (modelOverrides === undefined) return compaction;
+  if (!isPlainObject(modelOverrides)) throw new Error("Invalid compaction setting");
+  const models = Object.keys(modelOverrides);
+  if (models.length > hostConfigLimits.compactionModels) throw new Error(`Compaction is set for at most ${hostConfigLimits.compactionModels} models`);
+  if (models.some(model => !COMPACTION_MODEL.test(model))) throw new Error("Compaction names each model as provider/modelId");
+  const overrides = Object.fromEntries(models.sort().map(model => [model, compactionTokens(modelOverrides[model])])
+    .filter(([, tokens]) => Object.keys(tokens as CompactionTokens).length));
+  return Object.keys(overrides).length ? { ...compaction, modelOverrides: overrides } : compaction;
+}
 
 /**
  * Only the host's owner changes these: they decide whose Git credentials the host uses, and whether anything runs on it
@@ -69,7 +136,7 @@ export function parseHostConfig(value: unknown): HostConfig {
   if (!repositoryCacheModes.includes(input.repositoryCache as RepositoryCacheMode)) throw new Error("Invalid repository cache setting");
   if (typeof input.hostSessions !== "boolean") throw new Error("Invalid host sessions setting");
   return { commandTimeoutSeconds: timeout, gpu: input.gpu, gitCredentials: input.gitCredentials, repositoryCache: input.repositoryCache as RepositoryCacheMode,
-    hostSessions: input.hostSessions };
+    hostSessions: input.hostSessions, compaction: parseHostCompaction(input.compaction) };
 }
 
 /**

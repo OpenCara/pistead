@@ -1,8 +1,9 @@
 # Pistead for the desktop
 
 An Electron app with two jobs: the **Pistead window** shows your Pistead server (https://pistead.com by default), and
-**This Mac** runs the `pistead` connector on this computer, so it hosts Pi agent sessions without a terminal. macOS
-builds ship today; the Linux and Windows targets are declared for later.
+**This Mac** runs the `pistead` connector on this computer, so it hosts Pi agent sessions without a terminal. **Settings
+→ Pistead on this computer** can also run Pistead itself here, as `pistead serve` does. macOS builds ship today; the
+Linux and Windows targets are declared for later.
 
 - The Pistead window loads the configured server with no preload and no Node, in its own persistent session. It
   navigates only within the server and GitHub (for sign-in); other links open in your default browser.
@@ -17,6 +18,13 @@ builds ship today; the Linux and Windows targets are declared for later.
 - macOS has no isolated sandbox, so starting the host asks for consent in a native dialog showing the CLI's own
   `--unsafe-no-sandbox` warning. Linux uses the bubblewrap sandbox when its prerequisites are installed and asks the
   same consent otherwise; native Windows gets the CLI's WSL2 instructions.
+- Pistead on this computer runs the local server (`dist/host/desktop-server.mjs`, bundled from
+  `apps/server/src/local/desktop.ts`) in a second utility process, with `pistead serve`'s state
+  (`~/.local/share/pistead/server`), so the two share their data; a kernel lease on that directory (flock or lockf, as
+  the connector's) lets only one of them run at a time. The GitHub OAuth app's secret travels only over the IPC channel into that state. While it runs, the Pistead window shows
+  it instead of the configured server, opening its sign-in link while nobody has claimed it; this computer becomes its
+  host once the owner has signed in, after the same unsandboxed consent where there is no sandbox. It starts again at
+  launch while it is on, and stopping it in Settings returns the window to the configured server.
 - A host left running when Pistead quits starts again the next time it opens, with the consent given at its start;
   stopping the host, or a host failure, ends that. With the host running, closing every window keeps Pistead in the
   menu bar.
@@ -34,6 +42,7 @@ Development switches, honored only when the app runs unpackaged:
 | --- | --- |
 | `PISTEAD_DESKTOP_ALLOW_FAUX=1` | The host offers the deterministic fixture model instead of Pi's (needs a test-mode server) |
 | `PISTEAD_DESKTOP_STATE_DIR=/path` | Connector state other than the CLI's, so your real pairing is untouched |
+| `PISTEAD_DESKTOP_SERVER_STATE_DIR=/path` | Local server state other than `pistead serve`'s (with `PISTEAD_DESKTOP_ALLOW_FAUX=1` it runs in test mode with the fixture model) |
 | `PISTEAD_DESKTOP_USER_DATA=/path` | A separate app profile (settings, window bounds, Pistead session) |
 
 `PISTEAD_DESKTOP_SMOKE=/path` works in any build: the app writes `main.png` (Pistead window), `host.png` (This Mac)
@@ -52,7 +61,8 @@ This Mac finds those models.
 pnpm --filter @pistead/desktop dist
 ```
 
-This builds the app, stages the connector into `dist/connector` with its production dependencies installed by `npm ci`
+This builds the app, stages the connector and the local server into `dist/connector` (with the web app from the
+repository's `dist/web`: run `pnpm build` first) with its production dependencies installed by `npm ci`
 from `packages/cli/npm-shrinkwrap.json` (the registry must be reachable), and writes an arm64 DMG and zip to
 `dist/release`. The connector is copied to `Pistead.app/Contents/Resources/connector`, outside the asar.
 

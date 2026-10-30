@@ -1,4 +1,4 @@
-import { mkdir, readFile, open, link, unlink, chmod, realpath, lstat } from "node:fs/promises";
+import { mkdir, readFile, open, link, unlink, chmod, realpath, lstat, readdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -9,7 +9,7 @@ import type { RunnerAction, RunnerBinding, RunnerTicket, SubmitInput, Operation 
 import type { RestoreDescriptor, RestoreInput } from "../../../packages/shared/src/connector.js";
 import { ViewRevisions } from "../../../packages/shared/src/view-patch.js";
 import { assertId, permissionFor, RunnerError, stableJson, validateBinding, verifyRunnerTicket } from "./protocol.js";
-import { RunnerSession, type RunnerConfig } from "./session.js";
+import { RunnerSession, WORK_MARKER, type RunnerConfig } from "./session.js";
 import { restoreSession } from "./restore.js";
 
 function immutable<T>(value: T): T {
@@ -75,6 +75,23 @@ export class RunnerService {
     })();
     this.sessions.set(id, opening);
     try { return await opening; } catch (error) { this.sessions.delete(id); throw error; }
+  }
+
+  /**
+   * Opens every session that had work in progress when its runner last stopped (WORK_MARKER), one at a time, so that
+   * work goes on rather than waiting until someone opens the session. Opening resumes it as any open does; a session
+   * that can't open is left for its next request.
+   */
+  async resume(): Promise<void> {
+    let names: string[];
+    try { names = await readdir(join(this.dataDir, "sessions")); }
+    catch { return; }
+    for (const name of names.sort()) {
+      if (this.closed) return;
+      try { assertId(name); } catch { continue; }
+      const marked = await lstat(join(this.dataDir, "sessions", name, WORK_MARKER)).then(stat => stat.isFile(), () => false);
+      if (marked) await this.get(name).catch(() => {});
+    }
   }
 
   async provision(input: unknown, ticket: RunnerTicket): Promise<RunnerSession> {
@@ -152,6 +169,25 @@ export class RunnerService {
     return binding;
   }
 
+  /**
+   * Starts `target`, a new session of the ticket's owner, from the shared conversation of `sourceSessionId`, another of
+   * their sessions on this host, up to one of its messages. The transcript goes from one to the other here, on the host.
+   */
+  async fork(target: RunnerSession, ticket: RunnerTicket, input: unknown): Promise<{ conversationId: string; entries: number }> {
+    const value = input as { sourceSessionId?: unknown; entryId?: unknown } | null;
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => key !== "sourceSessionId" && key !== "entryId")
+      || typeof value.sourceSessionId !== "string" || typeof value.entryId !== "string" || value.entryId.length > 64) throw new RunnerError(400, "Invalid fork request");
+    const sourceId = assertId(value.sourceSessionId);
+    if (sourceId === target.binding.session.id) throw new RunnerError(400, "A session can't be forked into itself");
+    if (ticket.actorId !== target.binding.owner.id) throw new RunnerError(403, "Only the session's owner can fork into it");
+    const source = await this.get(sourceId);
+    if (source.binding.owner.id !== ticket.actorId || source.binding.session.workspaceId !== target.binding.session.workspaceId) {
+      throw new RunnerError(403, "Only the session's owner can fork it, into the same workspace");
+    }
+    const entries = await source.forkEntries(ticket.actorId, value.entryId);
+    return target.seed(ticket, { sessionId: sourceId, entryId: value.entryId }, entries);
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     for (const pending of this.sessions.values()) {
@@ -194,7 +230,7 @@ export function createRunnerApp(service: RunnerService): Hono {
     const approval = /^approvals\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(route);
     // view/<revision>: what changed since a view this caller already holds.
     const since = /^view\/([0-9a-f]{32})$/.exec(route)?.[1];
-    const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore", stop: "stop", files: "files" };
+    const actions: Record<string, RunnerAction> = { submit: "submit", ask: "ask", view: "view", events: "events", operations: "operations", restart: "restart", backup: "backup", restore: "restore", stop: "stop", files: "files", revert: "revert", fork: "fork" };
     const action = approval ? "approve" : since ? "view" : actions[route];
     if (!action) throw new RunnerError(404, "Unknown runner endpoint");
     if (c.req.method !== (action === "view" || action === "events" ? "GET" : "POST")) throw new RunnerError(405, "Method not allowed");
@@ -209,7 +245,9 @@ export function createRunnerApp(service: RunnerService): Hono {
     }
     const session = await service.get(id);
     if (ticket.ownerId !== session.binding.owner.id) throw new RunnerError(403, "Ticket owner mismatch");
-    await session.authorize(ticket.actorId, permissionFor(action), ticket.policyVersion);
+    // A decision needs approve permission, but the host's owner decides a host command with any access to the session:
+    // decide() checks which one the card's operation needs.
+    await session.authorize(ticket.actorId, action === "approve" ? "read" : permissionFor(action), ticket.policyVersion);
     if (action === "operations" || action === "restart" || action === "backup") await session.consumeTicket(ticket);
     if (action === "view") {
       let views = revisions.get(session);
@@ -244,6 +282,8 @@ export function createRunnerApp(service: RunnerService): Hono {
     if (action === "submit" || action === "ask") return c.json(await session.submit(ticket, input as SubmitInput, action === "ask" ? "ask" : "write"));
     if (action === "operations") return c.json({ approval: await session.createApproval(ticket.actorId, input.operation as Operation) }, 201);
     if (action === "stop") return c.json(await session.stop(ticket));
+    if (action === "revert") return c.json(await session.revert(ticket, input));
+    if (action === "fork") return c.json(await service.fork(session, ticket, input));
     if (action === "files") {
       // One worktree path, relative, as the file browser asks for it; the sandbox checks it again.
       if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => key !== "path")

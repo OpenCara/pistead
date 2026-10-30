@@ -8,6 +8,7 @@ import { agentVersion, auditStatement, modelDefinition, requireNoMigration, requ
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text } from './http.js';
 import { bindingForSession } from './sessions.js';
 import { authenticateConnector, requireConnectorSession } from './connectors.js';
+import { runsShellCommands } from './host-access.js';
 import { runnerJSON, runnerRequest } from './runner.js';
 import { boundedSnapshotText, MAX_BACKUP_BYTES, repositoryIdentity, validateSnapshot } from './restore-snapshot.js';
 import { migratedAgentVersion, requireModel } from './catalog.js';
@@ -95,8 +96,9 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   }
   // A clone session has no pins to carry: its successor needs a host where the agent can clone again, and that restores
   // its clones' local work from the snapshot.
+  const destination = { connector_id: model.connector_id, connector_owner_id: model.connector_owner_id, workspace_id: source.workspace_id };
   if (source.repository_mode === 'clone' && (capabilities.plainGit !== true || capabilities.cloneBackups !== true || capabilities.unsandboxed
-    || (capabilities.productionShell !== true && model.connector_owner_id !== ownerId))) {
+    || !await runsShellCommands(c.env, capabilities, destination, ownerId))) {
     fail(409, 'clone_host_required', 'This session clones its repositories with plain Git; move it to a host with an up-to-date connector, not running unsandboxed, that can run your shell commands.');
   }
   const sourceAgent = await c.env.DB.query<AgentRow>('SELECT * FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
@@ -117,7 +119,7 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   const target: SessionRow = { id: id(), workspace_id: source.workspace_id, owner_id: ownerId, agent_version_id: agent.id,
     connector_id: model.connector_id, connector_owner_id: model.connector_owner_id, title: input.title ?? source.title,
     repositories_json: source.repositories_json ?? '[]', repository_mode: source.repository_mode ?? null, visibility: source.visibility ?? 'private', policy_version: 1,
-    status: 'provisioning', created_at: now() };
+    status: 'provisioning', created_at: now(), tool_output: source.tool_output === 'brief' ? 'brief' : 'full' };
   target.branch = successorBranch(target, capabilities);
   await requireConnectorSession(c.env, model.connector_id, target);
   const binding: RunnerBinding = { session: runnerSessionRecord(target), owner: sourceBinding.owner, agent: agentVersion(agent), model: modelDefinition(model) };
@@ -136,11 +138,11 @@ async function startMigration(c: AppContext, input: { sourceId: string; requestI
   try {
     await c.env.DB.batch([
       c.env.DB.query(`INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, connector_id,
-        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode, branch)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
+        connector_owner_id, repositories_json, title, policy_version, status, created_at, visibility, repository_mode, branch, tool_output)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${admissible}`)
         .bind(target.id, target.workspace_id, ownerId, target.agent_version_id, target.connector_id ?? null,
           target.connector_owner_id ?? null, target.repositories_json ?? '[]', target.title, 1, 'provisioning', target.created_at,
-          target.visibility ?? 'private', target.repository_mode ?? null, target.branch ?? null, ...admissibleValues),
+          target.visibility ?? 'private', target.repository_mode ?? null, target.branch ?? null, target.tool_output ?? 'full', ...admissibleValues),
       c.env.DB.query(`INSERT INTO host_migrations (id, request_id, owner_id, workspace_id, source_session_id, source_connector_id,
         target_session_id, target_connector_id, target_model_id, request_title, sha256, size, snapshot, binding_json, created_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)`)

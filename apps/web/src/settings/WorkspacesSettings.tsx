@@ -14,6 +14,7 @@ import { Alert, Button, CardBody, Combobox, CopyField, DropdownMenu, EmptyState,
 import type { WorkspaceInviteLink, WorkspaceJoinRequest } from "../../../../packages/shared/src/invites";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
 import { NetworkAccess } from "./NetworkAccess";
+import { TranscriptSettings } from "./TranscriptSettings";
 import { PushAccess } from "./PushAccess";
 import { WorkspaceDatabaseSection } from "./WorkspaceDatabase";
 
@@ -78,6 +79,7 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
     <Repositories workspace={workspace} admin={admin} {...repositories} documents={<DocumentSources workspaceId={workspace.id} workspaceName={workspace.name} admin={admin} {...sources} changed={repositories.refresh} />} />
     <PushAccess workspace={workspace} admin={admin} />
     <NetworkAccess workspace={workspace} admin={admin} />
+    <TranscriptSettings workspace={workspace} admin={admin} />
     <WorkspaceDatabaseSection workspace={workspace} owner={role === "owner"} />
     <Members workspace={workspace} admin={admin} owner={role === "owner"} />
     {admin && <DataExport workspace={workspace} />}
@@ -86,8 +88,8 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
 
 function DataExport({ workspace }: { workspace: Workspace }) {
   return <Section title="Data export" info={<div className="stack">
-    <p>Downloads this workspace as JSON: its settings, members, models, published agents, repositories, push access, session database connection and activity, with your own sessions in full and the records of the other sessions you can view.</p>
-    <p>Other members' private sessions are left out; their owners can export them. Secrets are never included, and a session's conversation is in its backups.</p>
+    <p>Downloads this workspace as JSON: its settings, members, models, published agents, repositories, push access, session database connection and activity, with your own sessions in full and the records of every other session, which owners and admins manage.</p>
+    <p>The rest of another member's session, such as its people, approvals and activity, is in its owner's export of it. Secrets are never included, and a session's conversation is in its backups.</p>
     <p>The workspace owner can import exports into the workspace's session database.</p>
   </div>}>
     <Row title="Workspace data" hint="JSON, without secrets" trailing={<LinkButton variant="outline" size="sm" href={`/api/workspaces/${segment(workspace.id)}/export`} download>Export</LinkButton>} />
@@ -262,9 +264,9 @@ function Members({ workspace, admin, owner }: { workspace: Workspace; admin: boo
         <li><strong>Viewer</strong>: follows them read-only and can't start sessions, whatever a session grants.</li>
         <li><strong>Member</strong>: starts sessions, and follows other people's read-only unless they grant more.</li>
         <li><strong>Collaborator</strong>: starts sessions, and sends messages to any workspace-visible session.</li>
-        <li><strong>Admin</strong>: a collaborator who also manages the workspace. Only the owner manages admins.</li>
+        <li><strong>Admin</strong>: a collaborator who also manages the workspace and every session in it, private ones included. Only the owner manages admins.</li>
       </ul>
-      <p>Private sessions, and approve or manage permissions, still require explicit grants.</p>
+      <p>Opening someone else's private session takes a session role, except for the owner and admins. Approving tool calls takes one from the session's owner whatever the role.</p>
       <p>Membership never grants GitHub access, tool execution, or use of anyone's private Pi host.</p>
     </div>} action={admin && <Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add member</Button>}>
       <ResourceState {...resource} retry={resource.refresh}>

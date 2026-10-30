@@ -1,17 +1,18 @@
 import { HTTPException } from 'hono/http-exception';
 import { connectorLimits, type ConnectorRpcRequest } from '../../../packages/shared/src/connector.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
-import { hasPermission } from '../../../packages/shared/src/policy.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
 import type { Permission, RunnerAction, RunnerTicket } from '../../../packages/shared/src/types.js';
 import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
+import { mayRequestAction } from './host-access.js';
 import { fail, id } from './http.js';
 import type { AppContext, Env, SessionRow } from './types.js';
 
 export const connectorPermissions: Record<RunnerAction, Permission> = {
   create: 'write', view: 'read', events: 'read', submit: 'write', ask: 'ask',
   operations: 'write', approve: 'approve', backup: 'manage', restart: 'manage', restore: 'manage', stop: 'write', files: 'write',
+  revert: 'write', fork: 'write',
 };
 export const connectorRequestFrameBytes = connectorLimits.requestBytes * 6 + 16384;
 export interface ConnectorConnection {
@@ -39,7 +40,7 @@ export function connectorPath(action: RunnerAction, sessionId: string, suffix = 
       if (!suffix) return `${base}/view`;
       if (!isRevision(suffix)) fail(400, 'invalid_revision', 'Invalid view revision.');
       return `${base}/view/${suffix}`;
-    case 'events': case 'submit': case 'ask': case 'operations': case 'backup': case 'restart': case 'restore': case 'stop': case 'files':
+    case 'events': case 'submit': case 'ask': case 'operations': case 'backup': case 'restart': case 'restore': case 'stop': case 'files': case 'revert': case 'fork':
       return `${base}/${action}`;
     default: return fail(400, 'invalid_action', 'Invalid connector action.');
   }
@@ -65,11 +66,11 @@ export async function authorizeConnectorTicket(env: Env, ticket: RunnerTicket, c
   if (!permission || !Object.hasOwn(connectorPermissions, ticket.action) || !ticket.connectorId) fail(403, 'invalid_ticket', 'Invalid connector ticket.');
   const access = await sessionAccess(env, ticket.sessionId, ticket.actorId);
   if (!access || access.row.owner_id !== ticket.ownerId || access.row.connector_id !== ticket.connectorId ||
-      !hasPermission(access.permissions, permission) || access.row.policy_version !== ticket.policyVersion) {
+      access.row.policy_version !== ticket.policyVersion || !await mayRequestAction(env, access, ticket.actorId, ticket.action, permission)) {
     fail(403, 'permission_revoked', 'Session access is no longer authorized.');
   }
   if (access.row.status === 'archived' && ticket.action !== 'view' && ticket.action !== 'events') fail(409, 'session_archived', 'Session is archived.');
-  if (['create', 'restart', 'restore', 'backup'].includes(ticket.action) && ticket.actorId !== ticket.ownerId) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
+  if (['create', 'restart', 'restore', 'backup', 'fork'].includes(ticket.action) && ticket.actorId !== ticket.ownerId) fail(403, 'owner_required', 'Only the session owner can perform this operation.');
   await requireConnectorSession(env, ticket.connectorId, access.row, connectionHash);
   return access.row;
 }

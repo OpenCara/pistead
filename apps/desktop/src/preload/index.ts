@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { channels, type HostView, type PisteadBridge } from "../shared/bridge.js";
+import { channels, type HostView, type PisteadBridge, type SettingsView } from "../shared/bridge.js";
 
 // Loaded only into the app's local pages. Each function forwards one typed call; the main process checks the sender
 // and validates every payload, so nothing here is trusted.
@@ -20,6 +20,13 @@ const bridge: PisteadBridge = {
   settings: {
     view: () => ipcRenderer.invoke(channels.settingsView),
     setServer: origin => ipcRenderer.invoke(channels.settingsServer, origin),
+    startLocal: input => ipcRenderer.invoke(channels.localStart, input),
+    stopLocal: () => ipcRenderer.invoke(channels.localStop),
+    onUpdate: listener => {
+      const forward = (_event: unknown, view: SettingsView) => listener(view);
+      ipcRenderer.on(channels.settingsUpdate, forward);
+      return () => { ipcRenderer.off(channels.settingsUpdate, forward); };
+    },
   },
 };
 

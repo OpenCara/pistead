@@ -54,13 +54,12 @@ export function isModelDisabled(disabled: ReadonlySet<string>, model: { provider
  */
 export async function requireEnabledModel(c: AppContext, row: SessionRow, options: ChatOptions | undefined): Promise<void> {
   if (!row.connector_id || options?.model) return;
-  const host = await c.env.DB.query<{ models_json: string; capabilities_json: string }>('SELECT models_json, capabilities_json FROM connectors WHERE id = ?')
-    .bind(row.connector_id).first();
+  const host = await hostDisabledModels(c.env, row);
   // A host that is gone serves no message; the request to it says so.
   if (!host) return;
-  const disabled = hostModelSettings(JSON.parse(host.models_json) as LocalModelSummary[], await disabledModelKeys(c.env, row.connector_id)).disabledModels;
+  const { disabled } = host;
   if (!disabled.length) return;
-  if ((JSON.parse(host.capabilities_json) as ConnectorCapabilities).chatOptions === true) {
+  if (host.switchesModels) {
     fail(409, 'model_required', 'Some of this host\'s models are disabled, so each message names the model it runs on. Choose a model and send it again.');
   }
   const own = await c.env.DB.query<{ provider: string; model_id: string }>(`SELECT m.provider, m.model_id FROM agent_versions a
@@ -68,6 +67,28 @@ export async function requireEnabledModel(c: AppContext, row: SessionRow, option
   if (own && disabled.some(model => model.provider === own.provider && model.modelId === own.model_id)) {
     fail(409, 'model_disabled', 'This session\'s model is disabled on its host. Ask the host\'s owner or an admin to enable it.');
   }
+}
+
+/** The session's host's disabled models, and whether it switches models per message; null without a host. */
+async function hostDisabledModels(env: Env, row: SessionRow): Promise<{ disabled: LocalModelSummary[]; switchesModels: boolean } | null> {
+  if (!row.connector_id) return null;
+  const host = await env.DB.query<{ models_json: string; capabilities_json: string }>('SELECT models_json, capabilities_json FROM connectors WHERE id = ?')
+    .bind(row.connector_id).first();
+  if (!host) return null;
+  return {
+    disabled: hostModelSettings(JSON.parse(host.models_json) as LocalModelSummary[], await disabledModelKeys(env, row.connector_id)).disabledModels,
+    switchesModels: (JSON.parse(host.capabilities_json) as ConnectorCapabilities).chatOptions === true,
+  };
+}
+
+/**
+ * Whether a message to `row` must name its model (see requireEnabledModel): its host switches models per message and
+ * has a disabled model. Messages the server writes itself (cross-session messages and notifications, scheduled prompts)
+ * then name the conversation's current model, as the apps do.
+ */
+export async function messageNeedsModel(env: Env, row: SessionRow): Promise<boolean> {
+  const host = await hostDisabledModels(env, row);
+  return !!host && host.switchesModels && host.disabled.length > 0;
 }
 
 export function registerHostModels(app: Hono<WorkerEnv>): void {

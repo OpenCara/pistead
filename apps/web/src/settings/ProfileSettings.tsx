@@ -12,6 +12,38 @@ import "./settings.css";
 
 type EnvRow = { id: string; key: string; value: string };
 
+/** A password account changes its password here; every other browser signed in as it is signed out. */
+function PasswordSection() {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const action = useAction();
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    void action.run(async () => {
+      if (next !== confirm) throw new Error("The new passwords don't match.");
+      await api("/api/me/password", { method: "POST", body: { currentPassword: current, newPassword: next } });
+      setCurrent("");
+      setNext("");
+      setConfirm("");
+    }, "Password changed. Your other browsers are signed out.");
+  }
+  return <form className="settings-form" onSubmit={submit}>
+    <Section title="Password" info="You sign in with your username and this password. Changing it signs out every other browser signed in as you.">
+      <CardBody>
+        <Field label="Current password"><input className="input" type="password" required value={current} onChange={event => setCurrent(event.target.value)} autoComplete="current-password" maxLength={256} /></Field>
+        <Field label="New password" hint="At least 12 characters."><input className="input" type="password" required minLength={12} maxLength={256} value={next} onChange={event => setNext(event.target.value)} autoComplete="new-password" /></Field>
+        <Field label="Confirm new password"><input className="input" type="password" required maxLength={256} value={confirm} onChange={event => setConfirm(event.target.value)} autoComplete="new-password" /></Field>
+      </CardBody>
+    </Section>
+    <div className="settings-actions">
+      <Feedback {...action} />
+      <span className="spacer" />
+      <Button type="submit" variant="default" disabled={action.busy}>{action.busy ? "Changing..." : "Change password"}</Button>
+    </div>
+  </form>;
+}
+
 export function ProfileSettings() {
   const { user, setUser, signOut } = useApp();
   const [displayName, setDisplayName] = useState(user.displayName);
@@ -60,6 +92,7 @@ export function ProfileSettings() {
       </div>
     </form>
     <GitAccountsSection />
+    {user.passwordSignIn && <PasswordSection />}
     <ConnectedAccountsSection />
     <SignedInAppsSection />
     <OwnJoinRequests />

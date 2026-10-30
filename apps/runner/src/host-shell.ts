@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
 import { validHostOperation } from "../../../packages/shared/src/host-operations.js";
 import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
+import { bashPath, hostBashArgs, killTree, startHostBash, windows, windowsSystemEnvironment } from "./platform.js";
 
 /** No namespace or resource boundary. Callers must verify the host owner's exact approval immediately before launch. */
 export async function runHostShell(operation: HostCommandOperation, options: {
@@ -12,9 +13,13 @@ export async function runHostShell(operation: HostCommandOperation, options: {
   options.signal.throwIfAborted();
   return new Promise((resolve, reject) => {
     // Use host tools and the host home (SDKs/caches), but never inherit the connector's tokens or provider environment.
-    const child = spawn("/bin/bash", ["--noprofile", "--norc", "-c", operation.command], {
-      cwd: options.worktree, detached: true, stdio: ["ignore", "pipe", "pipe"],
+    const bash = bashPath();
+    if (!bash) throw new Error(windows ? "Host commands need Git for Windows' bash.exe" : "Host commands need /bin/bash");
+    const child = spawn(bash, hostBashArgs(operation.command), {
+      cwd: options.worktree, detached: !windows, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
       env: {
+        // Windows needs its system variables to start anything; bash finds its own tools from Git's install.
+        ...(windows ? windowsSystemEnvironment() : {}),
         PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: homedir(), TMPDIR: tmpdir(),
         LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TERM: "dumb", PWD: options.worktree,
         SANDBOX_WORKTREE: options.worktree, GIT_DIR: options.git, GIT_WORK_TREE: options.worktree,
@@ -26,10 +31,7 @@ export async function runHostShell(operation: HostCommandOperation, options: {
     const out: Buffer[] = [], err: Buffer[] = [];
     let size = 0;
     let failure: string | undefined;
-    const kill = () => {
-      if (!child.pid) return;
-      try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-    };
+    const kill = () => killTree(child);
     const stop = (reason: string) => {
       failure ??= reason;
       kill();
@@ -50,6 +52,9 @@ export async function runHostShell(operation: HostCommandOperation, options: {
     child.stdout.on("data", (chunk: Buffer) => capture(out, chunk));
     child.stderr.on("data", (chunk: Buffer) => capture(err, chunk));
     child.on("error", () => { failure ??= "Cannot start host bash"; });
+    child.stdin.on("error", () => { /* Early exit closes stdin; the exit status is authoritative. */ });
+    // A command cancelled before it starts never gets to bash, which then ends at once.
+    if (failure) child.stdin.end(); else startHostBash(child, operation.command);
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       options.signal.removeEventListener("abort", abort);

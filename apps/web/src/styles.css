@@ -119,6 +119,8 @@
   html { min-width: 320px; -webkit-text-size-adjust: 100%; }
   body {
     min-height: 100vh;
+    /* The visible height on touch screens (touch.ts), so an open keyboard doesn't leave the page scrolling under it. */
+    min-height: var(--viewport-height, 100dvh);
     color: var(--foreground);
     background: var(--background);
     font-family: var(--font);
@@ -322,6 +324,9 @@
   .dot.warning { background: var(--dot-warning); }
   .dot.danger { background: var(--dot-danger); }
   .dot.running { background: var(--dot-running); animation: pulse 1.6s ease-in-out infinite; }
+  /* Where a dot would be: a clock for a session that waits for its next scheduled prompt. */
+  .status-icon { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 11px; height: 11px; margin: 0 -2px; color: var(--foreground-extra-muted); }
+  .status-icon.info, .status-icon.running { color: var(--status-info); }
   /* A session's status label beside its dot: colored only while under way or needing attention. */
   .session-status.running, .session-status.info { color: var(--status-info); }
   .session-status.warning { color: var(--status-warning); }
@@ -540,7 +545,7 @@
     display: grid;
     grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
     height: 100vh;
-    height: 100dvh;
+    height: var(--viewport-height, 100dvh);
   }
 
   .sidebar {
@@ -602,6 +607,8 @@
 
   .mobile-header { display: none; }
   .scrim { display: none; }
+  /* A screen header's own navigation button (navigation.tsx), for narrow screens only. */
+  .nav-button.btn { display: none; }
 
   .welcome { display: grid; min-height: 100%; place-items: center; padding: var(--space-10) var(--space-6); }
   body > #root > .welcome { min-height: 100vh; }
@@ -611,6 +618,12 @@
   .welcome-inner p { color: var(--foreground-muted); }
   .welcome-inner .actions { display: grid; gap: var(--space-2); width: 100%; }
   .welcome-footnote { color: var(--foreground-muted); font-size: var(--font-sm); }
+  /* Username and password sign-in (PasswordSignIn.tsx), above "or" and the GitHub button. */
+  .password-sign-in { display: grid; gap: var(--space-3); width: 100%; text-align: left; }
+  .password-sign-in > .btn.ghost { justify-self: center; }
+  .password-sign-in > .field-hint { color: var(--foreground-muted); font-size: var(--font-sm); text-align: center; }
+  .sign-in-divider { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--font-sm); }
+  .sign-in-divider::before, .sign-in-divider::after { content: ""; border-top: 1px solid var(--border); }
 
   .skip-link { position: fixed; top: var(--space-2); left: var(--space-2); z-index: 200; transform: translateY(-200%); }
   .skip-link:focus { transform: none; }
@@ -647,11 +660,45 @@
     }
     .app.sidebar-open .sidebar { visibility: visible; transform: none; transition: transform 180ms ease; }
     .app.sidebar-open .scrim { position: fixed; inset: 0; z-index: 55; display: block; background: rgb(0 0 0 / 40%); }
+    /* Screens with their own header show the navigation button in it instead of a second header above. */
+    .app.own-header { grid-template-rows: minmax(0, 1fr); }
+    .app.own-header > .mobile-header { display: none; }
+    .nav-button.btn { display: inline-flex; margin-left: calc(-1 * var(--space-2)); }
+    .screen-header:has(> .nav-button) { padding-left: var(--space-3); }
+    .toast-region { right: var(--space-3); left: var(--space-3); justify-items: end; }
     .content-column { padding: var(--space-5) var(--space-4) var(--space-10); }
     .settings-shell { grid-template-columns: minmax(0, 1fr); align-content: start; }
     .settings-list { position: static; height: auto; display: flex; flex-wrap: wrap; gap: var(--space-1); padding: var(--space-2); border-right: 0; border-bottom: 1px solid var(--border); }
     .settings-list-title { display: none; }
     .settings-list .nav-item { flex: 0 0 auto; width: auto; }
     .settings-list .nav-item > .label { overflow: visible; }
+  }
+
+  /* Phones: sheets rise from the bottom edge, full width, where a thumb reaches their buttons. */
+  @media (max-width: 600px) {
+    dialog.sheet, dialog.sheet.wide {
+      width: 100%;
+      max-width: 100%;
+      max-height: 90vh;
+      max-height: 90dvh;
+      margin: auto 0 0;
+      border-width: 1px 0 0;
+      border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+    }
+    .sheet-header { padding: var(--space-3) var(--space-4); }
+    .sheet-content { padding: 0 var(--space-4) var(--space-4); }
+    .sheet-footer { padding: var(--space-3) var(--space-4) var(--space-4); }
+    .sheet-footer > .btn { flex: 1 1 0; }
+  }
+
+  /* Fingers, not a mouse. */
+  @media (pointer: coarse) {
+    /* iOS zooms into any field under 16px when it is focused, and doesn't zoom back out. */
+    .input, .select, .textarea, .composer > textarea, .composer-input { font-size: var(--font-lg); }
+    /* Header controls get a tap target of at least 36px. */
+    .screen-header .btn.xs, .mobile-header .btn, .session-panel-header .btn.xs, .nav-button.btn { height: 36px; min-width: 36px; }
+    .screen-header .btn.icon-only.xs, .session-panel-header .btn.icon-only.xs, .nav-button.btn { width: 36px; }
+    .menu-item { min-height: 40px; }
+    .segmented > button, .segmented.xs > button { height: 30px; }
   }
 }

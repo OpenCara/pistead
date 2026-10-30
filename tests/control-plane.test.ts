@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { app } from '../apps/server/src/index.js';
@@ -11,6 +11,7 @@ import { sha256 } from '../packages/shared/src/crypto.js';
 import type { SessionView } from '../packages/shared/src/types.js';
 import { applyViewPatch, diffView, type SessionViewPatch } from '../packages/shared/src/view-patch.js';
 import { seedAgentVersion, testDatabase } from './helpers/control-plane.js';
+import { applySqliteMigrations } from './helpers/sqlite-migrations.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'control-plane-test-secret-not-for-deployment';
@@ -20,16 +21,7 @@ const migrationFiles = readdirSync(migrationsDirectory).filter(name => name.ends
 
 function migrate(sqlite: DatabaseSync, files = migrationFiles) {
   sqlite.exec('PRAGMA foreign_keys = ON');
-  for (const file of files) {
-    sqlite.exec('BEGIN');
-    try {
-      sqlite.exec(readFileSync(new URL(file, migrationsDirectory), 'utf8'));
-      sqlite.exec('COMMIT');
-    } catch (error) {
-      sqlite.exec('ROLLBACK');
-      throw error;
-    }
-  }
+  applySqliteMigrations(sqlite, migrationsDirectory, files);
 }
 
 async function fixture(t: TestContext) {
@@ -214,12 +206,13 @@ test('cookie mutations require CSRF and reject hostile origins; logout revokes t
 
 test('agents are gone; saved versions are immutable and do not grant authors access to another owner session', async t => {
   const f = await fixture(t);
-  const alice = await f.client('alice'); const bob = await f.client('bob'); const eve = await f.client('eve');
+  const alice = await f.client('alice'); const bob = await f.client('bob'); const eve = await f.client('eve'); const carol = await f.client('carol');
   const workspace = (await (await alice.request('POST', '/api/workspaces', { name: 'team' })).json() as { workspace: { id: string } }).workspace;
   assert.equal((await alice.request('POST', `/api/workspaces/${workspace.id}/members`, { userId: bob.user.id, role: 'member' })).status, 200);
+  assert.equal((await alice.request('POST', `/api/workspaces/${workspace.id}/members`, { userId: carol.user.id, role: 'member' })).status, 200);
   const model = (await (await alice.request('POST', `/api/workspaces/${workspace.id}/models`, { name: 'fixture', provider: 'faux', modelId: 'faux-1' })).json() as { model: { id: string } }).model;
-  // A version alice published before agents were removed. Nothing lists, revises, publishes or starts one any more.
-  const published = seedAgentVersion(f.sqlite, { authorId: alice.user.id, workspaceId: workspace.id, modelId: model.id, tools: ['identity'] });
+  // A version carol, a plain member, published before agents were removed. Nothing lists, revises, publishes or starts one any more.
+  const published = seedAgentVersion(f.sqlite, { authorId: carol.user.id, workspaceId: workspace.id, modelId: model.id, tools: ['identity'] });
   const routes: [string, string][] = [['GET', '/api/agents'], ['GET', `/api/workspaces/${workspace.id}/agents`], ['POST', '/api/agents'],
     ['POST', `/api/agents/${published.agentId}/versions`], ['POST', `/api/agents/${published.agentId}/publish`]];
   for (const [method, path] of routes) {
@@ -232,17 +225,21 @@ test('agents are gone; saved versions are immutable and do not grant authors acc
   assert.throws(() => f.sqlite.prepare('UPDATE agent_versions SET name = ? WHERE id = ?').run('changed', published.id), /immutable/);
   f.sqlite.prepare("INSERT INTO sessions (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'private')")
     .run('bob-session', workspace.id, bob.user.id, published.id, 'private session', 1, 'ready', new Date().toISOString());
-  assert.equal((await alice.request('GET', '/api/sessions/bob-session')).status, 404);
+  // Authoring the agent the session runs gives carol nothing; alice opens it only because she owns the workspace.
+  assert.equal((await carol.request('GET', '/api/sessions/bob-session')).status, 404);
   assert.equal((await eve.request('GET', '/api/sessions/bob-session')).status, 404);
+  const workspaceOwner = await alice.request('GET', '/api/sessions/bob-session');
+  assert.equal(workspaceOwner.status, 200);
+  assert.deepEqual((await workspaceOwner.json() as { session: { permissions: string[] } }).session.permissions, ['read', 'ask', 'write', 'manage']);
   const ownerSession = await bob.request('GET', '/api/sessions/bob-session');
   assert.equal(ownerSession.status, 200);
   assert.deepEqual((await ownerSession.json() as { session: { permissions: string[] } }).session.permissions, ['read', 'ask', 'write', 'approve', 'manage']);
-  assert.equal((await bob.request('POST', '/api/sessions/bob-session/grants', { userId: alice.user.id, permissions: ['manage'] })).status, 200);
-  assert.equal((await alice.request('POST', '/api/sessions/bob-session/grants', { userId: alice.user.id, permissions: ['write', 'manage'] })).status, 403);
-  assert.equal((await alice.request('POST', '/api/sessions/bob-session/grants', { userId: eve.user.id, permissions: ['read'] })).status, 404);
+  assert.equal((await bob.request('POST', '/api/sessions/bob-session/grants', { userId: carol.user.id, permissions: ['manage'] })).status, 200);
+  assert.equal((await carol.request('POST', '/api/sessions/bob-session/grants', { userId: carol.user.id, permissions: ['write', 'manage'] })).status, 403);
+  assert.equal((await carol.request('POST', '/api/sessions/bob-session/grants', { userId: eve.user.id, permissions: ['read'] })).status, 404);
   assert.equal((await bob.request('POST', '/api/sessions/bob-session/grants', { userId: bob.user.id, permissions: ['read'] })).status, 400);
-  assert.equal((await bob.request('DELETE', `/api/sessions/bob-session/grants/${encodeURIComponent(alice.user.id)}`)).status, 200);
-  assert.equal((await alice.request('GET', '/api/sessions/bob-session')).status, 404);
+  assert.equal((await bob.request('DELETE', `/api/sessions/bob-session/grants/${encodeURIComponent(carol.user.id)}`)).status, 200);
+  assert.equal((await carol.request('GET', '/api/sessions/bob-session')).status, 404);
   assert.equal((await bob.request('POST', '/api/sessions/bob-session/backup', {})).status, 503);
   assert.equal((await bob.request('GET', '/api/sessions/bob-session/view')).status, 503);
 });
@@ -613,7 +610,7 @@ test('a client holding a revision gets patches: nothing while nothing changed, t
   }
 });
 
-test('workspace roles: viewers read and create nothing, members read, collaborators and admins message shared sessions', async t => {
+test('workspace roles: viewers read and create nothing, members read, collaborators message shared sessions, owners and admins manage every session', async t => {
   const f = await fixture(t);
   const owner = await f.client('roles-owner');
   const [viewer, member, collaborator, admin, other] = await Promise.all(['roles-viewer', 'roles-member', 'roles-collaborator', 'roles-admin', 'roles-other'].map(name => f.client(name)));
@@ -634,13 +631,15 @@ test('workspace roles: viewers read and create nothing, members read, collaborat
   insert.run('roles-private', workspace.id, owner.user.id, agent.id, 'private', 'ready', new Date().toISOString(), 'private');
   const held = async (client: { user: { id: string } }, sessionId: string) => (await sessionAccess(f.env, sessionId, client.user.id))?.permissions ?? null;
 
-  // A shared session: viewers and members follow it read-only; collaborators and admins can also send messages.
+  // A shared session: viewers and members follow it read-only; collaborators can also send messages; admins manage it too.
   assert.deepEqual(await held(viewer, 'roles-shared'), ['read']);
   assert.deepEqual(await held(member, 'roles-shared'), ['read']);
   assert.deepEqual(await held(collaborator, 'roles-shared'), ['read', 'ask', 'write']);
-  assert.deepEqual(await held(admin, 'roles-shared'), ['read', 'ask', 'write']);
-  // A private session stays private, whatever the role.
-  for (const client of [viewer, member, collaborator, admin]) assert.equal(await held(client, 'roles-private'), null);
+  assert.deepEqual(await held(admin, 'roles-shared'), ['read', 'ask', 'write', 'manage']);
+  // A private session stays private from every role below admin; admins manage it as they do every session, but
+  // never approve without a session role.
+  for (const client of [viewer, member, collaborator]) assert.equal(await held(client, 'roles-private'), null);
+  assert.deepEqual(await held(admin, 'roles-private'), ['read', 'ask', 'write', 'manage']);
 
   // Members are read-only by default, so they can be granted more; a viewer is read-only whatever it is granted.
   assert.equal((await owner.request('POST', '/api/sessions/roles-shared/grants', { userId: member.user.id, permissions: ['read', 'write'] })).status, 200);
@@ -710,6 +709,9 @@ test('workspace roles: viewers read and create nothing, members read, collaborat
   assert.equal((await change(owner, collaborator.user.id, { role: 'admin' })).status, 200);
   assert.equal((await change(owner, collaborator.user.id, { role: 'collaborator' })).status, 200);
   assert.equal((await owner.request('POST', members, { userId: admin.user.id, role: 'collaborator' })).status, 200);
+  // An admin no longer, they lose what managing the workspace's sessions gave them at once.
+  assert.equal(await held(admin, 'roles-private'), null);
+  assert.deepEqual(await held(admin, 'roles-shared'), ['read', 'ask', 'write']);
 });
 
 test('session roles: an owner gives a member one of four tiers, capped by their workspace role and the giver\'s own access', async t => {

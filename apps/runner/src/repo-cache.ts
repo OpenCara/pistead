@@ -2,17 +2,19 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { link, lstat, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { GitProvider } from "../../../packages/shared/src/repositories.js";
-import { GitRemote, ProgressLines, parseGitProgress, type GitProgressPhase } from "./git-remote.js";
+import { GitRemote, GitRemoteError, ProgressLines, parseGitProgress, type GitProgressPhase } from "./git-remote.js";
 
 /**
  * Host repository cache (docs/design/repository-cache.md). One bare mirror per provider repository identity,
  * holding full history with every blob, so clones in sandboxed sessions borrow its objects through
  * `objects/info/alternates` and fetch only what is new.
  *
- * Only the runner writes here, outside any sandbox. Every fetch goes through the session's egress relay with the
- * session owner's access (`MirrorTarget.remote`), so the server decides for each session whether its owner may
- * read a repository; the host never uses a credential of its own.
+ * Only the runner writes here, outside any sandbox. Fills read the repository straight from its provider through
+ * `MirrorTarget.remote`: for clone sessions, with this host's own Git credentials. The cache decides no access: a session
+ * borrows a mirror only once the control plane's relay confirms that its owner may read the repository (see
+ * RunnerSession.mirror).
  */
 
 export type RepositoryCacheScope = "host" | "owner";
@@ -36,14 +38,26 @@ export interface RepositoryCacheOptions {
   scope?: RepositoryCacheScope;
   /** Minimum interval between progress callbacks of the same phase. */
   progressIntervalMs?: number;
+  /**
+   * Pauses before each further attempt at a ref listing or a fetch that failed in a way another attempt may get past (a
+   * connection that failed or broke off, a busy or failing remote); one attempt more than there are pauses.
+   */
+  retryDelaysMs?: readonly number[];
 }
 
 /** A workspace repository a clone session's mirror is kept for: the provider identity, never a pin. */
 export interface MirrorRepository { provider: GitProvider; host: string; repositoryId: string; fullName: string }
 export interface MirrorTarget {
   repository: MirrorRepository; ownerId: string; sessionId: string;
-  /** Reaches the repository with the session owner's access, through the control plane's relay. */
+  /** Reads the repository from its provider; for clone sessions, directly with this host's own Git credentials. */
   remote: GitRemote;
+  /**
+   * The branches and tags to mirror, as the session owner's own ref listing named them (through the control plane's
+   * relay, which checks the repository's identity): the mirror then fetches only these tips' history through `remote`,
+   * so it never holds what that listing didn't reach, whosever credential `remote` reads with. Without it, `remote`'s
+   * own listing.
+   */
+  refs?: ReadonlyMap<string, string>;
 }
 /** One cached repository as `pistead cache list` shows it. */
 export interface CachedRepository { directory: string; bytes: number; sessions: number; pins: number }
@@ -53,6 +67,7 @@ export class RepositoryCacheError extends Error {
 }
 
 const OID = /^[0-9a-f]{40}$/;
+const RETRY_DELAYS_MS = [2_000, 10_000];
 const FETCH_TIMEOUT_MS = 60 * 60 * 1000;
 const GIT_TIMEOUT_MS = 60 * 60 * 1000;
 const LOCK_POLL_MS = 250;
@@ -81,6 +96,7 @@ export class RepositoryCache {
   readonly #root: string;
   readonly #scope: RepositoryCacheScope;
   readonly #interval: number;
+  readonly #retryDelays: readonly number[];
   /** Per cache repository: the tail of its serialized operations, and who is watching the current one. */
   readonly #queues = new Map<string, { tail: Promise<void>; listeners: Set<Listener>; last: RepositoryCacheProgress | undefined }>();
 
@@ -90,6 +106,7 @@ export class RepositoryCache {
     this.#scope = options.scope ?? "host";
     if (this.#scope !== "host" && this.#scope !== "owner") throw new RepositoryCacheError("Repository cache scope must be host or owner");
     this.#interval = options.progressIntervalMs ?? 250;
+    this.#retryDelays = options.retryDelaysMs ?? RETRY_DELAYS_MS;
   }
 
   get scope(): RepositoryCacheScope { return this.#scope; }
@@ -105,19 +122,63 @@ export class RepositoryCache {
   }
 
   /**
+   * Creates a mirror's bare repository, empty, unless it exists: a session gets its mirrors' directories before its first
+   * command, so that command can mount the mirror its clone then waits to fill.
+   */
+  async prepare(repository: MirrorRepository, ownerId: string): Promise<string> {
+    const directory = this.mirrorDirectory(repository, ownerId);
+    await this.#prepare(directory);
+    return directory;
+  }
+
+  /** Whether a fill of the mirror has ever completed: it mirrors at least one of the remote's branches or tags. */
+  async filled(repository: MirrorRepository, ownerId: string): Promise<boolean> {
+    const directory = this.mirrorDirectory(repository, ownerId);
+    try { await lstat(join(directory, "HEAD")); }
+    catch (error) { if (errorCode(error) === "ENOENT") return false; throw error; }
+    return (await cacheGit(directory).capture(["for-each-ref", "--count=1", "--format=%(refname)", UPSTREAM_PREFIX])).trim() !== "";
+  }
+
+  /**
+   * The mirror of `target`'s repository, ready to borrow from. A mirror no fill has completed yet is filled first, however
+   * long that takes, and a failure to fill it is thrown. A filled one is refreshed as well, but answered as it is once
+   * `wait` milliseconds have passed or its refresh failed: a clone borrows what it has and fetches only the rest. Either
+   * way the refresh goes on to its end. `fresh` tells whether it was answered up to date.
+   */
+  async ready(target: MirrorTarget, options: { onProgress?: Listener; wait?: number } = {}): Promise<{ directory: string; fresh: boolean }> {
+    const directory = this.mirrorDirectory(target.repository, target.ownerId);
+    const filled = await this.filled(target.repository, target.ownerId);
+    const refresh = this.refresh(target, options.onProgress ? { onProgress: options.onProgress } : {});
+    if (!filled) {
+      await refresh;
+      return { directory, fresh: true };
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const fresh = await Promise.race([
+      refresh.then(() => true, () => false),
+      new Promise<boolean>(resolveWait => { timer = setTimeout(() => resolveWait(false), Math.max(0, options.wait ?? 0)); }),
+    ]);
+    clearTimeout(timer);
+    return { directory, fresh };
+  }
+
+  /**
    * Brings a clone session's mirror up to date with every branch and tag the remote advertises, and records the
-   * session's keep ref. Fetches only what is new; serialized with every other operation on the repository.
+   * session's keep ref. Fetches only what is new; serialized with every other operation on the repository. A ref listing
+   * or fetch that fails in a way another attempt may get past is tried again (RepositoryCacheOptions.retryDelaysMs).
    */
   async refresh(target: MirrorTarget, options: { onProgress?: Listener; signal?: AbortSignal } = {}): Promise<{ directory: string; fetched: boolean }> {
     const directory = this.mirrorDirectory(target.repository, target.ownerId);
     return this.#serialized(directory, target.repository.fullName, throttle(options.onProgress, this.#interval), options.signal, async (emit) => {
       await this.#prepare(directory);
       const git = cacheGit(directory, options.signal);
-      emit({ phase: "connecting", percent: null, done: null, total: null, bytes: 0 });
-      const advertised = await target.remote.listRefs();
+      const connecting = () => emit({ phase: "connecting", percent: null, done: null, total: null, bytes: 0 });
+      connecting();
+      const advertised = target.refs ? listed(target.refs) : await this.#retrying(() => target.remote.listRefs(), options.signal, connecting);
       const before = await git.objectTypes([...advertised.values()]);
       const wants = [...before].filter(([, type]) => type === null).map(([id]) => id);
-      const bytes = wants.length ? await this.#fetchObjects(git, target.remote, wants, emit) : 0;
+      // A fetch that broke off starts again from what the mirror had: nothing of it is kept.
+      const bytes = wants.length ? await this.#retrying(() => this.#fetchObjects(directory, git, target.remote, wants, emit), options.signal, connecting) : 0;
       await this.#updateUpstream(git, advertised);
       // Its branch tips as of now, on top of those it saw before: whatever its clones borrowed stays until prune drops
       // the keep ref.
@@ -159,6 +220,7 @@ export class RepositoryCache {
     for (const directory of await cacheRepositories(this.#root)) {
       await this.#serialized(directory, basename(directory), undefined, undefined, async () => {
         const git = cacheGit(directory);
+        await removeTemporaryPacks(directory);
         const stale = (await git.capture(["for-each-ref", "--format=%(committerdate:unix) %(refname)", SESSION_PREFIX])).split("\n")
           .map(line => line.split(" ") as [string, string]).filter(([date, ref]) => ref && Number(date) <= cutoff).map(([, ref]) => ref);
         if (stale.length) await git.run(["update-ref", "--no-deref", "--stdin"], `${stale.map(ref => `delete ${ref}`).join("\n")}\n`);
@@ -170,8 +232,35 @@ export class RepositoryCache {
     return { repositories, sessions };
   }
 
+  /**
+   * Runs `attempt` again after a failure another attempt may get past (see retryable), after each of the cache's retry
+   * pauses, telling `again` before each new attempt; the last failure is thrown.
+   */
+  async #retrying<T>(attempt: () => Promise<T>, signal: AbortSignal | undefined, again: () => void): Promise<T> {
+    for (let failures = 0; ; failures++) {
+      try { return await attempt(); }
+      catch (error) {
+        const pause = this.#retryDelays[failures];
+        if (pause === undefined || signal?.aborted || !retryable(error)) throw error;
+        await sleep(pause, undefined, signal ? { signal } : {}).catch(() => { throw error; });
+        again();
+      }
+    }
+  }
+
   /** Fetches `wants` and their history into the cache, checked complete like `git fetch` does; returns the pack's size. */
-  async #fetchObjects(git: CacheGit, remote: GitRemote, wants: string[], emit: (progress: Omit<RepositoryCacheProgress, "path">) => void): Promise<number> {
+  async #fetchObjects(directory: string, git: CacheGit, remote: GitRemote, wants: string[], emit: (progress: Omit<RepositoryCacheProgress, "path">) => void): Promise<number> {
+    // Only ever with the mirror's lock held, so no fetch is writing these: what one that broke off left, here or in a
+    // runner that died, would otherwise stay until a prune.
+    await removeTemporaryPacks(directory);
+    try { return await this.#fetchPack(git, remote, wants, emit); }
+    catch (error) {
+      await removeTemporaryPacks(directory).catch(() => {});
+      throw error;
+    }
+  }
+
+  async #fetchPack(git: CacheGit, remote: GitRemote, wants: string[], emit: (progress: Omit<RepositoryCacheProgress, "path">) => void): Promise<number> {
     const haves = (await git.capture(["for-each-ref", "--format=%(objecttype) %(objectname)", "--sort=-committerdate", UPSTREAM_PREFIX]))
       .split("\n").filter(line => line.startsWith("commit ")).map(line => line.slice(7));
     let bytes = 0;
@@ -332,6 +421,35 @@ async function directorySize(directory: string): Promise<number> {
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
+/** A ref listing given to a refresh (MirrorTarget.refs): only branches and tags, each at an object id. */
+function listed(refs: ReadonlyMap<string, string>): Map<string, string> {
+  for (const [ref, id] of refs) {
+    if (!/^refs\/(?:heads|tags)\/./.test(ref) || !OID.test(id)) throw new RepositoryCacheError("Invalid ref listing");
+  }
+  return new Map(refs);
+}
+
+/**
+ * Removes what a pack download that broke off leaves in a mirror's objects/pack: index-pack's `tmp_pack_*`, `tmp_idx_*`
+ * and the like, which Git itself collects only once they are older than a prune's cutoff.
+ */
+async function removeTemporaryPacks(directory: string): Promise<void> {
+  const pack = join(directory, "objects", "pack");
+  let names: string[];
+  try { names = await readdir(pack); }
+  catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+  await Promise.all(names.filter(name => /^(?:tmp_|\.tmp-)/.test(name)).map(name => rm(join(pack, name), { force: true })));
+}
+
+/**
+ * Whether another attempt at a ref listing or fetch may get past `error`: only what GitRemote says may, a connection that
+ * failed or broke off mid-pack, or a busy or failing remote. Git refusing what it received, a refusal, a time limit or a
+ * cancellation of the cache's own, and anything unforeseen, are final.
+ */
+function retryable(error: unknown): boolean {
+  return error instanceof GitRemoteError && error.retryable;
 }
 
 function errorCode(error: unknown): string | undefined {

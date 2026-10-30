@@ -1,6 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { migrationsDirectory } from './migrations.js';
-import { PostgresDatabase } from './postgres.js';
 import { SqliteDatabase, sqlitePath } from './sqlite.js';
 import type { Database } from './types.js';
 
@@ -13,7 +12,11 @@ export type { Database, DatabaseProviderName, ExecResult, Query, SqlValue, Trans
  */
 export async function openDatabase(url: string): Promise<Database> {
   if (url.startsWith('sqlite:')) return new SqliteDatabase(sqlitePath(url), migrationsDirectory('sqlite'));
-  if (url.startsWith('postgres:') || url.startsWith('postgresql:')) return new PostgresDatabase(url, migrationsDirectory('postgres'));
+  if (url.startsWith('postgres:') || url.startsWith('postgresql:')) {
+    // Loaded on demand: SQLite servers (a local one, say) need no Postgres driver installed.
+    const { PostgresDatabase } = await import('./postgres.js');
+    return new PostgresDatabase(url, migrationsDirectory('postgres'));
+  }
   throw new Error('DATABASE_URL must start with sqlite:, postgres: or postgresql:.');
 }
 

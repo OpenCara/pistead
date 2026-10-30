@@ -884,16 +884,27 @@ test('workspace network policies: members read, administrators write, invalid do
   const owner = await f.client('owner'); const reader = await f.client('reader');
   const team = await workspace(owner); await member(owner, team.id, reader);
   const path = `/api/workspaces/${team.id}/network-policy`;
-  const initial = await json<{ policy: { mode: string; domains: string[]; packageRegistries: boolean }; packageRegistryDomains: string[] }>(await reader.request('GET', path));
-  assert.deepEqual(initial.policy, { mode: 'off', domains: [], packageRegistries: true });
+  type PolicyResponse = { policy: { mode: string; domains: string[]; packageRegistries: boolean; webSearch: boolean }; packageRegistryDomains: string[]; webSearchProvider: string | null };
+  const initial = await json<PolicyResponse>(await reader.request('GET', path));
+  assert.deepEqual(initial.policy, { mode: 'off', domains: [], packageRegistries: true, webSearch: false });
   assert.ok(initial.packageRegistryDomains.includes('registry.npmjs.org'));
+  assert.equal(initial.webSearchProvider, null);
   const allowlist = { mode: 'allowlist', domains: ['docs.example.com', '*.cdn.example.net'], packageRegistries: false };
   await denied(await reader.request('PUT', path, allowlist), 403, 'forbidden');
   await denied(await owner.request('PUT', path, { ...allowlist, domains: ['169.254.169.254'] }), 400, 'invalid_network_policy');
   await denied(await owner.request('PUT', path, { ...allowlist, mode: 'everything' }), 400, 'invalid_network_policy');
-  assert.deepEqual((await json<{ policy: unknown }>(await owner.request('PUT', path, allowlist))).policy, allowlist);
-  assert.deepEqual((await json<{ policy: unknown }>(await reader.request('GET', path))).policy, allowlist);
-  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.network_policy.updated'").get()!.n, 1);
+  await denied(await owner.request('PUT', path, { ...allowlist, webSearch: 'yes' }), 400, 'invalid_network_policy');
+  // A client that predates web search names no setting for it.
+  assert.deepEqual((await json<PolicyResponse>(await owner.request('PUT', path, allowlist))).policy, { ...allowlist, webSearch: false });
+  assert.deepEqual((await json<PolicyResponse>(await reader.request('GET', path))).policy, { ...allowlist, webSearch: false });
+  // Web search is saved, and a later change from such a client keeps it.
+  assert.deepEqual((await json<PolicyResponse>(await owner.request('PUT', path, { ...allowlist, webSearch: true }))).policy, { ...allowlist, webSearch: true });
+  assert.deepEqual((await json<PolicyResponse>(await owner.request('PUT', path, { ...allowlist, domains: ['docs.example.com'] }))).policy,
+    { ...allowlist, domains: ['docs.example.com'], webSearch: true });
+  // The page names the server's search provider, where its operator configured one.
+  f.env.WEB_SEARCH = 'brave'; f.env.WEB_SEARCH_API_KEY = 'brave-key';
+  assert.equal((await json<PolicyResponse>(await reader.request('GET', path))).webSearchProvider, 'brave');
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.network_policy.updated'").get()!.n, 3);
   const outsider = await f.client('outsider');
   await denied(await outsider.request('GET', path), 404, 'not_found');
 });
@@ -905,6 +916,8 @@ test('egress grants and the Git relay serve only the connector running the sessi
   const grant = await json<{ policy: { mode: string }; repositories: { bindingId: string; fullName: string }[] }>(
     await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers));
   assert.equal(grant.policy.mode, 'off');
+  // Never the web search setting, which older connectors' policy parsing would refuse.
+  assert.deepEqual(Object.keys(grant.policy).sort(), ['domains', 'mode', 'packageRegistries']);
   assert.deepEqual(grant.repositories.map(item => [item.bindingId, item.fullName]), [[repository.id, metadata.full_name]]);
   await denied(await f.request('POST', '/api/internal/network', { sessionId: session.id }, { Authorization: `Bearer ${internalSecret}` }), 403, 'connector_scope_required');
 
@@ -1120,14 +1133,18 @@ test('every session clones: older connectors are refused, and a session whose ag
   assert.deepEqual(own.repositories, []);
   assert.equal(own.cloneUnavailable, undefined);
   assert.deepEqual(remote.calls, [], 'nothing is resolved with the owner\'s account at creation');
-  // Another member's session needs the host's resource limits to run shell commands; without them it starts empty, and says so.
+  // Another member's session needs the host's resource limits to run shell commands, or a host command grant there;
+  // without either it starts empty, and says so.
   const unlimited = await host({}, true);
   const { session: empty } = await json<{ session: SessionRecord }>(await start(member_, unlimited), 201);
   assert.equal(empty.repositoryMode, 'clone');
-  assert.match(empty.cloneUnavailable ?? '', /runs shell commands only for its owner/);
+  assert.match(empty.cloneUnavailable ?? '', /runs shell commands only for its owner and for members they granted host commands/);
   assert.match((await json<{ session: SessionRecord }>(await member_.request('GET', `/api/sessions/${empty.id}`))).session.cloneUnavailable ?? '', /only for its owner/);
   const { session: limited } = await json<{ session: SessionRecord }>(await start(member_, await host({ productionShell: true }, true)), 201);
   assert.equal(limited.cloneUnavailable, undefined);
+  // A host without the sandbox runs everyone's commands, as its owner accepted.
+  const { session: unsandboxed } = await json<{ session: SessionRecord }>(await start(member_, await host({ sandbox: false, unsandboxed: true }, true)), 201);
+  assert.equal(unsandboxed.cloneUnavailable, undefined);
   // A connector from before sessions cloned can't run one.
   await denied(await start(admin, await host({ plainGit: undefined }, false)), 409, 'connector_update_required');
   // A session started from a saved agent without bash, before agents were removed, works in an empty worktree too.
@@ -1138,6 +1155,38 @@ test('every session clones: older connectors are refused, and a session whose ag
   assert.equal(filesOnly.repositoryMode, 'clone');
   assert.match(filesOnly.cloneUnavailable ?? '', /doesn't have the bash tool/);
   assert.throws(() => f.sqlite.prepare("UPDATE sessions SET repository_mode = NULL WHERE id = ?").run(own.id), /immutable/);
+});
+
+test('a member granted host commands clones on a host without resource limits, once its connector honors that, while the grant lasts', async t => {
+  const f = await fixture(t); github(t);
+  const admin = await f.client('admin'); const member_ = await f.client('member');
+  const team = await workspace(admin);
+  await member(admin, team.id, member_);
+  await bindRepository(admin, team.id);
+  provisionHub(f);
+  const host = async (capabilities: Record<string, unknown>) => {
+    const connector = await connect(f, admin, { models: manifest.models, capabilities: { ...manifest.capabilities, hostCommands: true, hostGrants: true, ...capabilities } });
+    await json(await admin.request('PUT', `/api/connectors/${connector.connectorId}/shares/${team.id}`));
+    await json(await admin.request('PUT', `/api/connectors/${connector.connectorId}/host-grants/${team.id}`, { level: 'approve', userId: member_.user.id }));
+    return connector;
+  };
+  const start = async (connector: { connectorId: string }) => {
+    const { models } = await json<{ models: ModelDefinition[] }>(await member_.request('GET', `/api/workspaces/${team.id}/models`));
+    const model = models.find(item => item.connectorId === connector.connectorId)!;
+    const { session } = await json<{ session: SessionRecord }>(await member_.request('POST', '/api/sessions', {
+      workspaceId: team.id, modelId: model.id, title: 'Clone', trustedConnectorId: connector.connectorId,
+    }), 201);
+    return session;
+  };
+  // Neither host has resource limits; the member holds a host command grant on both.
+  const current = await host({ unboundedShellGrants: true });
+  const older = await host({});
+  const session = await start(current);
+  assert.equal(session.cloneUnavailable, undefined);
+  assert.match((await start(older)).cloneUnavailable ?? '', /only for its owner and for members they granted host commands/);
+  // The grant is checked on each read: once it ends, the session says why it can't clone.
+  assert.equal((await admin.request('DELETE', `/api/connectors/${current.connectorId}/host-grants/${team.id}?userId=${member_.user.id}`)).status, 204);
+  assert.match((await json<{ session: SessionRecord }>(await member_.request('GET', `/api/sessions/${session.id}`))).session.cloneUnavailable ?? '', /only for its owner/);
 });
 
 test('a session that pinned its repositories is read-only: it shows, and nothing runs or is approved in it', async t => {

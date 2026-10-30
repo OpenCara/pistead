@@ -1,6 +1,6 @@
 import {
-  accessUnavailable, activeStatuses, chatOptionsBody, decidesHostCommands, HOST_COMMAND_WAITING, initialSelection, isHostCommand, modelUnavailable,
-  mustConfirmAutoApprove, preparingRepositories, segment, type ChatSelection,
+  accessUnavailable, activeStatuses, chatOptionsBody, copyText, decidedAsHostCommand, decidesHostCommand, hostCommandWaiting, initialSelection, isHostCommand,
+  messageCut, modelUnavailable, mustConfirmAutoApprove, preparingRepositories, resendText, rewindable, segment, type ChatSelection,
 } from "@pistead/client";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
@@ -10,13 +10,14 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View, type NativeScrollEvent, type NativeSyntheticEvent } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { ConnectorInfo } from "../../../../packages/shared/src/connector";
+import { managesSession } from "../../../../packages/shared/src/policy";
 import { redactSecrets, REDACTED } from "../../../../packages/shared/src/redaction";
 // Brings in `SessionRecord.linkShared`, which link sharing declares there.
 import type {} from "../../../../packages/shared/src/sharing";
-import type { ApprovalRecord, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
+import type { ApprovalRecord, EntryView, SessionRecord, SessionView as LiveView, SubmitResult, UserProfile } from "../../../../packages/shared/src/types";
 import { useAppData } from "../lib/app-data";
 import { useSession } from "../lib/auth";
-import { saveDraft, takeDraft } from "../lib/drafts";
+import { forgetSentDraft, readDraft, saveDraft, useDraft } from "../lib/drafts";
 import { useKeyboardVisible, useOpenSession } from "../lib/layout";
 import { useLiveSession } from "../lib/live-session";
 import { PeopleProvider, useUsername, useWorkspacePeople } from "../lib/people";
@@ -27,7 +28,7 @@ import { ChatOptionsBar, useConfirmAutoApprove } from "./ChatOptionsBar";
 import { Composer } from "./Composer";
 import { RepositoryPreparationCard } from "./RepositoryPreparation";
 import { TranscriptEntry } from "./TranscriptEntry";
-import { Badge, Banner, Button, Chip, EmptyState, Feedback, IconButton, Loading, OptionSheet, styles as ui } from "./ui";
+import { Badge, Banner, Button, Chip, confirm, EmptyState, Feedback, IconButton, Loading, OptionSheet, styles as ui, type Option } from "./ui";
 
 /**
  * One session: live transcript, pending approvals and the chat box. `embedded` renders its own title bar (the wide
@@ -66,7 +67,10 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   // Everyone a session names (owner, host owner, writers, approvers) is or was a member of its workspace.
   const people = useWorkspacePeople(known?.workspaceId ?? null);
   const title = known?.title ?? "Session";
-  const workspaceName = known && workspaces.find(workspace => workspace.id === known.workspaceId)?.name;
+  const workspace = known && workspaces.find(item => item.id === known.workspaceId);
+  const workspaceName = workspace?.name;
+  // Its owner, and its workspace's owner and admins, unarchive it; the server decides.
+  const manages = Boolean(session && managesSession(user.id, session.ownerId, workspace?.role));
   const approvals = view?.approvals ?? [];
   const pendingCount = approvals.filter(approval => approval.status === "pending").length;
 
@@ -75,9 +79,22 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
   useEffect(() => { setLiveActivity(viewActivity ? { sessionId: id, activity: viewActivity } : null); }, [id, viewActivity, setLiveActivity]);
   useEffect(() => () => { setLiveActivity(null); refreshSessions(); }, [setLiveActivity, refreshSessions]);
 
+  /**
+   * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
+   * command, as every command of a session that runs on its host is, needs host command authority, and so does a command
+   * without the host's missing resource limits in a member's session (see decidedAsHostCommand and decidesHostCommand:
+   * the host's owner decides host_bash without approve permission here); everything else, approve permission.
+   */
+  function decides(approval: ApprovalRecord): boolean {
+    if (readOnly) return false;
+    if (decidedAsHostCommand(approval.operation, session ?? {}, approval.unbounded)) return decidesHostCommand(approval.operation, session ?? {}, host, user.id, permissions.includes("approve"));
+    const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
+    return canApprove && (!ownerOnly || isOwner);
+  }
+
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
-    if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
+    if (!decides(approval) || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
     // The card is the prompt: it shows the exact operation, who it runs as, its resource limits and any unsandboxed-host warning, so a tap decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
@@ -116,14 +133,12 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
 
   const pendingApprovalCard = (approval: ApprovalRecord) => {
     const permission = approval.operation.kind === "permission";
-    // Only the session owner can let a call do more than the session allows. A host command, as every command of a
-    // session that runs on its host is, is decided by its host's owner or a member granted host commands.
     const hostCommand = isHostCommand(approval.operation, session ?? {});
+    const hostDecided = decidedAsHostCommand(approval.operation, session ?? {}, approval.unbounded);
     const ownerOnly = permission || approval.operation.kind === "git.repin";
-    const decides = canApprove && (hostCommand ? decidesHostCommands(session ?? {}, host, user.id) : !ownerOnly || isOwner);
     const disabled = approvalAction.busy || !approval.reviewHash;
     return <ApprovalCard approval={approval} key={approval.id}>
-      {decides ? <>
+      {decides(approval) ? <>
         {!approval.reviewHash && <Banner tone="warning" title="No verified review commitment" actions={<Button small label="Refresh approval" disabled={approvalAction.busy} onPress={live.refresh} />}>
           Refresh before deciding; the server must bind the displayed operation and requester.
         </Banner>}
@@ -142,7 +157,7 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
           </Text>
         </>}
       </> : <Text style={[ui.small, { color: palette.muted }]}>
-        {hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
+        {hostDecided ? hostCommandWaiting(approval.operation, host) : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}
       </Text>}
     </ApprovalCard>;
   };
@@ -161,8 +176,8 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
       <SessionPeople session={session} host={host} />
     </View>}
     {(archived || (live.error && !startFailed) || action.error || action.notice) && <View style={styles.alerts}>
-      {archived && <Banner title="Archived" actions={isOwner && <Button small label="Unarchive" disabled={action.busy} onPress={unarchive} />}>
-        {`This session is read-only. ${isOwner ? "Unarchive it to continue the work." : "Only its owner can unarchive it."}`}
+      {archived && <Banner title="Archived" actions={manages && <Button small label="Unarchive" disabled={action.busy} onPress={unarchive} />}>
+        {`This session is read-only. ${manages ? "Unarchive it to continue the work." : "Only its owner, or the workspace's owner or an admin, can unarchive it."}`}
       </Banner>}
       {live.error && !startFailed && <Banner tone="danger" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button small label="Reconnect and check access" onPress={live.reconnect} />}>
         {live.error}
@@ -172,7 +187,8 @@ export function SessionView({ id, embedded }: { id: string; embedded: boolean })
     {!view ? (!live.error ? <Loading />
       : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
       : <View style={ui.flex} />)
-      : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
+      : session && <Conversation id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh} loadOlder={live.loadOlder}
+        openSession={target => { refreshSessions(); openSession(target); }}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={() => { live.refresh(); refreshSessions(); }} />}
@@ -238,8 +254,9 @@ function ApprovalsSheet({ visible, approvals, olderApprovals, onClose, onOpenSes
   </Modal>;
 }
 
-function Conversation({ id, user, session, view, host, stale, refresh, pinned }: {
-  id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode;
+function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, openSession, pinned }: {
+  id: string; user: UserProfile; session: SessionRecord; view: LiveView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void;
+  loadOlder: (conversationId: string) => Promise<void>; openSession: (id: string) => void; pinned: ReactNode;
 }) {
   const { api } = useSession();
   const { rememberChat, autoApproveConfirmed } = useAppData();
@@ -251,8 +268,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   // Initialised once per session (the view remounts per id); view refreshes never reset the user's picks.
   const [selection, setSelection] = useState<ChatSelection>(() => initialSelection(view, owner));
   const [mode, setMode] = useState<"write" | "ask">("write");
-  // A first message that failed to send from the new-session screen is handed over here.
-  const [content, setContent] = useState(() => takeDraft(id));
+  // The unsent text is remembered until it is sent, so switching to another session and back keeps it; a first message
+  // that failed to send from the new-session screen is handed over the same way.
+  const [content, setContent] = useDraft(id);
   const [conversationId, setConversationId] = useState("");
   const [pickingConversation, setPickingConversation] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
@@ -285,6 +303,17 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     if (actualMode === "ask") return conversation?.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || entry.conversationId === conversationId);
     return conversation?.mode !== "ask";
   });
+  // In a workspace that loads transcripts latest first: the shown conversations with earlier entries still to read.
+  const olderConversations = conversations.filter(conversation => (conversation.olderEntries ?? 0) > 0 && (actualMode === "ask"
+    ? conversation.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || conversation.id === conversationId)
+    : conversation.mode !== "ask"));
+  const olderCount = olderConversations.reduce((total, conversation) => total + (conversation.olderEntries ?? 0), 0);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  function loadEarlier() {
+    if (loadingOlder || !olderConversations.length) return;
+    setLoadingOlder(true);
+    void Promise.all(olderConversations.map(conversation => loadOlder(conversation.id))).finally(() => setLoadingOlder(false));
+  }
 
   // FlatList's own scrollToEnd measures the footer from a layout event that can arrive after the content grew, which
   // leaves a new approval card (in the footer) below the fold; the native scroll view knows the real content end.
@@ -330,7 +359,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
       if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
-      setContent(current => current === sent ? "" : current);
+      // Through the draft, not this box's state: the box may have unmounted, and another opened, while it was in flight.
+      forgetSentDraft(id, sent);
       request.current = null;
       refresh();
     });
@@ -341,6 +371,62 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     void stopping.run(async () => {
       await api(`/api/sessions/${segment(id)}/stop`, { method: "POST", body: {} });
       refresh();
+    });
+  }
+
+  // A message's actions: copy it; go back to it, for anyone who drives the work; fork a new session from it, for the
+  // owner. Going back and forking take the shared conversation, on a host that offers them (see messageCut).
+  const rewinding = useAction();
+  // The entry stays chosen once its sheet closes: on iOS the choice applies after that (see OptionSheet).
+  const [chosen, setChosen] = useState<EntryView | null>(null);
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const showActions = useCallback((entry: EntryView) => { setChosen(entry); setActionsOpen(true); }, []);
+  const working = view.busy || activeQueue.length > 0;
+  const cut = chosen && rewindable(view) && actualMode === "write" && !readOnly ? messageCut(chosen) : undefined;
+  const messageOptions: Option<"copy" | "revert" | "fork">[] = chosen ? [
+    { value: "copy", label: "Copy message" },
+    ...(cut && canWrite ? [{ value: "revert" as const, label: cut.before ? "Go back to before this message" : "Go back to this reply", destructive: true,
+      hint: working ? "Stop the session's work first" : "Later messages leave the conversation; files stay as they are" }] : []),
+    ...(cut && owner ? [{ value: "fork" as const, label: "Fork a new session from here", hint: "A new session with the conversation up to here" }] : []),
+  ] : [];
+
+  function messageAction(choice: "copy" | "revert" | "fork") {
+    const entry = chosen;
+    if (!entry) return;
+    if (choice === "copy") { void rewinding.run(async () => { await Clipboard.setStringAsync(copyText(entry)); }, "Message copied"); return; }
+    const target = messageCut(entry);
+    if (!target || rewinding.busy) return;
+    if (choice === "revert") void revert(entry, target.entryId, target.before);
+    else void fork(entry, target.entryId, target.before);
+  }
+
+  async function revert(entry: EntryView, entryId: string, before: boolean) {
+    if (working) { void rewinding.run(async () => { throw new Error("Stop the session's work to go back to an earlier message."); }); return; }
+    const confirmed = await confirm({
+      title: before ? "Go back to before this message?" : "Go back to this reply?",
+      message: `${before ? "This message and everything after it leave" : "Everything after this reply leaves"} the shared conversation, for everyone, and the agent continues from there.${before ? " The message goes back into your chat box, when it's empty, to edit and send again." : ""} Only the conversation goes back: files, commits and pushes stay as they are.`,
+      confirmLabel: "Go back", destructive: true,
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      await api(`/api/sessions/${segment(id)}/revert`, { method: "POST", body: { entryId } });
+      if (before && !readDraft(id).trim()) setContent(resendText(entry));
+      stick.current = true;
+      refresh();
+    });
+  }
+
+  async function fork(entry: EntryView, entryId: string, before: boolean) {
+    const confirmed = await confirm({
+      title: "Fork a new session from here?",
+      message: `A new session of yours starts on the same host and model with this conversation up to ${before ? "just before this message, which goes into its chat box" : "this reply"}. This session stays as it is. Like every new session, the fork's worktree starts empty: its agent clones the workspace's repositories again.`,
+      confirmLabel: "Fork session",
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      const result = await api<{ session: SessionRecord }>(`/api/sessions/${segment(id)}/fork`, { method: "POST", body: { entryId } });
+      if (before) saveDraft(result.session.id, resendText(entry));
+      openSession(result.session.id);
     });
   }
 
@@ -359,11 +445,15 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   return <>
     <FlatList ref={list} style={ui.flex} data={entries} keyExtractor={entry => entry.id}
       contentContainerStyle={[styles.transcript, !entries.length && styles.grow]}
-      renderItem={({ item }) => <TranscriptEntry entry={item} userId={user.id} />}
+      renderItem={({ item }) => <TranscriptEntry entry={item} userId={user.id} onActions={showActions} />}
       ItemSeparatorComponent={Separator}
       ListEmptyComponent={<EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>
         {actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}
       </EmptyState>}
+      ListHeaderComponent={olderCount > 0 ? <Button small variant="ghost" icon="chevron-up" busy={loadingOlder} onPress={loadEarlier}
+        label={`Show earlier messages (${olderCount})`} testID="load-earlier" /> : undefined}
+      // Earlier entries arrive above what the reader is looking at, which stays where it is.
+      maintainVisibleContentPosition={olderCount > 0 || loadingOlder ? { minIndexForVisible: 0 } : undefined}
       ListFooterComponent={<View style={styles.pinned}>{pinned}</View>}
       onScrollEndDrag={onScrollEnd} onMomentumScrollEnd={onScrollEnd} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled"
       onContentSizeChange={() => { if (stick.current) toEnd(); }}
@@ -407,8 +497,9 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       {draftHasSecret && <Text testID="draft-secret" style={[ui.small, { color: palette.muted }]} accessibilityLiveRegion="polite">
         This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.
       </Text>}
-      <Feedback error={submission.error || stopping.error} />
+      <Feedback error={submission.error || stopping.error || rewinding.error} notice={rewinding.notice} />
     </View>
+    <OptionSheet<"copy" | "revert" | "fork"> visible={actionsOpen} title="Message" options={messageOptions} onClose={() => setActionsOpen(false)} onSelect={messageAction} />
     <OptionSheet<string> visible={pickingConversation} title="Side conversation" value={conversationId} onClose={() => setPickingConversation(false)} onSelect={setConversationId}
       options={[{ value: "", label: "All my side asks" }, ...sideConversations.map((conversation, index) => ({ value: conversation.id, label: `Side ask ${index + 1}`, hint: conversation.id.slice(0, 8) }))]} />
   </>;
@@ -427,7 +518,7 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
   const palette = usePalette();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardVisible();
-  const [content, setContent] = useState("");
+  const [content, setContent] = useDraft(id);
   const request = useRef<{ content: string; id: string } | null>(null);
   const action = useAction();
   const failed = session.status === "error" || session.status === "provisioning";
@@ -449,7 +540,7 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
         throw reason;
       }
       request.current = null;
-      setContent("");
+      forgetSentDraft(id, sent);
       recovered();
     });
   }

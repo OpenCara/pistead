@@ -1,8 +1,9 @@
 import { parseArgs } from "node:util";
 import { z } from "zod";
 import { createConnector, controlPlaneOrigin, type LocalConnector } from "./connector.js";
-import { assertConnectorPlatform, assertPrerequisites, checkPrerequisites, defaultStateDir, loadConnectorModels, savedPairing, unsandboxedWarning } from "./connect-setup.js";
-import { pairingCodePattern, pairingIdPattern, type HostError, type HostErrorCode, type HostEvent, type HostInspection, type HostRequest, type HostState, type Prerequisite, type StartRequest } from "./desktop-protocol.js";
+import { assertConnectorPlatform, assertPrerequisites, defaultStateDir, hostIsolation, loadConnectorModels, savedPairing, unsandboxedWarning } from "./connect-setup.js";
+import { parentTransport } from "./desktop-transport.js";
+import { pairingCodePattern, pairingIdPattern, type HostError, type HostErrorCode, type HostEvent, type HostInspection, type HostRequest, type HostState, type StartRequest } from "./desktop-protocol.js";
 import { RunnerLeaseBusyError } from "./lease.js";
 import { ConnectorSetupError } from "./protocol.js";
 
@@ -28,35 +29,6 @@ const hostRequestSchema: z.ZodType<HostRequest> = z.discriminatedUnion("type", [
   z.object({ type: z.literal("stop"), id: requestId }).strict(),
 ]);
 
-interface Transport {
-  send(event: HostEvent): void;
-  onMessage(listener: (value: unknown) => void): void;
-  onClose(listener: () => void): void;
-}
-
-/** Electron's utilityProcess `process.parentPort`. */
-interface ParentPort {
-  postMessage(message: unknown): void;
-  on(event: "message", listener: (event: { data: unknown }) => void): void;
-}
-
-function parentTransport(): Transport {
-  const candidate = "parentPort" in process ? process.parentPort : undefined;
-  if (candidate && typeof candidate === "object" && "postMessage" in candidate && "on" in candidate) {
-    // Shape checked above; Electron documents postMessage and on("message") with MessageEvent-like { data }.
-    const port = candidate as ParentPort;
-    // Electron tears a utility process down with its parent, so only Node's channel reports a close.
-    return { send: event => port.postMessage(event), onMessage: listener => port.on("message", event => listener(event.data)), onClose: () => {} };
-  }
-  const send = process.send?.bind(process);
-  if (!send) throw new Error("The desktop host must be started by the Pistead app");
-  return {
-    send: event => { if (process.connected) send(event); },
-    onMessage: listener => process.on("message", listener),
-    onClose: listener => process.once("disconnect", listener),
-  };
-}
-
 /** Only connector-authored text crosses to the app: SDK and HTTP errors can carry auth or configuration detail. */
 function hostError(error: unknown, fallback: string): HostError {
   if (error instanceof HostFailure) return { code: error.code, message: error.message };
@@ -67,28 +39,19 @@ function hostError(error: unknown, fallback: string): HostError {
 
 const { values } = parseArgs({ args: process.argv.slice(2), strict: true, allowPositionals: false, options: { "state-dir": { type: "string" } } });
 const stateDir = values["state-dir"] ?? defaultStateDir();
-const transport = parentTransport();
+const transport = parentTransport<HostEvent>();
 let running: { connector: LocalConnector; stopRequested: boolean } | undefined;
 
 function emit(event: HostEvent): void { transport.send(event); }
 function log(level: "info" | "warning" | "error", message: string): void { emit({ type: "log", level, message }); }
 function status(state: HostState, detail: { server?: string; unsandboxed?: boolean } = {}): void { emit({ type: "status", state, ...detail }); }
 
-/** Sandboxed only on Linux with every sandbox prerequisite; anything else runs unsandboxed after explicit consent. */
-async function isolation(): Promise<{ mode: HostInspection["mode"]; sandboxPrerequisites?: Prerequisite[]; prerequisites: Prerequisite[] }> {
-  if (process.platform !== "linux") return { mode: "unsandboxed", prerequisites: await checkPrerequisites(true) };
-  const sandboxPrerequisites = await checkPrerequisites(false);
-  return sandboxPrerequisites.every(item => item.ok)
-    ? { mode: "sandboxed", sandboxPrerequisites, prerequisites: sandboxPrerequisites }
-    : { mode: "unsandboxed", sandboxPrerequisites, prerequisites: await checkPrerequisites(true) };
-}
-
 async function inspect(allowFaux = false, allowInsecureLoopback = false): Promise<HostInspection> {
   try { assertConnectorPlatform(); }
   catch (error) {
     return { platform: process.platform, stateDir, unsupported: hostError(error, "This computer cannot run the Pistead host.").message, mode: "unsandboxed", prerequisites: [], models: [] };
   }
-  const { mode, sandboxPrerequisites, prerequisites } = await isolation();
+  const { mode, sandboxPrerequisites, prerequisites } = await hostIsolation();
   const inspection: HostInspection = { platform: process.platform, stateDir, mode, prerequisites, models: [] };
   if (sandboxPrerequisites) inspection.sandboxPrerequisites = sandboxPrerequisites;
   if (mode === "unsandboxed") inspection.unsandboxedWarning = unsandboxedWarning();
@@ -106,7 +69,7 @@ async function start(request: StartRequest): Promise<void> {
   if (running) throw new HostFailure("already-running", "The host is already running.");
   try { assertConnectorPlatform(); }
   catch (error) { throw new HostFailure("unsupported", hostError(error, "This computer cannot run the Pistead host.").message); }
-  const { mode, prerequisites } = await isolation();
+  const { mode, prerequisites } = await hostIsolation();
   const unsandboxed = mode === "unsandboxed";
   if (unsandboxed && request.unsandboxedConsent !== true) throw new HostFailure("consent-required", "This computer has no isolated sandbox: running the host needs your consent to run agent work directly on it.");
   assertPrerequisites(prerequisites, unsandboxed, "");

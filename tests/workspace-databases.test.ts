@@ -419,8 +419,11 @@ test('backups of a workspace with its own database are saved and read back there
   assert.equal(download.status, 200);
   assert.equal(await download.text(), f.snapshot);
   assert.deepEqual(f.databases.loads, [{ id: backup.id, sessionId: 'session', size: backup.size }]);
-  // Connecting the database gives the workspace owner no access to the member's backups through Pistead.
-  assert.equal((await f.request('GET', downloadPath, 'test:owner')).status, 404);
+  // Connecting the database gives the workspace owner no access to the member's backups through Pistead, and neither
+  // does managing the member's session: its backups stay its owner's.
+  const ownerDownload = await f.request('GET', downloadPath, 'test:owner');
+  assert.equal(ownerDownload.status, 403);
+  assert.equal(await code(ownerDownload), 'owner_required');
   // A snapshot changed in the workspace database no longer matches the digest the control plane recorded.
   saved.snapshot = new TextEncoder().encode(f.snapshot.replace('Instructions', 'Instructionz'));
   assert.equal((await f.request('GET', downloadPath, 'test:member')).status, 502);

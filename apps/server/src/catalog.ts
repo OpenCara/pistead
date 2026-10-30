@@ -96,6 +96,15 @@ function modelAccessSQL(actor: 'member.user_id' | 'actor.user_id' | 'a.author_id
     ))`;
 }
 
+/** The models of a workspace the actor may start a session on now, oldest first, as its New session lists them. */
+export async function usableModels(env: Env, workspaceId: string, actorId: string): Promise<ModelRow[]> {
+  return env.DB.query<ModelRow>(`SELECT m.* FROM models m
+    INNER JOIN workspace_members actor ON actor.workspace_id = m.workspace_id AND actor.user_id = ?
+    WHERE m.workspace_id = ? AND ${modelAccessSQL('actor.user_id')}
+    ORDER BY m.created_at, m.id LIMIT 1000`)
+    .bind(actorId, workspaceId, testMode(env) ? 1 : 0, testMode(env) ? 1 : 0).all();
+}
+
 export async function requireModel(env: Env, modelId: string, actorId: string): Promise<ModelRow> {
   const usable = (disabled: 'excluded' | 'included') => env.DB.query<ModelRow>(`SELECT m.* FROM models m
     INNER JOIN workspace_members member ON member.workspace_id = m.workspace_id AND member.user_id = ?
@@ -160,6 +169,9 @@ function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
   if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
   if (tool === 'github_issue') return capabilities.githubIssues === true;
   if (tool === 'source_read') return capabilities.sources === true;
+  if (tool === 'schedule') return capabilities.schedules === true;
+  if (tool === 'sessions') return capabilities.crossSessions === true;
+  if (tool === 'web_fetch' || tool === 'web_search') return capabilities.web === true;
   return true;
 }
 
@@ -364,12 +376,7 @@ export function registerCatalog(app: Hono<WorkerEnv>): void {
     const workspaceId = identifier(c.req.param('id'), 'workspaceId');
     const actorId = c.get('auth').userId;
     await requireMember(c.env, workspaceId, actorId);
-    const result = await c.env.DB.query<ModelRow>(`SELECT m.* FROM models m
-      INNER JOIN workspace_members actor ON actor.workspace_id = m.workspace_id AND actor.user_id = ?
-      WHERE m.workspace_id = ? AND ${modelAccessSQL('actor.user_id')}
-      ORDER BY m.created_at, m.id LIMIT 1000`)
-      .bind(actorId, workspaceId, testMode(c.env) ? 1 : 0, testMode(c.env) ? 1 : 0).all();
-    return c.json({ models: result.map(modelDefinition) });
+    return c.json({ models: (await usableModels(c.env, workspaceId, actorId)).map(modelDefinition) });
   });
 
   app.post('/api/workspaces/:id/models', async c => {

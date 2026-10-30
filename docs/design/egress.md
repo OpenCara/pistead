@@ -15,7 +15,8 @@ The rules this keeps from today:
 
 - **No credential enters the sandbox.** A sandboxed process can read and send anything it holds, so it holds none.
 - **Session owners read with their own accounts.** On a shared host the host owner's credentials never serve other
-  members' sessions, and owners' tokens never reach other people's hosts.
+  members' sessions, and owners' tokens never reach other people's hosts. (Since direct transfers, below, the control plane may give
+  a host a token that can only read one repository; the owner's own account still reaches only the owner's own hosts.)
 - **Policy is enforced where the agent can't change it:** in the runner, outside the sandbox, and in the control plane.
 
 ## Phases
@@ -25,7 +26,7 @@ The rules this keeps from today:
    follows a per-workspace network policy (off, allowlist, open).
 2. **Repositories on demand, no pins.** Sessions start empty; the agent clones what it needs with plain Git. The
    commits served and pushed are recorded for audit instead of pins. Branches are plain Git.
-3. **Host cache.** A bare mirror per repository on the host, filled by the proxy and mounted read-only into sandboxes
+3. **Host cache.** A bare mirror per repository on the host, filled by the host and mounted read-only into sandboxes
    authorized for it; sessions borrow its objects through `objects/info/alternates` (a `git` shim adds
    `--reference-if-able` to clones of bound repositories). Keep refs per live session, prune with a grace period,
    `pistead cache add` / `pistead cache prune`. Sparse checkout and partial clone served from the mirror.
@@ -106,7 +107,8 @@ it for a minute, and keeps a stale one for up to five minutes if the control pla
 
 A session is created as a **clone session** (`sessions.repository_mode = 'clone'`, `SessionRecord.repositoryMode`) when
 its host's connector advertises `plainGit` (sandboxed connectors of this version) and can run the session owner's shell
-commands: the host has resource limits (`productionShell`), or the owner is the host's owner. The session's agent must
+commands: the host has resource limits (`productionShell`), or the owner is the host's owner (or, since, holds a host
+command grant there, on a connector advertising `unboundedShellGrants`). The session's agent must
 also have `bash` (a session started from a model always does). Shell access is what cloning needs, so elsewhere
 sessions keep pinning as before, and an agent with only file and Git tools keeps its pinned snapshots; phase 5
 revisits that. The mode is immutable like the pins
@@ -152,23 +154,35 @@ the insert, but resolves nothing with the owner's accounts. The relay checks the
 Hosts whose configuration keeps a repository cache keep one bare mirror per repository ([repository-cache.md](repository-cache.md)),
 which pinned sessions were checked out of until phase 5. Clone sessions borrow from the same mirrors.
 
-- **Filled through the relay.** `RepositoryCache.refresh` fetches every branch and tag the remote advertises that the
-  mirror lacks, with a `GitRemote` whose `fetch` is `relayFetch`: every read goes through the control plane's relay,
-  with the session owner's own account and the relay's checks. Refreshes are serialized per repository with a lock,
-  and report progress.
-- **Asked for by the clone.** Clone sessions' shell commands get a `git` shim first on `PATH`. For `git clone` of a
-  URL, it asks the proxy's `/__pistead/mirror?remote=…` (up to 20 seconds), which maps the URL to a workspace
-  repository, refreshes its mirror and answers its path in the sandbox; the shim then adds `--reference-if-able`.
-  Clones that already chose `--reference`, `--shared` or `--dissociate`, and everything else, run Git unchanged.
+- **Filled with the host's own Git credentials.** Before a session asks for a mirror, the relay lists the repository's
+  branches and tags with the session owner's own account, which confirms they may read it. `RepositoryCache.refresh`
+  then fetches the history of the listed tips the mirror lacks straight from the provider, with the credential Git on
+  the host would use (or anonymously, for a public repository on a host without one), and mirrors that listing. No
+  pack goes through the relay for the cache. Refreshes are serialized per repository with a lock, report progress, and
+  try again after a failure another attempt may get past.
+- **Waited for by the clone.** Clone sessions' shell commands get a `git` shim first on `PATH`. For `git clone` of a
+  URL, it asks the proxy's `/__pistead/mirror?remote=…`, which maps the URL to a workspace repository, confirms the
+  owner's access, makes its mirror ready (`RepositoryCache.ready`) and answers its path in the sandbox, streaming the
+  fill's progress until then (one JSON object per line, with a heartbeat); the shim then adds `--reference-if-able`.
+  A mirror's first fill is waited for however long it takes, and the shim says so on stderr: the clone never downloads
+  the repository through the relay beside it. The fill goes on if the command stops (its time limit, say), so running
+  the clone again picks it up. A mirror filled before is refreshed first, but borrowed as it is after 10 seconds. Only a
+  mirror the host can't fill at all (its credential can't read the repository, or the relay's listing of it fails the
+  same way every time) lets the clone go ahead without it, with the reason. A dropped connection is asked again while
+  the fill goes on, and so, twice, is a failure another attempt may get past (answered with `retry`: the relay was busy,
+  failing or too slow to list the repository just now, or the host's download kept breaking off); a mirror that stays
+  unavailable stops the clone, to be run again. Relayed reads keep to their caller's time limit (`relayFetch` honours
+  its signal), so a relay that hangs is a failure to ask again rather than a wait without end. Clones that already chose `--reference`, `--shared` or `--dissociate`, and
+  everything else, run Git unchanged.
 - **Mounted only while authorized.** A mirror is mounted read-only at `/repository-mirrors/<provider>/<host>/<id>.git`
   (`mirrorPath`) for shell commands and for the steps that run Git in a clone (`clone-head`, `clone-push-*`; a
-  borrowing clone can't read its objects without it). It is mounted only while the repository is in the session's
-  grant and the relay let the owner read it in the last 10 minutes: after this open's refresh of it, or, for a mirror
-  that already existed when the session was reopened, after a ref listing through the relay confirms it (asked for
-  again every 10 minutes, at the next step that needs it). A refusal from the relay (a 4xx other than a timeout or rate
-  limit), or the grant dropping the repository, unmounts it for the rest of the open; a timeout, a rate limit or an
-  outage only leaves it out of that step. Mounts are fixed when a step starts, so a mirror the session's
-  first clone created is visible from its next command on.
+  borrowing clone can't read its objects without it). Each open creates the mirror of every workspace repository the
+  host lacks, empty, before any command runs. It is mounted only while the repository is in the session's grant and the
+  relay let the owner read it in the last 10 minutes: after a ref listing through the relay confirms it, at the first
+  step that needs it and again every 10 minutes, or when a clone asks for it. A refusal from the relay (a 4xx other than
+  a timeout or rate limit), or the grant dropping the repository, unmounts it for the rest of the open; a timeout, a
+  rate limit or an outage only leaves it out of that step. Mounts are fixed when a step starts: a mirror the command's
+  step couldn't mount fails its clone with a message to run it again, rather than cloning without it.
 - **Kept and pruned.** Each refresh moves the session's keep ref (`refs/pistead/sessions/<hash>`) to a new commit whose
   parents are its previous keep commit and the branch tips it saw (500 per commit, chained), so the objects its clones
   borrowed stay reachable; each confirmation moves it on too (`touch`), dating its last use. `pistead cache prune
@@ -179,8 +193,8 @@ which pinned sessions were checked out of until phase 5. Clone sessions borrow f
 ### Not in phase 3
 
 - Shell commands still stop after the host's command time limit (30 seconds by default). A first clone of a big
-  repository can outlast that; its mirror keeps filling in the runner, so a later clone borrows from it.
-- Pre-filling a mirror without a session: every fill needs a session's owner and the relay.
+  repository can outlast that; its mirror keeps filling in the runner, so the clone run again borrows from it.
+- Pre-filling a mirror without a session: which repositories to fill, and when, needs a session to say.
 
 ## Phase 4: pushing the session branch
 
@@ -201,7 +215,7 @@ pushed it). Pinned sessions push only with `git_push`.
   or moves `refs/heads/<session branch>` (`sessionBranchRefusal`); anything else is answered as a forge answers it
   (`pushRejection`: `ng <ref> <reason>`, on side-band 1 when negotiated), so Git shows `! [remote rejected] … (reason)`.
   Git's probe before a chunked upload (a lone flush) is answered here. The pack then streams to the control plane as Git
-  sends it, up to 2 GiB. Closing the proxy (a session closing, as on a connector reconnect) waits for pushes under way,
+  sends it, up to 2 GiB. Closing the proxy (a session closing, as when its connector stops; a reconnect leaves sessions open) waits for pushes under way,
   within the relay's hour, so Git hears how one the forge took went.
 - **In the control plane** (`push/session-branch.ts`, behind the same relay route). Only clone sessions, and only while the
   owner holds `write` on them, no restore or move is pending, and the binding is still configured. As for an approved
@@ -245,9 +259,10 @@ clones that borrow from the host's mirror.
   list of pending clones are staged in the worktree's `.git/pistead-clones`, which shell commands see read-only.
 - **Opening the restored session.** Pending clones are cloned again in the background, as a cache host prepares pinned
   repositories, and runs wait for it. For each (`clone-restore`, with the proxy socket and the mirrors): its origin must
-  be one of the workspace's repositories; the mirror is refreshed through the relay where the host keeps a cache and
-  borrowed from; `git clone --no-checkout` goes through the proxy into a staging directory; commits the bundle builds on
-  that the origin no longer lists (a branch merged and deleted) are fetched by commit; the bundle is fetched; branches
+  be one of the workspace's repositories; where the host keeps a cache, the mirror is made ready (with the host's own Git
+  credentials, once the relay confirms the owner's access) and borrowed from; `git clone --no-checkout` goes through the
+  proxy into a staging directory; commits the bundle builds on that the origin no longer lists (a branch merged and
+  deleted) are fetched by commit; the bundle is fetched; branches
   and HEAD are set; the working tree is checked out from the backup commit and the index reset to HEAD, so the changes
   show as uncommitted again; and the clone is moved into place. A path already taken is never overwritten, unless it is
   this restoration's own result (a marker in its `.git`), left by a runner that stopped before updating the list. A
@@ -335,10 +350,120 @@ audited as `repository.lfs.updated`; the setting is in `WorkspaceRepository.lfs`
   sessions from before don't (their owner config is immutable). `git_push` is not offered there. Backups keep the
   worktree as files, so a session with a clone in its worktree can't be backed up: a clone's history has no bound.
 - **Sessions that can't clone.** An agent without `bash`, or another member's session on a host without resource limits
-  (whose shell commands are refused), works in an empty worktree. The session is created anyway, and its record says why
-  (`cloneUnavailable`, on creation and on single-session reads).
+  where they hold no host command grant (whose shell commands are refused), works in an empty worktree. The session is
+  created anyway, and its record says why (`cloneUnavailable`, on creation and on single-session reads, so a grant given
+  or ended later shows). A member holding a grant there runs commands without the limits the host lacks, as its owner
+  does in their own sessions, decided like host commands (`unboundedShellGrants`).
 - **Pinned sessions are read-only** (`frozenSession`: not a clone session, with pins). Every runner request but `view`,
   `events`, `create`, `restart` and `stop` (which open it to show its history, and end work) is refused
   (`session_frozen`), and so are push credentials, GitHub comments and merges, restores of their backups and moves.
   Opening one ends whatever it had queued or at work, and the cards waiting on decisions, as `interrupted`. Their transcript, approvals, backups (to download) and exports stay available; the session
   record says `frozen`, and the web and mobile apps offer nothing that would be refused.
+
+## Direct transfers: Git's data without the control plane
+
+Status: implemented. Relaying every pack, push and LFS object through the control plane spent its bandwidth twice per
+byte (from the forge, then down to the host), and big repositories or many sessions used it up quickly. Now the
+control plane still decides every Git request, but where it can give the host a credential limited enough for that
+host, the host's proxy makes the request at the forge itself.
+
+- **Asking** (`apps/runner/src/git-direct.ts`, `DirectGit`). The session's one Git choke point (`RunnerSession.relay`,
+  which serves the proxy and the host cache's mirror fills) first asks `POST /api/connectors/self/git/direct` (or
+  `/api/internal/git/direct` on the control plane's own runner) with `{ sessionId, bindingId, access }`, `access` being
+  `read`, `lfs` or `push`; a push's request also names its one command, which the proxy has read and checked
+  (`sessionBranchRefusal`). The answer (`GitDirectGrant`) is either `direct: false`, and the request is relayed as
+  before, or a remote, an `Authorization` header (null for none), what kind of credential it is, its expiry and how long
+  it may be reused. A runner configured with a relay of its own and no way to ask relays everything.
+- **Deciding** (`apps/server/src/network.ts`, `gitDirect`). The same authority as for a relayed request
+  (`gitAuthority`: the session, its owner, connector and connection, the binding, the owner's account), then:
+  - reads and LFS downloads verify the repository with the owner's account (`verifyRepository`, so renames and transfers
+    still fail closed) and, for LFS, the workspace's switch. A **public** repository is read without a credential, on
+    any host. A **private** one gets a GitHub App installation token limited to the repository and to `contents: read`
+    (`mintRepositoryReadToken`: the workspace's GitHub App push identity for the host, else the operator's app on
+    github.com), on any host; such tokens are shared while they have 20 minutes left. Without one, the **owner's own
+    account** serves only on the owner's own host or the control plane's own runner. Anything else is relayed.
+  - pushes of the session branch are direct only on the **owner's own host or the control plane's own runner**: a push
+    token can't be limited to one branch, and only the proxy enforces the session branch, so a host shared with the
+    workspace relays its pushes (answered before anything is minted). There, after the relay's own checks
+    (`sessionBranchTarget`: no restore pending, the binding, the owner able to push, the default-branch policy) and the
+    command's, the workspace's push identity is minted for each request. The owner's GitHub sign-in token (which would
+    have to be reset after leaving the server) and the host's own Git credentials stay relayed. A push's command is
+    audited as `git.push.session_branch` with `direct: true`; an installation token comes with its revocation, which the
+    host makes once the forge's answer has been read.
+  - `GIT_DIRECT` lets the operator choose: `on` (default), `own-hosts` (credentials only to owners' own hosts and the
+    control plane's runner; public repositories stay direct everywhere) or `off` (everything relayed).
+- **Transferring** (`packages/shared/src/git-transfer.ts`). The relay and the host make the same requests with the same
+  code: `gitUpstreamHeaders` (Git's own user agent, protocol and request types only), `fetchGit` (manual redirects,
+  fixed credential-free errors) and the LFS batch and download (`lfsProviderBatch`, `lfsDownload`: the credential only
+  for the provider's origin and only when the action brings none, an action's headers never across origins, exactly
+  the pointer's size). On the host, a download that points off the provider's own origin is made only when every address
+  of its name is public, as for the proxy's tunnels, since its content goes to the sandbox, and it connects to exactly
+  the addresses checked (`pinnedFetch`: its own agent, which never resolves the name again or takes a proxy from the
+  environment), so DNS rebinding can't send it elsewhere; otherwise it is relayed.
+  Direct answers keep the relay's form (a Git service's stream, the relay's LFS batch answer and
+  object content), so the proxy and the mirror fills don't change; an internal header marks them for the proxy's log,
+  `(direct <kind>)`, and never reaches the sandbox.
+- **Falling back.** A read grant is reused for a minute at most (`GIT_DIRECT_CACHE_SECONDS`) and never within five
+  minutes of its expiry; a push asks for each request. A read the forge fails is made again through the relay (its
+  request is whole in memory), and a host that can't reach the forge relays that repository for five minutes; an
+  older control plane, or a failed grant request, means relaying for a minute. A push the forge refuses is not retried:
+  its pack has been sent. Why a request was relayed after all shows in the proxy's log (`relayed: …`).
+
+What this gives up, and where: on a host shared with the workspace, the host's owner can take a read token while it
+lasts (an hour at most) and read that one repository with it, where before they could take nothing. Pushes, and the
+owner's own account, still never reach such a host. The sandbox still holds no credential, and LFS download links and
+their tokens still never reach it.
+
+## Credentialed APIs: `gh` without a token in the sandbox
+
+Status: implemented for api.github.com, reads only. Agents kept needing GitHub's API (a failed Actions run's log, a pull
+request's checks), and the only ways there were the brokers' fixed reads or `host_bash` with the host's own `gh` login,
+outside the sandbox. Putting a token in the sandbox would make it readable by everything that runs there (build scripts,
+and whatever a prompt injection in a repository or issue asks for), and every later command could use it. Instead the
+proxy adds the credential, the way the Git relay does, for a short list of hosts (`credentialedApiHosts`).
+
+- **In the sandbox.** `GH_TOKEN` and `GITHUB_TOKEN` hold `API_TOKEN_PLACEHOLDER`, so `gh` and GitHub's SDKs send their
+  requests at all. The session's CA bundle includes the connector's interception authority.
+- **The authority** (`apps/runner/src/interception-ca.ts`). An ECDSA P-256 key made in memory when the connector starts
+  and never written anywhere; a restart makes a new one, which sessions get when they next open (the bundle is written
+  at every open). Its certificate is name-constrained (critical `permittedSubtrees`) to `credentialedApiHosts`, so even
+  its key couldn't vouch for another host to OpenSSL, Go, Node.js or Python. It issues week-long leaf certificates per
+  host, with the extensions Python 3.13's strict verification requires (key identifiers, key usage). X.509 is written
+  as DER from Node's own keys and signatures, so no dependency is added.
+- **The proxy** (`apps/runner/src/egress.ts`, `apps/runner/src/api-access.ts`). A CONNECT to a credentialed API host is
+  answered by the proxy, whatever the network policy, and also where the grant lists no credential for it (`apis`: a
+  pinned session, `SANDBOX_GITHUB_API=off`, an older control plane), so the placeholder never reaches the API: TLS with the authority's
+  certificate, HTTP/1.1 only, the request's `Host` must match the CONNECT's. Each request is then checked: GET and HEAD
+  pass, and POST `/graphql` unless the document defines a mutation or subscription; anything else is refused with
+  GitHub's error shape, pointing at the approved tools. A `/repos/{owner}/{name}` path takes the credential that covers
+  that repository; GraphQL, the token of the installation whose account the query's `owner` variable names; anything
+  else, the first. A repository no credential covers, or a request carrying a credential of its own, goes on without
+  Pistead's credential only where the network policy allows the host. The proxy makes the request itself, at the API's
+  public addresses only and connected to exactly the addresses checked, and streams the answer back. GitHub's redirects
+  to its download hosts (`codeload.github.com`, `*.githubusercontent.com`, `*.blob.core.windows.net`) are followed
+  without the credential, so `gh run view --log` works with network access off; other redirects reach the client. Every
+  request is logged (kind `api`) with the credential it was made with.
+- **The credential** (`apps/server/src/api-access.ts`, `apiCredential`; `POST /api/connectors/self/api/credential` or
+  `/api/internal/api/credential`). The session's authority as for its Git requests (owner, not archived, connector and
+  connection), a clone session, then every github.com repository of the workspace verified with the owner's own account
+  (`verifyRepository`): only those the owner can read now, under the identity they were bound with, are covered.
+  `mintGitHubApiReadTokens` then asks the workspace's GitHub App (or the operator's) for one token per installation the
+  repositories belong to, limited to them and to reading the permissions `gh` needs that the installation has
+  (`actions`, `checks`, `contents`, `deployments`, `discussions`, `issues`, `metadata`, `pages`, `pull_requests`,
+  `statuses`), shared while it has 20 minutes left. The owner's own sign-in token is never handed out: it reaches
+  everything the owner can. The proxy reuses an answer for a minute at most (`API_CREDENTIAL_CACHE_SECONDS`), and an
+  unavailable one (no app, not installed, `SANDBOX_GITHUB_API=off`) is passed on as the reason for its refusals.
+- **`SANDBOX_GITHUB_API`**: `on` (default), `own-hosts` (tokens only to owners' own hosts and the control plane's
+  runner) or `off` (no `apis` in grants; api.github.com is a host like any other).
+
+What this gives up: as with direct Git reads, a host shared with the workspace could take a read token while it lasts
+(an hour at most) and read the workspace's repositories the owner can read with it. Reads through the token aren't
+limited to the workspace's repositories by the proxy for GraphQL and non-repository paths; the token's own repository
+scope is what limits them. Writes through the API wait for a way to approve one request of a running command; until
+then they stay with the brokers.
+
+### Not yet
+
+- **Approved writes**: a write the proxy holds until someone approves it, as the brokers' are.
+- **Other APIs**: Azure Resource Manager (`management.azure.com`, with a federated credential of the workspace's),
+  GitHub Enterprise Server, GitLab.

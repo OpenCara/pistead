@@ -3,15 +3,17 @@ import type { ModelDefinition, SessionRecord, Workspace } from "../../../package
 import { canCreateSessions } from "../../../packages/shared/src/policy";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
+import { AttachButton, AttachmentStrip, encodeImages, handOverImages, imagesUnavailable, useAttachments } from "./attachments";
 import {
   autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, mustConfirmAutoApprove, preferredSelection, readChatPreference, rememberChat, type ChatSelection,
 } from "./chat-options";
+import { writeDraft } from "./drafts";
 import { ConnectionStatus, HostCapabilities, useConnections } from "./hosts";
 import { Icon } from "./icons";
 import { useWorkspacePeople } from "./people";
 import { RepositoryClonePolicy, useWorkspaceRepositories } from "./repositories";
 import { href, navigate } from "./router";
+import { enterSends, isPhone } from "./touch";
 import { Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, IdentityBadge, InfoTip, LinkButton, Loading, PageLoading, useAction, useResource } from "./ui";
 import { usernameWithId } from "../../../packages/client/src/usernames";
 import "./new-session.css";
@@ -79,7 +81,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const [content, setContent] = useState("");
   const [visibility, setVisibility] = useState<Visibility>("workspace");
   const [trustedHost, setTrustedHost] = useState("");
-  // Where the session runs: in the sandbox, or directly on the host, which only its owner chooses where it accepts that.
+  // Where the session runs: in the sandbox, or directly on the host, which only its owner, or a member they granted that,
+  // chooses where it accepts that.
   const [onHost, setOnHost] = useState(false);
   const action = useAction();
   const input = useRef<HTMLTextAreaElement>(null);
@@ -113,7 +116,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const repositories = repos.repositories;
   const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repos.sourceCount || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
-  const hostSessions = Boolean(host?.hostSessions && host.ownerId === user.id);
+  // The listing offers it to the host's owner, and to members whose grant in this workspace includes it.
+  const hostSessions = Boolean(host?.hostSessions);
   const runOnHost = hostSessions && onHost;
   const unsandboxed = Boolean(host?.capabilities.unsandboxed || runOnHost);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
@@ -161,7 +165,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
             ...(images.length ? { images } : {}) } });
         } catch {
           // The session exists; keep the unsent text and images for its composer instead of failing the start.
-          writeStorage(() => sessionStorage, `pistead.draft.${sessionId}`, message);
+          writeDraft(sessionId, message);
           handOverImages(sessionId, pasted);
         }
       }
@@ -170,8 +174,12 @@ function Composer({ workspace }: { workspace: Workspace }) {
     });
   }
 
+  // On a phone Enter adds a line, and the send button starts the session (touch.ts).
+  const [sendsOnEnter] = useState(() => enterSends());
+  // Nor does a phone open its keyboard over the screen before the task is even read.
+  const [focusOnOpen] = useState(() => !isPhone());
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (sendsOnEnter && event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       void start();
     }
@@ -200,7 +208,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   const visibilityItems = [
     { label: "Workspace", icon: "globe" as const, hint: "Members can view", onSelect: () => setVisibility("workspace") },
-    { label: "Private", icon: "lock" as const, hint: "Explicit grants only", onSelect: () => setVisibility("private") },
+    { label: "Private", icon: "lock" as const, hint: "You, workspace admins and grants", onSelect: () => setVisibility("private") },
   ];
   const environmentItems = [
     { label: "Sandbox", icon: "shield" as const, hint: "Isolated, with the workspace's network access", onSelect: () => setOnHost(false) },
@@ -220,9 +228,11 @@ function Composer({ workspace }: { workspace: Workspace }) {
     <form className="composer-card" onSubmit={start} aria-busy={action.busy}>
       <fieldset disabled={action.busy}>
         <AttachmentStrip attachments={attachments} disabled={action.busy} />
-        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message" autoFocus />
+        <textarea ref={input} className="composer-input" rows={2} value={content} onChange={event => setContent(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments.paste} placeholder="Describe the task" aria-label="First message"
+          enterKeyHint={sendsOnEnter ? "send" : "enter"} autoFocus={focusOnOpen} />
         {attachments.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
         <div className="composer-toolbar">
+          <AttachButton attachments={attachments} disabled={action.busy} />
           <Combobox label="Host" placeholder={models.loading || connections.loading ? "Loading..." : "Choose a host"} disabled={!hosts.length} value={hostKey}
             options={hosts.map(item => ({ value: item.id, label: item.name, hint: item.ownerId === user.id ? "Your host" : `${item.ownerName}'s host` }))}
             onChange={setChoice} />
@@ -230,7 +240,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
           {hostSessions && <DropdownMenu label="Where it runs" align="start" items={environmentItems} trigger={<><Icon name={runOnHost ? "server" : "shield"} size={14} />{runOnHost ? "On host" : "Sandbox"}</>} />}
           <InfoTip label="Who can see and do what">
             <div className="stack">
-              <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators and admins can also send messages to it; anything more (approving tool calls, managing the session) needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
+              <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators can also send messages to it, and the workspace's owner and admins manage it; approving tool calls needs an explicit grant." : "Workspace membership alone does not give access to a private session: only the workspace's owner and admins, who manage every session, and people you give a session role open it."}</p>
               <p>You are the session owner; the host owner is a separate role. Viewing never grants access to your Git accounts, and visibility does not share your Pi host or local models.</p>
             </div>
           </InfoTip>
@@ -242,8 +252,10 @@ function Composer({ workspace }: { workspace: Workspace }) {
       </fieldset>
     </form>
     <Feedback error={action.error} />
-    {runOnHost && host && <Alert variant="warning" title="Runs on your host, without the sandbox">
-      Its commands run on {host.name} as its user, with its files, credentials, network and GPU, and no resource limits; the workspace's network access doesn't apply. Approve them as you would commands you run yourself: people you share the session with can't decide them unless you granted them host commands.
+    {runOnHost && host && <Alert variant="warning" title={foreign ? `Runs on ${host.ownerName}'s host, without the sandbox` : "Runs on your host, without the sandbox"}>
+      {foreign && <>{host.ownerName} granted you sessions on {host.name}. </>}Its commands run on {host.name} as its user, with its files, credentials, network and GPU, and no resource limits; the workspace's network access doesn't apply. Approve them as you would commands you run yourself: {foreign
+        ? `people you share the session with can decide them only if they also hold host commands on ${host.name}.`
+        : "people you share the session with can't decide them unless you granted them host commands."}
     </Alert>}
     <div className="new-session-meta">
       {action.busy

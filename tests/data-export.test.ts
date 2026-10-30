@@ -6,10 +6,11 @@ import { exportSession, exportWorkspace, registerDataExports, type SessionExport
 import { testDatabase } from './helpers/control-plane.js';
 
 // Values that must never leave the database in any export: credentials, credential digests, ciphertexts, personal
-// environment (also inside restore bindings), storage keys, and other members' private sessions.
+// environment (also inside restore bindings), storage keys, and the data of other members' sessions.
 const secrets = ['REVOCATION-CIPHERTEXT', 'BROKER-TOKEN-HASH', 'DATABASE-PASSWORD-CIPHERTEXT', 'IDENTITY-SECRET-CIPHERTEXT',
   'PERSONAL-ENVIRONMENT-VALUE', 'OBJECT-KEY-SERVER', 'OBJECT-KEY-DATABASE', 'D'.repeat(43), 'GITHUB-TOKEN-CIPHERTEXT'];
 const memberPrivate = 'MEMBER PRIVATE TITLE';
+const memberPrivateActivity = 'MEMBER PRIVATE ACTIVITY';
 
 async function fixture(t: TestContext) {
   const { db, sqlite } = await testDatabase();
@@ -65,7 +66,7 @@ async function fixture(t: TestContext) {
     INSERT INTO audit (id,workspace_id,session_id,actor_id,action,detail_json,created_at) VALUES
       ('audit-session','workspace','owner-private','test:owner','session.created','{"agentVersionId":"version"}','2026-01-01'),
       ('audit-workspace','workspace',NULL,'test:owner','workspace.create','{}','2026-01-01'),
-      ('audit-private','workspace','member-private','test:member','session.created','{"note":"${memberPrivate}"}','2026-01-04'),
+      ('audit-private','workspace','member-private','test:member','session.created','{"note":"${memberPrivateActivity}"}','2026-01-04'),
       ('audit-other','other',NULL,'test:outsider','workspace.create','{}','2026-01-01');
   `);
   const app = new Hono<WorkerEnv>();
@@ -81,7 +82,7 @@ async function fixture(t: TestContext) {
 
 function assertNoSecrets(text: string): void {
   for (const secret of secrets) assert.ok(!text.includes(secret), `An export must not contain ${secret}`);
-  assert.ok(!text.includes(memberPrivate), "An export must not contain another member's private session");
+  assert.ok(!text.includes(memberPrivateActivity), "An export must not contain the data of another member's session, only its record");
 }
 
 test('a session export is its owner\'s, archived sessions included, with every record and no secrets', async t => {
@@ -132,7 +133,7 @@ test('a session export is its owner\'s, archived sessions included, with every r
   assert.equal(archivedExport.session.archivedStatus, 'ready');
 });
 
-test('a workspace export covers its settings, the exporter\'s own sessions in full and only the records of sessions they can view', async t => {
+test('a workspace export covers its settings, the exporter\'s own sessions in full and only the records of the other sessions, which they manage', async t => {
   const f = await fixture(t);
   const denied = await f.get('/api/workspaces/workspace/export', 'test:member');
   assert.equal(denied.status, 403);
@@ -161,12 +162,16 @@ test('a workspace export covers its settings, the exporter\'s own sessions in fu
   assert.deepEqual(exported.audit.map(event => event.id), ['audit-workspace']);
   assert.deepEqual(exported.sessions.map(session => session.session.id), ['owner-private', 'owner-shared', 'owner-restored']);
   assert.deepEqual(exported.sessions[0]!.backups.map(backup => backup.location), ['server', 'workspace-database']);
+  // The workspace's owner manages every session there, private ones included, so every other member's session comes
+  // as its record, with what they hold on it; its activity, grants and approvals stay in its owner's own export.
+  const managed = ['read', 'ask', 'write', 'manage'];
   assert.deepEqual(exported.otherSessions.map(session => [session.id, session.permissions]),
-    // The workspace owner can message a workspace-visible session; a private one gives only what its grant says.
-    [['member-shared', ['read', 'ask', 'write']], ['member-granted', ['read', 'ask']]]);
+    [['member-private', managed], ['member-shared', managed], ['member-granted', managed]]);
+  assert.equal(exported.otherSessions[0]!.title, memberPrivate);
   assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.exported'").get()!.n, 1);
 
-  // An admin gets the same settings; the sessions they can view are someone else's, so they come as records only.
+  // An admin gets the same settings; every session is someone else's, so they come as records only, with what the
+  // admin holds on each: what managing it gives, and what a grant adds.
   const admin = await f.get('/api/workspaces/workspace/export', 'test:admin');
   assert.equal(admin.status, 200);
   const adminText = await admin.text();
@@ -174,7 +179,8 @@ test('a workspace export covers its settings, the exporter\'s own sessions in fu
   const adminExport = JSON.parse(adminText) as WorkspaceExport;
   assert.deepEqual(adminExport.sessions, []);
   assert.deepEqual(adminExport.otherSessions.map(session => [session.id, session.permissions]),
-    [['owner-private', ['read']], ['owner-shared', ['read', 'ask', 'write']], ['member-shared', ['read', 'ask', 'write']]]);
+    [['owner-private', managed], ['owner-shared', managed], ['owner-restored', managed], ['member-private', managed], ['member-shared', managed],
+      ['member-granted', managed]]);
 });
 
 test('the operator dump holds every session of the workspace in full, still without secrets', async t => {

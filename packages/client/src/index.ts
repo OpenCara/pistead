@@ -8,11 +8,15 @@ export {
   activeStatuses, liveTiming, startLiveSession, type EventStream, type LiveSession, type LiveSessionDependencies, type LiveSessionHandlers,
   type StreamStatus,
 } from "./live-session";
-export { decidesHostCommands, HOST_COMMAND_WAITING, isHostCommand } from "./host-commands";
+export { COMPACTION_FAILED_TITLE, compactionFailureText } from "./compaction";
+export { copyText, messageCut, resendText, rewindable, type MessageCut } from "./message-actions";
+export type { CompactionFailure } from "../../shared/src/types";
+export { decidedAsHostCommand, decidesHostCommand, decidesHostCommands, hostCommandWaiting, isHostCommand } from "./host-commands";
 export { formatBytes, preparingRepositories, repositoryPhaseLabel, repositoryProgressText, repositoryProgressValue } from "./repository-progress";
 export { sessionStatus, type SessionStatus, type SessionStatusTone } from "./session-status";
 export { openFetchEventStream, SseParser, type FetchEventStreamOptions } from "./sse";
-export { splitToolCalls, type ToolCallLine } from "./transcript";
+export { splitToolCalls, transcriptLines, type ToolCallLine } from "./transcript";
+export { carryEarlier, firstHeld, withEarlier, type EarlierEntries } from "./transcript-pages";
 export {
   memberPerson, peopleDirectory, userIdFromInput, username, usernameWithId, withUsernames, type Person, type WorkspaceMember,
 } from "./usernames";

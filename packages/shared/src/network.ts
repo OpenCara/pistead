@@ -7,13 +7,19 @@ import type { GrantSource } from "./sources.js";
  * - off: nothing else;
  * - allowlist: the listed domains, plus the package registries below when `packageRegistries` is set;
  * - open: any public host.
- * Private, loopback and link-local addresses are never reachable, whatever the mode.
+ * Private, loopback and link-local addresses are never reachable, whatever the mode. The agent's web_fetch tool reaches
+ * exactly what this lets sandboxed commands reach.
+ *
+ * `webSearch` lets the workspace's agents search the web with web_search, through the search provider the server's
+ * operator configured: each query leaves for that provider. The control plane always names it; a policy from an older
+ * client leaves it out, which keeps the saved setting. Egress grants never carry it, as older connectors would refuse
+ * a policy with it (see egressGrantPolicy).
  */
 export const networkModes = ["off", "allowlist", "open"] as const;
 export type NetworkMode = (typeof networkModes)[number];
-export interface NetworkPolicy { mode: NetworkMode; domains: string[]; packageRegistries: boolean }
+export interface NetworkPolicy { mode: NetworkMode; domains: string[]; packageRegistries: boolean; webSearch?: boolean }
 
-export const defaultNetworkPolicy: NetworkPolicy = Object.freeze({ mode: "off", domains: [], packageRegistries: true }) as NetworkPolicy;
+export const defaultNetworkPolicy: NetworkPolicy = Object.freeze({ mode: "off", domains: [], packageRegistries: true, webSearch: false }) as NetworkPolicy;
 export const networkLimits = { domains: 100 } as const;
 
 /** Package registries an allowlist includes when `packageRegistries` is set. */
@@ -38,14 +44,21 @@ export function validNetworkDomain(value: unknown): value is string {
 export function parseNetworkPolicy(value: unknown): NetworkPolicy {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid network policy");
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !["mode", "domains", "packageRegistries"].includes(key))) throw new Error("Invalid network policy");
+  if (Object.keys(input).some(key => !["mode", "domains", "packageRegistries", "webSearch"].includes(key))) throw new Error("Invalid network policy");
   if (!networkModes.includes(input.mode as NetworkMode)) throw new Error("Invalid network mode");
   if (typeof input.packageRegistries !== "boolean") throw new Error("Invalid package registry setting");
+  if (input.webSearch !== undefined && typeof input.webSearch !== "boolean") throw new Error("Invalid web search setting");
   const domains = input.domains ?? [];
   if (!Array.isArray(domains) || domains.length > networkLimits.domains) throw new Error(`At most ${networkLimits.domains} domains are allowed`);
   const invalid = domains.find(domain => !validNetworkDomain(domain));
   if (invalid !== undefined) throw new Error(`Invalid domain: ${String(invalid).slice(0, 100)}`);
-  return { mode: input.mode as NetworkMode, domains: [...new Set(domains as string[])], packageRegistries: input.packageRegistries };
+  return { mode: input.mode as NetworkMode, domains: [...new Set(domains as string[])], packageRegistries: input.packageRegistries,
+    ...(input.webSearch !== undefined ? { webSearch: input.webSearch } : {}) };
+}
+
+/** The policy as egress grants carry it: what the proxy and web_fetch enforce, without the workspace's web search setting. */
+export function egressGrantPolicy(policy: NetworkPolicy): NetworkPolicy {
+  return { mode: policy.mode, domains: [...policy.domains], packageRegistries: policy.packageRegistries };
 }
 
 function matches(pattern: string, host: string): boolean {
@@ -73,15 +86,50 @@ export interface EgressRepository {
    */
   lfs?: boolean;
 }
-/** What the control plane lets one session's egress proxy do; the proxy asks again every minute. */
+/**
+ * What the control plane lets one session's egress proxy do; the proxy asks again every minute. `apis` lists the
+ * credentialed APIs the proxy answers for itself (see ApiCredentialGrant); absent from older control planes.
+ */
 export interface EgressGrant {
   policy: NetworkPolicy;
   repositories: EgressRepository[];
+  apis?: EgressApi[];
   /**
-   * The workspace's document sources (Notion, Google Drive, Feishu/Lark), which the agent reads through
-   * the control plane (source_read), never through the proxy. Absent from older control planes.
+   * The workspace's document sources (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs), which the
+   * agent reads through the control plane (source_read), never through the proxy. Absent from older control planes.
    */
   sources?: GrantSource[];
+}
+
+/**
+ * Credentialed APIs: hosts whose HTTPS the egress proxy terminates itself, with a certificate from the connector's own
+ * authority that only sessions' sandboxes trust, so that it can add a credential outside the sandbox. Sandboxed tools
+ * such as `gh` send a placeholder token (API_TOKEN_PLACEHOLDER) and never hold a real one. Every other host's HTTPS
+ * stays an opaque tunnel.
+ */
+export const credentialedApiHosts: readonly string[] = Object.freeze(["api.github.com"]);
+export type CredentialedApiProvider = "github";
+export interface EgressApi { host: string; provider: CredentialedApiProvider }
+/** What `GH_TOKEN` and `GITHUB_TOKEN` hold in a sandbox: the proxy puts the real credential in its place. */
+export const API_TOKEN_PLACEHOLDER = "pistead-egress-proxy-adds-the-credential";
+/** Longest a proxy reuses an API credential: a revoked session or repository stops using it within this. */
+export const API_CREDENTIAL_CACHE_SECONDS = 60;
+/**
+ * A session's credential for a credentialed API, from the control plane. For api.github.com: one token per GitHub App
+ * installation, limited to reading the workspace's github.com repositories that the session owner can read (the
+ * installation's account is `account`), never the owner's own sign-in token.
+ */
+export type ApiCredentialGrant =
+  | { available: false; reason: string; cacheSeconds: number }
+  | { available: true; credentials: ApiCredential[]; cacheSeconds: number };
+export interface ApiCredential {
+  /** The installation's account (a user or organization login), which owns `repositories`. */
+  account: string;
+  /** The full Authorization header for the API. */
+  authorization: string;
+  /** The repositories (owner/name) the credential can read. */
+  repositories: string[];
+  expiresAt: string;
 }
 /**
  * The Git requests the relay forwards: a fetch's ref advertisement and the fetch itself; in clone sessions a push's
@@ -100,6 +148,45 @@ export function egressPushService(service: EgressGitService): service is "receiv
 export function egressLfsService(service: EgressGitService): service is "lfs-batch" | "lfs-object" {
   return service === "lfs-batch" || service === "lfs-object";
 }
+
+/**
+ * Direct Git transfers: instead of relaying a Git request through the control plane, a host's egress proxy may ask it
+ * for a credential for one repository and make the request at the forge itself, so packs and LFS objects never cross
+ * the control plane. The control plane checks the session's authority exactly as for a relayed request and decides:
+ * - public repositories are read without any credential, on every host;
+ * - private ones with a token limited to that repository and to reading (a GitHub App installation token), on every
+ *   host, or with the session owner's own credential only on the owner's own hosts;
+ * - pushes of the session branch, with the workspace's push identity, only on the owner's own hosts (and the control
+ *   plane's own runner): such a token can't be limited to one branch, so a shared host keeps relaying them.
+ * Anything else is relayed as before (`direct: false`).
+ */
+export type GitDirectAccess = "read" | "lfs" | "push";
+export function gitDirectAccess(service: EgressGitService): GitDirectAccess {
+  return egressPushService(service) ? "push" : egressLfsService(service) ? "lfs" : "read";
+}
+export interface GitDirectRequest {
+  sessionId: string; bindingId: string; access: GitDirectAccess;
+  /** A push's one command, as the proxy read it from the request; absent for the advertisement. */
+  command?: { old: string; new: string; ref: string };
+}
+export type GitDirectGrant =
+  | { direct: false; reason: string; cacheSeconds: number }
+  | {
+    direct: true;
+    /** The repository's Git remote (https), where the proxy makes the request. */
+    remote: string;
+    /** The full Authorization header for the forge, or null for a public repository. */
+    authorization: string | null;
+    /** What the credential is, for the proxy's log: none, a repository token, the owner's account, the push identity. */
+    kind: "public" | "repository-token" | "owner-account" | "push-identity";
+    expiresAt: string;
+    /** How long the proxy may reuse the grant for further requests of the same access; 0 for pushes, which each ask. */
+    cacheSeconds: number;
+    /** A token the proxy revokes once its request is done (a push's installation token): DELETE url with authorization. */
+    revoke?: { url: string; authorization: string };
+  };
+/** Longest a proxy reuses a grant: a revoked session or repository stops direct transfers within this. */
+export const GIT_DIRECT_CACHE_SECONDS = 60;
 
 /**
  * Git LFS through the relay. The proxy turns git-lfs's batch API into these requests, and the control plane answers

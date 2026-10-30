@@ -28,6 +28,25 @@ export interface Env {
   GITHUB_APP_ID?: string;
   GITHUB_APP_SLUG?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  /**
+   * Direct Git transfers (network.ts gitDirect): `on` (default), `own-hosts` (credentials only to session owners' own hosts;
+   * public repositories are still read directly everywhere) or `off` (every Git request is relayed through the server).
+   */
+  GIT_DIRECT?: string;
+  /**
+   * Sandboxed GitHub API reads (api-access.ts): `on` (default) gives every host running a clone session a token that
+   * only reads the workspace's github.com repositories, which its egress proxy adds to api.github.com requests;
+   * `own-hosts` only to session owners' own hosts and the server's own runner; `off` to none.
+   */
+  SANDBOX_GITHUB_API?: string;
+  /**
+   * The agent's web_search tool (web-search.ts): `brave`, `tavily` or `searxng` searches with that provider, in workspaces
+   * whose network access turns web search on; unset or `off`, no search. WEB_SEARCH_API_KEY is Brave's or Tavily's key
+   * (secret; optional for SearXNG), WEB_SEARCH_URL a SearXNG instance's origin.
+   */
+  WEB_SEARCH?: string;
+  WEB_SEARCH_API_KEY?: string;
+  WEB_SEARCH_URL?: string;
   /** RSA private key (PEM, PKCS#8; secret) signing Pistead OIDC assertions for Entra federation and Forgejo integrations. */
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */
@@ -49,6 +68,14 @@ export interface Env {
   MICROSOFT_TENANT?: string;
   TENCENT_DOCS_CLIENT_ID?: string;
   TENCENT_DOCS_CLIENT_SECRET?: string;
+  /** `true` on a local server (http.ts localMode): loopback only, and only the GitHub account that claimed it signs in. */
+  LOCAL_MODE?: string;
+  /** The local server's claim secret (base64url, 32 bytes): a sign-in carrying it may claim an unclaimed local server. */
+  LOCAL_CLAIM_SECRET?: string;
+  /** `true` lets people sign up and sign in with a username and password (password-auth.ts), next to GitHub. */
+  PASSWORD_AUTH?: string;
+  /** Who may create an account (http.ts signupMode): `open`, `invite` or `off`; unset, GitHub is open and passwords invite. */
+  SIGNUP?: string;
 }
 export interface AuthIdentity {
   userId: string;
@@ -67,7 +94,7 @@ export interface UserRow {
   git_name: string;
   git_email: string;
   env_json: string;
-  auth_kind: 'github' | 'test';
+  auth_kind: 'github' | 'test' | 'password';
   created_at: string;
   /** Set while an instance administrator has the account suspended. */
   suspended_at?: string | null;
@@ -99,10 +126,20 @@ export interface SessionRow {
   archived_status?: 'provisioning' | 'ready' | 'error' | null;
   /** What its agent is doing, as its host last reported it; display state only, never part of the runner binding. */
   activity?: SessionActivity | null;
+  /** When its next scheduled prompt runs (scheduled-prompts.ts); display state only, never part of the runner binding. */
+  next_scheduled_at?: string | null;
+  /** The session whose agent started this one with the sessions tool (cross-session.ts); null otherwise. Immutable. */
+  parent_session_id?: string | null;
+  /** How its transcript shows tool output to viewers (transcript-display.ts); display only. Absent on older rows: full. */
+  tool_output?: 'full' | 'brief';
   /** Only on rows read through session access: the newest pull request a push from this session opened or found. */
   pull_request_url?: string | null;
   /** Only on rows read through session access: that pull request's state as last read (pull-request-states.ts). */
   pull_request_state?: string | null;
+  /** Only on rows read through session access: the pull request found last for a branch its host reported (session-branches.ts). */
+  branch_pull_request_url?: string | null;
+  /** Only on rows read through session access: that pull request's state as last read. */
+  branch_pull_request_state?: string | null;
 }
 export interface RepositoryRow {
   id: string; workspace_id: string; provider: GitProvider; host: string; repository_id: string; full_name: string;
@@ -124,5 +161,10 @@ export interface PushCredentialRow {
   pull_request_url: string | null;
   pull_request_state?: string | null; pull_request_checked_at?: string | null;
 }
-export interface SessionAccess { row: SessionRow; permissions: Permission[] }
+export interface SessionAccess {
+  row: SessionRow;
+  permissions: Permission[];
+  /** The actor's role in the session's workspace, from the same policy snapshot as `permissions`. */
+  role: WorkspaceRole;
+}
 export type PublicProfile = UserProfile;

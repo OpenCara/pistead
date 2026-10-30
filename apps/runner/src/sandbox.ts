@@ -11,22 +11,24 @@ import type { HostCommandOperation, Operation, RunnerBinding } from "../../../pa
 import type { ClonePushPreparation } from "./push.js";
 import { resourceLaunch, validateResourceConfig, type ResourceConfig } from "./resources.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
-import { CA_BUNDLE, trustedCertificates } from "./trust-store.js";
+import { CA_BUNDLE, sandboxCertificates } from "./trust-store.js";
 import { runHostShell } from "./host-shell.js";
 import { checkedBrowse, type BrowseResult } from "./file-browser.js";
 import { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 import { commandLimits, gpuMounts, type CommandLimits } from "./host-config.js";
+import type { IsolatedWorkspace } from "./workspace.js";
+import { CREATE_FILE, OPEN_FILE, privateEntry } from "./platform.js";
 
 export { MAX_OUTPUT_BYTES, SandboxProcessError } from "./process-output.js";
 
 export const TIMEOUT_MS = 30_000;
 /** Push rewrites and packs move whole repositories; only push kinds get this deadline. */
-const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
-const OID = /^[0-9a-f]{40}$/;
+export const PUSH_TIMEOUT_MS = 60 * 60 * 1000;
+export const OID = /^[0-9a-f]{40}$/;
 export const MAX_FILE_BYTES = 1024 * 1024;
-const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
+export const MAX_SNAPSHOT_OUTPUT_BYTES = 48 * 1024 * 1024;
 /** A whole image file as base64 in one JSON object, with room for its key. */
-const MAX_CONTENT_OUTPUT_BYTES = Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 64;
+export const MAX_CONTENT_OUTPUT_BYTES = Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 64;
 const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const sessionQueues = new Map<string, Promise<void>>();
 
@@ -75,7 +77,7 @@ export interface MirrorMount { source: string; target: string }
 export const MIRROR_ROOT = "/repository-mirrors";
 const SHIM_DIRECTORY = "/opt/pistead/bin";
 /** The host's trusted certificates in the session's private root, mounted read-only at CA_BUNDLE for shell commands. */
-const CA_BUNDLE_FILE = "ca-certificates.crt";
+export const CA_BUNDLE_FILE = "ca-certificates.crt";
 /** The steps that may run Git in an agent's clone, and so need the mirrors a clone borrows from. */
 const MIRROR_KINDS: ReadonlySet<Request["kind"]> = new Set(["bash", "clone-head", "clone-push-prepare", "clone-push-pack", "clone-backup", "clone-restore"]);
 
@@ -91,16 +93,20 @@ export function hostGitLfs(): string | undefined {
 
 /**
  * `git` for clone sessions on a host with a repository cache or git-lfs. A clone of a workspace repository:
- * - on a cache host, first asks the egress proxy to bring the host's mirror up to date, then borrows its objects
- *   (--reference-if-able) instead of downloading them again; if the mirror is not ready within 20 seconds, the clone goes
- *   ahead on its own;
+ * - on a cache host, first asks the egress proxy for the host's mirror and borrows its objects (--reference-if-able)
+ *   instead of downloading them again. It waits for the mirror however long that takes: a mirror's first fill downloads
+ *   the whole repository once, with the host's own Git credentials, and the clone never downloads it a second time
+ *   beside it. The wait is told on stderr, and the fill goes on if the command stops. A dropped connection or a failure
+ *   that may pass is asked again; only a mirror the host can't fill at all lets the clone go ahead without it. A mirror
+ *   that stays unavailable, or that the command can't see yet (mounts are fixed when a command starts), fails the
+ *   clone, to be run again;
  * - where the workspace turned Git LFS on for the repository and git-lfs is installed, configures the clone's LFS
  *   filters (in its own .git/config), so its checkout downloads LFS files' content through the proxy. Elsewhere clones
  *   keep LFS pointer files, as plain Git does.
  * Everything else runs Git unchanged.
  */
 const GIT_SHIM = String.raw`#!/usr/bin/python3 -I
-import json, os, sys, urllib.parse, urllib.request
+import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 args = sys.argv[1:]
 VALUED = {'-o', '--origin', '-b', '--branch', '-u', '--upload-pack', '--template', '-c', '--config', '--depth', '--shallow-since',
@@ -111,15 +117,94 @@ VALUED = {'-o', '--origin', '-b', '--branch', '-u', '--upload-pack', '--template
 LFS = next((path for path in ${JSON.stringify(GIT_LFS_PATHS)} if os.access(path, os.X_OK)), None)
 
 
-def ask(endpoint, url, timeout):
+def endpoint(name, url, timeout):
     query = urllib.parse.urlencode({'remote': url})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/' + name + '?' + query, timeout=timeout)
+
+
+def ask(name, url, timeout):
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open('http://127.0.0.1:${EGRESS_PORT}/__pistead/' + endpoint + '?' + query, timeout=timeout) as response:
+        with endpoint(name, url, timeout) as response:
             answer = json.load(response)
             return answer if isinstance(answer, dict) else {}
     except Exception:
         return {}
+
+
+def note(text):
+    try:
+        sys.stderr.write('pistead: ' + text + '\n')
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def described(progress):
+    phase = progress.get('phase')
+    text = phase if isinstance(phase, str) and phase.isalpha() else 'filling'
+    percent = progress.get('percent')
+    if type(percent) is int:
+        text += ' %d%%' % percent
+    count = progress.get('bytes')
+    if type(count) is int and count > 0:
+        size, unit = float(count), 'bytes'
+        for bigger in ('KiB', 'MiB', 'GiB'):
+            if size < 1024:
+                break
+            size, unit = size / 1024, bigger
+        text += ', %s received' % ('%d bytes' % count if unit == 'bytes' else '%.1f %s' % (size, unit))
+    return text
+
+
+def mirror(url):
+    # The host's mirror of a workspace repository once it is ready to borrow from, however long its fill takes; None where
+    # the host keeps no mirror of the repository, or can't fill it at all. The proxy streams one JSON object per line, with
+    # a heartbeat. A connection that drops while the fill goes on is asked again, which joins it; a failure that may pass,
+    # or a proxy that doesn't answer, is asked again twice more. Then the clone stops, to be run again, rather than
+    # downloading the repository without the cache.
+    started, shown, failures, reason = time.monotonic(), None, 0, 'it did not answer'
+    while True:
+        progressed = transient = False
+        try:
+            with endpoint('mirror', url, 120) as response:
+                for line in response:
+                    try:
+                        answer = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(answer, dict):
+                        continue
+                    path = answer.get('path')
+                    if isinstance(path, str) and path:
+                        if shown is not None:
+                            note('the repository cache is ready; cloning from it')
+                        return path
+                    if 'error' in answer:
+                        reason = str(answer['error'])[:300]
+                        if answer.get('retry') is not True:
+                            note('the host cannot fill its repository cache (%s); cloning without it' % reason)
+                            return None
+                        transient = True
+                        break
+                    progressed = True
+                    progress, now = answer.get('progress'), time.monotonic()
+                    if isinstance(progress, dict) and now - started >= 3 and (shown is None or now - shown >= 30):
+                        if shown is None:
+                            note('waiting for the host to fill its repository cache of ' + url + ': it downloads the repository once,'
+                                 ' then every clone borrows from it, and it goes on if this command stops')
+                        note('repository cache: ' + described(progress))
+                        shown = now
+        except urllib.error.HTTPError:
+            # No repository cache on this host, or not one of the workspace's repositories: a clone as any other.
+            return None
+        except Exception:
+            reason = 'it did not answer'
+        failures = failures + 1 if transient or not progressed else 0
+        if failures >= 3:
+            note('the repository cache of ' + url + ' is not available right now (%s); run the clone again' % reason)
+            sys.exit(128)
+        time.sleep(failures or 1)
 
 
 index = 0
@@ -141,8 +226,12 @@ if index < len(args) and args[index] == 'clone':
     borrowing = any(argument.startswith('--reference') or argument in ('-s', '--shared', '--dissociate') for argument in rest)
     extra = []
     if url and not borrowing:
-        path = ask('mirror', url, 20).get('path')
-        if isinstance(path, str) and path:
+        path = mirror(url)
+        if path and not os.path.isdir(path):
+            # Mounted from the next command on: cloning without it would download the whole repository again.
+            note('the repository cache of ' + url + ' is ready, but this command started before it could see it; run the clone again')
+            sys.exit(128)
+        if path:
             extra += ['--reference-if-able', path]
     if url and LFS and ask('lfs', url, 10).get('lfs') is True:
         extra += ['-c', 'filter.lfs.process=' + LFS + ' filter-process', '-c', 'filter.lfs.smudge=' + LFS + ' smudge -- %f',
@@ -186,6 +275,7 @@ interface Mounts {
   config: FileHandle;
 }
 
+export type SandboxRequest = Request;
 type Request =
   | { kind: "initialize" }
   | { kind: "read" | "read-content" | "list" | "browse"; path: string }
@@ -205,10 +295,11 @@ interface Transfer { input?: AsyncIterable<Uint8Array>; output?: (stdout: Readab
  * realpath is only a policy check: actual opens walk pinned directory descriptors
  * with O_NOFOLLOW, so swapping a checked parent for a symlink cannot win a race.
  */
-const HELPER = String.raw`
+export const HELPER = String.raw`
 import base64, json, os, re, resource, secrets, shutil, socket, stat, subprocess, sys, threading
 
-for fd_name in os.listdir('/proc/self/fd'):
+# Linux lists a process's descriptors in /proc; macOS (the Seatbelt backend) in /dev/fd.
+for fd_name in os.listdir('/proc/self/fd' if os.path.isdir('/proc/self/fd') else '/dev/fd'):
     fd = int(fd_name)
     if fd > 2:
         try:
@@ -251,7 +342,12 @@ def limits(request):
     # before bash starts; Sandbox.execute refuses bash without it unless the host's owner waived limits.
     if kind != 'bash':
         memory = (4096 if push else 512) * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+        except (ValueError, OSError):
+            # macOS doesn't let a process lower its address-space limit; Linux always does.
+            if sys.platform != 'darwin':
+                raise
 
 
 HOME = os.environ['HOME']
@@ -457,7 +553,18 @@ def write_at(root, parts, content):
 
 
 # Hardening shared by every Git invocation; session commands add the worktree and owner identity below.
-GIT_HARDENED = ['/usr/bin/git', '--no-pager',
+# Backends without bind mounts (macOS Seatbelt) see the session's Git directory where it is on the host, with a
+# gitdir: file at WORK/.git, and name their own Git and Bash; bubblewrap mounts it at WORK/.git and uses /usr/bin.
+GITDIR = os.environ.get('SANDBOX_GITDIR') or None
+GIT_BINARY = os.environ.get('SANDBOX_GIT') or '/usr/bin/git'
+BASH = os.environ.get('SANDBOX_BASH') or '/usr/bin/bash'
+
+
+def open_gitdir(work):
+    return os.open('.git', DIR_FLAGS, dir_fd=work) if GITDIR is None else os.open(GITDIR, DIR_FLAGS)
+
+
+GIT_HARDENED = [GIT_BINARY, '--no-pager',
                 '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
                 '-c', 'core.attributesFile=/dev/null', '-c', 'core.sshCommand=/usr/bin/false',
                 '-c', 'credential.helper=', '-c', 'commit.gpgSign=false',
@@ -569,10 +676,19 @@ def snapshot(request):
 
     home = os.open(HOME, DIR_FLAGS)
     work = os.open(WORK, DIR_FLAGS)
-    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    git = open_gitdir(work)
     try:
         visit(home, 'home', ('.gitconfig',))
-        add(home, '.gitconfig', 'owner.gitconfig')
+        owner = os.environ.get('SANDBOX_OWNER_CONFIG')
+        if owner is None:
+            add(home, '.gitconfig', 'owner.gitconfig')
+        else:
+            # Not mounted into the home: read where the runner keeps it.
+            parent = os.open(os.path.dirname(owner), DIR_FLAGS)
+            try:
+                add(parent, os.path.basename(owner), 'owner.gitconfig')
+            finally:
+                os.close(parent)
         visit(work, 'worktree', ('.git',))
         # Push scratch repositories are transient and never belong in a backup; pending clone restorations go with the
         # clones' bundles.
@@ -861,7 +977,7 @@ def clone_backup():
     # Restorations still pending stay in the backup as they were restored, whatever is at their paths now: a restore
     # never clones over something, so they stay pending there too.
     work = os.open(WORK, DIR_FLAGS)
-    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    git = open_gitdir(work)
     state = None
     try:
         state, pending = clone_state(git)
@@ -891,7 +1007,7 @@ def clone_backup():
 
 def clone_pending():
     work = os.open(WORK, DIR_FLAGS)
-    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    git = open_gitdir(work)
     try:
         state, clones = clone_state(git)
         if state is not None:
@@ -924,7 +1040,7 @@ def clone_restore(request):
             or (reference is not None and (not isinstance(reference, str) or not reference.startswith('${MIRROR_ROOT}/')))):
         raise ValueError('invalid clone restoration')
     work = os.open(WORK, DIR_FLAGS)
-    git = os.open('.git', DIR_FLAGS, dir_fd=work)
+    git = open_gitdir(work)
     state = None
     try:
         state, clones = clone_state(git)
@@ -993,7 +1109,7 @@ def clone_restore(request):
                                       + wanted, reason='commits the backup builds on are no longer on the clone\'s origin')
 
             if bundle is not None:
-                source = os.path.join(WORK, '.git', CLONE_STATE, bundle)
+                source = os.path.join(GITDIR or os.path.join(WORK, '.git'), CLONE_STATE, bundle)
                 fetch_missing(bundle_prerequisites(source))
                 clone_git_checked(staging, ['-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--no-tags', source,
                                             'refs/*:refs/pistead/restore/*'], reason=reason)
@@ -1043,9 +1159,14 @@ def main():
     limits(request)
     if kind == 'initialize':
         try:
-            os.stat(os.path.join(WORK, '.git', 'HEAD'), follow_symlinks=False)
+            os.stat(os.path.join(GITDIR or os.path.join(WORK, '.git'), 'HEAD'), follow_symlinks=False)
         except FileNotFoundError:
-            run(GIT + ['init', '--quiet', '--template=', '--initial-branch=main', WORK])
+            if GITDIR is None:
+                run(GIT + ['init', '--quiet', '--template=', '--initial-branch=main', WORK])
+            else:
+                # The runner wrote WORK/.git, which the session can't change, pointing here.
+                run(GIT + ['--git-dir=' + GITDIR, 'init', '--quiet', '--template=', '--initial-branch=main'])
+                run(GIT + ['--git-dir=' + GITDIR, 'config', 'core.bare', 'false'])
         run(GIT + ['rev-parse', '--is-inside-work-tree'])
         return
     if kind == 'clone-head':
@@ -1073,7 +1194,7 @@ def main():
         egress = request.get('egress')
         if egress is not None:
             egress_relay(egress['socket'], int(egress['port']))
-        run(['/usr/bin/bash', '--noprofile', '--norc', '-c', request['command']])
+        run([BASH, '--noprofile', '--norc', '-c', request['command']])
         return
     if kind == 'snapshot':
         print(json.dumps(snapshot(request), ensure_ascii=True))
@@ -1282,7 +1403,7 @@ function mirrorMount(mount: MirrorMount): boolean {
 /** Creates the read-only owner Git config once, then verifies it is the unchanged private original. */
 export async function pinOwnerConfig(path: string, configText: string): Promise<FileHandle> {
   try {
-    const created = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o400);
+    const created = await open(path, CREATE_FILE, 0o400);
     try {
       await created.writeFile(configText, "utf8");
       await created.sync();
@@ -1292,10 +1413,10 @@ export async function pinOwnerConfig(path: string, configText: string): Promise<
   } catch (error) {
     if (errorCode(error) !== "EEXIST") throw error;
   }
-  const config = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const config = await open(path, OPEN_FILE);
   try {
     const info = await config.stat();
-    if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid?.() || (info.mode & 0o377) !== 0 || info.size !== Buffer.byteLength(configText)) {
+    if (!info.isFile() || info.nlink !== 1 || !privateEntry(info, 0o377) || info.size !== Buffer.byteLength(configText)) {
       throw new Error("Unsafe or changed session owner configuration");
     }
     if (await config.readFile("utf8") !== configText) throw new Error("Session owner identity is immutable");
@@ -1312,7 +1433,8 @@ export async function pinOwnerConfig(path: string, configText: string): Promise<
  * execute() takes the exact approved Operation, never a reconstructed shell command.
  * No host-shell, host-Git, or host-filesystem-tool fallback exists.
  */
-export class Sandbox {
+export class Sandbox implements IsolatedWorkspace {
+  readonly isolated = true;
   readonly #root: string;
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;
@@ -1425,7 +1547,7 @@ export class Sandbox {
           const bundle = join(this.#root, CA_BUNDLE_FILE);
           const staged = `${bundle}.new`;
           await rm(staged, { force: true });
-          await writeFile(staged, trustedCertificates(), { mode: 0o400 });
+          await writeFile(staged, sandboxCertificates(), { mode: 0o400 });
           await chmod(staged, 0o400);
           await rename(staged, bundle);
         }

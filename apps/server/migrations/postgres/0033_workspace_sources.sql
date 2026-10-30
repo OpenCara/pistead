@@ -1,4 +1,4 @@
--- Postgres translation of sqlite/0032_workspace_sources.sql.
+-- Postgres translation of sqlite/0040_workspace_sources.sql.
 
 -- What a workspace's sessions work on: its sources (docs/design/external-sources.md). A Git repository is one kind of
 -- source; its details, push policy, LFS and cache stay in workspace_repositories. Every source of a workspace is in the

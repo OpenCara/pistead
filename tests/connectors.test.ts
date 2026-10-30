@@ -5,12 +5,13 @@ import test, { type TestContext } from 'node:test';
 import { HTTPException } from 'hono/http-exception';
 import { app } from '../apps/server/src/index.js';
 import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
-import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
+import { authorizeConnectorTicket, type ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import type { Env } from '../apps/server/src/types.js';
 import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
+import { runScheduledPrompts } from '../apps/server/src/scheduled-prompts.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
-import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostModelSettings } from '../packages/shared/src/connector.js';
-import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
+import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostCommandGrant, HostModelSettings } from '../packages/shared/src/connector.js';
+import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, RunnerTicket, SessionRecord, SessionView } from '../packages/shared/src/types.js';
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { diffView } from '../packages/shared/src/view-patch.js';
@@ -471,6 +472,8 @@ test('claim and manifest updates reject malformed metadata and secret-bearing fi
     { name: 'non-boolean host configuration', value: { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: 'true' } }, code: 'invalid_manifest' },
     { name: 'unknown GPU device', value: { ...manifest, capabilities: { ...manifest.capabilities, gpu: 'cuda' } }, code: 'invalid_manifest' },
     { name: 'GPU lent by an unsandboxed host', value: { ...manifest, capabilities: { platform: 'darwin', sandbox: false, productionShell: false, unsandboxed: true, gpu: 'render' } }, code: 'invalid_manifest' },
+    { name: 'unbounded shell grants without host grants', value: { ...manifest, capabilities: { ...manifest.capabilities, hostCommands: true, unboundedShellGrants: true } }, code: 'invalid_manifest' },
+    { name: 'non-boolean unbounded shell grants', value: { ...manifest, capabilities: { ...manifest.capabilities, hostCommands: true, hostGrants: true, unboundedShellGrants: 'yes' } }, code: 'invalid_manifest' },
   ];
   const before = f.sqlite.prepare('SELECT * FROM connectors WHERE id = ?').get(connector.connectorId);
   for (const entry of invalid) {
@@ -507,10 +510,10 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   await denied(await f.request('GET', '/api/me', undefined, headers), 401, 'unauthorized');
   await denied(await f.request('POST', '/api/connectors/pairings', { name: 'Bearer only' }, headers), 401, 'unauthorized');
   for (const path of ['/api/internal/authorize', '/api/internal/github/comment', '/api/internal/github/read', '/api/internal/github/merge', '/api/internal/github/issue',
-    '/api/internal/restores/unknown/download']) {
+    '/api/internal/restores/unknown/download', '/api/internal/git/direct']) {
     await denied(await f.request('POST', path, {}, headers), 401, 'unauthorized');
   }
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download', 'git/direct']) {
     await denied(await owner.request('POST', `/api/connectors/self/${path}`, {}), 401, 'connector_authentication_required');
     await denied(await self(f, connector, path, {}, null), 401, 'stale_connection');
     await denied(await self(f, connector, path, {}, 'malformed'), 401, 'stale_connection');
@@ -521,7 +524,7 @@ test('connector bearer credentials cannot authenticate browser or internal APIs,
   const oldConnection = connector.connectionToken;
   connector.connectionToken = token();
   f.sqlite.prepare('UPDATE connectors SET connection_hash = ? WHERE id = ?').run(await sha256(connector.connectionToken), connector.connectorId);
-  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download']) {
+  for (const path of ['manifest', 'authorize', 'activity', 'github/comment', 'github/read', 'github/merge', 'github/issue', 'restores/unknown/download', 'git/direct']) {
     await denied(await self(f, connector, path, {}, oldConnection), 401, 'stale_connection');
   }
   await json(await self(f, connector, 'manifest', manifest));
@@ -1230,7 +1233,8 @@ test('only the session owner answers a permission request, for one call or the s
     client.request('POST', `${path}/approvals/${id}`, { decision: 'approve', reviewHash: presented.get(id)!.reviewHash, ...body });
   await denied(await decide(s.admin, once.id, { scope: 'call' }), 403, 'owner_required');
   await denied(await decide(s.creator, once.id, { scope: 'forever' }), 400, 'invalid_decision');
-  // The creator's session runs on the host's machine, and only the host's owner can lift the limits it lacks.
+  // The creator's session runs on the host's machine, and only the host's owner, or a member they granted host commands,
+  // can lift the limits it lacks.
   await denied(await decide(s.creator, unlimited.id, {}), 403, 'host_owner_required');
   // A host command runs outside the sandbox, so each one is allowed for its own call only.
   await denied(await decide(s.creator, hostCommand.id, { scope: 'session' }), 400, 'invalid_decision');
@@ -1251,6 +1255,131 @@ test('only the session owner answers a permission request, for one call or the s
   // Only permission requests take a scope, and nobody can request a permission directly.
   await denied(await decide(s.admin, command.id, { scope: 'session' }), 400, 'invalid_decision');
   await denied(await s.creator.request('POST', `${path}/operations`, { kind: 'permission', tool: 'bash', target: '', needs: ['tool'] }), 400, 'invalid_operation');
+});
+
+test('a member granted host commands lets their commands run without the limits the host lacks, and only host command authority decides them', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'bash']);
+  // The workspace's owner may approve the creator's work here, but holds no host command grant.
+  await json(await s.creator.request('POST', `/api/sessions/${s.session.id}/grants`, { userId: s.admin.user.id, permissions: ['read', 'approve'] }));
+  const path = `/api/sessions/${s.session.id}`;
+  const pending = (id: string, operation: Operation, extra: Partial<ApprovalRecord> = {}): ApprovalRecord => ({
+    id, sessionId: s.session.id, requestedBy: s.creator.user.id, operation, status: 'pending', createdAt: new Date().toISOString(), ...extra,
+  });
+  const unlimited = pending('permission-call-1', { kind: 'permission', tool: 'bash', target: 'make', needs: ['unbounded-shell'] });
+  const command = pending('tool-call-1', { kind: 'bash', command: 'make' }, { unbounded: true });
+  // A command within the host's limits is decided as before, by anyone with approve permission.
+  const bounded = pending('tool-call-2', { kind: 'bash', command: 'make check' });
+  let approvals = [unlimited, command, bounded];
+  const decisions: { approvalId: string; actorId: string }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const { admissionId } = JSON.parse(envelope.request.body) as { admissionId: string };
+      approvals = approvals.map(approval => ({ ...approval, admissionId }));
+      return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: true,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string };
+    decisions.push({ approvalId: input.approvalId, actorId: envelope.request.ticket.actorId });
+    const decided: ApprovalRecord = { ...approvals.find(approval => approval.id === input.approvalId)!, status: 'approved', decidedBy: envelope.request.ticket.actorId };
+    approvals = approvals.map(approval => approval.id === decided.id ? decided : approval);
+    return Response.json({ approval: decided });
+  });
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Build it', requestId: 'granted-shell' }), 202);
+  const presented = new Map((await json<{ view: SessionView }>(await s.creator.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
+  assert.equal(presented.get(command.id)!.unbounded, true);
+  const decide = (client: typeof s.creator, approval: ApprovalRecord) =>
+    client.request('POST', `${path}/approvals/${approval.id}`, { decision: 'approve', reviewHash: presented.get(approval.id)!.reviewHash });
+
+  // Without a grant, the creator can neither lift the host's limits nor run a command without them.
+  await denied(await decide(s.creator, unlimited), 403, 'host_owner_required');
+  await denied(await decide(s.creator, command), 403, 'host_owner_required');
+  assert.deepEqual(decisions, []);
+  // With one, they can; approve permission on the session alone still can't decide a command without limits.
+  await json(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/host-grants/${s.team.id}`, { level: 'approve', userId: s.creator.user.id }));
+  await json(await decide(s.creator, unlimited));
+  await denied(await decide(s.admin, command), 403, 'host_owner_required');
+  await json(await decide(s.creator, command));
+  await json(await decide(s.admin, bounded));
+  assert.deepEqual(decisions, [{ approvalId: unlimited.id, actorId: s.creator.user.id }, { approvalId: command.id, actorId: s.creator.user.id },
+    { approvalId: bounded.id, actorId: s.admin.user.id }]);
+});
+
+test('the host\'s owner decides host commands in a session on it they can read, once its connector lets them; nothing else and nobody else without approve', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'host_bash', 'github_comment']);
+  const path = `/api/sessions/${s.session.id}`;
+  const pending = (id: string, operation: Operation): ApprovalRecord => ({
+    id, sessionId: s.session.id, requestedBy: s.creator.user.id, operation, status: 'pending', createdAt: new Date().toISOString(),
+  });
+  const command = pending('tool-call-1', { kind: 'host.bash', command: 'dotnet --info', timeoutSeconds: 300 });
+  const comment = pending('tool-call-2', { kind: 'github.comment', repository: 'owner/repo', issue: 3, body: 'Looks good.' });
+  let approvals = [command, comment];
+  const decisions: { approvalId: string; actorId: string; decision: string }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    const action = envelope.request.ticket.action;
+    if (action === 'submit') {
+      const { admissionId } = JSON.parse(envelope.request.body) as { admissionId: string };
+      approvals = approvals.map(approval => ({ ...approval, admissionId }));
+      return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+    }
+    if (action === 'view') return Response.json({ view: {
+      sessionId: s.session.id,
+      owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+      entries: [], approvals, conversations: [], busy: true,
+    } });
+    assert.equal(action, 'approve');
+    const input = JSON.parse(envelope.request.body) as { approvalId: string; decision: string };
+    decisions.push({ approvalId: input.approvalId, actorId: envelope.request.ticket.actorId, decision: input.decision });
+    const decided: ApprovalRecord = { ...approvals.find(approval => approval.id === input.approvalId)!, status: input.decision === 'approve' ? 'executing' : 'denied',
+      decidedBy: envelope.request.ticket.actorId };
+    approvals = approvals.map(approval => approval.id === decided.id ? decided : approval);
+    return Response.json({ approval: decided });
+  });
+  await json(await s.creator.request('POST', `${path}/submit`, { content: 'Comment, then check the SDK', requestId: 'host-owner-write' }), 202);
+  // The host's owner follows the workspace-visible session with read access only, and no session role.
+  const { session } = await json<{ session: SessionRecord }>(await s.host.request('GET', path));
+  assert.deepEqual(session.permissions, ['read']);
+  const presented = new Map((await json<{ view: SessionView }>(await s.host.request('GET', `${path}/view`))).view.approvals.map(approval => [approval.id, approval]));
+  const decide = (client: typeof s.creator, approval: ApprovalRecord, decision = 'approve') =>
+    client.request('POST', `${path}/approvals/${approval.id}`, { decision, reviewHash: presented.get(approval.id)!.reviewHash });
+
+  // The host's own decision ticket, as the transport checks it on the way to the host and again with its answer.
+  const decisionTicket = async (): Promise<RunnerTicket> => {
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const { policy_version } = f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id) as { policy_version: number };
+    return { aud: 'runner', sessionId: s.session.id, actorId: s.host.user.id, ownerId: s.creator.user.id, connectorId: s.connector.connectorId,
+      action: 'approve', policyVersion: policy_version, iat: issuedAt, exp: issuedAt + 60, jti: token(), bodyHash: await sha256('') };
+  };
+  const refused = (error: unknown) => error instanceof HTTPException && error.status === 403;
+
+  // A connector that predates it checks approve permission on every decision, its owner's included, and so does the transport.
+  await denied(await decide(s.host, command), 403, 'forbidden');
+  await assert.rejects(authorizeConnectorTicket(f.env, await decisionTicket()), refused);
+  const capabilities = { ...manifest.capabilities, hostCommands: true, hostGrants: true };
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostOwnerDecides: 'yes' } }), 400);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostOwnerDecides: true } }), 400);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostOwnerDecides: true } }));
+  await authorizeConnectorTicket(f.env, await decisionTicket());
+  // Now the host command is its owner's to decide; anything else still needs approve permission.
+  await denied(await decide(s.host, comment, 'deny'), 403, 'forbidden');
+  // A member granted host commands, here the workspace's owner, still needs approve permission on the session.
+  await json(await s.host.request('PUT', `/api/connectors/${s.connector.connectorId}/host-grants/${s.team.id}`, { level: 'approve', userId: s.admin.user.id }));
+  await denied(await decide(s.admin, command), 403, 'forbidden');
+  assert.deepEqual(decisions, []);
+  const approved = await json<{ approval: ApprovalRecord }>(await decide(s.host, command));
+  assert.deepEqual([approved.approval.status, approved.approval.decidedBy], ['executing', s.host.user.id]);
+  assert.deepEqual(decisions, [{ approvalId: command.id, actorId: s.host.user.id, decision: 'approve' }]);
+  await denied(await decide(s.host, command), 409, 'approval_already_decided');
+  // An archived session takes no decisions, its host's owner's included.
+  approvals = approvals.map(approval => approval.id === command.id ? { ...approval, status: 'pending' as const, decidedBy: undefined } : approval);
+  f.sqlite.prepare("UPDATE sessions SET status = 'archived' WHERE id = ?").run(s.session.id);
+  await denied(await decide(s.host, command), 409, 'session_archived');
+  assert.equal(decisions.length, 1);
 });
 
 test('per-message chat options are checked against the session host, mode and owner before reaching the runtime', async t => {
@@ -1937,7 +2066,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'source_read'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search', 'source_read'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // There is no agent catalog: agents can't be listed, revised or published.
@@ -1949,21 +2078,22 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'source_read'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search', 'source_read'].includes(tool)));
 
-  // A host that also carries GitHub reads and merges offers those; opening issues needs its own capability, which
-  // connectors from before github_issue don't advertise.
+  // A host that also carries GitHub reads and merges offers those; opening issues, managing schedules and working with
+  // other sessions need their own capabilities, which connectors from before github_issue, schedule and sessions don't
+  // advertise, and so do the web tools.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue' && tool !== 'source_read'));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search', 'source_read'].includes(tool)));
 
   // A current host gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, sources: true, hostCommands: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, schedules: true, crossSessions: true, sources: true, hostCommands: true, web: true } }));
   const { session: fourth } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(fourth.agentVersionId, third.agentVersionId);
   assert.deepEqual(startedAgent().tools, offered);
-  assert.ok(offered.includes('github_issue'));
+  assert.ok(offered.includes('github_issue') && offered.includes('schedule') && offered.includes('sessions') && offered.includes('web_fetch') && offered.includes('web_search'));
 });
 
 test('workspace read does not grant mutations, connector credentials, personal environment or backup access', async t => {
@@ -2016,16 +2146,16 @@ test('workspace read does not grant mutations, connector credentials, personal e
   assert.equal(f.sqlite.prepare('SELECT ciphertext FROM github_tokens WHERE user_id = ?').get(s.owner.user.id)!.ciphertext, ciphertext);
 });
 
-test('root visibility PATCH is CSRF protected, owner-only, versioned and unions rather than replaces explicit grants', async t => {
+test('root visibility PATCH is CSRF protected, for the owner and the workspace\'s owner and admins, versioned and unions rather than replaces explicit grants', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
   assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403);
   // A role change bumps the policy version of the workspace's sessions, so promote before taking the baseline.
-  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'collaborator' }));
   const rowBefore = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { 'X-CSRF-Token': '' })).status, 403);
   assert.equal((await s.owner.request('PATCH', path, { visibility: 'private' }, { Origin: 'https://hostile.example' })).status, 403);
-  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403, 'Workspace administration is not session ownership');
+  assert.equal((await s.member.request('PATCH', path, { visibility: 'private' })).status, 403, 'Messaging a shared session is not managing it');
   await denied(await s.outsider.request('PATCH', path, { visibility: 'private' }), 404, 'not_found');
   for (const visibility of ['public', '', null, 1]) {
     assert.equal((await s.owner.request('PATCH', path, { visibility })).status, 400);
@@ -2043,13 +2173,13 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   await json(await s.owner.request('POST', `${path}/grants`, { userId: s.member.user.id, permissions: ['ask', 'manage'] }));
   const granted = await json<{ session: SessionRecord }>(await s.member.request('GET', path));
   assert.deepEqual(granted.session.permissions, ['read', 'ask', 'manage']);
-  assert.equal((await s.member.request('PATCH', path, { visibility: 'workspace' })).status, 403, 'Manage is not ownership');
+  await denied(await s.member.request('PATCH', path, { visibility: 'workspace' }), 403, 'owner_required');
   assert.equal(f.sqlite.prepare('SELECT policy_version FROM sessions WHERE id = ?').get(s.session.id)!.policy_version, granted.session.policyVersion);
   const grantBefore = f.sqlite.prepare('SELECT * FROM session_grants WHERE session_id = ?').all(s.session.id);
   const shared = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'workspace' }));
   assert.equal(shared.session.policyVersion, granted.session.policyVersion + 1);
   assert.equal(shared.session.visibility, 'workspace');
-  // Shared with the workspace, an admin can also send messages; its grant adds manage.
+  // Shared with the workspace, a collaborator can also send messages; its grant adds manage.
   assert.deepEqual((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.permissions, ['read', 'ask', 'write', 'manage']);
   const privateAgain = await json<{ session: SessionRecord }>(await s.owner.request('PATCH', path, { visibility: 'private' }));
   assert.equal(privateAgain.session.policyVersion, shared.session.policyVersion + 1);
@@ -2061,6 +2191,21 @@ test('root visibility PATCH is CSRF protected, owner-only, versioned and unions 
   await json(await s.owner.request('PATCH', path, { visibility: 'private' }));
   await denied(await s.member.request('GET', path), 404, 'not_found');
   assert.deepEqual(await json(await s.member.request('GET', '/api/sessions')), { sessions: [] });
+
+  // The workspace's owner and admins manage every session there: made an admin, the member opens the private session,
+  // with no grant, and changes its visibility as its owner would, versioned and recorded as their own change.
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  const managed = await json<{ session: SessionRecord }>(await s.member.request('GET', path));
+  assert.deepEqual(managed.session.permissions, ['read', 'ask', 'write', 'manage']);
+  assert.deepEqual((await json<{ sessions: SessionRecord[] }>(await s.member.request('GET', '/api/sessions'))).sessions.map(session => session.id), [s.session.id]);
+  const reshared = await json<{ session: SessionRecord }>(await s.member.request('PATCH', path, { visibility: 'workspace' }));
+  assert.equal(reshared.session.visibility, 'workspace');
+  assert.equal(reshared.session.policyVersion, managed.session.policyVersion + 1);
+  assert.deepEqual(reshared.session.permissions, ['read', 'ask', 'write', 'manage'], 'what the admin holds, not the owner\'s access');
+  assert.equal((await json<{ session: SessionRecord }>(await s.member.request('PATCH', path, { visibility: 'private' }))).session.visibility, 'private');
+  assert.deepEqual(f.sqlite.prepare("SELECT actor_id FROM audit WHERE session_id = ? AND action = 'session.visibility.updated' ORDER BY created_at DESC, rowid DESC LIMIT 2")
+    .all(s.session.id).map(row => row.actor_id), [s.member.user.id, s.member.user.id]);
+  assert.deepEqual(f.sqlite.prepare('SELECT * FROM session_grants WHERE session_id = ?').all(s.session.id), []);
   const stored = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
   for (const key of ['owner_id', 'workspace_id', 'agent_version_id', 'connector_id', 'connector_owner_id', 'repositories_json']) {
     assert.equal(stored[key], rowBefore![key], key);
@@ -2108,6 +2253,78 @@ test('owners rename and archive sessions; archived sessions are read-only and un
   const actions = (f.sqlite.prepare('SELECT action FROM audit WHERE session_id = ? ORDER BY created_at, rowid').all(s.session.id) as { action: string }[]).map(row => row.action);
   for (const action of ['session.renamed', 'session.archived', 'session.unarchived']) assert.ok(actions.includes(action), action);
   assert.equal(s.hub.requests.length, 1, 'Renaming and archiving must not contact the host');
+});
+
+test('the workspace\'s owner and admins manage every session there, private ones included, but nothing that is its owner\'s alone', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  // The creator's private session on the host s.host shares; s.admin owns the workspace.
+  const { session } = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, visibility: 'private', trustedConnectorId: s.connector.connectorId,
+  }), 201);
+  const path = `/api/sessions/${session.id}`;
+  const workspaceAdmin = await f.client('workspace-admin');
+  await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: workspaceAdmin.user.id, role: 'admin' }));
+  const managed = ['read', 'ask', 'write', 'manage'];
+  const held = async (client: Client) => (await json<{ session: SessionRecord }>(await client.request('GET', path))).session.permissions;
+
+  // Another member, the host's owner included, doesn't see it; the workspace's owner and its admins open and list it
+  // with no grant, holding all but approve.
+  await denied(await s.host.request('GET', path), 404, 'not_found');
+  for (const manager of [s.admin, workspaceAdmin]) {
+    assert.deepEqual(await held(manager), managed);
+    const { sessions } = await json<{ sessions: SessionRecord[] }>(await manager.request('GET', '/api/sessions'));
+    assert.deepEqual(sessions.find(item => item.id === session.id)?.permissions, managed);
+  }
+
+  // They rename it and change its tool output and visibility as its owner would; each answer carries what they hold.
+  const renamed = await json<{ session: SessionRecord }>(await workspaceAdmin.request('PATCH', path, { title: '  Tidied up  ' }));
+  assert.equal(renamed.session.title, 'Tidied up');
+  assert.deepEqual(renamed.session.permissions, managed);
+  assert.equal((await json<{ session: SessionRecord }>(await s.admin.request('PATCH', path, { toolOutput: 'brief' }))).session.toolOutput, 'brief');
+  assert.equal((await json<{ session: SessionRecord }>(await workspaceAdmin.request('PATCH', path, { visibility: 'workspace' }))).session.visibility, 'workspace');
+  assert.deepEqual(await held(s.host), ['read']);
+  await json(await workspaceAdmin.request('PATCH', path, { visibility: 'private' }));
+  await denied(await s.host.request('GET', path), 404, 'not_found');
+
+  // They give session roles up to what they hold, so never one that approves, and take any away.
+  await denied(await workspaceAdmin.request('POST', `${path}/grants`, { userId: s.host.user.id, role: 'admin' }), 403, 'grant_escalation');
+  await json(await workspaceAdmin.request('POST', `${path}/grants`, { userId: s.host.user.id, role: 'collaborator' }));
+  assert.deepEqual(await held(s.host), ['read', 'ask', 'write']);
+  // A session admin role, which its owner can give, manages who has access but not the session itself.
+  await json(await s.creator.request('POST', `${path}/grants`, { userId: s.host.user.id, role: 'admin' }));
+  for (const [method, suffix, body] of [['PATCH', '', { title: 'Hijacked' }], ['PATCH', '', { visibility: 'workspace' }], ['PATCH', '', { toolOutput: 'full' }],
+    ['POST', '/archive', undefined]] as const) {
+    await denied(await s.host.request(method, `${path}${suffix}`, body), 403, 'owner_required');
+  }
+  await json(await s.admin.request('DELETE', `${path}/grants/${encodeURIComponent(s.host.user.id)}`));
+  await denied(await s.host.request('GET', path), 404, 'not_found');
+
+  // Approving, and whatever acts as the session's owner or takes their work elsewhere, stay its owner's.
+  await denied(await workspaceAdmin.request('POST', `${path}/approvals/approval`, { decision: 'approve', reviewHash: 'r'.repeat(43) }), 403, 'forbidden');
+  for (const [method, suffix, body] of [['POST', '/backup', {}], ['GET', '/backups', undefined], ['POST', '/restart', {}], ['GET', '/export', undefined],
+    ['GET', '/link', undefined], ['PUT', '/link', undefined], ['POST', '/schedules', { message: 'Nightly', cron: '0 3 * * *' }],
+    ['POST', '/migrate', { requestId: 'manager-move', modelId: s.model.id }]] as const) {
+    await denied(await workspaceAdmin.request(method, `${path}${suffix}`, body), 403, 'owner_required');
+  }
+
+  // They archive it and unarchive it to its exact status; every change is recorded as the one who made it.
+  const archived = await json<{ session: SessionRecord }>(await workspaceAdmin.request('POST', `${path}/archive`));
+  assert.equal(archived.session.status, 'archived');
+  assert.deepEqual(archived.session.permissions, managed);
+  const restored = await json<{ session: SessionRecord }>(await s.admin.request('POST', `${path}/unarchive`));
+  assert.equal(restored.session.status, 'ready');
+  const actors = Object.fromEntries((f.sqlite.prepare(`SELECT action, actor_id FROM audit WHERE session_id = ?
+    AND action IN ('session.renamed', 'session.tool_output.updated', 'session.archived', 'session.unarchived')`).all(session.id) as { action: string; actor_id: string }[])
+    .map(row => [row.action, row.actor_id]));
+  assert.deepEqual(actors, { 'session.renamed': workspaceAdmin.user.id, 'session.tool_output.updated': s.admin.user.id,
+    'session.archived': workspaceAdmin.user.id, 'session.unarchived': s.admin.user.id });
+
+  // An admin no more, they manage nothing and don't see it.
+  await json(await s.admin.request('PATCH', `/api/workspaces/${s.team.id}/members/${encodeURIComponent(workspaceAdmin.user.id)}`, { role: 'collaborator' }));
+  await denied(await workspaceAdmin.request('GET', path), 404, 'not_found');
+  await denied(await workspaceAdmin.request('POST', `${path}/archive`), 404, 'not_found');
+  assert.equal(s.hub.requests.length, 1, 'Managing a session never contacts its host');
+  assert.deepEqual(s.hub.unexpected, []);
 });
 
 test('hosts report what the agent of each session they serve is doing; lists show it and the runner binding never carries it', async t => {
@@ -2171,6 +2388,93 @@ test('writers stop a session\'s work through its host, audited; archived session
   await json(await s.owner.request('POST', `${path}/archive`));
   await denied(await s.owner.request('POST', `${path}/stop`, {}), 409, 'session_archived');
   assert.equal(requests.length, 2);
+});
+
+test('writers take the shared conversation back to a message through its host, audited; readers and archived sessions refuse', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  let answer: unknown = { conversationId: '7' };
+  const requests = rpcHub(f, s.connector, () => Response.json(answer));
+  assert.deepEqual(await json(await s.owner.request('POST', `${path}/revert`, { entryId: '1:12' })), { conversationId: '7' });
+  const { request } = requests[0]!;
+  assert.deepEqual([request.method, request.path, request.body, request.ticket.action, request.ticket.actorId],
+    ['POST', `/v1/sessions/${s.session.id}/revert`, JSON.stringify({ entryId: '1:12' }), 'revert', s.owner.user.id]);
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.reverted'").all(s.session.id);
+  assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ entryId: '1:12' }) }]);
+  for (const body of [{}, { entryId: 12 }, { entryId: '12' }, { entryId: '1:12', extra: true }]) {
+    await denied(await s.owner.request('POST', `${path}/revert`, body), 400, 'invalid_input');
+  }
+  await denied(await s.member.request('POST', `${path}/revert`, { entryId: '1:12' }), 403, 'forbidden');
+  answer = {};
+  await denied(await s.owner.request('POST', `${path}/revert`, { entryId: '1:12' }), 502, 'invalid_runner_response');
+  await json(await s.owner.request('POST', `${path}/archive`));
+  await denied(await s.owner.request('POST', `${path}/revert`, { entryId: '1:12' }), 409, 'session_archived');
+  assert.equal(requests.length, 2);
+});
+
+test('its owner forks a session from a message into a new one on the same host and current model, which the host fills; a failed fork is archived', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  // A second model on the same host, which the session's messages switched to.
+  const columns = (f.sqlite.prepare('PRAGMA table_info(models)').all() as { name: string }[]).map(column => column.name);
+  f.sqlite.prepare(`INSERT INTO models (${columns.join(',')}) SELECT ${columns.map(column => column === 'id' ? "'second-model'" : column === 'model_id' ? "'second'" : column).join(',')} FROM models WHERE id = ?`).run(s.model.id);
+  const advertised = JSON.parse((f.sqlite.prepare('SELECT models_json FROM connectors WHERE id = ?').get(s.connector.connectorId) as { models_json: string }).models_json) as { modelId: string }[];
+  f.sqlite.prepare('UPDATE connectors SET models_json = ? WHERE id = ?').run(JSON.stringify([...advertised, { ...advertised[0]!, modelId: 'second' }]), s.connector.connectorId);
+  let agent: SessionView['agent'] = { provider: s.model.provider, modelId: 'second', thinkingLevel: 'high' };
+  let forkAnswer: () => Response = () => Response.json({ conversationId: '1', entries: 4 });
+  const requests = rpcHub(f, s.connector, envelope => envelope.request.ticket.action === 'fork' ? forkAnswer()
+    : envelope.request.ticket.action === 'view' ? Response.json({ view: { ...s.view, ...(agent ? { agent } : {}) } })
+    : Response.json({ session: {} }, { status: 201 }));
+  const { session } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 201);
+  assert.notEqual(session.id, s.session.id);
+  assert.deepEqual([session.title, session.visibility, session.status, session.connectorId, session.ownerId],
+    [`Fork: ${s.session.title}`, s.session.visibility, 'ready', s.session.connectorId, s.owner.user.id]);
+  assert.deepEqual(requests.map(({ request }) => [request.path, request.ticket.action, request.ticket.sessionId]), [
+    [`/v1/sessions/${s.session.id}/view`, 'view', s.session.id],
+    ['/v1/sessions', 'create', session.id],
+    [`/v1/sessions/${session.id}/fork`, 'fork', session.id],
+  ]);
+  assert.deepEqual(JSON.parse(requests[2]!.request.body), { sourceSessionId: s.session.id, entryId: '1:12' });
+  const model = (id: string) => (f.sqlite.prepare('SELECT a.model_id FROM sessions s JOIN agent_versions a ON a.id = s.agent_version_id WHERE s.id = ?').get(id) as { model_id: string }).model_id;
+  assert.equal(model(session.id), 'second-model', 'the model the conversation uses now');
+  assert.equal(model(s.session.id), s.model.id);
+  const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.forked'").all(session.id);
+  assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ sourceSessionId: s.session.id, entryId: '1:12' }) }]);
+
+  // A host that names no model, or one no new session may start on now: the model the session started on.
+  const fallsBack = async () => {
+    const { session: fallback } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 201);
+    assert.equal(model(fallback.id), s.model.id);
+  };
+  for (const current of [undefined, { provider: s.model.provider, modelId: 'gone', thinkingLevel: 'high' as const }]) {
+    agent = current;
+    await fallsBack();
+  }
+  agent = { provider: s.model.provider, modelId: 'second', thinkingLevel: 'high' };
+  // The host stopped offering it: its row stays, unavailable.
+  f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run('second-model');
+  await fallsBack();
+  // Its owner disabled it on the host: its row stays available.
+  f.sqlite.prepare('UPDATE models SET available = 1 WHERE id = ?').run('second-model');
+  f.sqlite.prepare('INSERT INTO connector_disabled_models (connector_id, provider, model_id, disabled_by, disabled_at) VALUES (?,?,?,?,?)')
+    .run(s.connector.connectorId, s.model.provider, 'second', s.owner.user.id, new Date().toISOString());
+  await fallsBack();
+  f.sqlite.prepare('DELETE FROM connector_disabled_models WHERE model_id = ?').run('second');
+  const { session: titled } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12', title: 'Try another way' }), 201);
+  assert.equal(titled.title, 'Try another way');
+  for (const body of [{}, { entryId: '1:12', visibility: 'private' }, { entryId: 'x' }]) await denied(await s.owner.request('POST', `${path}/fork`, body), 400, 'invalid_input');
+  // Only its owner: a reader can't, and nor could someone who could write to it.
+  await denied(await s.member.request('POST', `${path}/fork`, { entryId: '1:12' }), 403, 'forbidden');
+  await json(await s.owner.request('POST', `${path}/grants`, { userId: s.member.user.id, permissions: ['read', 'ask', 'write', 'approve', 'manage'] }));
+  await denied(await s.member.request('POST', `${path}/fork`, { entryId: '1:12' }), 403, 'owner_required');
+
+  // The host refuses: the new session is archived rather than left empty.
+  const before = requests.length;
+  forkAnswer = () => Response.json({ error: 'That message is no longer in the shared conversation; reload it' }, { status: 409 });
+  await denied(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 409, 'runner_error');
+  const failed = requests.at(-1)!.request.ticket.sessionId;
+  assert.equal(requests.length, before + 3);
+  assert.equal((f.sqlite.prepare('SELECT status FROM sessions WHERE id = ?').get(failed) as { status: string }).status, 'archived');
 });
 
 test('explicitly private creation stays unlisted until granted and membership removal defeats both visibility and grants', async t => {
@@ -2365,6 +2669,45 @@ for (const mutation of ['owner-membership', 'policy-version'] as const) {
     assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE session_id = ? AND action = 'session.visibility.updated'").get(s.session.id)!.n, 0);
     assert.equal(s.hub.requests.length, 1);
     if (mutation === 'owner-membership') await denied(await s.creator.request('GET', path), 404, 'not_found');
+  });
+}
+
+// A workspace admin's change to someone else's session checks again, as it writes, that they still manage it: a
+// suspension bumps no policy version, and neither would a role change made some other way.
+for (const mutation of ['demoted', 'suspended'] as const) {
+  test(`a workspace admin's changes to another member's session are refused once they are ${mutation} after admission`, async t => {
+    const f = await fixture(t); const s = await sharedSession(f);
+    const path = `/api/sessions/${s.session.id}`;
+    const manager = await f.client(`manager-${mutation}`);
+    const operations = [
+      { name: 'archive', sql: 'UPDATE sessions SET archived_status = status', action: 'session.archived', send: () => manager.request('POST', `${path}/archive`) },
+      { name: 'unarchive', sql: 'UPDATE sessions SET status = COALESCE', action: 'session.unarchived', send: () => manager.request('POST', `${path}/unarchive`) },
+      { name: 'rename', sql: 'UPDATE sessions SET title =', action: 'session.renamed', send: () => manager.request('PATCH', path, { title: 'Renamed' }) },
+      { name: 'visibility', sql: 'UPDATE sessions SET visibility =', action: 'session.visibility.updated', send: () => manager.request('PATCH', path, { visibility: 'private' }) },
+      { name: 'tool output', sql: 'UPDATE sessions SET tool_output =', action: 'session.tool_output.updated', send: () => manager.request('PATCH', path, { toolOutput: 'brief' }) },
+    ];
+    for (const operation of operations) {
+      // An admin again, and active, before each attempt; the session is archived for the unarchive.
+      f.sqlite.prepare("UPDATE users SET suspended_at = NULL WHERE id = ?").run(manager.user.id);
+      await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: manager.user.id, role: 'admin' }));
+      if (operation.name === 'unarchive') await json(await s.creator.request('POST', `${path}/archive`));
+      const before = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
+      let changed = false;
+      f.setBeforeQuery(sql => {
+        if (changed || !sql.startsWith(operation.sql)) return;
+        changed = true;
+        if (mutation === 'demoted') f.sqlite.prepare("UPDATE workspace_members SET role = 'member' WHERE workspace_id = ? AND user_id = ?").run(s.team.id, manager.user.id);
+        else f.sqlite.prepare('UPDATE users SET suspended_at = ? WHERE id = ?').run(new Date().toISOString(), manager.user.id);
+      });
+      await denied(await operation.send(), 409, 'policy_changed');
+      f.setBeforeQuery();
+      assert.equal(changed, true, `The ${mutation} change must land after admission and before the conditional ${operation.name}`);
+      assert.deepEqual({ ...f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)! }, { ...before }, operation.name);
+      assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE session_id = ? AND action = ? AND actor_id = ?')
+        .get(s.session.id, operation.action, manager.user.id)!.n, 0, operation.name);
+      if (operation.name === 'unarchive') await json(await s.creator.request('POST', `${path}/unarchive`));
+    }
+    assert.equal(s.hub.requests.length, 1);
   });
 }
 
@@ -2610,7 +2953,7 @@ test('host owners add admins who manage sharing and host command grants, and gra
 test('host owners and admins configure how the host runs sessions, and only the owner decides whose credentials it uses', async t => {
   const f = await fixture(t); const s = await sharedHost(f); const outsider = await f.client('outsider');
   const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
-  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: {} };
   const listed = async (client: Client) => (await json<{ connectors: ConnectorInfo[] }>(await client.request('GET', '/api/connectors'))).connectors
     .find(item => item.id === id)?.config;
   // Its owner and the connector itself read it; members of a workspace it is shared with neither see nor change it.
@@ -2628,7 +2971,7 @@ test('host owners and admins configure how the host runs sessions, and only the 
     await denied(await host.request('PATCH', path, invalid), 400, 'invalid_host_config');
   }
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_configs').get()!.n, 0);
-  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true };
+  const owned = { commandTimeoutSeconds: 600, gpu: true, gitCredentials: true, repositoryCache: 'owner', hostSessions: true, compaction: {} };
   assert.deepEqual(await json(await host.request('PATCH', path, owned)), { config: owned });
   assert.deepEqual(await listed(host), owned);
   assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: owned });
@@ -2661,7 +3004,7 @@ test('a save changes only the settings it names, so what someone else saved mean
   // An admin's form loaded the defaults; then the owner turns on Git credentials and the cache.
   await json(await host.request('PATCH', path, { gitCredentials: true, repositoryCache: 'host' }));
   // The admin's save of the time limit names none of the owner's settings: it is neither refused nor undoes theirs.
-  const both = { commandTimeoutSeconds: 120, gpu: false, gitCredentials: true, repositoryCache: 'host', hostSessions: false };
+  const both = { commandTimeoutSeconds: 120, gpu: false, gitCredentials: true, repositoryCache: 'host', hostSessions: false, compaction: {} };
   assert.deepEqual(await json(await creator.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: both });
   // Nor does the owner's next save undo the admin's time limit.
   assert.deepEqual(await json(await host.request('PATCH', path, { gpu: true })), { config: { ...both, gpu: true } });
@@ -2677,10 +3020,37 @@ test('an admin\'s first configuration of a host leaves the owner\'s settings at 
   const f = await fixture(t); const s = await sharedHost(f);
   const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
   await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.creator.user.id}`));
-  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  const config = { commandTimeoutSeconds: 120, gpu: true, gitCredentials: false, repositoryCache: 'off', hostSessions: false, compaction: {} };
   assert.deepEqual(await json(await s.creator.request('PATCH', path, config)), { config });
   assert.deepEqual({ ...f.sqlite.prepare('SELECT git_credentials, repository_cache, host_sessions, updated_by FROM connector_configs WHERE connector_id = ?').get(id) },
     { git_credentials: 0, repository_cache: 'off', host_sessions: 0, updated_by: s.creator.user.id });
+});
+
+test('a host\'s owner and admins set its compaction token counts, which its connector reads with the rest of its configuration', async t => {
+  const f = await fixture(t); const s = await sharedHost(f);
+  const { host, creator } = s; const id = s.connector.connectorId; const path = `/api/connectors/${id}/config`;
+  const defaults = { commandTimeoutSeconds: 30, gpu: false, gitCredentials: false, repositoryCache: 'off', hostSessions: false };
+  for (const invalid of [{ compaction: null }, { compaction: [] }, { compaction: { reserveTokens: -1 } }, { compaction: { reserveTokens: 1.5 } },
+    { compaction: { reserveTokens: 10_000_001 } }, { compaction: { enabled: false } }, { compaction: { modelOverrides: { model: { reserveTokens: 1 } } } },
+    { compaction: { modelOverrides: { 'anthropic/opus': { keepRecentTokens: '1' } } } }]) {
+    await denied(await host.request('PATCH', path, invalid), 400, 'invalid_host_config');
+  }
+  // Kept as it is read back: models sorted, and a model without counts left out.
+  const compaction = { reserveTokens: 32_768, modelOverrides: { 'openai/gpt-5': { keepRecentTokens: 4000 }, 'anthropic/opus': { reserveTokens: 65_536, keepRecentTokens: 20_000 }, 'faux/none': {} } };
+  const kept = { reserveTokens: 32_768, modelOverrides: { 'anthropic/opus': { reserveTokens: 65_536, keepRecentTokens: 20_000 }, 'openai/gpt-5': { keepRecentTokens: 4000 } } };
+  assert.deepEqual(await json(await host.request('PATCH', path, { compaction })), { config: { ...defaults, compaction: kept } });
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, compaction: kept } });
+  assert.equal(f.sqlite.prepare('SELECT compaction_json FROM connector_configs WHERE connector_id = ?').get(id)!.compaction_json, JSON.stringify(kept));
+  // A save of another setting keeps it; an admin changes it, as a whole, for as many models as a host offers, with the longest names.
+  assert.deepEqual(await json(await host.request('PATCH', path, { commandTimeoutSeconds: 120 })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: kept } });
+  await json(await host.request('PUT', `/api/connectors/${id}/admins/${creator.user.id}`));
+  const many = { modelOverrides: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`${String(index).padStart(80, 'p')}/${'m'.repeat(200)}`, { reserveTokens: 1_000_000 + index, keepRecentTokens: 9_999_999 }])) };
+  const saved = await json<{ config: { compaction: { modelOverrides: Record<string, unknown> } } }>(await creator.request('PATCH', path, { compaction: many }));
+  assert.equal(Object.keys(saved.config.compaction.modelOverrides).length, 200);
+  assert.deepEqual(await json(await creator.request('PATCH', path, { compaction: {} })), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
+  // A setting the database no longer reads as valid is none.
+  f.sqlite.prepare('UPDATE connector_configs SET compaction_json = ? WHERE connector_id = ?').run('{"reserveTokens":"lots"}', id);
+  assert.deepEqual(await json(await self(f, s.connector, 'config', {})), { config: { ...defaults, commandTimeoutSeconds: 120, compaction: {} } });
 });
 
 test('a host\'s owner and admins disable its models for everyone: a disabled model is neither listed, started from nor chosen', async t => {
@@ -2773,6 +3143,81 @@ test('a host\'s owner and admins disable its models for everyone: a disabled mod
   await denied(await host.request('PATCH', settings, { ...first, enabled: true }), 409, 'connector_revoked');
   assert.equal((await host.request('DELETE', `/api/connectors/${id}/permanent`)).status, 204);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_disabled_models WHERE connector_id = ?').get(id)!.n, 0);
+});
+
+test('messages the server writes itself name the conversation\'s current model while its host has a disabled model', async t => {
+  const f = await fixture(t); const s = await sharedSession(f); const id = s.connector.connectorId;
+  const settings = `/api/connectors/${id}/models`;
+  const first = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  const second = { provider: 'local-native', modelId: 'local/model-v2' };
+  const third = { provider: 'local-native', modelId: 'local/model-v3' };
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }, { ...third, name: 'Third model' }],
+    capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  let agent: SessionView['agent'];
+  const submitted: Record<string, unknown>[] = [];
+  rpcHub(f, s.connector, envelope => {
+    if (envelope.request.ticket.action === 'view') {
+      return Response.json({ view: { sessionId: s.session.id, owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [], approvals: [], conversations: [], busy: false, ...(agent ? { agent } : {}) } satisfies SessionView });
+    }
+    submitted.push(JSON.parse(envelope.request.body));
+    return Response.json({ submissionId: `submission-${submitted.length}`, conversationId: 'conversation', status: 'queued' }, { status: 202 });
+  });
+  let run = 0;
+  const schedule = async () => {
+    const at = Date.parse('2030-01-01T00:00:00Z') + ++run * 3600_000;
+    const due = new Date(at - 1000).toISOString();
+    f.sqlite.prepare(`INSERT INTO session_schedules (id, session_id, created_by, name, cron, time_zone, content, access, enabled, next_run_at, created_at, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(`schedule-${run}`, s.session.id, s.creator.user.id, 'Nightly', '0 0 * * *', 'UTC', 'Check it', 'approval', 1, due, due, due);
+    const outcomes = await runScheduledPrompts(f.env, at);
+    assert.deepEqual(outcomes.map(outcome => 'error' in outcome ? outcome.error : 'sent'), ['sent']);
+    f.sqlite.prepare('DELETE FROM session_schedules').run();
+    return submitted.at(-1)!.options;
+  };
+
+  // With nothing disabled, it names none, as before.
+  assert.equal(await schedule(), undefined);
+  // With a model disabled, it names the shared conversation's current one, at its reasoning.
+  await json(await s.host.request('PATCH', settings, { ...third, enabled: false }));
+  agent = { ...second, thinkingLevel: 'high' };
+  assert.deepEqual(await schedule(), { model: second, thinkingLevel: 'high' });
+  // Before the host reports one, the session's own.
+  agent = undefined;
+  assert.deepEqual(await schedule(), { model: first });
+  // A conversation on a disabled model sends nothing.
+  agent = { ...third, thinkingLevel: 'high' };
+  const before = submitted.length;
+  f.sqlite.prepare(`INSERT INTO session_schedules (id, session_id, created_by, name, cron, time_zone, content, access, enabled, next_run_at, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('schedule-disabled', s.session.id, s.creator.user.id, 'Nightly', '0 0 * * *', 'UTC', 'Check it', 'approval', 1,
+    '2031-01-01T00:00:00Z', '2031-01-01T00:00:00Z', '2031-01-01T00:00:00Z');
+  assert.deepEqual((await runScheduledPrompts(f.env, Date.parse('2031-01-01T00:00:01Z'))).map(outcome => 'error' in outcome && outcome.error), ['model_disabled']);
+  assert.equal(submitted.length, before);
+});
+
+test('the sessions tool sends another session a message on the conversation\'s current model while its host has a disabled model', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'sessions']); const id = s.connector.connectorId;
+  const { session: target } = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, title: 'Worker', trustedConnectorId: id }), 201);
+  const first = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  const second = { provider: 'local-native', modelId: 'local/model-v2' };
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }],
+    capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  await json(await s.host.request('PATCH', `/api/connectors/${id}/models`, { ...second, enabled: false }));
+  const submitted: { path: string; body: Record<string, unknown> }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    if (envelope.request.ticket.action === 'view') {
+      return Response.json({ view: { sessionId: target.id, owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [], approvals: [], conversations: [], busy: false, agent: { ...first, thinkingLevel: 'low' } } satisfies SessionView });
+    }
+    submitted.push({ path: envelope.request.path, body: JSON.parse(envelope.request.body) });
+    return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+  });
+  const admissionId = admit(f, s.session.id, s.creator.user.id);
+  const sent = await self(f, s.connector, 'sessions', { sessionId: s.session.id, actorId: s.creator.user.id, admissionId, callId: 'call-send',
+    action: 'send', targetSessionId: target.id, message: 'The brief' });
+  await json(sent, 202);
+  assert.deepEqual(submitted.map(item => [item.path, item.body.options]), [[`/v1/sessions/${target.id}/submit`, { model: first, thinkingLevel: 'low' }]]);
+  assert.match(String(submitted[0]!.body.content), /The brief$/);
 });
 
 for (const enabled of [false, true]) {
@@ -2895,15 +3340,155 @@ test('a host\'s owner starts a session directly on the host only where its confi
   await denied(await start({ hostEnvironment: true }), 400, 'host_unsandboxed');
 });
 
-test('only a host\'s owner starts sessions directly on it, never a member it is shared with', async t => {
+test('a member it is shared with starts sessions directly on a host only with a grant from its owner that includes them', async t => {
   const f = await fixture(t); const s = await sharedHost(f);
-  const id = s.connector.connectorId;
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, hostConfig: true } }));
+  const id = s.connector.connectorId; const grants = `/api/connectors/${id}/host-grants/${s.team.id}`;
+  const capabilities = { ...manifest.capabilities, hostConfig: true, hostCommands: true, hostGrants: true };
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities }));
   await json(await s.host.request('PATCH', `/api/connectors/${id}/config`, { hostSessions: true }));
-  const shared = (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors;
-  assert.equal(shared.find(item => item.id === id)?.hostSessions, undefined);
-  await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true }), 403, 'host_owner_required');
-  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n, 0);
+  const start = () => s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true });
+  const offered = async () => (await json<{ connectors: ConnectorInfo[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/connectors`))).connectors
+    .find(item => item.id === id)?.hostSessions;
+  const onHost = () => f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n;
+
+  // Without a grant, or with one of host commands alone, a member always gets the sandbox.
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await json(await s.host.request('PUT', grants, { level: 'auto', userId: s.creator.user.id }));
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await denied(await s.host.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: 'yes' }), 400, 'invalid_grant');
+
+  // Only the owner adds sessions on the host to a grant; an admin's change keeps what the grant had, or takes them away.
+  await json(await s.host.request('PUT', `/api/connectors/${id}/admins/${s.admin.user.id}`));
+  await denied(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: true }), 403, 'host_owner_required');
+  const given = await json<{ hostGrants: HostCommandGrant[] }>(await s.host.request('PUT', grants, { level: 'approve', userId: s.creator.user.id, hostSessions: true }));
+  assert.equal(given.hostGrants.find(grant => grant.userId === s.creator.user.id)?.hostSessions, true);
+  const kept = await json<{ hostGrants: HostCommandGrant[] }>(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id }));
+  assert.equal(kept.hostGrants.find(grant => grant.userId === s.creator.user.id)?.hostSessions, true, 'an admin changing its level keeps them');
+  const audit = f.sqlite.prepare(`SELECT detail_json FROM audit WHERE action = 'host.grant.set' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get()!;
+  assert.equal(JSON.parse(String(audit.detail_json)).hostSessions, true);
+
+  // A connector that runs only its owner's sessions on the host can't run theirs: they are refused, never sandboxed.
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 409, 'connector_update_required');
+  assert.equal(onHost(), 0);
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...capabilities, hostSessionGrants: true } }));
+  assert.equal(await offered(), true);
+  const { session } = await json<{ session: SessionRecord }>(await start(), 201);
+  assert.equal(session.hostEnvironment, true);
+  assert.equal(session.ownerId, s.creator.user.id);
+  assert.equal((JSON.parse(s.hub.requests.at(-1)!.request.body) as RunnerBinding).session.hostEnvironment, true);
+
+  // The host learns it with its owner's authority, and only when it asks: older connectors parse the reply strictly.
+  const asked = (body: Record<string, unknown>) => self(f, s.connector, 'authorize', { ...authorization(session), permission: 'write', ...body });
+  const reply = await json<{ hostCommands?: string; hostSessions?: true }>(await asked({ host: true, hostSessions: true }));
+  assert.deepEqual([reply.hostCommands, reply.hostSessions], ['auto', true]);
+  assert.equal(Object.hasOwn(await json(await asked({ host: true })), 'hostSessions'), false);
+  await denied(await asked({ hostSessions: true }), 400, 'invalid_authorization');
+
+  // Their grant without sessions on the host, or the host not accepting them, ends it; the session keeps what it was.
+  await json(await s.admin.request('PUT', grants, { level: 'auto', userId: s.creator.user.id, hostSessions: false }));
+  assert.equal(Object.hasOwn(await json(await asked({ host: true, hostSessions: true })), 'hostSessions'), false);
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 403, 'host_owner_required');
+  await json(await s.host.request('PUT', grants, { level: 'approve', hostSessions: true }));
+  assert.equal(await offered(), true, 'a workspace-wide grant counts too');
+  await json(await s.host.request('PATCH', `/api/connectors/${id}/config`, { hostSessions: false }));
+  assert.equal(await offered(), undefined);
+  await denied(await start(), 409, 'host_sessions_off');
+  assert.equal(onHost(), 1);
+});
+
+test('web searches need the requester\'s live write admission, the web_search tool or the owner\'s grant, and web search on in the workspace', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']);
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('The search provider must not be called'); });
+  f.env.WEB_SEARCH = 'brave'; f.env.WEB_SEARCH_API_KEY = 'brave-key';
+  const owner = s.session.ownerId;
+  const search = (admissionId: string, body: Record<string, unknown> = {}) => self(f, s.connector, 'web/search', {
+    sessionId: s.session.id, actorId: owner, admissionId, callId: 'call-1', query: 'pistead egress proxy', ...body,
+  });
+  for (const admissionId of [token(), admit(f, s.session.id, owner, { expiresAt: Math.floor(Date.now() / 1000) - 1 }), admit(f, s.session.id, owner, { mode: 'ask' })]) {
+    await denied(await search(admissionId), 403, 'web_search_not_admitted');
+  }
+  const admissionId = admit(f, s.session.id, owner);
+  await denied(await search(admissionId, { query: '  ' }), 400, 'invalid_input');
+  await denied(await search(admissionId, { count: 21 }), 400, 'invalid_input');
+  await denied(await search(admissionId, { extra: true }), 400, 'invalid_input');
+  await denied(await search(admissionId), 403, 'tool_not_allowed');
+  // A one-call grant covers only the query its card showed.
+  const grant = f.sqlite.prepare('INSERT INTO session_tool_grants (session_id,tool,call_id,approval_id,granted_by,created_at) VALUES (?,?,?,?,?,?)');
+  grant.run(s.session.id, 'web_search', 'call-1', 'permission-call-1', owner, new Date().toISOString());
+  f.sqlite.prepare(`INSERT INTO approval_reviews (session_id,approval_id,requested_by,source,admission_id,operation_json,review_hash,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`).run(s.session.id, 'permission-call-1', owner, 'model', admissionId,
+    JSON.stringify({ kind: 'permission', tool: 'web_search', target: 'pistead egress proxy', needs: ['tool'] }), token(), new Date().toISOString());
+  await denied(await search(admissionId, { query: 'something else' }), 403, 'tool_not_allowed');
+  // Allowed, but the workspace hasn't turned web search on.
+  await denied(await search(admissionId), 403, 'web_search_off');
+  f.sqlite.prepare(`INSERT INTO workspace_network_policies (workspace_id, mode, domains_json, package_registries, web_search, updated_by, updated_at)
+    VALUES (?, 'off', '[]', 1, 1, ?, ?)`).run(s.team.id, s.admin.user.id, new Date().toISOString());
+  // On, but the server has no provider.
+  delete f.env.WEB_SEARCH;
+  await denied(await search(admissionId), 503, 'web_search_unconfigured');
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'web.search'").get()!.n, 0);
+});
+
+test('a web search goes to the operator\'s provider with its key, and returns plain, bounded results that are audited', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'web_search']);
+  f.sqlite.prepare(`INSERT INTO workspace_network_policies (workspace_id, mode, domains_json, package_registries, web_search, updated_by, updated_at)
+    VALUES (?, 'off', '[]', 1, 1, ?, ?)`).run(s.team.id, s.admin.user.id, new Date().toISOString());
+  const owner = s.session.ownerId;
+  const admissionId = admit(f, s.session.id, owner);
+  const search = (body: Record<string, unknown> = {}) => self(f, s.connector, 'web/search', {
+    sessionId: s.session.id, actorId: owner, admissionId, callId: 'call-1', query: 'pistead  egress\nproxy', ...body,
+  });
+  let answer = () => Response.json({ web: { results: [
+    { title: 'Pistead <strong>egress</strong> &amp; proxy', url: 'https://github.com/OpenCara/pistead#network-access', description: 'The <strong>proxy</strong> &#39;answers&#39;', age: '2 days ago' },
+    { title: 'Not a page', url: 'javascript:alert(1)', description: 'dropped' },
+    { title: '', url: 'https://example.com/untitled', description: 'd'.repeat(2000) },
+  ] } });
+  const calls: { url: string; init?: RequestInit }[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => { calls.push({ url: String(input), init }); return answer(); });
+  f.env.WEB_SEARCH = 'brave'; f.env.WEB_SEARCH_API_KEY = 'brave-key';
+  const result = await json<{ query: string; provider: string; results: { title: string; url: string; snippet: string; published?: string }[] }>(await search({ count: 3 }));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url, 'https://api.search.brave.com/res/v1/web/search?q=pistead+egress+proxy&count=3');
+  assert.equal(new Headers(calls[0]!.init?.headers).get('x-subscription-token'), 'brave-key');
+  assert.equal(calls[0]!.init?.redirect, 'error');
+  assert.equal(result.query, 'pistead egress proxy');
+  assert.equal(result.provider, 'brave');
+  assert.deepEqual(result.results.slice(0, 1), [{ title: 'Pistead egress & proxy', url: 'https://github.com/OpenCara/pistead#network-access', snippet: 'The proxy \'answers\'', published: '2 days ago' }]);
+  assert.equal(result.results.length, 2);
+  assert.equal(result.results[1]!.title, 'https://example.com/untitled');
+  assert.equal(result.results[1]!.snippet.length, 1000);
+  assert.ok(!JSON.stringify(result).includes('brave-key'));
+  const audits = f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'web.search'").all().map(row => JSON.parse(String(row.detail_json)));
+  assert.deepEqual(audits, [{ provider: 'brave', query: 'pistead egress proxy', results: 2 }]);
+
+  // Tavily and SearXNG answer in their own shapes.
+  f.env.WEB_SEARCH = 'tavily'; f.env.WEB_SEARCH_API_KEY = 'tavily-key';
+  answer = () => Response.json({ results: [{ title: 'T', url: 'https://t.example/', content: 'tavily snippet', published_date: '2026-10-01' }] });
+  assert.deepEqual((await json<{ results: unknown[] }>(await search())).results, [{ title: 'T', url: 'https://t.example/', snippet: 'tavily snippet', published: '2026-10-01' }]);
+  assert.equal(calls.at(-1)!.url, 'https://api.tavily.com/search');
+  assert.equal(new Headers(calls.at(-1)!.init?.headers).get('authorization'), 'Bearer tavily-key');
+  assert.deepEqual(JSON.parse(String(calls.at(-1)!.init?.body)), { query: 'pistead egress proxy', max_results: 8, search_depth: 'basic' });
+  f.env.WEB_SEARCH = 'searxng'; delete f.env.WEB_SEARCH_API_KEY; f.env.WEB_SEARCH_URL = 'https://search.example.org/';
+  answer = () => Response.json({ results: [{ title: 'S', url: 'https://s.example/', content: 'searx snippet' }] });
+  assert.deepEqual((await json<{ results: unknown[] }>(await search())).results, [{ title: 'S', url: 'https://s.example/', snippet: 'searx snippet' }]);
+  assert.equal(calls.at(-1)!.url, 'https://search.example.org/search?q=pistead+egress+proxy&format=json');
+
+  // The provider's refusals come back as such, with nothing of its answer.
+  answer = () => new Response('slow down', { status: 429 });
+  await denied(await search(), 429, 'web_search_rate_limited');
+  answer = () => new Response('<html>broken</html>', { status: 200 });
+  await denied(await search(), 502, 'web_search_failed');
+
+  // Turning web search off stops the next search.
+  f.sqlite.prepare('UPDATE workspace_network_policies SET web_search = 0 WHERE workspace_id = ?').run(s.team.id);
+  const before = calls.length;
+  await denied(await search(), 403, 'web_search_off');
+  assert.equal(calls.length, before);
 });
 
 /** A fake Notion API: a root page with a child page, a page under that child's block, a database, and a page elsewhere. */

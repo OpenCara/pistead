@@ -6,10 +6,11 @@ import { validateUserEnv } from '../../../packages/shared/src/policy.js';
 import type { NativeSignIn, SignedInDevice } from '../../../packages/shared/src/types.js';
 import { isInstanceAdmin } from './admin.js';
 import { getUser, userProfile } from './db.js';
-import type { Query, SqlValue } from './db/types.js';
-import { appOrigin, fail, id, identifier, jsonObject, now, randomToken, requireOrigin, testMode, text } from './http.js';
+import type { Database, Query, SqlValue } from './db/types.js';
+import { appOrigin, fail, id, identifier, jsonObject, localMode, now, passwordAuthEnabled, randomToken, requireOrigin, signupMode, testMode, text } from './http.js';
 import type { AppContext, AuthIdentity, Env, UserRow, WorkerEnv } from './types.js';
 import { assertVaultConfigured, encryptToken } from './vault.js';
+import { joinRequestStatement, requireInvitedWorkspace } from './workspace-invites.js';
 
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
 /** Native apps keep their sign-in longer than a browser; a device can be revoked from the web app any time. */
@@ -25,23 +26,25 @@ const NATIVE_CALLBACK = 'pistead://auth';
 const VERIFIER = /^[A-Za-z0-9_-]{43,128}$/;
 const APP_STATE = /^[A-Za-z0-9_-]{16,128}$/;
 const PROFILE_FIELDS: Record<string, true> = { displayName: true, gitName: true, gitEmail: true, env: true };
-const SUSPENDED = 'This account is suspended. Ask the administrator of this Pistead server to restore it.';
+export const SUSPENDED = 'This account is suspended. Ask the administrator of this Pistead server to restore it.';
 
 function cookies(env: Env) {
   const secure = new URL(appOrigin(env)).protocol === 'https:';
   return {
     auth: secure ? '__Host-auth' : 'test-auth',
     state: secure ? '__Host-oauth-state' : 'test-oauth-state',
+    /** A local server's claim, from its launcher's sign-in link to GitHub's callback (localOwner). */
+    claim: secure ? '__Host-local-claim' : 'local-claim',
     options: { secure, httpOnly: true, sameSite: 'Lax' as const, path: '/' },
   };
 }
 
-function expireCookie(c: AppContext, kind: 'auth' | 'state'): void {
+function expireCookie(c: AppContext, kind: 'auth' | 'state' | 'claim'): void {
   const config = cookies(c.env);
   setCookie(c, config[kind], '', { ...config.options, maxAge: 0, expires: new Date(0) });
 }
 
-async function dbResult<T>(operation: Promise<T>): Promise<T> {
+export async function dbResult<T>(operation: Promise<T>): Promise<T> {
   try { return await operation; }
   catch { fail(503, 'auth_unavailable', 'Authentication storage is temporarily unavailable.'); }
 }
@@ -61,9 +64,12 @@ export const authenticate: MiddlewareHandler<WorkerEnv> = async (c, next) => {
     .bind(tokenHash).first());
   if (!session || session.client !== client || session.expires_at <= Date.now() || !Number.isSafeInteger(session.expires_at) ||
       !OPAQUE_TOKEN.test(session.csrf_token) ||
-      (session.auth_kind !== 'github' && session.auth_kind !== 'test') ||
+      (session.auth_kind !== 'github' && session.auth_kind !== 'test' && session.auth_kind !== 'password') ||
       (session.auth_kind === 'test' && (!testMode(c.env) || !session.user_id.startsWith('test:'))) ||
-      (session.auth_kind === 'github' && session.user_id.startsWith('test:'))) {
+      (session.auth_kind === 'github' && session.user_id.startsWith('test:')) ||
+      (session.auth_kind !== 'password' && session.user_id.startsWith('password:')) ||
+      // Turning PASSWORD_AUTH off ends password sign-ins at once, not when they expire.
+      (session.auth_kind === 'password' && (!passwordAuthEnabled(c.env) || !session.user_id.startsWith('password:')))) {
     if (client === 'browser') expireCookie(c, 'auth');
     fail(401, 'unauthorized', 'Authentication is required.');
   }
@@ -101,14 +107,14 @@ export const csrfGuard: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   await next();
 };
 
-const privateResponse: MiddlewareHandler<WorkerEnv> = async (c, next) => {
+export const privateResponse: MiddlewareHandler<WorkerEnv> = async (c, next) => {
   c.header('Cache-Control', 'no-store');
   c.header('Pragma', 'no-cache');
   c.header('Referrer-Policy', 'no-referrer');
   await next();
 };
 
-function safeText(value: unknown, field: string, max: number): string {
+export function safeText(value: unknown, field: string, max: number): string {
   const result = text(value, field, max);
   if (!result.trim() || /[\u0000-\u001f\u007f]/.test(result)) fail(400, 'invalid_input', `Invalid ${field}.`);
   return result;
@@ -141,12 +147,13 @@ async function currentUser(c: AppContext): Promise<UserRow> {
 }
 
 /** The signed-in user's own profile, which also says whether they administer this server. */
-function ownProfile(env: Env, user: UserRow) {
-  return { ...userProfile(user), ...(isInstanceAdmin(env, user.id) ? { instanceAdmin: true as const } : {}) };
+export function ownProfile(env: Env, user: UserRow) {
+  return { ...userProfile(user), ...(isInstanceAdmin(env, user.id) ? { instanceAdmin: true as const } : {}),
+    ...(user.auth_kind === 'password' ? { passwordSignIn: true as const } : {}) };
 }
 
 /** A new sign-in. Native sessions are bearer tokens listed as devices under the app's `deviceName`. */
-async function newSession(env: Env, userId: string, kind: 'github' | 'test', native?: { deviceName: string | null }) {
+export async function newSession(env: Env, userId: string, kind: 'github' | 'test' | 'password', native?: { deviceName: string | null }) {
   const issuedAt = Date.now();
   let expiresAt = issuedAt + (native ? NATIVE_SESSION_TTL : SESSION_TTL);
   if (kind === 'test') {
@@ -156,15 +163,21 @@ async function newSession(env: Env, userId: string, kind: 'github' | 'test', nat
   const token = randomToken();
   const csrfToken = randomToken();
   const tokenHash = await sha256(token);
+  const columns = '(token_hash, user_id, csrf_token, expires_at, created_at, client, device_id, device_name)';
+  const sql = `INSERT INTO auth_sessions ${columns} VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+  const values: SqlValue[] = [tokenHash, userId, csrfToken, expiresAt, new Date(issuedAt).toISOString(),
+    native ? 'native' : 'browser', native ? id() : null, native?.deviceName ?? null];
   return {
     token, expiresAt,
-    statement: env.DB.query(`INSERT INTO auth_sessions (token_hash, user_id, csrf_token, expires_at, created_at, client, device_id, device_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(tokenHash, userId, csrfToken, expiresAt, new Date(issuedAt).toISOString(),
-      native ? 'native' : 'browser', native ? id() : null, native?.deviceName ?? null),
+    // `sql` and `values` let a caller insert it inside its own transaction.
+    sql, values, statement: env.DB.query(sql).bind(...values),
+    /** The insert, made only while `condition` (SQL, with `conditionValues`) holds as it runs. */
+    statementWhere: (condition: string, ...conditionValues: SqlValue[]) =>
+      env.DB.query(`INSERT INTO auth_sessions ${columns} SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${condition}`).bind(...values, ...conditionValues),
   };
 }
 
-function sessionCookie(c: AppContext, session: { token: string; expiresAt: number }): void {
+export function sessionCookie(c: AppContext, session: { token: string; expiresAt: number }): void {
   const config = cookies(c.env);
   setCookie(c, config.auth, session.token, {
     ...config.options, expires: new Date(session.expiresAt),
@@ -261,14 +274,23 @@ function record(value: unknown): value is Record<string, unknown> {
 
 /** Starts GitHub's OAuth. A native app's sign-in carries its PKCE challenge and state through to the callback. */
 async function githubStart(c: AppContext, native?: { challenge: string; state: string }) {
+  return c.redirect(await githubAuthorization(c, native));
+}
+
+/**
+ * GitHub's authorization URL for a new sign-in, whose state (saved here and in a cookie) carries a native app's PKCE
+ * challenge, or the hash of the invite link a browser sign-in started from (githubInviteStart).
+ */
+async function githubAuthorization(c: AppContext, native?: { challenge: string; state: string }, inviteTokenHash?: string): Promise<string> {
   requireOrigin(c);
   await assertVaultConfigured(c.env);
   const config = githubConfig(c.env);
   const state = randomToken();
   const verifier = randomToken();
   const expiresAt = Date.now() + STATE_TTL;
-  await dbResult(c.env.DB.query('INSERT INTO oauth_states (state_hash, verifier, expires_at, created_at, native_challenge, native_state) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(await sha256(state), verifier, expiresAt, now(), native?.challenge ?? null, native?.state ?? null).run());
+  await dbResult(c.env.DB.query(`INSERT INTO oauth_states (state_hash, verifier, expires_at, created_at, native_challenge, native_state, invite_token_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(await sha256(state), verifier, expiresAt, now(), native?.challenge ?? null, native?.state ?? null, inviteTokenHash ?? null).run());
   const cookieConfig = cookies(c.env);
   setCookie(c, cookieConfig.state, state, { ...cookieConfig.options, maxAge: STATE_TTL / 1000, expires: new Date(expiresAt) });
   const authorization = new URL('https://github.com/login/oauth/authorize');
@@ -276,7 +298,52 @@ async function githubStart(c: AppContext, native?: { challenge: string; state: s
     client_id: config.clientId, redirect_uri: config.redirectUri, scope: 'read:user user:email repo workflow',
     state, code_challenge: await sha256(verifier), code_challenge_method: 'S256',
   }).toString();
-  return c.redirect(authorization.toString());
+  return authorization.toString();
+}
+
+/**
+ * A browser's GitHub sign-in from a workspace's invite link: the token comes in the body, never a URL, and only its hash
+ * is kept with the sign-in, so a new account can be created where SIGNUP=invite and asks to join that workspace. The
+ * app then sends the browser to the URL it answers with.
+ */
+async function githubInviteStart(c: AppContext) {
+  requireOrigin(c);
+  const body = await jsonObject(c, 1024);
+  if (Object.keys(body).some(key => key !== 'inviteToken')) fail(400, 'invalid_input', 'Only inviteToken is accepted.');
+  await requireInvitedWorkspace(c.env, body.inviteToken);
+  return c.json({ url: await githubAuthorization(c, undefined, await sha256(body.inviteToken as string)) });
+}
+
+/**
+ * A new account refused (githubSignup): a browser goes back to the sign-in page, which says why, and an app to its
+ * callback with the code.
+ */
+class SignupRefusal extends Error {
+  constructor(readonly code: 'signup_closed' | 'invite_required' | 'too_many_pending', message: string) { super(message); }
+}
+/** The invite link's queue filled, or the link went, while a new account was being created. */
+class JoinRequestRefused extends Error {}
+
+/**
+ * Whether GitHub's `githubId` may sign in: an account that exists always may; a new one only as SIGNUP allows, or when
+ * ADMIN_USER_IDS lists it, so a server's administrators can always set it up. Returns the invite link's workspace a new
+ * account asks to join, or null. Checked before GitHub's token is stored.
+ */
+async function githubSignup(c: AppContext, githubId: string, inviteTokenHash: string | null, native: boolean): Promise<{ workspaceId: string; tokenHash: string } | null> {
+  if (localMode(c.env)) return null;
+  if (await dbResult(c.env.DB.query('SELECT 1 FROM users WHERE github_id = ?').bind(githubId).first())) return null;
+  const invite = inviteTokenHash === null ? null : await dbResult(c.env.DB.query<{ workspace_id: string }>(
+    'SELECT workspace_id FROM workspace_invite_links WHERE token_hash = ?').bind(inviteTokenHash).first());
+  const mode = signupMode(c.env, 'github');
+  if (!isInstanceAdmin(c.env, `github:${githubId}`)) {
+    if (mode === 'off') throw new SignupRefusal('signup_closed', 'This Pistead doesn\'t take new accounts. Ask its operator to add you.');
+    if (mode === 'invite' && !invite) {
+      throw new SignupRefusal('invite_required', inviteTokenHash !== null ? 'That invite link was turned off or replaced. Ask for the current one.'
+        : native ? 'New accounts need an invite link. Open the link a workspace owner or admin shared in a browser to create your account, then sign in here.'
+          : 'New accounts need an invite link. Ask a workspace owner or admin for theirs, and sign in from it.');
+    }
+  }
+  return invite && inviteTokenHash ? { workspaceId: invite.workspace_id, tokenHash: inviteTokenHash } : null;
 }
 
 /**
@@ -304,7 +371,7 @@ async function nativeFailure(c: AppContext, error: unknown, state: string): Prom
 }
 
 /** Exchanges GitHub's code, then creates or updates the user it names; the token statement stores their GitHub token. */
-async function githubUser(c: AppContext, config: GitHubConfig, code: string, verifier: string): Promise<GitHubSignIn> {
+async function githubUser(c: AppContext, config: GitHubConfig, code: string, verifier: string, inviteTokenHash: string | null = null, native = false): Promise<GitHubSignIn> {
   const exchange = await githubJson('https://github.com/login/oauth/access_token', {
     method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret,
@@ -331,22 +398,100 @@ async function githubUser(c: AppContext, config: GitHubConfig, code: string, ver
   const displayName = typeof identity.name === 'string' && identity.name.trim() && identity.name.length <= 200 &&
     !/[\u0000-\u001f\u007f]/.test(identity.name) ? identity.name : identity.login;
   const githubId = String(identity.id);
+  // Narrowed above; the statement below is built in a closure, which doesn't keep the narrowing.
+  const verifiedEmail: string = email;
+  const login: string = identity.login;
+  if (localMode(c.env)) await admitLocalOwner(c, githubId);
+  const invited = await githubSignup(c, githubId, inviteTokenHash, native);
   // Identity comes exclusively from GitHub, never the current cookie (especially test cookies).
-  const user = await dbResult(c.env.DB.query<UserRow>(`INSERT INTO users
+  const upsert = (db: Pick<Database, 'query'>) => db.query<UserRow>(`INSERT INTO users
     (id, github_id, github_login, display_name, git_name, git_email, env_json, auth_kind, created_at)
     VALUES (?, ?, ?, ?, ?, ?, '{}', 'github', ?)
     ON CONFLICT(github_id) DO UPDATE SET github_login = excluded.github_login
     WHERE users.auth_kind = 'github' AND users.id NOT LIKE 'test:%'
-    RETURNING *`).bind(`github:${githubId}`, githubId, identity.login, displayName, displayName, email, now()).first());
+    RETURNING *`).bind(`github:${githubId}`, githubId, login, displayName, displayName, verifiedEmail, now());
+  let user: UserRow | null;
+  if (!invited) {
+    user = await dbResult(upsert(c.env.DB).first());
+  } else {
+    // A new account through an invite link exists only with its request to join: a full queue, or the link turned off
+    // meanwhile, creates neither.
+    try {
+      user = await c.env.DB.transaction(async tx => {
+        const created = await upsert(tx).first();
+        if (!created) return null;
+        const filed = await joinRequestStatement(tx, invited.workspaceId, invited.tokenHash, created.id).run();
+        if (filed.changes !== 1) throw new JoinRequestRefused();
+        await tx.query('INSERT INTO audit (id, workspace_id, session_id, actor_id, action, detail_json, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?)')
+          .bind(id(), invited.workspaceId, created.id, 'workspace.join.request', JSON.stringify({ userId: created.id }), now()).run();
+        return created;
+      });
+    } catch (error) {
+      if (error instanceof JoinRequestRefused) throw new SignupRefusal('too_many_pending', 'This workspace has too many people waiting to join, or its invite link was just turned off. Ask an owner or admin.');
+      fail(503, 'auth_unavailable', 'Authentication storage is temporarily unavailable.');
+    }
+  }
   if (!user || user.auth_kind !== 'github' || user.id.startsWith('test:')) {
     fail(409, 'identity_conflict', 'GitHub identity cannot be used for this account.');
   }
+  if (localMode(c.env)) await settleLocalClaim(c.env, user.id);
   // Refused before the new token is stored, so a suspended account keeps none it didn't already have.
   if (user.suspended_at) fail(403, 'account_suspended', SUSPENDED);
   const ciphertext = await encryptToken(c.env, user.id, exchange.access_token);
   return { user, tokenStatement: c.env.DB.query(`INSERT INTO github_tokens (user_id, ciphertext, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`)
     .bind(user.id, ciphertext, now()) };
+}
+
+/** The GitHub account that claimed this local server, or null while nobody has: its first GitHub user. */
+export async function localOwner(env: Env): Promise<{ id: string; github_id: string } | null> {
+  return await dbResult(env.DB.query<{ id: string; github_id: string }>(
+    `SELECT id, github_id FROM users WHERE auth_kind = 'github' AND github_id IS NOT NULL ORDER BY created_at, id LIMIT 1`).first()) ?? null;
+}
+
+/**
+ * A local server admits one GitHub account. Its owner signs in as on any server; before anyone has, only a sign-in started
+ * from the launcher's link (localClaim), which carries the claim secret, may claim it. Checked before GitHub's token is
+ * stored, so nobody else's token is ever kept.
+ */
+async function admitLocalOwner(c: AppContext, githubId: string): Promise<void> {
+  const owner = await localOwner(c.env);
+  if (owner) {
+    if (owner.github_id !== githubId) fail(403, 'local_server_owner_only', 'This Pistead runs on its owner\'s computer, and only the GitHub account that set it up can sign in.');
+    return;
+  }
+  const claim = getCookie(c, cookies(c.env).claim);
+  if (!claim || !OPAQUE_TOKEN.test(claim) || !constantTimeEqual(claim, c.env.LOCAL_CLAIM_SECRET!)) {
+    fail(403, 'local_server_unclaimed', 'Nobody has set up this Pistead yet. Sign in with the link it printed when it started (or from the Pistead app), which makes your GitHub account its owner.');
+  }
+}
+
+/**
+ * Two claims at once (both holding the claim secret) could each pass admitLocalOwner before either user exists: once
+ * this sign-in's user is written, only the server's owner, its first GitHub user, goes on. A later one is removed again,
+ * before any token of its own is stored.
+ */
+async function settleLocalClaim(env: Env, userId: string): Promise<void> {
+  const owner = await localOwner(env);
+  if (owner?.id === userId) return;
+  await dbResult(env.DB.query(`DELETE FROM users WHERE id = ? AND auth_kind = 'github'
+    AND NOT EXISTS (SELECT 1 FROM github_tokens WHERE user_id = ?) AND NOT EXISTS (SELECT 1 FROM auth_sessions WHERE user_id = ?)`)
+    .bind(userId, userId, userId).run());
+  fail(403, 'local_server_owner_only', 'This Pistead runs on its owner\'s computer, and only the GitHub account that set it up can sign in.');
+}
+
+/**
+ * The launcher's sign-in link on a local server: `?token=` is its claim secret. It goes to GitHub like "Continue with
+ * GitHub", carrying the claim in a cookie to the callback, where an unclaimed server takes the account as its owner.
+ */
+async function localClaim(c: AppContext) {
+  if (!localMode(c.env)) fail(404, 'not_found', 'Not found.');
+  const tokens = c.req.queries('token');
+  const token = tokens?.length === 1 ? tokens[0] : undefined;
+  if (!token || !OPAQUE_TOKEN.test(token) || !constantTimeEqual(token, c.env.LOCAL_CLAIM_SECRET!)) fail(403, 'invalid_claim', 'This sign-in link is not valid for this Pistead.');
+  const config = cookies(c.env);
+  setCookie(c, config.claim, token, { ...config.options, maxAge: STATE_TTL / 1000, expires: new Date(Date.now() + STATE_TTL) });
+  return githubStart(c);
 }
 
 async function githubCallback(c: AppContext) {
@@ -360,8 +505,8 @@ async function githubCallback(c: AppContext) {
     fail(400, 'invalid_oauth_state', 'Invalid or expired OAuth state.');
   }
   // DELETE RETURNING makes concurrent callbacks and replay fail before code exchange.
-  const saved = await dbResult(c.env.DB.query<{ verifier: string; expires_at: number; native_challenge: string | null; native_state: string | null }>(
-    'DELETE FROM oauth_states WHERE state_hash = ? RETURNING verifier, expires_at, native_challenge, native_state')
+  const saved = await dbResult(c.env.DB.query<{ verifier: string; expires_at: number; native_challenge: string | null; native_state: string | null; invite_token_hash: string | null }>(
+    'DELETE FROM oauth_states WHERE state_hash = ? RETURNING verifier, expires_at, native_challenge, native_state, invite_token_hash')
     .bind(await sha256(state)).first());
   expireCookie(c, 'state');
   if (!saved || !Number.isSafeInteger(saved.expires_at) || saved.expires_at <= Date.now() || !OPAQUE_TOKEN.test(saved.verifier)) {
@@ -375,12 +520,17 @@ async function githubCallback(c: AppContext) {
     if (c.req.query('error') !== undefined || !code || code.length > 2048 || /[\u0000-\u0020\u007f]/.test(code)) {
       fail(400, 'oauth_denied', 'GitHub authorization was not completed.');
     }
-    signedIn = await githubUser(c, config, code, saved.verifier);
+    signedIn = await githubUser(c, config, code, saved.verifier, saved.invite_token_hash, !!native);
   } catch (error) {
-    if (!native) throw error;
-    return nativeFailure(c, error, native.state);
+    if (error instanceof SignupRefusal) {
+      return c.redirect(native ? nativeCallback({ error: error.code, state: native.state })
+        : `${appOrigin(c.env)}/?${new URLSearchParams({ error: error.message }).toString()}`);
+    }
+    if (native) return nativeFailure(c, error, native.state);
+    throw error;
   }
   const { user, tokenStatement } = signedIn;
+  if (localMode(c.env)) expireCookie(c, 'claim');
   if (native) {
     const code = randomToken();
     try {
@@ -482,7 +632,9 @@ async function testLogin(c: AppContext) {
 // Register before a parent's /api/* authenticate + csrfGuard stack. These routes own their guards.
 export function registerAuth(app: Hono<WorkerEnv>): void {
   app.get('/api/auth/github', privateResponse, c => githubStart(c));
+  app.post('/api/auth/github/start', privateResponse, githubInviteStart);
   app.get(CALLBACK_PATH, privateResponse, githubCallback);
+  app.get('/api/auth/local/claim', privateResponse, localClaim);
   app.get('/api/auth/native/start', privateResponse, nativeStart);
   app.post('/api/auth/native/token', privateResponse, nativeToken);
   app.post('/api/auth/test', privateResponse, csrfGuard, testLogin);

@@ -184,7 +184,8 @@ function githubHeaders(bearer: string): Record<string, string> {
   return { Authorization: `Bearer ${bearer}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
 }
 
-async function mintGitHub(target: MintTarget, app: GitHubApp, identityId: string | null): Promise<MintedToken> {
+async function mintGitHub(target: Pick<MintTarget, 'provider' | 'host' | 'fullName' | 'repositoryId'>, app: GitHubApp, identityId: string | null,
+  permissions: Record<string, 'read' | 'write'> = { contents: 'write' }): Promise<MintedToken> {
   const repositoryId = Number(target.repositoryId);
   if (!/^[1-9]\d{0,15}$/.test(target.repositoryId) || !Number.isSafeInteger(repositoryId)) fail(400, 'invalid_repository', 'A GitHub numeric repository identity is required.');
   const api = githubApiBase(target.provider, target.host);
@@ -197,7 +198,7 @@ async function mintGitHub(target: MintTarget, app: GitHubApp, identityId: string
   if (typeof installationId !== 'number' || !Number.isSafeInteger(installationId) || installationId <= 0) unavailable('mint');
   const issued = expectStatus('mint', await upstream('mint', `${api}/app/installations/${installationId}/access_tokens`, {
     method: 'POST', headers: { ...githubHeaders(jwt), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ repository_ids: [repositoryId], permissions: { contents: 'write' } }),
+    body: JSON.stringify({ repository_ids: [repositoryId], permissions }),
   }), 201);
   const installationToken = token('mint', issued.token);
   const expiry = typeof issued.expires_at === 'string' ? Math.floor(Date.parse(issued.expires_at) / 1000) : NaN;
@@ -356,6 +357,129 @@ export async function mintPushToken(env: Env, target: MintTarget): Promise<Minte
       return { kind: row.kind, identityId: row.id, authorization: null, expiresAt: expiresAt(undefined, 3600) };
     }
   }
+}
+
+/** A repository read token handed out again while it outlives the longest Git command by a wide margin. */
+const readReuseSeconds = 20 * 60;
+const readTokens = new Map<string, MintedToken>();
+
+/**
+ * A token that can only read one repository, for a host's direct Git reads (GitDirectGrant): a GitHub App installation
+ * token limited to the repository and to `contents: read`, from the workspace's GitHub App push identity for the host or
+ * the operator's app on github.com. Null when there is none, the app isn't installed on the repository, or the provider
+ * has no such tokens; the read is then relayed, or made with the owner's account on their own host. Tokens are shared
+ * by the sessions that read the same repository with the same app, for as long as they last; the caller has checked
+ * the session's authority for this request.
+ */
+export async function mintRepositoryReadToken(env: Env, target: { workspaceId: string; provider: GitProvider; host: string; fullName: string; repositoryId: string })
+  : Promise<MintedToken | null> {
+  const found = await readApp(env, target.workspaceId, target.provider, target.host);
+  if (!found) return null;
+  const { app, identityId } = found;
+  const key = `${target.provider}\0${target.host}\0${app.appId}\0${target.repositoryId}`;
+  const cached = readTokens.get(key);
+  if (cached && cached.expiresAt - Math.floor(Date.now() / 1000) > readReuseSeconds) return cached;
+  readTokens.delete(key);
+  let minted: MintedToken;
+  try { minted = await mintGitHub(target, app, identityId, { contents: 'read' }); }
+  catch { return null; }
+  // Shared tokens are never revoked by one session's request; they expire within the hour.
+  const token: MintedToken = { kind: minted.kind, identityId: minted.identityId, authorization: minted.authorization, expiresAt: minted.expiresAt };
+  if (readTokens.size >= 1000) readTokens.clear();
+  readTokens.set(key, token);
+  return token;
+}
+
+/** The GitHub App that mints read tokens for a workspace's repositories on `host`: its own push identity's, else the operator's. */
+async function readApp(env: Env, workspaceId: string, provider: GitProvider, host: string): Promise<{ app: GitHubApp; identityId: string | null } | null> {
+  if (provider !== 'github' && provider !== 'github-enterprise') return null;
+  const row = await env.DB.query<PushIdentityRow>("SELECT * FROM push_identities WHERE workspace_id = ? AND provider = ? AND host = ? AND scope = ''")
+    .bind(workspaceId, provider, host).first();
+  if (row?.kind === 'github-app' && row.status === 'ready') {
+    const config = JSON.parse(row.config_json) as Record<string, string>;
+    return { app: { appId: config.appId!, slug: config.slug!, privateKey: await identitySecret(env, row) }, identityId: row.id };
+  }
+  if (provider === 'github' && env.GITHUB_APP_ID && env.GITHUB_APP_SLUG && env.GITHUB_APP_PRIVATE_KEY) {
+    return { app: { appId: env.GITHUB_APP_ID, slug: env.GITHUB_APP_SLUG, privateKey: env.GITHUB_APP_PRIVATE_KEY }, identityId: null };
+  }
+  return null;
+}
+
+/**
+ * The repository permissions a sandbox's API token may read, of those its installation was granted: what `gh` reads
+ * (code, issues, pull requests, Actions runs and logs, checks, statuses, deployments, discussions, Pages), never
+ * secrets, administration or anything about the organization.
+ */
+const apiReadPermissions = ['actions', 'checks', 'contents', 'deployments', 'discussions', 'issues', 'metadata', 'pages', 'pull_requests', 'statuses'];
+export interface ApiReadToken { account: string; token: string; expiresAt: number; repositories: string[] }
+/** A result some of whose repositories the app couldn't reach is asked again this soon, so installing it there shows. */
+const incompleteReuseSeconds = 60;
+const apiTokens = new Map<string, { tokens: ApiReadToken[]; notInstalled: string[]; until: number }>();
+
+/**
+ * Tokens for sandboxed reads of the GitHub API (see `credentialedApiHosts`): one per installation of the workspace's
+ * GitHub App (as for mintRepositoryReadToken) that the repositories belong to, limited to those repositories and to
+ * reading them. `notInstalled` names the repositories the app can't reach. Null when there's no app. Shared, as read
+ * tokens are, by the sessions that read the same repositories, for as long as they last; the caller has checked the
+ * session's authority and that its owner can read each repository.
+ */
+export async function mintGitHubApiReadTokens(env: Env, target: { workspaceId: string; repositories: { fullName: string; repositoryId: string }[] })
+  : Promise<{ tokens: ApiReadToken[]; notInstalled: string[] } | null> {
+  const found = await readApp(env, target.workspaceId, 'github', 'github.com');
+  if (!found || !target.repositories.length) return null;
+  const { app } = found;
+  const ids = target.repositories.map(repository => repository.repositoryId).sort();
+  const key = `${app.appId}\0${ids.join(',')}`;
+  const time = Math.floor(Date.now() / 1000);
+  const cached = apiTokens.get(key);
+  if (cached && cached.until > time && cached.tokens.every(token => token.expiresAt - time > readReuseSeconds)) {
+    return { tokens: cached.tokens, notInstalled: cached.notInstalled };
+  }
+  apiTokens.delete(key);
+  const api = githubApiBase('github', 'github.com');
+  const jwt = await appJwt('mint', app);
+  const installations = new Map<number, { account: string; permissions: Record<string, 'read'>; repositories: { fullName: string; id: number }[] }>();
+  const notInstalled: string[] = [];
+  for (const repository of target.repositories) {
+    const id = Number(repository.repositoryId);
+    if (!/^[1-9]\d{0,15}$/.test(repository.repositoryId) || !Number.isSafeInteger(id)) { notInstalled.push(repository.fullName); continue; }
+    const found = await upstream('mint', `${api}/repos/${repository.fullName.split('/').map(encodeURIComponent).join('/')}/installation`, { headers: githubHeaders(jwt) });
+    if (found.status === 404) { notInstalled.push(repository.fullName); continue; }
+    const installation = expectStatus('mint', found, 200);
+    const installationId = installation.id;
+    if (typeof installationId !== 'number' || !Number.isSafeInteger(installationId) || installationId <= 0) unavailable('mint');
+    const login = (installation.account as { login?: unknown } | null | undefined)?.login;
+    const granted = installation.permissions as Record<string, unknown> | null | undefined;
+    const permissions: Record<string, 'read'> = {};
+    for (const name of apiReadPermissions) if (granted?.[name] === 'read' || granted?.[name] === 'write') permissions[name] = 'read';
+    const entry = installations.get(installationId)
+      ?? { account: typeof login === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(login) ? login : repository.fullName.split('/')[0]!,
+        permissions: Object.keys(permissions).length ? permissions : { contents: 'read' }, repositories: [] };
+    entry.repositories.push({ fullName: repository.fullName, id });
+    installations.set(installationId, entry);
+  }
+  const tokens: ApiReadToken[] = [];
+  for (const [installationId, installation] of installations) {
+    const issued = expectStatus('mint', await upstream('mint', `${api}/app/installations/${installationId}/access_tokens`, {
+      method: 'POST', headers: { ...githubHeaders(jwt), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repository_ids: installation.repositories.map(repository => repository.id), permissions: installation.permissions }),
+    }), 201);
+    const expiry = typeof issued.expires_at === 'string' ? Math.floor(Date.parse(issued.expires_at) / 1000) : NaN;
+    if (!Number.isSafeInteger(expiry) || expiry <= time) unavailable('mint');
+    tokens.push({ account: installation.account, token: token('mint', issued.token), expiresAt: Math.min(expiry, expiresAt(undefined, 3600)),
+      repositories: installation.repositories.map(repository => repository.fullName) });
+  }
+  if (tokens.length) {
+    if (apiTokens.size >= 1000) apiTokens.clear();
+    apiTokens.set(key, { tokens, notInstalled, until: notInstalled.length ? time + incompleteReuseSeconds : Infinity });
+  }
+  return { tokens, notInstalled };
+}
+
+/** Forgets the shared read tokens (tests). */
+export function forgetRepositoryReadTokens(): void {
+  readTokens.clear();
+  apiTokens.clear();
 }
 
 /**

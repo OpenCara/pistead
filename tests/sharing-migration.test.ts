@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -7,19 +7,14 @@ import test, { type TestContext } from 'node:test';
 import { sessionAccess } from '../apps/server/src/db.js';
 import { openDatabase } from '../apps/server/src/db/index.js';
 import type { Env } from '../apps/server/src/types.js';
+import { applySqliteMigrations } from './helpers/sqlite-migrations.js';
 
 const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const sharingMigration = '0006_sharing_defaults.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 
 function migrate(sqlite: DatabaseSync, files: string[]) {
-  for (const file of files) {
-    sqlite.exec('BEGIN');
-    try {
-      sqlite.exec(readFileSync(new URL(file, directory), 'utf8'));
-      sqlite.exec('COMMIT');
-    } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  }
+  applySqliteMigrations(sqlite, directory, files);
 }
 
 function fixture(t: TestContext) {

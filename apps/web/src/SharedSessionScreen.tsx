@@ -5,6 +5,7 @@ import { api, ApiError, errorMessage } from "./api";
 import { Icon, Logo, type IconName } from "./icons";
 import { Markdown } from "./markdown";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
+import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
 import { Alert, EmptyState, formatDuration, PageLoading, ScreenHeader, Spinner, StatusBadge, Timestamp } from "./ui";
 import "./session.css";
 import "./shared-session.css";
@@ -96,10 +97,11 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
 }
 
 /** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
-function ToolDetails({ role, icon, label, text }: { role?: string; icon: IconName; label: ReactNode; text: string }) {
+function ToolDetails({ role, icon, label, text, trimmed }: { role?: string; icon: IconName; label: ReactNode; text: string; trimmed?: EntryView["trimmed"] }) {
   return <details className="entry-tool" data-role={role}>
     <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span><Icon name="chevron-right" size={14} /></summary>
     <pre>{text}</pre>
+    {trimmed && <p className="muted small entry-brief">Brief tool output · {trimmed.lines === 1 ? "1 line" : `${trimmed.lines.toLocaleString()} lines`}, {trimmed.chars.toLocaleString()} characters in full.</p>}
   </details>;
 }
 
@@ -117,16 +119,24 @@ function SharedEntry({ entry }: { entry: EntryView }) {
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined
       && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
-    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}</>} text={entry.text} />;
+    // A brief tool result's one line shows on its row.
+    const line = entry.trimmed && entry.role === "toolResult" && entry.text.trim() ? <span className="muted"> · {entry.text}</span> : null;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{line}</>} text={entry.text} trimmed={entry.trimmed} />;
   }
   if (entry.error) {
+    // A link's viewers can't send the next message, so they get the cause without the advice.
+    if (entry.error.compaction) {
+      return <div className="entry-error" title={entry.kind}>
+        <Alert variant="error" title={COMPACTION_FAILED_TITLE}>{compactionFailureText(entry.error.compaction, { advice: false })}</Alert>
+      </div>;
+    }
     return <div className="entry-error" title={entry.kind}><Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert></div>;
   }
   if (entry.role === "user") return <div className="entry-user" title={entry.kind}><div className="entry-bubble">{entry.text}</div></div>;
   const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
-    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} />}
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} trimmed={entry.trimmed} />}
     {took && <div className="entry-actor">{took}</div>}
   </div>;
 }

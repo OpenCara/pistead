@@ -175,7 +175,7 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
       </Pressable>)}
     </View>
     <Text style={[ui.small, { color: palette.muted }]}>
-      {visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Asking the agent, invoking tools, or controlling the session needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}
+      {visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators can also message it, and the workspace's owner and admins manage it; approving tool calls needs an explicit grant." : "Workspace membership alone does not give access to a private session: only the workspace's owner and admins, who manage every session, and people you give a session role open it."}
     </Text>
     {blockingAlert()}
     {host?.capabilities.unsandboxed && <Banner tone="danger" title="Unsandboxed host">Agent work runs directly on the owner's machine without isolation: approved commands and commits run as their user, with access to their files, credentials and network, and no resource limits.</Banner>}

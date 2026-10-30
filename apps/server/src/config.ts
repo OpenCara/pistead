@@ -4,7 +4,7 @@ import { ConnectorHubRegistry } from './connector-hub.js';
 import { openDatabase } from './db/index.js';
 import { openStorage } from './storage/index.js';
 import type { Env } from './types.js';
-import { PostgresWorkspaceDatabases } from './workspace-databases/postgres.js';
+import { webSearchConfigurationError } from './web-search.js';
 
 export interface ServerConfig {
   env: Env;
@@ -31,10 +31,13 @@ export const defaultDatabaseUrl = 'sqlite:///data/pistead.sqlite';
 const stringVars = [
   'APP_ORIGIN', 'RUNNER_URL', 'RUNNER_EVENT_TRANSPORT', 'RUNNER_SHARED_SECRET', 'SESSION_SECRET', 'VAULT_KEY',
   'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'TEST_AUTH_ENABLED', 'TEST_AUTH_SECRET', 'TEST_AUTH_EXPIRES_AT',
-  'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS',
+  'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS', 'GIT_DIRECT', 'SANDBOX_GITHUB_API',
+  'WEB_SEARCH', 'WEB_SEARCH_API_KEY', 'WEB_SEARCH_URL',
+  'LOCAL_MODE', 'LOCAL_CLAIM_SECRET', 'PASSWORD_AUTH', 'SIGNUP',
   'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'NOTION_CLIENT_ID', 'NOTION_CLIENT_SECRET', 'DROPBOX_CLIENT_ID', 'DROPBOX_CLIENT_SECRET',
   'MICROSOFT_CLIENT_ID', 'MICROSOFT_CLIENT_SECRET', 'MICROSOFT_TENANT', 'TENCENT_DOCS_CLIENT_ID', 'TENCENT_DOCS_CLIENT_SECRET',
 ] as const;
+const LOOPBACK = ['127.0.0.1', '::1', 'localhost'];
 
 /**
  * Builds `Env` from process environment variables: opens the database named by `DATABASE_URL` and, only when it is set,
@@ -59,7 +62,26 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   if (!env.VAULT_KEY) throw new ConfigurationError('VAULT_KEY is required: set it to a base64url-encoded random 32-byte key.');
   if (!/^(?:[A-Za-z0-9+/]{43}=?|[A-Za-z0-9_-]{43}=?)$/.test(env.VAULT_KEY)) throw new ConfigurationError('VAULT_KEY must be a base64url-encoded 32-byte key.');
   if (env.ADMIN_USER_IDS && env.ADMIN_USER_IDS.split(',').some(item => !adminUserId(env, item.trim()))) {
-    throw new ConfigurationError('ADMIN_USER_IDS must list user IDs such as github:12345, separated by commas.');
+    throw new ConfigurationError('ADMIN_USER_IDS must list user IDs such as github:12345 or password:alice, separated by commas.');
+  }
+  if (env.PASSWORD_AUTH !== undefined) {
+    if (!['true', 'false'].includes(env.PASSWORD_AUTH)) throw new ConfigurationError('PASSWORD_AUTH must be "true" or "false".');
+    if (env.PASSWORD_AUTH === 'true' && env.LOCAL_MODE === 'true') throw new ConfigurationError('PASSWORD_AUTH is for shared servers: a LOCAL_MODE server admits only the GitHub account that claimed it.');
+  }
+  const webSearch = webSearchConfigurationError(env);
+  if (webSearch) throw new ConfigurationError(webSearch);
+  if (env.SIGNUP !== undefined && !['open', 'invite', 'off'].includes(env.SIGNUP)) {
+    throw new ConfigurationError('SIGNUP must be "open", "invite" or "off" (unset: GitHub sign-ups are open and password sign-ups need an invite).');
+  }
+  const listenHost = processEnv.HOST || (env.LOCAL_MODE === 'true' ? '127.0.0.1' : '0.0.0.0');
+  // A local server is reachable from this machine only, and admits only the GitHub account that claimed it.
+  if (env.LOCAL_MODE !== undefined) {
+    if (!['true', 'false'].includes(env.LOCAL_MODE)) throw new ConfigurationError('LOCAL_MODE must be "true" or "false".');
+    if (env.LOCAL_MODE === 'true') {
+      if (!env.LOCAL_CLAIM_SECRET || !/^[A-Za-z0-9_-]{43}$/.test(env.LOCAL_CLAIM_SECRET)) throw new ConfigurationError('LOCAL_MODE needs LOCAL_CLAIM_SECRET, a base64url-encoded random 32-byte value.');
+      if (!LOOPBACK.includes(new URL(env.APP_ORIGIN).hostname.replace(/^\[|\]$/g, ''))) throw new ConfigurationError('LOCAL_MODE needs APP_ORIGIN on this machine, such as http://127.0.0.1:8787.');
+      if (!LOOPBACK.includes(listenHost)) throw new ConfigurationError('LOCAL_MODE listens on loopback only: leave HOST unset or set it to 127.0.0.1.');
+    }
   }
   const port = Number(processEnv.PORT ?? '8787');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new ConfigurationError('PORT must be a TCP port number.');
@@ -75,11 +97,15 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
   const storageUrl = processEnv.STORAGE_URL || null;
   if (storageUrl) env.BUCKET = openStorage(storageUrl, processEnv);
   env.DB = await openDatabase(databaseUrl);
-  if (workspaceDatabases) env.WORKSPACE_DATABASES = new PostgresWorkspaceDatabases({ privateHosts: workspaceDatabasePrivateHosts });
+  // Loaded only when enabled, so a server without them (a local one, say) needs no Postgres driver installed.
+  if (workspaceDatabases) {
+    const { PostgresWorkspaceDatabases } = await import('./workspace-databases/postgres.js');
+    env.WORKSPACE_DATABASES = new PostgresWorkspaceDatabases({ privateHosts: workspaceDatabasePrivateHosts });
+  }
   env.CONNECTOR_HUB = new ConnectorHubRegistry(env);
   return {
     env, port, databaseUrl, storageUrl,
-    host: processEnv.HOST || '0.0.0.0',
+    host: listenHost,
     trustProxy: trustProxyValue === 'true',
     staticDir: resolve(processEnv.STATIC_DIR || 'dist/web'),
   };

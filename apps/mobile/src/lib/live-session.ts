@@ -18,7 +18,9 @@ export function useLiveSession(id: string) {
   const [status, setStatus] = useState<StreamStatus>("connecting");
   const [revision, setRevision] = useState(0);
   const refreshRef = useRef<() => void>(() => {});
+  const loadOlderRef = useRef<(conversationId: string) => Promise<void>>(async () => {});
   const refresh = useCallback(() => refreshRef.current(), []);
+  const loadOlder = useCallback((conversationId: string) => loadOlderRef.current(conversationId), []);
   const reconnect = useCallback(() => setRevision(current => current + 1), []);
   useEffect(() => {
     setStatus("connecting");
@@ -32,7 +34,8 @@ export function useLiveSession(id: string) {
       },
     });
     refreshRef.current = live.refresh;
-    return () => { live.stop(); refreshRef.current = () => {}; };
+    loadOlderRef.current = live.loadOlder;
+    return () => { live.stop(); refreshRef.current = () => {}; loadOlderRef.current = async () => {}; };
   }, [api, id, origin, token, revision]);
-  return { session, view, error, status, refresh, reconnect };
+  return { session, view, error, status, refresh, loadOlder, reconnect };
 }

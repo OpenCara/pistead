@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
-const sourcesMigration = '0032_workspace_sources.sql';
+const sourcesMigration = '0040_workspace_sources.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 
 function migrate(sqlite: DatabaseSync, files: string[]) {
@@ -21,7 +21,7 @@ function fixture(): DatabaseSync {
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec('PRAGMA foreign_keys = ON');
   assert.ok(migrationFiles.includes(sourcesMigration));
-  assert.ok(readdirSync(new URL('../apps/server/migrations/postgres/', import.meta.url)).includes('0025_workspace_sources.sql'), 'Postgres has the same migration');
+  assert.ok(readdirSync(new URL('../apps/server/migrations/postgres/', import.meta.url)).includes('0033_workspace_sources.sql'), 'Postgres has the same migration');
   migrate(sqlite, migrationFiles.filter(file => file < sourcesMigration));
   sqlite.exec(`INSERT INTO users (id, display_name, git_name, git_email, auth_kind, created_at)
     VALUES ('owner', 'Owner', 'Owner', 'owner@example.test', 'test', '2026-01-01');

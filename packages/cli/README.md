@@ -2,6 +2,8 @@
 
 Connect your Linux or WSL2 Pi host to a [Pistead](https://pistead.com) workspace. The connector uses outbound WebSocket only; no inbound port or tunnel is needed.
 
+Or run Pistead itself on your own computer, for yourself: `npx pistead@latest serve` (see [Running Pistead on your own computer](#running-pistead-on-your-own-computer)).
+
 ## Requirements
 
 - Linux or WSL2 (native Windows is unsupported)
@@ -33,7 +35,7 @@ The saved token is replaced only once the new code is accepted. The old host sta
 
 Connector 0.8.0 moved the default state directory from `~/.local/share/opencara/connector` to `~/.local/share/pistead/connector` without moving anything: to keep a pairing made by an older connector, run `npx pistead@latest connect --state-dir ~/.local/share/opencara/connector`, or pair the machine again.
 
-Run `npx pistead connect --help` for all options. The connector takes only what pairing and this machine's own setup need (`--state-dir`, `--pi-agent-dir`, `--model`, `--resources`, `--unsafe-no-sandbox`).
+Run `npx pistead connect --help` for all options. The connector takes only what pairing and this machine's own setup need (`--state-dir`, `--pi-agent-dir`, `--model`, `--resources`, `--unsafe-no-sandbox`, `--experimental-sandbox`).
 
 ## Host configuration
 
@@ -42,7 +44,7 @@ Everything else about how the host runs sessions is set in the web app, on the h
 - **Command time limit**: how long a shell command may run, from 30 seconds (the default) to an hour. A longer limit also lifts the per-process limits of short commands (25 seconds of CPU, 64 MiB per file, 256 open files) so builds fit. Set by the host's owner or its admins.
 - **GPU**: sandboxed commands get the host's GPU render device for offscreen rendering and compute: `/dev/dxg` on WSL2 (install Mesa's `vulkan-dzn` there for Vulkan), or Linux DRM render nodes. Never the screen, windows or input. Offered only where the connector found such a device. Set by the host's owner or its admins.
 - **Git credentials** and **Repository cache**: see below. Only the host's owner changes them.
-- **Sessions on the host**: the host's owner may start sessions that run directly on this machine, without the sandbox, by choosing **Where it runs → On this host** when starting one; members' sessions always run in the sandbox. Only the owner changes it.
+- **Sessions on the host**: the host's owner may start sessions that run directly on this machine, without the sandbox, by choosing **Where it runs → On this host** when starting one. Members' sessions run in the sandbox unless the owner's host command grant to them includes **Sessions on the host**. Only the owner changes it.
 
 `--git-credentials`, `--repo-cache` and `--repo-cache-scope` are still accepted, so existing service units keep starting, but ignored: a host that used them keeps those settings in its configuration.
 
@@ -62,9 +64,9 @@ Commands run in the session's worktree, whose files and Git configuration the ag
 
 Each exact command and timeout needs the approval of the **host owner**, or of a member they (or one of the host's admins) granted host commands, in the session. On a shared host, the approver must also have approve access to the session. The session owner's **Auto-approve** skips this decision only when they own the host too, or hold an automatic host command grant on it; without one it never authorizes commands on someone else's host. Commands default to a five-minute timeout (`timeout_seconds`, 1-3600); timeout, cancellation and output limits terminate the process group, but cannot contain an unrestricted command that deliberately detaches processes.
 
-## macOS and hosts without bubblewrap
+## macOS, Windows and hosts without bubblewrap
 
-The isolated sandbox needs Linux. On macOS, or Linux without bubblewrap, you can opt out of isolation:
+The isolated sandbox needs Linux (or WSL2 on Windows). macOS and native Windows can try their own experimental sandboxes with `--experimental-sandbox` (see the main README, "Experimental sandboxes on macOS and Windows"). On macOS, native Windows, or Linux without bubblewrap, you can also opt out of isolation:
 
 ```sh
 npx pistead@latest connect --unsafe-no-sandbox
@@ -120,6 +122,15 @@ The sandbox has no network, so `gh` and `curl` inside it can't reach GitHub. Age
 - `github_comment` posts a comment. It waits for a human approval unless the session owner's message chose **Auto-approve**.
 - `github_issue` opens an issue with exactly the approved title and body in one of those repositories, and gives the agent its number and URL (connector newer than 0.9.0). It waits for a human approval unless the session owner's message chose **Auto-approve**. If GitHub refuses (issues turned off, no access), no issue is opened and the agent gets GitHub's reason.
 
+## Web pages and search
+
+Agents read web pages with `web_fetch` and search the web with `web_search` (connector newer than 0.9.0).
+
+- `web_fetch` reads one `https://` page from this host, as far as the workspace's network access lets the session's sandbox reach, and never at an address in this host's own networks. It sends no cookies or credentials and only reads; HTML comes back as text, images as images. It needs no approval, during a shared message. On a host running without the sandbox it still follows the workspace's network access.
+- `web_search` asks Pistead, which searches with the provider its operator configured, where the workspace turned web search on. The provider's key never reaches this host.
+
+What they return is untrusted input, like any repository content.
+
 ## Chat options
 
 In a session's chat box you can pick any model this host's Pi offers that isn't disabled in the web app, its reasoning level, and the access mode for each message: **Read only**, **Ask before acting** (the default) or **Auto-approve** (session owner only). Hosts running a connector older than 0.3.0 keep each session's pinned model; restart the connector with `npx pistead@latest connect` to enable the options.
@@ -130,7 +141,7 @@ Agents change files with `edit_file`, which replaces exact text in place, or wit
 
 A new session starts from a host and one of its models, and gets every tool that host supports with no extra instructions. The access mode still decides what runs without asking.
 
-When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes, GitHub comments, merges and issues still need their own approval unless the message auto-approves. A message the session owner sends with **Auto-approve** asks none of this (connector 0.7.1 or newer): its calls go ahead at once, for that message only. Only the host's owner can let commands run without resource limits, and only in their own sessions: they still run in the sandbox, offline and for at most the host's command time limit, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
+When a call needs more than the session allows, the agent asks instead of failing (connector 0.6.0 or newer): a tool its agent doesn't include, a change in a **Read only** message, or a shell command on a sandboxed host without resource limits. The session owner gets a card with **Allow once**, **Allow for this session** and **Deny**. The call can wait for the answer until an hour after the message was sent, and the session's queue waits with it. Allowing a tool doesn't approve what it does: commands, commits, pushes, GitHub comments, merges and issues still need their own approval unless the message auto-approves. A message the session owner sends with **Auto-approve** asks none of this (connector 0.7.1 or newer): its calls go ahead at once, for that message only. Only the host's owner can let commands run without resource limits in their own sessions, and so can members they granted host commands there, in theirs (connectors advertising `unboundedShellGrants`), whose commands are then decided like host commands. Either way they still run in the sandbox, offline and for at most the host's command time limit, but with no cap on CPU, memory, processes or disk. A session restored from a backup asks again.
 
 ## Session status
 
@@ -139,3 +150,13 @@ The session list shows what each session's agent is doing, as its host reports i
 ## License
 
 MIT
+
+## Running Pistead on your own computer
+
+```sh
+npx pistead@latest serve
+```
+
+runs the Pistead server and its web app on `http://127.0.0.1:7878`, reachable from this computer only, with this computer as the host that runs your sessions. You sign in with GitHub through an OAuth app of your own: register one once at <https://github.com/settings/applications/new> with the homepage `http://127.0.0.1` and the callback URL `http://127.0.0.1/api/auth/github/callback`, and the first run asks for its client ID and secret (hidden). It then prints a sign-in link: the GitHub account that signs in through it becomes the owner, and the only account that can sign in. Once you have, this computer pairs itself as your host, sandboxed as with `connect` (or with `--unsafe-no-sandbox`; `--no-host` serves without it).
+
+Everything is kept in `~/.local/share/pistead/server` (`--state-dir`), apart from `connect`'s own state, so later runs need no options. Run `npx pistead serve --help` for the rest.

@@ -68,7 +68,10 @@ export function SessionList({ selectedId, onOpen, onNew }: { selectedId?: string
       const status = sessionStatus(session, liveActivity?.sessionId === session.id ? liveActivity.activity : undefined);
       return <Pressable testID={`session-row-${session.id}`} accessibilityRole="button" accessibilityState={{ selected }} onPress={() => onOpen(session.id)}
         style={({ pressed }) => [styles.row, { backgroundColor: selected || pressed ? palette.selection : palette.surface, borderColor: palette.border }]}>
-        <View accessibilityLabel={status.label ? undefined : session.status} style={[styles.status, { backgroundColor: palette.tones[status.tone].text }]} />
+        {status.icon === "clock"
+          // Waiting for its next scheduled prompt: a clock where others show a dot.
+          ? <Ionicons testID={`session-scheduled-${session.id}`} name="time-outline" size={12} color={palette.tones[status.tone].text} style={styles.statusIcon} />
+          : <View accessibilityLabel={status.label ? undefined : session.status} style={[styles.status, { backgroundColor: palette.tones[status.tone].text }]} />}
         <View style={ui.flex}>
           <Text style={[styles.title, { color: palette.text }]} numberOfLines={1}>{session.title}</Text>
           <Text style={[ui.small, { color: palette.muted }]} numberOfLines={1}>
@@ -100,6 +103,7 @@ const styles = StyleSheet.create({
   sectionTitle: { fontSize: 13, fontWeight: "600", textTransform: "uppercase", paddingHorizontal: 16, paddingTop: 16, paddingBottom: 6 },
   row: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
   status: { width: 8, height: 8, borderRadius: 4 },
+  statusIcon: { width: 12, marginHorizontal: -2 },
   title: { fontSize: 16, fontWeight: "500" },
   statusLabel: { fontWeight: "600" },
 });

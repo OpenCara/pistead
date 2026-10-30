@@ -3,13 +3,16 @@ import type { ChatImage } from "../../../packages/shared/src/chat-images";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
+import { managesSession } from "../../../packages/shared/src/policy";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
-import { AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
+import { AttachButton, AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
 import {
   accessUnavailable, autoApproveConfirmed, ChatOptionsBar, chatOptionsBody, confirmAutoApprove, initialSelection, modelUnavailable, mustConfirmAutoApprove, rememberChat,
   type ChatSelection,
 } from "./chat-options";
+import { forgetSentDraft, readDraft, useDraft, writeDraft } from "./drafts";
+import { copyText, messageCut, resendText, rewindable, type MessageCut } from "../../../packages/client/src/message-actions";
 import { useConnections } from "./hosts";
 import { Icon, type IconName } from "./icons";
 import { activeStatuses, startLiveSession, type StreamStatus } from "./live-session";
@@ -17,13 +20,16 @@ import { Markdown } from "./markdown";
 import { PeopleProvider, Username, useWorkspacePeople } from "./people";
 import { PullRequestLink } from "./pull-request";
 import { RepositoryPreparationCard } from "./repository-preparation";
-import { decidesHostCommands, HOST_COMMAND_WAITING, isHostCommand } from "../../../packages/client/src/host-commands";
+import { decidedAsHostCommand, decidesHostCommand, hostCommandWaiting, isHostCommand } from "../../../packages/client/src/host-commands";
 import { preparingRepositories } from "../../../packages/client/src/repository-progress";
+import { NavigationButton } from "./navigation";
 import { navigate } from "./router";
+import { enterSends } from "./touch";
 import { ApprovalCard, AutoApprovedMarks, SessionPanel, useSessionActions, type AuditEvent, type PanelTab } from "./session-panel";
 import { splitToolCalls } from "../../../packages/client/src/transcript";
+import { COMPACTION_FAILED_TITLE, compactionFailureText } from "../../../packages/client/src/compaction";
 import {
-  Alert, Button, Combobox, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
+  Alert, Button, Combobox, confirmDialog, DropdownMenu, EmptyState, Feedback, Field, formatDuration, PageLoading, ScreenHeader, SegmentedControl,
   Sheet, Spinner, StatusBadge, useAction, useResource, type MenuItem,
 } from "./ui";
 import "./session.css";
@@ -35,29 +41,41 @@ function useLiveSession(id: string) {
   const [status, setStatus] = useState<StreamStatus>("connecting");
   const [revision, setRevision] = useState(0);
   const refreshRef = useRef<() => void>(() => {});
+  const loadOlderRef = useRef<(conversationId: string) => Promise<void>>(async () => {});
   const refresh = useCallback(() => refreshRef.current(), []);
+  const loadOlder = useCallback((conversationId: string) => loadOlderRef.current(conversationId), []);
   const reconnect = useCallback(() => setRevision(current => current + 1), []);
   useEffect(() => {
     setStatus("connecting");
     const live = startLiveSession(id, { session: setSession, view: setView, error: setError, status: setStatus });
     refreshRef.current = live.refresh;
-    return () => { live.stop(); refreshRef.current = () => {}; };
+    loadOlderRef.current = live.loadOlder;
+    return () => { live.stop(); refreshRef.current = () => {}; loadOlderRef.current = async () => {}; };
   }, [id, revision]);
-  return { session, view, error, status, refresh, reconnect };
+  return { session, view, error, status, refresh, loadOlder, reconnect };
 }
 
 const PANEL_KEY = "pistead.sessionPanel";
+/** Where the panel is a column beside the conversation (session.css); narrower, it covers the conversation. */
+const PANEL_BESIDE = "(min-width: 1100px)";
 
+/**
+ * Whether the session panel is open. Beside the conversation, the choice is remembered; where it would cover the
+ * conversation (a phone, a narrow window), each session opens on its conversation and the remembered choice stays
+ * the wide screen's.
+ */
 function usePanelOpen() {
   const [open, setOpen] = useState(() => {
+    if (!window.matchMedia(PANEL_BESIDE).matches) return false;
     try {
       const stored = localStorage.getItem(PANEL_KEY);
       if (stored) return stored === "open";
     } catch { /* Storage unavailable: fall back to the viewport default. */ }
-    return window.matchMedia("(min-width: 1100px)").matches;
+    return true;
   });
   const set = useCallback((value: boolean) => {
     setOpen(value);
+    if (!window.matchMedia(PANEL_BESIDE).matches) return;
     try { localStorage.setItem(PANEL_KEY, value ? "open" : "closed"); } catch { /* Keep the in-memory choice. */ }
   }, []);
   return [open, set] as const;
@@ -73,15 +91,59 @@ function modelFailure({ provider, modelId, status }: NonNullable<EntryView["erro
 }
 
 /** One collapsed row for tool calls, tool results and system entries; expanding it shows the raw text. */
-function ToolDetails({ role, icon, label, text, badges }: { role?: string; icon: IconName; label: ReactNode; text: string; badges?: ReactNode }) {
+function ToolDetails({ role, icon, label, text, badges, trimmed }: { role?: string; icon: IconName; label: ReactNode; text: string; badges?: ReactNode; trimmed?: EntryView["trimmed"] }) {
   return <details className="entry-tool" data-role={role}>
     <summary><Icon name={icon} size={14} /><span className="truncate">{label}</span>{badges}<Icon name="chevron-right" size={14} /></summary>
     <pre>{text}</pre>
+    {trimmed && <BriefNote trimmed={trimmed} />}
   </details>;
 }
 
+/** Under a tool row the session shows briefly: how much the host keeps. */
+export function BriefNote({ trimmed }: { trimmed: NonNullable<EntryView["trimmed"]> }) {
+  return <p className="muted small entry-brief">Brief tool output · {trimmed.lines === 1 ? "1 line" : `${trimmed.lines.toLocaleString()} lines`}, {trimmed.chars.toLocaleString()} characters in full. The session's owner can show full tool output under Details.</p>;
+}
+
+/** The first line of a brief tool result, shown on its collapsed row. */
+function briefLine(entry: EntryView): ReactNode {
+  return entry.trimmed && entry.role === "toolResult" && entry.text.trim() ? <span className="muted"> · {entry.text}</span> : null;
+}
+
+/**
+ * What a shared-conversation entry's actions do, where the viewer may take them (see messageCut): go back to it, fork a
+ * new session from it. `disabled` says why one can't be taken now. Copying is offered on every message.
+ */
+type MessageActionHandlers = {
+  revert?: { run: (entry: EntryView, cut: MessageCut) => void; disabled?: string };
+  fork?: { run: (entry: EntryView, cut: MessageCut) => void; disabled?: string };
+};
+
+/** A message's actions, shown beside who sent it: on hover or focus with a pointer, always on touch screens. */
+function MessageActions({ entry, actions }: { entry: EntryView; actions?: MessageActionHandlers }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  const text = copyText(entry);
+  const cut = actions && messageCut(entry);
+  const revert = cut && actions?.revert;
+  const fork = cut && actions?.fork;
+  if (!text && !revert && !fork) return null;
+  const revertLabel = cut?.before ? "Go back to before this message" : "Go back to this reply";
+  return <span className="entry-actions" role="toolbar" aria-label="Message actions">
+    {text && <Button variant="ghost" size="xs" icon={copied ? "check" : "copy"} aria-label={copied ? "Copied" : "Copy message"} title={copied ? "Copied" : "Copy message"}
+      onClick={() => void navigator.clipboard.writeText(text).then(() => setCopied(true))} />}
+    {revert && <Button variant="ghost" size="xs" icon="history" aria-label={revertLabel} title={revert.disabled || revertLabel} disabled={Boolean(revert.disabled)}
+      onClick={() => revert.run(entry, cut)} />}
+    {fork && <Button variant="ghost" size="xs" icon="git-branch" aria-label="Fork a new session from here" title={fork.disabled || "Fork a new session from here"}
+      disabled={Boolean(fork.disabled)} onClick={() => fork.run(entry, cut)} />}
+  </span>;
+}
+
 /** User messages are plain-text bubbles; assistant text is markdown; tool calls, results and system entries collapse to one row. */
-function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }) {
+function TranscriptEntry({ entry, userId, actions }: { entry: EntryView; userId: string; actions?: MessageActionHandlers }) {
   const actor = entry.actorId && <Username id={entry.actorId} you />;
   const { prose, calls } = entry.role === "assistant" ? splitToolCalls(entry.text) : { prose: entry.text, calls: [] };
   const toolLabel = calls.length > 0 && `Tool · ${calls[0].name}`;
@@ -92,26 +154,34 @@ function TranscriptEntry({ entry, userId }: { entry: EntryView; userId: string }
     // A tool call row would show the model's time, not the tool's, so only results carry a duration.
     const took = entry.role === "toolResult" && entry.durationMs !== undefined
       && <> · <span title="How long the tool ran">{formatDuration(entry.durationMs)}</span></>;
-    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}</>} text={entry.text}
-      badges={<AutoApprovedMarks calls={entry.autoApproved} />} />;
+    return <ToolDetails role={entry.role} icon={toolLabel ? "tool" : "terminal"} label={<>{label}{took}{actor && <> · {actor}</>}{briefLine(entry)}</>} text={entry.text}
+      badges={<AutoApprovedMarks calls={entry.autoApproved} />} trimmed={entry.trimmed} />;
   }
   if (entry.error) {
     return <div className="entry-error" title={entry.kind}>
-      <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>
+      {entry.error.compaction
+        ? <Alert variant="error" title={COMPACTION_FAILED_TITLE}>{compactionFailureText(entry.error.compaction)}</Alert>
+        : <Alert variant="error" title="Model request failed">{modelFailure(entry.error)}</Alert>}
       {actor && <div className="entry-actor">by {actor}</div>}
     </div>;
   }
   if (entry.role === "user") {
     return <div className="entry-user" title={entry.kind}>
       <div className="entry-bubble">{entry.text}</div>
-      {actor && entry.actorId !== userId && <div className="entry-actor">by {actor}</div>}
+      <div className="entry-footer">
+        {actor && entry.actorId !== userId && <span className="entry-actor">by {actor}</span>}
+        <MessageActions entry={entry} actions={actions} />
+      </div>
     </div>;
   }
   const took = entry.durationMs !== undefined && <span title="How long the model took to reply">{formatDuration(entry.durationMs)}</span>;
   return <div className="entry-assistant" data-role={entry.role} title={entry.kind}>
     <Markdown text={prose} />
-    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} />}
-    {(actor || took) && <div className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</div>}
+    {toolLabel && <ToolDetails icon="tool" label={toolLabel} text={calls.map(call => call.line).join("\n")} badges={<AutoApprovedMarks calls={entry.autoApproved} />} trimmed={entry.trimmed} />}
+    <div className="entry-footer">
+      {(actor || took) && <span className="entry-actor">{actor && <>by {actor}</>}{actor && took && " · "}{took}</span>}
+      <MessageActions entry={entry} actions={actions} />
+    </div>
   </div>;
 }
 
@@ -153,8 +223,11 @@ function SessionPane({ id }: { id: string }) {
   useEffect(() => () => { setLiveActivity(null); refreshSessions(); }, [setLiveActivity, refreshSessions]);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
+  // Its owner, and its workspace's owner and admins, rename and archive the session and change its visibility; the server decides.
+  const workspaceRole = session ? workspaces.find(workspace => workspace.id === session.workspaceId)?.role : undefined;
+  const manages = Boolean(session && managesSession(user.id, session.ownerId, workspaceRole));
   const actions = useSessionActions({
-    session, user,
+    session, user, manages,
     backupBlocked: archived || frozen || !view || Boolean(live.error) || view.busy || activeQueue.length > 0,
     onChange: refreshAll,
   });
@@ -174,10 +247,11 @@ function SessionPane({ id }: { id: string }) {
     : <StatusBadge tone="neutral" dot>Connecting</StatusBadge>;
 
   const menu: (MenuItem | "separator")[] = [{ label: "Copy session ID", icon: "copy", onSelect: () => void navigator.clipboard.writeText(id) }];
-  if (session && isOwner && !archived) {
+  if (session && manages && !archived) {
     menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
-    if (!frozen) {
+    // Backups hold the owner's work and personal environment, so they stay the owner's.
+    if (isOwner && !frozen) {
       menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy,
         hint: actions.backupsOff ? "Backups are off" : actions.backupBlocked ? "Session busy" : undefined, onSelect: () => actions.createBackup() });
       menu.push({ label: "Back up conversation only", icon: "archive",
@@ -187,14 +261,27 @@ function SessionPane({ id }: { id: string }) {
     }
     menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
   }
-  if (session && isOwner && archived) {
+  if (session && manages && archived) {
     menu.push({ label: "Unarchive", icon: "archive", disabled: actions.action.busy, onSelect: actions.unarchive });
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
 
+  /**
+   * Whether the viewer decides `approval`. Only the session owner can let a call do more than the session allows. A host
+   * command, as every command of a session that runs on its host is, needs host command authority, and so does a command
+   * without the host's missing resource limits in a member's session (see decidedAsHostCommand and decidesHostCommand:
+   * the host's owner decides host_bash without approve permission here); everything else, approve permission.
+   */
+  function decides(approval: ApprovalRecord): boolean {
+    if (!session || archived || frozen) return false;
+    if (decidedAsHostCommand(approval.operation, session, approval.unbounded)) return decidesHostCommand(approval.operation, session, host, user.id, permissions.includes("approve"));
+    const ownerOnly = approval.operation.kind === "permission" || approval.operation.kind === "git.repin";
+    return canApprove && (!ownerOnly || isOwner);
+  }
+
   /** `scope` answers a permission request: allow the one call, or the same need for the rest of the session. */
   async function decide(approval: ApprovalRecord, decision: "approve" | "deny", scope?: "call" | "session") {
-    if (!canApprove || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
+    if (!decides(approval) || approvalAction.busy || !approval.reviewHash || approval.status !== "pending") return;
     // The card is the prompt: it shows the exact operation, who it runs as, its resource limits and any unsandboxed-host warning, so a click decides at once.
     const notice = approval.operation.kind === "permission"
       ? decision === "deny" ? "Not allowed" : scope === "session" ? "Allowed for the rest of the session" : "Allowed for this call"
@@ -214,6 +301,7 @@ function SessionPane({ id }: { id: string }) {
   return <PeopleProvider people={people}><div className={panelOpen && session ? `session-screen panel-open${tab === "files" ? " panel-wide" : ""}` : "session-screen"}>
     <div className="session-pane">
       <ScreenHeader
+        leading={<NavigationButton />}
         title={known?.title ?? "Session"}
         subtitle={workspaceName}
         actions={<>
@@ -228,8 +316,8 @@ function SessionPane({ id }: { id: string }) {
           This session pinned its repositories when it started, which sessions no longer do. Its conversation, approvals and backups stay viewable, but it no longer runs. Start a new session to continue the work.
         </Alert>}
         {session?.cloneUnavailable && !frozen && <Alert variant="warning" title="Can't clone repositories">{session.cloneUnavailable}</Alert>}
-        {archived && <Alert title="Archived" actions={isOwner && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unarchive}>Unarchive</Button>}>
-          This session is read-only. {isOwner ? "Unarchive it to continue the work." : "Only its owner can unarchive it."}
+        {archived && <Alert title="Archived" actions={manages && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unarchive}>Unarchive</Button>}>
+          This session is read-only. {manages ? "Unarchive it to continue the work." : "Only its owner, or the workspace's owner or an admin, can unarchive it."}
         </Alert>}
         {live.error && !startFailed && <Alert variant="error" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button variant="outline" size="sm" onClick={live.reconnect}>Reconnect and check access</Button>}>{live.error}</Alert>}
         <Feedback {...actions.action} />
@@ -237,7 +325,8 @@ function SessionPane({ id }: { id: string }) {
       {!view ? (!live.error ? <PageLoading />
         : session ? <UnavailableConversation id={id} user={user} session={session} error={live.error} recovered={() => { live.reconnect(); refreshSessions(); }} />
         : <div className="session-transcript" />) : session && <Conversation
-        id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh}
+        id={id} user={user} session={session} view={view} host={host} stale={Boolean(live.error)} refresh={live.refresh} loadOlder={live.loadOlder}
+        openSession={openSession}
         pinned={<>
           {view.repositories && <RepositoryPreparationCard sessionId={id} preparation={view.repositories}
             canRestart={isOwner && !archived && permissions.includes("manage")} onRestarted={refreshAll} />}
@@ -246,14 +335,12 @@ function SessionPane({ id }: { id: string }) {
             : <Alert variant="error" title="Unsandboxed host">This session's host runs without a sandbox. Approved commands and commits execute directly on the host owner's machine with their full user permissions, network access and no resource limits.</Alert>)}
           {view.approvals.filter(approval => approval.status === "pending").map(approval => {
             const permission = approval.operation.kind === "permission";
-            // Only the session owner can let a call do more than the session allows. A host command, as every command of a
-            // session that runs on its host is, is decided by its host's owner or a member granted host commands.
             const hostCommand = isHostCommand(approval.operation, session);
+            const hostDecided = decidedAsHostCommand(approval.operation, session, approval.unbounded);
             const ownerOnly = permission || approval.operation.kind === "git.repin";
-            const decides = canApprove && (hostCommand ? decidesHostCommands(session, host, user.id) : !ownerOnly || isOwner);
             const disabled = approvalAction.busy || !approval.reviewHash;
             return <ApprovalCard approval={approval} key={approval.id}>
-              {decides ? <>
+              {decides(approval) ? <>
                 {!approval.reviewHash && <Alert variant="warning" title="No verified review commitment" actions={<Button variant="outline" size="sm" disabled={approvalAction.busy} onClick={live.refresh}>Refresh approval</Button>}>Refresh before deciding; the server must bind the displayed operation and requester.</Alert>}
                 {permission ? <div className="inline">
                   <Button variant="default" size="sm" disabled={disabled} onClick={() => void decide(approval, "approve", "call")}>Allow once</Button>
@@ -265,7 +352,7 @@ function SessionPane({ id }: { id: string }) {
                   <Button variant="outline" size="sm" disabled={disabled} onClick={() => void decide(approval, "deny")}>Deny</Button>
                   <span className="muted small">Runs as {hostCommand ? "the host OS user (outside the sandbox)" : view.owner.displayName} · each approval covers one exact operation and its arguments</span>
                 </div>}
-              </> : <p className="muted small">{hostCommand ? HOST_COMMAND_WAITING : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
+              </> : <p className="muted small">{hostDecided ? hostCommandWaiting(approval.operation, host) : ownerOnly ? "Waiting for the session owner" : "Waiting for an authorized approver"}</p>}
             </ApprovalCard>;
           })}
           <Feedback {...approvalAction} />
@@ -274,9 +361,9 @@ function SessionPane({ id }: { id: string }) {
     </div>
     {session && panelOpen && <>
       <button type="button" className="session-scrim" aria-label="Close session panel" onClick={() => setPanelOpen(false)} />
-      <SessionPanel session={session} view={view} user={user} hosts={hosts} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
+      <SessionPanel session={session} view={view} user={user} workspaceRole={workspaceRole} hosts={hosts} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
     </>}
-    {session && isOwner && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
+    {session && manages && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
       onSave={async title => { if (await actions.rename(title)) setRenaming(false); }} />}
   </div></PeopleProvider>;
 }
@@ -302,19 +389,20 @@ function RenameSheet({ open, title, busy, onClose, onSave }: { open: boolean; ti
   </Sheet>;
 }
 
-function Conversation({ id, user, session, view, host, stale, refresh, pinned }: { id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void; pinned: ReactNode }) {
+function Conversation({ id, user, session, view, host, stale, refresh, loadOlder, openSession, pinned }: {
+  id: string; user: UserProfile; session: SessionRecord; view: SessionView; host: ConnectorInfo | undefined; stale: boolean; refresh: () => void;
+  loadOlder: (conversationId: string) => Promise<void>; openSession: (id: string) => void; pinned: ReactNode;
+}) {
   const owner = session.ownerId === user.id;
   // Initialised once per session (SessionPane remounts per id); view refreshes never reset the user's picks.
   const [selection, setSelection] = useState<ChatSelection>(() => initialSelection(view, owner));
   const [mode, setMode] = useState<"write" | "ask">("write");
-  // A first message that failed to send from the new-session screen is handed over here.
-  const [content, setContent] = useState(() => {
-    try { return sessionStorage.getItem(`pistead.draft.${id}`) ?? ""; } catch { return ""; }
-  });
+  // The unsent text is remembered locally until it is sent, so switching to another session and back keeps it; a first
+  // message that failed to send from the new-session screen is handed over the same way.
+  const [content, setContent] = useDraft(id);
   // So are its images, which the new-session screen keeps in memory.
   const attachments = useAttachments(imagesUnavailable(host), () => handedOverImages(id));
   useEffect(() => {
-    try { sessionStorage.removeItem(`pistead.draft.${id}`); } catch { /* Storage unavailable: nothing to clear. */ }
     forgetHandedOverImages(id);
   }, [id]);
   const [conversationId, setConversationId] = useState("");
@@ -326,6 +414,11 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
   const [receipt, setReceipt] = useState<SubmitResult | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  // Shown while the reader has scrolled up from the latest entry: a button back down to it.
+  const [scrolledUp, setScrolledUp] = useState(false);
+  // Set while the button's smooth scroll runs: its frames are on the way down, not the reader scrolling up.
+  const jumping = useRef(false);
+  const jumpTimer = useRef<number | undefined>(undefined);
   const permissions = session.permissions ?? [];
   const canWrite = permissions.includes("write");
   const canAsk = permissions.includes("ask");
@@ -349,17 +442,89 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     return conversation?.mode !== "ask";
   });
   const lastEntryId = entries.at(-1)?.id;
+  const firstEntryId = entries[0]?.id;
+  // In a workspace that loads transcripts latest first: the shown conversations with earlier entries still to read.
+  const olderConversations = conversations.filter(conversation => (conversation.olderEntries ?? 0) > 0 && (actualMode === "ask"
+    ? conversation.mode === "ask" && (!conversation.actorId || conversation.actorId === user.id) && (!conversationId || conversation.id === conversationId)
+    : conversation.mode !== "ask"));
+  const olderCount = olderConversations.reduce((total, conversation) => total + (conversation.olderEntries ?? 0), 0);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  /** Where the reader was when earlier entries were asked for, to keep them there once those arrive above. */
+  const anchor = useRef<{ first?: string; height: number; top: number } | null>(null);
+  function loadEarlier() {
+    if (loadingOlder || !olderConversations.length) return;
+    const element = transcript.current;
+    anchor.current = element ? { first: firstEntryId, height: element.scrollHeight, top: element.scrollTop } : null;
+    setLoadingOlder(true);
+    void Promise.all(olderConversations.map(conversation => loadOlder(conversation.id))).finally(() => setLoadingOlder(false));
+  }
 
   // Follow new entries unless the reader has scrolled up.
   useLayoutEffect(() => {
     const element = transcript.current;
     if (element && stick.current) element.scrollTop = element.scrollHeight;
   }, [lastEntryId, entries.length]);
+  // The transcript shrinks when the chat box grows, a card is pinned above it or a phone's keyboard opens: a reader at
+  // the latest entry stays there instead of having it slide under the chat box. So does one whose entry grows as it streams.
+  useEffect(() => {
+    const element = transcript.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const follow = () => { if (stick.current) element.scrollTop = element.scrollHeight; };
+    const observer = new ResizeObserver(follow);
+    observer.observe(element);
+    if (element.firstElementChild) observer.observe(element.firstElementChild);
+    return () => observer.disconnect();
+  }, []);
+  /** Following and the jump button, from where the transcript is scrolled now. */
+  function track(element: HTMLElement) {
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    stick.current = distance < 80;
+    // A little further up than following stops, so the button doesn't flicker in and out at the bottom.
+    const up = distance > 240;
+    setScrolledUp(current => current === up ? current : up);
+  }
+  function endJump() {
+    jumping.current = false;
+    window.clearTimeout(jumpTimer.current);
+    jumpTimer.current = undefined;
+  }
+  useEffect(() => () => window.clearTimeout(jumpTimer.current), []);
+  function jumpToLatest() {
+    const element = transcript.current;
+    if (!element) return;
+    stick.current = true;
+    jumping.current = true;
+    setScrolledUp(false);
+    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    // However the scroll ends (cut short by layout, say), after a second where it stands decides again; a second jump restarts it.
+    window.clearTimeout(jumpTimer.current);
+    jumpTimer.current = window.setTimeout(() => {
+      endJump();
+      if (transcript.current) track(transcript.current);
+    }, 1000);
+  }
+  /** The reader takes over (a touch, the wheel, a key): a jump under way ends where they stop it, and they aren't pulled down. */
+  function interrupt() {
+    if (!jumping.current) return;
+    endJump();
+    if (transcript.current) track(transcript.current);
+  }
   useLayoutEffect(() => {
     stick.current = true;
+    anchor.current = null;
     const element = transcript.current;
     if (element) element.scrollTop = element.scrollHeight;
   }, [actualMode, conversationId]);
+  // Earlier entries arrived above: keep what the reader was looking at in place. When the first entry they saw is gone
+  // instead (the transcript started again, after a compaction say), nothing was added above it, so the scroll stays.
+  useLayoutEffect(() => {
+    const element = transcript.current;
+    const kept = anchor.current;
+    if (!element || !kept || kept.first === firstEntryId) return;
+    anchor.current = null;
+    if (kept.first === undefined || !entries.some(entry => entry.id === kept.first)) return;
+    element.scrollTop = kept.top + element.scrollHeight - kept.height;
+  }, [firstEntryId]);
 
   async function submit(event?: FormEvent) {
     event?.preventDefault();
@@ -393,7 +558,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
       // The next new chat starts from the model and reasoning this one went with, the session's own where none was picked.
       if (options) rememberChat(host, selection, view.agent);
       if (actualMode === "ask") setConversationId(result.conversationId);
-      setContent(current => current === sent ? "" : current);
+      // Through the draft, not this box's state: the box may have unmounted, and another opened, while it was in flight.
+      forgetSentDraft(id, sent);
       attachments.sent(pasted);
       request.current = null;
       refresh();
@@ -405,6 +571,50 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     void stopping.run(async () => {
       await api(`/api/sessions/${segment(id)}/stop`, { method: "POST", body: {} });
       refresh();
+    });
+  }
+
+  // Going back to a message, and forking from one: the shared conversation's, on a host that offers it. Anyone who drives
+  // the work can take it back; only the owner forks it, as the fork is a session of theirs with this one's history.
+  const rewinding = useAction();
+  const working = view.busy || activeQueue.length > 0;
+  const cuts = rewindable(view) && actualMode === "write" && !archived && !frozen;
+  const messageActions: MessageActionHandlers | undefined = cuts && (canWrite || owner) ? {
+    ...(canWrite ? { revert: { run: revert, disabled: rewinding.busy ? "Working..." : working ? "Stop the session's work to go back to an earlier message" : undefined } } : {}),
+    ...(owner ? { fork: { run: fork, disabled: rewinding.busy ? "Working..." : undefined } } : {}),
+  } : undefined;
+
+  async function revert(entry: EntryView, cut: MessageCut) {
+    if (rewinding.busy) return;
+    const confirmed = await confirmDialog({
+      title: cut.before ? "Go back to before this message?" : "Go back to this reply?",
+      message: <>{cut.before ? "This message and everything after it leave" : "Everything after this reply leaves"} the shared conversation, for everyone, and the agent continues from there.
+        {cut.before && " The message goes back into your chat box, when it's empty, to edit and send again."} Only the conversation goes back: files, commits and pushes stay as they are.</>,
+      confirmLabel: "Go back", destructive: true,
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      await api(`/api/sessions/${segment(id)}/revert`, { method: "POST", body: { entryId: cut.entryId } });
+      // Read again: something may have been typed while the dialog was open.
+      if (cut.before && !readDraft(id).trim()) setContent(resendText(entry));
+      stick.current = true;
+      refresh();
+    });
+  }
+
+  async function fork(entry: EntryView, cut: MessageCut) {
+    if (rewinding.busy) return;
+    const confirmed = await confirmDialog({
+      title: "Fork a new session from here?",
+      message: <>A new session of yours starts on the same host and model with this conversation up to {cut.before ? "just before this message, which goes into its chat box" : "this reply"}. This session stays as it is.
+        Like every new session, the fork's worktree starts empty: its agent clones the workspace's repositories again, and only what was pushed is there.</>,
+      confirmLabel: "Fork session",
+    });
+    if (!confirmed) return;
+    void rewinding.run(async () => {
+      const result = await api<{ session: SessionRecord }>(`/api/sessions/${segment(id)}/fork`, { method: "POST", body: { entryId: cut.entryId } });
+      if (cut.before) writeDraft(result.session.id, resendText(entry));
+      openSession(result.session.id);
     });
   }
 
@@ -421,17 +631,33 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
     : <>Idle</>;
 
   return <>
-    <div className="session-transcript" ref={transcript} onScroll={event => {
-      const element = event.currentTarget;
-      stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-    }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
-      <div className="chat-column">
-        {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} key={entry.id} />)
-          : <EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}</EmptyState>}
+    <div className="session-transcript-frame">
+      <div className="session-transcript" ref={transcript} onWheel={interrupt} onTouchStart={interrupt} onKeyDown={interrupt} onScroll={event => {
+        const element = event.currentTarget;
+        if (jumping.current) {
+          // Following and the hidden button stand until the scroll lands; entries that arrive meanwhile are followed.
+          if (element.scrollHeight - element.scrollTop - element.clientHeight < 80) endJump();
+          else return;
+        }
+        track(element);
+        // Near the top of a transcript that has earlier entries: read the next page before the reader gets there.
+        if (element.scrollTop < 240 && olderCount > 0) loadEarlier();
+      }} aria-label={actualMode === "ask" ? "Side ask history" : "Shared session history"}>
+        <div className="chat-column">
+          {olderCount > 0 && <div className="transcript-earlier">
+            <Button variant="ghost" size="sm" icon="chevron-up" disabled={loadingOlder} onClick={loadEarlier}>
+              {loadingOlder ? "Loading earlier messages..." : `Show earlier messages (${olderCount})`}
+            </Button>
+          </div>}
+          {entries.length ? entries.map(entry => <TranscriptEntry entry={entry} userId={user.id} actions={messageActions} key={entry.id} />)
+            : <EmptyState title={actualMode === "ask" ? "A question on the side" : "The conversation begins here"}>{actualMode === "ask" ? "Ask about the work without changing it" : "Committed messages and tool results will appear here"}</EmptyState>}
+        </div>
       </div>
+      {scrolledUp && <Button variant="secondary" size="sm" icon="arrow-down" className="jump-to-latest" aria-label="Jump to the latest message" title="Jump to the latest message" onClick={jumpToLatest} />}
     </div>
     <div className="session-bottom">
-      <div className="chat-column stack">
+      {/* Cards and the queue line scroll on their own above the chat box, which always stays on screen. */}
+      <div className="session-pinned"><div className="chat-column stack">
         {pinned}
         <details className="queue-line">
           <summary role="status" aria-live="polite">{queueLabel}<Icon name="chevron-down" size={14} /></summary>
@@ -450,6 +676,8 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
             <div className="inline"><Button variant="outline" size="sm" icon="refresh" onClick={refresh}>Refresh queue</Button></div>
           </div>
         </details>
+      </div></div>
+      <div className="chat-column stack">
         <ComposerInput
           value={content}
           onChange={setContent}
@@ -462,6 +690,7 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           label={actualMode === "ask" ? "Ask without making changes" : "Continue the shared work"}
           placeholder={!permitted ? "Read-only" : actualMode === "ask" ? "Ask without changing anything" : "Message the agent"}
           sendLabel={actualMode === "ask" ? "Send side ask" : "Submit to session"}
+          hintRequired={!permitted || actualMode === "ask"}
           hint={archived ? "Read-only · this session is archived" : frozen ? "Read-only · this session pinned its repositories when it started" : !permitted ? (canAsk ? "Read-only · switch to Side ask to ask questions" : "Read-only · submitting needs write permission")
             : actualMode === "ask" ? "Read-only · anyone who can view this session can see side asks"
             : `Runs as ${view.owner.displayName}${view.owner.id === user.id ? " (you)" : ""}`}
@@ -475,19 +704,23 @@ function Conversation({ id, user, session, view, host, stale, refresh, pinned }:
           </>}
         />
         {draftHasSecret && <p className="muted small" role="status">This message looks like it holds a secret. Everyone, you included, sees it as {REDACTED} in the transcript, but the agent and its host receive it as typed.</p>}
-        <Feedback error={submission.error || stopping.error} />
+        <Feedback error={submission.error || stopping.error || rewinding.error} />
       </div>
     </div>
   </>;
 }
 
-/** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. */
+/** The chat box: auto-growing input; Enter sends, Shift+Enter adds a line, IME composition is respected. On a phone, */
+/** whose keyboard has no Shift, Enter adds a line and the send button sends (touch.ts). */
 /** `onStop`, while the agent works and the person may stop it, shows a stop button beside send; messages can still be queued. */
-/** With `attachments`, images pasted into it go with the message, which may then have no text. */
-function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, tools }: {
+/** With `attachments`, images pasted into it or picked with its image button go with the message, which may then have no text. */
+/** `hint` is hidden on phones to keep the chat box to one toolbar row, unless `hintRequired` (it says why sending is */
+/** unavailable, or who can see what is sent). */
+function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stopping, busy, disabled, label, placeholder, sendLabel, hint, hintRequired, tools }: {
   value: string; onChange: (value: string) => void; onSubmit: () => void; attachments?: Attachments; onStop?: () => void; stopping?: boolean; busy: boolean; disabled?: boolean;
-  label: string; placeholder: string; sendLabel: string; hint: ReactNode; tools?: ReactNode;
+  label: string; placeholder: string; sendLabel: string; hint: ReactNode; hintRequired?: boolean; tools?: ReactNode;
 }) {
+  const [sendsOnEnter] = useState(() => enterSends());
   const sendable = Boolean(value.trim() || attachments?.images.length);
   const input = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
@@ -501,16 +734,19 @@ function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stoppin
     if (!disabled && !busy && sendable) onSubmit();
   }
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event);
+    if (sendsOnEnter && event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event);
   }
   return <form className="composer" onSubmit={submit}>
     {attachments && <AttachmentStrip attachments={attachments} disabled={busy || disabled} />}
     <textarea ref={input} rows={1} required={!attachments?.images.length} value={value} disabled={busy || disabled} aria-label={label} placeholder={placeholder}
-      onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments?.paste} />
+      enterKeyHint={sendsOnEnter ? "send" : "enter"} onChange={event => onChange(event.target.value)} onKeyDown={onKeyDown} onPaste={attachments?.paste} />
     {attachments?.notice && <p className="composer-notice" role="status">{attachments.notice}</p>}
     <div className="composer-toolbar">
-      {tools}
-      <span className="composer-hint">{hint}</span>
+      {(attachments && !disabled || tools) && <span className="composer-tools">
+        {attachments && !disabled && <AttachButton attachments={attachments} disabled={busy} />}
+        {tools}
+      </span>}
+      <span className={hintRequired ? "composer-hint required" : "composer-hint"}>{hint}</span>
       <span className="composer-actions">
         {onStop && <Button variant="outline" size="sm" icon="stop" className="composer-stop" aria-label={stopping ? "Stopping..." : "Stop"} title="Stop the running message and those queued" disabled={stopping} onClick={onStop} />}
         <Button type="submit" variant="default" size="sm" icon="send" className="composer-send" aria-label={busy ? "Sending..." : sendLabel} title={sendLabel} disabled={busy || disabled || !sendable} />
@@ -524,7 +760,7 @@ function ComposerInput({ value, onChange, onSubmit, attachments, onStop, stoppin
  * next message: restart re-provisions on the pinned host, then the message is submitted.
  */
 function UnavailableConversation({ id, user, session, error, recovered }: { id: string; user: UserProfile; session: SessionRecord; error: string; recovered: () => void }) {
-  const [content, setContent] = useState("");
+  const [content, setContent] = useDraft(id);
   const request = useRef<{ content: string; id: string } | null>(null);
   const action = useAction();
   const failed = session.status === "error" || session.status === "provisioning";
@@ -541,12 +777,12 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
         await api<SubmitResult>(`/api/sessions/${segment(id)}/submit`, { method: "POST", body: { content: sent, requestId } });
       } catch (reason) {
         // The session is running again; hand the unsent text to the live conversation.
-        try { sessionStorage.setItem(`pistead.draft.${id}`, sent); } catch { /* Storage unavailable: the text is lost. */ }
+        writeDraft(id, sent);
         recovered();
         throw reason;
       }
       request.current = null;
-      setContent("");
+      forgetSentDraft(id, sent);
       recovered();
     });
   }
@@ -577,6 +813,7 @@ function UnavailableConversation({ id, user, session, error, recovered }: { id: 
           label="Message the agent"
           placeholder={canRestart ? "Message the agent to start the session again" : "Message the agent"}
           sendLabel={canRestart ? "Restart and send" : "Sending is unavailable"}
+          hintRequired
           hint={action.busy ? "Starting the session and preparing repositories..." : canRestart ? "Restarts the session, then sends" : failed ? "Only the owner can restart this session" : canWrite ? "Waiting for the host" : "Read-only — submitting needs write permission"}
         />
         <Feedback error={action.error} />

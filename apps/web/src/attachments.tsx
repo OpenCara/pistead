@@ -57,6 +57,12 @@ export function useAttachments(unavailable?: string, initial?: () => Blob[]) {
     if (!unavailable && !event.clipboardData.types.includes("text/plain")) event.preventDefault();
     add(files);
   }
+  /** Attaches images chosen with a file picker (on a phone, from its photo library or camera). */
+  function pick(files: FileList | null) {
+    const chosen = Array.from(files ?? []).filter(file => file.type.startsWith("image/"));
+    if (chosen.length) add(chosen);
+    else if (files?.length) setNotice("Only images can be attached.");
+  }
   function remove(id: string) {
     setImages(previous => previous.filter(image => image.id !== id));
     setNotice("");
@@ -66,9 +72,23 @@ export function useAttachments(unavailable?: string, initial?: () => Blob[]) {
     const ids = new Set(images.map(image => image.id));
     setImages(previous => previous.filter(image => !ids.has(image.id)));
   }
-  return { images, notice, paste, remove, sent };
+  return { images, notice, paste, pick, remove, sent };
 }
 export type Attachments = ReturnType<typeof useAttachments>;
+
+/**
+ * A button that attaches images from a file picker, for where pasting one isn't handy, as on a phone. Naming the types
+ * makes iOS hand over its photos as JPEG rather than HEIC, which messages can't carry.
+ */
+export function AttachButton({ attachments, disabled }: { attachments: Attachments; disabled?: boolean }) {
+  const input = useRef<HTMLInputElement>(null);
+  return <>
+    <Button variant="ghost" size="sm" icon="image" className="composer-attach" aria-label="Attach images" title="Attach images" disabled={disabled}
+      onClick={() => input.current?.click()} />
+    <input ref={input} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden tabIndex={-1}
+      onChange={event => { attachments.pick(event.currentTarget.files); event.currentTarget.value = ""; }} />
+  </>;
+}
 
 /** Thumbnails of a composer's images, each with a button to remove it. */
 export function AttachmentStrip({ attachments, disabled }: { attachments: Attachments; disabled?: boolean }) {

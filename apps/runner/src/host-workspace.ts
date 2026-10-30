@@ -2,7 +2,7 @@ import { runHostShell } from "./host-shell.js";
 import type { HostCommandOperation } from "../../../packages/shared/src/types.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants, type BigIntStats, type Stats } from "node:fs";
+import type { BigIntStats, Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -13,15 +13,19 @@ import {
 } from "./sandbox.js";
 import { MAX_IMAGE_BYTES, imageType, type FileContent } from "./images.js";
 import { browseDirectory, browseFile, checkedBrowse, type BrowseResult } from "./file-browser.js";
+import type { SessionWorkspace } from "./workspace.js";
+import { bashPath, CREATE_FILE, hostBashArgs, killTree, OPEN_DIRECTORY, OPEN_FILE, privateEntry, startHostBash, windows, windowsSystemEnvironment } from "./platform.js";
+import { readCloneBranches, type CloneBranch } from "./clone-branches.js";
 
 const MAX_ENTRIES = 10_000;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
-const FILE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
-const DIRECTORY_FLAGS = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const FILE_FLAGS = OPEN_FILE;
+const DIRECTORY_FLAGS = OPEN_DIRECTORY;
 const queues = new Map<string, Promise<void>>();
 
 type Captured = { code: number | null; stdout: string; stderr: string };
-type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal };
+/** `hostCommand`: the process is bash spawned with hostBashArgs, started with startHostBash rather than given `input`. */
+type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal; hostCommand?: string };
 
 /**
  * Owner-consented host mode for macOS or Linux without bubblewrap. It runs as the
@@ -31,7 +35,8 @@ type SpawnOptions = { env?: Record<string, string>; timeoutMs?: number; signal?:
  * that could race these checks is an approved command, which already has full user
  * authority on the host.
  */
-export class HostWorkspace {
+export class HostWorkspace implements SessionWorkspace {
+  readonly isolated = false;
   readonly #root: string;
   readonly #identity: Readonly<SandboxIdentity>;
   readonly #environment: Readonly<Record<string, string>>;
@@ -44,8 +49,8 @@ export class HostWorkspace {
   #cancelActive: (() => void) | undefined;
 
   constructor(binding: RunnerBinding, root: string) {
-    if (!["linux", "darwin"].includes(process.platform) || !isAbsolute(root) || resolve(root) === sep) {
-      throw new Error("Host workspace requires Linux or macOS and an absolute, non-root private storage path");
+    if (!["linux", "darwin", "win32"].includes(process.platform) || !isAbsolute(root) || resolve(root) === sep || resolve(root) === resolve(root, "..")) {
+      throw new Error("Host workspace requires Linux, macOS or Windows and an absolute, non-root private storage path");
     }
     const ownerId = text(binding.owner.id, "owner id", 256);
     if (binding.session.ownerId !== ownerId) throw new Error("Session owner does not match its binding");
@@ -62,8 +67,10 @@ export class HostWorkspace {
       env: Object.freeze({ ...binding.owner.env }),
     });
     // Approved commands need the owner's own tools; runner secrets are still never inherited.
-    this.#environment = sessionEnvironment(this.#identity, {
-      path: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin", gitConfig: join(this.#root, "owner.gitconfig"),
+    this.#environment = Object.freeze({
+      // Windows programs need the system's own variables to start; POSIX ones need none of the runner's.
+      ...(windows ? windowsSystemEnvironment() : {}),
+      ...sessionEnvironment(this.#identity, { path: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin", gitConfig: join(this.#root, "owner.gitconfig") }),
     });
   }
 
@@ -80,7 +87,7 @@ export class HostWorkspace {
       for (const directory of [this.#root, this.home, this.worktree, join(this.home, ".tmp")]) {
         await mkdir(directory, { recursive: true, mode: 0o700 });
         const info = await lstat(directory);
-        if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) {
+        if (!info.isDirectory() || !privateEntry(info)) {
           throw new Error("Sandbox storage must be private and owned by the runner user");
         }
       }
@@ -161,8 +168,10 @@ export class HostWorkspace {
         return this.#operation(authorize, async () => {
           // The host's command time limit applies here too; nothing else does (there is no sandbox to set limits in).
           if (options.signal?.aborted) throw new SandboxProcessError("Command stopped before it started", null, null, "", "");
-          return output(checked(await this.#spawn("/bin/bash", ["--noprofile", "--norc", "-c", command], undefined,
-            { timeoutMs: (options.limits?.seconds ?? TIMEOUT_MS / 1000) * 1000, signal: options.signal })));
+          const bash = bashPath();
+          if (!bash) throw hostError(windows ? "bash commands need Git for Windows' bash.exe" : "bash commands need /bin/bash");
+          return output(checked(await this.#spawn(bash, hostBashArgs(command), undefined,
+            { timeoutMs: (options.limits?.seconds ?? TIMEOUT_MS / 1000) * 1000, signal: options.signal, hostCommand: command })));
         });
       }
       case "github.comment":
@@ -209,6 +218,11 @@ export class HostWorkspace {
       await visit(join(this.worktree, ".git"), "git", ["pistead-push"]);
       return files;
     });
+  }
+
+  /** The branches the worktree's clones have checked out (clone-branches.ts), in turn with the session's other work. */
+  cloneBranches(authorize: SandboxAuthorize): Promise<CloneBranch[]> {
+    return this.#operation(authorize, () => readCloneBranches(this.worktree));
   }
 
   /** Explicit host-owner-approved execution, serialized with sandbox file/Git operations; never a fallback. */
@@ -314,7 +328,7 @@ export class HostWorkspace {
 
   #spawn(command: string, args: string[], input?: string, options: SpawnOptions = {}): Promise<Captured> {
     const { promise, resolve: resolveResult, reject } = Promise.withResolvers<Captured>();
-    const child = spawn(command, args, { cwd: this.worktree, env: { ...this.#environment, ...options.env }, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd: this.worktree, env: { ...this.#environment, ...options.env }, detached: !windows, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -322,7 +336,7 @@ export class HostWorkspace {
     let failure: string | undefined;
     const kill = () => {
       if (!child.pid) return;
-      try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (errorCode(error) !== "ESRCH") child.kill("SIGKILL"); }
+      killTree(child);
     };
     const cancel = () => { failure ??= "Sandbox closed"; kill(); };
     this.#cancelActive = cancel;
@@ -353,7 +367,10 @@ export class HostWorkspace {
       if (failure || signal) reject(new SandboxProcessError(`${failure ?? `Command killed by ${signal}`}${err ? `: ${err.slice(0, 4096).trim()}` : ""}`, code, signal, out, err));
       else resolveResult({ code, stdout: out, stderr: err });
     });
-    child.stdin.end(input ?? "");
+    // A command cancelled before it starts never gets to bash, which then ends at once.
+    if (options.hostCommand === undefined) child.stdin.end(input ?? "");
+    else if (failure) child.stdin.end();
+    else startHostBash(child, options.hostCommand);
     return promise;
   }
 }
@@ -465,7 +482,7 @@ async function writeAt(root: string, parts: readonly string[], content: string):
   const temporary = join(parent, `.sandbox-write-${randomUUID().replaceAll("-", "")}`);
   let created = false;
   try {
-    const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    const handle = await open(temporary, CREATE_FILE, 0o600);
     created = true;
     try {
       await handle.writeFile(data);
@@ -483,6 +500,8 @@ async function writeAt(root: string, parts: readonly string[], content: string):
 }
 
 async function syncPath(path: string): Promise<void> {
+  // Windows can't open a directory to flush it; NTFS journals the rename itself.
+  if (windows) return;
   const handle = await open(path, DIRECTORY_FLAGS);
   try { await handle.sync(); } finally { await handle.close(); }
 }

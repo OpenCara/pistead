@@ -1,20 +1,15 @@
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { applySqliteMigrations } from './helpers/sqlite-migrations.js';
 
 const directory = new URL('../apps/server/migrations/sqlite/', import.meta.url);
 const ownerHostsMigration = '0027_owner_hosts.sql';
 const migrationFiles = readdirSync(directory).filter(name => name.endsWith('.sql')).sort();
 
 function migrate(sqlite: DatabaseSync, files: string[]) {
-  for (const file of files) {
-    sqlite.exec('BEGIN');
-    try {
-      sqlite.exec(readFileSync(new URL(file, directory), 'utf8'));
-      sqlite.exec('COMMIT');
-    } catch (error) { sqlite.exec('ROLLBACK'); throw error; }
-  }
+  applySqliteMigrations(sqlite, directory, files);
 }
 
 test('hosts paired into one workspace are connected, privately, to every workspace their owner belongs to', () => {

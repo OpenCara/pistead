@@ -1,6 +1,8 @@
-import type { SessionRecord, SessionView } from "../../shared/src/types";
+import type { EntryView, SessionRecord, SessionView } from "../../shared/src/types";
+import { transcriptPage } from "../../shared/src/transcript-display";
 import { applyViewPatch, isViewPatch } from "../../shared/src/view-patch";
 import { ApiError, errorMessage, segment } from "./api";
+import { carryEarlier, firstHeld, withEarlier, type EarlierEntries } from "./transcript-pages";
 
 export type StreamStatus = "connecting" | "online" | "reconnecting" | "offline";
 
@@ -45,6 +47,12 @@ export interface LiveSessionDependencies {
 export interface LiveSession {
   /** Reloads now and looks for new work right away, e.g. after the user sends a message. */
   refresh(): void;
+  /**
+   * Reads a page of a conversation's earlier entries, for a view that says it has some (`olderEntries`, in a workspace
+   * that loads transcripts latest first), and shows the view with them. Resolves once shown, or once there is nothing
+   * to read; a failure is reported through `error`.
+   */
+  loadOlder(conversationId: string): Promise<void>;
   stop(): void;
 }
 
@@ -63,15 +71,40 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
   /** The view shown and its revision: streams send only what changed since it. */
   let current: SessionView | null = null;
   let revision: string | undefined;
+  /** Earlier entries read for a paged view, which streams never send again. */
+  let earlier: EarlierEntries = new Map();
+  const reading = new Map<string, Promise<void>>();
   const running = () => !revoked && !controller.signal.aborted;
 
   function showView(view: SessionView, at?: string) {
+    earlier = carryEarlier(earlier, current, view);
     current = view;
     revision = typeof at === "string" ? at : undefined;
     // A cache host preparing repositories reports progress worth showing every second, even before any message.
     active = view.busy || (view.queue ?? []).some(item => activeStatuses.includes(item.status)) || view.repositories?.status === "preparing";
-    handlers.view(view);
+    handlers.view(withEarlier(view, earlier));
     handlers.error("");
+  }
+
+  async function readOlder(conversationId: string): Promise<void> {
+    const view = current;
+    const conversation = view?.conversations?.find(item => item.id === conversationId);
+    const left = (conversation?.olderEntries ?? 0) - (earlier.get(conversationId)?.length ?? 0);
+    const before = view && firstHeld(view, earlier, conversationId);
+    if (!running() || !view || left <= 0 || !before) return;
+    const query = `conversation=${encodeURIComponent(conversationId)}&before=${encodeURIComponent(before)}&limit=${transcriptPage.size}`;
+    try {
+      const page = await dependencies.api<{ entries: EntryView[]; older: number }>(`${base}/entries?${query}`, { signal: controller.signal });
+      // A newer view may have moved the window while the page loaded: the page joins only the entry it was read before.
+      if (!running() || !current || firstHeld(current, earlier, conversationId) !== before || !Array.isArray(page?.entries)) return;
+      const held = earlier.get(conversationId) ?? [];
+      const next = new Map(earlier);
+      next.set(conversationId, [...page.entries, ...held]);
+      earlier = next;
+      handlers.view(withEarlier(current, earlier));
+    } catch (reason) {
+      if (running()) handlers.error(errorMessage(reason));
+    }
   }
 
   function closeStream() {
@@ -84,6 +117,7 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
     revoked = true;
     current = null;
     revision = undefined;
+    earlier = new Map();
     closeStream();
     cancelReopen();
     handlers.session(null);
@@ -196,6 +230,15 @@ export function startLiveSession(id: string, handlers: LiveSessionHandlers, depe
       void load(false);
       if (stream) followUp = true;
       else openStream();
+    },
+    loadOlder(conversationId) {
+      // One read per conversation at a time: scrolling asks again and again while one is on its way.
+      let pending = reading.get(conversationId);
+      if (!pending) {
+        pending = readOlder(conversationId).finally(() => reading.delete(conversationId));
+        reading.set(conversationId, pending);
+      }
+      return pending;
     },
     stop() {
       controller.abort();
