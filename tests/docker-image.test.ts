@@ -8,7 +8,7 @@ const repository = new URL("../", import.meta.url);
 
 /** What the image's final stage sets with ENV: NAME=value pairs, on lines a backslash continues. */
 function imageEnvironment(): Record<string, string> {
-  const instructions = readFileSync(new URL("Dockerfile", repository), "utf8").replace(/\\\n/g, " ").split("\n")
+  const instructions = readFileSync(new URL("Dockerfile", repository), "utf8").replace(/\\\r?\n/g, " ").split(/\r?\n/)
     .map(line => line.trim()).filter(line => line && !line.startsWith("#"));
   const environment: Record<string, string> = {};
   for (const instruction of instructions.slice(instructions.findLastIndex(line => /^FROM\s/i.test(line)))) {
@@ -25,7 +25,7 @@ function imageEnvironment(): Record<string, string> {
 /** What docker compose's env_file passes from a copy of .env.example: each NAME=value line, an empty value too. */
 function envFileEnvironment(): Record<string, string> {
   const environment: Record<string, string> = {};
-  for (const line of readFileSync(new URL("apps/server/.env.example", repository), "utf8").split("\n")) {
+  for (const line of readFileSync(new URL("apps/server/.env.example", repository), "utf8").split(/\r?\n/)) {
     const setting = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line.trim());
     if (setting) environment[setting[1]!] = setting[2]!;
   }
