@@ -24,7 +24,7 @@ import { chatAgentVersion, requireModel } from './catalog.js';
 import { isLinkShared } from './session-links.js';
 import { hostAuthority, hostCommandSession, hostOwnerDecides, mayDecideHostCommands, runsShellCommands } from './host-access.js';
 import { decidedAsHostCommand, grantedShell } from '../../../packages/shared/src/host-operations.js';
-import { disabledModelKeys, isModelDisabled, modelEnabledSQL, requireEnabledModel } from './host-models.js';
+import { disabledModelKeys, isModelDisabled, messageNeedsModel, modelEnabledSQL, requireEnabledModel } from './host-models.js';
 import { earlierEntries, invalidateSessionView, sessionView, transcriptDisplay, viewChanges } from './view-feed.js';
 import { toolOutputs, transcriptPage, type ToolOutput } from '../../../packages/shared/src/transcript-display.js';
 import { newSessionToolOutput } from './transcript-settings.js';
@@ -110,9 +110,13 @@ async function chatImages(c: AppContext, row: SessionRow, value: unknown): Promi
  * Sends a message (`submit`) or side ask to the session's agent as the request's user, who already holds the session
  * permission for it: the chat box's route, and scheduled prompts (scheduled-prompts.ts) as the session's owner, whose
  * audit entry names the schedule in `audit`.
+ *
+ * Messages the server writes itself (`currentModel`: scheduled prompts, cross-session messages and notifications) have
+ * nobody to pick a model; where a message must name one (messageNeedsModel), they name the conversation's current model
+ * and reasoning, as the apps do, and are then checked like any other choice.
  */
 export async function submitMessage(c: AppContext, row: SessionRow, mode: 'submit' | 'ask', input: Record<string, unknown>,
-  audit: Record<string, unknown> = {}): Promise<SubmitResult> {
+  audit: Record<string, unknown> = {}, { currentModel = false }: { currentModel?: boolean } = {}): Promise<SubmitResult> {
   // Before an admission is issued: a read-only session runs nothing.
   requireUnfrozen(row);
   if ('admissionId' in input) fail(400, 'server_owned_admission', 'Write admissions are assigned by the server.');
@@ -120,7 +124,8 @@ export async function submitMessage(c: AppContext, row: SessionRow, mode: 'submi
   // A message of images alone has no text.
   const content = text(input.content, 'content', 60000, images ? 0 : 1);
   const requestId = text(input.requestId, 'requestId', 128);
-  const options = await chatOptions(c, row, mode, input.options);
+  const requested = currentModel ? await withCurrentModel(c, row, input.options as Record<string, unknown> | undefined) : input.options;
+  const options = await chatOptions(c, row, mode, requested);
   // A message that names no model must not run on one its host's owner or an admin disabled.
   await requireEnabledModel(c, row, options);
   // Said before an admission is issued, in words the sender can act on; the host request is checked again as it goes.
@@ -135,6 +140,21 @@ export async function submitMessage(c: AppContext, row: SessionRow, mode: 'submi
   await auditStatement(c.env, c.get('auth').userId, `session.${mode}`, row.workspace_id, row.id, { submissionId: result.submissionId, ...(options ? { options } : {}),
     ...(images ? { images: images.length } : {}), ...audit }).run();
   return result;
+}
+
+/**
+ * `options` naming the conversation's current model, and its reasoning, when a message to `row` must name one and
+ * `options` doesn't: the model its host reports for the shared conversation, or before that the session's own.
+ */
+async function withCurrentModel(c: AppContext, row: SessionRow, options: Record<string, unknown> | undefined): Promise<Record<string, unknown> | undefined> {
+  if (options?.model !== undefined || !await messageNeedsModel(c.env, row)) return options;
+  const { agent } = (await sessionView(c, row, { latest: true })).view;
+  if (agent) {
+    return { ...options, model: { provider: agent.provider, modelId: agent.modelId }, ...(options?.thinkingLevel === undefined && agent.thinkingLevel ? { thinkingLevel: agent.thinkingLevel } : {}) };
+  }
+  const own = await c.env.DB.query<{ provider: string; model_id: string }>(`SELECT m.provider, m.model_id FROM agent_versions a
+    JOIN models m ON m.id = a.model_id WHERE a.id = ?`).bind(row.agent_version_id).first();
+  return own ? { ...options, model: { provider: own.provider, modelId: own.model_id } } : options;
 }
 
 /**

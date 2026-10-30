@@ -8,6 +8,7 @@ import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
 import { authorizeConnectorTicket, type ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import type { Env } from '../apps/server/src/types.js';
 import { encryptToken } from '../apps/server/src/vault.js';
+import { runScheduledPrompts } from '../apps/server/src/scheduled-prompts.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostCommandGrant, HostModelSettings } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, RunnerTicket, SessionRecord, SessionView } from '../packages/shared/src/types.js';
@@ -2927,6 +2928,81 @@ test('a host\'s owner and admins disable its models for everyone: a disabled mod
   await denied(await host.request('PATCH', settings, { ...first, enabled: true }), 409, 'connector_revoked');
   assert.equal((await host.request('DELETE', `/api/connectors/${id}/permanent`)).status, 204);
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM connector_disabled_models WHERE connector_id = ?').get(id)!.n, 0);
+});
+
+test('messages the server writes itself name the conversation\'s current model while its host has a disabled model', async t => {
+  const f = await fixture(t); const s = await sharedSession(f); const id = s.connector.connectorId;
+  const settings = `/api/connectors/${id}/models`;
+  const first = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  const second = { provider: 'local-native', modelId: 'local/model-v2' };
+  const third = { provider: 'local-native', modelId: 'local/model-v3' };
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }, { ...third, name: 'Third model' }],
+    capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  let agent: SessionView['agent'];
+  const submitted: Record<string, unknown>[] = [];
+  rpcHub(f, s.connector, envelope => {
+    if (envelope.request.ticket.action === 'view') {
+      return Response.json({ view: { sessionId: s.session.id, owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [], approvals: [], conversations: [], busy: false, ...(agent ? { agent } : {}) } satisfies SessionView });
+    }
+    submitted.push(JSON.parse(envelope.request.body));
+    return Response.json({ submissionId: `submission-${submitted.length}`, conversationId: 'conversation', status: 'queued' }, { status: 202 });
+  });
+  let run = 0;
+  const schedule = async () => {
+    const at = Date.parse('2030-01-01T00:00:00Z') + ++run * 3600_000;
+    const due = new Date(at - 1000).toISOString();
+    f.sqlite.prepare(`INSERT INTO session_schedules (id, session_id, created_by, name, cron, time_zone, content, access, enabled, next_run_at, created_at, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(`schedule-${run}`, s.session.id, s.creator.user.id, 'Nightly', '0 0 * * *', 'UTC', 'Check it', 'approval', 1, due, due, due);
+    const outcomes = await runScheduledPrompts(f.env, at);
+    assert.deepEqual(outcomes.map(outcome => 'error' in outcome ? outcome.error : 'sent'), ['sent']);
+    f.sqlite.prepare('DELETE FROM session_schedules').run();
+    return submitted.at(-1)!.options;
+  };
+
+  // With nothing disabled, it names none, as before.
+  assert.equal(await schedule(), undefined);
+  // With a model disabled, it names the shared conversation's current one, at its reasoning.
+  await json(await s.host.request('PATCH', settings, { ...third, enabled: false }));
+  agent = { ...second, thinkingLevel: 'high' };
+  assert.deepEqual(await schedule(), { model: second, thinkingLevel: 'high' });
+  // Before the host reports one, the session's own.
+  agent = undefined;
+  assert.deepEqual(await schedule(), { model: first });
+  // A conversation on a disabled model sends nothing.
+  agent = { ...third, thinkingLevel: 'high' };
+  const before = submitted.length;
+  f.sqlite.prepare(`INSERT INTO session_schedules (id, session_id, created_by, name, cron, time_zone, content, access, enabled, next_run_at, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run('schedule-disabled', s.session.id, s.creator.user.id, 'Nightly', '0 0 * * *', 'UTC', 'Check it', 'approval', 1,
+    '2031-01-01T00:00:00Z', '2031-01-01T00:00:00Z', '2031-01-01T00:00:00Z');
+  assert.deepEqual((await runScheduledPrompts(f.env, Date.parse('2031-01-01T00:00:01Z'))).map(outcome => 'error' in outcome && outcome.error), ['model_disabled']);
+  assert.equal(submitted.length, before);
+});
+
+test('the sessions tool sends another session a message on the conversation\'s current model while its host has a disabled model', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'sessions']); const id = s.connector.connectorId;
+  const { session: target } = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, title: 'Worker', trustedConnectorId: id }), 201);
+  const first = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  const second = { provider: 'local-native', modelId: 'local/model-v2' };
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }],
+    capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  await json(await s.host.request('PATCH', `/api/connectors/${id}/models`, { ...second, enabled: false }));
+  const submitted: { path: string; body: Record<string, unknown> }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    if (envelope.request.ticket.action === 'view') {
+      return Response.json({ view: { sessionId: target.id, owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [], approvals: [], conversations: [], busy: false, agent: { ...first, thinkingLevel: 'low' } } satisfies SessionView });
+    }
+    submitted.push({ path: envelope.request.path, body: JSON.parse(envelope.request.body) });
+    return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+  });
+  const admissionId = admit(f, s.session.id, s.creator.user.id);
+  const sent = await self(f, s.connector, 'sessions', { sessionId: s.session.id, actorId: s.creator.user.id, admissionId, callId: 'call-send',
+    action: 'send', targetSessionId: target.id, message: 'The brief' });
+  await json(sent, 202);
+  assert.deepEqual(submitted.map(item => [item.path, item.body.options]), [[`/v1/sessions/${target.id}/submit`, { model: first, thinkingLevel: 'low' }]]);
+  assert.match(String(submitted[0]!.body.content), /The brief$/);
 });
 
 for (const enabled of [false, true]) {

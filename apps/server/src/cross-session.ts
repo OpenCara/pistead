@@ -309,7 +309,7 @@ async function deliver(call: Call, target: SessionRow, kind: 'ask' | 'send' | 'c
       }
       return submitMessage(inner, row, kind === 'ask' ? 'ask' : 'submit', {
         content, requestId: `xs:${messageId}`, ...(access && access !== 'approval' ? { options: { access } } : {}),
-      }, { crossSession: messageId, originSessionId: origin.id });
+      }, { crossSession: messageId, originSessionId: origin.id }, { currentModel: true });
     });
   } catch (error) {
     // Refused or failed before it went: the place is free again.
@@ -442,7 +442,7 @@ async function notify(env: Env, message: MessageRow): Promise<{ delivered: strin
     const header = crossSessionHeader({ id: notifyId, kind: 'notify', hops: Number(message.hops) + 1 }, target, { id: message.actor_id, login: actor?.github_login }, { id: message.id });
     const body = `Its ${message.kind === 'ask' ? 'side ask' : 'message'} ended: ${outcome.status}${outcome.failed ? ' (its model request failed)' : ''}.`
       + (outcome.reply ? `\n\nIts reply:\n\n${outcome.reply}` : '\n\nIt left no reply.');
-    const submitted = await submitMessage(c, origin, 'submit', { content: `${header}\n\n${body}`, requestId: `xs:${notifyId}` }, { crossSessionNotification: message.id });
+    const submitted = await submitMessage(c, origin, 'submit', { content: `${header}\n\n${body}`, requestId: `xs:${notifyId}` }, { crossSessionNotification: message.id }, { currentModel: true });
     const at = now();
     await env.DB.query(`INSERT INTO session_messages (id, workspace_id, origin_session_id, target_session_id, actor_id, kind, submission_id, conversation_id, hops,
       chain_json, reply_to, created_at, updated_at) VALUES (?,?,?,?,?,'notify',?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING`)

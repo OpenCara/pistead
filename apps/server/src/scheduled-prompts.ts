@@ -126,7 +126,7 @@ async function send(env: Env, schedule: ScheduleRow, ownerId: string, at: number
       requestId: `schedule:${schedule.id}:${at}`,
       // Approval is every message's default, so older hosts that take no options run these too.
       ...(schedule.access === 'approval' ? {} : { options: { access: schedule.access } }),
-    }, { scheduleId: schedule.id, trigger });
+    }, { scheduleId: schedule.id, trigger }, { currentModel: true });
   }, 'scheduled-prompt');
 }
 
