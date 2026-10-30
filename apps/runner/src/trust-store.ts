@@ -1,4 +1,5 @@
 import { getCACertificates, rootCertificates } from "node:tls";
+import { interceptionAuthority } from "./interception-ca.js";
 
 /**
  * Where shell commands find the certificates the host trusts. The sandbox has no `/etc`, so HTTPS clients that read
@@ -35,4 +36,12 @@ export function trustedCertificates(source: CertificateSource = getCACertificate
   const base = platform === "darwin" ? [...read("bundled"), ...system] : system.length ? system : read("bundled");
   const certificates = [...new Set([...(base.length ? base : rootCertificates), ...read("extra")].map(certificate => certificate.trim()))];
   return `${certificates.join("\n")}\n`;
+}
+
+/**
+ * What a session's sandbox trusts: the host's certificates, plus the connector's own authority for the credentialed APIs
+ * its egress proxy answers itself (interception-ca.ts), which can vouch for nothing else.
+ */
+export function sandboxCertificates(): string {
+  return `${trustedCertificates()}${interceptionAuthority().certificate}`;
 }

@@ -706,6 +706,8 @@ export class LocalConnector {
       // A credential for one Git request, which the session's proxy then makes at the forge itself (DirectGit), or the
       // control plane's word to relay it.
       gitDirect: async (sessionId, request) => this.brokerCallback(await this.connection(), "/api/connectors/self/git/direct", { sessionId, ...request }),
+      // The session's credential for a credentialed API (api.github.com), which its proxy adds to the requests it answers.
+      apiCredential: async (sessionId, host) => this.brokerCallback(await this.connection(), "/api/connectors/self/api/credential", { sessionId, host }),
       // The relay streams a whole pack, so it gets the length of the longest command rather than the RPC budget. A push
       // outlives a replaced connection: once its pack is under way, the forge's answer must reach Git.
       gitRelay: async (sessionId, request) => {

@@ -13,6 +13,7 @@ import { agentSessions } from './cross-session.js';
 import { legacyRestoreDownload } from './restore-routes.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { egressGrant, gitDirect, gitRelay } from './network.js';
+import { apiCredential } from './api-access.js';
 import { hostAuthority } from './host-access.js';
 
 const internalAuthentication: MiddlewareHandler<WorkerEnv> = async (c, next) => {
@@ -40,6 +41,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/network', c => egressGrant(c, null));
   app.post('/api/internal/git/relay/:bindingId/:service', c => gitRelay(c, null));
   app.post('/api/internal/git/direct', c => gitDirect(c, null));
+  app.post('/api/internal/api/credential', c => apiCredential(c, null));
 }
 
 export async function authorizeSession(c: AppContext, connectorId: string | null): Promise<Response> {

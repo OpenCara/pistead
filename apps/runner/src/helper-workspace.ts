@@ -17,7 +17,7 @@ import {
   sessionEnvironment, text, type CloneBackup, type SandboxAuthorize, type SandboxExecutionOptions, type SandboxIdentity, type SandboxRequest,
   type SnapshotFile,
 } from "./sandbox.js";
-import { trustedCertificates } from "./trust-store.js";
+import { sandboxCertificates } from "./trust-store.js";
 import type { IsolatedWorkspace } from "./workspace.js";
 
 /** Where a helper backend keeps one session, all below its private root, at the same paths inside the sandbox. */
@@ -175,7 +175,7 @@ export class HelperWorkspace implements IsolatedWorkspace {
       // Replaced in one step, so no command finds it missing or half written; the host's current store applies.
       const staged = `${this.#layout.caBundle}.new`;
       await rm(staged, { force: true });
-      await writeFile(staged, trustedCertificates(), { mode: 0o400 });
+      await writeFile(staged, sandboxCertificates(), { mode: 0o400 });
       await chmod(staged, 0o400);
       // The previous bundle is read-only, and Windows won't rename over a read-only file; it stays in place until then.
       await chmod(this.#layout.caBundle, 0o600).catch(() => undefined);

@@ -16,6 +16,7 @@ import { ownerGitAuthorization } from './push/targets.js';
 import { sessionBranchPush, sessionBranchTarget } from './push/session-branch.js';
 import { requireBinding } from './push/broker.js';
 import { mintPushToken, mintRepositoryReadToken, type MintedToken } from './push/mint.js';
+import { sessionApis } from './api-access.js';
 
 /** Owner/admin authority, re-checked inside the write (binds workspace id, user id). */
 const adminSql = `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))`;
@@ -74,6 +75,9 @@ export async function egressGrant(c: AppContext, connectorId: string | null): Pr
     repositories: repositories.map(repository => ({ bindingId: repository.id, provider: repository.provider, host: repository.host,
       repositoryId: repository.repository_id, fullName: repository.full_name, lfs: repository.lfs_enabled === 1 })),
   };
+  // Credentialed APIs the session's proxy answers itself, asking apiCredential for the token it adds.
+  const apis = sessionApis(c.env, row, repositories);
+  if (apis.length) grant.apis = apis;
   return c.json(grant, 200, { 'Cache-Control': 'private, no-store' });
 }
 

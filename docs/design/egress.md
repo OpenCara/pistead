@@ -413,3 +413,57 @@ What this gives up, and where: on a host shared with the workspace, the host's o
 lasts (an hour at most) and read that one repository with it, where before they could take nothing. Pushes, and the
 owner's own account, still never reach such a host. The sandbox still holds no credential, and LFS download links and
 their tokens still never reach it.
+
+## Credentialed APIs: `gh` without a token in the sandbox
+
+Status: implemented for api.github.com, reads only. Agents kept needing GitHub's API (a failed Actions run's log, a pull
+request's checks), and the only ways there were the brokers' fixed reads or `host_bash` with the host's own `gh` login,
+outside the sandbox. Putting a token in the sandbox would make it readable by everything that runs there (build scripts,
+and whatever a prompt injection in a repository or issue asks for), and every later command could use it. Instead the
+proxy adds the credential, the way the Git relay does, for a short list of hosts (`credentialedApiHosts`).
+
+- **In the sandbox.** `GH_TOKEN` and `GITHUB_TOKEN` hold `API_TOKEN_PLACEHOLDER`, so `gh` and GitHub's SDKs send their
+  requests at all. The session's CA bundle includes the connector's interception authority.
+- **The authority** (`apps/runner/src/interception-ca.ts`). An ECDSA P-256 key made in memory when the connector starts
+  and never written anywhere; a restart makes a new one, which sessions get when they next open (the bundle is written
+  at every open). Its certificate is name-constrained (critical `permittedSubtrees`) to `credentialedApiHosts`, so even
+  its key couldn't vouch for another host to OpenSSL, Go, Node.js or Python. It issues week-long leaf certificates per
+  host, with the extensions Python 3.13's strict verification requires (key identifiers, key usage). X.509 is written
+  as DER from Node's own keys and signatures, so no dependency is added.
+- **The proxy** (`apps/runner/src/egress.ts`, `apps/runner/src/api-access.ts`). A CONNECT to a credentialed API host is
+  answered by the proxy, whatever the network policy, and also where the grant lists no credential for it (`apis`: a
+  pinned session, `SANDBOX_GITHUB_API=off`, an older control plane), so the placeholder never reaches the API: TLS with the authority's
+  certificate, HTTP/1.1 only, the request's `Host` must match the CONNECT's. Each request is then checked: GET and HEAD
+  pass, and POST `/graphql` unless the document defines a mutation or subscription; anything else is refused with
+  GitHub's error shape, pointing at the approved tools. A `/repos/{owner}/{name}` path takes the credential that covers
+  that repository; GraphQL, the token of the installation whose account the query's `owner` variable names; anything
+  else, the first. A repository no credential covers, or a request carrying a credential of its own, goes on without
+  Pistead's credential only where the network policy allows the host. The proxy makes the request itself, at the API's
+  public addresses only and connected to exactly the addresses checked, and streams the answer back. GitHub's redirects
+  to its download hosts (`codeload.github.com`, `*.githubusercontent.com`, `*.blob.core.windows.net`) are followed
+  without the credential, so `gh run view --log` works with network access off; other redirects reach the client. Every
+  request is logged (kind `api`) with the credential it was made with.
+- **The credential** (`apps/server/src/api-access.ts`, `apiCredential`; `POST /api/connectors/self/api/credential` or
+  `/api/internal/api/credential`). The session's authority as for its Git requests (owner, not archived, connector and
+  connection), a clone session, then every github.com repository of the workspace verified with the owner's own account
+  (`verifyRepository`): only those the owner can read now, under the identity they were bound with, are covered.
+  `mintGitHubApiReadTokens` then asks the workspace's GitHub App (or the operator's) for one token per installation the
+  repositories belong to, limited to them and to reading the permissions `gh` needs that the installation has
+  (`actions`, `checks`, `contents`, `deployments`, `discussions`, `issues`, `metadata`, `pages`, `pull_requests`,
+  `statuses`), shared while it has 20 minutes left. The owner's own sign-in token is never handed out: it reaches
+  everything the owner can. The proxy reuses an answer for a minute at most (`API_CREDENTIAL_CACHE_SECONDS`), and an
+  unavailable one (no app, not installed, `SANDBOX_GITHUB_API=off`) is passed on as the reason for its refusals.
+- **`SANDBOX_GITHUB_API`**: `on` (default), `own-hosts` (tokens only to owners' own hosts and the control plane's
+  runner) or `off` (no `apis` in grants; api.github.com is a host like any other).
+
+What this gives up: as with direct Git reads, a host shared with the workspace could take a read token while it lasts
+(an hour at most) and read the workspace's repositories the owner can read with it. Reads through the token aren't
+limited to the workspace's repositories by the proxy for GraphQL and non-repository paths; the token's own repository
+scope is what limits them. Writes through the API wait for a way to approve one request of a running command; until
+then they stay with the brokers.
+
+### Not yet
+
+- **Approved writes**: a write the proxy holds until someone approves it, as the brokers' are.
+- **Other APIs**: Azure Resource Manager (`management.azure.com`, with a federated credential of the workspace's),
+  GitHub Enterprise Server, GitLab.
