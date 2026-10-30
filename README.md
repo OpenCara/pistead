@@ -69,7 +69,7 @@ And around them:
 
 Just for yourself, on one computer? `npx pistead@latest serve` runs all of it there, with no server to deploy: see [Running Pistead on your own computer](#running-pistead-on-your-own-computer). For a team:
 
-1. **Run the server** with Docker and a GitHub OAuth app, or with [username and password](#username-and-password) accounts (`PASSWORD_AUTH=true`) and an administrator created with `--create-admin`: see [Running the server](#running-the-server).
+1. **Run the server** with Docker and create its first administrator with `--create-admin`: the image signs people in with a [username and password](#username-and-password), and with GitHub once you add a GitHub OAuth app, and takes new accounts only through invite links. See [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub** or your username and password, then choose **New workspace** and name it.
 3. **Bind a repository**: **Settings → Workspaces →** your workspace **→ Repositories → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**.
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
@@ -81,7 +81,7 @@ Just for yourself, on one computer? `npx pistead@latest serve` runs all of it th
 5. **Start a session**: select the workspace in the sidebar, choose your host in **Host**, describe the task and press Enter.
 6. **Approve** commands and commits as their cards appear above the transcript.
 
-To bring in teammates, share the workspace's invite link (**Settings → Workspaces → Members → Invite link**) and accept them under **Pending members** once they've signed in from it; where the server takes new accounts only through invitations (`SIGNUP=invite`, see [Who can create an account](#who-can-create-an-account)), that is how they get one. Or they sign in once and send you their **User ID** from **Settings → Profile**, and you add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
+To bring in teammates, share the workspace's invite link (**Settings → Workspaces → Members → Invite link**) and accept them under **Pending members** once they've signed in from it; where the server takes new accounts only through invitations (`SIGNUP=invite`, as the Docker image does; see [Who can create an account](#who-can-create-an-account)), that is how they get one. Or they sign in once and send you their **User ID** from **Settings → Profile**, and you add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
 
 ## Using Pistead
 
@@ -94,14 +94,14 @@ Pistead signs people in with GitHub, and asks GitHub for the `read:user user:ema
 The first sign-in creates an account, as far as the operator's `SIGNUP` setting allows, for GitHub and password sign-ins alike:
 
 - `open`: anyone who can reach the server. Unset, `SIGNUP` means this for GitHub, as before.
-- `invite`: only someone who opens a workspace's [invite link](#invite-links-and-pending-members) and signs in, or signs up, from it. The new account asks to join that workspace in the same step, so an owner or admin still accepts them before they see anything. A link turned off or replaced admits nobody new, and while 200 people wait to join a workspace its link creates no more accounts. Unset, `SIGNUP` means this for passwords.
+- `invite`: only someone who opens a workspace's [invite link](#invite-links-and-pending-members) and signs in, or signs up, from it. The new account asks to join that workspace in the same step, so an owner or admin still accepts them before they see anything. A link turned off or replaced admits nobody new, and while 200 people wait to join a workspace its link creates no more accounts. Unset, `SIGNUP` means this for passwords, and the [Docker image](#docker) sets it, for GitHub too.
 - `off`: nobody new, apart from the operator's own: the GitHub accounts `ADMIN_USER_IDS` lists, and password accounts made with `--create-admin` (see [Administration](#administration)).
 
 Existing accounts sign in whatever `SIGNUP` says; it decides only who may be added. In every mode, `ADMIN_USER_IDS`'s GitHub accounts can sign up, so a server's administrators can always set it up. Someone signing up through an invite link where `SIGNUP=open` asks to join its workspace too. The iPhone, iPad and Mac apps can't open invite links, so where `SIGNUP=invite` a new person creates their account through the link in a browser first, then signs in on the app. A refused sign-in keeps nothing: no account, and not the token GitHub issued.
 
 #### Username and password
 
-Where the operator sets `PASSWORD_AUTH=true`, the sign-in page also offers a username and password, and **New here? Create an account** where `SIGNUP` lets the visitor sign up: by default only on an invite link's sign-in page. Then:
+Where the operator sets `PASSWORD_AUTH=true`, as the [Docker image](#docker) does, the sign-in page also offers a username and password, and **New here? Create an account** where `SIGNUP` lets the visitor sign up: by default only on an invite link's sign-in page. Then:
 
 - The username (3 to 39 letters, digits, `-` and `_`, not case-sensitive) makes your user ID, `password:<username>`, so teammates can add you to a workspace by it before you ever sign in. It can't be changed later.
 - Passwords are at least 12 characters, other than the username. The server keeps only a salted scrypt hash. After five wrong passwords in a row the account refuses sign-ins for 30 seconds, doubling with each further miss up to 15 minutes; a correct sign-in resets the count.
@@ -730,12 +730,17 @@ Run `npx pistead serve --help` for every option. The server is the one [Running 
 
 ```sh
 cp apps/server/.env.example .env
-# In .env set APP_ORIGIN (the public https:// origin), SESSION_SECRET (openssl rand -base64 48)
-# and VAULT_KEY (head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '='), then:
+# In .env set APP_ORIGIN (the public https:// origin), SESSION_SECRET (openssl rand -base64 48),
+# VAULT_KEY (head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=') and ADMIN_USER_IDS=password:admin, then:
 docker compose up -d
+docker compose exec pistead node dist/server/main.js --create-admin admin   # asks for its password
 ```
 
 The image builds the web app and the bundled server and runs them as a non-root user. The server listens on port 8787 and keeps its SQLite database in the `pistead-data` volume; it stores no session backups unless you set `STORAGE_URL` (see [Database and backup storage](#database-and-backup-storage)). The image sets `WORKSPACE_DATABASES=true`, so workspace owners can keep their sessions' backups in a Postgres database of their own (see [Workspace session databases](#workspace-session-databases)); set `WORKSPACE_DATABASES=false` in `.env` to turn that off. `GET /api/health` reports which providers are configured, and the image's health check uses it. Migrations run automatically at start-up: to upgrade, update the source and run `docker compose up -d --build`.
+
+The image also sets `PASSWORD_AUTH=true` and `SIGNUP=invite`: people sign in with a [username and password](#username-and-password), and with GitHub once you add its OAuth app (see [Sign-in and GitHub apps](#sign-in-and-github-apps)), and new accounts, GitHub ones too, come only through a workspace's [invite link](#invite-links-and-pending-members). So a new server's first account is the administrator `--create-admin` makes (see [Administration](#administration)), who signs in, creates a workspace and shares its invite link; or, with a GitHub OAuth app, a GitHub account that `ADMIN_USER_IDS` lists, which can always sign up. Set `PASSWORD_AUTH=false` in `.env` to sign in with GitHub only, and `SIGNUP=open` to let anyone who reaches the server sign up, or `off` to let in only the operator's accounts (see [Who can create an account](#who-can-create-an-account)).
+
+> **Upgrading to server 0.18.0:** the image now sets `PASSWORD_AUTH=true` and `SIGNUP=invite`. Unless `.env` sets them, the sign-in page offers a username and password, and new accounts, GitHub ones too, need a workspace's invite link (or, with GitHub, a place in `ADMIN_USER_IDS`); existing accounts sign in as before. To keep the previous behavior, set `PASSWORD_AUTH=false` and `SIGNUP=open` in `.env`. An `.env` copied from 0.17.0's `.env.example` already sets both, to empty values that mean unset, so it keeps the previous behavior: remove those two lines to take the image's defaults.
 
 > **Upgrading to server 0.16.0:** its first start rebuilds the `users` table of a SQLite database (to allow password accounts), keeping every row and checking every reference to it before committing; back up the `pistead-data` volume first, as before any upgrade. Postgres changes the table in place. Nothing else changes until you set `PASSWORD_AUTH` or `SIGNUP`: unset, sign-in and GitHub sign-up work as before.
 
@@ -746,8 +751,8 @@ Put a reverse proxy with TLS in front of it (Caddy, nginx, Traefik, a cloud load
 ### Sign-in and GitHub apps
 
 - **GitHub sign-in** needs a GitHub OAuth app whose callback URL is `<APP_ORIGIN>/api/auth/github/callback`; put its id and secret in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The same app resets session owners' GitHub tokens after pushes that used them. github.com repositories need it: only accounts that sign in with GitHub can read them.
-- **Username and password sign-in** is on with `PASSWORD_AUTH=true` (see [Username and password](#username-and-password)), next to GitHub or instead of it. Create the first administrator with `--create-admin` (see [Administration](#administration)). With neither, the sign-in page says GitHub sign-in isn't configured.
-- **Who can create an account** is `SIGNUP`'s choice (see [Who can create an account](#who-can-create-an-account)). Unset, anyone with a GitHub account can sign up, as before; on a server the internet can reach, `SIGNUP=invite` limits new accounts to people holding a workspace's invite link.
+- **Username and password sign-in** is on with `PASSWORD_AUTH=true`, as in the Docker image (see [Username and password](#username-and-password)), next to GitHub or instead of it. Create the first administrator with `--create-admin` (see [Administration](#administration)). With neither, the sign-in page says GitHub sign-in isn't configured.
+- **Who can create an account** is `SIGNUP`'s choice (see [Who can create an account](#who-can-create-an-account)). Unset, anyone with a GitHub account can sign up, as before; on a server the internet can reach, `SIGNUP=invite`, the Docker image's default, limits new accounts to people holding a workspace's invite link.
 - **github.com pushes** can use an operator GitHub App with Repository contents read & write: set `GITHUB_APP_ID`, `GITHUB_APP_SLUG` and `GITHUB_APP_PRIVATE_KEY`. Without it, each workspace adds its own GitHub App under **Push access**. Either app also gives hosts read-only tokens for single repositories, so that sessions' clones of private repositories don't go through the server.
 - **Azure DevOps and Forgejo push identities** trust Pistead as an OIDC issuer at `APP_ORIGIN` (`/.well-known/openid-configuration`, `/.well-known/jwks.json`): set `OIDC_SIGNING_KEY` to an RSA key (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072`).
 
@@ -779,8 +784,8 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |
-| `PASSWORD_AUTH` | off | `true` offers sign-in with a username and password (see [Username and password](#username-and-password)); not with `LOCAL_MODE` |
-| `SIGNUP` | GitHub `open`, passwords `invite` | Who can create an account, with GitHub and with a password: `open` (anyone who reaches the server), `invite` (only through a workspace's invite link) or `off` (only the operator's: `ADMIN_USER_IDS` and `--create-admin`); see [Who can create an account](#who-can-create-an-account). Not for `LOCAL_MODE`, which admits only its owner |
+| `PASSWORD_AUTH` | off (`true` in the Docker image) | `true` offers sign-in with a username and password (see [Username and password](#username-and-password)); not with `LOCAL_MODE` |
+| `SIGNUP` | GitHub `open`, passwords `invite` (`invite` in the Docker image) | Who can create an account, with GitHub and with a password: `open` (anyone who reaches the server), `invite` (only through a workspace's invite link) or `off` (only the operator's: `ADMIN_USER_IDS` and `--create-admin`); see [Who can create an account](#who-can-create-an-account). Not for `LOCAL_MODE`, which admits only its owner |
 | `LOCAL_MODE`, `LOCAL_CLAIM_SECRET` | off | A server for one person on their own computer, as `pistead serve` runs it: plain HTTP on loopback only, and only the GitHub account that signs in through `/api/auth/local/claim?token=LOCAL_CLAIM_SECRET` first (a base64url 32-byte value) can sign in |
 
 ### Administration
@@ -788,12 +793,12 @@ Settings are environment variables, read once at start-up; secrets are never log
 The server's administrators see every account, workspace and host under **Settings → Administration** and can suspend accounts. List their user IDs in `ADMIN_USER_IDS`, separated by commas (`ADMIN_USER_IDS=github:12345,github:67890,password:alice`); each person finds theirs under **Settings → Profile**. A GitHub user ID is `github:` and the numeric ID GitHub gives the account, which `https://api.github.com/users/<login>` shows as `id` before anyone signs in. A password account's is `password:` and its username. Nobody can sign up in the app as an account `ADMIN_USER_IDS` lists, so listing one reserves the name; the operator creates it from the server's command line instead, with the password typed at a hidden prompt (or piped in on the first line of standard input, never as an argument):
 
 ```sh
-# ADMIN_USER_IDS=password:admin and PASSWORD_AUTH=true, in the server's environment
+# ADMIN_USER_IDS=password:admin and PASSWORD_AUTH=true (the Docker image sets it), in the server's environment
 node dist/server/main.js --create-admin admin
 docker compose exec pistead node dist/server/main.js --create-admin admin   # under Docker
 ```
 
-That needs no sign-in first and no restart afterwards, and a fresh server with `SIGNUP=invite` or `off` starts this way (or with a GitHub administrator, who can always sign up): the administrator signs in, creates a workspace and shares its invite link. `--reset-password USERNAME` sets a new password for any password account the same way, clears its failed sign-ins and signs it out everywhere. Both are recorded in the audit table, with no actor. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
+That needs no sign-in first and no restart afterwards, and a fresh server with `SIGNUP=invite` (as the Docker image has it) or `off` starts this way (or with a GitHub administrator, who can always sign up): the administrator signs in, creates a workspace and shares its invite link. `--reset-password USERNAME` sets a new password for any password account the same way, clears its failed sign-ins and signs it out everywhere. Both are recorded in the audit table, with no actor. The role comes only from this setting: nobody can grant it in the app, and it gives no access inside workspaces or sessions.
 
 - **Overview** counts accounts, workspaces, hosts (and how many are online) and sessions.
 - **Accounts**, **Workspaces** and **Hosts** list each one with its owner and how many members, repositories, hosts and sessions it has. They never show session titles, prompts, repository names, models, environment values or credentials.
