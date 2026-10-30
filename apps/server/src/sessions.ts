@@ -328,16 +328,31 @@ function messageEntry(input: Record<string, unknown>): string {
  * host copies the conversation from one session to the other itself, so it never crosses the control plane. A fork
  * that doesn't complete leaves its new session archived.
  */
+/**
+ * The model a fork of `source` starts on: the one its host reports for the shared conversation now, which messages may
+ * have changed (the host carries the reasoning level over too), else the model the session started on.
+ */
+async function forkModel(c: AppContext, source: SessionRow): Promise<string> {
+  const { agent } = (await sessionView(c, source, { latest: true })).view;
+  if (agent) {
+    const current = await c.env.DB.query<{ id: string }>('SELECT id FROM models WHERE workspace_id = ? AND connector_id = ? AND provider = ? AND model_id = ?')
+      .bind(source.workspace_id, source.connector_id ?? null, agent.provider, agent.modelId).first();
+    if (current) return current.id;
+  }
+  const own = await c.env.DB.query<{ model_id: string }>('SELECT model_id FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
+  if (!own) fail(409, 'invalid_binding', 'Session binding is incomplete.');
+  return own.model_id;
+}
+
 export async function forkSession(c: AppContext, source: SessionRow, entryId: string, title?: string): Promise<{ row: SessionRow }> {
   const actorId = c.get('auth').userId;
   if (source.owner_id !== actorId) fail(403, 'owner_required', 'Only the session owner can fork it.');
   requireUnfrozen(source);
   if (!source.connector_id) fail(409, 'connector_required', 'Only a session on a connected host can be forked.');
-  const agent = await c.env.DB.query<{ model_id: string }>('SELECT model_id FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
-  if (!agent) fail(409, 'invalid_binding', 'Session binding is incomplete.');
+  const modelId = await forkModel(c, source);
   const { row } = await createSession(c, {
     workspaceId: source.workspace_id, title: title ?? `Fork: ${source.title}`.slice(0, 200), visibility: source.visibility ?? 'private',
-    modelId: agent.model_id, trustedConnectorId: source.connector_id, ...(source.host_environment ? { hostEnvironment: true } : {}),
+    modelId, trustedConnectorId: source.connector_id, ...(source.host_environment ? { hostEnvironment: true } : {}),
   });
   try {
     const result = await runnerJSON<{ conversationId: string; entries: number }>(

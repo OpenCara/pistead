@@ -73,6 +73,8 @@ type Run = {
   stopped?: { by: string; pending?: true };
   /** Pi parked its work after host crashes cut it off again and again, so it ended (see endParkedRuns). */
   crashed?: true;
+  /** Someone went back to before this shared message (see `revert`): it no longer says what the session is doing. */
+  reverted?: true;
 };
 /**
  * One of the session's conversations. The shared conversation is the write branch that isn't `superseded`: going back to
@@ -81,6 +83,8 @@ type Run = {
 type Branch = { id: number; mode: "write" | "ask"; actorId?: string; superseded?: true };
 /** An entry of the shared conversation as a session forked from it starts with (see `forkEntries` and `seed`). */
 export type ForkedEntry = { kind: string; model: readonly Message[] };
+/** What a session forked from another starts with: its shared conversation's entries, and the model and reasoning it used. */
+export type ForkedConversation = { entries: ForkedEntry[]; agent: { model?: { provider: string; modelId: string }; thinkingLevel?: ThinkingLevel } };
 /** The kind of the entries a forked session starts with. */
 const FORKED_KIND = "workspace.forked";
 
@@ -1194,7 +1198,7 @@ export class RunnerSession {
     // Held work waits for the repositories, and a failed preparation holds it until the session restarts.
     if (preparation !== "ready") return preparation === "preparing" ? "working" : "failed";
     const state = await this.metadata();
-    const runs = Object.values(state.runs);
+    const runs = Object.values(state.runs).filter(run => !run.reverted);
     const approvals = Object.values(state.approvals);
     const activity = sessionActivity(runs, approvals);
     if (activity !== "done") return activity;
@@ -2409,6 +2413,9 @@ export class RunnerSession {
       await this.mutate(meta => {
         for (const branch of meta.branches) if (branch.mode === "write") branch.superseded = true;
         meta.branches.push({ id: next.id, mode: "write" });
+        // Entry ids grow across the session's conversations, so the shared messages cut off are those that started at
+        // the cut or after it; before the first message, all of them.
+        for (const run of Object.values(meta.runs)) if (run.mode === "write" && (at === undefined || run.startEntry >= at)) run.reverted = true;
       });
       this.#shared = next;
       return { conversationId: String(next.id) };
@@ -2419,7 +2426,7 @@ export class RunnerSession {
    * The shared conversation's entries up to one of its messages (see `cutPoint`), as the model sees them, for a session
    * forked from it (see `seed`). Its owner reads them on this host: they never leave it.
    */
-  async forkEntries(actorId: string, entryId: string): Promise<ForkedEntry[]> {
+  async forkEntries(actorId: string, entryId: string): Promise<ForkedConversation> {
     return this.exclusive(async () => {
       if (this.closing) throw new RunnerError(503, "Session is closing");
       if (actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session's owner can fork it");
@@ -2428,13 +2435,18 @@ export class RunnerSession {
       const { at, last } = await this.cutPoint(shared, entryId);
       // The latest reply while the agent still works may be followed at once by more of its turn.
       if (last && this.working(await this.metadata())) throw new RunnerError(409, "Wait for the agent to finish before forking from its latest reply");
-      if (at === undefined) return [];
+      // The fork goes on with the model and reasoning the conversation uses now, which messages may have changed.
+      const current = await shared.agent(context);
+      const agent = { ...(current.model ? { model: { provider: current.model.provider, modelId: current.model.modelId } } : {}),
+        ...(current.thinkingLevel ? { thinkingLevel: current.thinkingLevel as ThinkingLevel } : {}) };
+      if (at === undefined) return { entries: [], agent };
       const transcript = await shared.context(context, { at });
       // System messages are this session's prompt (its branch, its worktree): the fork's agent renders its own.
-      return transcript.entries.flatMap((_entry, index) => {
+      const entries = transcript.entries.flatMap((_entry, index) => {
         const model = (transcript.contributions[index] ?? []).filter(message => (message.role as string) !== "system");
         return model.length ? [{ kind: FORKED_KIND, model }] : [];
       });
+      return { entries, agent };
     });
   }
 
@@ -2442,7 +2454,7 @@ export class RunnerSession {
    * Starts this new session's shared conversation with another session's (see `forkEntries`). Only into a session that
    * hasn't run anything yet; the same fork again is answered as before.
    */
-  async seed(ticket: RunnerTicket, from: { sessionId: string; entryId: string }, entries: readonly ForkedEntry[]): Promise<{ conversationId: string; entries: number }> {
+  async seed(ticket: RunnerTicket, from: { sessionId: string; entryId: string }, { entries, agent }: ForkedConversation): Promise<{ conversationId: string; entries: number }> {
     this.assertTicket(ticket);
     this.requireUnfrozen();
     if (ticket.actorId !== this.binding.owner.id) throw new RunnerError(403, "Only the session's owner can fork into it");
@@ -2465,6 +2477,10 @@ export class RunnerSession {
         meta.forkedFrom = { sessionId: from.sessionId, entryId: from.entryId };
         doc.json = JSON.stringify(meta);
       }, context);
+      // On the source's model and reasoning, where this host still offers them (it is the same host); else its own.
+      const model = agent.model && this.models.getModel(agent.model.provider, agent.model.modelId) ? agent.model : undefined;
+      const level = agent.thinkingLevel && thinkingLevels.includes(agent.thinkingLevel) ? agent.thinkingLevel : undefined;
+      if (model || level) await shared.configure({ ...(model ? { model } : {}), ...(level ? { thinkingLevel: level } : {}) }, context);
       this.#activity?.changed();
       return { conversationId: String(shared.id), entries: entries.length };
     });
@@ -2532,7 +2548,7 @@ export class RunnerSession {
       ...(access ? { access } : {}),
       ...(repositories ? { repositories } : {}),
       activity: repositories ? (repositories.status === "preparing" ? "working" : "failed")
-        : sessionActivity(Object.values(state.runs), Object.values(state.approvals),
+        : sessionActivity(Object.values(state.runs).filter(run => !run.reverted), Object.values(state.approvals),
           activityEntry(snapshots.find(snapshot => snapshot.branch.mode === "write")?.entries.at(-1))),
     };
   }

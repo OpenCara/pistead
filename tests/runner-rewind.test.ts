@@ -10,7 +10,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFact
 import { RunnerService } from "../apps/runner/src/server.js";
 import type { RunnerSession } from "../apps/runner/src/session.js";
 import { RunnerError } from "../apps/runner/src/protocol.js";
-import type { AuthorizationRequest, EntryView, RunnerAction, RunnerBinding, RunnerTicket, SessionView } from "../packages/shared/src/types.js";
+import type { AuthorizationRequest, EntryView, RunnerAction, RunnerBinding, RunnerTicket, SessionView, SubmitInput } from "../packages/shared/src/types.js";
 import { sha256 } from "../packages/shared/src/crypto.js";
 
 // Going back to an earlier message of the shared conversation (revert), and starting a new session from one (fork), on
@@ -43,7 +43,7 @@ async function fixture(t: TestContext) {
   // "TOOL" makes a tool call and then answers; "HOLD" waits for `release`; anything else is answered with every user
   // message the model was given.
   let release = Promise.withResolvers<void>();
-  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  const faux = fauxProvider({ models: [{ id: "faux-1", reasoning: true }, { id: "faux-2", reasoning: true }] });
   const respond: FauxResponseFactory = async context => {
     faux.appendResponses([respond]);
     const latest = context.messages.at(-1);
@@ -51,6 +51,7 @@ async function fixture(t: TestContext) {
     const prompt = text(latest?.role === "user" ? latest.content : "");
     if (prompt === "TOOL") return fauxAssistantMessage([fauxToolCall("identity", {})], { stopReason: "toolUse" });
     if (prompt === "HOLD") await release.promise;
+    if (prompt === "FAIL") throw new Error("400 Bad Request");
     return fauxAssistantMessage(`saw ${context.messages.filter(message => message.role === "user").map(message => text(message.content)).join("|")}`);
   };
   faux.setResponses([respond]);
@@ -93,9 +94,14 @@ async function idle(session: RunnerSession): Promise<SessionView> {
   assert.fail("runner did not settle");
 }
 
-async function send(session: RunnerSession, content: string): Promise<SessionView> {
-  await session.submit(await ticket(session, "submit"), { content, requestId: randomUUID() }, "write");
+async function send(session: RunnerSession, content: string, options?: SubmitInput["options"]): Promise<SessionView> {
+  await session.submit(await ticket(session, "submit"), { content, requestId: randomUUID(), ...(options ? { options } : {}) }, "write");
   return idle(session);
+}
+
+/** What the session reports it is doing (as its activity reporter reads it). */
+function activity(session: RunnerSession): Promise<string> {
+  return (session as unknown as { activity(): Promise<string> }).activity();
 }
 
 /** The shared conversation as people read it, without the empty bookkeeping entries the apps leave out. */
@@ -254,4 +260,34 @@ test("a backup of a session that went back keeps the conversation it went back f
   for (const [index, branches] of [[old, { ...current, superseded: true }], [{ ...old, superseded: undefined }, current], [{ ...old, superseded: "yes" }, current]].entries()) {
     await assert.rejects(restore(branches, `tampered-${index}`), refused(400, /Invalid backup branches/));
   }
+});
+
+test("going back to before a failed message, or before the first, leaves its status behind", async t => {
+  const runner = await fixture(t);
+  const session = await runner.provision("rewind-activity");
+  await send(session, "one");
+  assert.equal(await activity(session), "done");
+  let view = await send(session, "FAIL");
+  assert.equal(await activity(session), "failed");
+  assert.equal(view.activity, "failed");
+  await session.revert(await ticket(session, "revert"), { entryId: find(view, "user", "FAIL").id });
+  assert.equal(await activity(session), "done", "the message that is left finished");
+  assert.equal((await session.view()).activity, "done");
+  view = await session.view();
+  await session.revert(await ticket(session, "revert"), { entryId: find(view, "user", "one").id });
+  assert.equal(await activity(session), "idle", "nothing was sent in what is left");
+  await send(session, "two");
+  assert.equal(await activity(session), "done");
+});
+
+test("a fork goes on with the model and reasoning the conversation uses now", async t => {
+  const runner = await fixture(t);
+  const source = await runner.provision("fork-model-source");
+  await send(source, "one");
+  const view = await send(source, "two", { model: { provider: "faux", modelId: "faux-2" }, thinkingLevel: "high" });
+  assert.deepEqual(view.agent, { provider: "faux", modelId: "faux-2", thinkingLevel: "high" });
+  const target = await runner.provision("fork-model-target");
+  assert.equal((await target.view()).agent?.modelId, "faux-1");
+  await runner.service.fork(target, await ticket(target, "fork"), { sourceSessionId: "fork-model-source", entryId: find(view, "assistant", "saw one|two").id });
+  assert.deepEqual((await target.view()).agent, { provider: "faux", modelId: "faux-2", thinkingLevel: "high" });
 });

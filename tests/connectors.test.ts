@@ -2410,25 +2410,41 @@ test('writers take the shared conversation back to a message through its host, a
   assert.equal(requests.length, 2);
 });
 
-test('its owner forks a session from a message into a new one on the same host and model, which the host fills; a failed fork is archived', async t => {
+test('its owner forks a session from a message into a new one on the same host and current model, which the host fills; a failed fork is archived', async t => {
   const f = await fixture(t); const s = await privateHostSession(f);
   const path = `/api/sessions/${s.session.id}`;
+  // A second model on the same host, which the session's messages switched to.
+  const columns = (f.sqlite.prepare('PRAGMA table_info(models)').all() as { name: string }[]).map(column => column.name);
+  f.sqlite.prepare(`INSERT INTO models (${columns.join(',')}) SELECT ${columns.map(column => column === 'id' ? "'second-model'" : column === 'model_id' ? "'second'" : column).join(',')} FROM models WHERE id = ?`).run(s.model.id);
+  const advertised = JSON.parse((f.sqlite.prepare('SELECT models_json FROM connectors WHERE id = ?').get(s.connector.connectorId) as { models_json: string }).models_json) as { modelId: string }[];
+  f.sqlite.prepare('UPDATE connectors SET models_json = ? WHERE id = ?').run(JSON.stringify([...advertised, { ...advertised[0]!, modelId: 'second' }]), s.connector.connectorId);
+  let agent: SessionView['agent'] = { provider: s.model.provider, modelId: 'second', thinkingLevel: 'high' };
   let forkAnswer: () => Response = () => Response.json({ conversationId: '1', entries: 4 });
-  const requests = rpcHub(f, s.connector, envelope => envelope.request.ticket.action === 'fork' ? forkAnswer() : Response.json({ session: {} }, { status: 201 }));
+  const requests = rpcHub(f, s.connector, envelope => envelope.request.ticket.action === 'fork' ? forkAnswer()
+    : envelope.request.ticket.action === 'view' ? Response.json({ view: { ...s.view, ...(agent ? { agent } : {}) } })
+    : Response.json({ session: {} }, { status: 201 }));
   const { session } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 201);
   assert.notEqual(session.id, s.session.id);
   assert.deepEqual([session.title, session.visibility, session.status, session.connectorId, session.ownerId],
     [`Fork: ${s.session.title}`, s.session.visibility, 'ready', s.session.connectorId, s.owner.user.id]);
   assert.deepEqual(requests.map(({ request }) => [request.path, request.ticket.action, request.ticket.sessionId]), [
+    [`/v1/sessions/${s.session.id}/view`, 'view', s.session.id],
     ['/v1/sessions', 'create', session.id],
     [`/v1/sessions/${session.id}/fork`, 'fork', session.id],
   ]);
-  assert.deepEqual(JSON.parse(requests[1]!.request.body), { sourceSessionId: s.session.id, entryId: '1:12' });
+  assert.deepEqual(JSON.parse(requests[2]!.request.body), { sourceSessionId: s.session.id, entryId: '1:12' });
   const model = (id: string) => (f.sqlite.prepare('SELECT a.model_id FROM sessions s JOIN agent_versions a ON a.id = s.agent_version_id WHERE s.id = ?').get(id) as { model_id: string }).model_id;
-  assert.equal(model(session.id), model(s.session.id));
+  assert.equal(model(session.id), 'second-model', 'the model the conversation uses now');
+  assert.equal(model(s.session.id), s.model.id);
   const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.forked'").all(session.id);
   assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ sourceSessionId: s.session.id, entryId: '1:12' }) }]);
 
+  // A host that names no model, or one it no longer offers here: the model the session started on.
+  for (const current of [undefined, { provider: s.model.provider, modelId: 'gone', thinkingLevel: 'high' as const }]) {
+    agent = current;
+    const { session: fallback } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 201);
+    assert.equal(model(fallback.id), s.model.id);
+  }
   const { session: titled } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12', title: 'Try another way' }), 201);
   assert.equal(titled.title, 'Try another way');
   for (const body of [{}, { entryId: '1:12', visibility: 'private' }, { entryId: 'x' }]) await denied(await s.owner.request('POST', `${path}/fork`, body), 400, 'invalid_input');
@@ -2442,7 +2458,7 @@ test('its owner forks a session from a message into a new one on the same host a
   forkAnswer = () => Response.json({ error: 'That message is no longer in the shared conversation; reload it' }, { status: 409 });
   await denied(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 409, 'runner_error');
   const failed = requests.at(-1)!.request.ticket.sessionId;
-  assert.equal(requests.length, before + 2);
+  assert.equal(requests.length, before + 3);
   assert.equal((f.sqlite.prepare('SELECT status FROM sessions WHERE id = ?').get(failed) as { status: string }).status, 'archived');
 });
 
