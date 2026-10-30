@@ -1,8 +1,11 @@
 # Copy apps/server/.env.example to .env next to this file and fill in APP_ORIGIN, SESSION_SECRET and VAULT_KEY.
 # By default the server keeps SQLite in the pistead-data volume and stores no session backups; to keep backups in that
 # volume too, set STORAGE_URL=file:///data/backups in .env. The image lets workspace owners connect a Postgres database
-# of their own for their backups; WORKSPACE_DATABASES=false in .env turns that off. For Postgres, run
-# `docker compose --profile postgres up` and set in .env:
+# of their own for their backups; WORKSPACE_DATABASES=false in .env turns that off. It signs people in with a username
+# and password, and takes new accounts only through a workspace's invite link (PASSWORD_AUTH=false, or SIGNUP=open or
+# off, in .env change that). For its first administrator, set ADMIN_USER_IDS=password:admin in .env, start it and run:
+#   docker compose exec pistead node dist/server/main.js --create-admin admin
+# For Postgres, run `docker compose --profile postgres up` and set in .env:
 #   DATABASE_URL=postgres://pistead:change-me@postgres:5432/pistead
 services:
   pistead:
