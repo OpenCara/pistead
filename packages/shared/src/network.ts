@@ -1,4 +1,5 @@
 import { validGitHost, type GitProvider } from "./repositories.js";
+import type { GrantSource } from "./sources.js";
 
 /**
  * What a workspace's sandboxed sessions may reach through their host's egress proxy. The workspace's own repositories
@@ -73,7 +74,15 @@ export interface EgressRepository {
   lfs?: boolean;
 }
 /** What the control plane lets one session's egress proxy do; the proxy asks again every minute. */
-export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[] }
+export interface EgressGrant {
+  policy: NetworkPolicy;
+  repositories: EgressRepository[];
+  /**
+   * The workspace's sources other than its repositories (Notion pages and databases), which the agent reads through
+   * the control plane (notion_read), never through the proxy. Absent from older control planes.
+   */
+  sources?: GrantSource[];
+}
 /**
  * The Git requests the relay forwards: a fetch's ref advertisement and the fetch itself; in clone sessions a push's
  * (`receive-refs`, `receive-pack`), which may only update the session branch; and, for repositories with Git LFS on,

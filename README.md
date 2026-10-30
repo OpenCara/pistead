@@ -68,7 +68,7 @@ And around them:
 
 1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
-3. **Bind a repository**: **Settings → Workspaces →** your workspace **→ Repositories → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**.
+3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page works too (see [Notion sources](#notion-sources)).
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
    ```sh
@@ -78,7 +78,7 @@ And around them:
 5. **Start a session**: select the workspace in the sidebar, choose your host in **Host**, describe the task and press Enter.
 6. **Approve** commands and commits as their cards appear above the transcript.
 
-To bring in teammates, they sign in once and send you their **User ID** from **Settings → Profile**; add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
+To bring in teammates, they sign in once and send you their **User ID** from **Settings → Profile**; add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Add a source**, **Pair a host**, **Start a session**) until all three are done.
 
 ## Using Pistead
 
@@ -98,7 +98,7 @@ Pistead signs people in with GitHub only, and asks GitHub for the `read:user use
 
 ### Workspaces and members
 
-Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
+Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Sources**, **Push access**, **Network access**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Or they share an invite link instead (see [Invite links and pending members](#invite-links-and-pending-members)). Below the owner there are four tiers:
 
@@ -112,7 +112,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | View workspace-visible sessions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Start sessions | ✓ | ✓ | ✓ | ✓ | |
 | Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
-| Bind and remove repositories, set their push policy and Git LFS | ✓ | ✓ | | | |
+| Add and remove sources (repositories, Notion pages), set repositories' push policy and Git LFS | ✓ | ✓ | | | |
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
 | Add, change or remove collaborators, members and viewers | ✓ | ✓ | | | |
@@ -137,7 +137,7 @@ Workspace admins manage only their workspace; the server's administrators are co
 
 ### Repositories and Git accounts
 
-Sessions work on the repositories bound to their workspace. Until a workspace has one, nobody can share a host with it or start a session in it.
+Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [Notion pages and databases](#notion-sources), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
 
 Connect the accounts that can read your repositories under **Settings → Profile → Git accounts** (**Add account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
@@ -150,7 +150,7 @@ Connect the accounts that can read your repositories under **Settings → Profil
 | Azure DevOps | Personal access token and organization | Code (Read); opening pull requests or pushing with your account needs Code (Read & write) |
 | Gitea / Forgejo | Personal access token and host | `read:repository` and `read:user`; opening pull requests or pushing with your account needs `write:repository` |
 
-Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's own account, on hosts that have `git-lfs` installed (Pistead uses the host's own). The provider's download links and the tokens that come with them stay on the control plane. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
+Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Sources → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's own account, on hosts that have `git-lfs` installed (Pistead uses the host's own). The provider's download links and the tokens that come with them stay on the control plane. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
 
 Sessions **clone on demand**: every new session starts with an empty worktree and pins nothing.
 
@@ -162,6 +162,17 @@ Sessions **clone on demand**: every new session starts with an empty worktree an
 - The host needs connector 0.9.0 or newer: one from before sessions cloned their repositories can't start new sessions.
 
 Sessions started before this change pinned their repositories to exact commits. They stay **read-only**: their conversation, approvals, backups (to download) and exports remain, but they no longer run messages, approvals, backups, restores or moves. Start a new session to continue their work.
+
+#### Notion sources
+
+A workspace's sources can also be Notion pages and databases: agents read them, and the pages under them, as context (specs, notes, task lists). They don't write to Notion.
+
+- **Connect Notion** under **Settings → Profile → Connected accounts → Notion → Connect**: create an [internal integration](https://www.notion.so/profile/integrations) with the **Read content** capability, paste its secret, and share the pages it may read with it (a page's **•••** menu → **Connections**). Notion lets it read only those pages and the pages under them. Pistead verifies the secret with Notion and keeps it encrypted on the server; it never goes to any host.
+- **Add a page**: owners and admins choose **Settings → Workspaces →** the workspace **→ Sources → Notion → Add Notion page** and paste the page's or database's link (**Share → Copy link**). Pistead checks it with their own Notion connection. A workspace has at most 10 Notion sources.
+- **In a session**, the agent reads them with `notion_read`, with the **session owner's** Notion connection, during a message sent with write access: a page comes back as Markdown with the pages and databases under it, and a database as its rows (the 200 most recently edited). Pages outside the bound page or database are refused, even where the owner's integration can read them, and long content is cut at 96 KiB. A session owner without a Notion connection gets a refusal that says so.
+- Removing a Notion source stops reads of it at once, in running sessions too. Every read is recorded in the audit log (`notion.read`).
+
+Notion content is written by other people: the agent is told to treat it as information, not as instructions.
 
 ### Hosts
 
@@ -350,6 +361,7 @@ The tools an agent can use:
 | `github_comment` | Comment on a GitHub issue or pull request | Approval |
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
+| `notion_read` | Read a page or database of one of the workspace's [Notion sources](#notion-sources), with the session owner's Notion connection | Nothing, during a shared message |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments, merges and issues, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.

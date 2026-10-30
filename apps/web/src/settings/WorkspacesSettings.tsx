@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import { assignableWorkspaceRoles, type AssignableWorkspaceRole, type UserProfile, type Workspace, type WorkspaceRole } from "../../../../packages/shared/src/types";
 import { adminManagedRoles, canCreateSessions } from "../../../../packages/shared/src/policy";
 import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
@@ -9,6 +9,7 @@ import { Icon } from "../icons";
 import { NewWorkspaceSheet } from "../NewWorkspaceSheet";
 import { gitAccountLabel, gitProviderLabel, RepositoryClonePolicy, useGitAccounts, useWorkspaceRepositories } from "../repositories";
 import { href } from "../router";
+import { NotionSources, useWorkspaceSources } from "../sources";
 import { Alert, Button, CardBody, Combobox, CopyField, DropdownMenu, EmptyState, Feedback, Field, IdentityBadge, LinkButton, PageLoading, RelativeTime, ResourceState, Row, Section, Sheet, StatusBadge, StatusDot, confirmDialog, useAction, useResource } from "../ui";
 import type { WorkspaceInviteLink, WorkspaceJoinRequest } from "../../../../packages/shared/src/invites";
 import { memberPerson, userIdFromInput, username, usernameWithId, type WorkspaceMember } from "../../../../packages/client/src/usernames";
@@ -67,13 +68,14 @@ function WorkspaceDetail({ user, workspace }: { user: UserProfile; workspace: Wo
   const role = workspaceRole(workspace, user);
   const admin = role === "owner" || role === "admin";
   const repositories = useWorkspaceRepositories(workspace.id);
+  const sources = useWorkspaceSources(workspace.id);
   return <>
     <Section title="General">
       <Row title="Name" trailing={<span>{workspace.name}</span>} />
       <Row title="Your role" trailing={<StatusBadge tone={admin ? "success" : "neutral"}>{roleLabel[role]}</StatusBadge>} />
     </Section>
-    {canCreateSessions(role) && <Setup user={user} workspace={workspace} admin={admin} repositoryCount={repositories.repositories?.length ?? null} />}
-    <Repositories workspace={workspace} admin={admin} {...repositories} />
+    {canCreateSessions(role) && <Setup user={user} workspace={workspace} admin={admin} sourceCount={repositories.sourceCount} />}
+    <Repositories workspace={workspace} admin={admin} {...repositories} notion={<NotionSources workspaceId={workspace.id} workspaceName={workspace.name} admin={admin} {...sources} changed={repositories.refresh} />} />
     <PushAccess workspace={workspace} admin={admin} />
     <NetworkAccess workspace={workspace} admin={admin} />
     <WorkspaceDatabaseSection workspace={workspace} owner={role === "owner"} />
@@ -92,13 +94,13 @@ function DataExport({ workspace }: { workspace: Workspace }) {
   </Section>;
 }
 
-function Setup({ user, workspace, admin, repositoryCount }: { user: UserProfile; workspace: Workspace; admin: boolean; repositoryCount: number | null }) {
+function Setup({ user, workspace, admin, sourceCount }: { user: UserProfile; workspace: Workspace; admin: boolean; sourceCount: number | null }) {
   const { sessions, sessionsLoading } = useApp();
   const connectors = useConnections(`/api/workspaces/${segment(workspace.id)}/connectors`);
   // Only show the checklist once every signal is known, so it never flashes in and out.
-  if (repositoryCount === null || !connectors.data || sessionsLoading) return null;
+  if (sourceCount === null || !connectors.data || sessionsLoading) return null;
   const steps = [
-    { label: "Bind a repository", done: repositoryCount > 0, hint: admin ? undefined : "An owner or admin does this", onClick: () => document.getElementById("workspace-repositories")?.scrollIntoView({ behavior: "smooth" }) },
+    { label: "Add a source", done: sourceCount > 0, hint: admin ? undefined : "An owner or admin does this", onClick: () => document.getElementById("workspace-repositories")?.scrollIntoView({ behavior: "smooth" }) },
     { label: "Pair a host", done: connectors.data.connectors.some(connector => !connector.revokedAt && connector.online && (connector.ownerId === user.id || connector.workspaceIds.includes(workspace.id))), link: href({ name: "settings", section: "hosts" }) },
     { label: "Start a session", done: sessions.some(session => session.workspaceId === workspace.id), link: href({ name: "new", workspaceId: workspace.id }) },
   ];
@@ -108,17 +110,18 @@ function Setup({ user, workspace, admin, repositoryCount }: { user: UserProfile;
   </Section>;
 }
 
-function Repositories({ workspace, admin, repositories, loading, error, refresh }: { workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; loading: boolean; error: string; refresh: () => void }) {
+/** The workspace's sources: its Git repositories, then `notion`, the Notion pages and databases. */
+function Repositories({ workspace, admin, repositories, sourceCount, loading, error, refresh, notion }: { workspace: Workspace; admin: boolean; repositories: WorkspaceRepository[] | null; sourceCount: number | null; loading: boolean; error: string; refresh: () => void; notion: ReactNode }) {
   const action = useAction();
   const accounts = useGitAccounts(admin);
   const [picking, setPicking] = useState(false);
   const full = (repositories?.length ?? 0) >= repositoryLimits.repositories;
   async function remove(repository: WorkspaceRepository) {
     if (action.busy || !admin) return;
-    const last = repositories?.length === 1;
+    const last = sourceCount === 1;
     const confirmed = await confirmDialog({
       title: "Remove repository",
-      message: `Remove ${repository.fullName} from ${workspace.name}? Existing sessions keep their pinned snapshots.${last ? " With no repositories, new sessions, pairing and sharing will be disabled until an owner or admin adds a repository." : " This changes new sessions only."}`,
+      message: `Remove ${repository.fullName} from ${workspace.name}? Existing sessions keep their pinned snapshots.${last ? " With no sources, new sessions, pairing and sharing will be disabled until an owner or admin adds a source." : " This changes new sessions only."}`,
       confirmLabel: "Remove",
       destructive: true,
     });
@@ -143,17 +146,19 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
     }, enabled ? "Git LFS turned on. New clones download LFS files." : "Git LFS turned off. Clones check out LFS pointer files.");
   }
   const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
-  return <Section bare title="Repositories" info={<div className="stack">
-    {!admin && <p>Only workspace owners and admins can add or remove repositories.</p>}
-    <p>Changes apply at once, in running sessions too: a removed repository can no longer be read or pushed. To change a ref, remove and re-add the repository.</p>
+  return <Section bare title="Sources" info={<div className="stack">
+    <p>What this workspace's sessions work on: Git repositories, which agents clone, and Notion pages and databases, which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts.</p>
+    {!admin && <p>Only workspace owners and admins can add or remove sources.</p>}
+    <p>Changes apply at once, in running sessions too: a removed source can no longer be read, nor a removed repository pushed. To change a ref, remove and re-add the repository.</p>
     <p>Git LFS is off by default, and clones check out LFS pointer files. Turned on, sessions download the repository's LFS files with their owner's own account, where the host has git-lfs installed. Sessions never upload LFS files.</p>
     <RepositoryClonePolicy />
   </div>} action={canAdd && <Button variant="outline" size="sm" icon="plus" disabled={loading || Boolean(error) || action.busy} onClick={() => setPicking(true)}>Add repository</Button>}>
     <div className="stack" id="workspace-repositories">
+      <div className="section-header"><h3 className="section-title">Git repositories</h3></div>
       <div className="card">
         <ResourceState loading={loading} error={error} retry={refresh}>
           {!repositories?.length
-            ? <CardBody><span className="muted">{admin ? "No repositories yet. Add a repository to start sessions" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
+            ? <CardBody><span className="muted">{admin ? "No repositories yet" : "No repositories yet. Ask a workspace owner or admin to bind one"}</span></CardBody>
             : repositories.map(repository => <Row key={repository.id} title={repository.fullName} hint={<>{gitProviderLabel(repository.provider, repository.host)} · <code>{repository.ref}</code></>} trailing={<>
               <label className="inline small"><input type="checkbox" className="checkbox" checked={!repository.forbidDefaultBranchPush} disabled={!admin || action.busy} onChange={event => setPushPolicy(repository, event.target.checked)} />Allow agent pushes to the default branch</label>
               <label className="inline small" title="Sessions download this repository's Git LFS files instead of checking out pointer files"><input type="checkbox" className="checkbox" checked={repository.lfs} disabled={!admin || action.busy} onChange={event => setLfs(repository, event.target.checked)} />Git LFS</label>
@@ -167,6 +172,7 @@ function Repositories({ workspace, admin, repositories, loading, error, refresh 
       {admin && accounts.accounts && !accounts.accounts.length && <Alert variant="warning" title="No Git accounts connected" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Connect GitHub or add a Git account in Settings → Profile before choosing repositories.</Alert>}
       {admin && Boolean(accounts.accounts?.length) && full && <Alert variant="info" title="Repository limit reached">The workspace has reached its {repositoryLimits.repositories}-repository limit. Remove a binding to choose another.</Alert>}
     </div>
+    {notion}
     {canAdd && <RepositoryPicker open={picking} workspace={workspace} accounts={accounts.accounts ?? []} repositories={repositories ?? []} disabled={loading || Boolean(error) || action.busy} refresh={refresh} close={() => setPicking(false)} />}
   </Section>;
 }

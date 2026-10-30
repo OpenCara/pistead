@@ -111,7 +111,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const foreign = Boolean(host && host.ownerId !== user.id);
   const available = Boolean(host?.online && !host.revokedAt && model && (host.ownerId === user.id || host.workspaceIds.includes(workspace.id)));
   const repositories = repos.repositories;
-  const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repos.required));
+  const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repos.sourceCount || !repos.required));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const hostSessions = Boolean(host?.hostSessions && host.ownerId === user.id);
   const runOnHost = hostSessions && onHost;
@@ -180,8 +180,8 @@ function Composer({ workspace }: { workspace: Workspace }) {
   const workspaceSettings = href({ name: "settings", section: "workspaces", id: workspace.id });
 
   function blockingAlert() {
-    if (repos.error) return <Alert variant="warning" title="Unable to load repositories" actions={<Button variant="outline" size="sm" onClick={repos.refresh}>Retry</Button>}>{repos.error}</Alert>;
-    if (repositories && !repositories.length && repos.required) return <Alert variant="warning" title="No repositories in this workspace" actions={<LinkButton variant="outline" size="sm" href={workspaceSettings}>Add repository</LinkButton>}>Sessions need at least one repository. Workspace owners and admins can bind one in workspace settings.</Alert>;
+    if (repos.error) return <Alert variant="warning" title="Unable to load sources" actions={<Button variant="outline" size="sm" onClick={repos.refresh}>Retry</Button>}>{repos.error}</Alert>;
+    if (repositories && !repos.sourceCount && repos.required) return <Alert variant="warning" title="No sources in this workspace" actions={<LinkButton variant="outline" size="sm" href={workspaceSettings}>Add a source</LinkButton>}>Sessions need at least one source, such as a repository or a Notion page. Workspace owners and admins add them in workspace settings.</Alert>;
     if (models.error) return <Alert variant="error" title="Unable to load models" actions={<Button variant="outline" size="sm" onClick={models.refresh}>Retry</Button>}>{models.error}</Alert>;
     if (!models.loading && !connections.loading && !connections.error && !hosts.length) return <Alert variant="info" title="No host to chat with yet" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "hosts" })}>Pair a host</LinkButton>}>Pair your own Pi to chat with its models, or ask a workspace member to share their host here.</Alert>;
     if (!host || connections.loading || !modelList) return null;

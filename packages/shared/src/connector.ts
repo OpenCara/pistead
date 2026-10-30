@@ -38,6 +38,8 @@ export interface ConnectorCapabilities {
   github?: boolean;
   /** The connector opens GitHub issues through the control plane once a human approves each (github_issue). Absent on older connectors. */
   githubIssues?: boolean;
+  /** The connector reads the workspace's Notion sources through the control plane (notion_read). Absent on older connectors. */
+  notion?: boolean;
   /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
    * docs/design/repository-cache.md). Absent on older connectors and on hosts whose cache is off, for this connection.

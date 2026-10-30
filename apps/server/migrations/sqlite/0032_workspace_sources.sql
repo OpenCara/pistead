@@ -9,7 +9,7 @@
 CREATE TABLE workspace_sources (
   id TEXT PRIMARY KEY NOT NULL,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK (kind IN ('git')),
+  kind TEXT NOT NULL CHECK (kind IN ('git', 'notion')),
   repository_binding_id TEXT UNIQUE REFERENCES workspace_repositories(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
   CHECK ((kind = 'git') = (repository_binding_id IS NOT NULL)),
@@ -31,5 +31,39 @@ WHEN NEW.kind = 'git' AND NOT EXISTS (SELECT 1 FROM workspace_repositories
   SELECT RAISE(ABORT, 'a git source needs its workspace repository');
 END;
 CREATE TRIGGER workspace_sources_immutable BEFORE UPDATE ON workspace_sources BEGIN
+  SELECT RAISE(ABORT, 'workspace sources are immutable');
+END;
+
+-- Connected accounts of kinds other than Git (Git accounts are git_credentials and the GitHub sign-in): one per user and
+-- provider. The token is vault-encrypted with the user id as AAD, like Git tokens, and never leaves the server: sessions
+-- read their owner's sources through the control plane (notion_read).
+CREATE TABLE source_accounts (
+  id TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK (provider IN ('notion')),
+  ciphertext TEXT NOT NULL,
+  -- What the provider calls the account (a Notion integration's workspace), as verified when it was connected.
+  account_name TEXT NOT NULL CHECK (length(account_name) BETWEEN 1 AND 300),
+  created_at TEXT NOT NULL,
+  UNIQUE (user_id, provider)
+);
+
+-- A Notion page or database bound to a workspace: the detail of a 'notion' source. Sessions read it and the pages under
+-- it with their owner's own Notion account. Removing the source removes it.
+CREATE TABLE notion_sources (
+  source_id TEXT PRIMARY KEY NOT NULL REFERENCES workspace_sources(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  notion_id TEXT NOT NULL CHECK (length(notion_id) = 36),
+  object TEXT NOT NULL CHECK (object IN ('page', 'database')),
+  title TEXT NOT NULL CHECK (length(title) <= 300),
+  url TEXT NOT NULL CHECK (length(url) <= 2048),
+  created_by TEXT NOT NULL,
+  UNIQUE (workspace_id, notion_id)
+);
+CREATE TRIGGER notion_sources_kind BEFORE INSERT ON notion_sources
+WHEN NOT EXISTS (SELECT 1 FROM workspace_sources WHERE id = NEW.source_id AND workspace_id = NEW.workspace_id AND kind = 'notion') BEGIN
+  SELECT RAISE(ABORT, 'a notion source needs its workspace source');
+END;
+CREATE TRIGGER notion_sources_immutable BEFORE UPDATE ON notion_sources BEGIN
   SELECT RAISE(ABORT, 'workspace sources are immutable');
 END;

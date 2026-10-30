@@ -14,6 +14,7 @@ import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Op
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { diffView } from '../packages/shared/src/view-patch.js';
+import type { NotionReadView, WorkspaceNotionSource } from '../packages/shared/src/sources.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'connectors-test-secret-not-for-deployment';
@@ -1936,7 +1937,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'notion_read'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // There is no agent catalog: agents can't be listed, revised or published.
@@ -1948,17 +1949,17 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'notion_read'].includes(tool)));
 
   // A host that also carries GitHub reads and merges offers those; opening issues needs its own capability, which
   // connectors from before github_issue don't advertise.
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue'));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => tool !== 'github_issue' && tool !== 'notion_read'));
 
   // A current host gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, hostCommands: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, notion: true, hostCommands: true } }));
   const { session: fourth } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(fourth.agentVersionId, third.agentVersionId);
   assert.deepEqual(startedAgent().tools, offered);
@@ -2903,4 +2904,157 @@ test('only a host\'s owner starts sessions directly on it, never a member it is 
   assert.equal(shared.find(item => item.id === id)?.hostSessions, undefined);
   await denied(await s.creator.request('POST', '/api/sessions', { ...s.input, trustedConnectorId: id, hostEnvironment: true }), 403, 'host_owner_required');
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM sessions WHERE host_environment = 1').get()!.n, 0);
+});
+
+/** A fake Notion API: a root page with a child page, a page under that child's block, a database, and a page elsewhere. */
+function notionFake(t: TestContext, tokens: Record<string, string>) {
+  const ids = { root: '11111111-1111-4111-8111-111111111111', child: '22222222-2222-4222-8222-222222222222', block: '33333333-3333-4333-8333-333333333333',
+    nested: '44444444-4444-4444-8444-444444444444', database: '55555555-5555-4555-8555-555555555555', row: '66666666-6666-4666-8666-666666666666',
+    outside: '77777777-7777-4777-8777-777777777777' };
+  const page = (id: string, title: string, parent: Record<string, unknown>) => ({ object: 'page', id, url: `https://www.notion.so/${title}-${id.replace(/-/g, '')}`,
+    last_edited_time: '2026-10-01T00:00:00.000Z', parent, properties: { Name: { type: 'title', title: [{ plain_text: title }] } } });
+  const text = (content: string, annotations: Record<string, boolean> = {}) => [{ plain_text: content, annotations, href: null }];
+  const routes: Record<string, () => Response> = {
+    'GET /users/me': () => Response.json({ object: 'user', id: 'bot', type: 'bot', name: 'Pistead', bot: { workspace_name: 'Acme' } }),
+    [`GET /pages/${ids.root}`]: () => Response.json(page(ids.root, 'Specs', { type: 'workspace', workspace: true })),
+    [`GET /pages/${ids.child}`]: () => Response.json(page(ids.child, 'Design', { type: 'page_id', page_id: ids.root })),
+    [`GET /blocks/${ids.block}`]: () => Response.json({ object: 'block', id: ids.block, type: 'toggle', parent: { type: 'page_id', page_id: ids.child } }),
+    [`GET /pages/${ids.nested}`]: () => Response.json(page(ids.nested, 'Nested', { type: 'block_id', block_id: ids.block })),
+    [`GET /pages/${ids.outside}`]: () => Response.json(page(ids.outside, 'Payroll', { type: 'workspace', workspace: true })),
+    [`GET /pages/${ids.database}`]: () => Response.json({ object: 'error', status: 400, code: 'validation_error' }, { status: 400 }),
+    [`GET /databases/${ids.database}`]: () => Response.json({ object: 'database', id: ids.database, url: `https://www.notion.so/${ids.database.replace(/-/g, '')}`,
+      title: [{ plain_text: 'Tasks' }], last_edited_time: '2026-10-02T00:00:00.000Z', parent: { type: 'page_id', page_id: ids.root } }),
+    [`POST /databases/${ids.database}/query`]: () => Response.json({ results: [page(ids.row, 'Write the spec', { type: 'database_id', database_id: ids.database })], has_more: false, next_cursor: null }),
+    [`GET /blocks/${ids.root}/children?page_size=100`]: () => Response.json({ has_more: false, next_cursor: null, results: [
+      { object: 'block', id: 'b1', type: 'heading_1', has_children: false, heading_1: { rich_text: text('Goals') } },
+      { object: 'block', id: 'b2', type: 'paragraph', has_children: false, paragraph: { rich_text: text('Ship it', { bold: true }) } },
+      { object: 'block', id: 'b3', type: 'bulleted_list_item', has_children: true, bulleted_list_item: { rich_text: text('First') } },
+      { object: 'block', id: ids.child, type: 'child_page', has_children: true, child_page: { title: 'Design' } },
+      { object: 'block', id: ids.database, type: 'child_database', has_children: false, child_database: { title: 'Tasks' } },
+      { object: 'block', id: 'b4', type: 'code', has_children: false, code: { language: 'typescript', rich_text: text('const a = 1;') } },
+    ] }),
+    'GET /blocks/b3/children?page_size=100': () => Response.json({ has_more: false, next_cursor: null, results: [
+      { object: 'block', id: 'b5', type: 'to_do', has_children: false, to_do: { checked: true, rich_text: text('Nested item') } },
+    ] }),
+    [`GET /blocks/${ids.nested}/children?page_size=100`]: () => Response.json({ has_more: false, next_cursor: null, results: [
+      { object: 'block', id: 'b6', type: 'paragraph', has_children: false, paragraph: { rich_text: text('Deep down') } },
+    ] }),
+  };
+  const calls: { route: string; token: string | null }[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    assert.ok(url.startsWith('https://api.notion.com/v1/'), `unexpected call ${url}`);
+    assert.equal(init?.redirect, 'manual');
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('notion-version'), '2022-06-28');
+    const token = headers.get('authorization')?.replace(/^Bearer /, '') ?? null;
+    const route = `${init?.method ?? 'GET'} ${url.slice('https://api.notion.com/v1'.length)}`;
+    calls.push({ route, token });
+    if (!token || !Object.values(tokens).includes(token)) return Response.json({ object: 'error', code: 'unauthorized' }, { status: 401 });
+    const answer = routes[route];
+    return answer ? answer() : Response.json({ object: 'error', code: 'object_not_found' }, { status: 404 });
+  });
+  return { ids, calls };
+}
+
+test('owners and admins bind Notion pages as workspace sources; sessions read them, and only them, with their owner\'s own Notion account', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'notion_read']);
+  const tokens = { admin: 'ntn_admin_secret_0123456789abcdef', creator: 'ntn_creator_secret_0123456789abcdef' };
+  const notion = notionFake(t, tokens);
+  const owner = s.session.ownerId;
+  // Connecting checks the token with Notion and never returns or logs it.
+  await denied(await s.admin.request('PUT', '/api/source-accounts/notion', { token: 'short' }), 400, 'invalid_notion_token');
+  await denied(await s.admin.request('PUT', '/api/source-accounts/notion', { token: 'ntn_wrong_secret_0123456789abcdef' }), 403, 'notion_account_rejected');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 409, 'notion_account_required');
+  const connected = await json<{ provider: string; name: string }>(await s.admin.request('PUT', '/api/source-accounts/notion', { token: tokens.admin }));
+  assert.deepEqual([connected.provider, connected.name], ['notion', 'Acme']);
+  assert.equal((await json<{ accounts: unknown[] }>(await s.admin.request('GET', '/api/source-accounts'))).accounts.length, 1);
+  assert.equal((await json<{ accounts: unknown[] }>(await s.creator.request('GET', '/api/source-accounts'))).accounts.length, 0);
+
+  // Only owners and admins bind sources; a link or a bare id names the page.
+  await denied(await s.host.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 403, 'forbidden');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: 'https://example.com/page' }), 400, 'invalid_source');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'drive', target: notion.ids.root }), 400, 'invalid_source');
+  const { source } = await json<{ source: WorkspaceNotionSource }>(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`,
+    { kind: 'notion', target: `https://www.notion.so/acme/Specs-${notion.ids.root.replace(/-/g, '')}?pvs=4` }), 201);
+  assert.deepEqual([source.kind, source.notionId, source.object, source.title], ['notion', notion.ids.root, 'page', 'Specs']);
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 409, 'source_exists');
+  assert.deepEqual((await json<{ sources: WorkspaceNotionSource[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/sources`))).sources.map(item => item.id), [source.id]);
+  assert.equal((await json<{ sources: number }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/repositories`))).sources, 2);
+  // Every session in the workspace gets the source in its grant.
+  const grant = await json<{ sources: unknown[] }>(await self(f, s.connector, 'network', { sessionId: s.session.id }));
+  assert.deepEqual(grant.sources, [{ id: source.id, kind: 'notion', object: 'page', title: 'Specs' }]);
+
+  const admissionId = admit(f, s.session.id, owner);
+  const read = (body: Record<string, unknown> = {}, admission = admissionId) => self(f, s.connector, 'notion/read', {
+    sessionId: s.session.id, actorId: owner, admissionId: admission, callId: 'call-1', source: source.id, ...body,
+  });
+  // Reads need a write message, and use the session owner's account, not the admin's who bound the source.
+  await denied(await read({}, admit(f, s.session.id, owner, { mode: 'ask' })), 403, 'notion_read_not_admitted');
+  await denied(await read(), 409, 'notion_account_required');
+  await json(await s.creator.request('PUT', '/api/source-accounts/notion', { token: tokens.creator }));
+  const before = notion.calls.length;
+  const root = await json<NotionReadView>(await read());
+  assert.ok(notion.calls.slice(before).every(call => call.token === tokens.creator));
+  assert.deepEqual([root.title, root.object, root.truncated], ['Specs', 'page', false]);
+  assert.equal(root.markdown, `# Goals\n**Ship it**\n- First\n  - [x] Nested item\n[Page: Design] (id ${notion.ids.child})\n[Database: Tasks] (id ${notion.ids.database})\n\`\`\`typescript\nconst a = 1;\n\`\`\``);
+  assert.deepEqual(root.children, [{ id: notion.ids.child, object: 'page', title: 'Design' }, { id: notion.ids.database, object: 'database', title: 'Tasks' }]);
+  // Pages and databases under the source, however deep, through blocks too; not others the account can read.
+  const tasks = await json<NotionReadView>(await read({ page: notion.ids.database }));
+  assert.deepEqual(tasks.rows?.map(row => row.title), ['Write the spec']);
+  const nested = await json<NotionReadView>(await read({ page: `https://www.notion.so/Nested-${notion.ids.nested.replace(/-/g, '')}` }));
+  assert.equal(nested.markdown, 'Deep down');
+  await denied(await read({ page: notion.ids.outside }), 403, 'notion_outside_source');
+  await denied(await read({ page: 'not a page' }), 400, 'invalid_input');
+  await denied(await read({ source: 'shared-repository' }), 404, 'source_not_found');
+  const audits = f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'notion.read'").all().map(row => JSON.parse(String(row.detail_json)));
+  assert.deepEqual(audits.map(item => item.page), [notion.ids.root, notion.ids.database, notion.ids.nested]);
+  const everything = JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all()) + JSON.stringify(f.sqlite.prepare('SELECT * FROM source_accounts').all());
+  assert.ok(!everything.includes(tokens.admin) && !everything.includes(tokens.creator), 'Tokens are stored only encrypted and never audited');
+
+  // Removing the source ends reads at once; repositories are removed under Repositories.
+  await denied(await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/sources/shared-repository`), 409, 'invalid_source');
+  await denied(await s.host.request('DELETE', `/api/workspaces/${s.team.id}/sources/${source.id}`), 403, 'forbidden');
+  await json(await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/sources/${source.id}`));
+  await denied(await read(), 404, 'source_not_found');
+  assert.deepEqual((await json<{ sources: unknown[] }>(await self(f, s.connector, 'network', { sessionId: s.session.id }))).sources, []);
+  await json(await s.creator.request('DELETE', '/api/source-accounts/notion'));
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM source_accounts WHERE user_id = ?').get(s.creator.user.id)!.n, 0);
+});
+
+test('notion reads need the notion_read tool or the owner\'s permission for that read', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']);
+  const tokens = { admin: 'ntn_admin_secret_0123456789abcdef' };
+  const notion = notionFake(t, tokens);
+  await json(await s.admin.request('PUT', '/api/source-accounts/notion', { token: tokens.admin }));
+  const { source } = await json<{ source: WorkspaceNotionSource }>(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 201);
+  const before = notion.calls.length;
+  const admissionId = admit(f, s.session.id, s.session.ownerId);
+  const read = () => self(f, s.connector, 'notion/read', { sessionId: s.session.id, actorId: s.session.ownerId, admissionId, callId: 'call-1', source: source.id });
+  await denied(await read(), 403, 'tool_not_allowed');
+  f.sqlite.prepare('INSERT INTO session_tool_grants (session_id,tool,call_id,approval_id,granted_by,created_at) VALUES (?,?,?,?,?,?)')
+    .run(s.session.id, 'notion_read', '', 'permission-any', s.session.ownerId, new Date().toISOString());
+  // Allowed now; the owner has no Notion account, and Notion is never asked.
+  await denied(await read(), 409, 'notion_account_required');
+  assert.equal(notion.calls.length, before);
+});
+
+test('a workspace whose only source is a Notion page can be shared with hosts and start sessions', async t => {
+  const f = await fixture(t);
+  const admin = await f.client('docs-admin'); const host = await f.githubClient();
+  const docs = await workspace(admin);
+  await addMember(admin, docs.id, host);
+  const connector = await connect(f, host);
+  // A real user's host can't be shared into a workspace with no source.
+  await denied(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${docs.id}`), 409, 'workspace_repositories_required');
+  const tokens = { admin: 'ntn_admin_secret_0123456789abcdef' };
+  const notion = notionFake(t, tokens);
+  await json(await admin.request('PUT', '/api/source-accounts/notion', { token: tokens.admin }));
+  await json(await admin.request('POST', `/api/workspaces/${docs.id}/sources`, { kind: 'notion', target: notion.ids.root }), 201);
+  assert.deepEqual(await json(await host.request('GET', `/api/workspaces/${docs.id}/repositories`)), { repositories: [], required: true, sources: 1 });
+  await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${docs.id}`));
+  const { models } = await json<{ models: ModelDefinition[] }>(await host.request('GET', `/api/workspaces/${docs.id}/models`));
+  provisionHub(f);
+  const { session } = await json<{ session: SessionRecord }>(await host.request('POST', '/api/sessions', { workspaceId: docs.id, modelId: models[0]!.id, title: 'Summarize the specs' }), 201);
+  assert.equal(session.status, 'ready');
 });

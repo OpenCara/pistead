@@ -203,8 +203,30 @@ so every path that binds or removes a repository (the API, imports, tests) keeps
 immutable, and a `git` source is refused without its own repository in its own workspace. Sharing a host with a
 workspace and starting a session now require a source (`workspaceHasSourceSQL`, `workspaceSourceIds` in
 `repositories.ts`), and the session insert requires the workspace's sources, not its repositories, to be unchanged.
-The error code stays `workspace_repositories_required` for API callers. The session grant and exports are unchanged
-until a non-Git kind exists: today every source is a repository, which they already carry.
+The error code stays `workspace_repositories_required` for API callers.
+
+**Done: steps 3 and 4.** The web app's workspace section is **Sources**, holding **Git repositories** and **Notion**;
+the setup step is **Add a source**; new-session and host-sharing gates (web and mobile) count every source
+(`WorkspaceRepositoryList.sources`). Notion is the first non-Git kind, read-only:
+
+- `source_accounts` (per user, provider `notion`, an internal integration secret, vault-encrypted with the user id as
+  AAD) under **Settings → Profile → Connected accounts**; `PUT/DELETE /api/source-accounts/notion` verify with
+  `GET /v1/users/me`.
+- `notion_sources` (the detail of a `notion` workspace source: Notion id, page or database, title, URL), at most 10 per
+  workspace; `GET/POST /api/workspaces/:id/sources` and `DELETE …/sources/:sourceId`, owners and admins, audited
+  (`workspace.source.added` / `.removed`). The adding admin's own Notion connection checks the page and names it.
+- The session grant lists them (`EgressGrant.sources`), and the runner names them in the instructions with a warning
+  that their content is other people's.
+- `notion_read {source, page?}`: a tool behind the connector capability `notion`, brokered like `github_read`
+  (`/api/connectors/self/notion/read`, `/api/internal/notion/read`): a write admission of the requester, the tool or
+  the owner's permission for that exact target, the **session owner's** Notion connection, and a target that is the
+  bound page or database or under it (`requireUnder` follows Notion parents, through blocks, at most 16 steps). A page
+  returns as Markdown (`apps/server/src/notion.ts`; at most 1,000 blocks, 3 levels of nested blocks) with its child
+  pages and databases; a database returns its 200 most recently edited rows. Results stay within 96 KiB of JSON, the
+  account is rechecked before the result leaves, and every read is audited (`notion.read`).
+
+Not yet: writes to Notion, exports of Notion sources in workspace data exports, OAuth (public integrations) instead
+of internal integration secrets, and the other kinds (Drive, Dropbox, OneDrive, Feishu, Tencent Docs).
 
 ## Open questions
 

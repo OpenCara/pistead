@@ -92,7 +92,9 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
   const foreign = Boolean(host && host.ownerId !== user.id);
   const availableModel = Boolean(model && host?.models.some(item => sameModel(item, model)));
   const available = Boolean(host?.online && !host.revokedAt && availableModel && (host.ownerId === user.id || host.workspaceIds.includes(workspace.id)));
-  const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (repositories.length || !repositoriesRequired));
+  // Any source counts (a Notion page, say); an older server counts only repositories.
+  const sourceCount = repos.data ? repos.data.sources ?? repos.data.repositories.length : 0;
+  const repositoriesReady = Boolean(repositories && !repos.error && !repos.loading && (sourceCount || !repositoriesRequired));
   const trusted = !foreign || Boolean(host && trustedHost === host.id);
   const canStart = Boolean(model && host && available && repositoriesReady && trusted && !action.busy);
 
@@ -132,8 +134,8 @@ function Composer({ workspace, onStarted }: { workspace: Workspace; onStarted: (
 
   const loading = models.loading || connections.loading;
   function blockingAlert() {
-    if (repos.error) return <Banner tone="warning" title="Unable to load repositories" actions={<Button small label="Retry" onPress={repos.refresh} />}>{repos.error}</Banner>;
-    if (repositories && !repositories.length && repositoriesRequired) return <Banner tone="warning" title="No repositories in this workspace">Sessions need at least one repository. Workspace owners and admins can bind one in workspace settings on the web.</Banner>;
+    if (repos.error) return <Banner tone="warning" title="Unable to load sources" actions={<Button small label="Retry" onPress={repos.refresh} />}>{repos.error}</Banner>;
+    if (repositories && !sourceCount && repositoriesRequired) return <Banner tone="warning" title="No sources in this workspace">Sessions need at least one source, such as a repository or a Notion page. Workspace owners and admins add them in workspace settings on the web.</Banner>;
     if (models.error) return <Banner tone="danger" title="Unable to load models" actions={<Button small label="Retry" onPress={models.refresh} />}>{models.error}</Banner>;
     const refreshHost = <Button small label="Refresh host status" onPress={connections.refresh} />;
     if (connections.error) return <Banner tone="warning" title="Unable to check host" actions={refreshHost}>{connections.error}</Banner>;

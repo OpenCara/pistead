@@ -11,10 +11,14 @@ export function RepositoryClonePolicy() {
   </div>;
 }
 
-/** `required`: the signed-in user's sessions and hosts in this workspace need a repository (until loaded, assume so). */
+/**
+ * `required`: the signed-in user's sessions and hosts in this workspace need a source (until loaded, assume so).
+ * `sourceCount`: its sources, repositories included (an older server counts only repositories).
+ */
 export function useWorkspaceRepositories(workspaceId: string | null) {
   const resource = useResource<WorkspaceRepositoryList>(workspaceId ? `/api/workspaces/${segment(workspaceId)}/repositories` : null);
-  return { repositories: resource.data?.repositories ?? null, required: resource.data?.required ?? true, loading: resource.loading, error: resource.error, refresh: resource.refresh };
+  const sourceCount = resource.data ? resource.data.sources ?? resource.data.repositories.length : null;
+  return { repositories: resource.data?.repositories ?? null, sourceCount, required: resource.data?.required ?? true, loading: resource.loading, error: resource.error, refresh: resource.refresh };
 }
 
 /** The caller's connected Git accounts: the GitHub sign-in account first (id "github") when connected, then token accounts. */

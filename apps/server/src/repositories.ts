@@ -222,7 +222,8 @@ export function registerRepositories(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/repositories', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
     await requireMember(c.env, workspaceId, actor);
-    return c.json({ repositories: await workspaceRepositories(c.env, workspaceId), required: !await legacyRepositoryFixture(c.env, actor) } satisfies WorkspaceRepositoryList);
+    return c.json({ repositories: await workspaceRepositories(c.env, workspaceId), required: !await legacyRepositoryFixture(c.env, actor),
+      sources: (await workspaceSourceIds(c.env, workspaceId)).length } satisfies WorkspaceRepositoryList);
   });
   app.post('/api/workspaces/:id/repositories', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;

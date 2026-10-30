@@ -9,6 +9,7 @@ import type { Database } from './db/types.js';
 import { auditStatement, requireMember, sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, now } from './http.js';
 import { authenticateConnector, requireCallbackScope, requireConnectorSession, type ConnectorRow } from './connectors.js';
+import { grantSources } from './sources.js';
 import { recheckAccess, repositoryAccess, repositorySettingsSelect, verifyRepository, type RepositorySettingsRow } from './repositories.js';
 import { lfsRelay, lfsRequestBytes } from './lfs.js';
 import { ownerGitAuthorization } from './push/targets.js';
@@ -76,6 +77,7 @@ export async function egressGrant(c: AppContext, connectorId: string | null): Pr
     policy: await workspaceNetworkPolicy(c.env.DB, row.workspace_id),
     repositories: repositories.map(repository => ({ bindingId: repository.id, provider: repository.provider, host: repository.host,
       repositoryId: repository.repository_id, fullName: repository.full_name, lfs: repository.lfs_enabled === 1 })),
+    sources: await grantSources(c.env, row.workspace_id),
   };
   return c.json(grant, 200, { 'Cache-Control': 'private, no-store' });
 }

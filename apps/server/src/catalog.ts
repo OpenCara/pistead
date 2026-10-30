@@ -159,6 +159,7 @@ function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
   if (tool === 'git_push') return capabilities.gitPush === true;
   if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
   if (tool === 'github_issue') return capabilities.githubIssues === true;
+  if (tool === 'notion_read') return capabilities.notion === true;
   return true;
 }
 
