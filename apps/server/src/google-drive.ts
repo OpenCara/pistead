@@ -114,11 +114,12 @@ async function requireUnder(secret: string, root: string, target: DriveFile): Pr
 const textTypes = /^(text\/|application\/(json|xml|x-yaml|yaml|javascript|x-sh|sql|toml|x-toml|csv)\b)/;
 const textNames = /\.(md|markdown|txt|csv|tsv|json|ya?ml|toml|xml|html?|css|js|ts|py|sh|sql|ini|cfg|log)$/i;
 
-async function exported(secret: string, item: DriveFile, mimeType: string): Promise<{ text: string; truncated: boolean } | null> {
+/** The export in `mimeType`; 'unsupported' where Drive doesn't export it so (400), 'refused' where it won't (403, too large). */
+async function exported(secret: string, item: DriveFile, mimeType: string): Promise<{ text: string; truncated: boolean } | 'unsupported' | 'refused'> {
   const answer = await drive(secret, `/files/${encodeURIComponent(item.id)}/export?mimeType=${encodeURIComponent(mimeType)}`, 'text', textLimit);
   if (answer.status === 200) return textBody(answer);
-  if (answer.status === 400) return null;
-  if (answer.status === 403) return { text: '', truncated: true };
+  if (answer.status === 400) return 'unsupported';
+  if (answer.status === 403) return 'refused';
   if (answer.status === 404) notFound('Google Drive', share);
   return fail(502, 'source_unavailable', 'Google Drive could not export the file. Try again later.');
 }
@@ -126,13 +127,14 @@ async function exported(secret: string, item: DriveFile, mimeType: string): Prom
 async function content(secret: string, item: DriveFile): Promise<{ content?: string; note?: string; truncated: boolean }> {
   if (item.type === 'document') {
     // Markdown where Drive exports it; plain text otherwise.
-    const body = await exported(secret, item, 'text/markdown') ?? await exported(secret, item, 'text/plain');
-    return body?.text ? { content: body.text, truncated: body.truncated } : { note: 'Google Drive could not export this document (it may be too large).', truncated: true };
+    let body = await exported(secret, item, 'text/markdown');
+    if (body === 'unsupported') body = await exported(secret, item, 'text/plain');
+    return typeof body === 'object' ? { content: body.text, truncated: body.truncated } : { note: 'Google Drive could not export this document (it may be too large).', truncated: true };
   }
   if (item.type === 'spreadsheet' || item.type === 'presentation') {
     const body = await exported(secret, item, item.type === 'spreadsheet' ? 'text/csv' : 'text/plain');
     const note = item.type === 'spreadsheet' ? 'Only the first sheet is exported, as CSV.' : undefined;
-    return body?.text ? { content: body.text, truncated: body.truncated, ...(note ? { note } : {}) } : { note: 'Google Drive could not export this file.', truncated: true };
+    return typeof body === 'object' ? { content: body.text, truncated: body.truncated, ...(note ? { note } : {}) } : { note: 'Google Drive could not export this file (it may be too large).', truncated: true };
   }
   if (item.mimeType.startsWith('application/vnd.google-apps.')) return { note: `A ${item.mimeType.slice('application/vnd.google-apps.'.length)} can't be read as text.`, truncated: false };
   const word = item.mimeType === docxFile.type || docxFile.name.test(item.title);

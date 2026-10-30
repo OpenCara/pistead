@@ -395,7 +395,7 @@ export class RunnerSession {
   readonly #hostSession: boolean;
   /** The workspace's repositories as of this open, for a clone session's instructions. */
   #cloneRepositories: string[] = [];
-  /** The workspace's sources other than repositories (Notion, Google Drive, Feishu/Lark) as of this open, for the instructions. */
+  /** The workspace's document sources as of this open, for the instructions. */
   #sources: GrantSource[] = [];
   /** The workspace's repositories whose Git LFS objects the egress proxy downloads, as of the session's opening. */
   #lfsRepositories: string[] = [];
@@ -1964,7 +1964,7 @@ export class RunnerSession {
         await this.permit(api, call, "github_issue", `${repository}: ${args.title}`, { write: true });
         return approvalText(await this.operationOutcome(await this.createApproval(attribution.initiatedBy, { kind: "github.issue", repository, title: args.title, body: args.body }, String(api.taskId), { permitted: true }), call));
       } }),
-      defineTool({ name: "source_read", description: "Read one of the workspace's document sources (source, its id as the instructions list it: Notion, Google Drive or Feishu/Lark) as the session owner, through Pistead: a page or document as text (Markdown where the provider gives it), a folder, database or wiki page as the items in it. Pass item (an id or link from an earlier result) to read an item under that source; others are refused. Long content is cut and marked truncated. Read-only; no credentials enter tools.", parameters: Type.Object({ source: Type.String(), item: Type.Optional(Type.String()) }), execute: async (args, api, call) => {
+      defineTool({ name: "source_read", description: "Read one of the workspace's document sources (source, its id as the instructions list it: Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark or Tencent Docs) as the session owner, through Pistead: a page or document as text (Markdown where the provider gives it), a folder, database or wiki page as the items in it. Pass item (an id or link from an earlier result) to read an item under that source; others are refused. Long content is cut and marked truncated. Read-only; no credentials enter tools.", parameters: Type.Object({ source: Type.String(), item: Type.Optional(Type.String()) }), execute: async (args, api, call) => {
         const attribution = await this.toolActor(api, false);
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(args.source)) throw new RunnerError(400, "source must be a source id, as the instructions list it");
         if (args.item !== undefined && !validSourceItem(args.item)) throw new RunnerError(400, "item must be an id or link of one line, as an earlier result gives it");

@@ -190,6 +190,8 @@ export function registerSources(app: Hono<WorkerEnv>): void {
     const item = await adapter.resolve(secret, input.target);
     await recheckAccount(c.env, account);
     const sourceId = id(); const created = now();
+    const limit = () => fail(409, 'source_limit', `A workspace has at most ${sourceLimits.documents} sources besides its repositories.`);
+    // The count below keeps a lone admin within the limit; the database's trigger keeps concurrent adds within it too.
     const results = await c.env.DB.batch([
       c.env.DB.query(`INSERT INTO workspace_sources (id, workspace_id, kind, repository_binding_id, created_at)
         SELECT ?, ?, ?, NULL, ? WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role IN ('owner','admin'))
@@ -199,12 +201,12 @@ export function registerSources(app: Hono<WorkerEnv>): void {
       c.env.DB.query(`INSERT INTO document_sources (source_id, workspace_id, kind, item_id, item_type, title, url, created_by)
         SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM workspace_sources WHERE id = ?)`)
         .bind(sourceId, workspaceId, kind, item.id, item.type, item.title, item.url, actor, sourceId),
-    ]);
+    ]).catch((error: unknown) => { if (/document source limit/.test(String(error instanceof Error ? error.message : error))) limit(); throw error; });
     if (!results[0].results[0]) {
       const existing = await c.env.DB.query('SELECT 1 FROM document_sources WHERE workspace_id = ? AND kind = ? AND item_id = ?').bind(workspaceId, kind, item.id).first();
       if (existing) fail(409, 'source_exists', 'This item is already a source of the workspace.');
       await requireMember(c.env, workspaceId, actor, ['owner', 'admin']);
-      fail(409, 'source_limit', `A workspace has at most ${sourceLimits.documents} sources besides its repositories.`);
+      limit();
     }
     await auditStatement(c.env, actor, 'workspace.source.added', workspaceId, null, { source: sourceId, kind, type: item.type, item: item.id }).run();
     return c.json({ source: publicSource({ source_id: sourceId, workspace_id: workspaceId, kind, item_id: item.id, item_type: item.type,

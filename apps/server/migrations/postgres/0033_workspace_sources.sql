@@ -87,6 +87,19 @@ END
 $$;
 CREATE TRIGGER document_sources_kind BEFORE INSERT ON document_sources
   FOR EACH ROW EXECUTE FUNCTION document_sources_kind();
+-- At most 20 document sources per workspace (sourceLimits.documents). Concurrent inserts for one workspace wait on a
+-- per-workspace advisory lock, so each counts the others' committed rows and the cap stays exact.
+CREATE FUNCTION document_sources_limit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('document_sources:' || NEW.workspace_id));
+  IF (SELECT COUNT(*) FROM document_sources WHERE workspace_id = NEW.workspace_id) >= 20 THEN
+    RAISE EXCEPTION 'workspace document source limit reached';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER document_sources_limit BEFORE INSERT ON document_sources
+  FOR EACH ROW EXECUTE FUNCTION document_sources_limit();
 CREATE TRIGGER document_sources_immutable BEFORE UPDATE ON document_sources
   FOR EACH ROW EXECUTE FUNCTION pistead_raise('workspace sources are immutable');
 

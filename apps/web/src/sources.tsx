@@ -8,7 +8,7 @@ import { href } from "./router";
 import { Icon } from "./icons";
 import { Alert, Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState, Row, Section, Sheet, StatusBadge, confirmDialog, useAction, useResource } from "./ui";
 
-/** The caller's connected accounts other than Git (Notion, Google Drive, Feishu/Lark). */
+/** The caller's connected accounts other than Git: one per document provider. */
 export function useSourceAccounts(enabled = true) {
   const resource = useResource<SourceAccountList>(enabled ? "/api/source-accounts" : null);
   return { accounts: resource.data?.accounts ?? null, loading: resource.loading, error: resource.error, refresh: resource.refresh };
@@ -177,14 +177,14 @@ export function DocumentSources({ workspaceId, workspaceName, admin, sources, lo
     <div className="card">
       <ResourceState loading={loading} error={error} retry={refresh}>
         {!sources?.length
-          ? <CardBody><span className="muted">No documents yet. Sessions read a bound Notion page, Google Drive folder or Feishu/Lark folder, document or wiki page, and what is under it, with their owner's own connection</span></CardBody>
+          ? <CardBody><span className="muted">No documents yet. Sessions read a bound Notion page or a folder or document in Google Drive, Dropbox, OneDrive, Feishu/Lark or Tencent Docs, and what is under it, with their owner's own connection</span></CardBody>
           : sources.map(source => <Row key={source.id} leading={<Icon name="file" size={16} />} title={source.title}
             hint={<>{documentKindNames[source.kind]} · {itemLabels[source.itemType]} · <a href={source.url} target="_blank" rel="noreferrer">Open</a></>}
             trailing={admin && <Button variant="outline" size="sm" disabled={action.busy} aria-label={`Remove ${source.title}`} onClick={() => void remove(source)}>Remove</Button>} />)}
         {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
       </ResourceState>
     </div>
-    {admin && accounts.accounts && !connected.length && <Alert variant="info" title="Connect an account to add documents" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Pistead checks each item you add with your own Notion, Google Drive or Feishu/Lark connection, in Settings → Profile → Connected accounts.</Alert>}
+    {admin && accounts.accounts && !connected.length && <Alert variant="info" title="Connect an account to add documents" actions={<LinkButton variant="outline" size="sm" href={href({ name: "settings", section: "profile" })}>Open profile</LinkButton>}>Pistead checks each item you add with your own connection to its provider, in Settings → Profile → Connected accounts.</Alert>}
     {admin && full && <Alert variant="info" title="Document source limit reached">A workspace has at most {sourceLimits.documents} document sources. Remove one to add another.</Alert>}
     {admin && connected.length > 0 && <AddSourceSheet open={adding} kinds={connected} workspaceId={workspaceId} close={() => setAdding(false)} added={() => { refresh(); changed(); }} />}
   </div>;

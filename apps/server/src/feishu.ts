@@ -70,7 +70,7 @@ function linkOf(value: unknown): string | undefined {
   return typeof value === 'string' && /^https:\/\/[a-z0-9.-]+\.(feishu\.cn|larksuite\.com)\//.test(value) ? value.slice(0, 2048) : undefined;
 }
 
-interface Listing { entries: SourceReadEntry[]; folders: string[]; nodes: { token: string; objToken?: string; objType?: string }[]; truncated: boolean }
+interface Listing { entries: SourceReadEntry[]; folders: string[]; nodes: { token: string; objToken?: string; objType?: string; hasChild?: boolean }[]; truncated: boolean }
 
 async function folderListing(secret: string, folder: string): Promise<Listing> {
   const listing: Listing = { entries: [], folders: [], nodes: [], truncated: false };
@@ -91,10 +91,12 @@ async function folderListing(secret: string, folder: string): Promise<Listing> {
 
 interface WikiNode { token: string; spaceId: string; objToken: string; objType: string; title: string; hasChild: boolean }
 
-function wikiNode(raw: unknown): WikiNode | null {
+/** A wiki node; `space` is the space it was listed in, for list items that don't repeat their space_id. */
+function wikiNode(raw: unknown, space?: string): WikiNode | null {
   const node = raw as Json | null;
-  if (!node || typeof node.node_token !== 'string' || typeof node.space_id !== 'string') return null;
-  return { token: node.node_token, spaceId: node.space_id, objToken: typeof node.obj_token === 'string' ? node.obj_token : '', objType: typeof node.obj_type === 'string' ? node.obj_type : '',
+  const spaceId = node && typeof node.space_id === 'string' ? node.space_id : space;
+  if (!node || typeof node.node_token !== 'string' || !spaceId) return null;
+  return { token: node.node_token, spaceId, objToken: typeof node.obj_token === 'string' ? node.obj_token : '', objType: typeof node.obj_type === 'string' ? node.obj_type : '',
     title: clean(node.title, sourceLimits.title) || 'Untitled', hasChild: node.has_child === true };
 }
 
@@ -109,9 +111,9 @@ async function nodeListing(secret: string, node: WikiNode): Promise<Listing> {
   do {
     const data: Json = (await call(secret, `/wiki/v2/spaces/${encodeURIComponent(node.spaceId)}/nodes?parent_node_token=${encodeURIComponent(node.token)}&page_size=50${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ''}`))!;
     for (const raw of Array.isArray(data.items) ? data.items : []) {
-      const child = wikiNode(raw);
+      const child = wikiNode(raw, node.spaceId);
       if (!child) continue;
-      listing.nodes.push({ token: child.token, objToken: child.objToken, objType: child.objType });
+      listing.nodes.push({ token: child.token, objToken: child.objToken, objType: child.objType, hasChild: child.hasChild });
       listing.entries.push({ id: `wiki:${child.token}`, type: 'wiki', title: child.title });
     }
     pageToken = data.has_more === true && typeof data.page_token === 'string' ? data.page_token : null;
@@ -144,7 +146,7 @@ async function requireUnder(secret: string, root: FeishuItem, target: FeishuItem
     if (!node.hasChild) continue;
     const listing = await nodeListing(secret, node);
     if (listing.nodes.some(child => (target.type === 'wiki' && child.token === target.token) || (target.type === 'document' && child.objType === 'docx' && child.objToken === target.token))) return;
-    for (const child of listing.nodes) queue.push({ token: child.token, spaceId: node.spaceId, objToken: child.objToken ?? '', objType: child.objType ?? '', title: '', hasChild: true });
+    for (const child of listing.nodes) queue.push({ token: child.token, spaceId: node.spaceId, objToken: child.objToken ?? '', objType: child.objType ?? '', title: '', hasChild: child.hasChild ?? true });
   }
   outsideSource();
 }

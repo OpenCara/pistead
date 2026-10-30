@@ -3,7 +3,7 @@ import { sourceReadLimits } from '../../../packages/shared/src/sources.js';
 import { fail } from './http.js';
 
 /**
- * Calls to document providers (Notion, Google, Feishu/Lark) as one connected account. Requests never follow redirects
+ * Calls to document providers (Notion, Google, Dropbox, Microsoft, Feishu/Lark, Tencent Docs) as one connected account. Requests never follow redirects
  * and read bounded bodies; adapters send credentials only to their provider's fixed API origin and turn every refusal
  * into a fixed, credential-free reason.
  */

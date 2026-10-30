@@ -57,6 +57,7 @@ function googleFake(t: TestContext) {
     designDoc00001: { name: 'Architecture', mimeType: 'application/vnd.google-apps.document', parents: ['subFolder00001'], body: '# Architecture\n\nThe plan.' },
     budgetSheet001: { name: 'Budget', mimeType: 'application/vnd.google-apps.spreadsheet', parents: ['rootFolder0001'], body: 'item,cost\nhosts,10' },
     notesFile00001: { name: 'notes.md', mimeType: 'text/markdown', parents: ['rootFolder0001'], body: 'plain notes' },
+    emptyDoc000001: { name: 'Blank', mimeType: 'application/vnd.google-apps.document', parents: ['rootFolder0001'], body: '' },
     photoFile00001: { name: 'photo.png', mimeType: 'image/png', parents: ['rootFolder0001'] },
     payrollDoc0001: { name: 'Payroll', mimeType: 'application/vnd.google-apps.document', parents: ['hrFolder00001'], body: 'secret' },
     hrFolder00001: { name: 'HR', mimeType: folder, parents: [] },
@@ -115,12 +116,15 @@ test('a Google Drive service account reads the folders, Docs, Sheets and text fi
   const root = await googleDriveAdapter.resolve(secret, 'https://drive.google.com/drive/folders/rootFolder0001?usp=sharing');
   assert.deepEqual([root.id, root.type, root.title], ['rootFolder0001', 'folder', 'Specs']);
   const listing = await googleDriveAdapter.read(secret, root, null);
-  assert.deepEqual(listing.entries?.map(entry => [entry.id, entry.type]), [['subFolder00001', 'folder'], ['budgetSheet001', 'spreadsheet'], ['notesFile00001', 'file'], ['photoFile00001', 'file']]);
+  assert.deepEqual(listing.entries?.map(entry => [entry.id, entry.type]), [['subFolder00001', 'folder'], ['budgetSheet001', 'spreadsheet'], ['notesFile00001', 'file'], ['emptyDoc000001', 'document'], ['photoFile00001', 'file']]);
   const doc = await googleDriveAdapter.read(secret, root, 'https://docs.google.com/document/d/designDoc00001/edit');
   assert.deepEqual([doc.type, doc.title, doc.content], ['document', 'Architecture', '# Architecture\n\nThe plan.']);
   const sheet = await googleDriveAdapter.read(secret, root, 'budgetSheet001');
   assert.equal(sheet.content, 'item,cost\nhosts,10');
   assert.equal((await googleDriveAdapter.read(secret, root, 'notesFile00001')).content, 'plain notes');
+  // An empty Doc is empty content, not a failed export.
+  const blank = await googleDriveAdapter.read(secret, root, 'emptyDoc000001');
+  assert.deepEqual([blank.content, blank.note], ['', undefined]);
   const photo = await googleDriveAdapter.read(secret, root, 'photoFile00001');
   assert.equal(photo.content, undefined);
   assert.match(photo.note!, /binary file \(image\/png\)/);
@@ -177,7 +181,8 @@ function feishuFake(t: TestContext, origin = 'https://open.feishu.cn') {
     }
     if (path === '/wiki/v2/spaces/7000/nodes') {
       return ok({ items: url.searchParams.get('parent_node_token') === 'wikRoot0000001'
-        ? [{ space_id: '7000', node_token: 'wikChild000001', obj_token: 'doxWiki0000001', obj_type: 'docx', title: 'Runbook', has_child: false }] : [], has_more: false });
+        // List items aren't guaranteed to repeat the space they were listed in.
+        ? [{ node_token: 'wikChild000001', obj_token: 'doxWiki0000001', obj_type: 'docx', title: 'Runbook', has_child: false }] : [], has_more: false });
     }
     return assert.fail(`unexpected Feishu call ${path}`);
   });

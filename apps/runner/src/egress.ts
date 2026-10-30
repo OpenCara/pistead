@@ -843,7 +843,7 @@ export function parseEgressGrant(value: unknown): EgressGrant {
     return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
       ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}), ...(repository.lfs ? { lfs: true } : {}) };
   });
-  // Document sources (Notion, Google Drive, Feishu/Lark) the agent reads through the control plane; absent from older control planes.
+  // Document sources (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs) the agent reads through the control plane; absent from older control planes.
   if (input.sources !== undefined && (!Array.isArray(input.sources) || input.sources.length > 100)) throw new RunnerError(502, "Invalid sources from the control plane");
   const sources = (input.sources as unknown[] | undefined)?.map((item): GrantSource => {
     const source = item as Partial<GrantSource> | null;

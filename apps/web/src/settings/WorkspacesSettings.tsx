@@ -149,7 +149,7 @@ function Repositories({ workspace, admin, repositories, sourceCount, loading, er
   }
   const canAdd = admin && Boolean(accounts.accounts?.length) && !full;
   return <Section bare title="Sources" info={<div className="stack">
-    <p>What this workspace's sessions work on: Git repositories, which agents clone, and documents (Notion, Google Drive, Feishu/Lark), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts.</p>
+    <p>What this workspace's sessions work on: Git repositories, which agents clone, and documents (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts.</p>
     {!admin && <p>Only workspace owners and admins can add or remove sources.</p>}
     <p>Changes apply at once, in running sessions too: a removed source can no longer be read, nor a removed repository pushed. To change a ref, remove and re-add the repository.</p>
     <p>Git LFS is off by default, and clones check out LFS pointer files. Turned on, sessions download the repository's LFS files with their owner's own account, where the host has git-lfs installed. Sessions never upload LFS files.</p>

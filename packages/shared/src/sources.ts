@@ -21,7 +21,7 @@ export const secretKinds: readonly DocumentKind[] = ["notion", "google-drive", "
 export const oauthKinds: readonly DocumentKind[] = ["notion", "google-drive", "dropbox", "onedrive", "tencent-docs"];
 
 export const sourceLimits = {
-  /** Document sources per workspace, all kinds together. */
+  /** Document sources per workspace, all kinds together. The migration's document_sources_limit trigger repeats it. */
   documents: 20,
   /** A bound item's title as stored and shown. */
   title: 300,

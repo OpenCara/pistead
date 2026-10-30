@@ -68,6 +68,12 @@ CREATE TRIGGER document_sources_kind BEFORE INSERT ON document_sources
 WHEN NOT EXISTS (SELECT 1 FROM workspace_sources WHERE id = NEW.source_id AND workspace_id = NEW.workspace_id AND kind = NEW.kind) BEGIN
   SELECT RAISE(ABORT, 'a document source needs its workspace source');
 END;
+-- At most 20 document sources per workspace (sourceLimits.documents). SQLite serializes writers, so the check in the
+-- same transaction as the insert is exact.
+CREATE TRIGGER document_sources_limit BEFORE INSERT ON document_sources
+WHEN (SELECT COUNT(*) FROM document_sources WHERE workspace_id = NEW.workspace_id) >= 20 BEGIN
+  SELECT RAISE(ABORT, 'workspace document source limit reached');
+END;
 CREATE TRIGGER document_sources_immutable BEFORE UPDATE ON document_sources BEGIN
   SELECT RAISE(ABORT, 'workspace sources are immutable');
 END;

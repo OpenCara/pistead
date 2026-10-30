@@ -46,7 +46,7 @@ export interface ConnectorCapabilities {
    */
   crossSessions?: boolean;
   /**
-   * The connector reads the workspace's document sources (Notion, Google Drive, Feishu/Lark) through the control plane
+   * The connector reads the workspace's document sources (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs) through the control plane
    * (source_read). Absent on older connectors. New kinds of source need no newer connector.
    */
   sources?: boolean;

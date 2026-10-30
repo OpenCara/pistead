@@ -90,3 +90,16 @@ test('sources are immutable, and a git source needs its own repository in its ow
   sqlite.exec("DELETE FROM workspace_sources WHERE id = 'notion'");
   assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM document_sources').get()!.n, 0);
 });
+
+test('a workspace has at most 20 document sources, whatever inserts them', () => {
+  const sqlite = fixture();
+  migrate(sqlite, [sourcesMigration]);
+  const source = sqlite.prepare(`INSERT INTO workspace_sources (id, workspace_id, kind, repository_binding_id, created_at) VALUES (?, ?, 'notion', NULL, '2026-03-01')`);
+  const detail = sqlite.prepare(`INSERT INTO document_sources (source_id, workspace_id, kind, item_id, item_type, title, url, created_by) VALUES (?, ?, 'notion', ?, 'page', 'Page', 'https://www.notion.so/x', 'owner')`);
+  const add = (workspace: string, index: number) => { source.run(`${workspace}-${index}`, workspace); detail.run(`${workspace}-${index}`, workspace, `item-${index}`); };
+  for (let index = 0; index < 20; index++) add('one', index);
+  assert.throws(() => add('one', 20), /document source limit reached/);
+  // Another workspace has its own 20.
+  add('two', 0);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM document_sources WHERE workspace_id = 'one'").get()!.n, 20);
+});
