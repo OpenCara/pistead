@@ -192,6 +192,14 @@ test("web_fetch stops with its call", async () => {
   await refusal(fetchPage("https://example.com/slow", { policy: async () => open, upstream, signal: controller.signal }), 499, /stopped/);
 });
 
+test("a fetch stopped before its page arrives reads none of it, and lets the response go", async () => {
+  const controller = new AbortController();
+  const body = new Readable({ read() {} });
+  const upstream = async () => { controller.abort(); return { status: 200, headers: { "content-type": "text/plain" }, body }; };
+  await refusal(fetchPage("https://example.com/", { policy: async () => open, upstream, signal: controller.signal }), 499, /stopped/);
+  assert.equal(body.destroyed, true);
+});
+
 test("web search queries and counts are checked before anything leaves the host", () => {
   assert.equal(webSearchQuery("  rust \n async  traits "), "rust async traits");
   assert.throws(() => webSearchQuery(" "), /empty/);

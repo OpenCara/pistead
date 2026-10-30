@@ -152,9 +152,10 @@ async function download(source: Readable, encoding: string | undefined, signal: 
   let size = 0;
   let truncated = false;
   const abort = () => source.destroy(new Error("aborted"));
-  if (signal.aborted) throw new Error("aborted");
   signal.addEventListener("abort", abort, { once: true });
   try {
+    // A call stopped already reads nothing; the finally below still lets its response go.
+    if (signal.aborted) throw new Error("aborted");
     for await (const chunk of source as AsyncIterable<Buffer>) {
       if (size + chunk.length > webLimits.downloadBytes) {
         chunks.push(chunk.subarray(0, webLimits.downloadBytes - size));
