@@ -196,6 +196,16 @@ Google Drive, Dropbox, OneDrive, Tencent Docs and the rest are others.
 
 Steps 1 and 2 are a refactor with no visible behaviour change, and can land before any integration.
 
+**Done: steps 1 and 2.** Migration `0032_workspace_sources.sql` (Postgres `0025_workspace_sources.sql`) adds
+`workspace_sources` and backfills one `git` row per repository, with the repository's id. A `git` source references its
+repository (`repository_binding_id`, `ON DELETE CASCADE`), and an insert trigger on `workspace_repositories` adds it,
+so every path that binds or removes a repository (the API, imports, tests) keeps the two in step. Sources are
+immutable, and a `git` source is refused without its own repository in its own workspace. Sharing a host with a
+workspace and starting a session now require a source (`workspaceHasSourceSQL`, `workspaceSourceIds` in
+`repositories.ts`), and the session insert requires the workspace's sources, not its repositories, to be unchanged.
+The error code stays `workspace_repositories_required` for API callers. The session grant and exports are unchanged
+until a non-Git kind exists: today every source is a repository, which they already carry.
+
 ## Open questions
 
 - Is the main demand reading context (specs, notes) or writing documents back? Reading-only cuts the work roughly

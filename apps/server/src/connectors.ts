@@ -14,7 +14,7 @@ import { markSessionChanged } from './session-changes.js';
 import { githubComment, githubIssue, githubMerge, githubRead } from './github-broker.js';
 import { pushComplete, pushCredential } from './push/broker.js';
 import { connectorRestoreDownload } from './restore-routes.js';
-import { legacyRepositoryFixture, requireConfiguredWorkspace } from './repositories.js';
+import { legacyRepositoryFixture, requireConfiguredWorkspace, workspaceHasSourceSQL } from './repositories.js';
 import { connectorAdmins, connectorHostGrants, managedConnector, requireManagedWorkspace, viewerHostCommands } from './host-access.js';
 import { connectorHostConfig } from './host-config.js';
 import { disabledModelKeys, hostModelSettings } from './host-models.js';
@@ -451,7 +451,7 @@ export function registerConnectors(app: Hono<WorkerEnv>): void {
         OR EXISTS (SELECT 1 FROM connector_shares WHERE connector_id = ? AND workspace_id = ?))
       AND EXISTS (SELECT 1 FROM connectors WHERE id = ? AND owner_id = ? AND revoked_at IS NULL)
       AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?)
-      AND (EXISTS (SELECT 1 FROM workspace_repositories WHERE workspace_id = ?)
+      AND (${workspaceHasSourceSQL('?')}
         OR (? = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ? AND auth_kind = 'test')))
       ON CONFLICT (connector_id, workspace_id) DO UPDATE SET created_at = connector_shares.created_at
       RETURNING connector_id`)
