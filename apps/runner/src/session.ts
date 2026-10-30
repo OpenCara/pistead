@@ -2477,10 +2477,11 @@ export class RunnerSession {
         meta.forkedFrom = { sessionId: from.sessionId, entryId: from.entryId };
         doc.json = JSON.stringify(meta);
       }, context);
-      // On the source's model and reasoning, where this host still offers them (it is the same host); else its own.
-      const model = agent.model && this.models.getModel(agent.model.provider, agent.model.modelId) ? agent.model : undefined;
-      const level = agent.thinkingLevel && thinkingLevels.includes(agent.thinkingLevel) ? agent.thinkingLevel : undefined;
-      if (model || level) await shared.configure({ ...(model ? { model } : {}), ...(level ? { thinkingLevel: level } : {}) }, context);
+      // The control plane started this session on the source's current model when it still could (the host offers it
+      // and nobody disabled it), else on the source's own: only on the same model does the reasoning level carry over.
+      // The model itself is the control plane's choice, never set here.
+      const same = agent.model?.provider === this.modelRef.provider && agent.model.modelId === this.modelRef.modelId;
+      if (same && agent.thinkingLevel && thinkingLevels.includes(agent.thinkingLevel)) await shared.configure({ thinkingLevel: agent.thinkingLevel }, context);
       this.#activity?.changed();
       return { conversationId: String(shared.id), entries: entries.length };
     });

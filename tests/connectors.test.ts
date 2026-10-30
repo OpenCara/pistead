@@ -2439,12 +2439,25 @@ test('its owner forks a session from a message into a new one on the same host a
   const audit = f.sqlite.prepare("SELECT actor_id, detail_json FROM audit WHERE session_id = ? AND action = 'session.forked'").all(session.id);
   assert.deepEqual(audit.map(row => ({ ...row })), [{ actor_id: s.owner.user.id, detail_json: JSON.stringify({ sourceSessionId: s.session.id, entryId: '1:12' }) }]);
 
-  // A host that names no model, or one it no longer offers here: the model the session started on.
-  for (const current of [undefined, { provider: s.model.provider, modelId: 'gone', thinkingLevel: 'high' as const }]) {
-    agent = current;
+  // A host that names no model, or one no new session may start on now: the model the session started on.
+  const fallsBack = async () => {
     const { session: fallback } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12' }), 201);
     assert.equal(model(fallback.id), s.model.id);
+  };
+  for (const current of [undefined, { provider: s.model.provider, modelId: 'gone', thinkingLevel: 'high' as const }]) {
+    agent = current;
+    await fallsBack();
   }
+  agent = { provider: s.model.provider, modelId: 'second', thinkingLevel: 'high' };
+  // The host stopped offering it: its row stays, unavailable.
+  f.sqlite.prepare('UPDATE models SET available = 0 WHERE id = ?').run('second-model');
+  await fallsBack();
+  // Its owner disabled it on the host: its row stays available.
+  f.sqlite.prepare('UPDATE models SET available = 1 WHERE id = ?').run('second-model');
+  f.sqlite.prepare('INSERT INTO connector_disabled_models (connector_id, provider, model_id, disabled_by, disabled_at) VALUES (?,?,?,?,?)')
+    .run(s.connector.connectorId, s.model.provider, 'second', s.owner.user.id, new Date().toISOString());
+  await fallsBack();
+  f.sqlite.prepare('DELETE FROM connector_disabled_models WHERE model_id = ?').run('second');
   const { session: titled } = await json<{ session: SessionRecord }>(await s.owner.request('POST', `${path}/fork`, { entryId: '1:12', title: 'Try another way' }), 201);
   assert.equal(titled.title, 'Try another way');
   for (const body of [{}, { entryId: '1:12', visibility: 'private' }, { entryId: 'x' }]) await denied(await s.owner.request('POST', `${path}/fork`, body), 400, 'invalid_input');

@@ -18,13 +18,13 @@ import { sha256 } from "../packages/shared/src/crypto.js";
 const ALICE = "test:alice";
 const BOB = "test:bob";
 
-function binding(id: string, ownerId = ALICE): RunnerBinding {
+function binding(id: string, ownerId = ALICE, modelId = "faux-1"): RunnerBinding {
   const createdAt = "2026-01-01T00:00:00Z";
   return {
     session: { id, workspaceId: "workspace", ownerId, agentVersionId: "version-1", title: "Rewind", policyVersion: 1, status: "ready", createdAt, repositories: [], repositoryMode: "clone" },
     owner: { id: ownerId, githubId: null, githubLogin: ownerId.slice(5), displayName: ownerId.slice(5), gitName: "Owner", gitEmail: "owner@example.test", env: {}, githubConnected: false },
     agent: { id: "version-1", agentId: "agent", authorId: ownerId, workspaceId: "workspace", version: 1, name: "Agent", description: "", instructions: "Use tools.", tools: ["identity"], modelId: "model-1", createdAt },
-    model: { id: "model-1", workspaceId: "workspace", name: "Model", provider: "faux", modelId: "faux-1" },
+    model: { id: "model-1", workspaceId: "workspace", name: "Model", provider: "faux", modelId },
   };
 }
 
@@ -71,8 +71,8 @@ async function fixture(t: TestContext) {
     get service() { return service; },
     backups,
     hold() { release = Promise.withResolvers<void>(); return () => release.resolve(); },
-    async provision(id: string, ownerId = ALICE) {
-      const input = binding(id, ownerId);
+    async provision(id: string, ownerId = ALICE, modelId?: string) {
+      const input = binding(id, ownerId, modelId);
       const now = Math.floor(Date.now() / 1000);
       return service.provision(input, { aud: "runner", sessionId: id, actorId: ownerId, ownerId, action: "create", policyVersion: 1, iat: now, exp: now + 60, jti: randomUUID(), bodyHash: await sha256("") });
     },
@@ -280,14 +280,21 @@ test("going back to before a failed message, or before the first, leaves its sta
   assert.equal(await activity(session), "done");
 });
 
-test("a fork goes on with the model and reasoning the conversation uses now", async t => {
+test("a fork on the conversation's current model goes on with its reasoning; on another model, with that model's own", async t => {
   const runner = await fixture(t);
   const source = await runner.provision("fork-model-source");
   await send(source, "one");
   const view = await send(source, "two", { model: { provider: "faux", modelId: "faux-2" }, thinkingLevel: "high" });
   assert.deepEqual(view.agent, { provider: "faux", modelId: "faux-2", thinkingLevel: "high" });
-  const target = await runner.provision("fork-model-target");
-  assert.equal((await target.view()).agent?.modelId, "faux-1");
-  await runner.service.fork(target, await ticket(target, "fork"), { sourceSessionId: "fork-model-source", entryId: find(view, "assistant", "saw one|two").id });
-  assert.deepEqual((await target.view()).agent, { provider: "faux", modelId: "faux-2", thinkingLevel: "high" });
+  const entryId = find(view, "assistant", "saw one|two").id;
+  // The control plane starts the fork on the current model when it still may.
+  const current = await runner.provision("fork-model-current", ALICE, "faux-2");
+  await runner.service.fork(current, await ticket(current, "fork"), { sourceSessionId: "fork-model-source", entryId });
+  assert.deepEqual((await current.view()).agent, { provider: "faux", modelId: "faux-2", thinkingLevel: "high" });
+  // Else on the source's own model, which the host never changes back to the one the control plane refused.
+  const own = await runner.provision("fork-model-own");
+  const before = (await own.view()).agent;
+  await runner.service.fork(own, await ticket(own, "fork"), { sourceSessionId: "fork-model-source", entryId });
+  assert.deepEqual((await own.view()).agent, before);
+  assert.equal(before?.modelId, "faux-1");
 });

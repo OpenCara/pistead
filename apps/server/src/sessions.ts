@@ -1,4 +1,5 @@
 import type { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
 import type { ApprovalRecord, ChatOptions, Operation, Permission, RunnerBinding, SessionRole, SessionView, SubmitResult, WorkspaceRole } from '../../../packages/shared/src/types.js';
 import { accessModes, permissions, sessionRoles, thinkingLevels } from '../../../packages/shared/src/types.js';
@@ -330,14 +331,20 @@ function messageEntry(input: Record<string, unknown>): string {
  */
 /**
  * The model a fork of `source` starts on: the one its host reports for the shared conversation now, which messages may
- * have changed (the host carries the reasoning level over too), else the model the session started on.
+ * have changed, while its owner may still start a session on it (the host offers it and nobody disabled it); else the
+ * model the session started on. On the current model, the host carries the reasoning level over too.
  */
 async function forkModel(c: AppContext, source: SessionRow): Promise<string> {
   const { agent } = (await sessionView(c, source, { latest: true })).view;
   if (agent) {
-    const current = await c.env.DB.query<{ id: string }>('SELECT id FROM models WHERE workspace_id = ? AND connector_id = ? AND provider = ? AND model_id = ?')
-      .bind(source.workspace_id, source.connector_id ?? null, agent.provider, agent.modelId).first();
-    if (current) return current.id;
+    const rows = await c.env.DB.query<{ id: string }>('SELECT id FROM models WHERE workspace_id = ? AND connector_id = ? AND provider = ? AND model_id = ?')
+      .bind(source.workspace_id, source.connector_id ?? null, agent.provider, agent.modelId).all();
+    for (const row of rows) {
+      // The same rule a new session's model meets: a host that stopped offering it keeps its row, and so does one
+      // whose owner or admins disabled it.
+      try { return (await requireModel(c.env, row.id, source.owner_id)).id; }
+      catch (error) { if (!(error instanceof HTTPException)) throw error; }
+    }
   }
   const own = await c.env.DB.query<{ model_id: string }>('SELECT model_id FROM agent_versions WHERE id = ?').bind(source.agent_version_id).first();
   if (!own) fail(409, 'invalid_binding', 'Session binding is incomplete.');
