@@ -35,11 +35,11 @@ function modelCount(connector: ConnectorInfo) {
   return `${count(connector.models.length, "model", "models")}${disabled ? `, ${disabled} disabled` : ""}`;
 }
 
-/** Repository gate for sharing: work needs a bound repository wherever the server requires one. */
+/** Source gate for sharing: work needs a source (a repository, a Notion page) wherever the server requires one. */
 function useRepositoryGate(workspace: Workspace | null) {
   const repositories = useResource<WorkspaceRepositoryList>(workspace ? `/api/workspaces/${segment(workspace.id)}/repositories` : null);
   const listed = !repositories.loading && !repositories.error ? repositories.data : null;
-  const configured = Boolean(workspace && listed && (listed.repositories.length || !listed.required));
+  const configured = Boolean(workspace && listed && (listed.repositories.length || listed.sources || !listed.required));
   return { ...repositories, configured };
 }
 

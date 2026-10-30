@@ -8,6 +8,7 @@ import { z } from "zod";
 import type { ConnectorCapabilities, ConnectorCredentials, ConnectorRpcRequest, ConnectorRpcResponse, LocalModelSummary, RestoreDescriptor } from "../../../packages/shared/src/connector.js";
 import { connectorLimits, connectorRequestTimeoutMs } from "../../../packages/shared/src/connector.js";
 import { sha256, signToken } from "../../../packages/shared/src/crypto.js";
+import { documentItemTypes, documentKinds, type SourceReadView } from "../../../packages/shared/src/sources.js";
 import type { AuthorizationRequest, AuthorizationResult, GitHubEffectAuthority, GitHubIssueView, RunnerAction, RunnerBinding, ScheduleToolResult, SessionActivity, SessionBranch } from "../../../packages/shared/src/types.js";
 import type { SessionsToolResult } from "../../../packages/shared/src/cross-session.js";
 import { webLimits, webSearchProviders, type WebSearchResult } from "../../../packages/shared/src/web.js";
@@ -205,9 +206,9 @@ function capabilities(value?: ConnectorCapabilities, mode: { unsandboxed?: boole
   // owner runs it unsandboxed.
   const cache = mode.repositoryCache ? { repositoryCache: true } : {};
   if (mode.unsandboxed) return { platform: result.platform, sandbox: false, productionShell: false, unsandboxed: true, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, schedules: true, crossSessions: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache };
+    github: true, githubIssues: true, sources: true, schedules: true, crossSessions: true, plainGit: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache };
   return { platform: result.platform, sandbox: result.sandbox, productionShell: result.productionShell, chatOptions: true, chatImages: true, gitProviders: true, gitPush: true,
-    github: true, githubIssues: true, schedules: true, crossSessions: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache,
+    github: true, githubIssues: true, sources: true, schedules: true, crossSessions: true, plainGit: true, cloneBackups: true, sessionBranches: true, conversationBackups: true, hostConfig: true, compactionConfig: true, ...cache,
     ...(mode.gpu ? { gpu: mode.gpu } : {}) };
 }
 
@@ -636,6 +637,11 @@ export class LocalConnector {
         const view = await this.brokerCallback(await this.connection(), "/api/connectors/self/github/read", payload, GITHUB_READ_LIMIT);
         z.looseObject({ repository: z.string(), number: z.number().int().positive(), title: z.string(), comments: z.array(z.unknown()) }).parse(view);
         return view as GitHubIssueView;
+      },
+      sourceRead: async request => {
+        const view = await this.brokerCallback(await this.connection(), "/api/connectors/self/sources/read", request, GITHUB_READ_LIMIT);
+        z.looseObject({ source: z.string(), kind: z.enum(documentKinds), id: z.string(), type: z.enum(documentItemTypes), title: z.string(), truncated: z.boolean() }).parse(view);
+        return view as SourceReadView;
       },
       githubMerge: async request => {
         const payload = {

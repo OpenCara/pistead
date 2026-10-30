@@ -17,7 +17,8 @@ export type RepositoryAccess = { provider: 'github'; github: GitHubAccess } | { 
 interface ExpectedRepository { repositoryId: string; fullName: string }
 interface RepositoryResolution {
   repositories: SessionRepository[];
-  bindingIds: string;
+  /** The workspace's sources (workspace_sources ids, as a sorted JSON array); the session insert requires them unchanged. */
+  sourceIds: string;
   githubAuthority: Pick<GitHubAccess, 'ciphertext' | 'githubId'> | null;
   /** Token accounts that resolved the pins; session admission requires each to be unchanged. */
   credentials: { id: string; ciphertext: string }[];
@@ -70,10 +71,21 @@ export async function workspaceRepositories(env: Env, workspaceId: string): Prom
 export async function legacyRepositoryFixture(env: Env, userId: string): Promise<boolean> {
   return testMode(env) && (await getUser(env, userId))?.auth_kind === 'test';
 }
+/** The ids of a workspace's sources (a Git repository is one kind), sorted. Every session in the workspace gets them all. */
+export async function workspaceSourceIds(env: Env, workspaceId: string): Promise<string[]> {
+  const rows = await env.DB.query<{ id: string }>('SELECT id FROM workspace_sources WHERE workspace_id = ? ORDER BY id').bind(workspaceId).all();
+  return rows.map(row => row.id);
+}
+/** SQL true when workspace `workspaceId` (a placeholder or column) has at least one source. */
+export function workspaceHasSourceSQL(workspaceId: string): string {
+  return `EXISTS (SELECT 1 FROM workspace_sources WHERE workspace_id = ${workspaceId})`;
+}
+// The code keeps its name (workspace_repositories_required) for API callers that match on it.
+const sourcesRequired = 'workspace_repositories_required';
 export async function requireConfiguredWorkspace(env: Env, workspaceId: string, userId: string): Promise<void> {
   await requireMember(env, workspaceId, userId);
-  if (!await env.DB.query('SELECT 1 FROM workspace_repositories WHERE workspace_id = ?').bind(workspaceId).first() &&
-      !await legacyRepositoryFixture(env, userId)) fail(409, 'workspace_repositories_required', 'Configure at least one repository for this workspace first.');
+  if (!await env.DB.query(`SELECT 1 WHERE ${workspaceHasSourceSQL('?')}`).bind(workspaceId).first() &&
+      !await legacyRepositoryFixture(env, userId)) fail(409, sourcesRequired, 'Add at least one source, such as a repository, to this workspace first.');
 }
 /** Worktree paths must be distinct and never nest, ignoring case (macOS and Windows hosts). */
 function conflictingPaths(paths: string[]): boolean {
@@ -198,19 +210,21 @@ export async function cloneSessionRepository(env: Env, row: SessionRow, matches:
 }
 /**
  * A clone session pins nothing and borrows no owner credential at creation: the egress relay checks the owner's own
- * access on every read. The workspace still needs a repository, and its bindings must not change before the insert.
+ * access on every read. The workspace still needs a source (a repository, say), and its sources must not change before
+ * the insert.
  */
 export async function cloneRepositories(env: Env, workspaceId: string, ownerId: string): Promise<RepositoryResolution> {
   await requireMember(env, workspaceId, ownerId);
-  const configured = await workspaceRepositories(env, workspaceId);
-  if (!configured.length && !await legacyRepositoryFixture(env, ownerId)) fail(409, 'workspace_repositories_required', 'Configure at least one repository before starting a session.');
-  return { repositories: [], bindingIds: JSON.stringify(configured.map(item => item.id)), githubAuthority: null, credentials: [] };
+  const sources = await workspaceSourceIds(env, workspaceId);
+  if (!sources.length && !await legacyRepositoryFixture(env, ownerId)) fail(409, sourcesRequired, 'Add at least one source, such as a repository, before starting a session.');
+  return { repositories: [], sourceIds: JSON.stringify(sources), githubAuthority: null, credentials: [] };
 }
 export function registerRepositories(app: Hono<WorkerEnv>): void {
   app.get('/api/workspaces/:id/repositories', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;
     await requireMember(c.env, workspaceId, actor);
-    return c.json({ repositories: await workspaceRepositories(c.env, workspaceId), required: !await legacyRepositoryFixture(c.env, actor) } satisfies WorkspaceRepositoryList);
+    return c.json({ repositories: await workspaceRepositories(c.env, workspaceId), required: !await legacyRepositoryFixture(c.env, actor),
+      sources: (await workspaceSourceIds(c.env, workspaceId)).length } satisfies WorkspaceRepositoryList);
   });
   app.post('/api/workspaces/:id/repositories', async c => {
     const workspaceId = identifier(c.req.param('id')); const actor = c.get('auth').userId;

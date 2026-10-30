@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { HTTPException } from 'hono/http-exception';
@@ -7,7 +7,7 @@ import { app } from '../apps/server/src/index.js';
 import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
 import { authorizeConnectorTicket, type ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import type { Env } from '../apps/server/src/types.js';
-import { encryptToken } from '../apps/server/src/vault.js';
+import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { runScheduledPrompts } from '../apps/server/src/scheduled-prompts.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostCommandGrant, HostModelSettings } from '../packages/shared/src/connector.js';
@@ -15,6 +15,7 @@ import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Op
 import { retiredToolNames, toolNames } from '../packages/shared/src/types.js';
 import { sha256 } from '../packages/shared/src/crypto.js';
 import { diffView } from '../packages/shared/src/view-patch.js';
+import type { SourceReadView, WorkspaceDocumentSource } from '../packages/shared/src/sources.js';
 
 const origin = 'http://localhost:8787';
 const testSecret = 'connectors-test-secret-not-for-deployment';
@@ -2065,7 +2066,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   assert.equal(session.status, 'ready');
   const agent = startedAgent();
   assert.equal(agent.id, session.agentVersionId);
-  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search'].includes(tool)));
+  assert.deepEqual(agent.tools, offered.filter(tool => !['git_push', 'github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search', 'source_read'].includes(tool)));
   assert.deepEqual([agent.name, agent.instructions, agent.workspaceId, agent.authorId, agent.modelId], [s.model.name, '', null, s.owner.user.id, s.model.id]);
 
   // There is no agent catalog: agents can't be listed, revised or published.
@@ -2077,7 +2078,7 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true } }));
   const { session: second } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(second.agentVersionId, session.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_read', 'github_merge', 'host_bash', 'github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search', 'source_read'].includes(tool)));
 
   // A host that also carries GitHub reads and merges offers those; opening issues, managing schedules and working with
   // other sessions need their own capabilities, which connectors from before github_issue, schedule and sessions don't
@@ -2085,10 +2086,10 @@ test('a session starts from a model and gets its own chat agent with every tool 
   await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, hostCommands: true } }));
   const { session: third } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(third.agentVersionId, second.agentVersionId);
-  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search'].includes(tool)));
+  assert.deepEqual(startedAgent().tools, offered.filter(tool => !['github_issue', 'schedule', 'sessions', 'web_fetch', 'web_search', 'source_read'].includes(tool)));
 
   // A current host gets every tool.
-  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, schedules: true, crossSessions: true, hostCommands: true, web: true } }));
+  await json(await self(f, s.connector, 'manifest', { ...manifest, capabilities: { ...manifest.capabilities, gitPush: true, github: true, githubIssues: true, schedules: true, crossSessions: true, sources: true, hostCommands: true, web: true } }));
   const { session: fourth } = await json<{ session: SessionRecord }>(await start(s.owner, { modelId: s.model.id }), 201);
   assert.notEqual(fourth.agentVersionId, third.agentVersionId);
   assert.deepEqual(startedAgent().tools, offered);
@@ -3488,4 +3489,309 @@ test('a web search goes to the operator\'s provider with its key, and returns pl
   const before = calls.length;
   await denied(await search(), 403, 'web_search_off');
   assert.equal(calls.length, before);
+});
+
+/** A fake Notion API: a root page with a child page, a page under that child's block, a database, and a page elsewhere. */
+function notionFake(t: TestContext, tokens: Record<string, string>) {
+  const ids = { root: '11111111-1111-4111-8111-111111111111', child: '22222222-2222-4222-8222-222222222222', block: '33333333-3333-4333-8333-333333333333',
+    nested: '44444444-4444-4444-8444-444444444444', database: '55555555-5555-4555-8555-555555555555', row: '66666666-6666-4666-8666-666666666666',
+    outside: '77777777-7777-4777-8777-777777777777' };
+  const page = (id: string, title: string, parent: Record<string, unknown>) => ({ object: 'page', id, url: `https://www.notion.so/${title}-${id.replace(/-/g, '')}`,
+    last_edited_time: '2026-10-01T00:00:00.000Z', parent, properties: { Name: { type: 'title', title: [{ plain_text: title }] } } });
+  const text = (content: string, annotations: Record<string, boolean> = {}) => [{ plain_text: content, annotations, href: null }];
+  const routes: Record<string, () => Response> = {
+    'GET /users/me': () => Response.json({ object: 'user', id: 'bot', type: 'bot', name: 'Pistead', bot: { workspace_name: 'Acme' } }),
+    [`GET /pages/${ids.root}`]: () => Response.json(page(ids.root, 'Specs', { type: 'workspace', workspace: true })),
+    [`GET /pages/${ids.child}`]: () => Response.json(page(ids.child, 'Design', { type: 'page_id', page_id: ids.root })),
+    [`GET /blocks/${ids.block}`]: () => Response.json({ object: 'block', id: ids.block, type: 'toggle', parent: { type: 'page_id', page_id: ids.child } }),
+    [`GET /pages/${ids.nested}`]: () => Response.json(page(ids.nested, 'Nested', { type: 'block_id', block_id: ids.block })),
+    [`GET /pages/${ids.outside}`]: () => Response.json(page(ids.outside, 'Payroll', { type: 'workspace', workspace: true })),
+    [`GET /pages/${ids.database}`]: () => Response.json({ object: 'error', status: 400, code: 'validation_error' }, { status: 400 }),
+    [`GET /databases/${ids.database}`]: () => Response.json({ object: 'database', id: ids.database, url: `https://www.notion.so/${ids.database.replace(/-/g, '')}`,
+      title: [{ plain_text: 'Tasks' }], last_edited_time: '2026-10-02T00:00:00.000Z', parent: { type: 'page_id', page_id: ids.root } }),
+    [`POST /databases/${ids.database}/query`]: () => Response.json({ results: [page(ids.row, 'Write the spec', { type: 'database_id', database_id: ids.database })], has_more: false, next_cursor: null }),
+    [`GET /blocks/${ids.root}/children?page_size=100`]: () => Response.json({ has_more: false, next_cursor: null, results: [
+      { object: 'block', id: 'b1', type: 'heading_1', has_children: false, heading_1: { rich_text: text('Goals') } },
+      { object: 'block', id: 'b2', type: 'paragraph', has_children: false, paragraph: { rich_text: text('Ship it', { bold: true }) } },
+      { object: 'block', id: 'b3', type: 'bulleted_list_item', has_children: true, bulleted_list_item: { rich_text: text('First') } },
+      { object: 'block', id: ids.child, type: 'child_page', has_children: true, child_page: { title: 'Design' } },
+      { object: 'block', id: ids.database, type: 'child_database', has_children: false, child_database: { title: 'Tasks' } },
+      { object: 'block', id: 'b4', type: 'code', has_children: false, code: { language: 'typescript', rich_text: text('const a = 1;') } },
+    ] }),
+    'GET /blocks/b3/children?page_size=100': () => Response.json({ has_more: false, next_cursor: null, results: [
+      { object: 'block', id: 'b5', type: 'to_do', has_children: false, to_do: { checked: true, rich_text: text('Nested item') } },
+    ] }),
+    [`GET /blocks/${ids.nested}/children?page_size=100`]: () => Response.json({ has_more: false, next_cursor: null, results: [
+      { object: 'block', id: 'b6', type: 'paragraph', has_children: false, paragraph: { rich_text: text('Deep down') } },
+    ] }),
+  };
+  const calls: { route: string; token: string | null }[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    assert.ok(url.startsWith('https://api.notion.com/v1/'), `unexpected call ${url}`);
+    assert.equal(init?.redirect, 'manual');
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get('notion-version'), '2022-06-28');
+    const token = headers.get('authorization')?.replace(/^Bearer /, '') ?? null;
+    const route = `${init?.method ?? 'GET'} ${url.slice('https://api.notion.com/v1'.length)}`;
+    calls.push({ route, token });
+    if (!token || !Object.values(tokens).includes(token)) return Response.json({ object: 'error', code: 'unauthorized' }, { status: 401 });
+    const answer = routes[route];
+    return answer ? answer() : Response.json({ object: 'error', code: 'object_not_found' }, { status: 404 });
+  });
+  return { ids, calls };
+}
+
+test('owners and admins bind Notion pages as workspace sources; sessions read them, and only them, with their owner\'s own Notion account', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'source_read']);
+  const tokens = { admin: 'ntn_admin_secret_0123456789abcdef', creator: 'ntn_creator_secret_0123456789abcdef' };
+  const notion = notionFake(t, tokens);
+  const owner = s.session.ownerId;
+  // Connecting checks the token with Notion and never returns or logs it.
+  await denied(await s.admin.request('PUT', '/api/source-accounts/notion', { token: 'short' }), 400, 'invalid_source_account');
+  await denied(await s.admin.request('PUT', '/api/source-accounts/notion', { token: 'ntn_wrong_secret_0123456789abcdef' }), 403, 'source_account_rejected');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 409, 'source_account_required');
+  const connected = await json<{ provider: string; name: string }>(await s.admin.request('PUT', '/api/source-accounts/notion', { token: tokens.admin }));
+  assert.deepEqual([connected.provider, connected.name], ['notion', 'Acme']);
+  assert.equal((await json<{ accounts: unknown[] }>(await s.admin.request('GET', '/api/source-accounts'))).accounts.length, 1);
+  assert.equal((await json<{ accounts: unknown[] }>(await s.creator.request('GET', '/api/source-accounts'))).accounts.length, 0);
+
+  // Only owners and admins bind sources; a link or a bare id names the page.
+  await denied(await s.host.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 403, 'forbidden');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: 'https://example.com/page' }), 400, 'invalid_source');
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'drive', target: notion.ids.root }), 400, 'invalid_source');
+  const { source } = await json<{ source: WorkspaceDocumentSource }>(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`,
+    { kind: 'notion', target: `https://www.notion.so/acme/Specs-${notion.ids.root.replace(/-/g, '')}?pvs=4` }), 201);
+  assert.deepEqual([source.kind, source.itemId, source.itemType, source.title], ['notion', notion.ids.root, 'page', 'Specs']);
+  await denied(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 409, 'source_exists');
+  assert.deepEqual((await json<{ sources: WorkspaceDocumentSource[] }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/sources`))).sources.map(item => item.id), [source.id]);
+  assert.equal((await json<{ sources: number }>(await s.creator.request('GET', `/api/workspaces/${s.team.id}/repositories`))).sources, 2);
+  // Every session in the workspace gets the source in its grant.
+  const grant = await json<{ sources: unknown[] }>(await self(f, s.connector, 'network', { sessionId: s.session.id }));
+  assert.deepEqual(grant.sources, [{ id: source.id, kind: 'notion', type: 'page', title: 'Specs' }]);
+
+  const admissionId = admit(f, s.session.id, owner);
+  const read = (body: Record<string, unknown> = {}, admission = admissionId) => self(f, s.connector, 'sources/read', {
+    sessionId: s.session.id, actorId: owner, admissionId: admission, callId: 'call-1', source: source.id, ...body,
+  });
+  // Reads need a write message, and use the session owner's account, not the admin's who bound the source.
+  await denied(await read({}, admit(f, s.session.id, owner, { mode: 'ask' })), 403, 'source_read_not_admitted');
+  await denied(await read(), 409, 'source_account_required');
+  await json(await s.creator.request('PUT', '/api/source-accounts/notion', { token: tokens.creator }));
+  const before = notion.calls.length;
+  const root = await json<SourceReadView>(await read());
+  assert.ok(notion.calls.slice(before).every(call => call.token === tokens.creator));
+  assert.deepEqual([root.title, root.type, root.truncated], ['Specs', 'page', false]);
+  assert.equal(root.content, `# Goals\n**Ship it**\n- First\n  - [x] Nested item\n[Page: Design] (id ${notion.ids.child})\n[Database: Tasks] (id ${notion.ids.database})\n\`\`\`typescript\nconst a = 1;\n\`\`\``);
+  assert.deepEqual(root.entries, [{ id: notion.ids.child, type: 'page', title: 'Design' }, { id: notion.ids.database, type: 'database', title: 'Tasks' }]);
+  // Pages and databases under the source, however deep, through blocks too; not others the account can read.
+  const tasks = await json<SourceReadView>(await read({ item: notion.ids.database }));
+  assert.deepEqual(tasks.entries?.map(row => row.title), ['Write the spec']);
+  const nested = await json<SourceReadView>(await read({ item: `https://www.notion.so/Nested-${notion.ids.nested.replace(/-/g, '')}` }));
+  assert.equal(nested.content, 'Deep down');
+  await denied(await read({ item: notion.ids.outside }), 403, 'source_outside');
+  await denied(await read({ item: 'not a page' }), 400, 'invalid_input');
+  await denied(await read({ source: 'shared-repository' }), 404, 'source_not_found');
+  const audits = f.sqlite.prepare("SELECT detail_json FROM audit WHERE action = 'source.read'").all().map(row => JSON.parse(String(row.detail_json)));
+  assert.deepEqual(audits.map(item => item.item), [notion.ids.root, notion.ids.database, notion.ids.nested]);
+  const everything = JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all()) + JSON.stringify(f.sqlite.prepare('SELECT * FROM source_accounts').all());
+  assert.ok(!everything.includes(tokens.admin) && !everything.includes(tokens.creator), 'Tokens are stored only encrypted and never audited');
+
+  // Removing the source ends reads at once; repositories are removed under Repositories.
+  await denied(await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/sources/shared-repository`), 409, 'invalid_source');
+  await denied(await s.host.request('DELETE', `/api/workspaces/${s.team.id}/sources/${source.id}`), 403, 'forbidden');
+  await json(await s.admin.request('DELETE', `/api/workspaces/${s.team.id}/sources/${source.id}`));
+  await denied(await read(), 404, 'source_not_found');
+  assert.deepEqual((await json<{ sources: unknown[] }>(await self(f, s.connector, 'network', { sessionId: s.session.id }))).sources, []);
+  await json(await s.creator.request('DELETE', '/api/source-accounts/notion'));
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM source_accounts WHERE user_id = ?').get(s.creator.user.id)!.n, 0);
+});
+
+test('source reads need the source_read tool or the owner\'s permission for that read', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity']);
+  const tokens = { admin: 'ntn_admin_secret_0123456789abcdef' };
+  const notion = notionFake(t, tokens);
+  await json(await s.admin.request('PUT', '/api/source-accounts/notion', { token: tokens.admin }));
+  const { source } = await json<{ source: WorkspaceDocumentSource }>(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'notion', target: notion.ids.root }), 201);
+  const before = notion.calls.length;
+  const admissionId = admit(f, s.session.id, s.session.ownerId);
+  const read = () => self(f, s.connector, 'sources/read', { sessionId: s.session.id, actorId: s.session.ownerId, admissionId, callId: 'call-1', source: source.id });
+  await denied(await read(), 403, 'tool_not_allowed');
+  f.sqlite.prepare('INSERT INTO session_tool_grants (session_id,tool,call_id,approval_id,granted_by,created_at) VALUES (?,?,?,?,?,?)')
+    .run(s.session.id, 'source_read', '', 'permission-any', s.session.ownerId, new Date().toISOString());
+  // Allowed now; the owner has no Notion account, and Notion is never asked.
+  await denied(await read(), 409, 'source_account_required');
+  assert.equal(notion.calls.length, before);
+});
+
+test('a workspace whose only source is a Notion page can be shared with hosts and start sessions', async t => {
+  const f = await fixture(t);
+  const admin = await f.client('docs-admin'); const host = await f.githubClient();
+  const docs = await workspace(admin);
+  await addMember(admin, docs.id, host);
+  const connector = await connect(f, host);
+  // A real user's host can't be shared into a workspace with no source.
+  await denied(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${docs.id}`), 409, 'workspace_repositories_required');
+  const tokens = { admin: 'ntn_admin_secret_0123456789abcdef' };
+  const notion = notionFake(t, tokens);
+  await json(await admin.request('PUT', '/api/source-accounts/notion', { token: tokens.admin }));
+  await json(await admin.request('POST', `/api/workspaces/${docs.id}/sources`, { kind: 'notion', target: notion.ids.root }), 201);
+  assert.deepEqual(await json(await host.request('GET', `/api/workspaces/${docs.id}/repositories`)), { repositories: [], required: true, sources: 1 });
+  await json(await host.request('PUT', `/api/connectors/${connector.connectorId}/shares/${docs.id}`));
+  const { models } = await json<{ models: ModelDefinition[] }>(await host.request('GET', `/api/workspaces/${docs.id}/models`));
+  provisionHub(f);
+  const { session } = await json<{ session: SessionRecord }>(await host.request('POST', '/api/sessions', { workspaceId: docs.id, modelId: models[0]!.id, title: 'Summarize the specs' }), 201);
+  assert.equal(session.status, 'ready');
+});
+
+/**
+ * A fake Dropbox: its OAuth token endpoint (codes and refresh tokens it issued), the account endpoint, and a folder
+ * with one text file in the account of whoever holds `tokens`.
+ */
+function dropboxFake(t: TestContext) {
+  const issued = new Map<string, { verifier: string; refresh: string }>();
+  const access = new Set<string>();
+  const calls: { url: string; authorization: string | null; body: string }[] = [];
+  let serial = 0;
+  const challenges = new Map<string, string>();
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const body = typeof init?.body === 'string' ? init.body : '';
+    const authorization = new Headers(init?.headers).get('authorization');
+    calls.push({ url, authorization, body });
+    assert.equal(init?.redirect, 'manual');
+    if (url === 'https://api.dropboxapi.com/oauth2/token') {
+      const form = new URLSearchParams(body);
+      assert.equal(form.get('client_id'), 'dropbox-app-key');
+      assert.equal(form.get('client_secret'), 'dropbox-app-secret');
+      if (form.get('grant_type') === 'authorization_code') {
+        const code = form.get('code')!;
+        const challenge = challenges.get(code);
+        assert.equal(form.get('redirect_uri'), `${origin}/api/source-accounts/dropbox/oauth/callback`);
+        // PKCE: the verifier must hash to the challenge the authorization request carried.
+        if (!challenge || createHash('sha256').update(form.get('code_verifier') ?? '').digest('base64url') !== challenge) return Response.json({ error: 'invalid_grant' }, { status: 400 });
+        challenges.delete(code);
+        const token = `sl.access-${++serial}`; const refresh = `refresh-${serial}`;
+        access.add(token); issued.set(refresh, { verifier: '', refresh });
+        return Response.json({ access_token: token, refresh_token: refresh, expires_in: 14400, token_type: 'bearer' });
+      }
+      if (form.get('grant_type') === 'refresh_token' && issued.has(form.get('refresh_token')!)) {
+        const token = `sl.access-${++serial}`;
+        access.add(token);
+        // Dropbox doesn't repeat the refresh token: Pistead keeps the one it has.
+        return Response.json({ access_token: token, expires_in: 14400, token_type: 'bearer' });
+      }
+      return Response.json({ error: 'invalid_grant' }, { status: 400 });
+    }
+    const token = authorization?.replace(/^Bearer /, '') ?? '';
+    if (!access.has(token)) return Response.json({ error: 'expired_access_token' }, { status: 401 });
+    if (url === 'https://api.dropboxapi.com/2/users/get_current_account') return Response.json({ email: 'creator@example.test', name: { display_name: 'Creator' } });
+    const folder = { '.tag': 'folder', id: 'id:folder00001', name: 'Specs', path_lower: '/specs', path_display: '/Specs' };
+    const notes = { '.tag': 'file', id: 'id:notes000001', name: 'notes.md', path_lower: '/specs/notes.md', path_display: '/Specs/notes.md', server_modified: '2026-10-01T00:00:00Z' };
+    const payroll = { '.tag': 'file', id: 'id:payroll0001', name: 'payroll.md', path_lower: '/hr/payroll.md', path_display: '/HR/payroll.md' };
+    if (url === 'https://api.dropboxapi.com/2/files/get_metadata') {
+      const path = JSON.parse(body).path;
+      const found = [folder, notes, payroll].find(item => item.id === path || item.path_lower === String(path).toLowerCase());
+      return found ? Response.json(found) : Response.json({ error_summary: 'path/not_found/' }, { status: 409 });
+    }
+    if (url === 'https://api.dropboxapi.com/2/files/list_folder') return Response.json({ entries: [notes], has_more: false, cursor: 'c' });
+    if (url === 'https://content.dropboxapi.com/2/files/download') {
+      assert.equal(JSON.parse(new Headers(init?.headers).get('dropbox-api-arg')!).path, 'id:notes000001');
+      return new Response('# Notes\nShip it.');
+    }
+    return assert.fail(`unexpected Dropbox call ${url}`);
+  });
+  return { calls, challenges, access };
+}
+
+/** Signs `client` in to the fake Dropbox: start, the provider's redirect back with a code, the callback. */
+async function dropboxSignIn(f: Fixture, client: Client, dropbox: ReturnType<typeof dropboxFake>, code: string) {
+  const start = await client.request('GET', '/api/source-accounts/dropbox/oauth/start');
+  assert.equal(start.status, 302);
+  const location = new URL(start.headers.get('location')!);
+  assert.equal(`${location.origin}${location.pathname}`, 'https://www.dropbox.com/oauth2/authorize');
+  assert.equal(location.searchParams.get('client_id'), 'dropbox-app-key');
+  assert.equal(location.searchParams.get('redirect_uri'), `${origin}/api/source-accounts/dropbox/oauth/callback`);
+  assert.equal(location.searchParams.get('token_access_type'), 'offline');
+  assert.equal(location.searchParams.get('code_challenge_method'), 'S256');
+  const state = location.searchParams.get('state')!;
+  const cookie = start.headers.get('set-cookie')!.match(/test-source-oauth=([^;]+)/)![1];
+  assert.equal(cookie, state);
+  dropbox.challenges.set(code, location.searchParams.get('code_challenge')!);
+  return { state, callback: (query: Record<string, string>, withCookie = true) => client.request('GET', `/api/source-accounts/dropbox/oauth/callback?${new URLSearchParams(query)}`,
+    undefined, withCookie ? { Cookie: `${client.cookie}; test-source-oauth=${state}` } : {}) };
+}
+
+function returned(response: Response) {
+  assert.equal(response.status, 302);
+  const location = new URL(response.headers.get('location')!);
+  assert.equal(location.origin, origin);
+  assert.equal(location.hash, '#/settings/profile');
+  return { result: location.searchParams.get('result'), reason: location.searchParams.get('reason') };
+}
+
+test('members connect Dropbox by signing in; the state, PKCE and the member are checked, and tokens are refreshed on the control plane', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'source_read']);
+  const dropbox = dropboxFake(t);
+  // Without an app registered by the operator, there is no sign-in.
+  assert.deepEqual((await json<{ oauth: string[] }>(await s.creator.request('GET', '/api/source-accounts'))).oauth, []);
+  await denied(await s.creator.request('GET', '/api/source-accounts/dropbox/oauth/start'), 404, 'oauth_unavailable');
+  Object.assign(f.env, { DROPBOX_CLIENT_ID: 'dropbox-app-key', DROPBOX_CLIENT_SECRET: 'dropbox-app-secret' });
+  assert.deepEqual((await json<{ oauth: string[] }>(await s.creator.request('GET', '/api/source-accounts'))).oauth, ['dropbox']);
+  // Dropbox has no secret to paste.
+  await denied(await s.creator.request('PUT', '/api/source-accounts/dropbox', { token: 'x'.repeat(40) }), 400, 'oauth_required');
+
+  // A callback without this browser's state cookie, with another member's state, or with a forged state links nothing.
+  const flow = await dropboxSignIn(f, s.creator, dropbox, 'code-1');
+  assert.deepEqual(returned(await flow.callback({ code: 'code-1', state: flow.state }, false)), { result: 'error', reason: 'invalid_state' });
+  const admins = await dropboxSignIn(f, s.admin, dropbox, 'code-2');
+  assert.deepEqual(returned(await s.creator.request('GET', `/api/source-accounts/dropbox/oauth/callback?code=code-2&state=${admins.state}`, undefined,
+    { Cookie: `${s.creator.cookie}; test-source-oauth=${admins.state}` })), { result: 'error', reason: 'invalid_state' });
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM source_accounts WHERE provider = 'dropbox'").get()!.n, 0);
+  // Starting again replaces the member's earlier state. A verifier that doesn't match the challenge fails at Dropbox.
+  const second = await dropboxSignIn(f, s.creator, dropbox, 'code-3');
+  dropbox.challenges.set('code-3', 'not-the-challenge');
+  assert.deepEqual(returned(await second.callback({ code: 'code-3', state: second.state })), { result: 'error', reason: 'source_account_rejected' });
+  // The member declining at Dropbox.
+  const declined = await dropboxSignIn(f, s.creator, dropbox, 'code-4');
+  assert.deepEqual(returned(await declined.callback({ error: 'access_denied', state: declined.state })), { result: 'error', reason: 'access_denied' });
+
+  const good = await dropboxSignIn(f, s.creator, dropbox, 'code-5');
+  assert.deepEqual(returned(await good.callback({ code: 'code-5', state: good.state })), { result: 'connected', reason: null });
+  // A state works once.
+  assert.deepEqual(returned(await good.callback({ code: 'code-5', state: good.state })), { result: 'error', reason: 'invalid_state' });
+  const { accounts } = await json<{ accounts: { provider: string; method: string; name: string }[] }>(await s.creator.request('GET', '/api/source-accounts'));
+  assert.deepEqual(accounts.map(account => [account.provider, account.method, account.name]), [['dropbox', 'oauth', 'creator@example.test']]);
+
+  // The admin binds a folder with their own sign-in; the creator's session reads it with the creator's.
+  const adminFlow = await dropboxSignIn(f, s.admin, dropbox, 'code-6');
+  assert.deepEqual(returned(await adminFlow.callback({ code: 'code-6', state: adminFlow.state })), { result: 'connected', reason: null });
+  const { source } = await json<{ source: WorkspaceDocumentSource }>(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'dropbox', target: '/Specs' }), 201);
+  assert.deepEqual([source.itemId, source.itemType, source.title, source.url], ['id:folder00001', 'folder', 'Specs', 'https://www.dropbox.com/home/Specs']);
+  const admissionId = admit(f, s.session.id, s.session.ownerId);
+  const read = (item?: string) => self(f, s.connector, 'sources/read', { sessionId: s.session.id, actorId: s.session.ownerId, admissionId, callId: 'call-1', source: source.id, ...(item ? { item } : {}) });
+  const folder = await json<SourceReadView>(await read());
+  assert.deepEqual(folder.entries?.map(entry => entry.id), ['id:notes000001']);
+  assert.equal((await json<SourceReadView>(await read('id:notes000001'))).content, '# Notes\nShip it.');
+  await denied(await read('/HR/payroll.md'), 403, 'source_outside');
+
+  // An expired access token is refreshed before the read, stored again, and the refresh token kept.
+  const row = f.sqlite.prepare("SELECT ciphertext FROM source_accounts WHERE user_id = ? AND provider = 'dropbox'").get(s.session.ownerId)!;
+  const stored = JSON.parse(await decryptToken(f.env, s.session.ownerId, String(row.ciphertext)));
+  const expired = { ...stored, expiresAt: Date.now() - 1000 };
+  f.sqlite.prepare("UPDATE source_accounts SET ciphertext = ? WHERE user_id = ? AND provider = 'dropbox'").run(await encryptToken(f.env, s.session.ownerId, JSON.stringify(expired)), s.session.ownerId);
+  dropbox.access.delete(stored.accessToken);
+  const before = dropbox.calls.length;
+  assert.equal((await json<SourceReadView>(await read('id:notes000001'))).content, '# Notes\nShip it.');
+  const refresh = dropbox.calls.slice(before).find(call => call.url === 'https://api.dropboxapi.com/oauth2/token')!;
+  assert.equal(new URLSearchParams(refresh.body).get('refresh_token'), stored.refreshToken);
+  const renewed = JSON.parse(await decryptToken(f.env, s.session.ownerId, String(f.sqlite.prepare("SELECT ciphertext FROM source_accounts WHERE user_id = ? AND provider = 'dropbox'").get(s.session.ownerId)!.ciphertext)));
+  assert.notEqual(renewed.accessToken, stored.accessToken);
+  assert.equal(renewed.refreshToken, stored.refreshToken);
+  assert.ok(renewed.expiresAt > Date.now());
+  // Nothing the provider issued is logged.
+  const audit = JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all());
+  assert.ok(!/sl\.access-|refresh-\d/.test(audit));
+  // Only the access token went to Dropbox's API; the refresh token went only to its token endpoint.
+  assert.ok(dropbox.calls.every(call => call.url === 'https://api.dropboxapi.com/oauth2/token' || !call.body.includes('refresh-')));
 });

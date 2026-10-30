@@ -71,7 +71,7 @@ Just for yourself, on one computer? `npx pistead@latest serve` runs all of it th
 
 1. **Run the server** with Docker and create its first administrator with `--create-admin`: the image signs people in with a [username and password](#username-and-password), and with GitHub once you add a GitHub OAuth app, and takes new accounts only through invite links. See [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub** or your username and password, then choose **New workspace** and name it.
-3. **Bind a repository**: **Settings → Workspaces →** your workspace **→ Repositories → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**.
+3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page or a folder or document in Google Drive, Dropbox, OneDrive, Feishu/Lark or Tencent Docs works too (see [Document sources](#document-sources)).
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
    ```sh
@@ -81,7 +81,7 @@ Just for yourself, on one computer? `npx pistead@latest serve` runs all of it th
 5. **Start a session**: select the workspace in the sidebar, choose your host in **Host**, describe the task and press Enter.
 6. **Approve** commands and commits as their cards appear above the transcript.
 
-To bring in teammates, share the workspace's invite link (**Settings → Workspaces → Members → Invite link**) and accept them under **Pending members** once they've signed in from it; where the server takes new accounts only through invitations (`SIGNUP=invite`, as the Docker image does; see [Who can create an account](#who-can-create-an-account)), that is how they get one. Or they sign in once and send you their **User ID** from **Settings → Profile**, and you add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Bind a repository**, **Pair a host**, **Start a session**) until all three are done.
+To bring in teammates, share the workspace's invite link (**Settings → Workspaces → Members → Invite link**) and accept them under **Pending members** once they've signed in from it; where the server takes new accounts only through invitations (`SIGNUP=invite`, as the Docker image does; see [Who can create an account](#who-can-create-an-account)), that is how they get one. Or they sign in once and send you their **User ID** from **Settings → Profile**, and you add them under **Settings → Workspaces → Members → Add member**. To let them run sessions on your machine, share your host with the workspace under **Settings → Hosts →** your host **→ Sharing**. Each workspace page shows a **Setup** checklist (**Add a source**, **Pair a host**, **Start a session**) until all three are done.
 
 ## Using Pistead
 
@@ -122,7 +122,7 @@ Where the operator sets `PASSWORD_AUTH=true`, as the [Docker image](#docker) doe
 
 ### Workspaces and members
 
-Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Repositories**, **Push access**, **Network access**, **Transcripts**, **Session database**, **Members** and, for owners and admins, **Data export**.
+Create a workspace with **New workspace** in the sidebar or on the home screen; you become its owner. Its page under **Settings → Workspaces** has these sections: **General**, **Setup**, **Sources**, **Push access**, **Network access**, **Transcripts**, **Session database**, **Members** and, for owners and admins, **Data export**.
 
 Owners and admins add people with **Members → Add member**, entering the person's **User ID** and a role; saving an existing member changes their role, which takes effect at once. Or they share an invite link instead (see [Invite links and pending members](#invite-links-and-pending-members)). Below the owner there are four tiers:
 
@@ -138,7 +138,7 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
 | View, message and stop any session, private ones included | ✓ | ✓ | | | |
 | Rename, archive or unarchive any session, change its visibility and tool output, give it session roles, turn off its share link | ✓ | ✓ | | | |
-| Bind and remove repositories, set their push policy and Git LFS | ✓ | ✓ | | | |
+| Add and remove sources (repositories, documents), set repositories' push policy and Git LFS | ✓ | ✓ | | | |
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
 | Add, change or remove collaborators, members and viewers | ✓ | ✓ | | | |
@@ -174,7 +174,7 @@ Workspace admins manage only their workspace; the server's administrators are co
 
 ### Repositories and Git accounts
 
-Sessions work on the repositories bound to their workspace. Until a workspace has one, nobody can share a host with it or start a session in it.
+Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [documents](#document-sources) (Notion, Google Drive, Dropbox, OneDrive and SharePoint, Feishu/Lark, Tencent Docs), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
 
 Connect the accounts that can read your repositories under **Settings → Profile → Git accounts** (**Add account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
@@ -187,7 +187,7 @@ Connect the accounts that can read your repositories under **Settings → Profil
 | Azure DevOps | Personal access token and organization | Code (Read); opening pull requests or pushing with your account needs Code (Read & write) |
 | Gitea / Forgejo | Personal access token and host | `read:repository` and `read:user`; opening pull requests or pushing with your account needs `write:repository` |
 
-Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Repositories → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's access, on hosts that have `git-lfs` installed (Pistead uses the host's own). The host downloads them from the provider itself where Pistead gives it a credential for the repository (see [Network access](#network-access)), else Pistead relays them; either way the provider's download links and the tokens that come with them never reach the sandbox. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
+Owners and admins bind a repository under **Settings → Workspaces →** the workspace **→ Sources → Add repository**: choose an **Account**, a repository the account can access (the first 3,000 are listed) and, optionally, a **Branch, tag or commit** (the default branch otherwise), then **Bind repository**. To change a ref, remove the repository and bind it again. Each repository row also has **Allow agent pushes to the default branch** (see [Commits, pushes and pull requests](#commits-pushes-and-pull-requests)). and **Git LFS**, off by default: sessions then check out the repository's LFS files as pointer files, as plain Git does. Turned on, sandboxed sessions download LFS files' content when they clone the repository, through the host's egress proxy and with the session owner's access, on hosts that have `git-lfs` installed (Pistead uses the host's own). The host downloads them from the provider itself where Pistead gives it a credential for the repository (see [Network access](#network-access)), else Pistead relays them; either way the provider's download links and the tokens that come with them never reach the sandbox. Sessions never upload LFS objects, so commits that add or change LFS-tracked files shouldn't be pushed from a session. Unsandboxed hosts use their own Git and `git-lfs` configuration, whatever the setting.
 
 Sessions **clone on demand**: every new session starts with an empty worktree and pins nothing.
 
@@ -199,6 +199,37 @@ Sessions **clone on demand**: every new session starts with an empty worktree an
 - The host needs connector 0.9.0 or newer: one from before sessions cloned their repositories can't start new sessions.
 
 Sessions started before this change pinned their repositories to exact commits. They stay **read-only**: their conversation, approvals, backups (to download) and exports remain, but they no longer run messages, approvals, backups, restores or moves. Start a new session to continue their work.
+
+#### Document sources
+
+A workspace's sources can also be documents: Notion pages and databases, and folders and files in Google Drive, Dropbox, OneDrive and SharePoint, Feishu/Lark and Tencent Docs. Agents read them, and what is under them, as context (specs, notes, runbooks, task lists). They don't write to them.
+
+Each member connects their own accounts under **Settings → Profile → Connected accounts**, by **signing in** to the provider or, for some, by pasting a secret. Pistead keeps what it gets encrypted on the server, renews sign-ins there, and never sends any of it to a host. A connection reads only what its account can, and sessions read only what lies under the workspace's sources:
+
+| Provider | Sign in | Or paste | What a session reads |
+|---|---|---|---|
+| Notion | Where the server has a Notion app | An [internal integration](https://www.notion.so/profile/integrations) secret with **Read content**, shared with the pages (a page's **•••** menu → **Connections**) | Pages as Markdown with the pages and databases under them; databases as their 200 most recently edited rows |
+| Google Drive | Where the server has a Google app (read-only Drive access) | A Google Cloud service account's JSON key, with the folders and files shared with its email as **Viewer** | Docs as Markdown, Sheets as CSV (first sheet), Slides and text files as text, Word files as their text, folders as their files |
+| Dropbox | Where the server has a Dropbox app | — | Paper docs as Markdown, Word and text files as text, folders as their files. Shared folders must be added to your Dropbox |
+| OneDrive and SharePoint | Where the server has a Microsoft app | — | Word and text files as text, folders as their files |
+| Feishu / Lark | — | A custom app's **App ID** and **App Secret** (Feishu or Lark), with read access to Drive, Docs and Wiki, added to what it may read | Docx documents as text, folders as their files, wiki pages as their text and the pages under them |
+| Tencent Docs | Where the server has a Tencent Docs app (see below) | — | Documents as text, through an export; folders as their files. Sheets and other kinds are listed, not read |
+
+- **Add a source**: owners and admins choose **Settings → Workspaces →** the workspace **→ Sources → Documents → Add document source**, pick the provider and paste the item's link. Pistead checks it with their own connection. A workspace has at most 20 document sources.
+- **In a session**, the agent reads them with `source_read`, with the **session owner's** connection of that kind, during a message sent with write access. Items outside the bound one are refused, even where the owner's connection can read them, and long content is cut at 96 KiB. A session owner without a connection of that kind gets a refusal that says so.
+- Removing a source stops reads of it at once, in running sessions too. Every read is recorded in the audit log (`source.read`).
+
+Documents are written by other people: the agent is told to treat them as information, not as instructions.
+
+**Sign-in for the server's operator.** Members can sign in to a provider only where you registered an OAuth app with it and set its client id and secret. Each app's redirect URI is `APP_ORIGIN/api/source-accounts/<provider>/oauth/callback`:
+
+| Provider | `<provider>` | Variables | App settings |
+|---|---|---|---|
+| Google Drive | `google-drive` | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | A Google Cloud OAuth client (web application) with the Drive API and the `drive.readonly` scope. An app for anyone outside your Google Workspace needs Google's verification for that scope |
+| Notion | `notion` | `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET` | A Notion public integration with **Read content** |
+| Dropbox | `dropbox` | `DROPBOX_CLIENT_ID`, `DROPBOX_CLIENT_SECRET` (the app key and secret) | A scoped app with `account_info.read`, `files.metadata.read`, `files.content.read` and `sharing.read` |
+| OneDrive and SharePoint | `onedrive` | `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, optionally `MICROSOFT_TENANT` (`common` by default; your tenant's id or domain to admit only its accounts) | A Microsoft Entra app registration (web) with delegated `User.Read`, `Files.Read.All`, `Sites.Read.All` and `offline_access` |
+| Tencent Docs | `tencent-docs` | `TENCENT_DOCS_CLIENT_ID`, `TENCENT_DOCS_CLIENT_SECRET` | An application on the Tencent Docs open platform. **Preview**: Pistead's Tencent Docs support was written without access to its API or documentation; check it with a test account before members rely on it |
 
 ### Hosts
 
@@ -428,6 +459,7 @@ The tools an agent can use:
 | `github_comment` | Comment on a GitHub issue or pull request | Approval |
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
+| `source_read` | Read an item of one of the workspace's [document sources](#document-sources), with the session owner's connection | Nothing, during a shared message |
 | `web_fetch` | Read a web page, as far as the workspace's [network access](#network-access) reaches | Nothing, during a shared message |
 | `web_search` | Search the web with the server's search provider | **Web search** on in the workspace's network access; nothing else, during a shared message |
 | `schedule` | List, create, change or delete the session's [scheduled prompts](#scheduled-prompts) | A message from the session owner; Auto-approve for auto-approved schedules |
@@ -775,6 +807,7 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `WORKSPACE_DATABASES` | `false` (`true` in the Docker image) | Let workspace owners connect a Postgres database |
 | `WORKSPACE_DATABASE_PRIVATE_HOSTS` | `false` | Also allow workspace databases on private networks |
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | none | GitHub OAuth app for sign-in |
+| `GOOGLE_CLIENT_ID`/`_SECRET`, `NOTION_CLIENT_ID`/`_SECRET`, `DROPBOX_CLIENT_ID`/`_SECRET`, `MICROSOFT_CLIENT_ID`/`_SECRET` (and `MICROSOFT_TENANT`), `TENCENT_DOCS_CLIENT_ID`/`_SECRET` | none | OAuth apps that let members connect [document sources](#document-sources) by signing in |
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | none | Operator GitHub App for github.com pushes (PEM as one line with `\n` escapes) |
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
 | `GIT_DIRECT` | `on` | Where sessions' Git data goes (see [Network access](#network-access)): `on` lets hosts fetch from Git hosts themselves with credentials limited to a repository, `own-hosts` gives credentials only to session owners' own hosts, `off` relays every Git request through the server |

@@ -224,13 +224,13 @@ export async function createSession(c: AppContext, input: Record<string, unknown
   const notice = row.connector_id ? await cloneUnavailable(c.env, capabilities, row, JSON.parse(agent.tools_json) as string[]) : undefined;
   await requireSessionCreator(c.env, workspaceId, ownerId);
   if (row.connector_id) await requireConnectorSession(c.env, row.connector_id, row);
-  // Admit the session only while its workspace's repositories, membership and host are as they were checked.
+  // Admit the session only while its workspace's sources, membership and host are as they were checked.
   const inserted = await c.env.DB.query(`INSERT INTO sessions
     (id, workspace_id, owner_id, agent_version_id, title, policy_version, status, created_at, connector_id, connector_owner_id, repositories_json, visibility, repository_mode, branch,
       host_environment, tool_output)
     SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
     WHERE ${sessionCreatorSQL('?')}
-    AND (SELECT json_group_array(id ORDER BY id) FROM workspace_repositories WHERE workspace_id = ?) = json(?)
+    AND (SELECT json_group_array(id ORDER BY id) FROM workspace_sources WHERE workspace_id = ?) = json(?)
     AND EXISTS (SELECT 1 FROM users session_owner WHERE session_owner.id = ? AND session_owner.suspended_at IS NULL
       AND ((? = 1 AND session_owner.auth_kind IN ('github', 'password')) OR (? = 1 AND session_owner.auth_kind = 'test'))
       AND (? IS NULL OR (session_owner.auth_kind = 'github' AND session_owner.github_id = ?
@@ -257,9 +257,9 @@ export async function createSession(c: AppContext, input: Record<string, unknown
     .bind(row.id, row.workspace_id, row.owner_id, row.agent_version_id, row.title, row.policy_version, row.status, row.created_at,
       row.connector_id ?? null, row.connector_owner_id ?? null, row.repositories_json, row.visibility ?? 'private', row.repository_mode ?? null, row.branch ?? null,
       row.host_environment ?? 0, row.tool_output ?? 'full',
-      workspaceId, ownerId, workspaceId, resolved.bindingIds,
-      // A workspace without repositories admits only the synthetic legacy fixture that cloneRepositories allowed.
-      ownerId, resolved.bindingIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
+      workspaceId, ownerId, workspaceId, resolved.sourceIds,
+      // A workspace without sources admits only the synthetic legacy fixture that cloneRepositories allowed.
+      ownerId, resolved.sourceIds === '[]' ? 0 : 1, resolved.githubAuthority === null && testMode(c.env) ? 1 : 0,
       resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.githubId ?? null, resolved.githubAuthority?.ciphertext ?? null,
       JSON.stringify(resolved.credentials), ownerId, resolved.credentials.length,
       row.connector_id ?? null, model.id, row.connector_id ?? null, row.connector_owner_id ?? null, workspaceId, ownerId,

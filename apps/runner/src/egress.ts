@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Readable, type Duplex } from "node:stream";
 import { bindingRemote, gitProviders, validGitHost, validRepositoryId, validRepositoryName, type GitProvider } from "../../../packages/shared/src/repositories.js";
+import { documentItemTypes, documentKind, sourceLimits, type DocumentItemType, type GrantSource } from "../../../packages/shared/src/sources.js";
 import { API_TOKEN_PLACEHOLDER, credentialedApiHosts, egressPushService, hostAllowed, lfsLimits, parseLfsBatchRequest, parseNetworkPolicy, validLfsOid, validLfsSize,
   type EgressApi, type EgressGitService, type EgressGrant, type EgressRepository, type LfsBatchResult } from "../../../packages/shared/src/network.js";
 import { boundedStream, drainStream, PUSH_REQUEST_BYTES, pushRejection, PushRequestError, readPushCommands, sessionBranchRefusal, type PushCommand } from "../../../packages/shared/src/git-push.js";
@@ -842,6 +843,16 @@ export function parseEgressGrant(value: unknown): EgressGrant {
     return { bindingId: repository.bindingId, provider: repository.provider!, host: repository.host, fullName: repository.fullName,
       ...(repository.repositoryId !== undefined ? { repositoryId: repository.repositoryId } : {}), ...(repository.lfs ? { lfs: true } : {}) };
   });
+  // Document sources (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs) the agent reads through the control plane; absent from older control planes.
+  if (input.sources !== undefined && (!Array.isArray(input.sources) || input.sources.length > 100)) throw new RunnerError(502, "Invalid sources from the control plane");
+  const sources = (input.sources as unknown[] | undefined)?.map((item): GrantSource => {
+    const source = item as Partial<GrantSource> | null;
+    if (!source || typeof source.id !== "string" || !IDENTIFIER.test(source.id) || !documentKind(source.kind)
+      || !documentItemTypes.includes(source.type as DocumentItemType) || typeof source.title !== "string" || source.title.length > sourceLimits.title) {
+      throw new RunnerError(502, "Invalid sources from the control plane");
+    }
+    return { id: source.id, kind: source.kind, type: source.type!, title: source.title };
+  });
   // Credentialed APIs this connector knows; a newer control plane's others are left out, as it may name hosts this proxy
   // has no rules for.
   if (input.apis !== undefined && (!Array.isArray(input.apis) || input.apis.length > 10)) throw new RunnerError(502, "Invalid APIs from the control plane");
@@ -850,7 +861,7 @@ export function parseEgressGrant(value: unknown): EgressGrant {
     if (!api || typeof api.host !== "string" || typeof api.provider !== "string") throw new RunnerError(502, "Invalid APIs from the control plane");
     return credentialedApiHosts.includes(api.host) && api.provider === "github" ? [{ host: api.host, provider: api.provider }] : [];
   });
-  return { policy, repositories, ...(apis.length ? { apis } : {}) };
+  return { policy, repositories, ...(apis.length ? { apis } : {}), ...(sources ? { sources } : {}) };
 }
 
 /**

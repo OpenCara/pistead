@@ -168,6 +168,7 @@ function carries(capabilities: ConnectorCapabilities, tool: ToolName): boolean {
   if (tool === 'git_push') return capabilities.gitPush === true;
   if (tool === 'github_read' || tool === 'github_merge') return capabilities.github === true;
   if (tool === 'github_issue') return capabilities.githubIssues === true;
+  if (tool === 'source_read') return capabilities.sources === true;
   if (tool === 'schedule') return capabilities.schedules === true;
   if (tool === 'sessions') return capabilities.crossSessions === true;
   if (tool === 'web_fetch' || tool === 'web_search') return capabilities.web === true;

@@ -8,6 +8,7 @@ import { sessionAccess } from './db.js';
 import { fail, identifier, jsonObject, userIdentifier } from './http.js';
 import { requireCallbackScope } from './connectors.js';
 import { githubComment, githubIssue, githubMerge, githubRead } from './github-broker.js';
+import { sourceRead } from './sources.js';
 import { agentSchedules } from './scheduled-prompts.js';
 import { agentSessions } from './cross-session.js';
 import { legacyRestoreDownload } from './restore-routes.js';
@@ -34,6 +35,7 @@ export function registerInternal(app: Hono<WorkerEnv>): void {
   app.post('/api/internal/github/read', c => githubRead(c, null));
   app.post('/api/internal/github/merge', c => githubMerge(c, null));
   app.post('/api/internal/github/issue', c => githubIssue(c, null));
+  app.post('/api/internal/sources/read', c => sourceRead(c, null));
   app.post('/api/internal/schedules', c => agentSchedules(c, null));
   app.post('/api/internal/sessions', c => agentSessions(c, null));
   app.post('/api/internal/web/search', c => webSearch(c, null));

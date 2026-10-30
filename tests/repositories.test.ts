@@ -478,8 +478,8 @@ test('real users pair a host without any workspace, but still need configured wo
 test('the repository listing tells real users they need a repository, even in testMode, and synthetic test users that they do not', async t => {
   const f = await fixture(t); const real = await f.client('real'); const synthetic = await f.client('synthetic', false);
   const listing = async (client: Client) => json<WorkspaceRepositoryList>(await client.request('GET', `/api/workspaces/${(await workspace(client)).id}/repositories`));
-  assert.deepEqual(await listing(real), { repositories: [], required: true });
-  assert.deepEqual(await listing(synthetic), { repositories: [], required: false });
+  assert.deepEqual(await listing(real), { repositories: [], required: true, sources: 0 });
+  assert.deepEqual(await listing(synthetic), { repositories: [], required: false, sources: 0 });
 });
 
 test('testMode does not let a real user start an unconnected faux-model session', async t => {

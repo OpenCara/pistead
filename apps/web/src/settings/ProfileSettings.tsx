@@ -5,6 +5,7 @@ import { useApp } from "../app-context";
 import { Button, CardBody, CopyButton, Feedback, Field, Row, Section, useAction } from "../ui";
 import { usernameWithId } from "../../../../packages/client/src/usernames";
 import { GitAccountsSection } from "./GitAccounts";
+import { ConnectedAccountsSection } from "../sources";
 import { OwnJoinRequests } from "../JoinWorkspaceScreen";
 import { SignedInAppsSection } from "./SignedInApps";
 import "./settings.css";
@@ -92,6 +93,7 @@ export function ProfileSettings() {
     </form>
     <GitAccountsSection />
     {user.passwordSignIn && <PasswordSection />}
+    <ConnectedAccountsSection />
     <SignedInAppsSection />
     <OwnJoinRequests />
     <Section title="Account">

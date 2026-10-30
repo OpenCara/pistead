@@ -46,6 +46,11 @@ export interface ConnectorCapabilities {
    */
   crossSessions?: boolean;
   /**
+   * The connector reads the workspace's document sources (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs) through the control plane
+   * (source_read). Absent on older connectors. New kinds of source need no newer connector.
+   */
+  sources?: boolean;
+  /**
    * The connector keeps a mirror of each repository its sessions clone, which their clones borrow objects from (see
    * docs/design/repository-cache.md). Absent on older connectors and on hosts whose cache is off, for this connection.
    */

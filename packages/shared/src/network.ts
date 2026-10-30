@@ -1,4 +1,5 @@
 import { validGitHost, type GitProvider } from "./repositories.js";
+import type { GrantSource } from "./sources.js";
 
 /**
  * What a workspace's sandboxed sessions may reach through their host's egress proxy. The workspace's own repositories
@@ -89,7 +90,16 @@ export interface EgressRepository {
  * What the control plane lets one session's egress proxy do; the proxy asks again every minute. `apis` lists the
  * credentialed APIs the proxy answers for itself (see ApiCredentialGrant); absent from older control planes.
  */
-export interface EgressGrant { policy: NetworkPolicy; repositories: EgressRepository[]; apis?: EgressApi[] }
+export interface EgressGrant {
+  policy: NetworkPolicy;
+  repositories: EgressRepository[];
+  apis?: EgressApi[];
+  /**
+   * The workspace's document sources (Notion, Google Drive, Dropbox, OneDrive, Feishu/Lark, Tencent Docs), which the
+   * agent reads through the control plane (source_read), never through the proxy. Absent from older control planes.
+   */
+  sources?: GrantSource[];
+}
 
 /**
  * Credentialed APIs: hosts whose HTTPS the egress proxy terminates itself, with a certificate from the connector's own

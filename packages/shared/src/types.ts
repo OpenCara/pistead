@@ -19,7 +19,7 @@ export type AssignableWorkspaceRole = (typeof assignableWorkspaceRoles)[number];
 /** The four tiers of access to one session given to one member, least first; sessionRolePermissions (policy.ts) defines them. */
 export const sessionRoles = ["viewer", "member", "collaborator", "admin"] as const;
 export type SessionRole = (typeof sessionRoles)[number];
-export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue", "schedule", "sessions", "web_fetch", "web_search"] as const;
+export const toolNames = ["identity", "list_files", "read_file", "write_file", "edit_file", "git_status", "git_commit", "bash", "github_read", "github_comment", "github_merge", "git_push", "git_repin", "host_bash", "github_issue", "schedule", "sessions", "web_fetch", "web_search", "source_read"] as const;
 export type ToolName = (typeof toolNames)[number];
 /**
  * Tools of sessions that pinned their repositories, which are read-only now: still valid in stored agents and

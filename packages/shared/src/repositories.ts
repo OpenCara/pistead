@@ -125,6 +125,11 @@ export interface WorkspaceRepositoryList {
    * except for synthetic test users on a test-mode server, which start without any.
    */
   required: boolean;
+  /**
+   * How many sources the workspace has, repositories included (a Notion page, say): a workspace with any source can
+   * start sessions. Absent from older control planes, where only repositories count.
+   */
+  sources?: number;
 }
 
 /**

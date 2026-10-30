@@ -51,6 +51,23 @@ export interface Env {
   OIDC_SIGNING_KEY?: string;
   /** Comma-separated user IDs of the instance administrators, who manage every account (see `apps/server/src/admin.ts`). */
   ADMIN_USER_IDS?: string;
+  /**
+   * OAuth apps the operator registered so members can connect document sources by signing in (see
+   * apps/server/src/source-oauth.ts). Each pair is optional; a provider without one offers no sign-in. Their redirect
+   * URI is APP_ORIGIN/api/source-accounts/<provider>/oauth/callback.
+   */
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  NOTION_CLIENT_ID?: string;
+  NOTION_CLIENT_SECRET?: string;
+  DROPBOX_CLIENT_ID?: string;
+  DROPBOX_CLIENT_SECRET?: string;
+  MICROSOFT_CLIENT_ID?: string;
+  MICROSOFT_CLIENT_SECRET?: string;
+  /** Microsoft Entra tenant for OneDrive and SharePoint sign-in: an id or domain, `organizations`, or `common` (the default). */
+  MICROSOFT_TENANT?: string;
+  TENCENT_DOCS_CLIENT_ID?: string;
+  TENCENT_DOCS_CLIENT_SECRET?: string;
   /** `true` on a local server (http.ts localMode): loopback only, and only the GitHub account that claimed it signs in. */
   LOCAL_MODE?: string;
   /** The local server's claim secret (base64url, 32 bytes): a sign-in carrying it may claim an unclaimed local server. */
