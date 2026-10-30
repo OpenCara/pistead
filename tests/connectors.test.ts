@@ -2979,6 +2979,32 @@ test('messages the server writes itself name the conversation\'s current model w
   assert.equal(submitted.length, before);
 });
 
+test('the sessions tool sends another session a message on the conversation\'s current model while its host has a disabled model', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'sessions']); const id = s.connector.connectorId;
+  const { session: target } = await json<{ session: SessionRecord }>(await s.creator.request('POST', '/api/sessions', {
+    ...s.input, title: 'Worker', trustedConnectorId: id }), 201);
+  const first = { provider: manifest.models[0].provider, modelId: manifest.models[0].modelId };
+  const second = { provider: 'local-native', modelId: 'local/model-v2' };
+  await json(await self(f, s.connector, 'manifest', { models: [...manifest.models, { ...second, name: 'Second model' }],
+    capabilities: { ...manifest.capabilities, chatOptions: true } }));
+  await json(await s.host.request('PATCH', `/api/connectors/${id}/models`, { ...second, enabled: false }));
+  const submitted: { path: string; body: Record<string, unknown> }[] = [];
+  rpcHub(f, s.connector, envelope => {
+    if (envelope.request.ticket.action === 'view') {
+      return Response.json({ view: { sessionId: target.id, owner: { id: s.creator.user.id, displayName: 'Creator', gitName: 'Creator', gitEmail: 'creator@example.test', githubLogin: 'creator' },
+        entries: [], approvals: [], conversations: [], busy: false, agent: { ...first, thinkingLevel: 'low' } } satisfies SessionView });
+    }
+    submitted.push({ path: envelope.request.path, body: JSON.parse(envelope.request.body) });
+    return Response.json({ submissionId: 'submission', conversationId: 'conversation', status: 'queued' }, { status: 202 });
+  });
+  const admissionId = admit(f, s.session.id, s.creator.user.id);
+  const sent = await self(f, s.connector, 'sessions', { sessionId: s.session.id, actorId: s.creator.user.id, admissionId, callId: 'call-send',
+    action: 'send', targetSessionId: target.id, message: 'The brief' });
+  await json(sent, 202);
+  assert.deepEqual(submitted.map(item => [item.path, item.body.options]), [[`/v1/sessions/${target.id}/submit`, { model: first, thinkingLevel: 'low' }]]);
+  assert.match(String(submitted[0]!.body.content), /The brief$/);
+});
+
 for (const enabled of [false, true]) {
   test(`a host model setting checks again as it writes that its author still manages the host (enabled=${enabled})`, async t => {
     const f = await fixture(t); const s = await sharedSession(f); const id = s.connector.connectorId;
