@@ -4,15 +4,21 @@
  * a Feishu/Lark folder or document) are the others: sessions read them with source_read, through the control plane,
  * with the session owner's own connected account. Every source of a workspace is in the grant of every session in it.
  */
-export const sourceKinds = ["git", "notion", "google-drive", "feishu"] as const;
+export const sourceKinds = ["git", "notion", "google-drive", "feishu", "dropbox", "onedrive", "tencent-docs"] as const;
 export type SourceKind = (typeof sourceKinds)[number];
 /** The kinds sessions read with source_read; each has a connected account of the same name. */
-export const documentKinds = ["notion", "google-drive", "feishu"] as const;
+export const documentKinds = ["notion", "google-drive", "feishu", "dropbox", "onedrive", "tencent-docs"] as const;
 export type DocumentKind = (typeof documentKinds)[number];
 export function documentKind(value: unknown): value is DocumentKind {
   return typeof value === "string" && (documentKinds as readonly string[]).includes(value);
 }
-export const documentKindNames: Record<DocumentKind, string> = { notion: "Notion", "google-drive": "Google Drive", feishu: "Feishu / Lark" };
+export const documentKindNames: Record<DocumentKind, string> = {
+  notion: "Notion", "google-drive": "Google Drive", feishu: "Feishu / Lark", dropbox: "Dropbox", onedrive: "OneDrive / SharePoint", "tencent-docs": "Tencent Docs",
+};
+/** The kinds a member connects by pasting a secret; the others only by signing in to the provider (OAuth). */
+export const secretKinds: readonly DocumentKind[] = ["notion", "google-drive", "feishu"];
+/** The kinds a member can connect by signing in to the provider, where the server's operator registered an OAuth app. */
+export const oauthKinds: readonly DocumentKind[] = ["notion", "google-drive", "dropbox", "onedrive", "tencent-docs"];
 
 export const sourceLimits = {
   /** Document sources per workspace, all kinds together. */
@@ -29,11 +35,17 @@ export const sourceLimits = {
  */
 export interface SourceAccount {
   provider: DocumentKind;
+  /** How it was connected: a pasted secret, or by signing in to the provider. */
+  method: "secret" | "oauth";
   /** What the provider calls it: the Notion workspace, the service account's email, the app's id. */
   name: string;
   createdAt: string;
 }
-export interface SourceAccountList { accounts: SourceAccount[] }
+export interface SourceAccountList {
+  accounts: SourceAccount[];
+  /** The kinds this server lets members connect by signing in (its operator registered an OAuth app for each). */
+  oauth: DocumentKind[];
+}
 export const feishuDomains = ["feishu", "lark"] as const;
 export type FeishuDomain = (typeof feishuDomains)[number];
 /** What a connect request carries, per provider. */
@@ -170,4 +182,58 @@ export function feishuItem(value: unknown): FeishuItem | null {
   const path = url.pathname.match(/\/(drive\/folder|docx|wiki)\/([A-Za-z0-9]+)/);
   if (!path || !feishuTokenPattern.test(path[2]!)) return null;
   return { type: path[1] === "docx" ? "document" : path[1] === "wiki" ? "wiki" : "folder", token: path[2]! };
+}
+
+const dropboxIdPattern = /^id:[A-Za-z0-9_-]{8,64}$/;
+/**
+ * A Dropbox item: a path in the connected account (`/Specs/Design`), an id (`id:…`), or a dropbox.com link to it,
+ * as Dropbox's API takes them (`{ path }` or `{ url }`); null otherwise.
+ */
+export function dropboxItem(value: unknown): { path: string } | { url: string } | null {
+  if (typeof value !== "string" || value.length > 2048) return null;
+  const text = value.trim();
+  if (dropboxIdPattern.test(text)) return { path: text };
+  if (text.startsWith("/") && text.length > 1 && !/[\x00-\x1f\x7f]/.test(text) && !text.split("/").some(part => part === "." || part === "..")) return { path: text.replace(/\/+$/, "") };
+  if (!/^https:\/\//i.test(text)) return null;
+  let url: URL;
+  try { url = new URL(text); } catch { return null; }
+  if (url.hostname !== "www.dropbox.com" && url.hostname !== "dropbox.com") return null;
+  if (url.pathname.startsWith("/home/")) return { path: decodeURIComponent(url.pathname.slice("/home".length)).replace(/\/+$/, "") };
+  return /^\/(s|sh|scl)\//.test(url.pathname) ? { url: url.href } : null;
+}
+
+/**
+ * A OneDrive or SharePoint item: an id from an earlier result (`DRIVE~ITEM`; personal ids contain `!`), or a link to it on
+ * onedrive.live.com, 1drv.ms or a *.sharepoint.com site, which Microsoft Graph resolves (/shares); null otherwise.
+ */
+export function onedriveItem(value: unknown): { driveId: string; itemId: string } | { url: string } | null {
+  if (typeof value !== "string" || value.length > 2048) return null;
+  const text = value.trim();
+  const id = text.match(/^([A-Za-z0-9!_-]{1,100})~([A-Za-z0-9!_-]{1,100})$/);
+  if (id) return { driveId: id[1]!, itemId: id[2]! };
+  if (!/^https:\/\//i.test(text)) return null;
+  let url: URL;
+  try { url = new URL(text); } catch { return null; }
+  const host = url.hostname;
+  return host === "onedrive.live.com" || host === "1drv.ms" || host.endsWith(".sharepoint.com") || host === "onedrive.cloud.microsoft" ? { url: url.href } : null;
+}
+
+const tencentIdPattern = /^[A-Za-z0-9_-]{6,80}$/;
+/**
+ * A Tencent Docs item: a document's link (docs.qq.com/doc/ID, /sheet/ID, /slide/ID, …), a folder's link
+ * (…/folder/ID), or `file:ID` / `folder:ID` from an earlier result; null otherwise.
+ */
+export function tencentDocsItem(value: unknown): { type: "folder" | "file"; id: string } | null {
+  if (typeof value !== "string" || value.length > 2048) return null;
+  const text = value.trim();
+  const prefixed = text.match(/^(file|folder):(.+)$/);
+  if (prefixed) return tencentIdPattern.test(prefixed[2]!) ? { type: prefixed[1] as "file" | "folder", id: prefixed[2]! } : null;
+  if (!/^https:\/\//i.test(text)) return null;
+  let url: URL;
+  try { url = new URL(text); } catch { return null; }
+  if (url.hostname !== "docs.qq.com") return null;
+  const folder = url.pathname.match(/\/folder\/([A-Za-z0-9_-]+)/);
+  if (folder) return tencentIdPattern.test(folder[1]!) ? { type: "folder", id: folder[1]! } : null;
+  const file = url.pathname.match(/^\/(doc|sheet|slide|mind|form|pdf|flowchart|smartsheet)\/([A-Za-z0-9_-]+)/);
+  return file && tencentIdPattern.test(file[2]!) ? { type: "file", id: file[2]! } : null;
 }

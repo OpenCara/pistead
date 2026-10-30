@@ -68,7 +68,7 @@ And around them:
 
 1. **Run the server** with Docker and a GitHub OAuth app: see [Running the server](#running-the-server).
 2. **Sign in** with **Continue with GitHub**, then choose **New workspace** and name it.
-3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page, Google Drive folder or Feishu/Lark document works too (see [Document sources](#document-sources)).
+3. **Add a source**: **Settings → Workspaces →** your workspace **→ Sources → Add repository**. Pick the account, the repository and optionally a branch, tag or commit, then **Bind repository**. A Notion page or a folder or document in Google Drive, Dropbox, OneDrive, Feishu/Lark or Tencent Docs works too (see [Document sources](#document-sources)).
 4. **Pair a host**: on a Linux or WSL2 machine with Node.js 24, Pi configured with at least one model, and `bubblewrap`, Python 3, Git and `flock` installed, open **Settings → Hosts → Pair a host**, name the host and **Create pairing code** (a host isn't paired into a workspace: it is yours, in each of your workspaces). Run the command it shows on the host and type the code at the hidden prompt:
 
    ```sh
@@ -137,7 +137,7 @@ Workspace admins manage only their workspace; the server's administrators are co
 
 ### Repositories and Git accounts
 
-Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [documents](#document-sources) (Notion, Google Drive, Feishu/Lark), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
+Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [documents](#document-sources) (Notion, Google Drive, Dropbox, OneDrive and SharePoint, Feishu/Lark, Tencent Docs), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
 
 Connect the accounts that can read your repositories under **Settings → Profile → Git accounts** (**Add account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
@@ -165,22 +165,34 @@ Sessions started before this change pinned their repositories to exact commits. 
 
 #### Document sources
 
-A workspace's sources can also be documents: Notion pages and databases, Google Drive folders and files, and Feishu/Lark folders, documents and wiki pages. Agents read them, and what is under them, as context (specs, notes, runbooks, task lists). They don't write to them.
+A workspace's sources can also be documents: Notion pages and databases, and folders and files in Google Drive, Dropbox, OneDrive and SharePoint, Feishu/Lark and Tencent Docs. Agents read them, and what is under them, as context (specs, notes, runbooks, task lists). They don't write to them.
 
-Each member connects their own accounts under **Settings → Profile → Connected accounts**. Pistead verifies what you paste with the provider and keeps it encrypted on the server; it never goes to any host. Each provider lets the connection read only what you share with it:
+Each member connects their own accounts under **Settings → Profile → Connected accounts**, by **signing in** to the provider or, for some, by pasting a secret. Pistead keeps what it gets encrypted on the server, renews sign-ins there, and never sends any of it to a host. A connection reads only what its account can, and sessions read only what lies under the workspace's sources:
 
-| Provider | How to connect | Share with it |
-|---|---|---|
-| Notion | An [internal integration](https://www.notion.so/profile/integrations) secret, with **Read content** | Pages and databases: a page's **•••** menu → **Connections** |
-| Google Drive | The JSON key of a Google Cloud service account, with the Drive API enabled (only its email and private key are kept) | Folders and files, shared with the service account's email as **Viewer** |
-| Feishu / Lark | A custom app's **App ID** and **App Secret**, on Feishu (open.feishu.cn) or Lark (open.larksuite.com), with read access to Drive, Docs and Wiki | Folders, documents and wiki spaces the app is added to |
+| Provider | Sign in | Or paste | What a session reads |
+|---|---|---|---|
+| Notion | Where the server has a Notion app | An [internal integration](https://www.notion.so/profile/integrations) secret with **Read content**, shared with the pages (a page's **•••** menu → **Connections**) | Pages as Markdown with the pages and databases under them; databases as their 200 most recently edited rows |
+| Google Drive | Where the server has a Google app (read-only Drive access) | A Google Cloud service account's JSON key, with the folders and files shared with its email as **Viewer** | Docs as Markdown, Sheets as CSV (first sheet), Slides and text files as text, Word files as their text, folders as their files |
+| Dropbox | Where the server has a Dropbox app | — | Paper docs as Markdown, Word and text files as text, folders as their files. Shared folders must be added to your Dropbox |
+| OneDrive and SharePoint | Where the server has a Microsoft app | — | Word and text files as text, folders as their files |
+| Feishu / Lark | — | A custom app's **App ID** and **App Secret** (Feishu or Lark), with read access to Drive, Docs and Wiki, added to what it may read | Docx documents as text, folders as their files, wiki pages as their text and the pages under them |
+| Tencent Docs | Where the server has a Tencent Docs app (see below) | — | Documents as text, through an export; folders as their files. Sheets and other kinds are listed, not read |
 
 - **Add a source**: owners and admins choose **Settings → Workspaces →** the workspace **→ Sources → Documents → Add document source**, pick the provider and paste the item's link. Pistead checks it with their own connection. A workspace has at most 20 document sources.
-- **In a session**, the agent reads them with `source_read`, with the **session owner's** connection of that kind, during a message sent with write access. A Notion page comes back as Markdown with the pages and databases under it, and a database as its rows (the 200 most recently edited). A Google Doc comes back as Markdown, a Sheet as CSV (its first sheet), Slides and text files as text, and a folder as its files. A Feishu/Lark docx document comes back as plain text, a folder as its files, and a wiki page as its document's text and the pages under it; older docs, sheets and bases are listed but not read.
-- Items outside the bound one are refused, even where the owner's connection can read them, and long content is cut at 96 KiB. A session owner without a connection of that kind gets a refusal that says so.
+- **In a session**, the agent reads them with `source_read`, with the **session owner's** connection of that kind, during a message sent with write access. Items outside the bound one are refused, even where the owner's connection can read them, and long content is cut at 96 KiB. A session owner without a connection of that kind gets a refusal that says so.
 - Removing a source stops reads of it at once, in running sessions too. Every read is recorded in the audit log (`source.read`).
 
-Documents are written by other people: the agent is told to treat them as information, not as instructions. Tencent Docs, Dropbox and OneDrive can't be connected yet: they grant access only through each person's own sign-in (OAuth), which Pistead doesn't offer for them yet.
+Documents are written by other people: the agent is told to treat them as information, not as instructions.
+
+**Sign-in for the server's operator.** Members can sign in to a provider only where you registered an OAuth app with it and set its client id and secret. Each app's redirect URI is `APP_ORIGIN/api/source-accounts/<provider>/oauth/callback`:
+
+| Provider | `<provider>` | Variables | App settings |
+|---|---|---|---|
+| Google Drive | `google-drive` | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | A Google Cloud OAuth client (web application) with the Drive API and the `drive.readonly` scope. An app for anyone outside your Google Workspace needs Google's verification for that scope |
+| Notion | `notion` | `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET` | A Notion public integration with **Read content** |
+| Dropbox | `dropbox` | `DROPBOX_CLIENT_ID`, `DROPBOX_CLIENT_SECRET` (the app key and secret) | A scoped app with `account_info.read`, `files.metadata.read`, `files.content.read` and `sharing.read` |
+| OneDrive and SharePoint | `onedrive` | `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, optionally `MICROSOFT_TENANT` (`common` by default; your tenant's id or domain to admit only its accounts) | A Microsoft Entra app registration (web) with delegated `User.Read`, `Files.Read.All`, `Sites.Read.All` and `offline_access` |
+| Tencent Docs | `tencent-docs` | `TENCENT_DOCS_CLIENT_ID`, `TENCENT_DOCS_CLIENT_SECRET` | An application on the Tencent Docs open platform. **Preview**: Pistead's Tencent Docs support was written without access to its API or documentation; check it with a test account before members rely on it |
 
 ### Hosts
 
@@ -369,7 +381,7 @@ The tools an agent can use:
 | `github_comment` | Comment on a GitHub issue or pull request | Approval |
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
-| `source_read` | Read an item of one of the workspace's [document sources](#document-sources) (Notion, Google Drive, Feishu/Lark), with the session owner's connection | Nothing, during a shared message |
+| `source_read` | Read an item of one of the workspace's [document sources](#document-sources), with the session owner's connection | Nothing, during a shared message |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
 
 "Approval" is skipped for messages the session owner sends with **Auto-approve**: always for commands, pushes, GitHub comments, merges and issues, and for `host_bash` only on the owner's own host or one whose owner granted them automatic host commands. Side asks offer only the read-only tools.
@@ -641,6 +653,7 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `WORKSPACE_DATABASES` | `false` (`true` in the Docker image) | Let workspace owners connect a Postgres database |
 | `WORKSPACE_DATABASE_PRIVATE_HOSTS` | `false` | Also allow workspace databases on private networks |
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | none | GitHub OAuth app for sign-in |
+| `GOOGLE_CLIENT_ID`/`_SECRET`, `NOTION_CLIENT_ID`/`_SECRET`, `DROPBOX_CLIENT_ID`/`_SECRET`, `MICROSOFT_CLIENT_ID`/`_SECRET` (and `MICROSOFT_TENANT`), `TENCENT_DOCS_CLIENT_ID`/`_SECRET` | none | OAuth apps that let members connect [document sources](#document-sources) by signing in |
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY` | none | Operator GitHub App for github.com pushes (PEM as one line with `\n` escapes) |
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |

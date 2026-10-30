@@ -11,7 +11,7 @@
 CREATE TABLE workspace_sources (
   id TEXT PRIMARY KEY NOT NULL,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK (kind IN ('git', 'notion', 'google-drive', 'feishu')),
+  kind TEXT NOT NULL CHECK (kind IN ('git', 'notion', 'google-drive', 'feishu', 'dropbox', 'onedrive', 'tencent-docs')),
   repository_binding_id TEXT UNIQUE REFERENCES workspace_repositories(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
   CHECK ((kind = 'git') = (repository_binding_id IS NOT NULL)),
@@ -54,10 +54,12 @@ CREATE TRIGGER workspace_sources_immutable BEFORE UPDATE ON workspace_sources
 CREATE TABLE source_accounts (
   id TEXT PRIMARY KEY NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  provider TEXT NOT NULL CHECK (provider IN ('notion', 'google-drive', 'feishu')),
+  provider TEXT NOT NULL CHECK (provider IN ('notion', 'google-drive', 'feishu', 'dropbox', 'onedrive', 'tencent-docs')),
   ciphertext TEXT NOT NULL,
   -- What the provider calls the account (a Notion workspace, a service account's email, an app id), as verified.
   account_name TEXT NOT NULL CHECK (length(account_name) BETWEEN 1 AND 300),
+  -- 'secret': pasted by the member; 'oauth': the member signed in to the provider, and the ciphertext holds its tokens.
+  method TEXT NOT NULL DEFAULT 'secret' CHECK (method IN ('secret', 'oauth')),
   created_at TEXT NOT NULL,
   UNIQUE (user_id, provider)
 );
@@ -67,7 +69,7 @@ CREATE TABLE source_accounts (
 CREATE TABLE document_sources (
   source_id TEXT PRIMARY KEY NOT NULL REFERENCES workspace_sources(id) ON DELETE CASCADE,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK (kind IN ('notion', 'google-drive', 'feishu')),
+  kind TEXT NOT NULL CHECK (kind IN ('notion', 'google-drive', 'feishu', 'dropbox', 'onedrive', 'tencent-docs')),
   item_id TEXT NOT NULL CHECK (length(item_id) BETWEEN 1 AND 200),
   item_type TEXT NOT NULL CHECK (item_type IN ('page', 'database', 'folder', 'document', 'spreadsheet', 'presentation', 'file', 'wiki')),
   title TEXT NOT NULL CHECK (length(title) <= 300),
@@ -87,3 +89,14 @@ CREATE TRIGGER document_sources_kind BEFORE INSERT ON document_sources
   FOR EACH ROW EXECUTE FUNCTION document_sources_kind();
 CREATE TRIGGER document_sources_immutable BEFORE UPDATE ON document_sources
   FOR EACH ROW EXECUTE FUNCTION pistead_raise('workspace sources are immutable');
+
+-- A member's sign-in to a source provider under way: the state Pistead sent and its PKCE verifier, for one user and
+-- provider, until the provider redirects back (at most 10 minutes). The browser carries the state in a cookie too.
+CREATE TABLE source_oauth_states (
+  state_hash TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK (provider IN ('notion', 'google-drive', 'dropbox', 'onedrive', 'tencent-docs')),
+  verifier TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  created_at TEXT NOT NULL
+);

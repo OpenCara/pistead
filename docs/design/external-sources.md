@@ -240,9 +240,41 @@ The Google Drive and Feishu/Lark adapters were written from memory of their APIs
 APIs nor their documentation) and are tested against fakes: verify endpoint shapes, error codes and permission scopes
 against the real services before relying on them.
 
-Not yet: writes; document sources in workspace data exports; OAuth sign-in per user, which Tencent Docs, Dropbox and
-OneDrive need (they offer no app-scoped secret to paste) and which would let Google and Notion skip the
-service-account and integration setup.
+**Done: sign-in (OAuth) and three more kinds.** Members can connect a document source by signing in to the provider
+(`apps/server/src/source-oauth.ts`), which Dropbox, OneDrive/SharePoint and Tencent Docs need (they have no app-scoped
+secret to paste), and which spares Notion and Google members the integration and service-account setup.
+
+- **Apps.** The operator registers one OAuth app per provider and sets its client id and secret
+  (`GOOGLE_`, `NOTION_`, `DROPBOX_`, `MICROSOFT_` (+ `MICROSOFT_TENANT`), `TENCENT_DOCS_CLIENT_ID`/`_SECRET`). The
+  redirect URI is `APP_ORIGIN/api/source-accounts/<provider>/oauth/callback`. `GET /api/source-accounts` lists which
+  kinds offer sign-in (`oauth`); a kind without an app offers none, and sign-in-only kinds then don't show.
+- **Flow.** `GET …/oauth/start` (the signed-in member, from the web app) stores a state and a PKCE verifier in
+  `source_oauth_states` for that member and provider (10 minutes, one per member), sets the state in a `SameSite=Lax`
+  cookie, and redirects to the provider (PKCE S256 for Google, Dropbox and Microsoft; offline access everywhere). The
+  callback requires the cookie to equal the state, the state's row to be this member's for this provider and
+  unexpired, deletes it (one use), exchanges the code, names the account, and stores the tokens encrypted with
+  `source_accounts.method = 'oauth'`. It then redirects to the profile with `source_account`, `result` and `reason`,
+  which the page shows once and removes from the address. A callback for another member, without the cookie, reused or
+  forged links nothing.
+- **Tokens.** The stored secret is `{ mode: 'oauth', accessToken, refreshToken?, expiresAt?, openId? }`. Before every
+  resolve and read, `adapterSecret` refreshes an access token within a minute of expiry with the refresh token (keeping
+  it where the provider doesn't send a new one), stores the result with a compare-and-swap on the old ciphertext (a
+  concurrent refresh's result wins and is used), and gives the adapter only the access token (and, for Tencent Docs,
+  the open id and app id its API wants). The refresh token goes only to the provider's token endpoint.
+- **Adapters.** `dropbox.ts` (paths compared, the bound item re-read by id; Paper docs export as Markdown),
+  `onedrive.ts` (Microsoft Graph; links via `/shares`; "under" follows `parentReference` within the drive; downloads
+  follow Graph's redirect only to Microsoft download hosts, without the token), `tencent-docs.ts` (**unverified**:
+  written from memory of the open platform; folders list, documents export to .docx and read as text, "under" searches
+  down at most 40 listings). Word files read as their paragraphs through `office.ts` (a bounded ZIP reader for
+  `word/document.xml`), in Dropbox, OneDrive, Google Drive and Tencent Docs exports. Notion and Google Drive adapters
+  take a signed-in access token as well as their pasted secrets.
+
+Like the Drive and Feishu adapters, these were written without access to the providers (the sandbox reaches none of
+them) and are tested against fakes, the Tencent Docs one most tentatively: check endpoints, scopes and codes with real
+accounts before relying on them.
+
+Not yet: writes; document sources in workspace data exports; sign-in from the iPhone, iPad and Mac apps (the flow
+needs the web app's cookie); revoking a provider's tokens when a member disconnects (the stored tokens are deleted).
 
 ## Open questions
 

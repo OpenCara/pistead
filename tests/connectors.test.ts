@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { HTTPException } from 'hono/http-exception';
@@ -7,7 +7,7 @@ import { app } from '../apps/server/src/index.js';
 import { authenticateConnectorSocket } from '../apps/server/src/connectors.js';
 import type { ConnectorRelayEnvelope } from '../apps/server/src/connector-transport.js';
 import type { Env } from '../apps/server/src/types.js';
-import { encryptToken } from '../apps/server/src/vault.js';
+import { decryptToken, encryptToken } from '../apps/server/src/vault.js';
 import { fakeHub, seedAgentVersion, seedSavedAgentSession, testDatabase, type FakeHub } from './helpers/control-plane.js';
 import type { ConnectorCredentials, ConnectorInfo, ConnectorPairing, HostModelSettings } from '../packages/shared/src/connector.js';
 import type { AgentVersion, ApprovalRecord, GitHubIssueView, ModelDefinition, Operation, RunnerBinding, SessionRecord, SessionView } from '../packages/shared/src/types.js';
@@ -3057,4 +3057,156 @@ test('a workspace whose only source is a Notion page can be shared with hosts an
   provisionHub(f);
   const { session } = await json<{ session: SessionRecord }>(await host.request('POST', '/api/sessions', { workspaceId: docs.id, modelId: models[0]!.id, title: 'Summarize the specs' }), 201);
   assert.equal(session.status, 'ready');
+});
+
+/**
+ * A fake Dropbox: its OAuth token endpoint (codes and refresh tokens it issued), the account endpoint, and a folder
+ * with one text file in the account of whoever holds `tokens`.
+ */
+function dropboxFake(t: TestContext) {
+  const issued = new Map<string, { verifier: string; refresh: string }>();
+  const access = new Set<string>();
+  const calls: { url: string; authorization: string | null; body: string }[] = [];
+  let serial = 0;
+  const challenges = new Map<string, string>();
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const body = typeof init?.body === 'string' ? init.body : '';
+    const authorization = new Headers(init?.headers).get('authorization');
+    calls.push({ url, authorization, body });
+    assert.equal(init?.redirect, 'manual');
+    if (url === 'https://api.dropboxapi.com/oauth2/token') {
+      const form = new URLSearchParams(body);
+      assert.equal(form.get('client_id'), 'dropbox-app-key');
+      assert.equal(form.get('client_secret'), 'dropbox-app-secret');
+      if (form.get('grant_type') === 'authorization_code') {
+        const code = form.get('code')!;
+        const challenge = challenges.get(code);
+        assert.equal(form.get('redirect_uri'), `${origin}/api/source-accounts/dropbox/oauth/callback`);
+        // PKCE: the verifier must hash to the challenge the authorization request carried.
+        if (!challenge || createHash('sha256').update(form.get('code_verifier') ?? '').digest('base64url') !== challenge) return Response.json({ error: 'invalid_grant' }, { status: 400 });
+        challenges.delete(code);
+        const token = `sl.access-${++serial}`; const refresh = `refresh-${serial}`;
+        access.add(token); issued.set(refresh, { verifier: '', refresh });
+        return Response.json({ access_token: token, refresh_token: refresh, expires_in: 14400, token_type: 'bearer' });
+      }
+      if (form.get('grant_type') === 'refresh_token' && issued.has(form.get('refresh_token')!)) {
+        const token = `sl.access-${++serial}`;
+        access.add(token);
+        // Dropbox doesn't repeat the refresh token: Pistead keeps the one it has.
+        return Response.json({ access_token: token, expires_in: 14400, token_type: 'bearer' });
+      }
+      return Response.json({ error: 'invalid_grant' }, { status: 400 });
+    }
+    const token = authorization?.replace(/^Bearer /, '') ?? '';
+    if (!access.has(token)) return Response.json({ error: 'expired_access_token' }, { status: 401 });
+    if (url === 'https://api.dropboxapi.com/2/users/get_current_account') return Response.json({ email: 'creator@example.test', name: { display_name: 'Creator' } });
+    const folder = { '.tag': 'folder', id: 'id:folder00001', name: 'Specs', path_lower: '/specs', path_display: '/Specs' };
+    const notes = { '.tag': 'file', id: 'id:notes000001', name: 'notes.md', path_lower: '/specs/notes.md', path_display: '/Specs/notes.md', server_modified: '2026-10-01T00:00:00Z' };
+    const payroll = { '.tag': 'file', id: 'id:payroll0001', name: 'payroll.md', path_lower: '/hr/payroll.md', path_display: '/HR/payroll.md' };
+    if (url === 'https://api.dropboxapi.com/2/files/get_metadata') {
+      const path = JSON.parse(body).path;
+      const found = [folder, notes, payroll].find(item => item.id === path || item.path_lower === String(path).toLowerCase());
+      return found ? Response.json(found) : Response.json({ error_summary: 'path/not_found/' }, { status: 409 });
+    }
+    if (url === 'https://api.dropboxapi.com/2/files/list_folder') return Response.json({ entries: [notes], has_more: false, cursor: 'c' });
+    if (url === 'https://content.dropboxapi.com/2/files/download') {
+      assert.equal(JSON.parse(new Headers(init?.headers).get('dropbox-api-arg')!).path, 'id:notes000001');
+      return new Response('# Notes\nShip it.');
+    }
+    return assert.fail(`unexpected Dropbox call ${url}`);
+  });
+  return { calls, challenges, access };
+}
+
+/** Signs `client` in to the fake Dropbox: start, the provider's redirect back with a code, the callback. */
+async function dropboxSignIn(f: Fixture, client: Client, dropbox: ReturnType<typeof dropboxFake>, code: string) {
+  const start = await client.request('GET', '/api/source-accounts/dropbox/oauth/start');
+  assert.equal(start.status, 302);
+  const location = new URL(start.headers.get('location')!);
+  assert.equal(`${location.origin}${location.pathname}`, 'https://www.dropbox.com/oauth2/authorize');
+  assert.equal(location.searchParams.get('client_id'), 'dropbox-app-key');
+  assert.equal(location.searchParams.get('redirect_uri'), `${origin}/api/source-accounts/dropbox/oauth/callback`);
+  assert.equal(location.searchParams.get('token_access_type'), 'offline');
+  assert.equal(location.searchParams.get('code_challenge_method'), 'S256');
+  const state = location.searchParams.get('state')!;
+  const cookie = start.headers.get('set-cookie')!.match(/test-source-oauth=([^;]+)/)![1];
+  assert.equal(cookie, state);
+  dropbox.challenges.set(code, location.searchParams.get('code_challenge')!);
+  return { state, callback: (query: Record<string, string>, withCookie = true) => client.request('GET', `/api/source-accounts/dropbox/oauth/callback?${new URLSearchParams(query)}`,
+    undefined, withCookie ? { Cookie: `${client.cookie}; test-source-oauth=${state}` } : {}) };
+}
+
+function returned(response: Response) {
+  assert.equal(response.status, 302);
+  const location = new URL(response.headers.get('location')!);
+  assert.equal(location.origin, origin);
+  assert.equal(location.hash, '#/settings/profile');
+  return { result: location.searchParams.get('result'), reason: location.searchParams.get('reason') };
+}
+
+test('members connect Dropbox by signing in; the state, PKCE and the member are checked, and tokens are refreshed on the control plane', async t => {
+  const f = await fixture(t); const s = await sharedSession(f, ['identity', 'source_read']);
+  const dropbox = dropboxFake(t);
+  // Without an app registered by the operator, there is no sign-in.
+  assert.deepEqual((await json<{ oauth: string[] }>(await s.creator.request('GET', '/api/source-accounts'))).oauth, []);
+  await denied(await s.creator.request('GET', '/api/source-accounts/dropbox/oauth/start'), 404, 'oauth_unavailable');
+  Object.assign(f.env, { DROPBOX_CLIENT_ID: 'dropbox-app-key', DROPBOX_CLIENT_SECRET: 'dropbox-app-secret' });
+  assert.deepEqual((await json<{ oauth: string[] }>(await s.creator.request('GET', '/api/source-accounts'))).oauth, ['dropbox']);
+  // Dropbox has no secret to paste.
+  await denied(await s.creator.request('PUT', '/api/source-accounts/dropbox', { token: 'x'.repeat(40) }), 400, 'oauth_required');
+
+  // A callback without this browser's state cookie, with another member's state, or with a forged state links nothing.
+  const flow = await dropboxSignIn(f, s.creator, dropbox, 'code-1');
+  assert.deepEqual(returned(await flow.callback({ code: 'code-1', state: flow.state }, false)), { result: 'error', reason: 'invalid_state' });
+  const admins = await dropboxSignIn(f, s.admin, dropbox, 'code-2');
+  assert.deepEqual(returned(await s.creator.request('GET', `/api/source-accounts/dropbox/oauth/callback?code=code-2&state=${admins.state}`, undefined,
+    { Cookie: `${s.creator.cookie}; test-source-oauth=${admins.state}` })), { result: 'error', reason: 'invalid_state' });
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM source_accounts WHERE provider = 'dropbox'").get()!.n, 0);
+  // Starting again replaces the member's earlier state. A verifier that doesn't match the challenge fails at Dropbox.
+  const second = await dropboxSignIn(f, s.creator, dropbox, 'code-3');
+  dropbox.challenges.set('code-3', 'not-the-challenge');
+  assert.deepEqual(returned(await second.callback({ code: 'code-3', state: second.state })), { result: 'error', reason: 'source_account_rejected' });
+  // The member declining at Dropbox.
+  const declined = await dropboxSignIn(f, s.creator, dropbox, 'code-4');
+  assert.deepEqual(returned(await declined.callback({ error: 'access_denied', state: declined.state })), { result: 'error', reason: 'access_denied' });
+
+  const good = await dropboxSignIn(f, s.creator, dropbox, 'code-5');
+  assert.deepEqual(returned(await good.callback({ code: 'code-5', state: good.state })), { result: 'connected', reason: null });
+  // A state works once.
+  assert.deepEqual(returned(await good.callback({ code: 'code-5', state: good.state })), { result: 'error', reason: 'invalid_state' });
+  const { accounts } = await json<{ accounts: { provider: string; method: string; name: string }[] }>(await s.creator.request('GET', '/api/source-accounts'));
+  assert.deepEqual(accounts.map(account => [account.provider, account.method, account.name]), [['dropbox', 'oauth', 'creator@example.test']]);
+
+  // The admin binds a folder with their own sign-in; the creator's session reads it with the creator's.
+  const adminFlow = await dropboxSignIn(f, s.admin, dropbox, 'code-6');
+  assert.deepEqual(returned(await adminFlow.callback({ code: 'code-6', state: adminFlow.state })), { result: 'connected', reason: null });
+  const { source } = await json<{ source: WorkspaceDocumentSource }>(await s.admin.request('POST', `/api/workspaces/${s.team.id}/sources`, { kind: 'dropbox', target: '/Specs' }), 201);
+  assert.deepEqual([source.itemId, source.itemType, source.title, source.url], ['id:folder00001', 'folder', 'Specs', 'https://www.dropbox.com/home/Specs']);
+  const admissionId = admit(f, s.session.id, s.session.ownerId);
+  const read = (item?: string) => self(f, s.connector, 'sources/read', { sessionId: s.session.id, actorId: s.session.ownerId, admissionId, callId: 'call-1', source: source.id, ...(item ? { item } : {}) });
+  const folder = await json<SourceReadView>(await read());
+  assert.deepEqual(folder.entries?.map(entry => entry.id), ['id:notes000001']);
+  assert.equal((await json<SourceReadView>(await read('id:notes000001'))).content, '# Notes\nShip it.');
+  await denied(await read('/HR/payroll.md'), 403, 'source_outside');
+
+  // An expired access token is refreshed before the read, stored again, and the refresh token kept.
+  const row = f.sqlite.prepare("SELECT ciphertext FROM source_accounts WHERE user_id = ? AND provider = 'dropbox'").get(s.session.ownerId)!;
+  const stored = JSON.parse(await decryptToken(f.env, s.session.ownerId, String(row.ciphertext)));
+  const expired = { ...stored, expiresAt: Date.now() - 1000 };
+  f.sqlite.prepare("UPDATE source_accounts SET ciphertext = ? WHERE user_id = ? AND provider = 'dropbox'").run(await encryptToken(f.env, s.session.ownerId, JSON.stringify(expired)), s.session.ownerId);
+  dropbox.access.delete(stored.accessToken);
+  const before = dropbox.calls.length;
+  assert.equal((await json<SourceReadView>(await read('id:notes000001'))).content, '# Notes\nShip it.');
+  const refresh = dropbox.calls.slice(before).find(call => call.url === 'https://api.dropboxapi.com/oauth2/token')!;
+  assert.equal(new URLSearchParams(refresh.body).get('refresh_token'), stored.refreshToken);
+  const renewed = JSON.parse(await decryptToken(f.env, s.session.ownerId, String(f.sqlite.prepare("SELECT ciphertext FROM source_accounts WHERE user_id = ? AND provider = 'dropbox'").get(s.session.ownerId)!.ciphertext)));
+  assert.notEqual(renewed.accessToken, stored.accessToken);
+  assert.equal(renewed.refreshToken, stored.refreshToken);
+  assert.ok(renewed.expiresAt > Date.now());
+  // Nothing the provider issued is logged.
+  const audit = JSON.stringify(f.sqlite.prepare('SELECT * FROM audit').all());
+  assert.ok(!/sl\.access-|refresh-\d/.test(audit));
+  // Only the access token went to Dropbox's API; the refresh token went only to its token endpoint.
+  assert.ok(dropbox.calls.every(call => call.url === 'https://api.dropboxapi.com/oauth2/token' || !call.body.includes('refresh-')));
 });

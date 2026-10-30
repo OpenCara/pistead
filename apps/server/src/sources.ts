@@ -1,7 +1,7 @@
 import type { Hono } from 'hono';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
 import {
-  documentKind, sourceLimits, validSourceItem,
+  documentKind, documentKindNames, secretKinds, sourceLimits, validSourceItem,
   type DocumentItemType, type DocumentKind, type GrantSource, type SourceAccountList, type SourceReadView, type WorkspaceDocumentSource, type WorkspaceSourceList,
 } from '../../../packages/shared/src/sources.js';
 import type { AppContext, Env, SessionRow, WorkerEnv } from './types.js';
@@ -14,6 +14,10 @@ import { fit, type DocumentAdapter } from './document-http.js';
 import { notionAdapter } from './notion.js';
 import { googleDriveAdapter } from './google-drive.js';
 import { feishuAdapter } from './feishu.js';
+import { dropboxAdapter } from './dropbox.js';
+import { onedriveAdapter } from './onedrive.js';
+import { tencentDocsAdapter } from './tencent-docs.js';
+import { configuredOAuth, refreshedSecret, type OAuthSecret } from './source-oauth.js';
 
 /**
  * Workspace sources other than Git repositories (docs/design/external-sources.md): Notion pages and databases, Google
@@ -21,9 +25,11 @@ import { feishuAdapter } from './feishu.js';
  * the workspace reads them, each with its owner's own connected account of that kind, through the control plane
  * (source_read). Secrets never reach a host.
  */
-export const documentAdapters: Record<DocumentKind, DocumentAdapter> = { notion: notionAdapter, 'google-drive': googleDriveAdapter, feishu: feishuAdapter };
+export const documentAdapters: Record<DocumentKind, DocumentAdapter> = {
+  notion: notionAdapter, 'google-drive': googleDriveAdapter, feishu: feishuAdapter, dropbox: dropboxAdapter, onedrive: onedriveAdapter, 'tencent-docs': tencentDocsAdapter,
+};
 
-interface SourceAccountRow { id: string; user_id: string; provider: DocumentKind; ciphertext: string; account_name: string; created_at: string }
+interface SourceAccountRow { id: string; user_id: string; provider: DocumentKind; ciphertext: string; account_name: string; method: 'secret' | 'oauth'; created_at: string }
 interface DocumentSourceRow { source_id: string; workspace_id: string; kind: DocumentKind; item_id: string; item_type: DocumentItemType; title: string; url: string; created_by: string; created_at: string }
 
 const documentSourceSelect = `SELECT d.*, s.created_at FROM document_sources d JOIN workspace_sources s ON s.id = d.source_id AND s.kind = d.kind`;
@@ -42,11 +48,36 @@ export async function grantSources(env: Env, workspaceId: string): Promise<Grant
   return (await workspaceDocumentSources(env, workspaceId)).map(source => ({ id: source.id, kind: source.kind, type: source.itemType, title: source.title }));
 }
 
-interface LoadedAccount { secret: string; ciphertext: string; userId: string; provider: DocumentKind }
+interface LoadedAccount { secret: string; ciphertext: string; userId: string; provider: DocumentKind; method: 'secret' | 'oauth' }
 
 async function loadAccount(env: Env, userId: string, provider: DocumentKind): Promise<LoadedAccount | null> {
   const row = await env.DB.query<SourceAccountRow>('SELECT * FROM source_accounts WHERE user_id = ? AND provider = ?').bind(userId, provider).first();
-  return row ? { secret: await decryptToken(env, userId, row.ciphertext), ciphertext: row.ciphertext, userId, provider } : null;
+  return row ? { secret: await decryptToken(env, userId, row.ciphertext), ciphertext: row.ciphertext, userId, provider, method: row.method } : null;
+}
+
+/**
+ * What an adapter gets: a pasted secret as it is, or for a sign-in only a current access token (refreshed here, and
+ * stored again, when it is about to expire). The refresh token never reaches an adapter. A refresh that races another
+ * keeps whichever was stored first, so the account the read uses is always the stored one.
+ */
+async function adapterSecret(env: Env, account: LoadedAccount): Promise<{ account: LoadedAccount; secret: string }> {
+  if (account.method !== 'oauth') return { account, secret: account.secret };
+  let stored = JSON.parse(account.secret) as OAuthSecret;
+  const fresh = await refreshedSecret(env, account.provider, stored);
+  if (fresh) {
+    const plaintext = JSON.stringify(fresh);
+    const ciphertext = await encryptToken(env, account.userId, plaintext);
+    const updated = await env.DB.query('UPDATE source_accounts SET ciphertext = ? WHERE user_id = ? AND provider = ? AND ciphertext = ? RETURNING id')
+      .bind(ciphertext, account.userId, account.provider, account.ciphertext).first();
+    if (updated) { account = { ...account, secret: plaintext, ciphertext }; stored = fresh; }
+    else {
+      const current = await loadAccount(env, account.userId, account.provider);
+      if (!current || current.method !== 'oauth') fail(403, 'source_access_changed', 'The connected account changed; try again with the current one.');
+      account = current; stored = JSON.parse(current.secret) as OAuthSecret;
+    }
+  }
+  const clientId = account.provider === 'tencent-docs' ? env.TENCENT_DOCS_CLIENT_ID : undefined;
+  return { account, secret: JSON.stringify({ mode: 'oauth', accessToken: stored.accessToken, ...(stored.openId ? { openId: stored.openId } : {}), ...(clientId ? { clientId } : {}) }) };
 }
 
 /** The account that was used must still be the connected one before its result leaves the control plane. */
@@ -96,9 +127,10 @@ export async function sourceRead(c: AppContext, connectorId: string | null): Pro
   };
   const { row, source } = await authorize();
   const adapter = documentAdapters[source.kind];
-  const account = await loadAccount(c.env, row.owner_id, source.kind);
-  if (!account) fail(409, 'source_account_required', `The session owner has not connected ${adapter.name} in Settings → Profile → Connected accounts.`);
-  const read = await adapter.read(account.secret, { id: source.item_id, type: source.item_type, title: source.title, url: source.url }, item);
+  const loaded = await loadAccount(c.env, row.owner_id, source.kind);
+  if (!loaded) fail(409, 'source_account_required', `The session owner has not connected ${adapter.name} in Settings → Profile → Connected accounts.`);
+  const { account, secret } = await adapterSecret(c.env, loaded);
+  const read = await adapter.read(secret, { id: source.item_id, type: source.item_type, title: source.title, url: source.url }, item);
   const view = fit<SourceReadView>({ source: source.title, kind: source.kind, ...read });
   await recheckAccount(c.env, account);
   await authorize();
@@ -109,23 +141,25 @@ export async function sourceRead(c: AppContext, connectorId: string | null): Pro
 export function registerSources(app: Hono<WorkerEnv>): void {
   app.get('/api/source-accounts', async c => {
     const rows = await c.env.DB.query<SourceAccountRow>('SELECT * FROM source_accounts WHERE user_id = ? ORDER BY provider').bind(c.get('auth').userId).all();
-    return c.json({ accounts: rows.map(row => ({ provider: row.provider, name: row.account_name, createdAt: row.created_at })) } satisfies SourceAccountList);
+    return c.json({ accounts: rows.map(row => ({ provider: row.provider, method: row.method, name: row.account_name, createdAt: row.created_at })),
+      oauth: configuredOAuth(c.env) } satisfies SourceAccountList);
   });
   app.put('/api/source-accounts/:provider', async c => {
     const actor = c.get('auth').userId;
     const provider = providerParam(c.req.param('provider'));
+    if (!secretKinds.includes(provider)) fail(400, 'oauth_required', `Connect ${documentKindNames[provider]} by signing in to it.`);
     const input = await jsonObject(c, 16384);
     // The adapter verifies what was pasted with its provider and keeps only what reads need.
     const { secret, name } = await documentAdapters[provider].connect(input);
     const ciphertext = await encryptToken(c.env, actor, secret);
     const created = now();
     await c.env.DB.batch([
-      c.env.DB.query(`INSERT INTO source_accounts (id, user_id, provider, ciphertext, account_name, created_at) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT (user_id, provider) DO UPDATE SET ciphertext = excluded.ciphertext, account_name = excluded.account_name, created_at = excluded.created_at`)
+      c.env.DB.query(`INSERT INTO source_accounts (id, user_id, provider, ciphertext, account_name, method, created_at) VALUES (?, ?, ?, ?, ?, 'secret', ?)
+        ON CONFLICT (user_id, provider) DO UPDATE SET ciphertext = excluded.ciphertext, account_name = excluded.account_name, method = 'secret', created_at = excluded.created_at`)
         .bind(id(), actor, provider, ciphertext, name.slice(0, sourceLimits.title), created),
       auditStatement(c.env, actor, 'source_account.connected', null, null, { provider, name }),
     ]);
-    return c.json({ provider, name, createdAt: created });
+    return c.json({ provider, method: 'secret', name, createdAt: created });
   });
   app.delete('/api/source-accounts/:provider', async c => {
     const actor = c.get('auth').userId;
@@ -147,12 +181,13 @@ export function registerSources(app: Hono<WorkerEnv>): void {
     await requireMember(c.env, workspaceId, actor, ['owner', 'admin']);
     const input = await jsonObject(c, 8192);
     if (Object.keys(input).some(key => !['kind', 'target'].includes(key))) fail(400, 'invalid_source', 'Only the kind and target are accepted.');
-    if (!documentKind(input.kind)) fail(400, 'invalid_source', 'Add Git repositories under Repositories; other sources are Notion, Google Drive or Feishu/Lark items.');
+    if (!documentKind(input.kind)) fail(400, 'invalid_source', 'Add Git repositories under Repositories; other sources are documents: Notion, Google Drive, Feishu/Lark, Dropbox, OneDrive or Tencent Docs.');
     const kind = input.kind;
     const adapter = documentAdapters[kind];
     // The admin's own account checks the item and names it; sessions read it with their owners' accounts.
-    const account = await loadAccount(c.env, actor, kind) ?? fail(409, 'source_account_required', `Connect ${adapter.name} in Settings → Profile → Connected accounts first.`);
-    const item = await adapter.resolve(account.secret, input.target);
+    const loaded = await loadAccount(c.env, actor, kind) ?? fail(409, 'source_account_required', `Connect ${adapter.name} in Settings → Profile → Connected accounts first.`);
+    const { account, secret } = await adapterSecret(c.env, loaded);
+    const item = await adapter.resolve(secret, input.target);
     await recheckAccount(c.env, account);
     const sourceId = id(); const created = now();
     const results = await c.env.DB.batch([

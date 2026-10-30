@@ -1,6 +1,6 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
-  documentKindNames, documentKinds, sourceLimits,
+  documentKindNames, documentKinds, secretKinds, sourceLimits,
   type DocumentItemType, type DocumentKind, type FeishuDomain, type SourceAccountList, type WorkspaceDocumentSource, type WorkspaceSourceList,
 } from "../../../packages/shared/src/sources";
 import { api, segment } from "./api";
@@ -24,6 +24,9 @@ const setup: Record<DocumentKind, ReactNode> = {
   notion: <>Create an internal integration at notion.so/profile/integrations with Read content, and share the pages it may read with it (a page's ••• menu → Connections).</>,
   "google-drive": <>Create a service account in Google Cloud with the Drive API enabled, download its JSON key, and share the folders and files it may read with the service account's email, as Viewer.</>,
   feishu: <>Create a custom app in the Feishu or Lark developer console with read access to Drive, Docs and Wiki, publish it, and add it to the folders, documents or wiki spaces it may read.</>,
+  dropbox: <>Sign in to Dropbox. Sessions read the folders and files under the workspace's Dropbox sources that your account can see.</>,
+  onedrive: <>Sign in with your Microsoft account. Sessions read the OneDrive and SharePoint folders and files under the workspace's sources that you can open.</>,
+  "tencent-docs": <>Sign in to Tencent Docs. Sessions read the folders and documents under the workspace's Tencent Docs sources that you can open.</>,
 };
 
 const itemLabels: Record<DocumentItemType, string> = {
@@ -32,9 +35,21 @@ const itemLabels: Record<DocumentItemType, string> = {
 
 /** Profile section: the accounts sessions you own read the workspaces' document sources with. */
 export function ConnectedAccountsSection() {
-  const { accounts, loading, error, refresh } = useSourceAccounts();
+  const resource = useResource<SourceAccountList>("/api/source-accounts");
+  const { accounts, loading, error, refresh } = { accounts: resource.data?.accounts ?? null, loading: resource.loading, error: resource.error, refresh: resource.refresh };
+  const signIn = resource.data?.oauth ?? [];
   const action = useAction();
   const [connecting, setConnecting] = useState<DocumentKind | null>(null);
+  const [returned, setReturned] = useState<{ kind: DocumentKind; ok: boolean; reason: string } | null>(null);
+  // Back from a provider's sign-in: say how it went, once, and take it out of the address.
+  useEffect(() => {
+    const query = new URLSearchParams(window.location.search);
+    const kind = query.get("source_account") as DocumentKind | null;
+    if (!kind || !documentKinds.includes(kind)) return;
+    setReturned({ kind, ok: query.get("result") === "connected", reason: query.get("reason") ?? "" });
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
+  }, []);
+  const shown = documentKinds.filter(kind => secretKinds.includes(kind) || signIn.includes(kind) || accounts?.some(account => account.provider === kind));
   async function remove(provider: DocumentKind, name: string) {
     if (action.busy) return;
     const confirmed = await confirmDialog({
@@ -51,18 +66,28 @@ export function ConnectedAccountsSection() {
   }
   return <Section title="Connected accounts"
     info={<div className="stack">
-      <p>Sessions you own read the workspaces' Notion, Google Drive and Feishu/Lark sources with your own connections here, through Pistead. Secrets are encrypted on the server and never sent to any host, yours included.</p>
+      <p>Sessions you own read the workspaces' document sources with your own connections here, through Pistead. Sign in to a provider, or for Notion, Google Drive and Feishu/Lark paste a secret. Tokens and secrets are encrypted on the server, refreshed there, and never sent to any host, yours included.</p>
       <p>Each provider lets its connection read only what you share with it, and sessions read only what lies under the workspace's sources.</p>
     </div>}>
     <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
-      {documentKinds.map(provider => {
+      {shown.map(provider => {
         const account = accounts?.find(item => item.provider === provider);
-        return <Row key={provider} leading={<Icon name="file" size={16} />} title={documentKindNames[provider]} hint={account ? account.name : "Not connected"}
+        const oauth = signIn.includes(provider);
+        const paste = secretKinds.includes(provider);
+        const connect = <>
+          {oauth && <LinkButton variant={account ? "ghost" : "outline"} size="sm" href={`/api/source-accounts/${provider}/oauth/start`}>{account ? "Sign in again" : "Sign in"}</LinkButton>}
+          {paste && <Button variant={account || oauth ? "ghost" : "outline"} size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>{oauth ? "Paste secret" : account ? "Replace" : "Connect"}</Button>}
+        </>;
+        return <Row key={provider} leading={<Icon name="file" size={16} />} title={documentKindNames[provider]}
+          hint={account ? `${account.name}${account.method === "oauth" ? " · signed in" : ""}` : "Not connected"}
           trailing={account
-            ? <><StatusBadge tone="success">Connected</StatusBadge><Button variant="ghost" size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>Replace</Button><Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Disconnect ${documentKindNames[provider]}`} onClick={() => void remove(provider, account.name)}>Disconnect</Button></>
-            : <Button variant="outline" size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>Connect</Button>} />;
+            ? <><StatusBadge tone="success">Connected</StatusBadge>{connect}<Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Disconnect ${documentKindNames[provider]}`} onClick={() => void remove(provider, account.name)}>Disconnect</Button></>
+            : connect} />;
       })}
     </ResourceState>
+    {returned && <CardBody><Feedback {...(returned.ok
+      ? { notice: `${documentKindNames[returned.kind]} connected.`, error: "" }
+      : { notice: "", error: `${documentKindNames[returned.kind]} wasn't connected${returned.reason === "access_denied" ? ": the sign-in was cancelled" : returned.reason ? ` (${returned.reason})` : ""}. Try again.` })} /></CardBody>}
     {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
     <ConnectSheet provider={connecting} close={() => setConnecting(null)} connected={refresh} />
   </Section>;
@@ -169,6 +194,9 @@ const linkHints: Record<DocumentKind, string> = {
   notion: "A page or database link (Share → Copy link). It must be shared with your Notion integration",
   "google-drive": "A folder, file, Google Doc, Sheet or Slides link. It must be shared with your service account",
   feishu: "A folder, docx document or wiki page link. Your app must be added to it",
+  dropbox: "A folder or file link, or its path in your Dropbox (/Specs). Shared folders must be added to your Dropbox",
+  onedrive: "A OneDrive or SharePoint folder or file link",
+  "tencent-docs": "A Tencent Docs folder or document link (docs.qq.com/…)",
 };
 
 function AddSourceSheet({ open, kinds, workspaceId, close, added }: { open: boolean; kinds: DocumentKind[]; workspaceId: string; close: () => void; added: () => void }) {

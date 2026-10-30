@@ -2,6 +2,7 @@ import { createPrivateKey, createHash, sign } from 'node:crypto';
 import { googleDriveId, sourceLimits, sourceReadLimits, type DocumentItemType, type SourceReadEntry } from '../../../packages/shared/src/sources.js';
 import { fail } from './http.js';
 import { accountRejected, clean, json, notFound, outsideSource, rateLimited, textBody, upstream, type DocumentAdapter, type ItemView } from './document-http.js';
+import { docxFile, docxText } from './office.js';
 
 /**
  * Google Drive as a service account: its owner shares a folder or file with the account's email, as with a Notion
@@ -30,6 +31,9 @@ const base64url = (value: Buffer | string) => Buffer.from(value).toString('base6
 const tokens = new Map<string, { token: string; expires: number }>();
 
 async function accessToken(secret: string): Promise<string> {
+  // A member who signed in to Google: the control plane already refreshed the token.
+  const signedIn = JSON.parse(secret) as { mode?: string; accessToken?: string };
+  if (signedIn.mode === 'oauth' && typeof signedIn.accessToken === 'string') return signedIn.accessToken;
   const cacheKey = createHash('sha256').update(secret).digest('hex');
   const cached = tokens.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.token;
@@ -131,10 +135,16 @@ async function content(secret: string, item: DriveFile): Promise<{ content?: str
     return body?.text ? { content: body.text, truncated: body.truncated, ...(note ? { note } : {}) } : { note: 'Google Drive could not export this file.', truncated: true };
   }
   if (item.mimeType.startsWith('application/vnd.google-apps.')) return { note: `A ${item.mimeType.slice('application/vnd.google-apps.'.length)} can't be read as text.`, truncated: false };
-  if (!textTypes.test(item.mimeType) && !textNames.test(item.title)) return { note: `A binary file (${item.mimeType || 'unknown type'}) can't be read as text.`, truncated: false };
-  const answer = await drive(secret, `/files/${encodeURIComponent(item.id)}?alt=media&supportsAllDrives=true`, 'text', textLimit);
+  const word = item.mimeType === docxFile.type || docxFile.name.test(item.title);
+  if (!word && !textTypes.test(item.mimeType) && !textNames.test(item.title)) return { note: `A binary file (${item.mimeType || 'unknown type'}) can't be read as text.`, truncated: false };
+  const answer = await drive(secret, `/files/${encodeURIComponent(item.id)}?alt=media&supportsAllDrives=true`, 'text', word ? 8 * 1024 * 1024 : textLimit);
   if (answer.status === 403 || answer.status === 404) notFound('Google Drive', share);
   if (answer.status !== 200) fail(502, 'source_unavailable', 'Google Drive could not download the file. Try again later.');
+  if (word) {
+    // A Word file uploaded to Drive (not a Google Doc): its paragraphs.
+    const text = answer.headers.get('x-pistead-truncated') ? null : docxText(answer.bytes);
+    return text === null ? { note: 'This Word document is too large or unreadable.', truncated: true } : { content: text, truncated: false };
+  }
   const body = textBody(answer);
   return { content: body.text, truncated: body.truncated };
 }

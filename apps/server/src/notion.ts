@@ -9,11 +9,16 @@ const share = 'the Notion integration';
 
 type Json = Record<string, unknown>;
 
+/** The token to call Notion with: an integration secret as pasted, or a signed-in connection's access token. */
+function bearer(secret: string): string {
+  return secret.startsWith('{') ? (JSON.parse(secret) as { accessToken: string }).accessToken : secret;
+}
+
 /** One Notion call; `missing: 'null'` answers null for an id Notion doesn't have (or one of the other kind). */
 async function call(token: string, path: string, init: { method?: 'GET' | 'POST'; body?: unknown } = {}, missing: 'fail' | 'null' = 'fail'): Promise<Json | null> {
   const answer = await upstream('Notion', `${notionApi}${path}`, {
     method: init.method ?? 'GET',
-    headers: { Authorization: `Bearer ${token}`, 'Notion-Version': notionVersion, Accept: 'application/json',
+    headers: { Authorization: `Bearer ${bearer(token)}`, 'Notion-Version': notionVersion, Accept: 'application/json',
       ...(init.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
     ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
   });
