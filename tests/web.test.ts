@@ -81,6 +81,21 @@ test("malformed HTML converts in time proportional to its length", () => {
   }
 });
 
+test("deeply nested lists indent only so far, and no page converts to more text than web_fetch decodes", () => {
+  const started = performance.now();
+  const { text } = htmlToText("<ul><li>x".repeat(50_000), new URL("https://example.com/"));
+  assert.ok(performance.now() - started < 2000);
+  assert.ok(text.length < 50_000 * 25, `${text.length} characters`);
+  assert.ok(text.split("\n").every(line => line.length <= 2 * 8 + 3), "indentation is capped");
+  const huge = htmlToText(`<p>${"word ".repeat(3_000_000)}</p>`, new URL("https://example.com/"));
+  assert.ok(huge.text.length <= webLimits.decodedBytes);
+});
+
+test("a page that leaves out </head> keeps its body, and a skipped element ends only at its own end tag", () => {
+  assert.deepEqual(htmlToText("<head><title>T</title><meta charset=utf-8><body><p>Hi</p>", new URL("https://example.com/")), { title: "T", text: "Hi" });
+  assert.equal(htmlToText('<script>var a = "</scripture>";</script><p>After</p>', new URL("https://example.com/")).text, "After");
+});
+
 test("text is decoded in the charset its Content-Type or meta tag names, else UTF-8", () => {
   assert.equal(decodeText(Buffer.from([0x63, 0x61, 0x66, 0xe9]), "text/plain; charset=iso-8859-1", false), "café");
   assert.equal(decodeText(Buffer.from('<meta charset="windows-1252"><p>\x93hi\x94</p>', "latin1"), "text/html", true), '<meta charset="windows-1252"><p>“hi”</p>');
@@ -185,6 +200,16 @@ test("web search queries and counts are checked before anything leaves the host"
   assert.equal(webSearchCount(undefined), 8);
   assert.equal(webSearchCount(20), 20);
   for (const count of [0, 21, 1.5, "3"]) assert.throws(() => webSearchCount(count), /whole number/);
+});
+
+test("search results with markup that never closes are cleaned in time, within their limits", async t => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ results: [{ title: "<".repeat(900_000), url: "https://example.com/", content: "<b".repeat(400_000) }] }));
+  const provider = webSearchProvider({ APP_ORIGIN: "x", WEB_SEARCH: "tavily", WEB_SEARCH_API_KEY: "key" } as never)!;
+  const started = performance.now();
+  const [hit] = await provider.search("query", 1);
+  assert.ok(performance.now() - started < 2000);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.ok(hit!.title.length <= webLimits.titleLength && hit!.snippet.length <= webLimits.snippetLength);
 });
 
 test("the server refuses to start with an incomplete web search provider, and offers none unless one is complete", async () => {

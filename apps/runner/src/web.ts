@@ -152,6 +152,7 @@ async function download(source: Readable, encoding: string | undefined, signal: 
   let size = 0;
   let truncated = false;
   const abort = () => source.destroy(new Error("aborted"));
+  if (signal.aborted) throw new Error("aborted");
   signal.addEventListener("abort", abort, { once: true });
   try {
     for await (const chunk of source as AsyncIterable<Buffer>) {
@@ -238,10 +239,23 @@ export function decodeEntities(value: string): string {
   });
 }
 
-/** Elements whose content never reaches the text. */
-const SKIPPED = new Set(["script", "style", "noscript", "template", "svg", "math", "iframe", "object", "canvas", "head", "select", "datalist"]);
+/** Elements whose content never reaches the text. Not `head`, whose end tag pages may leave out: what it holds is skipped anyway. */
+const SKIPPED = new Set(["script", "style", "noscript", "template", "svg", "math", "iframe", "object", "canvas", "select", "datalist"]);
 const BLOCKS = new Set(["p", "div", "section", "article", "header", "footer", "main", "nav", "aside", "ul", "ol", "dl", "dt", "dd", "table", "thead",
   "tbody", "tfoot", "blockquote", "figure", "figcaption", "form", "fieldset", "details", "summary", "address", "caption"]);
+
+/** The most text a page converts to, in characters: as much as web_fetch decodes of it. */
+const HTML_TEXT_LIMIT = webLimits.decodedBytes;
+/** Nested lists indent this deep at most, so their markers never outgrow the page. */
+const MAX_INDENT = 8;
+
+/** Where `name`'s end tag starts at or after `from`, not a longer name's that begins the same (`</scripture>`); -1 for none. */
+function closingTag(lower: string, name: string, from: number): number {
+  for (let index = lower.indexOf(`</${name}`, from); index >= 0; index = lower.indexOf(`</${name}`, index + 1)) {
+    if (!/[a-z0-9:-]/.test(lower[index + name.length + 2] ?? "")) return index;
+  }
+  return -1;
+}
 
 /**
  * HTML as text an agent reads well: script, style and other non-content elements dropped, headings as `#` lines, list
@@ -251,6 +265,9 @@ const BLOCKS = new Set(["p", "div", "section", "article", "header", "footer", "m
 export function htmlToText(html: string, base: URL): { title?: string; text: string } {
   const lower = html.toLowerCase();
   const out: string[] = [];
+  /** The output's length so far: conversion stops at HTML_TEXT_LIMIT, whatever the page holds. */
+  let size = 0;
+  const emit = (text: string) => { out.push(text); size += text.length; };
   const titleStart = lower.indexOf("<title");
   const titleOpen = titleStart < 0 ? -1 : lower.indexOf(">", titleStart);
   const titleEnd = titleOpen < 0 ? -1 : lower.indexOf("</title", titleOpen);
@@ -269,19 +286,19 @@ export function htmlToText(html: string, base: URL): { title?: string; text: str
     const end = last(count);
     if (!end) return;
     const have = /\n*$/.exec(end)![0].length;
-    if (have < count) out.push("\n".repeat(count - have));
+    if (have < count) emit("\n".repeat(count - have));
   };
   const write = (raw: string) => {
-    if (pre) { out.push(decodeEntities(raw)); return; }
+    if (pre) { emit(decodeEntities(raw)); return; }
     let text = decodeEntities(raw).replace(/[\s\u00a0]+/g, " ");
     const end = last(1);
     if (!end || end === "\n" || end === " ") text = text.trimStart();
-    if (text) out.push(text);
+    if (text) emit(text);
   };
   // A tag's attributes stop at the next `<`, so an unclosed one costs only the text up to the next tag.
   const tag = /<!--|<[!?][^<>]{0,1024}>|<(\/?)([a-zA-Z][a-zA-Z0-9:-]{0,63})(?![a-zA-Z0-9:-])([^<>]{0,4096})>/g;
   let position = 0;
-  for (let match = tag.exec(html); match; match = tag.exec(html)) {
+  for (let match = tag.exec(html); match && size < HTML_TEXT_LIMIT; match = tag.exec(html)) {
     if (match.index > position) write(html.slice(position, match.index));
     position = tag.lastIndex;
     if (match[0] === "<!--") {
@@ -298,7 +315,7 @@ export function htmlToText(html: string, base: URL): { title?: string; text: str
     if (!closing && (SKIPPED.has(name) || name === "title")) {
       // Its content, up to its own end tag, is skipped whole; the title was read above.
       if (attributes.trimEnd().endsWith("/")) continue;
-      const end = lower.indexOf(`</${name}`, position);
+      const end = closingTag(lower, name, position);
       const close = end < 0 ? -1 : lower.indexOf(">", end);
       position = close < 0 ? html.length : close + 1;
       tag.lastIndex = position;
@@ -306,21 +323,21 @@ export function htmlToText(html: string, base: URL): { title?: string; text: str
     }
     if (/^h[1-6]$/.test(name)) {
       newlines(2);
-      if (!closing) out.push(`${"#".repeat(Number(name[1]))} `);
+      if (!closing) emit(`${"#".repeat(Number(name[1]))} `);
       continue;
     }
     switch (name) {
-      case "br": out.push("\n"); break;
-      case "hr": newlines(2); out.push("---"); newlines(2); break;
-      case "li": if (!closing) { newlines(1); out.push(`${"  ".repeat(Math.max(0, lists - 1))}- `); } break;
+      case "br": emit("\n"); break;
+      case "hr": newlines(2); emit("---"); newlines(2); break;
+      case "li": if (!closing) { newlines(1); emit(`${"  ".repeat(Math.min(MAX_INDENT, Math.max(0, lists - 1)))}- `); } break;
       case "ul": case "ol": lists = Math.max(0, lists + (closing ? -1 : 1)); newlines(lists > 1 || (lists === 1 && closing) ? 1 : 2); break;
       case "tr": newlines(1); break;
-      case "td": case "th": if (closing) out.push(" | "); break;
+      case "td": case "th": if (closing) emit(" | "); break;
       case "pre":
-        if (!closing) { newlines(2); out.push("```\n"); pre++; }
-        else if (pre) { pre--; if (last(1) !== "\n") out.push("\n"); out.push("```"); newlines(2); }
+        if (!closing) { newlines(2); emit("```\n"); pre++; }
+        else if (pre) { pre--; if (last(1) !== "\n") emit("\n"); emit("```"); newlines(2); }
         break;
-      case "code": if (!pre) out.push("`"); break;
+      case "code": if (!pre) emit("`"); break;
       case "img": {
         const alt = attribute(attributes, "alt");
         if (alt && !closing) write(` [image: ${alt}] `);
@@ -331,9 +348,11 @@ export function htmlToText(html: string, base: URL): { title?: string; text: str
           const href = attribute(attributes, "href");
           link = href !== undefined ? { href, start: out.length } : undefined;
         } else if (link) {
-          const text = out.splice(link.start).join("").replace(/\s+/g, " ").trim();
+          const removed = out.splice(link.start).join("");
+          size -= removed.length;
+          const text = removed.replace(/\s+/g, " ").trim();
           const target = linkTarget(link.href, base);
-          if (text) out.push(target && target !== text ? `[${text}](${target})` : text);
+          if (text) emit(target && target !== text ? `[${text}](${target})` : text);
           link = undefined;
         }
         break;
@@ -341,8 +360,8 @@ export function htmlToText(html: string, base: URL): { title?: string; text: str
         if (BLOCKS.has(name)) newlines(2);
     }
   }
-  if (position < html.length) write(html.slice(position));
-  const text = out.join("").split("\n").map(line => line.replace(/[ \t]+$/, "")).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (position < html.length && size < HTML_TEXT_LIMIT) write(html.slice(position, position + HTML_TEXT_LIMIT));
+  const text = out.join("").slice(0, HTML_TEXT_LIMIT).split("\n").map(line => line.replace(/[ \t]+$/, "")).join("\n").replace(/\n{3,}/g, "\n\n").trim();
   return { ...(title ? { title } : {}), text };
 }
 

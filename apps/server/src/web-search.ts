@@ -64,7 +64,8 @@ function searxngBase(value: string | undefined): string | undefined {
 /** Plain text of a provider's snippet or title: markup and entities out, whitespace collapsed, within `limit`. */
 function plain(value: unknown, limit: number): string {
   if (typeof value !== 'string') return '';
-  const textValue = value.replace(/<[^>]*>/g, '').replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp|#39);/gi, (_match, entity: string) => {
+  // Cut down first, and a tag never runs past the next `<`: a provider's field costs time in proportion to the limit.
+  const textValue = value.slice(0, limit * 4).replace(/<[^<>]*>/g, '').replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp|#39);/gi, (_match, entity: string) => {
     const lower = entity.toLowerCase();
     if (lower.startsWith('#x')) return safeCodePoint(Number.parseInt(lower.slice(2), 16));
     if (lower.startsWith('#')) return safeCodePoint(Number.parseInt(lower.slice(1), 10));
