@@ -108,11 +108,13 @@ export function sessionCreatorSQL(workspace: string): string {
 const sessionManagerRolesSQL = workspaceManagerRoles.map(role => `'${role}'`).join(', ');
 /**
  * SQL true while the bound user (one `?`) still manages `session` (the alias of a sessions row) as a whole, as
- * managesSession decides it: a member of its workspace who owns it, or the workspace's owner or an admin.
+ * managesSession decides it: a member of its workspace, not suspended, who owns it or is the workspace's owner or an
+ * admin. Writes check it themselves rather than trust the policy version alone, which a suspension doesn't bump.
  */
 export function sessionManagerSQL(session: string): string {
-  return `EXISTS (SELECT 1 FROM workspace_members manager WHERE manager.workspace_id = ${session}.workspace_id AND manager.user_id = ?
-    AND (manager.user_id = ${session}.owner_id OR manager.role IN (${sessionManagerRolesSQL})))`;
+  return `EXISTS (SELECT 1 FROM workspace_members manager JOIN users manager_user ON manager_user.id = manager.user_id
+    WHERE manager.workspace_id = ${session}.workspace_id AND manager.user_id = ? AND manager_user.suspended_at IS NULL
+      AND (manager.user_id = ${session}.owner_id OR manager.role IN (${sessionManagerRolesSQL})))`;
 }
 type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: WorkspaceRole };
 

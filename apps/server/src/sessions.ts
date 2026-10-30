@@ -275,11 +275,11 @@ export async function archiveSession(c: AppContext, sessionId: string, audit: Re
   const access = await requireSessionManager(c, sessionId, 'manage', 'Only the session owner, or the workspace\'s owner or an admin, can archive it.');
   const { row } = access;
   const actorId = c.get('auth').userId;
-  // A policy version bump invalidates runner tickets and broker capabilities issued before archiving. Membership and
-  // role changes bump it too, so this lands only while the actor still manages the session as checked.
+  // A policy version bump invalidates runner tickets and broker capabilities issued before archiving. It lands only
+  // while the actor still manages the session, checked as it writes: a suspension, say, bumps no policy version.
   const archived = await c.env.DB.query<SessionRow>(`UPDATE sessions SET archived_status = status, status = 'archived', policy_version = policy_version + 1
-    WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived'
-    RETURNING *`).bind(row.id, row.owner_id, row.policy_version).first();
+    WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived' AND ${sessionManagerSQL('sessions')}
+    RETURNING *`).bind(row.id, row.owner_id, row.policy_version, actorId).first();
   if (!archived) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
   await auditStatement(c.env, actorId, 'session.archived', row.workspace_id, row.id, { previousStatus: row.status, ...audit }).run();
   return { ...access, row: archived };
@@ -502,11 +502,11 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     const { row } = access;
     const actorId = c.get('auth').userId;
     if (row.status !== 'archived') fail(409, 'session_not_archived', 'Session is not archived.');
-    // Membership and role changes bump the policy version, so this lands only while the actor still manages the session.
+    // It lands only while the actor still manages the session, checked as it writes, as archiving does.
     const restored = await c.env.DB.query<SessionRow>(`UPDATE sessions SET status = COALESCE(archived_status, 'ready'), archived_status = NULL,
         policy_version = policy_version + 1
-      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status = 'archived'
-      RETURNING *`).bind(row.id, row.owner_id, row.policy_version).first();
+      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status = 'archived' AND ${sessionManagerSQL('sessions')}
+      RETURNING *`).bind(row.id, row.owner_id, row.policy_version, actorId).first();
     if (!restored) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
     await auditStatement(c.env, actorId, 'session.unarchived', row.workspace_id, row.id, { status: restored.status }).run();
     return c.json({ session: sessionRecord(restored, access.permissions) });

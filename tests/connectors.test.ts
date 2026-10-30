@@ -2582,6 +2582,45 @@ for (const mutation of ['owner-membership', 'policy-version'] as const) {
   });
 }
 
+// A workspace admin's change to someone else's session checks again, as it writes, that they still manage it: a
+// suspension bumps no policy version, and neither would a role change made some other way.
+for (const mutation of ['demoted', 'suspended'] as const) {
+  test(`a workspace admin's changes to another member's session are refused once they are ${mutation} after admission`, async t => {
+    const f = await fixture(t); const s = await sharedSession(f);
+    const path = `/api/sessions/${s.session.id}`;
+    const manager = await f.client(`manager-${mutation}`);
+    const operations = [
+      { name: 'archive', sql: 'UPDATE sessions SET archived_status = status', action: 'session.archived', send: () => manager.request('POST', `${path}/archive`) },
+      { name: 'unarchive', sql: 'UPDATE sessions SET status = COALESCE', action: 'session.unarchived', send: () => manager.request('POST', `${path}/unarchive`) },
+      { name: 'rename', sql: 'UPDATE sessions SET title =', action: 'session.renamed', send: () => manager.request('PATCH', path, { title: 'Renamed' }) },
+      { name: 'visibility', sql: 'UPDATE sessions SET visibility =', action: 'session.visibility.updated', send: () => manager.request('PATCH', path, { visibility: 'private' }) },
+      { name: 'tool output', sql: 'UPDATE sessions SET tool_output =', action: 'session.tool_output.updated', send: () => manager.request('PATCH', path, { toolOutput: 'brief' }) },
+    ];
+    for (const operation of operations) {
+      // An admin again, and active, before each attempt; the session is archived for the unarchive.
+      f.sqlite.prepare("UPDATE users SET suspended_at = NULL WHERE id = ?").run(manager.user.id);
+      await json(await s.admin.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: manager.user.id, role: 'admin' }));
+      if (operation.name === 'unarchive') await json(await s.creator.request('POST', `${path}/archive`));
+      const before = f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)!;
+      let changed = false;
+      f.setBeforeQuery(sql => {
+        if (changed || !sql.startsWith(operation.sql)) return;
+        changed = true;
+        if (mutation === 'demoted') f.sqlite.prepare("UPDATE workspace_members SET role = 'member' WHERE workspace_id = ? AND user_id = ?").run(s.team.id, manager.user.id);
+        else f.sqlite.prepare('UPDATE users SET suspended_at = ? WHERE id = ?').run(new Date().toISOString(), manager.user.id);
+      });
+      await denied(await operation.send(), 409, 'policy_changed');
+      f.setBeforeQuery();
+      assert.equal(changed, true, `The ${mutation} change must land after admission and before the conditional ${operation.name}`);
+      assert.deepEqual({ ...f.sqlite.prepare('SELECT * FROM sessions WHERE id = ?').get(s.session.id)! }, { ...before }, operation.name);
+      assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM audit WHERE session_id = ? AND action = ? AND actor_id = ?')
+        .get(s.session.id, operation.action, manager.user.id)!.n, 0, operation.name);
+      if (operation.name === 'unarchive') await json(await s.creator.request('POST', `${path}/unarchive`));
+    }
+    assert.equal(s.hub.requests.length, 1);
+  });
+}
+
 test('a collaborator sends a message to a workspace-visible session it does not own; a viewer cannot, whatever its grant', async t => {
   const f = await fixture(t); const s = await sharedSession(f);
   const collaborator = await f.client('collaborator'); const viewer = await f.client('viewer');
