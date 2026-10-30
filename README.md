@@ -343,6 +343,12 @@ A sandbox's only way out is its session's **egress proxy**, which the connector 
 
   Shell commands verify these hosts against the certificates the **host** trusts (its system store, or Node.js's bundled one where it has none, plus the connector's `NODE_EXTRA_CA_CERTS`): the connector copies them into the session when it opens, and the sandbox sees them read-only at `/etc/ssl/certs/ca-certificates.crt`, which `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` name. Nothing else of the host's `/etc` is visible. A certificate added on the host reaches a session the next time it opens.
 
+- **The agent's web tools** (connector newer than 0.9.0):
+  - `web_fetch` reads one web page for the agent: the host makes the request itself, as far as this network access lets the session's sandbox reach (with **Off**, nowhere), and only over HTTPS on port 443 (an `http://` URL is read as `https://`). It never reaches addresses in the host's own networks, checks each redirect like the first request, sends no cookies or credentials, and only reads (GET). HTML comes back as text with its headings, lists, code blocks and links; JSON and other text as they are; PNG, JPEG, GIF and WebP images as images; other files are refused unread, for `curl` in `bash`. It downloads at most 5 MiB of a page, and the agent reads long pages in parts. It needs no approval, during a shared message (not a side ask), and its requests show in the session's egress status as `fetch`. It follows the workspace's network access on every host, unsandboxed ones too.
+  - `web_search` searches the web with the search provider the server's operator configured (`WEB_SEARCH`, see [Configuration](#configuration): Brave Search, Tavily or a SearXNG instance), whose key stays on the server. It works only where the workspace's owners and admins turn on **Web search** under **Network access**, off by default, because each query goes to that provider; it needs no approval, during a shared message (until an hour after it was sent), and each search is recorded in the workspace's audit log with its query.
+
+  Whatever the agent puts in a URL or a query reaches that host or the provider, so a workspace whose network access is **Open** lets a misled agent send what it read elsewhere without asking anyone, as approved or auto-approved shell commands already could. What the tools return is untrusted input, and the agent is told so with each result.
+
 `curl -s "$PISTEAD_EGRESS_STATUS"` in a session shows its current access, the workspace's repositories, the APIs its proxy answers itself and its recent decisions, with `(direct …)` on the Git requests the host made itself and each GitHub API request with the credential it was made with. A session on a connector that predates the proxy keeps having no network; update the connector to use it.
 
 #### Experimental sandboxes on macOS and Windows
@@ -422,6 +428,8 @@ The tools an agent can use:
 | `github_comment` | Comment on a GitHub issue or pull request | Approval |
 | `github_merge` | Merge a GitHub pull request | Approval |
 | `github_issue` | Open a GitHub issue | Approval |
+| `web_fetch` | Read a web page, as far as the workspace's [network access](#network-access) reaches | Nothing, during a shared message |
+| `web_search` | Search the web with the server's search provider | **Web search** on in the workspace's network access; nothing else, during a shared message |
 | `schedule` | List, create, change or delete the session's [scheduled prompts](#scheduled-prompts) | A message from the session owner; Auto-approve for auto-approved schedules |
 | `sessions` | List, read, message, start, stop and archive the workspace's other sessions, as the message's sender (see [Working across sessions](#working-across-sessions)) | A shared message; permission in **Read only** messages for changes, and to pass content between sessions whose readers differ |
 | `host_bash` | Run a command on the host, outside the sandbox | The approval of the host owner, or of a member they [granted host commands](#host-admins-and-host-command-grants) |
@@ -756,6 +764,8 @@ Settings are environment variables, read once at start-up; secrets are never log
 | `OIDC_SIGNING_KEY` | none | RSA private key (PKCS#8 PEM) for Pistead's OIDC issuer |
 | `GIT_DIRECT` | `on` | Where sessions' Git data goes (see [Network access](#network-access)): `on` lets hosts fetch from Git hosts themselves with credentials limited to a repository, `own-hosts` gives credentials only to session owners' own hosts, `off` relays every Git request through the server |
 | `SANDBOX_GITHUB_API` | `on` | Whether sessions' `gh` and other GitHub API clients read the workspace's github.com repositories (see [Network access](#network-access)): `on` gives every host running a session a read-only GitHub App token for them, which its egress proxy adds, `own-hosts` only session owners' own hosts, `off` none |
+| `WEB_SEARCH` | `off` | The search provider of the agent's `web_search` tool (see [Network access](#network-access)): `brave` ([Brave Search API](https://brave.com/search/api/)), `tavily` ([Tavily](https://tavily.com)) or `searxng` (a [SearXNG](https://docs.searxng.org) instance with its JSON output turned on); `off` offers no search. Workspaces still turn web search on themselves |
+| `WEB_SEARCH_API_KEY`, `WEB_SEARCH_URL` | none | The provider's API key (Brave, Tavily; for SearXNG, an optional bearer token); the SearXNG instance's origin, such as `https://search.example.com` |
 | `ADMIN_USER_IDS` | none | Comma-separated user IDs of the server's administrators (see [Administration](#administration)) |
 | `RUNNER_URL`, `RUNNER_EVENT_TRANSPORT`, `RUNNER_SHARED_SECRET` | none | Legacy operator-managed runner, for development only; leave empty |
 | `TEST_AUTH_ENABLED`, `TEST_AUTH_SECRET`, `TEST_AUTH_EXPIRES_AT` | off | Local test mode, for development only |

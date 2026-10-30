@@ -884,16 +884,27 @@ test('workspace network policies: members read, administrators write, invalid do
   const owner = await f.client('owner'); const reader = await f.client('reader');
   const team = await workspace(owner); await member(owner, team.id, reader);
   const path = `/api/workspaces/${team.id}/network-policy`;
-  const initial = await json<{ policy: { mode: string; domains: string[]; packageRegistries: boolean }; packageRegistryDomains: string[] }>(await reader.request('GET', path));
-  assert.deepEqual(initial.policy, { mode: 'off', domains: [], packageRegistries: true });
+  type PolicyResponse = { policy: { mode: string; domains: string[]; packageRegistries: boolean; webSearch: boolean }; packageRegistryDomains: string[]; webSearchProvider: string | null };
+  const initial = await json<PolicyResponse>(await reader.request('GET', path));
+  assert.deepEqual(initial.policy, { mode: 'off', domains: [], packageRegistries: true, webSearch: false });
   assert.ok(initial.packageRegistryDomains.includes('registry.npmjs.org'));
+  assert.equal(initial.webSearchProvider, null);
   const allowlist = { mode: 'allowlist', domains: ['docs.example.com', '*.cdn.example.net'], packageRegistries: false };
   await denied(await reader.request('PUT', path, allowlist), 403, 'forbidden');
   await denied(await owner.request('PUT', path, { ...allowlist, domains: ['169.254.169.254'] }), 400, 'invalid_network_policy');
   await denied(await owner.request('PUT', path, { ...allowlist, mode: 'everything' }), 400, 'invalid_network_policy');
-  assert.deepEqual((await json<{ policy: unknown }>(await owner.request('PUT', path, allowlist))).policy, allowlist);
-  assert.deepEqual((await json<{ policy: unknown }>(await reader.request('GET', path))).policy, allowlist);
-  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.network_policy.updated'").get()!.n, 1);
+  await denied(await owner.request('PUT', path, { ...allowlist, webSearch: 'yes' }), 400, 'invalid_network_policy');
+  // A client that predates web search names no setting for it.
+  assert.deepEqual((await json<PolicyResponse>(await owner.request('PUT', path, allowlist))).policy, { ...allowlist, webSearch: false });
+  assert.deepEqual((await json<PolicyResponse>(await reader.request('GET', path))).policy, { ...allowlist, webSearch: false });
+  // Web search is saved, and a later change from such a client keeps it.
+  assert.deepEqual((await json<PolicyResponse>(await owner.request('PUT', path, { ...allowlist, webSearch: true }))).policy, { ...allowlist, webSearch: true });
+  assert.deepEqual((await json<PolicyResponse>(await owner.request('PUT', path, { ...allowlist, domains: ['docs.example.com'] }))).policy,
+    { ...allowlist, domains: ['docs.example.com'], webSearch: true });
+  // The page names the server's search provider, where its operator configured one.
+  f.env.WEB_SEARCH = 'brave'; f.env.WEB_SEARCH_API_KEY = 'brave-key';
+  assert.equal((await json<PolicyResponse>(await reader.request('GET', path))).webSearchProvider, 'brave');
+  assert.equal(f.sqlite.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'workspace.network_policy.updated'").get()!.n, 3);
   const outsider = await f.client('outsider');
   await denied(await outsider.request('GET', path), 404, 'not_found');
 });
@@ -905,6 +916,8 @@ test('egress grants and the Git relay serve only the connector running the sessi
   const grant = await json<{ policy: { mode: string }; repositories: { bindingId: string; fullName: string }[] }>(
     await f.request('POST', '/api/connectors/self/network', { sessionId: session.id }, headers));
   assert.equal(grant.policy.mode, 'off');
+  // Never the web search setting, which older connectors' policy parsing would refuse.
+  assert.deepEqual(Object.keys(grant.policy).sort(), ['domains', 'mode', 'packageRegistries']);
   assert.deepEqual(grant.repositories.map(item => [item.bindingId, item.fullName]), [[repository.id, metadata.full_name]]);
   await denied(await f.request('POST', '/api/internal/network', { sessionId: session.id }, { Authorization: `Bearer ${internalSecret}` }), 403, 'connector_scope_required');
 

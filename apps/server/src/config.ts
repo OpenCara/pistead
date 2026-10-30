@@ -4,6 +4,7 @@ import { ConnectorHubRegistry } from './connector-hub.js';
 import { openDatabase } from './db/index.js';
 import { openStorage } from './storage/index.js';
 import type { Env } from './types.js';
+import { webSearchConfigurationError } from './web-search.js';
 
 export interface ServerConfig {
   env: Env;
@@ -31,6 +32,7 @@ const stringVars = [
   'APP_ORIGIN', 'RUNNER_URL', 'RUNNER_EVENT_TRANSPORT', 'RUNNER_SHARED_SECRET', 'SESSION_SECRET', 'VAULT_KEY',
   'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'TEST_AUTH_ENABLED', 'TEST_AUTH_SECRET', 'TEST_AUTH_EXPIRES_AT',
   'GITHUB_APP_ID', 'GITHUB_APP_SLUG', 'GITHUB_APP_PRIVATE_KEY', 'OIDC_SIGNING_KEY', 'ADMIN_USER_IDS', 'GIT_DIRECT', 'SANDBOX_GITHUB_API',
+  'WEB_SEARCH', 'WEB_SEARCH_API_KEY', 'WEB_SEARCH_URL',
   'LOCAL_MODE', 'LOCAL_CLAIM_SECRET', 'PASSWORD_AUTH', 'SIGNUP',
 ] as const;
 const LOOPBACK = ['127.0.0.1', '::1', 'localhost'];
@@ -64,6 +66,8 @@ export async function loadConfig(processEnv: NodeJS.ProcessEnv = process.env): P
     if (!['true', 'false'].includes(env.PASSWORD_AUTH)) throw new ConfigurationError('PASSWORD_AUTH must be "true" or "false".');
     if (env.PASSWORD_AUTH === 'true' && env.LOCAL_MODE === 'true') throw new ConfigurationError('PASSWORD_AUTH is for shared servers: a LOCAL_MODE server admits only the GitHub account that claimed it.');
   }
+  const webSearch = webSearchConfigurationError(env);
+  if (webSearch) throw new ConfigurationError(webSearch);
   if (env.SIGNUP !== undefined && !['open', 'invite', 'off'].includes(env.SIGNUP)) {
     throw new ConfigurationError('SIGNUP must be "open", "invite" or "off" (unset: GitHub sign-ups are open and password sign-ups need an invite).');
   }
