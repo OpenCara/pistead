@@ -197,7 +197,8 @@ export function registerDataExports(app: Hono<WorkerEnv>): void {
   });
 
   // Owners and admins: the workspace's settings and activity, their own sessions in full and the records of the other
-  // sessions they can view. Other members' private sessions stay out, as everywhere else; their owners export them.
+  // sessions they can view, which is every session there since they manage them all. Each other session's full data
+  // stays with its owner's own export.
   app.get('/api/workspaces/:id/export', async c => {
     const workspaceId = identifier(c.req.param('id'), 'workspaceId');
     const actor = c.get('auth').userId;

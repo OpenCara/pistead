@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { sessionRoles, type ApprovalRecord, type EntryView, type GitHubMergeMethod, type GitHubMergeOperation, type GitPushOperation, type Operation, type PermissionNeed, type PermissionRequest, type SessionGrant, type SessionRecord, type SessionRole, type SessionView, type UserProfile, type WorkspaceRole } from "../../../packages/shared/src/types";
-import { sessionRoleAllowed, sessionRoleGrantable, sessionRoleOf, sessionRolePermissions, workspaceSessionPermissions } from "../../../packages/shared/src/policy";
+import { managesSession, sessionRoleAllowed, sessionRoleGrantable, sessionRoleOf, sessionRolePermissions, workspaceManagerRoles, workspaceSessionPermissions } from "../../../packages/shared/src/policy";
 import { containsRedaction, REDACTED } from "../../../packages/shared/src/redaction";
 import { useSessionLink } from "./session-link";
 import { api, segment } from "./api";
@@ -46,7 +46,11 @@ export interface SessionActions {
   unarchive: () => void;
 }
 
-export function useSessionActions({ session, user, backupBlocked, onChange }: { session: SessionRecord | null; user: UserProfile; backupBlocked: boolean; onChange: () => void }): SessionActions {
+/**
+ * `manages`: the user is the session's owner, or its workspace's owner or an admin (managesSession), who rename,
+ * archive and unarchive it and change its visibility. Backups stay the owner's alone.
+ */
+export function useSessionActions({ session, user, manages, backupBlocked, onChange }: { session: SessionRecord | null; user: UserProfile; manages: boolean; backupBlocked: boolean; onChange: () => void }): SessionActions {
   const action = useAction();
   const [backup, setBackup] = useState<Backup | null>(null);
   const isOwner = session?.ownerId === user.id;
@@ -57,7 +61,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
   const backupsPending = !backups.data && !backups.error;
   const conversationOnlyOff = backups.data?.conversationOnlySupported === false;
   async function changeVisibility() {
-    if (!session || !isOwner || action.busy) return;
+    if (!session || !manages || action.busy) return;
     const nextVisibility = (session.visibility ?? "private") === "workspace" ? "private" : "workspace";
     const confirmed = await confirmDialog(nextVisibility === "workspace" ? {
       title: "Make session workspace-visible?",
@@ -65,7 +69,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
       confirmLabel: "Make workspace-visible",
     } : {
       title: "Make session private?",
-      message: "Workspace membership will no longer grant viewing access. Existing explicit grants will remain in effect, and previously viewed or copied content cannot be recalled.",
+      message: "Workspace membership will no longer grant viewing access, except to the workspace's owner and admins, who manage every session. Existing explicit grants will remain in effect, and previously viewed or copied content cannot be recalled.",
       confirmLabel: "Make private",
     });
     if (!confirmed) return;
@@ -103,7 +107,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
   }
   async function rename(title: string): Promise<boolean> {
     const next = title.trim();
-    if (!session || !isOwner || action.busy || !next) return false;
+    if (!session || !manages || action.busy || !next) return false;
     if (next === session.title) return true;
     let saved = false;
     await action.run(async () => {
@@ -114,7 +118,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
     return saved;
   }
   async function archive() {
-    if (!session || !isOwner || action.busy || session.status === "archived") return;
+    if (!session || !manages || action.busy || session.status === "archived") return;
     const confirmed = await confirmDialog({
       title: "Archive session?",
       message: "The session becomes read-only for everyone and is hidden from the sidebar. Its history stays viewable, and nothing is deleted. Pending approvals can't be decided while it's archived. You can unarchive it later.",
@@ -127,7 +131,7 @@ export function useSessionActions({ session, user, backupBlocked, onChange }: { 
     }, "Session archived");
   }
   function unarchive() {
-    if (!session || !isOwner || action.busy || session.status !== "archived") return;
+    if (!session || !manages || action.busy || session.status !== "archived") return;
     void action.run(async () => {
       await api(`/api/sessions/${segment(session.id)}/unarchive`, { method: "POST" });
       onChange();
@@ -175,6 +179,8 @@ type PanelProps = {
   session: SessionRecord;
   view: SessionView | null;
   user: UserProfile;
+  /** The user's role in the session's workspace, when the workspace list says; its owner and admins manage every session there. */
+  workspaceRole: WorkspaceRole | undefined;
   /** The session's workspace connector listing, shared with the chat box. */
   hosts: ConnectionsResource;
   tab: PanelTab;
@@ -204,7 +210,7 @@ export function SessionPanel(props: PanelProps) {
       <Button variant="ghost" size="xs" icon="x" aria-label="Close panel" title="Close panel" onClick={onClose} />
     </div>
     <div className="session-panel-body">
-      {tab === "details" && <PanelDetails key={JSON.stringify([props.session.id, props.session.ownerId, props.user.id, props.session.permissions])} {...props} />}
+      {tab === "details" && <PanelDetails key={JSON.stringify([props.session.id, props.session.ownerId, props.user.id, props.session.permissions, props.workspaceRole])} {...props} />}
       {tab === "approvals" && (approvals.length
         ? <div className="stack">
           {[...approvals].sort((a, b) => Number(b.status === "pending") - Number(a.status === "pending")).map(approval => <ApprovalCard key={approval.id} approval={approval} />)}
@@ -316,16 +322,17 @@ function GitHubMergeSummary({ operation }: { operation: GitHubMergeOperation }) 
   </dl>;
 }
 
-function PanelDetails({ session, view, user, hosts, refresh, audit, actions, openSession }: PanelProps) {
+function PanelDetails({ session, view, user, workspaceRole, hosts, refresh, audit, actions, openSession }: PanelProps) {
   const ownPermissions = session.permissions ?? [];
   const isOwner = session.ownerId === user.id;
   const canWrite = ownPermissions.includes("write");
+  const manages = managesSession(user.id, session.ownerId, workspaceRole);
   const changed = () => { audit.refresh(); refresh(); };
   return <div>
     <HostSection session={session} user={user} hosts={hosts} />
     <RepositoriesSection session={session} refresh={refresh} />
-    <PeopleSection session={session} user={user} actions={actions} changed={changed} />
-    <TranscriptSection session={session} user={user} changed={changed} />
+    <PeopleSection session={session} user={user} workspaceRole={workspaceRole} actions={actions} changed={changed} />
+    <TranscriptSection session={session} manages={manages} changed={changed} />
     <ConnectionsSection session={session} />
     {isOwner && session.status !== "archived" && <BackupsSection session={session} actions={actions} openSession={openSession} />}
     {isOwner && session.status !== "archived" && !session.frozen && session.connectorId && <MoveHostSection session={session} user={user} hosts={hosts} openSession={openSession} changed={changed} />}
@@ -336,14 +343,14 @@ function PanelDetails({ session, view, user, hosts, refresh, audit, actions, ope
 }
 
 /**
- * How the transcript shows: the session's own tool output (its owner's choice), and whether its workspace loads
- * transcripts latest first (the workspace's owners' and admins').
+ * How the transcript shows: the session's own tool output (its owner's choice, or its workspace's owner's or an
+ * admin's), and whether its workspace loads transcripts latest first (the workspace's owners' and admins').
  */
-function TranscriptSection({ session, user, changed }: { session: SessionRecord; user: UserProfile; changed: () => void }) {
+function TranscriptSection({ session, manages, changed }: { session: SessionRecord; manages: boolean; changed: () => void }) {
   const action = useAction();
   const settings = useResource<{ settings: { paging: boolean } }>(`/api/workspaces/${segment(session.workspaceId)}/transcripts`);
   const full = session.toolOutput !== "brief";
-  const editable = session.ownerId === user.id && session.status !== "archived";
+  const editable = manages && session.status !== "archived";
   function setFull(next: boolean) {
     if (!editable || action.busy || next === full) return;
     void action.run(async () => {
@@ -353,7 +360,7 @@ function TranscriptSection({ session, user, changed }: { session: SessionRecord;
   }
   const paging = settings.data?.settings.paging;
   return <Section title="Transcript" info={<div className="stack">
-    <p>With full tool output on, the transcript shows everything each tool printed. Turned off, each tool result shows only its first line and long tool calls are cut short, for everyone viewing the session, its share link included. Long sessions then load much faster. The host keeps the whole output either way, and the agent still sees all of it. Only the session's owner can change this; new sessions start with their workspace's choice, under Settings → Workspaces.</p>
+    <p>With full tool output on, the transcript shows everything each tool printed. Turned off, each tool result shows only its first line and long tool calls are cut short, for everyone viewing the session, its share link included. Long sessions then load much faster. The host keeps the whole output either way, and the agent still sees all of it. Only the session's owner, or the workspace's owner or an admin, can change this; new sessions start with their workspace's choice, under Settings → Workspaces.</p>
     <p>Whether the transcript loads latest messages first is a workspace setting, under Settings → Workspaces.</p>
   </div>}>
     <Row title="Full tool output" hint={full ? "Every tool result in full" : "One line per tool result"} trailing={editable
@@ -435,11 +442,14 @@ function grantLabel(grant: SessionGrant): string {
   return role ? sessionRoleLabel[role] : `Custom (${grant.permissions.join(", ") || "none"})`;
 }
 
-function PeopleSection({ session, user, actions, changed }: { session: SessionRecord; user: UserProfile; actions: SessionActions; changed: () => void }) {
+function PeopleSection({ session, user, workspaceRole, actions, changed }: { session: SessionRecord; user: UserProfile; workspaceRole: WorkspaceRole | undefined; actions: SessionActions; changed: () => void }) {
   const form = useAction();
   const people = usePeople();
   const ownPermissions = session.permissions ?? [];
   const isOwner = session.ownerId === user.id;
+  // The workspace's owner and admins manage every session there as its owner would, short of approving.
+  const manages = managesSession(user.id, session.ownerId, workspaceRole);
+  const managerRole = !isOwner && workspaceRole && workspaceManagerRoles.includes(workspaceRole) ? workspaceRole : null;
   const visibility = session.visibility ?? "private";
   const viewerOnly = !isOwner && !ownPermissions.some(permission => permission !== "read");
   // The tier of what you hold here, from your session role and, on a workspace-visible session, your workspace role.
@@ -466,8 +476,10 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     if (!sessionRoleAllowed(role, targetRole)) return "workspace viewers can only be session viewers";
     return null;
   }
-  // What their workspace role already gives them here while the session is shared with the workspace.
-  const fromWorkspace = visibility === "workspace" && targetRole && !ownerSelected ? sessionRoleOf(workspaceSessionPermissions(targetRole)) : null;
+  // What their workspace role already gives them here: the workspace's owner and admins manage every session, and
+  // everyone else holds something only while it is shared with the workspace.
+  const fromWorkspace = targetRole && !ownerSelected ? workspaceSessionPermissions(targetRole, visibility) : [];
+  const targetManages = targetRole !== undefined && workspaceManagerRoles.includes(targetRole);
   const grantReady = canManage && !ownerSelected && Boolean(target) && selected !== null && !tierBlocked(selected)
     && selected !== existingRole;
 
@@ -498,8 +510,10 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
     if (!canManage || ownerSelected || !existing || form.busy) return;
     const confirmed = await confirmDialog({
       title: "Remove session access?",
-      message: visibility === "workspace"
-        ? `Remove ${targetName}'s session role? They keep what their workspace role gives them while this session is workspace-visible. Only the owner can make it private to remove that.`
+      message: targetManages
+        ? `Remove ${targetName}'s session role? As a ${workspaceRoleLabel[targetRole!]}, they still manage this session, as they do every session in the workspace.`
+        : visibility === "workspace"
+        ? `Remove ${targetName}'s session role? They keep what their workspace role gives them while this session is workspace-visible. Making it private removes that.`
         : `Remove ${targetName}'s session role? They will no longer be able to open this private session.`,
       confirmLabel: "Remove access",
       destructive: true,
@@ -510,40 +524,43 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
       chooseGrant("");
       grants.refresh();
       changed();
-    }, visibility === "workspace" ? "Session role removed. Workspace members can still view this session until the owner makes it private." : "Session role removed");
+    }, targetManages ? "Session role removed. As a workspace owner or admin, they still manage this session."
+      : visibility === "workspace" ? "Session role removed. Workspace members can still view this session until it is made private." : "Session role removed");
   }
 
-  const sharing = useSessionLink({ session, user, action: actions.action, onChange: changed });
+  const sharing = useSessionLink({ session, user, manages, action: actions.action, onChange: changed });
   const link = sharing.link;
   // The owner's loaded link is current; until it loads, and for everyone else, the session says whether one exists.
   const linkShared = isOwner && link !== undefined ? link !== null : Boolean(session.linkShared);
 
-  return <Section title="People" info={<><p>The server checks every request. You give a workspace member one of four session roles: a viewer follows the session; a member also asks side questions; a collaborator also sends messages to the agent; an admin also decides approvals and manages who has access. You can only give a role whose permissions you hold, and workspace viewers can only be session viewers. On a workspace-visible session, people also keep what their workspace role gives them there. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else.</p></>}>
+  return <Section title="People" info={<><p>The server checks every request. You give a workspace member one of four session roles: a viewer follows the session; a member also asks side questions; a collaborator also sends messages to the agent; an admin also decides approvals and manages who has access. You can only give a role whose permissions you hold, and workspace viewers can only be session viewers. On a workspace-visible session, people also keep what their workspace role gives them there. Visibility doesn't grant GitHub or tool access, share a host, or publish an agent. The owner's access can't be changed.</p><p>The workspace's owner and admins manage every session in it, private ones included: they follow it, message it, rename and archive it, change its visibility and give session roles up to collaborator. Deciding its approvals takes a session role from its owner, since approved operations run as the owner.</p><p>The owner can also share a link: anyone who has it can view the shared conversation without signing in, but not side asks, approvals, who sent each message, or the host. It never grants anything else. The workspace's owner and admins can turn it off.</p></>}>
     <Row
       leading={<Icon name="user" size={16} />}
-      title={isOwner ? "Owner" : ownRole ? `Session ${sessionRoleLabel[ownRole].toLowerCase()}` : "Custom access"}
-      hint={<>Your permissions: {ownPermissions.join(", ") || "none"}{viewerOnly ? ". You can follow committed work but can't ask, submit, approve, manage grants, change visibility, or use backups" : ""}</>}
+      title={isOwner ? "Owner" : managerRole ? `Workspace ${managerRole}` : ownRole ? `Session ${sessionRoleLabel[ownRole].toLowerCase()}` : "Custom access"}
+      hint={<>Your permissions: {ownPermissions.join(", ") || "none"}{viewerOnly ? ". You can follow committed work but can't ask, submit, approve, manage grants, change visibility, or use backups"
+        : managerRole && !ownPermissions.includes("approve") ? `. As the workspace's ${managerRole}, you manage every session in it; deciding approvals takes a session role from the owner` : ""}</>}
     />
     <Row
       leading={<Icon name={visibility === "workspace" ? "globe" : "lock"} size={16} />}
       title={visibility === "workspace" ? "Workspace-visible" : "Private"}
       hint={<>{visibility === "workspace"
         ? "All workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks"
-        : "Only the owner and people with a grant can view prompts and output"}. {isOwner
+        : "Only the owner, the workspace's owner and admins, and people with a session role can view prompts and output"}. {manages
         ? visibility === "workspace" ? "Making it private keeps explicit grants and can't recall content already viewed or copied" : "Before sharing, check existing prompts, tool output and side asks for secrets"
-        : "Only the session owner can change visibility"}</>}
-      trailing={isOwner && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
+        : "Only the session owner, or the workspace's owner or an admin, can change visibility"}</>}
+      trailing={manages && !archived && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.changeVisibility}>{visibility === "workspace" ? "Make private" : "Make workspace-visible"}</Button>}
     />
     {(isOwner || linkShared) && <Row
       leading={<Icon name="link" size={16} />}
       title={linkShared ? "Anyone with the link can view" : "Link sharing off"}
-      hint={!isOwner ? "The owner shared this session by link: anyone who has it can view the shared conversation without signing in, including messages you send to it. Side asks stay hidden"
+      hint={!isOwner ? `The owner shared this session by link: anyone who has it can view the shared conversation without signing in, including messages you send to it. Side asks stay hidden${manages ? ". You can turn the link off, which stops it at once" : ""}`
         : linkShared ? "Without signing in, they can follow the shared conversation, but not side asks, approvals, who sent each message, or the host. Turning the link off stops it at once"
         : archived ? "Archived sessions can't get a new share link"
         : "Create a link that lets anyone who has it view the shared conversation, read-only, without signing in"}
-      trailing={isOwner && (linkShared
+      trailing={isOwner ? (linkShared
         ? <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={sharing.unshareLink}>Turn off</Button>
-        : !archived && <Button variant="outline" size="sm" disabled={actions.action.busy || sharing.linkLoading} onClick={() => void sharing.shareLink()}>Create link</Button>)}
+        : !archived && <Button variant="outline" size="sm" disabled={actions.action.busy || sharing.linkLoading} onClick={() => void sharing.shareLink()}>Create link</Button>)
+        : manages && linkShared && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={sharing.unshareLink}>Turn off</Button>}
     />}
     {isOwner && link && <CardBody><Field label="Share link" hint={<>Created <RelativeTime value={link.createdAt} /></>}><CopyField value={link.url} label="Copy share link" /></Field></CardBody>}
     {isOwner && sharing.linkError && <CardBody><Feedback error={sharing.linkError} /></CardBody>}
@@ -577,12 +594,12 @@ function PeopleSection({ session, user, actions, changed }: { session: SessionRe
               })}
             </fieldset>
             {existing && !ownerSelected && !existingRole && <p className="muted small">{targetName} has a custom grant ({existing.permissions.join(", ")}) from before session roles. Choose a role to replace it.</p>}
-            {fromWorkspace && fromWorkspace !== "viewer" && targetRole && <p className="muted small">As a {workspaceRoleLabel[targetRole]}, {targetName} already has {sessionRolePermissions[fromWorkspace].join(", ")} on this workspace-visible session; a session role adds to that.</p>}
+            {fromWorkspace.length > 1 && targetRole && <p className="muted small">As a {workspaceRoleLabel[targetRole]}, {targetName} already has {fromWorkspace.join(", ")} on this {targetManages ? "session, as on every session in the workspace" : "workspace-visible session"}; a session role adds to that.</p>}
             <div className="inline">
               <Button type="submit" variant="secondary" size="sm" disabled={!grantReady}>{form.busy ? "Saving..." : existing ? "Change role" : "Give role"}</Button>
               {existing && !ownerSelected && <Button variant="outline" size="sm" onClick={() => void revoke()}>Remove access</Button>}
             </div>
-            {visibility === "workspace" && <p className="muted small">Removing someone's session role doesn't stop workspace members from viewing; make the session private for that.</p>}
+            {visibility === "workspace" && <p className="muted small">Removing someone's session role doesn't stop workspace members from viewing; make the session private for that. The workspace's owner and admins keep managing it either way.</p>}
           </fieldset>
         </form>}
       </ResourceState>
@@ -677,7 +694,7 @@ function AccessSection({ session, view, user }: { session: SessionRecord; view: 
   const visibility = session.visibility ?? "private";
   return <Section title="Access" info={<><p>{visibility === "workspace"
     ? "Workspace-visible: all workspace members can view existing and future prompts and output, including tool output, repository content in the transcript, and side asks."
-    : "Private: only the owner and members with a session grant can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner can change visibility; it's separate from host sharing and agent publishing.</p>
+    : "Private: only the owner, the workspace's owner and admins, and members with a session role can view prompts and output."}{session.linkShared ? " Anyone with the session's share link can also view the shared conversation, without signing in." : ""} Viewing doesn't grant ask, write, approve or manage permissions, access to Git accounts, or tool use. Only the owner, or the workspace's owner or an admin, can change visibility; it's separate from host sharing and agent publishing.</p>
     <p>Values that look like passwords, tokens or keys are shown as {REDACTED} to everyone, in the transcript, approvals and share links. The agent and the host still see the real values.</p></>}>
     {view ? <>
       <Row leading={<Icon name="user" size={16} />} title={<>Runs as {view.owner.displayName}{view.owner.id === user.id ? " (you)" : ""}</>} hint={view.owner.githubLogin ? `GitHub @${view.owner.githubLogin}` : "No GitHub login connected"} />

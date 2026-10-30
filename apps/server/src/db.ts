@@ -3,7 +3,7 @@ import type { AgentVersion, ModelDefinition, Permission, SessionPullRequest, Ses
 import { permissions } from '../../../packages/shared/src/types.js';
 import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import { sessionBranchName } from '../../../packages/shared/src/git-push.js';
-import { hasPermission, normalizePermissions, roleSessionCeiling, sessionCreatorRoles, workspaceSessionPermissions } from '../../../packages/shared/src/policy.js';
+import { hasPermission, managesSession, normalizePermissions, roleSessionCeiling, sessionCreatorRoles, workspaceManagerRoles, workspaceSessionPermissions } from '../../../packages/shared/src/policy.js';
 import type { AgentRow, AppContext, Env, MemberRow, ModelRow, SessionAccess, SessionRow, UserRow } from './types.js';
 import { fail, id, now, testMode } from './http.js';
 import type { Query } from './db/types.js';
@@ -104,6 +104,18 @@ export function sessionCreatorSQL(workspace: string): string {
   return `EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ${workspace} AND user_id = ?
     AND role IN (${sessionCreatorRoles.map(role => `'${role}'`).join(', ')}))`;
 }
+/** The roles that manage every session of their workspace (workspaceManagerRoles), as an SQL list. */
+const sessionManagerRolesSQL = workspaceManagerRoles.map(role => `'${role}'`).join(', ');
+/**
+ * SQL true while the bound user (one `?`) still manages `session` (the alias of a sessions row) as a whole, as
+ * managesSession decides it: a member of its workspace, not suspended, who owns it or is the workspace's owner or an
+ * admin. Writes check it themselves rather than trust the policy version alone, which a suspension doesn't bump.
+ */
+export function sessionManagerSQL(session: string): string {
+  return `EXISTS (SELECT 1 FROM workspace_members manager JOIN users manager_user ON manager_user.id = manager.user_id
+    WHERE manager.workspace_id = ${session}.workspace_id AND manager.user_id = ? AND manager_user.suspended_at IS NULL
+      AND (manager.user_id = ${session}.owner_id OR manager.role IN (${sessionManagerRolesSQL})))`;
+}
 type SessionPolicyRow = SessionRow & { grants_json: string | null; actor_role: WorkspaceRole };
 
 // Membership, visibility and explicit grants must come from the same policy snapshot. A suspended account opens no
@@ -132,15 +144,16 @@ const SESSION_ACCESS_SQL = `SELECT s.*, g.permissions_json AS grants_json, actor
 function accessFromSnapshot(snapshot: SessionPolicyRow | null, actorId: string): SessionAccess | null {
   if (!snapshot) return null;
   const { grants_json, actor_role, ...row } = snapshot;
-  if (row.owner_id === actorId) return { row, permissions: [...permissions] };
-  // A session shared with the workspace gives each member what its role allows there; explicit grants add to that,
-  // up to the role's ceiling (a viewer only ever reads).
+  if (row.owner_id === actorId) return { row, permissions: [...permissions], role: actor_role };
+  // Each member's workspace role gives what it allows on the session (the workspace's owner and admins manage every
+  // session, private ones included; anyone else only follows or messages one shared with the workspace); explicit
+  // grants add to that, up to the role's ceiling (a viewer only ever reads).
   const held = new Set<Permission>(grants_json ? normalizePermissions(JSON.parse(grants_json)) : []);
-  if (row.visibility === 'workspace') for (const permission of workspaceSessionPermissions(actor_role)) held.add(permission);
+  for (const permission of workspaceSessionPermissions(actor_role, row.visibility ?? 'private')) held.add(permission);
   if (held.size) held.add('read');
   const ceiling = roleSessionCeiling(actor_role);
   const grants = permissions.filter(permission => held.has(permission) && (!ceiling || ceiling.includes(permission)));
-  return grants.length ? { row, permissions: grants } : null;
+  return grants.length ? { row, permissions: grants, role: actor_role } : null;
 }
 
 export async function sessionAccess(env: Env, sessionId: string, actorId: string): Promise<SessionAccess | null> {
@@ -168,9 +181,13 @@ export async function sessionReaders(env: Env, sessionId: string): Promise<Set<s
   return readers;
 }
 
+// The sessions a list may show the actor, before accessFromSnapshot decides each: theirs, those shared with the
+// workspace, those they hold a grant on, and every session of a workspace they manage.
+const LISTED_SESSIONS_SQL = `(s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL OR actor.role IN (${sessionManagerRolesSQL}))`;
+
 export async function listSessionAccess(env: Env, actorId: string): Promise<SessionAccess[]> {
   const snapshots = await env.DB.query<SessionPolicyRow>(`${SESSION_ACCESS_SQL}
-    AND (s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL)
+    AND ${LISTED_SESSIONS_SQL}
     ORDER BY s.created_at DESC, s.id DESC LIMIT 500`)
     .bind(actorId, testMode(env) ? 1 : 0, actorId).all();
   return snapshots.flatMap(snapshot => {
@@ -181,7 +198,7 @@ export async function listSessionAccess(env: Env, actorId: string): Promise<Sess
 /** Every session of one workspace the actor can read, newest first, on the same policy snapshot as `listSessionAccess`. */
 export async function workspaceSessionAccess(env: Env, workspaceId: string, actorId: string): Promise<SessionAccess[]> {
   const snapshots = await env.DB.query<SessionPolicyRow>(`${SESSION_ACCESS_SQL}
-    AND s.workspace_id = ? AND (s.owner_id = ? OR s.visibility = 'workspace' OR g.user_id IS NOT NULL)
+    AND s.workspace_id = ? AND ${LISTED_SESSIONS_SQL}
     ORDER BY s.created_at DESC, s.id DESC`)
     .bind(actorId, testMode(env) ? 1 : 0, workspaceId, actorId).all();
   return snapshots.flatMap(snapshot => {
@@ -194,6 +211,16 @@ export async function requireSession(c: AppContext, sessionId: string, permissio
   if (!access) fail(404, 'not_found', 'Session not found.');
   if (!hasPermission(access.permissions, permission)) fail(403, 'forbidden', `Session ${permission} permission is required.`);
   if (permission !== 'read') await requireActiveSession(c.env, access.row);
+  return access;
+}
+/**
+ * Session `sessionId`, for a change to it as a whole that its owner makes, and so do its workspace's owner and admins
+ * (managesSession): renaming it, archiving or unarchiving it, its visibility and tool output, turning off its share link.
+ * `permission` is what the change takes besides: manage, or read for what an archived session still allows.
+ */
+export async function requireSessionManager(c: AppContext, sessionId: string, permission: 'read' | 'manage', refusal: string): Promise<SessionAccess> {
+  const access = await requireSession(c, sessionId, permission);
+  if (!managesSession(c.get('auth').userId, access.row.owner_id, access.role)) fail(403, 'owner_required', refusal);
   return access;
 }
 /** What anything but a read of a session waits for: it isn't archived, being restored into, or moving to another host. */

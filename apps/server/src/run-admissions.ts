@@ -1,5 +1,5 @@
 import { messageHash, type ChatImage } from '../../../packages/shared/src/chat-images.js';
-import { hasPermission, readOnlyRoles, sharedSessionWriterRoles } from '../../../packages/shared/src/policy.js';
+import { hasPermission, readOnlyRoles, sharedSessionWriterRoles, workspaceManagerRoles } from '../../../packages/shared/src/policy.js';
 import { requireConnectorSession } from './connectors.js';
 import { sessionAccess } from './db.js';
 import { fail, now, randomToken, testMode, text } from './http.js';
@@ -37,7 +37,9 @@ const ELIGIBLE_SESSION = `SELECT s.id FROM sessions s
     AND m.connector_id IS s.connector_id AND m.connector_owner_id IS s.connector_owner_id
     AND (? = 1 OR (actor_user.auth_kind <> 'test' AND owner_user.auth_kind <> 'test' AND m.provider <> 'faux'))
     AND (s.owner_id = actor.user_id
-      -- As sessionAccess decides it: a role that messages shared sessions, or a write grant to a role above read-only.
+      -- As sessionAccess decides it: the workspace's owner and admins, who manage every session there, a role that
+      -- messages shared sessions, or a write grant to a role above read-only.
+      OR actor.role IN (${sqlList(workspaceManagerRoles)})
       OR (s.visibility = 'workspace' AND actor.role IN (${sqlList(sharedSessionWriterRoles)}))
       OR (actor.role NOT IN (${sqlList(readOnlyRoles)}) AND EXISTS (
         SELECT 1 FROM session_grants g, json_each(g.permissions_json) permission

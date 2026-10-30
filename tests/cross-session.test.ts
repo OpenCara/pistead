@@ -344,6 +344,52 @@ test('an agent stops and archives sessions as its sender may, and starts linked 
   await f.refused(f.tool('session-a', ownerId, f.admit('session-a', ownerId), { action: 'create' }), 429, 'cross_session_limit');
 });
 
+test('the workspace\'s owner and admins read every session there, so content passes between private sessions only they and the owner read without asking', async t => {
+  const f = await fixture(t);
+  const now = new Date().toISOString();
+  const memberId = 'test:xs-member'; const adminId = 'test:xs-admin';
+  for (const [id, role] of [[memberId, 'member'], [adminId, 'admin']] as const) {
+    f.sqlite.prepare("INSERT INTO users (id,display_name,git_name,git_email,env_json,auth_kind,created_at) VALUES (?,?,?,?,'{}','test',?)").run(id, id, id, `${id}@example.test`, now);
+    f.sqlite.prepare('INSERT INTO workspace_members (workspace_id,user_id,role,created_at) VALUES (?,?,?,?)').run(f.workspace.id, id, role, now);
+  }
+  const own = (id: string, ownerId: string) => {
+    f.sqlite.prepare("INSERT INTO sessions (id,workspace_id,owner_id,agent_version_id,title,status,created_at,visibility,repository_mode) VALUES (?,?,?,?,?,'ready',?,'private','clone')")
+      .run(id, f.workspace.id, ownerId, f.agent.id, id, now);
+    f.fake(id).view.owner = { id: ownerId, displayName: ownerId, gitName: ownerId, gitEmail: `${ownerId}@example.test`, githubLogin: null };
+    f.allow(id, 'sessions');
+  };
+  own('member-private', memberId);
+  own('admin-private', adminId);
+
+  // The admin's agent lists and reads the member's private session: everyone who reads the admin's private session (its
+  // owner, and the workspace's owner and admins) reads that one too.
+  const adminWrite = f.admit('admin-private', adminId);
+  const listed = await f.tool('admin-private', adminId, adminWrite, { action: 'list' });
+  assert.deepEqual((listed.body.sessions as CrossSessionSummary[]).find(item => item.id === 'member-private')?.permissions, ['read', 'ask', 'write', 'manage']);
+  const read = await f.tool('admin-private', adminId, adminWrite, { action: 'read', targetSessionId: 'member-private' });
+  assert.equal(read.status, 200, JSON.stringify(read.body));
+  assert.ok(!('consent' in read.body), JSON.stringify(read.body));
+  // Sending it the admin's session's content would show it to the member, who can't open the admin's: the admin's owner decides first.
+  const sent = await f.tool('admin-private', adminId, adminWrite, { action: 'send', targetSessionId: 'member-private', message: 'Look at this' });
+  assert.equal(sent.body.consent, 'audience', JSON.stringify(sent.body));
+  assert.deepEqual(f.fake('member-private').submitted, []);
+  // Once allowed, it goes as the admin's own message, which they may send to every session there, private ones included.
+  f.allow('admin-private', 'sessions:audience');
+  const delivered = await f.tool('admin-private', adminId, adminWrite, { action: 'send', targetSessionId: 'member-private', message: 'Look at this' });
+  assert.equal(delivered.status, 202, JSON.stringify(delivered.body));
+  assert.equal(f.fake('member-private').submitted.length, 1);
+  assert.equal(f.sqlite.prepare("SELECT actor_id FROM run_admissions WHERE session_id = 'member-private' AND request_id LIKE 'xs:%'").get()!.actor_id, adminId);
+
+  // The member's agent can't open the admin's session, and its own private sub-task is read by the same people as its
+  // session, so its outcome comes back without asking.
+  const memberWrite = f.admit('member-private', memberId);
+  await f.refused(f.tool('member-private', memberId, memberWrite, { action: 'read', targetSessionId: 'admin-private' }), 404, 'not_found');
+  const created = await f.tool('member-private', memberId, memberWrite, { action: 'create', title: 'Sub-task', message: 'Do it', notify: true });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const child = created.body.session as CrossSessionSummary;
+  assert.deepEqual([child.visibility, child.ownerId, child.parentSessionId], ['private', memberId, 'member-private']);
+});
+
 test('a notification brings a finished message\'s outcome back to its origin, once, while the origin is idle', async t => {
   const f = await fixture(t);
   const ownerId = f.owner.user.id;

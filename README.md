@@ -5,7 +5,7 @@ Run [Pi](https://github.com/earendil-works/pi) coding agents on your own machine
 Two things set it apart:
 
 - **One subscription, the whole team.** Pair a machine where Pi is signed in to your model provider, share it with a workspace, and every teammate can start their own sessions on its models. They never see its API keys or subscription login: those stay on the host. Each session still runs as the member who started it, with their own Git accounts, so the team shares the models and not each other's identities. See [Sharing a host](#sharing-a-host).
-- **Share a chat session, with exactly the permissions you choose.** Every session is a live conversation teammates can follow. Make it visible to the workspace or keep it private, then give people exactly what they need: `read` to watch, `ask` for side questions that don't touch the work, `write` to drive it, `approve` to decide its commands and pushes, `manage` to share it further. A read-only link can show the conversation to anyone, even without signing in. See [Collaborating on a session](#collaborating-on-a-session).
+- **Share a chat session, with exactly the permissions you choose.** Every session is a live conversation teammates can follow. Make it visible to the workspace or keep it private (the workspace's owner and admins still manage it), then give people exactly what they need: `read` to watch, `ask` for side questions that don't touch the work, `write` to drive it, `approve` to decide its commands and pushes, `manage` to share it further. A read-only link can show the conversation to anyone, even without signing in. See [Collaborating on a session](#collaborating-on-a-session).
 
 <p align="center">
   <img src="docs/images/team-collaboration.svg" alt="Alice shares her host, where Pi is signed in to a model provider, with the workspace. Bob starts a session on it that runs as Bob. Carol can write and approve, Dan sends side asks, Erin reads, and anyone with the share link follows the conversation read-only." width="900">
@@ -16,7 +16,7 @@ And around them:
 - **Your machines, your models.** Sessions run on members' own hosts with the models and credentials configured in Pi there. A host connects over an outbound WebSocket: no inbound port or tunnel.
 - **Isolated work.** Each session clones the workspace's repositories into its own sandbox, whose only way out is a proxy that reads them with the session owner's account and follows the workspace's network policy.
 - **People decide.** Shell commands, commits, pushes, GitHub comments, merges and new issues wait for an approval unless the session owner auto-approves a message.
-- **Built for teams.** Workspace roles (viewer, member, collaborator, admin) set what each person can do by default, and session grants add more for one session at a time.
+- **Built for teams.** Workspace roles (viewer, member, collaborator, admin) set what each person can do by default, with the workspace's owner and admins managing every session in it, and session grants add more for one session at a time.
 
 ## Contents
 
@@ -129,13 +129,15 @@ Owners and admins add people with **Members → Add member**, entering the perso
 - **Viewer**: follows workspace-visible sessions read-only and can't start sessions, restore a backup into a new one, or move one to another host. A session role can't give a viewer more than session viewer (read).
 - **Member**: starts sessions, and follows other people's workspace-visible sessions read-only unless their owner grants more.
 - **Collaborator**: starts sessions, and can send messages and side asks to any workspace-visible session.
-- **Admin**: everything a collaborator can do, plus managing the workspace.
+- **Admin**: everything a collaborator can do, plus managing the workspace and every session in it, private ones included (see [Managing every session](#managing-every-session)).
 
 | | Owner | Admin | Collaborator | Member | Viewer |
 |---|:-:|:-:|:-:|:-:|:-:|
 | View workspace-visible sessions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Start sessions | ✓ | ✓ | ✓ | ✓ | |
 | Send messages to any workspace-visible session | ✓ | ✓ | ✓ | | |
+| View, message and stop any session, private ones included | ✓ | ✓ | | | |
+| Rename, archive or unarchive any session, change its visibility and tool output, give it session roles, turn off its share link | ✓ | ✓ | | | |
 | Bind and remove repositories, set their push policy and Git LFS | ✓ | ✓ | | | |
 | Manage push identities | ✓ | ✓ | | | |
 | Set network access | ✓ | ✓ | | | |
@@ -145,7 +147,18 @@ Owners and admins add people with **Members → Add member**, entering the perso
 | Connect the session database, import dumps | ✓ | | | | |
 | Export the workspace | ✓ | ✓ | | | |
 
-Approving tool calls, and managing or opening someone else's private session, still take an explicit grant from the session's owner, whatever the role.
+Approving tool calls still takes an explicit grant from the session's owner, whatever the role. For collaborators, members and viewers, so does opening or managing someone else's private session.
+
+#### Managing every session
+
+The workspace's owner and admins manage every session in it, private ones included, without a session role. On a session they don't own they hold `read`, `ask`, `write` and `manage`, so they can:
+
+- open it from their session lists, follow it, send side asks and shared messages, stop its work and browse its **Files**;
+- **Rename**, **Archive** and **Unarchive** it, make it private or workspace-visible, and turn its **Full tool output** on or off;
+- give workspace members session roles up to **Collaborator** and remove anyone's, under **Details → People → Session roles**;
+- **Turn off** its share link.
+
+Everything that acts as the session's owner, or takes their work out of the session, stays theirs. Approving its tool calls takes a session role that allows it, since an approved operation runs as the owner with their Git accounts; the owner, or a session admin, gives that. Only the owner uses **Auto-approve**, decides permission requests, schedules prompts, restarts, backs up, restores, exports or moves the session, and creates or copies its share link. Every change a manager makes is recorded in the session's activity under their own name. Demoting an admin, or removing them, takes all of this away at once.
 
 #### Invite links and pending members
 
@@ -157,7 +170,7 @@ Owners and admins can share one link to the workspace with anyone: **Members →
 - A pending member can withdraw their request from the link's page, or under **Settings → Profile → Your requests to join**, which keeps working after the link is turned off or replaced. Adding someone with **Add member** also settles their pending request.
 - At most 200 people wait to join one workspace at a time. Requests count until someone accepts, declines or withdraws them, also after the link changes, so decline the ones you won't accept to make room.
 
-Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions to no one. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody can open them while their owner isn't a member.
+Workspace admins manage only their workspace; the server's administrators are configured separately (see [Administration](#administration)). A workspace has one owner, who can't be removed. Membership alone grants no GitHub access, no tool use and no access to anyone's host, and it shows private sessions only to the workspace's owner and admins. Removing a member also removes their grants on the workspace's sessions; sessions they own are not reassigned, and nobody, the workspace's owner and admins included, can open them while their owner isn't a member.
 
 ### Repositories and Git accounts
 
@@ -425,7 +438,7 @@ Select a workspace in the sidebar (or open **New session** in it):
 
 - **Describe the task**: the first message. Its first line becomes the session's title.
 - **Host**: one of your hosts, or a host shared with the workspace.
-- **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only). See [Collaborating on a session](#collaborating-on-a-session).
+- **Visibility**: **Workspace** (members can view; the default) or **Private** (explicit grants only, apart from the workspace's owner and admins, who [manage every session](#managing-every-session)). See [Collaborating on a session](#collaborating-on-a-session).
 - **Where it runs** (on your own host, or one whose owner granted you **Sessions on the host**, once its [configuration](#host-configuration) allows **Sessions on the host**): **Sandbox** (the default) or **On this host**, without the sandbox. See [Sessions on the host](#sessions-on-the-host).
 - The model, reasoning level and access for the first message (see [Chat options](#chat-options)). The info tips show the host, the model and the repositories the session will pin.
 
@@ -474,7 +487,7 @@ The **Approvals** list keeps to what people decide. Shell and host commands that
 
 Session lists show what each session's agent is doing: **Starting**, **Not started**, **In progress**, **Needs approval**, **Done**, **Failed**, **Idle** or **Archived**. A session at rest with a [scheduled prompt](#scheduled-prompts) shows **Scheduled**, with a clock in place of its status dot. The **Sessions** page groups sessions by workspace, with a search box, **Show archived** and **Open by ID** (for a session ID someone gave you).
 
-The session's menu offers **Copy session ID** and **Open in workspace settings**, and to its owner **Rename**, **Make private** or **Make workspace-visible**, **Create backup** and **Archive** (or **Unarchive**). Archiving makes a session read-only for everyone and hides it from lists; unarchiving brings it back as it was.
+The session's menu offers **Copy session ID** and **Open in workspace settings**; to its owner and the workspace's owner and admins **Rename**, **Make private** or **Make workspace-visible** and **Archive** (or **Unarchive**); and to its owner **Create backup** too. Archiving makes a session read-only for everyone and hides it from lists; unarchiving brings it back as it was.
 
 The session panel has five tabs:
 
@@ -559,8 +572,8 @@ sequenceDiagram
 
 #### Visibility and session roles
 
-- **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. Collaborators and admins can also send them messages. **Private** sessions only by the owner and people with a grant. Only the owner changes visibility; making a session private keeps explicit grants but can't recall what was already seen.
-- Session roles (**Details → People → Session roles**) give a workspace member one of four tiers of access to one session, named after the workspace roles. Each tier includes everything in the tiers below it. You can only give a tier whose permissions you hold, and the owner's own access can't be changed. A workspace viewer can only be a session viewer. Removing someone's session role doesn't take away what their workspace role gives them on a workspace-visible session (viewing, and for collaborators and admins messaging); making the session private does.
+- **Workspace-visible** sessions can be viewed by every workspace member: prompts, output, tool output, repository content shown in the transcript, and side asks. Collaborators and admins can also send them messages. **Private** sessions only by the owner, the workspace's owner and admins, and people with a grant. The owner, and the workspace's owner and admins, change visibility; making a session private keeps explicit grants but can't recall what was already seen.
+- Session roles (**Details → People → Session roles**) give a workspace member one of four tiers of access to one session, named after the workspace roles. Each tier includes everything in the tiers below it. You can only give a tier whose permissions you hold, and the owner's own access can't be changed. A workspace viewer can only be a session viewer. Removing someone's session role doesn't take away what their workspace role gives them on a workspace-visible session (viewing, and for collaborators and admins messaging); making the session private does, except for the workspace's owner and admins, who manage every session.
 
 | Session role | Permissions | Allows |
 |---|---|---|
@@ -571,17 +584,17 @@ sequenceDiagram
 
 The API takes a tier (`POST /api/sessions/:id/grants` with `{ userId, role }`) or, as before, an explicit permission list (`{ userId, permissions }`). A grant that matches no tier, such as one made before tiers existed, shows as **Custom** until someone chooses a tier for it.
 
-Only the session's owner can rename, archive or restart it, change its visibility or share link, back it up, restore or export it, use **Auto-approve**, and decide permission requests.
+Only the session's owner can restart it, create its share link, back it up, restore, move or export it, use **Auto-approve**, schedule prompts, and decide permission requests. Its owner and the workspace's owner and admins rename, archive and unarchive it, change its visibility and tool output, and turn off its share link (see [Managing every session](#managing-every-session)).
 
 #### Share links
 
-The owner can share a session by link (**Details → People → Create link**). Anyone who has the link can follow the shared conversation read-only, without signing in, with the session's title and the owner's display name. They see nothing else: no side asks, approvals, senders, host, workspace or repositories. **Turn off** stops the link at once, and turning sharing on again issues a new one; archived sessions can't get a new link. The token is carried only in the URL fragment (`#/shared/…`) and an `X-Share-Token` header, never in a request path, and the link pages read only `GET /api/shared` and `GET /api/shared/view`.
+The owner can share a session by link (**Details → People → Create link**). Anyone who has the link can follow the shared conversation read-only, without signing in, with the session's title and the owner's display name. They see nothing else: no side asks, approvals, senders, host, workspace or repositories. **Turn off** (the owner, or the workspace's owner or an admin) stops the link at once, and turning sharing on again issues a new one; archived sessions can't get a new link. The token is carried only in the URL fragment (`#/shared/…`) and an `X-Share-Token` header, never in a request path, and the link pages read only `GET /api/shared` and `GET /api/shared/view`.
 
 #### Transcript size
 
 A session's transcript comes from its host, which always sends Pistead the whole conversation, compressed. Two settings make what reaches each viewer smaller. Both change only what Pistead shows, so they work with every connector version:
 
-- **Full tool output** (**Details → Transcript**, the session's owner only; `PATCH /api/sessions/:id` with `{"toolOutput": "brief"}` or `"full"`) is on by default. A workspace's owners and admins choose what new sessions there start with (**Settings → Workspaces →** the workspace **→ Transcripts → Full tool output**; `PUT /api/workspaces/:id/transcripts` with `{"toolOutput": "brief"}` or `"full"`); changing it leaves existing sessions as they are, and a session moved to another host or restored from a backup keeps its source's. Turned off, each tool result shows only its first line (up to 200 characters), on its row in the transcript. Long tool calls, such as a file the agent writes, are cut to their first 200 characters. Tool output is most of a typical transcript, so long sessions then load roughly half as much. It applies to everyone viewing the session, its share link included. A shortened row says how many lines and characters the full output has; the host keeps all of it, and the agent still sees all of it. Secrets are hidden before anything is shortened.
+- **Full tool output** (**Details → Transcript**, the session's owner, or the workspace's owner or an admin; `PATCH /api/sessions/:id` with `{"toolOutput": "brief"}` or `"full"`) is on by default. A workspace's owners and admins choose what new sessions there start with (**Settings → Workspaces →** the workspace **→ Transcripts → Full tool output**; `PUT /api/workspaces/:id/transcripts` with `{"toolOutput": "brief"}` or `"full"`); changing it leaves existing sessions as they are, and a session moved to another host or restored from a backup keeps its source's. Turned off, each tool result shows only its first line (up to 200 characters), on its row in the transcript. Long tool calls, such as a file the agent writes, are cut to their first 200 characters. Tool output is most of a typical transcript, so long sessions then load roughly half as much. It applies to everyone viewing the session, its share link included. A shortened row says how many lines and characters the full output has; the host keeps all of it, and the agent still sees all of it. Secrets are hidden before anything is shortened.
 - **Latest messages first** (**Settings → Workspaces →** the workspace **→ Transcripts**, owners and admins; `PUT /api/workspaces/:id/transcripts` with `{"paging": true}`; either setting may be sent alone, and one left out keeps its value) is off by default. Turned on, a session opens with only the newest 50 entries of each conversation. Earlier ones load 50 at a time as you scroll up, or with **Show earlier messages** at the top (`GET /api/sessions/:id/entries?conversation=…&before=…&limit=…`, up to 200). Entries you've already seen stay in place while new ones arrive. Your browser's find on the page only searches what has loaded. Share links aren't paged: they show the whole shared conversation.
 
 Open sessions pick up either change within a few seconds.
@@ -656,7 +669,7 @@ A session's conversation and files live on its host. A backup copies them to the
 Exports are JSON records without secrets; a session's conversation is in its backups:
 
 - Session owners export a session (details, people, approvals, pushes, backup list and activity) under **Details → Export**.
-- Workspace owners and admins export a workspace (settings, members, models, published agents, repositories, push access, its session database connection and activity, with their own sessions in full and the records of the other sessions they can view) under **Settings → Workspaces → Data export**. Other members' private sessions are left out; their owners can export them.
+- Workspace owners and admins export a workspace (settings, members, models, published agents, repositories, push access, its session database connection and activity, with their own sessions in full and the records of every other session there, which they manage) under **Settings → Workspaces → Data export**. The rest of another member's session (its people, approvals, pushes and activity) is in its owner's export of it.
 
 ### Moving a session to another host
 

@@ -6,10 +6,10 @@ import { connectorLimits, type ConnectorCapabilities, type LocalModelSummary } f
 import { parseChatImages, type ChatImage } from '../../../packages/shared/src/chat-images.js';
 import { sha256 } from '../../../packages/shared/src/crypto.js';
 import { isRevision } from '../../../packages/shared/src/view-patch.js';
-import { hasPermission, normalizePermissions, roleSessionCeiling, sessionRoleOf, sessionRolePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
+import { hasPermission, managesSession, normalizePermissions, roleSessionCeiling, sessionRoleOf, sessionRolePermissions, validateUserEnv } from '../../../packages/shared/src/policy.js';
 import { redactApproval } from '../../../packages/shared/src/redaction.js';
-import type { AgentRow, AppContext, Env, ModelRow, SessionRow, WorkerEnv } from './types.js';
-import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireActiveSession, requireMember, requireSession, requireSessionCreator, sessionCreatorSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
+import type { AgentRow, AppContext, Env, ModelRow, SessionAccess, SessionRow, WorkerEnv } from './types.js';
+import { agentVersion, auditStatement, getUser, listSessionAccess, modelDefinition, requireActiveSession, requireMember, requireSession, requireSessionCreator, requireSessionManager, sessionCreatorSQL, sessionManagerSQL, requireUnfrozen, runnerSessionRecord, sessionAccess, sessionRecord, userProfile } from './db.js';
 import { sessionBranchName } from '../../../packages/shared/src/git-push.js';
 import { fail, id, identifier, jsonObject, now, randomToken, testMode, text, userIdentifier } from './http.js';
 import { runnerJSON, runnerRequest } from './runner.js';
@@ -288,20 +288,21 @@ export async function createSession(c: AppContext, input: Record<string, unknown
 }
 
 /**
- * Archives a session for its owner, the request's user: the session menu's Archive, and the sessions tool's archive
- * (cross-session.ts), whose audit entry names its call in `audit`.
+ * Archives a session as the request's user, its owner or one of its workspace's owner and admins: the session menu's
+ * Archive, and the sessions tool's archive (cross-session.ts), whose audit entry names its call in `audit`.
  */
-export async function archiveSession(c: AppContext, sessionId: string, audit: Record<string, unknown> = {}): Promise<SessionRow> {
-  const { row } = await requireSession(c, sessionId, 'manage');
-  const ownerId = c.get('auth').userId;
-  if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can archive it.');
-  // A policy version bump invalidates runner tickets and broker capabilities issued before archiving.
+export async function archiveSession(c: AppContext, sessionId: string, audit: Record<string, unknown> = {}): Promise<SessionAccess> {
+  const access = await requireSessionManager(c, sessionId, 'manage', 'Only the session owner, or the workspace\'s owner or an admin, can archive it.');
+  const { row } = access;
+  const actorId = c.get('auth').userId;
+  // A policy version bump invalidates runner tickets and broker capabilities issued before archiving. It lands only
+  // while the actor still manages the session, checked as it writes: a suspension, say, bumps no policy version.
   const archived = await c.env.DB.query<SessionRow>(`UPDATE sessions SET archived_status = status, status = 'archived', policy_version = policy_version + 1
-    WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived'
-    RETURNING *`).bind(row.id, ownerId, row.policy_version).first();
+    WHERE id = ? AND owner_id = ? AND policy_version = ? AND status <> 'archived' AND ${sessionManagerSQL('sessions')}
+    RETURNING *`).bind(row.id, row.owner_id, row.policy_version, actorId).first();
   if (!archived) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
-  await auditStatement(c.env, ownerId, 'session.archived', row.workspace_id, row.id, { previousStatus: row.status, ...audit }).run();
-  return archived;
+  await auditStatement(c.env, actorId, 'session.archived', row.workspace_id, row.id, { previousStatus: row.status, ...audit }).run();
+  return { ...access, row: archived };
 }
 
 /** Stops the session's work as the request's user, who may write to it; the sessions tool's audit entry names its call in `audit`. */
@@ -459,72 +460,76 @@ export function registerSessions(app: Hono<WorkerEnv>): void {
     return c.json({ session: { ...sessionRecord(access.row, access.permissions), ...(hostUnsandboxed ? { hostUnsandboxed } : {}), ...(linkShared ? { linkShared } : {}),
       ...(notice ? { cloneUnavailable: notice } : {}) } });
   });
+  // The session's owner, and its workspace's owner and admins (managesSession), rename it and change its tool output
+  // and visibility. Each statement checks again, as it writes, that the request's user still manages the session.
   app.patch('/api/sessions/:id', async c => {
-    const { row } = await requireSession(c, identifier(c.req.param('id')), 'manage');
-    const ownerId = c.get('auth').userId;
+    const access = await requireSession(c, identifier(c.req.param('id')), 'manage');
+    const { row } = access;
+    const actorId = c.get('auth').userId;
+    const manages = managesSession(actorId, row.owner_id, access.role);
     const input = await jsonObject(c, 4096);
     const keys = Object.keys(input);
     // A rename and tool output are cosmetic and a visibility change is policy; each is its own request, never mixed.
     if (keys.length === 1 && keys[0] === 'toolOutput') {
-      if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change how it shows tool output.');
+      if (!manages) fail(403, 'owner_required', 'Only the session owner, or the workspace\'s owner or an admin, can change how it shows tool output.');
       if (!toolOutputs.includes(input.toolOutput as ToolOutput)) fail(400, 'invalid_tool_output', 'Tool output is either full or brief.');
       const toolOutput = input.toolOutput as ToolOutput;
       // Display only: not part of the runner binding or policy, so the policy version stays.
       const updated = await c.env.DB.query<SessionRow>(`UPDATE sessions SET tool_output = ?
-        WHERE id = ? AND owner_id = ?
-          AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = sessions.workspace_id AND user_id = ?)
-        RETURNING *`).bind(toolOutput, row.id, ownerId, ownerId).first();
+        WHERE id = ? AND owner_id = ? AND ${sessionManagerSQL('sessions')}
+        RETURNING *`).bind(toolOutput, row.id, row.owner_id, actorId).first();
       if (!updated) fail(409, 'policy_changed', 'Session membership changed; reload and retry.');
-      await auditStatement(c.env, ownerId, 'session.tool_output.updated', row.workspace_id, row.id, { toolOutput }).run();
+      await auditStatement(c.env, actorId, 'session.tool_output.updated', row.workspace_id, row.id, { toolOutput }).run();
       invalidateSessionView(c, row.id);
-      return c.json({ session: sessionRecord(updated, [...permissions]) });
+      return c.json({ session: sessionRecord(updated, access.permissions) });
     }
     if (keys.length === 1 && keys[0] === 'title') {
-      if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can rename it.');
+      if (!manages) fail(403, 'owner_required', 'Only the session owner, or the workspace\'s owner or an admin, can rename it.');
       const title = text(input.title, 'title', 200).trim();
       if (!title || /[\r\n]/.test(title)) fail(400, 'invalid_title', 'The title must be a single non-empty line.');
       // The title is not part of the runner binding or policy, so it does not bump the policy version.
       const renamed = await c.env.DB.query<SessionRow>(`UPDATE sessions SET title = ?
-        WHERE id = ? AND owner_id = ? AND status <> 'archived'
-          AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = sessions.workspace_id AND user_id = ?)
-        RETURNING *`).bind(title, row.id, ownerId, ownerId).first();
+        WHERE id = ? AND owner_id = ? AND status <> 'archived' AND ${sessionManagerSQL('sessions')}
+        RETURNING *`).bind(title, row.id, row.owner_id, actorId).first();
       if (!renamed) fail(409, 'policy_changed', 'Session membership or status changed; reload and retry.');
-      await auditStatement(c.env, ownerId, 'session.renamed', row.workspace_id, row.id).run();
-      return c.json({ session: sessionRecord(renamed, [...permissions]) });
+      await auditStatement(c.env, actorId, 'session.renamed', row.workspace_id, row.id).run();
+      return c.json({ session: sessionRecord(renamed, access.permissions) });
     }
-    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can change its visibility.');
+    if (!manages) fail(403, 'owner_required', 'Only the session owner, or the workspace\'s owner or an admin, can change its visibility.');
     if (keys.some(key => key !== 'visibility')) fail(400, 'invalid_input', 'Change the session title, its visibility or its tool output, one at a time.');
     const visibility = sessionVisibility(input.visibility);
     const updated = await c.env.DB.query<SessionRow>(`UPDATE sessions SET visibility = ?, policy_version = policy_version + 1
-      WHERE id = ? AND owner_id = ? AND policy_version = ?
-        AND EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = sessions.workspace_id AND user_id = ?)
+      WHERE id = ? AND owner_id = ? AND policy_version = ? AND ${sessionManagerSQL('sessions')}
         AND EXISTS (SELECT 1 FROM users owner JOIN agent_versions a ON a.id = sessions.agent_version_id
           JOIN models m ON m.id = a.model_id WHERE owner.id = sessions.owner_id
             AND (? = 1 OR (owner.auth_kind <> 'test' AND m.provider <> 'faux')))
-      RETURNING *`).bind(visibility, row.id, ownerId, row.policy_version, ownerId, testMode(c.env) ? 1 : 0).first();
+      RETURNING *`).bind(visibility, row.id, row.owner_id, row.policy_version, actorId, testMode(c.env) ? 1 : 0).first();
     if (!updated) fail(409, 'policy_changed', 'Session membership or permissions changed; reload and retry.');
-    await auditStatement(c.env, ownerId, 'session.visibility.updated', row.workspace_id, row.id, { visibility }).run();
-    return c.json({ session: sessionRecord(updated, [...permissions]) });
+    await auditStatement(c.env, actorId, 'session.visibility.updated', row.workspace_id, row.id, { visibility }).run();
+    // The workspace's owner and admins manage the session whatever its visibility, so what they hold stays the same.
+    return c.json({ session: sessionRecord(updated, access.permissions) });
   });
   // Archiving makes a session read-only for everyone (see requireSession and runnerRequest) and hides it from default
-  // lists. It never contacts the host or deletes anything, so the owner can unarchive it to its exact previous status.
+  // lists. It never contacts the host or deletes anything, so whoever manages it can unarchive it to its exact previous
+  // status: its owner, or its workspace's owner or an admin.
   app.post('/api/sessions/:id/archive', async c => {
     const archived = await archiveSession(c, identifier(c.req.param('id')));
-    return c.json({ session: sessionRecord(archived, [...permissions]) });
+    return c.json({ session: sessionRecord(archived.row, archived.permissions) });
   });
   app.post('/api/sessions/:id/unarchive', async c => {
-    // Archived sessions only admit read access; ownership is what authorizes bringing one back.
-    const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');
-    const ownerId = c.get('auth').userId;
-    if (row.owner_id !== ownerId) fail(403, 'owner_required', 'Only the session owner can unarchive it.');
+    // Archived sessions only admit read access; managing the session is what authorizes bringing one back.
+    const access = await requireSessionManager(c, identifier(c.req.param('id')), 'read', 'Only the session owner, or the workspace\'s owner or an admin, can unarchive it.');
+    const { row } = access;
+    const actorId = c.get('auth').userId;
     if (row.status !== 'archived') fail(409, 'session_not_archived', 'Session is not archived.');
+    // It lands only while the actor still manages the session, checked as it writes, as archiving does.
     const restored = await c.env.DB.query<SessionRow>(`UPDATE sessions SET status = COALESCE(archived_status, 'ready'), archived_status = NULL,
         policy_version = policy_version + 1
-      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status = 'archived'
-      RETURNING *`).bind(row.id, ownerId, row.policy_version).first();
+      WHERE id = ? AND owner_id = ? AND policy_version = ? AND status = 'archived' AND ${sessionManagerSQL('sessions')}
+      RETURNING *`).bind(row.id, row.owner_id, row.policy_version, actorId).first();
     if (!restored) fail(409, 'policy_changed', 'Session status or permissions changed; reload and retry.');
-    await auditStatement(c.env, ownerId, 'session.unarchived', row.workspace_id, row.id, { status: restored.status }).run();
-    return c.json({ session: sessionRecord(restored, [...permissions]) });
+    await auditStatement(c.env, actorId, 'session.unarchived', row.workspace_id, row.id, { status: restored.status }).run();
+    return c.json({ session: sessionRecord(restored, access.permissions) });
   });
   app.get('/api/sessions/:id/view', async c => {
     const { row } = await requireSession(c, identifier(c.req.param('id')), 'read');

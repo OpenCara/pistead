@@ -281,6 +281,29 @@ test('share links show anyone who has one the shared conversation, and nothing e
   assert.deepEqual(actions, ['session.link.created', 'session.link.created', 'session.link.revoked']);
 });
 
+test('the workspace\'s owner and admins turn off any session\'s share link, which only its owner sees or creates', async t => {
+  const f = await fixture(t); const s = await privateHostSession(f);
+  const path = `/api/sessions/${s.session.id}`;
+  await json(await s.owner.request('PATCH', path, { visibility: 'private' }));
+  const { link } = await json<{ link: SessionLink }>(await s.owner.request('PUT', `${path}/link`), 201);
+  const token = link.url.slice(`${origin}/#/shared/`.length);
+  // A member made an admin manages the private session: they learn it is shared by link, but the link, which shows
+  // the session beyond the workspace, stays its owner's to see or create.
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'admin' }));
+  assert.equal((await json<{ session: SessionRecord }>(await s.member.request('GET', path))).session.linkShared, true);
+  for (const method of ['GET', 'PUT']) await denied(await s.member.request(method, `${path}/link`), 403, 'owner_required');
+  // Turning it off only takes access away, so they can, archived or not, and it is recorded as theirs.
+  await json(await s.member.request('POST', `${path}/archive`));
+  assert.deepEqual(await json(await s.member.request('DELETE', `${path}/link`)), { ok: true });
+  await denied(await f.request('GET', '/api/shared', undefined, { 'X-Share-Token': token }), 404, 'not_found');
+  assert.deepEqual(await json(await s.owner.request('GET', `${path}/link`)), { link: null });
+  assert.deepEqual(f.sqlite.prepare("SELECT actor_id FROM audit WHERE session_id = ? AND action = 'session.link.revoked'").all(s.session.id)
+    .map(row => row.actor_id), [s.member.user.id]);
+  // Demoted, they can't any more.
+  await json(await s.owner.request('POST', `/api/workspaces/${s.team.id}/members`, { userId: s.member.user.id, role: 'collaborator' }));
+  await denied(await s.member.request('DELETE', `${path}/link`), 404, 'not_found');
+});
+
 test('a share link shows only entries of a conversation the view lists as shared, and nothing when it lists none', () => {
   const entry = (id: string, conversationId?: string): EntryView =>
     ({ id, kind: 'message', role: 'user', text: id, ...(conversationId === undefined ? {} : { conversationId }) });

@@ -208,7 +208,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
 
   const visibilityItems = [
     { label: "Workspace", icon: "globe" as const, hint: "Members can view", onSelect: () => setVisibility("workspace") },
-    { label: "Private", icon: "lock" as const, hint: "Explicit grants only", onSelect: () => setVisibility("private") },
+    { label: "Private", icon: "lock" as const, hint: "You, workspace admins and grants", onSelect: () => setVisibility("private") },
   ];
   const environmentItems = [
     { label: "Sandbox", icon: "shield" as const, hint: "Isolated, with the workspace's network access", onSelect: () => setOnHost(false) },
@@ -240,7 +240,7 @@ function Composer({ workspace }: { workspace: Workspace }) {
           {hostSessions && <DropdownMenu label="Where it runs" align="start" items={environmentItems} trigger={<><Icon name={runOnHost ? "server" : "shield"} size={14} />{runOnHost ? "On host" : "Sandbox"}</>} />}
           <InfoTip label="Who can see and do what">
             <div className="stack">
-              <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators and admins can also send messages to it; anything more (approving tool calls, managing the session) needs an explicit grant." : "Workspace membership alone does not give access to a private session; only explicit session grants do."}</p>
+              <p>{visibility === "workspace" ? "Workspace members can view prompts, output, tool results, and repository content shown in the transcript. Collaborators can also send messages to it, and the workspace's owner and admins manage it; approving tool calls needs an explicit grant." : "Workspace membership alone does not give access to a private session: only the workspace's owner and admins, who manage every session, and people you give a session role open it."}</p>
               <p>You are the session owner; the host owner is a separate role. Viewing never grants access to your Git accounts, and visibility does not share your Pi host or local models.</p>
             </div>
           </InfoTip>

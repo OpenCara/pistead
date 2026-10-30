@@ -232,7 +232,7 @@ export function BackupList({ sourceId, ownerId, backups, latestBackup, refreshKe
           </div>
           <Feedback error={storageError || error} />
           {error && attempt && !attempt.targetSessionId && <Alert variant="warning" title="Outcome not confirmed">Retry the same restore; an error doesn't mean no session was created.</Alert>}
-          {attempt?.targetSessionId && <p className="muted small" role="status">Restored session: <code>{attempt.targetSessionId}</code>. It is private; only its owner can change visibility.</p>}
+          {attempt?.targetSessionId && <p className="muted small" role="status">Restored session: <code>{attempt.targetSessionId}</code>. It is private; only its owner, or the workspace's owner or an admin, can change visibility.</p>}
         </fieldset>
       </form>}
     </div>)}

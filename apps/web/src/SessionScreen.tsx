@@ -3,6 +3,7 @@ import type { ChatImage } from "../../../packages/shared/src/chat-images";
 import type { ConnectorInfo } from "../../../packages/shared/src/connector";
 import type { ApprovalRecord, EntryView, SessionRecord, SessionView, SubmitResult, UserProfile } from "../../../packages/shared/src/types";
 import { redactSecrets, REDACTED } from "../../../packages/shared/src/redaction";
+import { managesSession } from "../../../packages/shared/src/policy";
 import { api, segment } from "./api";
 import { useApp } from "./app-context";
 import { AttachButton, AttachmentStrip, encodeImages, forgetHandedOverImages, handedOverImages, imagesUnavailable, useAttachments, type Attachments } from "./attachments";
@@ -182,8 +183,11 @@ function SessionPane({ id }: { id: string }) {
   useEffect(() => () => { setLiveActivity(null); refreshSessions(); }, [setLiveActivity, refreshSessions]);
   const activeQueue = (view?.queue ?? []).filter(item => activeStatuses.includes(item.status));
   const refreshAll = useCallback(() => { live.refresh(); audit.refresh(); refreshSessions(); }, [live.refresh, audit.refresh, refreshSessions]);
+  // Its owner, and its workspace's owner and admins, rename and archive the session and change its visibility; the server decides.
+  const workspaceRole = session ? workspaces.find(workspace => workspace.id === session.workspaceId)?.role : undefined;
+  const manages = Boolean(session && managesSession(user.id, session.ownerId, workspaceRole));
   const actions = useSessionActions({
-    session, user,
+    session, user, manages,
     backupBlocked: archived || frozen || !view || Boolean(live.error) || view.busy || activeQueue.length > 0,
     onChange: refreshAll,
   });
@@ -203,10 +207,11 @@ function SessionPane({ id }: { id: string }) {
     : <StatusBadge tone="neutral" dot>Connecting</StatusBadge>;
 
   const menu: (MenuItem | "separator")[] = [{ label: "Copy session ID", icon: "copy", onSelect: () => void navigator.clipboard.writeText(id) }];
-  if (session && isOwner && !archived) {
+  if (session && manages && !archived) {
     menu.push({ label: "Rename", icon: "pencil", disabled: actions.action.busy, onSelect: () => setRenaming(true) });
     menu.push({ label: visibility === "workspace" ? "Make private" : "Make workspace-visible", icon: visibility === "workspace" ? "lock" : "globe", disabled: actions.action.busy, onSelect: actions.changeVisibility });
-    if (!frozen) {
+    // Backups hold the owner's work and personal environment, so they stay the owner's.
+    if (isOwner && !frozen) {
       menu.push({ label: "Create backup", icon: "archive", disabled: actions.backupsOff || actions.backupsPending || actions.backupBlocked || actions.action.busy,
         hint: actions.backupsOff ? "Backups are off" : actions.backupBlocked ? "Session busy" : undefined, onSelect: () => actions.createBackup() });
       menu.push({ label: "Back up conversation only", icon: "archive",
@@ -216,7 +221,7 @@ function SessionPane({ id }: { id: string }) {
     }
     menu.push({ label: "Archive", icon: "archive", disabled: actions.action.busy, onSelect: actions.archive });
   }
-  if (session && isOwner && archived) {
+  if (session && manages && archived) {
     menu.push({ label: "Unarchive", icon: "archive", disabled: actions.action.busy, onSelect: actions.unarchive });
   }
   if (known) menu.push("separator", { label: "Open in workspace settings", icon: "settings", onSelect: () => navigate({ name: "settings", section: "workspaces", id: known.workspaceId }) });
@@ -271,8 +276,8 @@ function SessionPane({ id }: { id: string }) {
           This session pinned its repositories when it started, which sessions no longer do. Its conversation, approvals and backups stay viewable, but it no longer runs. Start a new session to continue the work.
         </Alert>}
         {session?.cloneUnavailable && !frozen && <Alert variant="warning" title="Can't clone repositories">{session.cloneUnavailable}</Alert>}
-        {archived && <Alert title="Archived" actions={isOwner && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unarchive}>Unarchive</Button>}>
-          This session is read-only. {isOwner ? "Unarchive it to continue the work." : "Only its owner can unarchive it."}
+        {archived && <Alert title="Archived" actions={manages && <Button variant="outline" size="sm" disabled={actions.action.busy} onClick={actions.unarchive}>Unarchive</Button>}>
+          This session is read-only. {manages ? "Unarchive it to continue the work." : "Only its owner, or the workspace's owner or an admin, can unarchive it."}
         </Alert>}
         {live.error && !startFailed && <Alert variant="error" title={session ? "Live updates interrupted" : "Unable to open session"} actions={<Button variant="outline" size="sm" onClick={live.reconnect}>Reconnect and check access</Button>}>{live.error}</Alert>}
         <Feedback {...actions.action} />
@@ -315,9 +320,9 @@ function SessionPane({ id }: { id: string }) {
     </div>
     {session && panelOpen && <>
       <button type="button" className="session-scrim" aria-label="Close session panel" onClick={() => setPanelOpen(false)} />
-      <SessionPanel session={session} view={view} user={user} hosts={hosts} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
+      <SessionPanel session={session} view={view} user={user} workspaceRole={workspaceRole} hosts={hosts} tab={tab} setTab={setTab} onClose={() => setPanelOpen(false)} refresh={live.refresh} audit={audit} actions={actions} openSession={openSession} />
     </>}
-    {session && isOwner && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
+    {session && manages && <RenameSheet open={renaming} title={session.title} busy={actions.action.busy} onClose={() => setRenaming(false)}
       onSave={async title => { if (await actions.rename(title)) setRenaming(false); }} />}
   </div></PeopleProvider>;
 }
