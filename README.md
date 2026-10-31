@@ -176,7 +176,7 @@ Workspace admins manage only their workspace; the server's administrators are co
 
 Sessions work on their workspace's **sources**: the Git repositories bound to it, which agents clone, and [documents](#document-sources) (Notion, Google Drive, Dropbox, OneDrive and SharePoint, Feishu/Lark, Tencent Docs), which agents read. Every session in the workspace gets every source, and reads each with its owner's own accounts. Until a workspace has a source, nobody can share a host with it or start a session in it.
 
-Connect the accounts that can read your repositories under **Settings → Profile → Connected accounts** (**Add Git account**). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
+Connect the accounts that can read your repositories under **Settings → Profile → Connected accounts** (**Connect** on the provider's row). Pistead verifies each token with its provider and keeps it encrypted on the server; tokens never go to other people's hosts.
 
 | Provider | How to connect | Token scopes |
 |---|---|---|

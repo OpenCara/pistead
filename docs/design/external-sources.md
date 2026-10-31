@@ -180,8 +180,9 @@ Google Drive, Dropbox, OneDrive, Tencent Docs and the rest are others.
   `drive_sources` with the folder and drive ids, …). Branch, LFS or cache concepts are not pushed into the general
   layer.
 - **Accounts:** one **Connected accounts** page in the profile; storage stays per kind (`git_credentials` and a new
-  `source_accounts`). **Done:** the profile's **Connected accounts** section lists the Git accounts (the GitHub
-  sign-in and token accounts, **Add Git account**) first, then one row per document provider.
+  `source_accounts`). **Done:** the profile's **Connected accounts** section lists every supported Git provider, one row each
+  like the document providers (GitHub's sign-in, then the token providers with **Connect** and their connected accounts
+  under them), then one row per document provider.
 - **Tools by what they do.** Git keeps `git clone` and `git_push`. Every document kind is read with one tool,
   `source_read`, so a new kind needs no connector update; writes, when they come, get tools per kind, because their
   approval cards and failure modes differ.

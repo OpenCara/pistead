@@ -1,4 +1,6 @@
 @layer screens {
+  /* Accounts listed under their Git provider in Connected accounts line up with the provider name. */
+  .git-account-indent { display: block; width: 16px; }
   /* A form grouping several sections keeps the section rhythm across its boundary. */
   .settings-form + .section, .section + .settings-form { margin-top: var(--space-8); }
   .settings-actions { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-4); }
