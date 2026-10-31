@@ -1,7 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { assignableWorkspaceRoles, type AssignableWorkspaceRole, type UserProfile, type Workspace, type WorkspaceRole } from "../../../../packages/shared/src/types";
 import { adminManagedRoles, canCreateSessions } from "../../../../packages/shared/src/policy";
-import { gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
+import { gitProviderHasForge, gitProviderNames, repositoryLimits, type GitAccount, type ProviderRepository, type ProviderRepositoryList, type WorkspaceRepository } from "../../../../packages/shared/src/repositories";
 import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { useConnections } from "../hosts";
@@ -185,19 +185,35 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
   const [ref, setRef] = useState("");
   // The API lists the GitHub sign-in account first when connected, so it is the default.
   const account = accounts.find(item => item.id === accountId) ?? accounts[0];
-  const resource = useResource<ProviderRepositoryList>(open && account ? `/api/git/accounts/${segment(account.id)}/repositories` : null);
+  // A plain Git server lists nothing: its repository is looked up by the clone URL or path typed here.
+  const listed = account ? gitProviderHasForge(account.provider) : true;
+  const [path, setPath] = useState("");
+  const [found, setFound] = useState<ProviderRepository | null>(null);
+  const lookup = useAction();
+  const resource = useResource<ProviderRepositoryList>(open && account && listed ? `/api/git/accounts/${segment(account.id)}/repositories` : null);
   const action = useAction();
-  const selected = resource.data?.repositories.find(repository => repository.id === selectedId);
+  const selected = listed ? resource.data?.repositories.find(repository => repository.id === selectedId) : found ?? undefined;
   const alreadyBound = (repository: ProviderRepository) => repositories.some(binding => binding.provider === account?.provider && binding.host === account.host
     && (binding.repositoryId === repository.id || binding.fullName.toLowerCase() === repository.fullName.toLowerCase()));
-  const blocked = disabled || action.busy || resource.loading || Boolean(resource.error) || !account || !selected || alreadyBound(selected) || repositories.length >= repositoryLimits.repositories;
+  const blocked = disabled || action.busy || lookup.busy || (listed && (resource.loading || Boolean(resource.error))) || !account || !selected || alreadyBound(selected) || repositories.length >= repositoryLimits.repositories;
   const providerName = account ? gitProviderNames[account.provider] : "Git";
   function choose(id: string) { setSelectedId(id); setRef(""); }
-  function chooseAccount(id: string) { setAccountId(id); choose(""); }
+  function chooseAccount(id: string) { setAccountId(id); choose(""); setPath(""); setFound(null); }
+  function find() {
+    if (!account || lookup.busy || !path.trim()) return;
+    setFound(null);
+    setRef("");
+    void lookup.run(async () => {
+      const result = await api<ProviderRepositoryList>(`/api/git/accounts/${segment(account.id)}/repositories?path=${encodeURIComponent(path.trim())}`);
+      setFound(result.repositories[0] ?? null);
+    });
+  }
   function dismiss() {
     if (action.busy) return;
     setSelectedId("");
     setRef("");
+    setPath("");
+    setFound(null);
     close();
   }
   function add(event: FormEvent) {
@@ -208,9 +224,14 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
       refresh();
       setSelectedId("");
       setRef("");
+      setPath("");
+      setFound(null);
       close();
     });
   }
+  const refField = <Field label="Branch, tag or commit" hint={`Optional. Leave blank to use ${selected ? `the default branch, ${selected.defaultBranch}` : "the repository's default branch"}. New sessions pin this ref to a commit; existing sessions never follow branch changes`}>
+    <input className="input" value={ref} onChange={event => setRef(event.target.value)} disabled={disabled || action.busy || !selected} autoComplete="off" spellCheck={false} maxLength={255} placeholder={selected?.defaultBranch ?? "Repository default branch"} />
+  </Field>;
   return <Sheet open={open} title="Add repository" onClose={dismiss} footer={<>
     <Button disabled={action.busy} onClick={dismiss}>Cancel</Button>
     <Button variant="default" type="submit" form="repository-picker-form" disabled={blocked}>{action.busy ? "Binding..." : "Bind repository"}</Button>
@@ -220,8 +241,22 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
         <Combobox<string> label="Account" placeholder="Choose an account" value={account?.id ?? ""} disabled={disabled || action.busy}
           options={accounts.map(item => ({ value: item.id, label: gitAccountLabel(item), hint: item.login }))} onChange={chooseAccount} />
       </div>
-      <p className="muted small">Only repositories this {providerName} account can access are listed. Sessions read them with their owner's own account for the same provider. Never paste a token or clone URL</p>
-      <ResourceState {...resource} retry={resource.refresh}>
+      {listed ? <p className="muted small">Only repositories this {providerName} account can access are listed. Sessions read them with their owner's own account for the same provider. Never paste a token or clone URL</p>
+        : <p className="muted small">A Git server lists no repositories: enter the one to add. Pistead reads it with this account to check it, and sessions read it with their owner's own account for the same server. Never paste a token</p>}
+      {!listed && account && <>
+        <Field label="Clone URL or path" hint={`The repository's https:// clone URL on ${account.host}, or its path there, such as team/project.git`}>
+          <span className="inline">
+            <input className="input" value={path} onChange={event => { setPath(event.target.value); setFound(null); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); find(); } }}
+              disabled={disabled || action.busy || lookup.busy} autoComplete="off" spellCheck={false} maxLength={600} placeholder={`https://${account.host}/team/project.git`} />
+            <Button variant="outline" size="sm" disabled={disabled || action.busy || lookup.busy || !path.trim()} onClick={find}>{lookup.busy ? "Checking..." : "Look up"}</Button>
+          </span>
+        </Field>
+        {found && <Row leading={<Icon name="git-branch" size={16} />} title={found.fullName}
+          hint={`${found.private ? "Private" : "Public"} · default branch ${found.defaultBranch}${alreadyBound(found) ? " · Already configured" : ""}`} />}
+        <Feedback error={lookup.error} />
+        {found && refField}
+      </>}
+      {listed && <ResourceState {...resource} retry={resource.refresh}>
         {!resource.data?.repositories.length
           ? <EmptyState title="No repositories found">Check your {providerName} account and organization access</EmptyState>
           : <>
@@ -231,11 +266,9 @@ function RepositoryPicker({ open, workspace, accounts, repositories, disabled, r
                   hint: `${repository.private ? "Private" : "Public"}${alreadyBound(repository) ? " · Already configured" : ""}` }))} onChange={choose} />
               {resource.data.truncated && <span className="field-hint">Only the first {repositoryLimits.pickerRepositories.toLocaleString()} repositories this account can access are listed</span>}
             </div>
-            <Field label="Branch, tag or commit" hint={`Optional. Leave blank to use ${selected ? `the default branch, ${selected.defaultBranch}` : "the repository's default branch"}. New sessions pin this ref to a commit; existing sessions never follow branch changes`}>
-              <input className="input" value={ref} onChange={event => setRef(event.target.value)} disabled={disabled || action.busy || !selected} autoComplete="off" spellCheck={false} maxLength={255} placeholder={selected?.defaultBranch ?? "Repository default branch"} />
-            </Field>
+            {refField}
           </>}
-      </ResourceState>
+      </ResourceState>}
       {resource.error && <p className="muted small">Review your <a href={href({ name: "settings", section: "profile" })}>Git accounts</a> and repository access, then retry. An owner or admin with access can also configure this workspace</p>}
       <Feedback error={action.error} />
     </form>

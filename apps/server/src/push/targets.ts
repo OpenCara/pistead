@@ -3,7 +3,7 @@ import type { GitProvider, SessionRepository } from '../../../../packages/shared
 import { gitProviderNames, repositoryRemote } from '../../../../packages/shared/src/repositories.js';
 import { fail } from '../http.js';
 import { boundedRepositoryBody, verifyRepository, type RepositoryAccess } from '../repositories.js';
-import { basic, gitProviderAdapters } from '../git/providers.js';
+import { basic, gitProviderAdapters, plainAuthorization, plainPushAllowed } from '../git/providers.js';
 
 /** Where and whether the session owner may push one pinned repository. */
 export interface PushTarget { canPush: boolean; defaultBranch: string; remote: string; azureProjectId?: string }
@@ -27,9 +27,17 @@ function permissionRequired(provider: GitProvider): never {
 function unverifiable(provider: GitProvider, detail: string): never {
   return fail(409, 'push_permission_unverifiable', `${label(provider)} push permission could not be verified: ${detail}`);
 }
+/** A plain Git server has no REST API: no permission reads beyond Git's own, and no pull requests. */
+function noForge(): never {
+  return fail(422, 'pull_request_unsupported', `A ${label('git')} has no pull requests; push the branch without one.`);
+}
 
 function provider(pin: SessionRepository): GitProvider { return 'provider' in pin ? pin.provider : 'github'; }
 function host(pin: SessionRepository): string { return 'provider' in pin ? pin.host : 'github.com'; }
+/** A plain Git server's account must be for the pin's own server, as api() requires of the forges. */
+function plainAccount(credentialHost: string, pin: SessionRepository): void {
+  if (provider(pin) !== 'git' || credentialHost !== host(pin)) fail(409, 'repository_identity_changed', 'The repository host changed.');
+}
 
 /** The owner's own credential against the provider REST API (never the push identity). */
 function api(access: RepositoryAccess, pin: SessionRepository): Api {
@@ -53,6 +61,7 @@ function api(access: RepositoryAccess, pin: SessionRepository): Api {
       if (organization.toLowerCase() !== credential.organization.toLowerCase()) permissionRequired(access.provider);
       return { provider: access.provider, base: `https://dev.azure.com/${organization}`, web: 'dev.azure.com', headers: { Authorization: basic('', credential.token) } };
     }
+    case 'git': return noForge();
   }
 }
 
@@ -70,6 +79,7 @@ export function ownerGitAuthorization(access: RepositoryAccess): string {
     case 'gitlab': case 'gitea': return basic('oauth2', token);
     case 'bitbucket': return basic(username ? 'x-bitbucket-api-token-auth' : 'x-token-auth', token);
     case 'azure-devops': return basic('', token);
+    case 'git': return plainAuthorization(access.account.credential);
   }
 }
 
@@ -179,6 +189,8 @@ async function ownerCanPush(target: Api, pin: SessionRepository, branch: string)
       const value = array(target, object(target, result.body).value);
       return { canPush: value[0] === true, azureProjectId: projectId };
     }
+    // Plain Git servers are checked in pushTarget, with Git's own advertisement.
+    case 'git': return noForge();
   }
 }
 
@@ -221,6 +233,7 @@ async function ownerCanTag(target: Api, pin: SessionRepository, tag: string): Pr
       const value = array(target, object(target, result.body).value);
       return { canPush: value[0] === true, azureProjectId: projectId };
     }
+    case 'git': return noForge();
   }
 }
 
@@ -229,6 +242,13 @@ async function ownerCanTag(target: Api, pin: SessionRepository, tag: string): Pr
  * branch and the credential-free remote.
  */
 export async function pushTarget(access: RepositoryAccess, pin: SessionRepository, branch: string, tag?: string): Promise<PushTarget> {
+  if (access.provider === 'git') {
+    // The same for a branch and a tag: whether the server takes a push from the owner at all. Its own rules (protected
+    // branches, hooks) still apply to the push itself.
+    plainAccount(access.account.credential.host, pin);
+    const metadata = await verifyRepository(access, { repositoryId: String(pin.repositoryId), fullName: pin.fullName });
+    return { canPush: await plainPushAllowed(access.account.credential, pin.fullName), defaultBranch: metadata.defaultBranch, remote: repositoryRemote(pin) };
+  }
   const target = api(access, pin);
   const metadata = await verifyRepository(access, { repositoryId: String(pin.repositoryId), fullName: pin.fullName });
   const permission = tag === undefined ? await ownerCanPush(target, pin, branch) : await ownerCanTag(target, pin, tag);
@@ -238,8 +258,8 @@ export async function pushTarget(access: RepositoryAccess, pin: SessionRepositor
 
 /** Current commit of refs/heads/<branch> as the owner sees it; null when the branch does not exist. */
 export async function branchTip(access: RepositoryAccess, pin: SessionRepository, branch: string): Promise<string | null> {
-  const target = api(access, pin);
   if (access.provider === 'github') {
+    const target = api(access, pin);
     const result = await call(target, `${target.base}/repos/${pin.fullName}/commits/${encodeURIComponent(branch)}`);
     if (result.status === 404 || result.status === 422) return null;
     if (result.status !== 200) return unavailable(target.provider);
@@ -247,6 +267,9 @@ export async function branchTip(access: RepositoryAccess, pin: SessionRepository
     if (typeof sha !== 'string' || !sha1.test(sha)) unavailable(target.provider);
     return sha;
   }
+  // The account must belong to the pin's provider and host: api() checks that for the forges.
+  if (access.provider === 'git') plainAccount(access.account.credential.host, pin);
+  else api(access, pin);
   try {
     return await gitProviderAdapters[access.provider].commit(access.account.credential, { id: String(pin.repositoryId), fullName: pin.fullName }, branch);
   } catch (error) {
@@ -334,5 +357,6 @@ export async function openPullRequest(access: RepositoryAccess, pin: SessionRepo
         `&searchCriteria.targetRefName=${encodeURIComponent(`refs/heads/${input.base}`)}&searchCriteria.status=active&api-version=7.1`,
         body => array(target, object(target, body).value)[0])), created: false };
     }
+    case 'git': return noForge();
   }
 }

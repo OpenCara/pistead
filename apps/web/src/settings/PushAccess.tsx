@@ -30,6 +30,7 @@ const ownerAccount: Record<GitProvider, string> = {
   bitbucket: "the Bitbucket API token they connected, which needs write:repository:bitbucket",
   "azure-devops": "the Azure DevOps token they connected, which needs Code (Read & write)",
   gitea: "the Gitea token they connected, which needs write:repository",
+  git: "the Git server account they connected, which needs write access",
 };
 
 const entraAudience = "api://AzureADTokenExchange";

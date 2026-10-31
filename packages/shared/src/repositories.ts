@@ -2,9 +2,11 @@ import type { PushIdentityKind } from "./types.js";
 
 /**
  * Git hosting providers for workspace repositories. GitHub (github.com) uses the sign-in OAuth token; every other
- * provider uses a personal access token the user connects in Settings. Sign-in itself stays GitHub-only.
+ * provider uses a personal access token the user connects in Settings. Sign-in itself stays GitHub-only. `git` is any
+ * Git server over HTTPS (smart HTTP) without a forge API: a user name and password or token, no repository listing and no
+ * pull requests.
  */
-export const gitProviders = ["github", "github-enterprise", "gitlab", "bitbucket", "azure-devops", "gitea"] as const;
+export const gitProviders = ["github", "github-enterprise", "gitlab", "bitbucket", "azure-devops", "gitea", "git"] as const;
 export type GitProvider = (typeof gitProviders)[number];
 /** Providers connected with a personal access token (everything except github.com OAuth). */
 export type TokenGitProvider = Exclude<GitProvider, "github">;
@@ -16,6 +18,7 @@ export const gitProviderNames: Record<GitProvider, string> = {
   bitbucket: "Bitbucket Cloud",
   "azure-devops": "Azure DevOps",
   gitea: "Gitea / Forgejo",
+  git: "Git server (HTTPS)",
 };
 
 /** Fixed API hosts. A null entry means the user supplies the host (self-hosted); GitLab defaults to gitlab.com. */
@@ -26,7 +29,13 @@ export const gitProviderHosts: Record<GitProvider, { fixed: string | null; defau
   bitbucket: { fixed: "bitbucket.org", default: "bitbucket.org" },
   "azure-devops": { fixed: "dev.azure.com", default: "dev.azure.com" },
   gitea: { fixed: null, default: null },
+  git: { fixed: null, default: null },
 };
+
+/** Providers with a forge API: they list repositories and open pull requests. A plain `git` server does neither. */
+export function gitProviderHasForge(provider: GitProvider): boolean {
+  return provider !== "git";
+}
 
 /**
  * A self-hosted provider host: a public DNS name, optionally with a port, reached over HTTPS only.
@@ -62,7 +71,26 @@ export function validRepositoryName(provider: GitProvider, value: unknown): valu
       return parts.length >= 2 && parts.length <= 20 && parts.every(part => segment.test(part));
     case "azure-devops":
       return parts.length === 3 && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,48}[A-Za-z0-9])?$/.test(parts[0]!) && azureSegment.test(parts[1]!) && azureSegment.test(parts[2]!);
+    case "git":
+      // The repository's path on the server, exactly as its clone URL names it (`repo.git`, `team/project`, ...).
+      return parts.length >= 1 && parts.length <= 20 && parts.every(part => segment.test(part) && part !== "." && part !== "..");
   }
+}
+
+/**
+ * The path of a plain Git server's repository from what a user typed: its clone URL on `host` (https://host/path), or
+ * the path alone. Null when it names another host, carries credentials, a query or a fragment, or isn't a valid path.
+ */
+export function plainRepositoryPath(host: string, value: string): string | null {
+  let path = value.trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(path)) {
+    let url: URL;
+    try { url = new URL(path); } catch { return null; }
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || url.host !== host) return null;
+    try { path = decodeURIComponent(url.pathname); } catch { return null; }
+  }
+  path = path.replace(/^\/+/, "").replace(/\/+$/, "");
+  return validRepositoryName("git", path) ? path : null;
 }
 
 /** Provider-stable repository identity: GitHub numeric ids, or opaque strings (GitLab/Gitea numeric, Bitbucket and Azure UUIDs). */
@@ -159,6 +187,7 @@ export const pushIdentityKindsByProvider: Record<GitProvider, readonly PushIdent
   bitbucket: ["bitbucket-client-credentials", "owner-account", "host-credentials"],
   "azure-devops": ["entra-federation", "owner-account", "host-credentials"],
   gitea: ["oauth-refresh", "forgejo-integration", "owner-account", "host-credentials"],
+  git: ["owner-account", "host-credentials"],
 };
 
 /**
@@ -207,6 +236,8 @@ export function bindingRemote(binding: { provider: GitProvider; host: string; fu
       const [organization, project, repository] = name.split("/") as [string, string, string];
       return `https://dev.azure.com/${organization}/${encodeURIComponent(project)}/_git/${encodeURIComponent(repository)}`;
     }
+    // A plain Git server's path is its clone URL's, with or without ".git": nothing is added.
+    case "git": return `https://${binding.host}/${name}`;
     default: return `https://${binding.host}/${name}.git`;
   }
 }

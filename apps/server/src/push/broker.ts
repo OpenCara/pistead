@@ -1,6 +1,6 @@
 import { HTTPException } from 'hono/http-exception';
 import type { GitProvider, SessionRepository } from '../../../../packages/shared/src/repositories.js';
-import { repositoryPath } from '../../../../packages/shared/src/repositories.js';
+import { gitProviderNames, repositoryPath } from '../../../../packages/shared/src/repositories.js';
 import type { GitPushOperation, HostPushCredential, PushCompletionResult, PushCredential, PushOutcome } from '../../../../packages/shared/src/types.js';
 import { constantTimeEqual, sha256 } from '../../../../packages/shared/src/crypto.js';
 import { hasPermission } from '../../../../packages/shared/src/policy.js';
@@ -172,6 +172,8 @@ export async function pushCredential(c: AppContext, connectorId: string | null):
     fail(403, 'default_branch_push_forbidden', 'This workspace forbids pushes to the repository default branch.');
   }
   if (operation.tag !== undefined && operation.pullRequest) fail(400, 'invalid_pull_request', 'A tag push opens no pull request.');
+  // Refused before the push, not after it: a plain Git server has nowhere to open one.
+  if (operation.pullRequest && provider === 'git') fail(422, 'pull_request_unsupported', `A ${gitProviderNames.git} has no pull requests; push the branch without one.`);
   if (operation.pullRequest && (operation.pullRequest.base ?? target.defaultBranch) === operation.branch) {
     fail(400, 'invalid_pull_request', 'The pull request base must differ from the pushed branch.');
   }

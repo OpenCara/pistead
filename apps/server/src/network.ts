@@ -5,6 +5,7 @@ import { defaultNetworkPolicy, egressGitServices, egressGrantPolicy, egressLfsSe
 import { sessionBranchRefusal, type PushCommand } from '../../../packages/shared/src/git-push.js';
 import { fetchGit, gitUpstreamHeaders } from '../../../packages/shared/src/git-transfer.js';
 import { hasPermission } from '../../../packages/shared/src/policy.js';
+import type { ConnectorCapabilities } from '../../../packages/shared/src/connector.js';
 import type { AppContext, Env, RepositoryRow, SessionRow, WorkerEnv } from './types.js';
 import type { Database } from './db/types.js';
 import { auditStatement, requireMember, sessionAccess } from './db.js';
@@ -68,6 +69,12 @@ export function registerNetworkPolicies(app: Hono<WorkerEnv>): void {
   });
 }
 
+async function connectorAcceptsGitServers(env: Env, connectorId: string): Promise<boolean> {
+  const host = await env.DB.query<{ capabilities_json: string }>('SELECT capabilities_json FROM connectors WHERE id = ?').bind(connectorId).first();
+  try { return (JSON.parse(host?.capabilities_json ?? '{}') as ConnectorCapabilities).gitServers === true; }
+  catch { return false; }
+}
+
 /**
  * What one session's egress proxy may do: the workspace's network policy and its repositories. Hosts ask again every
  * minute, so a changed policy or a removed repository reaches running sessions without a restart.
@@ -79,8 +86,11 @@ export async function egressGrant(c: AppContext, connectorId: string | null): Pr
   if (!row) fail(404, 'not_found', 'Session not found.');
   await requireCallbackScope(c, row, connectorId);
   if (row.status === 'archived') fail(403, 'session_archived', 'Archived sessions have no network access.');
-  const repositories = await c.env.DB.query<RepositorySettingsRow>(`${repositorySettingsSelect} WHERE r.workspace_id = ? ORDER BY r.id`)
+  const bound = await c.env.DB.query<RepositorySettingsRow>(`${repositorySettingsSelect} WHERE r.workspace_id = ? ORDER BY r.id`)
     .bind(row.workspace_id).all();
+  // A connector from before plain Git servers refuses a whole grant that names one, so its sessions get the others.
+  const repositories = !connectorId || await connectorAcceptsGitServers(c.env, connectorId)
+    ? bound : bound.filter(repository => repository.provider !== 'git');
   const grant: EgressGrant = {
     // Without the web search setting, which the control plane checks itself (web-search.ts): older connectors refuse a
     // policy that names it.

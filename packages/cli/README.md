@@ -48,7 +48,7 @@ Everything else about how the host runs sessions is set in the web app, on the h
 
 `--git-credentials`, `--repo-cache` and `--repo-cache-scope` are still accepted, so existing service units keep starting, but ignored: a host that used them keeps those settings in its configuration.
 
-Workspace repositories can come from GitHub, GitHub Enterprise Server, GitLab (gitlab.com or self-managed), Bitbucket Cloud, Azure DevOps and Gitea/Forgejo. Connect the non-GitHub accounts in the web app under **Settings → Profile → Connected accounts** with personal access tokens. Sessions read the repositories through the Pistead server, which uses those tokens; the connector never receives them.
+Workspace repositories can come from GitHub, GitHub Enterprise Server, GitLab (gitlab.com or self-managed), Bitbucket Cloud, Azure DevOps, Gitea/Forgejo and any Git server over HTTPS (smart HTTP). Connect the non-GitHub accounts in the web app under **Settings → Profile → Connected accounts** with personal access tokens, or a user name and password for a Git server. This connector accepts Git server repositories in its sessions; older connectors are sent the workspace's other repositories only. Sessions read the repositories through the Pistead server, which uses those tokens; the connector never receives them.
 
 Model credentials stay in Pi on your host. Pairing keeps the host private to you; sharing it with a workspace is a separate, explicit action in the web app.
 

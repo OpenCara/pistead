@@ -1,9 +1,10 @@
 import {
-  gitProviderNames, repositoryLimits, validGitHost, validRepositoryId, validRepositoryName,
+  bindingRemote, gitProviderNames, repositoryLimits, validGitHost, validRepositoryId, validRepositoryName,
   type ProviderRepository, type ProviderRepositoryList, type TokenGitProvider,
 } from '../../../../packages/shared/src/repositories.js';
 import { fail } from '../http.js';
 import { boundedRepositoryBody, repositoryRef } from '../repositories.js';
+import { defaultBranch, readAdvertisement, resolveRef, type AdvertisedService, type Advertisement, type AdvertisementFailure } from './smart-http.js';
 import type { GitCredential, GitProviderAdapter, RepositoryRef } from './types.js';
 
 // GitHub, GitHub Enterprise Server, GitLab and Bitbucket serve at most 100 repositories per list page.
@@ -453,10 +454,91 @@ const azureDevOps: GitProviderAdapter = {
   },
 };
 
+// Plain Git servers: no forge API, only Git's own smart HTTP. The account is a user name with a password or token
+// (HTTP Basic), a repository is its path on the server, and its identity is derived from that path, since nothing else
+// names it: moving a repository reads as a new one, as a rename does elsewhere.
+
+/** The identity of a plain Git server's repository: the first 40 hex digits of the SHA-256 of its path. */
+export async function plainRepositoryId(fullName: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(fullName)));
+  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 40);
+}
+/** The account's credential as a smart HTTP Authorization header. */
+export function plainAuthorization(credential: Pick<GitCredential, 'username' | 'token'>): string {
+  return basic(credential.username ?? '', credential.token);
+}
+function plainFailure(failure: AdvertisementFailure): never {
+  switch (failure) {
+    case 'denied': return accessFailure('git', false);
+    case 'redirected': return fail(409, 'git_repository_redirected',
+      'The Git server redirected the request. Use the repository\'s exact clone URL, the one `git clone` takes.');
+    case 'not-smart': return fail(422, 'git_smart_http_required',
+      'This Git server only speaks Git\'s dumb HTTP protocol. Pistead needs smart HTTP, as git http-backend and Git forges serve it.');
+    case 'invalid': return invalidResponse('git');
+    case 'unavailable': return providerUnavailable('git');
+  }
+}
+/** The advertisement of `service` for one repository, read with the account's credential (or none, with `anonymous`). */
+export async function plainAdvertisement(credential: GitCredential, fullName: string, service: AdvertisedService,
+  anonymous = false): Promise<{ ok: true; advertisement: Advertisement } | { ok: false; failure: AdvertisementFailure }> {
+  const origin = selfHostedOrigin(credential);
+  if (!validRepositoryName('git', fullName)) fail(400, 'invalid_repository', `Use a valid ${label('git')} repository path.`);
+  return readAdvertisement(bindingRemote({ provider: 'git', host: origin.host, fullName }), service, anonymous ? null : plainAuthorization(credential));
+}
+async function readableRefs(credential: GitCredential, fullName: string): Promise<Advertisement> {
+  const result = await plainAdvertisement(credential, fullName, 'git-upload-pack');
+  if (!result.ok) return plainFailure(result.failure);
+  if (result.advertisement.sha256) fail(422, 'unsupported_repository_format', `This ${label('git')} repository uses SHA-256 object names, which are not supported.`);
+  return result.advertisement;
+}
+/**
+ * Whether the account may push to the repository: smart HTTP servers advertise receive-pack only to credentials allowed
+ * to push (git http-backend, for one, never anonymously). Branch rules beyond that are the server's to enforce at the push.
+ */
+export async function plainPushAllowed(credential: GitCredential, fullName: string): Promise<boolean> {
+  const result = await plainAdvertisement(credential, fullName, 'git-receive-pack');
+  if (result.ok) return true;
+  if (result.failure === 'denied') return false;
+  return plainFailure(result.failure);
+}
+const gitServer: GitProviderAdapter = {
+  // Nothing on a plain Git server answers for an account as such: its credential is checked on the first repository it
+  // reads, when a repository is added.
+  async verify(credential) {
+    selfHostedOrigin(credential);
+    if (!credential.username) fail(400, 'invalid_git_username', 'Enter the user name for this Git server.');
+    return { login: login('git', credential.username) };
+  },
+  // There is no listing: the repository picker looks a repository up by its path instead (`repository`).
+  async list() {
+    return { repositories: [], truncated: false };
+  },
+  async repository(credential, repository) {
+    const { fullName } = target('git', repository);
+    const refs = await readableRefs(credential, fullName);
+    const branch = defaultBranch(refs);
+    if (branch === null) return emptyRepository('git');
+    // Public when the server lets anyone read it; anything but a readable advertisement counts as private.
+    const anonymous = await plainAdvertisement(credential, fullName, 'git-upload-pack', true).catch(() => null);
+    return { id: await plainRepositoryId(fullName), fullName, defaultBranch: repositoryRef(branch), private: anonymous?.ok !== true };
+  },
+  async commit(credential, repository, ref) {
+    const { fullName } = target('git', repository);
+    const name = repositoryRef(ref);
+    const refs = await readableRefs(credential, fullName);
+    const commit = resolveRef(refs, name);
+    if (commit) return commitSha('git', commit);
+    // A commit id can't be looked up without fetching; the clone resolves it.
+    if (sha1.test(name)) return name;
+    return accessFailure('git', false);
+  },
+};
+
 export const gitProviderAdapters: Record<TokenGitProvider, GitProviderAdapter> = {
   'github-enterprise': githubEnterprise,
   gitlab,
   bitbucket,
   'azure-devops': azureDevOps,
   gitea,
+  git: gitServer,
 };

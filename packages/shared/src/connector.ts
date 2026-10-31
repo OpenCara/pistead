@@ -29,6 +29,11 @@ export interface ConnectorCapabilities {
   /** The connector pushes session commits with control-plane minted credentials (git_push). Absent on older connectors. */
   gitPush?: boolean;
   /**
+   * The connector accepts repositories on plain Git servers (provider `git`, any HTTPS host) in its sessions' egress
+   * grants. Absent on older connectors, which would refuse a whole grant naming one, so their grants leave them out.
+   */
+  gitServers?: boolean;
+  /**
    * A connector that predates host configuration was started with --git-credentials: pushes in its owner's own sessions
    * may use this host's Git credentials. Absent means false. Connectors with `hostConfig` never advertise it: their
    * owner turns this on in Pistead (HostConfig.gitCredentials).
