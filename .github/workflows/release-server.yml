@@ -1,7 +1,8 @@
 name: Release server
 # Pushing a server-v1.2.3 tag (server-v1.2.3-beta.1 for a prerelease) on a commit in main runs CI, then publishes the
 # server image, the web app and the backend in one, to ghcr.io/opencara/pistead (1.2.3, 1.2 and latest; only the full
-# version for a prerelease). It creates no GitHub release: the image is the release.
+# version for a prerelease). It creates no GitHub release: the image is the release. Once the image is pushed, a release
+# (not a prerelease) is deployed by deploy-server.yml, where the production environment configures a deployment server.
 on:
   push:
     tags: ["server-v*.*.*"]
@@ -27,6 +28,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # The pushed image by digest, so the deploy runs exactly what was built here.
+      image: ${{ steps.image.outputs.name }}:${{ needs.check.outputs.version }}@${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - name: Image name
@@ -51,6 +55,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.version }},enable=${{ needs.check.outputs.prerelease == 'false' }}
             type=raw,value=latest,enable=${{ needs.check.outputs.prerelease == 'false' }}
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -59,3 +64,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [check, docker]
+    if: needs.check.outputs.prerelease == 'false'
+    uses: ./.github/workflows/deploy-server.yml
+    with:
+      image: ${{ needs.docker.outputs.image }}
+    secrets: inherit

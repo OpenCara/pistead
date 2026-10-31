@@ -5,12 +5,14 @@
 # and password, and takes new accounts only through a workspace's invite link (PASSWORD_AUTH=false, or SIGNUP=open or
 # off, in .env change that). For its first administrator, set ADMIN_USER_IDS=password:admin in .env, start it and run:
 #   docker compose exec pistead node dist/server/main.js --create-admin admin
+# To run a published image instead of building one, set PISTEAD_IMAGE (such as ghcr.io/opencara/pistead:latest) in .env
+# and start it with `docker compose up -d --no-build`; the Deploy server workflow sets it on each release.
 # For Postgres, run `docker compose --profile postgres up` and set in .env:
 #   DATABASE_URL=postgres://pistead:change-me@postgres:5432/pistead
 services:
   pistead:
     build: .
-    image: pistead
+    image: ${PISTEAD_IMAGE:-pistead}
     restart: unless-stopped
     env_file: .env
     ports:
