@@ -344,9 +344,11 @@
   /* Page-level alert: quiet tinted border, transparent fill. */
   .alert {
     display: grid;
-    grid-template-columns: auto 1fr;
+    /* minmax(0, …): a long unbroken word (a model id, a URL) wraps rather than widening the alert past its column. */
+    grid-template-columns: auto minmax(0, 1fr);
     gap: 2px var(--space-3);
     padding: var(--space-3) var(--space-4);
+    overflow-wrap: anywhere;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
   }

@@ -31,7 +31,19 @@
     transform: translateX(-50%);
   }
   .jump-to-latest.btn:hover:not(:disabled) { background: var(--surface2); }
-  .session-transcript > .chat-column { display: grid; gap: var(--space-4); align-content: start; padding-top: var(--space-6); padding-bottom: var(--space-6); }
+  /*
+   * One column exactly as wide as the screen allows: an implicit auto column would grow to its widest entry's min-content
+   * (a long tool row label, a long unbroken word), pushing every message past a phone's edge.
+   */
+  .session-transcript > .chat-column {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-4);
+    align-content: start;
+    padding-top: var(--space-6);
+    padding-bottom: var(--space-6);
+  }
+  .session-transcript > .chat-column > * { min-width: 0; }
   .session-transcript .empty-state { margin-top: var(--space-12); }
 
   .entry-user { display: grid; justify-items: end; gap: 2px; }
@@ -61,9 +73,10 @@
   .entry-error > .entry-actor { margin-top: var(--space-1); }
   .entry-stopped { display: flex; align-items: center; gap: var(--space-3); color: var(--foreground-muted); font-size: var(--font-xs); }
   .entry-stopped::before, .entry-stopped::after { content: ""; flex: 1 1 0; border-top: 1px solid var(--border); }
+  .entry-stopped > span { min-width: 0; overflow-wrap: anywhere; }
 
   /* Assistant markdown: each block is spaced from the one before it, so the first and last sit flush. */
-  .markdown { overflow-wrap: break-word; }
+  .markdown { min-width: 0; overflow-wrap: anywhere; }
   .markdown :where(h5, h6, hr) { margin: 0; }
   /* Inside a list item only blocks are spaced: a nested list right after inline text stays tight. */
   .markdown > * + *, .markdown blockquote > * + *, .markdown li > :is(p, ul, ol, pre, blockquote, table) + * { margin-top: var(--space-3); }
