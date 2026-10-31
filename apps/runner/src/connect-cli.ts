@@ -63,7 +63,7 @@ commands have no hard memory limits, so only you can let them run, in your own s
 --unsafe-no-sandbox needs only Git on PATH, but approved commands then run as your
 user with access to your files, credentials and network, and no resource limits.
 GitLab, Azure DevOps, Bitbucket, Gitea/Forgejo and GitHub Enterprise repositories are
-connected in the web app (Settings > Profile > Git accounts) with personal access tokens;
+connected in the web app (Settings > Profile > Connected accounts) with personal access tokens;
 the connector never receives those tokens. Each approved git_push gets a credential for
 that push only, held in connector memory and sent only to the repository's Git host; the
 sandbox never sees it.

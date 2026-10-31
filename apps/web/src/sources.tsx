@@ -6,6 +6,7 @@ import {
 import { api, segment } from "./api";
 import { href } from "./router";
 import { Icon } from "./icons";
+import { GitAccountsGroup, gitAccountsInfo } from "./settings/GitAccounts";
 import { Alert, Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState, Row, Section, Sheet, StatusBadge, confirmDialog, useAction, useResource } from "./ui";
 
 /** The caller's connected accounts other than Git: one per document provider. */
@@ -33,7 +34,7 @@ const itemLabels: Record<DocumentItemType, string> = {
   page: "Page", database: "Database", folder: "Folder", document: "Document", spreadsheet: "Spreadsheet", presentation: "Presentation", file: "File", wiki: "Wiki page",
 };
 
-/** Profile section: the accounts sessions you own read the workspaces' document sources with. */
+/** Profile section: the accounts sessions you own work with, your Git accounts first, then one per document provider. */
 export function ConnectedAccountsSection() {
   const resource = useResource<SourceAccountList>("/api/source-accounts");
   const { accounts, loading, error, refresh } = { accounts: resource.data?.accounts ?? null, loading: resource.loading, error: resource.error, refresh: resource.refresh };
@@ -64,31 +65,39 @@ export function ConnectedAccountsSection() {
       refresh();
     }, `${documentKindNames[provider]} disconnected.`);
   }
-  return <Section title="Connected accounts"
+  return <Section bare title="Connected accounts"
     info={<div className="stack">
-      <p>Sessions you own read the workspaces' document sources with your own connections here, through Pistead. Sign in to a provider, or for Notion, Google Drive and Feishu/Lark paste a secret. Tokens and secrets are encrypted on the server, refreshed there, and never sent to any host, yours included.</p>
-      <p>Each provider lets its connection read only what you share with it, and sessions read only what lies under the workspace's sources.</p>
+      <p>Sessions you own work on the workspaces' sources with your own accounts here, through Pistead.</p>
+      <p>{gitAccountsInfo}</p>
+      <p>Documents are read with your own connections: sign in to a provider, or for Notion, Google Drive and Feishu/Lark paste a secret. Their tokens and secrets are encrypted on the server, refreshed there, and never sent to any host, yours included. Each provider lets its connection read only what you share with it, and sessions read only what lies under the workspace's sources.</p>
+      <p>Connecting an account doesn't change how you sign in; viewing a session, sharing a host or publishing an agent never grants access to your accounts.</p>
     </div>}>
-    <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
-      {shown.map(provider => {
-        const account = accounts?.find(item => item.provider === provider);
-        const oauth = signIn.includes(provider);
-        const paste = secretKinds.includes(provider);
-        const connect = <>
-          {oauth && <LinkButton variant={account ? "ghost" : "outline"} size="sm" href={`/api/source-accounts/${provider}/oauth/start`}>{account ? "Sign in again" : "Sign in"}</LinkButton>}
-          {paste && <Button variant={account || oauth ? "ghost" : "outline"} size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>{oauth ? "Paste secret" : account ? "Replace" : "Connect"}</Button>}
-        </>;
-        return <Row key={provider} leading={<Icon name="file" size={16} />} title={documentKindNames[provider]}
-          hint={account ? `${account.name}${account.method === "oauth" ? " · signed in" : ""}` : "Not connected"}
-          trailing={account
-            ? <><StatusBadge tone="success">Connected</StatusBadge>{connect}<Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Disconnect ${documentKindNames[provider]}`} onClick={() => void remove(provider, account.name)}>Disconnect</Button></>
-            : connect} />;
-      })}
-    </ResourceState>
-    {returned && <CardBody><Feedback {...(returned.ok
-      ? { notice: `${documentKindNames[returned.kind]} connected.`, error: "" }
-      : { notice: "", error: `${documentKindNames[returned.kind]} wasn't connected${returned.reason === "access_denied" ? ": the sign-in was cancelled" : returned.reason ? ` (${returned.reason})` : ""}. Try again.` })} /></CardBody>}
-    {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+    <GitAccountsGroup />
+    <div className="stack" id="document-accounts">
+      <div className="section-header"><h3 className="section-title">Documents</h3></div>
+      <div className="card">
+        <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
+          {shown.map(provider => {
+            const account = accounts?.find(item => item.provider === provider);
+            const oauth = signIn.includes(provider);
+            const paste = secretKinds.includes(provider);
+            const connect = <>
+              {oauth && <LinkButton variant={account ? "ghost" : "outline"} size="sm" href={`/api/source-accounts/${provider}/oauth/start`}>{account ? "Sign in again" : "Sign in"}</LinkButton>}
+              {paste && <Button variant={account || oauth ? "ghost" : "outline"} size="sm" disabled={action.busy} onClick={() => setConnecting(provider)}>{oauth ? "Paste secret" : account ? "Replace" : "Connect"}</Button>}
+            </>;
+            return <Row key={provider} leading={<Icon name="file" size={16} />} title={documentKindNames[provider]}
+              hint={account ? `${account.name}${account.method === "oauth" ? " · signed in" : ""}` : "Not connected"}
+              trailing={account
+                ? <><StatusBadge tone="success">Connected</StatusBadge>{connect}<Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Disconnect ${documentKindNames[provider]}`} onClick={() => void remove(provider, account.name)}>Disconnect</Button></>
+                : connect} />;
+          })}
+        </ResourceState>
+        {returned && <CardBody><Feedback {...(returned.ok
+          ? { notice: `${documentKindNames[returned.kind]} connected.`, error: "" }
+          : { notice: "", error: `${documentKindNames[returned.kind]} wasn't connected${returned.reason === "access_denied" ? ": the sign-in was cancelled" : returned.reason ? ` (${returned.reason})` : ""}. Try again.` })} /></CardBody>}
+        {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+      </div>
+    </div>
     <ConnectSheet provider={connecting} close={() => setConnecting(null)} connected={refresh} />
   </Section>;
 }

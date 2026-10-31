@@ -4,7 +4,6 @@ import { api } from "../api";
 import { useApp } from "../app-context";
 import { Button, CardBody, CopyButton, Feedback, Field, Row, Section, useAction } from "../ui";
 import { usernameWithId } from "../../../../packages/client/src/usernames";
-import { GitAccountsSection } from "./GitAccounts";
 import { ConnectedAccountsSection } from "../sources";
 import { OwnJoinRequests } from "../JoinWorkspaceScreen";
 import { SignedInAppsSection } from "./SignedInApps";
@@ -91,9 +90,8 @@ export function ProfileSettings() {
         <Button type="submit" variant="default" disabled={action.busy}>{action.busy ? "Saving..." : "Save profile"}</Button>
       </div>
     </form>
-    <GitAccountsSection />
-    {user.passwordSignIn && <PasswordSection />}
     <ConnectedAccountsSection />
+    {user.passwordSignIn && <PasswordSection />}
     <SignedInAppsSection />
     <OwnJoinRequests />
     <Section title="Account">

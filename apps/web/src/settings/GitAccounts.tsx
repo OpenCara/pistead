@@ -4,7 +4,7 @@ import { api, segment } from "../api";
 import { useApp } from "../app-context";
 import { GitHubMark, Icon } from "../icons";
 import { gitAccountLabel, useGitAccounts } from "../repositories";
-import { Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState, Row, Section, Sheet, StatusBadge, confirmDialog, useAction } from "../ui";
+import { Button, CardBody, Combobox, Feedback, Field, LinkButton, ResourceState, Row, Sheet, StatusBadge, confirmDialog, useAction } from "../ui";
 
 const tokenProviders = gitProviders.filter((provider): provider is TokenGitProvider => provider !== "github");
 
@@ -16,8 +16,11 @@ const tokenScopes: Record<TokenGitProvider, string> = {
   gitea: "read:repository and read:user; opening pull requests or pushing with your account needs write:repository",
 };
 
-/** Profile section listing the GitHub sign-in account and personal-access-token accounts for other Git providers. */
-export function GitAccountsSection() {
+/** What the Git accounts are for, as part of the Connected accounts section's info. */
+export const gitAccountsInfo = "Repositories you bind or pin are read with your Git accounts, and the pull requests your agents ask for are opened with them. Their tokens are encrypted on the server and never sent to other people's hosts. Where a workspace's push access uses the session owner's account, your own host receives yours in memory for each push in your sessions; Pistead resets your GitHub token when the push ends, so that copy stops working.";
+
+/** The Git group of the profile's Connected accounts: the GitHub sign-in account and personal-access-token accounts for other Git providers. */
+export function GitAccountsGroup() {
   const { user } = useApp();
   const { accounts, loading, error, refresh } = useGitAccounts();
   const action = useAction();
@@ -36,27 +39,30 @@ export function GitAccountsSection() {
       refresh();
     }, "Git account removed.");
   }
-  return <Section title="Git accounts"
-    info="Repositories you bind or pin are read with these accounts, and the pull requests your agents ask for are opened with them. Tokens are encrypted on the server and never sent to other people's hosts. Where a workspace's push access uses the session owner's account, your own host receives yours in memory for each push in your sessions; Pistead resets your GitHub token when the push ends, so that copy stops working. Your sign-in stays GitHub; viewing a session, sharing a host or publishing an agent never grants access to your accounts."
-    action={<Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add account</Button>}>
-    {/* Continuing with GitHub would sign in as a separate GitHub account, so a password account isn't offered it here. */}
-    {user.passwordSignIn
-      ? <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`}
-          hint="Repositories on github.com need an account that signs in with GitHub. This account signs in with a password; add accounts for other Git providers below."
-          trailing={<StatusBadge tone="warning">Not available</StatusBadge>} />
-      : <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`} hint={user.githubLogin ? `@${user.githubLogin}` : undefined}
-          trailing={<>
-            <StatusBadge tone={user.githubConnected ? "success" : "warning"}>{user.githubConnected ? "Connected" : "Not connected"}</StatusBadge>
-            {!user.githubConnected && <LinkButton variant="outline" size="sm" href="/api/auth/github">Connect GitHub</LinkButton>}
-          </>} />}
-    <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
-      {accounts?.filter(account => account.provider !== "github").map(account => <Row key={account.id} leading={<Icon name="git-branch" size={16} />}
-        title={gitAccountLabel(account)} hint={account.login}
-        trailing={<Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Remove ${gitAccountLabel(account)}`} onClick={() => void remove(account)}>Remove</Button>} />)}
-    </ResourceState>
-    {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+  return <div className="stack" id="git-accounts">
+    <div className="section-header"><h3 className="section-title">Git</h3><span className="spacer" />
+      <Button variant="outline" size="sm" icon="plus" onClick={() => setAdding(true)}>Add Git account</Button>
+    </div>
+    <div className="card">
+      {/* Continuing with GitHub would sign in as a separate GitHub account, so a password account isn't offered it here. */}
+      {user.passwordSignIn
+        ? <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`}
+            hint="Repositories on github.com need an account that signs in with GitHub. This account signs in with a password; add accounts for other Git providers below."
+            trailing={<StatusBadge tone="warning">Not available</StatusBadge>} />
+        : <Row leading={<GitHubMark />} title={`${gitProviderNames.github} · ${gitProviderHosts.github.default}`} hint={user.githubLogin ? `@${user.githubLogin}` : undefined}
+            trailing={<>
+              <StatusBadge tone={user.githubConnected ? "success" : "warning"}>{user.githubConnected ? "Connected" : "Not connected"}</StatusBadge>
+              {!user.githubConnected && <LinkButton variant="outline" size="sm" href="/api/auth/github">Connect GitHub</LinkButton>}
+            </>} />}
+      <ResourceState loading={loading && !accounts} error={error} retry={refresh}>
+        {accounts?.filter(account => account.provider !== "github").map(account => <Row key={account.id} leading={<Icon name="git-branch" size={16} />}
+          title={gitAccountLabel(account)} hint={account.login}
+          trailing={<Button variant="ghost" size="sm" disabled={action.busy} aria-label={`Remove ${gitAccountLabel(account)}`} onClick={() => void remove(account)}>Remove</Button>} />)}
+      </ResourceState>
+      {(action.error || action.notice) && <CardBody><Feedback {...action} /></CardBody>}
+    </div>
     <AddGitAccountSheet open={adding} close={() => setAdding(false)} added={refresh} />
-  </Section>;
+  </div>;
 }
 
 function AddGitAccountSheet({ open, close, added }: { open: boolean; close: () => void; added: () => void }) {

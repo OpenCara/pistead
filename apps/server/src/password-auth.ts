@@ -15,7 +15,7 @@ import type { AppContext, Env, UserRow, WorkerEnv } from './types.js';
  * default only someone holding a workspace's invite link, whose request to join that workspace is filed with the account.
  * The operator creates accounts from the command line as well (password-accounts-cli.ts). They are full accounts that
  * sign in with a cookie like GitHub's, but hold no GitHub token: github.com repositories need a GitHub sign-in, and other
- * providers work through personal access tokens under Settings → Profile → Git accounts. Native apps still sign in with
+ * providers work through personal access tokens under Settings → Profile → Connected accounts. Native apps still sign in with
  * GitHub only.
  */
 
