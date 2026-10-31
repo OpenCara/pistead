@@ -1,0 +1,113 @@
+name: Deploy server
+# Deploys a server image to the deployment server over SSH: release-server.yml calls this once a server-v1.2.3 release's
+# image is on GHCR (prereleases aren't deployed), and running it by hand (Actions → Deploy server → Run workflow)
+# deploys any published version, to redeploy or go back to one.
+#
+# On the server, scripts/deploy-server.sh pulls the image by digest, records it as PISTEAD_IMAGE in the deploy
+# directory's .env, recreates the pistead service with `docker compose up -d` and waits for its health check.
+#
+# Configuration, in the `production` environment (README.md, "Releasing"): the variables DEPLOY_HOST, DEPLOY_USER,
+# optionally DEPLOY_PORT (22), DEPLOY_PATH (pistead, from the user's home) and DEPLOY_URL (the public origin, whose
+# /api/health is checked last), and the secrets DEPLOY_SSH_KEY (a private key the server's user accepts) and
+# DEPLOY_SSH_KNOWN_HOSTS (the server's host keys: ssh-keyscan -p PORT HOST, checked against the server's own). Without
+# any of them nothing is deployed; with only some of them the job fails.
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: The image to deploy, by digest (ghcr.io/opencara/pistead:1.2.3@sha256:…).
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The published server version to deploy, such as 1.2.3 (an image tag on GHCR).
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.DEPLOY_URL }}
+    # One deploy at a time; a newer release's waits for the running one instead of cancelling it mid-migration.
+    concurrency:
+      group: deploy-server
+      cancel-in-progress: false
+    steps:
+      # Only whether each one is set, not its value.
+      - name: Deployment configured
+        id: config
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST != '' }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER != '' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY != '' }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS != '' }}
+        run: |
+          missing=()
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_SSH_KNOWN_HOSTS; do
+            [ "${!name}" = true ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ ${#missing[@]} -eq 4 ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Deployment is not configured in the production environment: nothing was deployed."
+          else
+            echo "::error::Deployment is partly configured; missing: ${missing[*]}."
+            exit 1
+          fi
+      - name: Image
+        if: steps.config.outputs.configured == 'true'
+        id: image
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -z "$IMAGE" ]; then
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::$VERSION is not a server version (1.2.3, or 1.2.3-beta.1)."
+              exit 1
+            fi
+            IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION"
+          fi
+          if ! [[ "$IMAGE" =~ ^[a-z0-9./_-]+(:[0-9A-Za-z._-]+)?(@sha256:[0-9a-f]{64})?$ ]]; then
+            echo "::error::$IMAGE is not an image reference."
+            exit 1
+          fi
+          echo "name=$IMAGE" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.configured == 'true'
+      - name: Deploy
+        if: steps.config.outputs.configured == 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'pistead' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          key="$RUNNER_TEMP/deploy_key"
+          known_hosts="$RUNNER_TEMP/deploy_known_hosts"
+          trap 'rm -f "$key" "$known_hosts"' EXIT
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > "$key")
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > "$known_hosts"
+          ssh -i "$key" -p "$DEPLOY_PORT" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash -s -- $(printf '%q ' "$IMAGE" "$DEPLOY_PATH")" < scripts/deploy-server.sh
+      - name: Public health
+        if: steps.config.outputs.configured == 'true' && vars.DEPLOY_URL != ''
+        env:
+          DEPLOY_URL: ${{ vars.DEPLOY_URL }}
+        run: |
+          for i in $(seq 1 30); do
+            curl -fsS --max-time 10 "${DEPLOY_URL%/}/api/health" && exit 0
+            sleep 2
+          done
+          echo "::error::${DEPLOY_URL%/}/api/health did not answer after the deploy."
+          exit 1
